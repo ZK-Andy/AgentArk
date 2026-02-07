@@ -1,0 +1,31 @@
+//! Task entity for task queue
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[sea_orm(table_name = "tasks")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
+    pub description: String,
+    pub action: String,
+    pub arguments: String,
+    pub approval: String,
+    pub status: String,
+    pub created_at: String,
+    #[sea_orm(nullable)]
+    pub scheduled_for: Option<String>,
+    #[sea_orm(nullable)]
+    pub cron: Option<String>,
+    #[sea_orm(nullable)]
+    pub result: Option<String>,
+    #[sea_orm(nullable)]
+    pub proof_id: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

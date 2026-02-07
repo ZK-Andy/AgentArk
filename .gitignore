@@ -1,0 +1,25 @@
+/target
+/dist
+
+# Secrets and user data
+*.enc
+*.keyfile
+.keyfile
+secrets.enc
+config/config.toml
+config/secrets.enc
+config/.keyfile
+config/safety.toml
+config/gmail.json
+data/
+
+# Environment
+.env
+.env.*
+
+# IDE / local
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo

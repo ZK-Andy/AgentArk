@@ -1,0 +1,100 @@
+# CogniArk Safety Rules
+# Copy this to ~/.config/cogniark/safety.toml
+
+# Block dangerous shell commands unless explicitly allowed
+[[rule]]
+name = "block_dangerous_commands"
+description = "Block potentially dangerous shell commands"
+verified = true
+
+[rule.trigger]
+type = "shell_command"
+
+[rule.condition]
+type = "not"
+[rule.condition.condition]
+type = "command_allowed"
+commands = [
+    "ls", "cat", "echo", "pwd", "whoami", "date",
+    "cargo", "git", "npm", "node", "python", "pip"
+]
+
+[rule.action]
+type = "require_approval"
+
+# Rate limit network requests
+[[rule]]
+name = "rate_limit_network"
+description = "Rate limit network requests to prevent abuse"
+verified = true
+
+[rule.trigger]
+type = "network_operation"
+
+[rule.condition]
+type = "rate_limit"
+max_count = 60
+interval_seconds = 60
+
+[rule.action]
+type = "block"
+message = "Rate limit exceeded. Please wait before making more requests."
+
+# Log all file operations
+[[rule]]
+name = "log_file_operations"
+description = "Log all file read/write operations"
+verified = true
+
+[rule.trigger]
+type = "file_operation"
+
+[rule.action]
+type = "log_and_allow"
+
+# Require approval for file writes outside workspace
+[[rule]]
+name = "restrict_file_writes"
+description = "Require approval for writes outside designated directories"
+verified = true
+
+[rule.trigger]
+type = "action"
+name = "file_write"
+
+[rule.condition]
+type = "not"
+[rule.condition.condition]
+type = "path_within"
+directories = [
+    "~/Documents/cogniark-workspace",
+    "/tmp/cogniark"
+]
+
+[rule.action]
+type = "require_approval"
+
+# Block access to sensitive files
+[[rule]]
+name = "protect_sensitive_files"
+description = "Block access to sensitive configuration files"
+verified = true
+
+[rule.trigger]
+type = "file_operation"
+
+[rule.condition]
+type = "or"
+[[rule.condition.conditions]]
+type = "expression"
+expr = "path.contains('.ssh')"
+[[rule.condition.conditions]]
+type = "expression"
+expr = "path.contains('.env')"
+[[rule.condition.conditions]]
+type = "expression"
+expr = "path.contains('credentials')"
+
+[rule.action]
+type = "block"
+message = "Access to sensitive files is not allowed"

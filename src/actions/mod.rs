@@ -1,0 +1,221 @@
+//! Action system with self-improvement capabilities
+//!
+//! Based on arXiv:2512.17102 "SAGE: Self-Improving Agent with Action Library"
+
+pub mod research;
+pub mod search;
+pub mod gmail;
+
+use serde::{Deserialize, Serialize};
+
+use crate::runtime::SandboxMode;
+
+#[allow(unused_imports)]
+pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth, ResearchResult};
+#[allow(unused_imports)]
+pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
+#[allow(unused_imports)]
+pub use gmail::{gmail_scan, gmail_reply};
+
+/// Action source type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActionSource {
+    /// Built-in system action (not editable)
+    System,
+    /// Bundled workflow action (editable)
+    Bundled,
+    /// User-created custom action (editable)
+    Custom,
+}
+
+/// Information about an action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDef {
+    /// Action name (unique identifier)
+    pub name: String,
+
+    /// Human-readable description
+    pub description: String,
+
+    /// Action version
+    pub version: String,
+
+    /// JSON Schema for input parameters
+    pub input_schema: serde_json::Value,
+
+    /// Required capabilities
+    pub capabilities: Vec<String>,
+
+    /// Preferred sandbox mode
+    pub sandbox_mode: Option<SandboxMode>,
+
+    /// Action source (system, bundled, or custom)
+    #[serde(default = "default_action_source")]
+    pub source: ActionSource,
+
+    /// Path to action file (for editable actions)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+}
+
+impl Default for ActionDef {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({}),
+            capabilities: vec![],
+            sandbox_mode: None,
+            source: ActionSource::System,
+            file_path: None,
+        }
+    }
+}
+
+fn default_action_source() -> ActionSource {
+    ActionSource::System
+}
+
+/// Action performance metrics for self-improvement
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionMetrics {
+    /// Total execution count
+    pub execution_count: u64,
+
+    /// Successful executions
+    pub success_count: u64,
+
+    /// Average execution time (ms)
+    pub avg_execution_time_ms: f64,
+
+    /// User satisfaction ratings
+    pub satisfaction_ratings: Vec<f32>,
+
+    /// Last improvement timestamp
+    pub last_improved: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ActionMetrics {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            execution_count: 0,
+            success_count: 0,
+            avg_execution_time_ms: 0.0,
+            satisfaction_ratings: vec![],
+            last_improved: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn success_rate(&self) -> f64 {
+        if self.execution_count == 0 {
+            return 1.0;
+        }
+        self.success_count as f64 / self.execution_count as f64
+    }
+
+    #[allow(dead_code)]
+    pub fn avg_satisfaction(&self) -> Option<f32> {
+        if self.satisfaction_ratings.is_empty() {
+            return None;
+        }
+        Some(
+            self.satisfaction_ratings.iter().sum::<f32>()
+                / self.satisfaction_ratings.len() as f32,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn record_execution(&mut self, success: bool, duration_ms: f64) {
+        self.execution_count += 1;
+        if success {
+            self.success_count += 1;
+        }
+        // Rolling average
+        self.avg_execution_time_ms = (self.avg_execution_time_ms
+            * (self.execution_count - 1) as f64
+            + duration_ms)
+            / self.execution_count as f64;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_rating(&mut self, rating: f32) {
+        self.satisfaction_ratings.push(rating.clamp(0.0, 5.0));
+        // Keep only last 100 ratings
+        if self.satisfaction_ratings.len() > 100 {
+            self.satisfaction_ratings.remove(0);
+        }
+    }
+}
+
+impl Default for ActionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A signed action for verification
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedAction {
+    /// Action info
+    pub info: ActionDef,
+
+    /// WASM module hash (hex encoded)
+    pub wasm_hash: String,
+
+    /// Publisher's DID
+    pub publisher: String,
+
+    /// Signature over (info + wasm_hash) (hex encoded)
+    pub signature: String,
+}
+
+/// Action origin (how it was obtained)
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ActionOrigin {
+    /// Built into the agent
+    BuiltIn,
+    /// Installed from registry
+    Registry { registry: String, version: String },
+    /// Created by user
+    UserCreated,
+    /// Self-generated by the agent
+    SelfGenerated {
+        prompt: String,
+        iterations: u32,
+        base_action: Option<String>,
+    },
+    /// Improved from feedback
+    Improved {
+        original_action: String,
+        feedback: String,
+    },
+}
+
+/// Request to improve an action
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionImprovementRequest {
+    /// Action to improve
+    pub action_name: String,
+
+    /// Feedback or issue description
+    pub feedback: String,
+
+    /// Example inputs/outputs that failed
+    pub failure_examples: Vec<FailureExample>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureExample {
+    pub input: serde_json::Value,
+    pub expected_output: Option<String>,
+    pub actual_output: Option<String>,
+    pub error: Option<String>,
+}

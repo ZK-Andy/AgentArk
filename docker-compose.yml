@@ -1,0 +1,107 @@
+# =============================================================================
+# CogniArk - AI Agent with Automatic Data Persistence
+# =============================================================================
+#
+# QUICK START:
+#   ./start.sh        (Linux/Mac)
+#   start.bat         (Windows)
+#
+# OR manually:
+#   docker-compose up -d --build
+#
+# YOUR DATA IS AUTOMATICALLY PRESERVED:
+#   - Conversations and memory
+#   - Custom actions you create
+#   - Settings and API keys
+#   - Scheduled tasks
+#
+# Data is stored in Docker named volumes and survives:
+#   - Container rebuilds
+#   - Image updates
+#   - System restarts
+#
+# =============================================================================
+
+services:
+  cogniark:
+    build: .
+    image: cogniark:latest
+    container_name: cogniark
+    restart: unless-stopped
+    ports:
+      - "17990:17990"
+    volumes:
+      # === PERSISTENT DATA VOLUMES ===
+      # These volumes are managed by Docker and NEVER deleted on rebuild
+      - cogniark-data:/app/data      # Database, memories, user actions
+      - cogniark-config:/app/config  # Settings, identity keys, API keys
+    environment:
+      # Secure logging: suppress SQLx queries to prevent sensitive data exposure
+      - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
+      - COGNIARK_CONFIG=/app/config
+      - COGNIARK_DATA=/app/data
+      - COGNIARK_BIND=0.0.0.0:17990
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:17990/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    # Resource limits for isolation
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Optional: Ollama for local LLM
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cogniark-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - agent-network
+    profiles:
+      - with-ollama
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+
+  # Optional: SearXNG for private search
+  searxng:
+    image: searxng/searxng:latest
+    container_name: cogniark-searxng
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+    networks:
+      - agent-network
+    profiles:
+      - with-search
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080
+
+volumes:
+  cogniark-data:
+    name: cogniark-data
+  cogniark-config:
+    name: cogniark-config
+  ollama-data:
+  searxng-data:
+
+networks:
+  agent-network:
+    driver: bridge
