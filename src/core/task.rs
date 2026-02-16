@@ -41,10 +41,17 @@ pub struct Task {
     pub cron: Option<String>,
     pub result: Option<String>,
     pub proof_id: Option<Uuid>,
+    /// User or LLM-assigned priority (0.0-1.0)
+    pub priority: Option<f32>,
+    /// Computed urgency based on deadline proximity (0.0-1.0)
+    pub urgency: Option<f32>,
+    /// LLM-scored importance (0.0-1.0)
+    pub importance: Option<f32>,
+    /// Eisenhower quadrant: 1=urgent+important, 2=important, 3=urgent, 4=neither
+    pub eisenhower_quadrant: Option<u8>,
 }
 
 impl Task {
-    #[allow(dead_code)]
     pub fn new(description: String, action: String, arguments: serde_json::Value) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -59,18 +66,11 @@ impl Task {
             cron: None,
             result: None,
             proof_id: None,
+            priority: None,
+            urgency: None,
+            importance: None,
+            eisenhower_quadrant: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_approval(mut self, approval: TaskApproval) -> Self {
-        self.approval = approval;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn requires_approval(&self) -> bool {
-        matches!(self.approval, TaskApproval::RequireApproval)
     }
 }
 
@@ -100,11 +100,6 @@ impl TaskQueue {
 
     pub fn all(&self) -> &[Task] {
         &self.tasks
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
     }
 }
 

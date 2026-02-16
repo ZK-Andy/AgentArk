@@ -10,10 +10,9 @@
 //! The OAuthTokens struct intentionally does NOT implement common traits that could
 //! accidentally expose tokens.
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
-use std::path::Path;
 use crate::crypto::KeyManager;
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// Secure OAuth token container
@@ -41,7 +40,10 @@ impl std::fmt::Debug for OAuthTokens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthTokens")
             .field("access_token", &"[REDACTED]")
-            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("expires_at", &self.expires_at)
             .field("token_type", &self.token_type)
             .field("scope", &self.scope)
@@ -53,7 +55,10 @@ impl Clone for OAuthTokens {
     fn clone(&self) -> Self {
         Self {
             access_token: Zeroizing::new(self.access_token.as_str().to_string()),
-            refresh_token: self.refresh_token.as_ref().map(|t| Zeroizing::new(t.as_str().to_string())),
+            refresh_token: self
+                .refresh_token
+                .as_ref()
+                .map(|t| Zeroizing::new(t.as_str().to_string())),
             expires_at: self.expires_at,
             token_type: self.token_type.clone(),
             scope: self.scope.clone(),
@@ -61,7 +66,6 @@ impl Clone for OAuthTokens {
     }
 }
 
-#[allow(dead_code)]
 impl OAuthTokens {
     /// Check if the access token has expired (with 5 min buffer)
     pub fn is_expired(&self) -> bool {
@@ -82,16 +86,6 @@ impl OAuthTokens {
     /// Get refresh token for internal use ONLY
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.refresh_token.as_ref().map(|t| t.as_str())
-    }
-
-    /// Check if we have a refresh token
-    pub fn has_refresh_token(&self) -> bool {
-        self.refresh_token.is_some()
-    }
-
-    /// Get expiration info (safe to expose)
-    pub fn expires_in_seconds(&self) -> Option<i64> {
-        self.expires_at.map(|exp| exp - chrono::Utc::now().timestamp())
     }
 }
 
@@ -141,67 +135,7 @@ pub struct OAuthConfig {
     pub scopes: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl OAuthConfig {
-    /// Create config for Google OAuth
-    pub fn google(client_id: String, client_secret: String, redirect_uri: String) -> Self {
-        Self {
-            client_id,
-            client_secret: Zeroizing::new(client_secret),
-            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
-            token_url: "https://oauth2.googleapis.com/token".to_string(),
-            redirect_uri,
-            scopes: vec![
-                "https://www.googleapis.com/auth/calendar".to_string(),
-                "https://www.googleapis.com/auth/calendar.events".to_string(),
-            ],
-        }
-    }
-
-    /// Create config for Spotify OAuth
-    pub fn spotify(client_id: String, client_secret: String, redirect_uri: String) -> Self {
-        Self {
-            client_id,
-            client_secret: Zeroizing::new(client_secret),
-            auth_url: "https://accounts.spotify.com/authorize".to_string(),
-            token_url: "https://accounts.spotify.com/api/token".to_string(),
-            redirect_uri,
-            scopes: vec![
-                "user-read-playback-state".to_string(),
-                "user-modify-playback-state".to_string(),
-                "user-read-currently-playing".to_string(),
-                "playlist-read-private".to_string(),
-            ],
-        }
-    }
-
-    /// Create config for Todoist OAuth
-    pub fn todoist(client_id: String, client_secret: String, redirect_uri: String) -> Self {
-        Self {
-            client_id,
-            client_secret: Zeroizing::new(client_secret),
-            auth_url: "https://todoist.com/oauth/authorize".to_string(),
-            token_url: "https://todoist.com/oauth/access_token".to_string(),
-            redirect_uri,
-            scopes: vec!["data:read_write".to_string()],
-        }
-    }
-
-    /// Create config for Meta/WhatsApp Business OAuth
-    pub fn meta_whatsapp(client_id: String, client_secret: String, redirect_uri: String) -> Self {
-        Self {
-            client_id,
-            client_secret: Zeroizing::new(client_secret),
-            auth_url: "https://www.facebook.com/v18.0/dialog/oauth".to_string(),
-            token_url: "https://graph.facebook.com/v18.0/oauth/access_token".to_string(),
-            redirect_uri,
-            scopes: vec![
-                "whatsapp_business_management".to_string(),
-                "whatsapp_business_messaging".to_string(),
-            ],
-        }
-    }
-
     /// Generate the authorization URL for user to visit
     pub fn auth_url(&self, state: &str) -> String {
         let scopes = self.scopes.join(" ");
@@ -228,7 +162,6 @@ pub struct OAuthClient {
     http: reqwest::Client,
 }
 
-#[allow(dead_code)]
 impl OAuthClient {
     pub fn new() -> Self {
         Self {
@@ -248,7 +181,8 @@ impl OAuthClient {
             ("grant_type", "authorization_code"),
         ];
 
-        let response = self.http
+        let response = self
+            .http
             .post(&config.token_url)
             .form(&params)
             .send()
@@ -271,9 +205,9 @@ impl OAuthClient {
 
         let token_response: TokenResponse = response.json().await?;
 
-        let expires_at = token_response.expires_in.map(|secs| {
-            chrono::Utc::now().timestamp() + secs
-        });
+        let expires_at = token_response
+            .expires_in
+            .map(|secs| chrono::Utc::now().timestamp() + secs);
 
         // SECURITY: Immediately wrap in Zeroizing containers
         Ok(OAuthTokens {
@@ -287,7 +221,11 @@ impl OAuthClient {
 
     /// Refresh an access token using the refresh token
     /// SECURITY: Tokens never logged
-    pub async fn refresh_token(&self, config: &OAuthConfig, refresh_token: &str) -> Result<OAuthTokens> {
+    pub async fn refresh_token(
+        &self,
+        config: &OAuthConfig,
+        refresh_token: &str,
+    ) -> Result<OAuthTokens> {
         let params = [
             ("client_id", config.client_id.as_str()),
             ("client_secret", config.client_secret()),
@@ -295,7 +233,8 @@ impl OAuthClient {
             ("grant_type", "refresh_token"),
         ];
 
-        let response = self.http
+        let response = self
+            .http
             .post(&config.token_url)
             .form(&params)
             .send()
@@ -316,9 +255,9 @@ impl OAuthClient {
 
         let token_response: TokenResponse = response.json().await?;
 
-        let expires_at = token_response.expires_in.map(|secs| {
-            chrono::Utc::now().timestamp() + secs
-        });
+        let expires_at = token_response
+            .expires_in
+            .map(|secs| chrono::Utc::now().timestamp() + secs);
 
         Ok(OAuthTokens {
             access_token: Zeroizing::new(token_response.access_token),
@@ -347,15 +286,7 @@ pub struct TokenStorage {
     key_manager: std::sync::Arc<KeyManager>,
 }
 
-#[allow(dead_code)]
 impl TokenStorage {
-    pub fn new(config_dir: &Path, key_manager: std::sync::Arc<KeyManager>) -> Self {
-        Self {
-            storage_path: config_dir.join("oauth_tokens.enc"),
-            key_manager,
-        }
-    }
-
     /// Save tokens for a service (encrypted)
     pub fn save(&self, service_id: &str, tokens: &OAuthTokens) -> Result<()> {
         let mut all_tokens = self.load_all_internal()?;
@@ -367,19 +298,6 @@ impl TokenStorage {
         std::fs::write(&self.storage_path, encrypted)?;
 
         Ok(())
-    }
-
-    /// Load tokens for a service (decrypted into secure container)
-    pub fn load(&self, service_id: &str) -> Result<Option<OAuthTokens>> {
-        let all_tokens = self.load_all_internal()?;
-        Ok(all_tokens.get(service_id).map(|t| OAuthTokens::from(t.clone())))
-    }
-
-    /// Check if tokens exist for a service (without loading)
-    pub fn exists(&self, service_id: &str) -> bool {
-        self.load_all_internal()
-            .map(|t| t.contains_key(service_id))
-            .unwrap_or(false)
     }
 
     /// Delete tokens for a service
@@ -398,13 +316,6 @@ impl TokenStorage {
         Ok(())
     }
 
-    /// List all service IDs that have stored tokens (doesn't expose tokens)
-    pub fn list_services(&self) -> Vec<String> {
-        self.load_all_internal()
-            .map(|t| t.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
     fn load_all_internal(&self) -> Result<std::collections::HashMap<String, TokensForStorage>> {
         if !self.storage_path.exists() {
             return Ok(std::collections::HashMap::new());
@@ -412,43 +323,10 @@ impl TokenStorage {
 
         let encrypted = std::fs::read(&self.storage_path)?;
         let decrypted = self.key_manager.decrypt(&encrypted)?;
-        let tokens: std::collections::HashMap<String, TokensForStorage> = serde_json::from_slice(&decrypted)?;
+        let tokens: std::collections::HashMap<String, TokensForStorage> =
+            serde_json::from_slice(&decrypted)?;
 
         Ok(tokens)
-    }
-}
-
-/// Safe info about OAuth status (no secrets)
-/// This CAN be serialized and returned in API responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthStatusInfo {
-    pub service_id: String,
-    pub is_connected: bool,
-    pub expires_in_seconds: Option<i64>,
-    pub needs_refresh: bool,
-    pub scopes: Option<Vec<String>>,
-}
-
-#[allow(dead_code)]
-impl OAuthStatusInfo {
-    /// Create status info from tokens (safe - no secrets exposed)
-    pub fn from_tokens(service_id: &str, tokens: Option<&OAuthTokens>) -> Self {
-        match tokens {
-            Some(t) => Self {
-                service_id: service_id.to_string(),
-                is_connected: true,
-                expires_in_seconds: t.expires_in_seconds(),
-                needs_refresh: t.is_expired(),
-                scopes: None, // Could expose this if needed
-            },
-            None => Self {
-                service_id: service_id.to_string(),
-                is_connected: false,
-                expires_in_seconds: None,
-                needs_refresh: false,
-                scopes: None,
-            },
-        }
     }
 }
 
@@ -474,11 +352,14 @@ mod tests {
 
     #[test]
     fn test_config_auth_url() {
-        let config = OAuthConfig::google(
-            "client123".to_string(),
-            "secret456".to_string(),
-            "http://localhost:17990/oauth/callback".to_string(),
-        );
+        let config = OAuthConfig {
+            client_id: "client123".to_string(),
+            client_secret: Zeroizing::new("secret456".to_string()),
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            token_url: "https://oauth2.googleapis.com/token".to_string(),
+            redirect_uri: "http://localhost:8990/oauth/callback".to_string(),
+            scopes: vec!["https://www.googleapis.com/auth/calendar".to_string()],
+        };
 
         let url = config.auth_url("test_state");
         assert!(url.contains("client123"));

@@ -14,6 +14,9 @@ pub struct Model {
     #[sea_orm(column_type = "Blob", nullable)]
     pub embedding: Option<Vec<u8>>,
     pub created_at: String,
+    /// Optional project scope
+    #[sea_orm(nullable)]
+    pub project_id: Option<String>,
 }
 
 #[allow(dead_code)]

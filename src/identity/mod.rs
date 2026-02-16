@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -60,8 +60,7 @@ pub struct IdentityManager {
     /// Signing key (private)
     signing_key: SigningKey,
     /// Verifiable credentials held by this agent
-    #[allow(dead_code)]
-    credentials: Vec<VerifiableCredential>,
+    _credentials: Vec<VerifiableCredential>,
 }
 
 impl IdentityManager {
@@ -111,7 +110,7 @@ impl IdentityManager {
         Ok(Self {
             did,
             signing_key,
-            credentials,
+            _credentials: credentials,
         })
     }
 
@@ -123,133 +122,5 @@ impl IdentityManager {
     /// Get the signing key for creating proofs
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
-    }
-
-    /// Get the verifying (public) key
-    pub fn verifying_key(&self) -> VerifyingKey {
-        self.signing_key.verifying_key()
-    }
-
-    /// Sign arbitrary data
-    pub fn sign(&self, data: &[u8]) -> Signature {
-        self.signing_key.sign(data)
-    }
-
-    /// Verify a signature
-    #[allow(dead_code)]
-    pub fn verify(&self, data: &[u8], signature: &Signature) -> bool {
-        self.verifying_key().verify(data, signature).is_ok()
-    }
-
-    /// Issue a verifiable credential
-    #[allow(dead_code)]
-    pub fn issue_credential(
-        &self,
-        subject_did: &str,
-        credential_type: Vec<String>,
-        claims: serde_json::Value,
-        expiration: Option<DateTime<Utc>>,
-    ) -> Result<VerifiableCredential> {
-        let id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-        let issuance_date = Utc::now();
-
-        let subject = CredentialSubject {
-            id: subject_did.to_string(),
-            claims,
-        };
-
-        // Create the credential without proof first
-        let mut cred_for_signing = serde_json::json!({
-            "id": id,
-            "type": credential_type,
-            "issuer": self.did.did,
-            "issuanceDate": issuance_date.to_rfc3339(),
-            "credentialSubject": subject,
-        });
-
-        if let Some(exp) = expiration {
-            cred_for_signing["expirationDate"] = serde_json::Value::String(exp.to_rfc3339());
-        }
-
-        // Sign the credential
-        let canonical = serde_json::to_string(&cred_for_signing)?;
-        let signature = self.sign(canonical.as_bytes());
-
-        let proof = CredentialProof {
-            proof_type: "Ed25519Signature2020".to_string(),
-            created: Utc::now(),
-            verification_method: format!("{}#keys-1", self.did.did),
-            proof_purpose: "assertionMethod".to_string(),
-            proof_value: base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                signature.to_bytes(),
-            ),
-        };
-
-        Ok(VerifiableCredential {
-            id,
-            credential_type,
-            issuer: self.did.did.clone(),
-            issuance_date,
-            expiration_date: expiration,
-            subject,
-            proof,
-        })
-    }
-
-    /// Verify a credential's signature
-    #[allow(dead_code)]
-    pub fn verify_credential(&self, credential: &VerifiableCredential) -> Result<bool> {
-        // Reconstruct the signed data
-        let mut cred_for_verification = serde_json::json!({
-            "id": credential.id,
-            "type": credential.credential_type,
-            "issuer": credential.issuer,
-            "issuanceDate": credential.issuance_date.to_rfc3339(),
-            "credentialSubject": credential.subject,
-        });
-
-        if let Some(exp) = credential.expiration_date {
-            cred_for_verification["expirationDate"] = serde_json::Value::String(exp.to_rfc3339());
-        }
-
-        let canonical = serde_json::to_string(&cred_for_verification)?;
-
-        // Decode and verify signature
-        let sig_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &credential.proof.proof_value,
-        )?;
-
-        if sig_bytes.len() != 64 {
-            return Ok(false);
-        }
-
-        let mut sig_array = [0u8; 64];
-        sig_array.copy_from_slice(&sig_bytes);
-        let signature = Signature::from_bytes(&sig_array);
-
-        Ok(self.verify(canonical.as_bytes(), &signature))
-    }
-
-    /// Store a credential
-    #[allow(dead_code)]
-    pub fn add_credential(&mut self, credential: VerifiableCredential) {
-        self.credentials.push(credential);
-    }
-
-    /// Get all credentials
-    #[allow(dead_code)]
-    pub fn credentials(&self) -> &[VerifiableCredential] {
-        &self.credentials
-    }
-
-    /// Find credentials by type
-    #[allow(dead_code)]
-    pub fn find_credentials(&self, credential_type: &str) -> Vec<&VerifiableCredential> {
-        self.credentials
-            .iter()
-            .filter(|c| c.credential_type.iter().any(|t| t == credential_type))
-            .collect()
     }
 }

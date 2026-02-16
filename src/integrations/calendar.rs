@@ -2,11 +2,11 @@
 //!
 //! Provides calendar access: list events, create events, find free time, set reminders.
 
-use super::{Capability, Integration, IntegrationStatus};
 use super::oauth::{OAuthClient, OAuthConfig, OAuthTokens, TokenStorage};
-use anyhow::{Result, anyhow};
+use super::{Capability, Integration, IntegrationStatus};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc, Duration, TimeZone};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -68,36 +68,20 @@ impl GoogleCalendarConnector {
         }
     }
 
-    /// Initialize with OAuth credentials and token storage
-    #[allow(dead_code)]
-    pub async fn init(
-        &mut self,
-        client_id: String,
-        client_secret: String,
-        redirect_uri: String,
-        token_storage: TokenStorage,
-    ) -> Result<()> {
-        self.oauth_config = Some(OAuthConfig::google(client_id, client_secret, redirect_uri));
-
-        // Try to load existing tokens
-        if let Ok(Some(tokens)) = token_storage.load(Self::SERVICE_ID) {
-            *self.tokens.write().await = Some(tokens);
-        }
-
-        self.token_storage = Some(token_storage);
-        Ok(())
-    }
-
     /// Get the OAuth authorization URL
     pub fn get_auth_url(&self, state: &str) -> Result<String> {
-        let config = self.oauth_config.as_ref()
+        let config = self
+            .oauth_config
+            .as_ref()
             .ok_or_else(|| anyhow!("OAuth not configured"))?;
         Ok(config.auth_url(state))
     }
 
     /// Handle OAuth callback with authorization code
     pub async fn handle_auth_callback(&self, code: &str) -> Result<()> {
-        let config = self.oauth_config.as_ref()
+        let config = self
+            .oauth_config
+            .as_ref()
             .ok_or_else(|| anyhow!("OAuth not configured"))?;
 
         let tokens = self.oauth_client.exchange_code(config, code).await?;
@@ -123,16 +107,22 @@ impl GoogleCalendarConnector {
     /// Get a valid access token (refreshing if needed)
     async fn get_access_token(&self) -> Result<String> {
         let mut tokens_guard = self.tokens.write().await;
-        let tokens = tokens_guard.as_mut()
+        let tokens = tokens_guard
+            .as_mut()
             .ok_or_else(|| anyhow!("Not authenticated with Google Calendar"))?;
 
         // Check if token needs refresh
         if tokens.is_expired() {
             if let Some(refresh_token) = tokens.refresh_token() {
-                let config = self.oauth_config.as_ref()
+                let config = self
+                    .oauth_config
+                    .as_ref()
                     .ok_or_else(|| anyhow!("OAuth not configured"))?;
 
-                let new_tokens = self.oauth_client.refresh_token(config, refresh_token).await?;
+                let new_tokens = self
+                    .oauth_client
+                    .refresh_token(config, refresh_token)
+                    .await?;
 
                 // Save refreshed tokens
                 if let Some(ref storage) = self.token_storage {
@@ -149,7 +139,11 @@ impl GoogleCalendarConnector {
     }
 
     /// List events in a time range
-    pub async fn list_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<CalendarEvent>> {
+    pub async fn list_events(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<CalendarEvent>> {
         let token = self.get_access_token().await?;
 
         let url = format!(
@@ -159,7 +153,8 @@ impl GoogleCalendarConnector {
             end.to_rfc3339()
         );
 
-        let response = self.http
+        let response = self
+            .http
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .send()
@@ -202,11 +197,16 @@ impl GoogleCalendarConnector {
 
         let events_response: EventsResponse = response.json().await?;
 
-        let events = events_response.items.unwrap_or_default()
+        let events = events_response
+            .items
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|e| {
                 let (start_dt, all_day) = if let Some(dt) = e.start.date_time {
-                    (DateTime::parse_from_rfc3339(&dt).ok()?.with_timezone(&Utc), false)
+                    (
+                        DateTime::parse_from_rfc3339(&dt).ok()?.with_timezone(&Utc),
+                        false,
+                    )
                 } else if let Some(d) = e.start.date {
                     // All-day event
                     let naive = chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()?;
@@ -232,7 +232,10 @@ impl GoogleCalendarConnector {
                     start: start_dt,
                     end: end_dt,
                     all_day,
-                    attendees: e.attendees.map(|a| a.into_iter().map(|x| x.email).collect()).unwrap_or_default(),
+                    attendees: e
+                        .attendees
+                        .map(|a| a.into_iter().map(|x| x.email).collect())
+                        .unwrap_or_default(),
                     html_link: e.html_link,
                 })
             })
@@ -299,20 +302,28 @@ impl GoogleCalendarConnector {
                 time_zone: "UTC".to_string(),
             },
             attendees: request.attendees.as_ref().map(|a| {
-                a.iter().map(|email| AttendeeBody { email: email.clone() }).collect()
+                a.iter()
+                    .map(|email| AttendeeBody {
+                        email: email.clone(),
+                    })
+                    .collect()
             }),
             reminders: request.reminders.as_ref().map(|r| RemindersBody {
                 use_default: false,
-                overrides: r.iter().map(|&m| ReminderOverride {
-                    method: "popup".to_string(),
-                    minutes: m,
-                }).collect(),
+                overrides: r
+                    .iter()
+                    .map(|&m| ReminderOverride {
+                        method: "popup".to_string(),
+                        minutes: m,
+                    })
+                    .collect(),
             }),
         };
 
         let url = format!("{}/calendars/primary/events", Self::API_BASE);
 
-        let response = self.http
+        let response = self
+            .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .json(&body)
@@ -392,7 +403,9 @@ impl GoogleCalendarConnector {
     /// Get today's events
     pub async fn today(&self) -> Result<Vec<CalendarEvent>> {
         let now = Utc::now();
-        let start = now.date_naive().and_hms_opt(0, 0, 0)
+        let start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
             .map(|dt| Utc.from_utc_datetime(&dt))
             .unwrap_or(now);
         let end = start + Duration::days(1);
@@ -402,7 +415,9 @@ impl GoogleCalendarConnector {
     /// Get this week's events
     pub async fn this_week(&self) -> Result<Vec<CalendarEvent>> {
         let now = Utc::now();
-        let start = now.date_naive().and_hms_opt(0, 0, 0)
+        let start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
             .map(|dt| Utc.from_utc_datetime(&dt))
             .unwrap_or(now);
         let end = start + Duration::days(7);
@@ -462,19 +477,22 @@ impl Integration for GoogleCalendarConnector {
                 Ok(serde_json::to_value(event)?)
             }
             "find_free_time" => {
-                let start = params.get("start")
+                let start = params
+                    .get("start")
                     .and_then(|v| v.as_str())
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(Utc::now);
 
-                let end = params.get("end")
+                let end = params
+                    .get("end")
                     .and_then(|v| v.as_str())
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(|| start + Duration::days(1));
 
-                let min_duration = params.get("min_duration_minutes")
+                let min_duration = params
+                    .get("min_duration_minutes")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(30);
 
@@ -482,14 +500,16 @@ impl Integration for GoogleCalendarConnector {
                 Ok(serde_json::to_value(slots)?)
             }
             "get_auth_url" => {
-                let state = params.get("state")
+                let state = params
+                    .get("state")
                     .and_then(|v| v.as_str())
                     .unwrap_or("calendar_auth");
                 let url = self.get_auth_url(state)?;
                 Ok(serde_json::json!({ "url": url }))
             }
             "auth_callback" => {
-                let code = params.get("code")
+                let code = params
+                    .get("code")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing authorization code"))?;
                 self.handle_auth_callback(code).await?;

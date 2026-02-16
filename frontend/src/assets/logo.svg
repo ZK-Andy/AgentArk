@@ -1,0 +1,432 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="170 60 684 900">
+  <defs>
+    <!-- Body gradients -->
+    <radialGradient id="gBody" cx="45%" cy="35%" r="55%">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="0.55" stop-color="#6D28D9"/>
+      <stop offset="1" stop-color="#4C1D95"/>
+    </radialGradient>
+    <radialGradient id="gBodyShine" cx="35%" cy="22%" r="40%">
+      <stop offset="0" stop-color="#A78BFA" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#6D28D9" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Belly panel -->
+    <radialGradient id="gBelly" cx="50%" cy="38%" r="50%">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.5"/>
+      <stop offset="0.8" stop-color="#6D28D9" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#5B21B6" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Eye whites -->
+    <radialGradient id="gEyeW" cx="45%" cy="38%" r="55%">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E8ECFF"/>
+    </radialGradient>
+
+    <!-- Iris cyan (left) -->
+    <radialGradient id="gIrisC" cx="42%" cy="38%" r="52%">
+      <stop offset="0" stop-color="#67E8F9"/>
+      <stop offset="0.55" stop-color="#00D4FF"/>
+      <stop offset="1" stop-color="#0891B2"/>
+    </radialGradient>
+    <!-- Iris amber (right) -->
+    <radialGradient id="gIrisA" cx="42%" cy="38%" r="52%">
+      <stop offset="0" stop-color="#FDE68A"/>
+      <stop offset="0.55" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#D97706"/>
+    </radialGradient>
+
+    <!-- Tendril gradients -->
+    <linearGradient id="tC" x1="0" y1="1" x2="0.2" y2="0">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset="0.5" stop-color="#00D4FF"/>
+      <stop offset="1" stop-color="#67E8F9"/>
+    </linearGradient>
+    <linearGradient id="tP" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset="0.5" stop-color="#A855F7"/>
+      <stop offset="1" stop-color="#D8B4FE"/>
+    </linearGradient>
+    <linearGradient id="tA" x1="0" y1="1" x2="-0.2" y2="0">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset="0.5" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#FDE68A"/>
+    </linearGradient>
+
+    <!-- Cheek glows -->
+    <radialGradient id="gChkL" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#00D4FF" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#00D4FF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gChkR" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#F59E0B" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Chest core -->
+    <radialGradient id="gCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#C084FC"/>
+      <stop offset="0.4" stop-color="#7C3AED" stop-opacity="0.6"/>
+      <stop offset="1" stop-color="#5B21B6" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Arm gradient -->
+    <radialGradient id="gArm" cx="50%" cy="30%" r="60%">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="1" stop-color="#4C1D95"/>
+    </radialGradient>
+
+    <!-- Foot gradient -->
+    <radialGradient id="gFoot" cx="50%" cy="30%" r="65%">
+      <stop offset="0" stop-color="#5B21B6"/>
+      <stop offset="1" stop-color="#3B0764"/>
+    </radialGradient>
+
+    <!-- Filters -->
+    <filter id="fGlow" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feColorMatrix in="b" type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.5 0" result="g"/>
+      <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="fGlowBig" x="-80%" y="-80%" width="260%" height="260%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="12" result="b"/>
+      <feColorMatrix in="b" type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.45 0" result="g"/>
+      <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="fShadow" x="-30%" y="-10%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="18"/>
+      <feOffset dy="14"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.1  0 0 0 0 0  0 0 0 0 0.2  0 0 0 0.5 0"/>
+    </filter>
+    <filter id="fInner" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feColorMatrix in="b" type="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 0.3 0" result="g"/>
+      <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- Clip paths for eyes to contain iris during blink -->
+    <clipPath id="clipEyeL">
+      <ellipse cx="430" cy="460" rx="62" ry="68">
+        <animate attributeName="ry"
+          values="68; 68; 2; 68; 68; 3; 68"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+    </clipPath>
+    <clipPath id="clipEyeR">
+      <ellipse cx="594" cy="460" rx="62" ry="68">
+        <animate attributeName="ry"
+          values="68; 68; 2; 68; 68; 3; 68"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+    </clipPath>
+  </defs>
+
+  <!-- ========= FLOATING ANIMATION WRAPPER ========= -->
+  <g>
+    <animateTransform attributeName="transform" type="translate"
+      values="0 0; 0 -10; 0 0" dur="3.8s" repeatCount="indefinite"
+      calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+
+    <!-- ===== DROP SHADOW (on ground) ===== -->
+    <ellipse cx="512" cy="820" rx="140" ry="22" fill="#3B0764" opacity="0.35">
+      <animate attributeName="rx" values="140;125;140" dur="3.8s" repeatCount="indefinite"
+        calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      <animate attributeName="opacity" values="0.35;0.22;0.35" dur="3.8s" repeatCount="indefinite"
+        calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+    </ellipse>
+
+    <!-- ===== NEURAL TENDRILS (behind body) ===== -->
+    <!-- Left tendril (cyan) -->
+    <g filter="url(#fGlow)">
+      <path d="M430 310 C410 240 370 195 355 155" stroke="url(#tC)" stroke-width="10" stroke-linecap="round" fill="none">
+        <animate attributeName="d" 
+          values="M430 310 C410 240 370 195 355 155;
+                  M430 310 C405 235 360 200 340 165;
+                  M430 310 C410 240 370 195 355 155" 
+          dur="3s" repeatCount="indefinite" calcMode="spline"
+          keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </path>
+      <!-- Tip node -->
+      <circle r="10" fill="#00D4FF" opacity="0.95">
+        <animate attributeName="cx" values="355;340;355" dur="3s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="cy" values="155;165;155" dur="3s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </circle>
+      <circle r="20" fill="#00D4FF" opacity="0.15">
+        <animate attributeName="cx" values="355;340;355" dur="3s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="cy" values="155;165;155" dur="3s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="opacity" values="0.15;0.28;0.15" dur="2.5s" repeatCount="indefinite"/>
+      </circle>
+    </g>
+
+    <!-- Center tendril (purple, tallest) -->
+    <g filter="url(#fGlow)">
+      <path d="M512 290 C512 220 518 170 512 120" stroke="url(#tP)" stroke-width="11" stroke-linecap="round" fill="none">
+        <animate attributeName="d"
+          values="M512 290 C512 220 518 170 512 120;
+                  M512 290 C508 215 506 165 512 110;
+                  M512 290 C512 220 518 170 512 120"
+          dur="3.4s" repeatCount="indefinite" calcMode="spline"
+          keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </path>
+      <circle cx="512" r="12" fill="#A855F7" opacity="0.95">
+        <animate attributeName="cy" values="120;110;120" dur="3.4s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </circle>
+      <circle cx="512" r="24" fill="#A855F7" opacity="0.12">
+        <animate attributeName="cy" values="120;110;120" dur="3.4s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="opacity" values="0.12;0.25;0.12" dur="2.8s" repeatCount="indefinite"/>
+      </circle>
+    </g>
+
+    <!-- Right tendril (amber) -->
+    <g filter="url(#fGlow)">
+      <path d="M594 310 C614 240 654 195 669 155" stroke="url(#tA)" stroke-width="10" stroke-linecap="round" fill="none">
+        <animate attributeName="d"
+          values="M594 310 C614 240 654 195 669 155;
+                  M594 310 C619 235 664 200 684 165;
+                  M594 310 C614 240 654 195 669 155"
+          dur="3.2s" repeatCount="indefinite" calcMode="spline"
+          keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </path>
+      <circle r="10" fill="#F59E0B" opacity="0.95">
+        <animate attributeName="cx" values="669;684;669" dur="3.2s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="cy" values="155;165;155" dur="3.2s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </circle>
+      <circle r="20" fill="#F59E0B" opacity="0.12">
+        <animate attributeName="cx" values="669;684;669" dur="3.2s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="cy" values="155;165;155" dur="3.2s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="opacity" values="0.12;0.26;0.12" dur="2.6s" repeatCount="indefinite"/>
+      </circle>
+    </g>
+
+    <!-- ===== FEET (behind body) ===== -->
+    <!-- Left foot -->
+    <ellipse cx="440" cy="770" rx="52" ry="28" fill="url(#gFoot)"/>
+    <ellipse cx="440" cy="765" rx="44" ry="20" fill="#5B21B6" opacity="0.3"/>
+    <!-- Right foot -->
+    <ellipse cx="584" cy="770" rx="52" ry="28" fill="url(#gFoot)"/>
+    <ellipse cx="584" cy="765" rx="44" ry="20" fill="#5B21B6" opacity="0.3"/>
+
+    <!-- ===== MAIN BODY ===== -->
+    <!-- Body shadow -->
+    <use href="#bodyShape" filter="url(#fShadow)"/>
+
+    <!-- Body shape: rounded bean/capsule with slight taper at top -->
+    <path id="bodyShape" d="
+      M512 280
+      C620 280 720 350 730 480
+      C738 580 710 680 680 730
+      C650 770 580 790 512 790
+      C444 790 374 770 344 730
+      C314 680 286 580 294 480
+      C304 350 404 280 512 280Z
+    " fill="url(#gBody)"/>
+
+    <!-- Body highlight/shine -->
+    <path d="
+      M512 280
+      C620 280 720 350 730 480
+      C738 580 710 680 680 730
+      C650 770 580 790 512 790
+      C444 790 374 770 344 730
+      C314 680 286 580 294 480
+      C304 350 404 280 512 280Z
+    " fill="url(#gBodyShine)"/>
+
+    <!-- Subtle body edge glow -->
+    <path d="
+      M512 280
+      C620 280 720 350 730 480
+      C738 580 710 680 680 730
+      C650 770 580 790 512 790
+      C444 790 374 770 344 730
+      C314 680 286 580 294 480
+      C304 350 404 280 512 280Z
+    " fill="none" stroke="#A78BFA" stroke-width="2" opacity="0.2"/>
+
+    <!-- Belly panel -->
+    <ellipse cx="512" cy="580" rx="140" ry="160" fill="url(#gBelly)"/>
+
+    <!-- ===== ARMS ===== -->
+    <!-- Left arm (shy tucked-in pose with subtle sway) -->
+    <g>
+      <animateTransform attributeName="transform" type="rotate"
+        values="0 340 520; -5 340 520; 0 340 520" dur="3.2s" repeatCount="indefinite"
+        calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      <!-- Arm -->
+      <path d="M340 490 C310 515 285 550 280 575 C277 590 284 598 298 594"
+            stroke="url(#gArm)" stroke-width="36" stroke-linecap="round" fill="none"/>
+      <!-- Hand (little rounded mitt) -->
+      <circle cx="290" cy="590" r="24" fill="#6D28D9"/>
+      <circle cx="290" cy="585" r="18" fill="#7C3AED" opacity="0.5"/>
+    </g>
+
+    <!-- Right arm (cool casual hang) -->
+    <g>
+      <animateTransform attributeName="transform" type="rotate"
+        values="0 684 520; 4 684 520; 0 684 520" dur="3.6s" repeatCount="indefinite"
+        calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      <path d="M684 490 C714 515 739 550 744 575 C747 590 740 598 726 594"
+            stroke="url(#gArm)" stroke-width="36" stroke-linecap="round" fill="none"/>
+      <circle cx="734" cy="590" r="24" fill="#6D28D9"/>
+      <circle cx="734" cy="585" r="18" fill="#7C3AED" opacity="0.5"/>
+    </g>
+
+    <!-- ===== FACE ===== -->
+
+    <!-- Cheek glows (blush — cute!) -->
+    <ellipse cx="370" cy="530" rx="50" ry="40" fill="url(#gChkL)">
+      <animate attributeName="opacity" values="0.7;1;0.7" dur="3s" repeatCount="indefinite"/>
+    </ellipse>
+    <ellipse cx="654" cy="530" rx="50" ry="40" fill="url(#gChkR)">
+      <animate attributeName="opacity" values="0.7;1;0.7" dur="3s" repeatCount="indefinite" begin="0.5s"/>
+    </ellipse>
+
+    <!-- ===== EYES (fixed blink-in-place using clipPath + ry animation) ===== -->
+
+    <!-- LEFT EYE -->
+    <g clip-path="url(#clipEyeL)">
+      <!-- Eye white (animated ry for visible blink shape) -->
+      <ellipse cx="430" cy="460" rx="62" ry="68" fill="url(#gEyeW)">
+        <animate attributeName="ry"
+          values="68; 68; 2; 68; 68; 3; 68"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+      <ellipse cx="430" cy="460" rx="58" ry="64" fill="#FFFFFF" opacity="0.5">
+        <animate attributeName="ry"
+          values="64; 64; 1; 64; 64; 2; 64"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+
+      <!-- Iris (with subtle shy sideways glance) -->
+      <g>
+        <animateTransform attributeName="transform" type="translate"
+          values="0 0; 5 3; 8 2; 5 3; -2 1; 0 0" dur="8s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1"/>
+        <circle cx="435" cy="468" r="30" fill="url(#gIrisC)"/>
+        <!-- Pupil -->
+        <circle cx="435" cy="468" r="16" fill="#0C1425"/>
+        <!-- Pupil highlights -->
+        <circle cx="425" cy="454" r="10" fill="#FFFFFF" opacity="0.9"/>
+        <circle cx="445" cy="475" r="5" fill="#FFFFFF" opacity="0.5"/>
+      </g>
+    </g>
+    <!-- Left eyelid line (appears during blink) -->
+    <line x1="372" y1="460" x2="488" y2="460" stroke="#5B21B6" stroke-width="3" stroke-linecap="round" opacity="0">
+      <animate attributeName="opacity"
+        values="0; 0; 0.6; 0; 0; 0.6; 0"
+        keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+        dur="5.5s" repeatCount="indefinite"/>
+    </line>
+
+    <!-- RIGHT EYE -->
+    <g clip-path="url(#clipEyeR)">
+      <ellipse cx="594" cy="460" rx="62" ry="68" fill="url(#gEyeW)">
+        <animate attributeName="ry"
+          values="68; 68; 2; 68; 68; 3; 68"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+      <ellipse cx="594" cy="460" rx="58" ry="64" fill="#FFFFFF" opacity="0.5">
+        <animate attributeName="ry"
+          values="64; 64; 1; 64; 64; 2; 64"
+          keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+          dur="5.5s" repeatCount="indefinite"/>
+      </ellipse>
+
+      <g>
+        <animateTransform attributeName="transform" type="translate"
+          values="0 0; 5 3; 8 2; 5 3; -2 1; 0 0" dur="8s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1; 0.4 0 0.6 1"/>
+        <circle cx="589" cy="468" r="30" fill="url(#gIrisC)"/>
+        <circle cx="589" cy="468" r="16" fill="#0C1425"/>
+        <circle cx="579" cy="454" r="10" fill="#FFFFFF" opacity="0.9"/>
+        <circle cx="599" cy="475" r="5" fill="#FFFFFF" opacity="0.5"/>
+      </g>
+    </g>
+    <!-- Right eyelid line -->
+    <line x1="536" y1="460" x2="652" y2="460" stroke="#5B21B6" stroke-width="3" stroke-linecap="round" opacity="0">
+      <animate attributeName="opacity"
+        values="0; 0; 0.6; 0; 0; 0.6; 0"
+        keyTimes="0; 0.82; 0.85; 0.88; 0.94; 0.97; 1"
+        dur="5.5s" repeatCount="indefinite"/>
+    </line>
+
+    <!-- ===== SMILE (asymmetric smirk — cute but cool) ===== -->
+    <!-- Main smirk: right side lifts higher -->
+    <path d="M458 558 C478 586 536 590 568 554"
+          stroke="#C4B5FD" stroke-width="8" stroke-linecap="round" fill="none" opacity="0.85"/>
+    <!-- Smirk highlight -->
+    <path d="M464 562 C482 582 534 586 562 558"
+          stroke="#E9DDFF" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.35"/>
+    <!-- Tiny cool dimple on the smirk side -->
+    <circle cx="572" cy="550" r="4" fill="#A78BFA" opacity="0.25"/>
+
+    <!-- ===== CHEST CORE (neural heart) ===== -->
+    <g filter="url(#fGlowBig)">
+      <circle cx="512" cy="640" r="18" fill="url(#gCore)">
+        <animate attributeName="r" values="16;20;16" dur="2.5s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+      </circle>
+      <circle cx="512" cy="640" r="10" fill="#C084FC" opacity="0.8">
+        <animate attributeName="r" values="8;12;8" dur="2.5s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="opacity" values="0.6;1;0.6" dur="2.5s" repeatCount="indefinite"/>
+      </circle>
+      <circle cx="512" cy="640" r="4" fill="#FFFFFF" opacity="0.7">
+        <animate attributeName="opacity" values="0.5;0.9;0.5" dur="2.5s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Core ring -->
+      <circle cx="512" cy="640" r="28" fill="none" stroke="#A855F7" stroke-width="1.5" opacity="0.3">
+        <animate attributeName="r" values="26;32;26" dur="2.5s" repeatCount="indefinite"
+          calcMode="spline" keySplines="0.45 0 0.55 1; 0.45 0 0.55 1"/>
+        <animate attributeName="opacity" values="0.3;0.15;0.3" dur="2.5s" repeatCount="indefinite"/>
+      </circle>
+    </g>
+
+    <!-- ===== TINY NEURAL SPARKLES around body ===== -->
+    <g opacity="0.6">
+      <circle cx="320" cy="400" r="3" fill="#00D4FF">
+        <animate attributeName="opacity" values="0;0.8;0" dur="3s" repeatCount="indefinite"/>
+        <animate attributeName="r" values="2;4;2" dur="3s" repeatCount="indefinite"/>
+      </circle>
+      <circle cx="710" cy="380" r="2.5" fill="#F59E0B">
+        <animate attributeName="opacity" values="0;0.7;0" dur="3.5s" repeatCount="indefinite" begin="1s"/>
+        <animate attributeName="r" values="1.5;3.5;1.5" dur="3.5s" repeatCount="indefinite" begin="1s"/>
+      </circle>
+      <circle cx="280" cy="550" r="2" fill="#A855F7">
+        <animate attributeName="opacity" values="0;0.6;0" dur="4s" repeatCount="indefinite" begin="0.5s"/>
+        <animate attributeName="r" values="1;3;1" dur="4s" repeatCount="indefinite" begin="0.5s"/>
+      </circle>
+      <circle cx="740" cy="530" r="2.5" fill="#00D4FF">
+        <animate attributeName="opacity" values="0;0.7;0" dur="3.8s" repeatCount="indefinite" begin="1.5s"/>
+        <animate attributeName="r" values="1.5;3.5;1.5" dur="3.8s" repeatCount="indefinite" begin="1.5s"/>
+      </circle>
+      <circle cx="380" cy="240" r="2" fill="#F59E0B">
+        <animate attributeName="opacity" values="0;0.5;0" dur="4.5s" repeatCount="indefinite" begin="2s"/>
+      </circle>
+      <circle cx="650" cy="230" r="2" fill="#A855F7">
+        <animate attributeName="opacity" values="0;0.5;0" dur="4.2s" repeatCount="indefinite" begin="0.8s"/>
+      </circle>
+    </g>
+
+  </g>
+</svg>

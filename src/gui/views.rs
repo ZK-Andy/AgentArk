@@ -2,8 +2,8 @@
 
 use eframe::egui;
 
-use crate::core::{Agent, LlmProvider};
 use crate::actions::SearchConfig;
+use crate::core::{Agent, LlmProvider};
 
 /// Setup wizard for first-time configuration
 pub struct SetupWizard {
@@ -30,8 +30,7 @@ pub struct SetupWizard {
 
     // Status
     error: Option<String>,
-    #[allow(dead_code)]
-    testing_connection: bool,
+    _testing_connection: bool,
     connection_result: Option<Result<String, String>>,
 }
 
@@ -58,25 +57,53 @@ impl SetupWizard {
         // Try to load existing config values
         let (llm_provider, api_key, ollama_url, ollama_model, openai_base_url) =
             match &agent.config.llm {
-                LlmProvider::Anthropic { api_key, .. } => {
-                    (LlmProviderChoice::Anthropic, api_key.clone(), String::new(), String::new(), String::new())
-                }
-                LlmProvider::OpenAI { api_key, model, base_url } => {
+                LlmProvider::Anthropic { api_key, .. } => (
+                    LlmProviderChoice::Anthropic,
+                    api_key.clone(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                LlmProvider::OpenAI {
+                    api_key,
+                    model,
+                    base_url,
+                } => {
                     if base_url.is_some() {
-                        (LlmProviderChoice::OpenAICompatible, api_key.clone(), String::new(), model.clone(), base_url.clone().unwrap_or_default())
+                        (
+                            LlmProviderChoice::OpenAICompatible,
+                            api_key.clone(),
+                            String::new(),
+                            model.clone(),
+                            base_url.clone().unwrap_or_default(),
+                        )
                     } else {
-                        (LlmProviderChoice::OpenAI, api_key.clone(), String::new(), model.clone(), String::new())
+                        (
+                            LlmProviderChoice::OpenAI,
+                            api_key.clone(),
+                            String::new(),
+                            model.clone(),
+                            String::new(),
+                        )
                     }
                 }
-                LlmProvider::Ollama { base_url, model } => {
-                    (LlmProviderChoice::Ollama, String::new(), base_url.clone(), model.clone(), String::new())
-                }
+                LlmProvider::Ollama { base_url, model } => (
+                    LlmProviderChoice::Ollama,
+                    String::new(),
+                    base_url.clone(),
+                    model.clone(),
+                    String::new(),
+                ),
             };
 
         let (telegram_token, telegram_users) = match &agent.config.telegram {
             Some(t) => (
                 t.bot_token.clone(),
-                t.allowed_users.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+                t.allowed_users
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ),
             None => (String::new(), String::new()),
         };
@@ -84,11 +111,19 @@ impl SetupWizard {
         Self {
             agent,
             step: SetupStep::Welcome,
-            agent_name: "My Agent".to_string(),
+            agent_name: "AgentArk".to_string(),
             llm_provider,
             api_key,
-            ollama_url: if ollama_url.is_empty() { "http://localhost:11434".to_string() } else { ollama_url },
-            ollama_model: if ollama_model.is_empty() { "llama3.2".to_string() } else { ollama_model },
+            ollama_url: if ollama_url.is_empty() {
+                "http://localhost:11434".to_string()
+            } else {
+                ollama_url
+            },
+            ollama_model: if ollama_model.is_empty() {
+                "llama3.2".to_string()
+            } else {
+                ollama_model
+            },
             openai_base_url,
             telegram_token,
             telegram_users,
@@ -99,7 +134,7 @@ impl SetupWizard {
             enable_brave: false,
             brave_key: String::new(),
             error: None,
-            testing_connection: false,
+            _testing_connection: false,
             connection_result: None,
         }
     }
@@ -109,7 +144,7 @@ impl SetupWizard {
             ui.add_space(30.0);
 
             // Logo/Title
-            ui.heading(egui::RichText::new("Crate Agent").size(32.0));
+            ui.heading(egui::RichText::new("AgentArk").size(32.0));
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Secure, Self-Improving AI Assistant").italics());
 
@@ -162,9 +197,13 @@ impl SetupWizard {
 
             ui.add_space(30.0);
 
-            if ui.add(egui::Button::new(
-                egui::RichText::new("  Get Started  ").size(16.0)
-            ).min_size(egui::vec2(150.0, 40.0))).clicked() {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("  Get Started  ").size(16.0))
+                        .min_size(egui::vec2(150.0, 40.0)),
+                )
+                .clicked()
+            {
                 self.step = SetupStep::LlmConfig;
             }
 
@@ -182,51 +221,70 @@ impl SetupWizard {
         ui.add_space(15.0);
 
         // Provider selection with descriptions
-        egui::Grid::new("llm_grid").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
-            // Ollama (Local)
-            let ollama_selected = self.llm_provider == LlmProviderChoice::Ollama;
-            if ui.add(egui::SelectableLabel::new(ollama_selected,
-                egui::RichText::new("Ollama (Local)").strong()
-            )).clicked() {
-                self.llm_provider = LlmProviderChoice::Ollama;
-                self.connection_result = None;
-            }
-            ui.label("Free, private, runs on your machine");
-            ui.end_row();
+        egui::Grid::new("llm_grid")
+            .num_columns(2)
+            .spacing([20.0, 10.0])
+            .show(ui, |ui| {
+                // Ollama (Local)
+                let ollama_selected = self.llm_provider == LlmProviderChoice::Ollama;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        ollama_selected,
+                        egui::RichText::new("Ollama (Local)").strong(),
+                    ))
+                    .clicked()
+                {
+                    self.llm_provider = LlmProviderChoice::Ollama;
+                    self.connection_result = None;
+                }
+                ui.label("Free, private, runs on your machine");
+                ui.end_row();
 
-            // Anthropic
-            let anthropic_selected = self.llm_provider == LlmProviderChoice::Anthropic;
-            if ui.add(egui::SelectableLabel::new(anthropic_selected,
-                egui::RichText::new("Anthropic Claude").strong()
-            )).clicked() {
-                self.llm_provider = LlmProviderChoice::Anthropic;
-                self.connection_result = None;
-            }
-            ui.label("Most capable, requires API key");
-            ui.end_row();
+                // Anthropic
+                let anthropic_selected = self.llm_provider == LlmProviderChoice::Anthropic;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        anthropic_selected,
+                        egui::RichText::new("Anthropic Claude").strong(),
+                    ))
+                    .clicked()
+                {
+                    self.llm_provider = LlmProviderChoice::Anthropic;
+                    self.connection_result = None;
+                }
+                ui.label("Most capable, requires API key");
+                ui.end_row();
 
-            // OpenAI
-            let openai_selected = self.llm_provider == LlmProviderChoice::OpenAI;
-            if ui.add(egui::SelectableLabel::new(openai_selected,
-                egui::RichText::new("OpenAI GPT").strong()
-            )).clicked() {
-                self.llm_provider = LlmProviderChoice::OpenAI;
-                self.connection_result = None;
-            }
-            ui.label("Popular, requires API key");
-            ui.end_row();
+                // OpenAI
+                let openai_selected = self.llm_provider == LlmProviderChoice::OpenAI;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        openai_selected,
+                        egui::RichText::new("OpenAI GPT").strong(),
+                    ))
+                    .clicked()
+                {
+                    self.llm_provider = LlmProviderChoice::OpenAI;
+                    self.connection_result = None;
+                }
+                ui.label("Popular, requires API key");
+                ui.end_row();
 
-            // OpenAI-Compatible
-            let compat_selected = self.llm_provider == LlmProviderChoice::OpenAICompatible;
-            if ui.add(egui::SelectableLabel::new(compat_selected,
-                egui::RichText::new("OpenAI-Compatible").strong()
-            )).clicked() {
-                self.llm_provider = LlmProviderChoice::OpenAICompatible;
-                self.connection_result = None;
-            }
-            ui.label("LMStudio, vLLM, etc.");
-            ui.end_row();
-        });
+                // OpenAI-Compatible
+                let compat_selected = self.llm_provider == LlmProviderChoice::OpenAICompatible;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        compat_selected,
+                        egui::RichText::new("OpenAI-Compatible").strong(),
+                    ))
+                    .clicked()
+                {
+                    self.llm_provider = LlmProviderChoice::OpenAICompatible;
+                    self.connection_result = None;
+                }
+                ui.label("LMStudio, vLLM, etc.");
+                ui.end_row();
+            });
 
         ui.add_space(20.0);
         ui.separator();
@@ -237,10 +295,12 @@ impl SetupWizard {
             LlmProviderChoice::Anthropic => {
                 ui.horizontal(|ui| {
                     ui.label("API Key: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.api_key)
-                        .password(true)
-                        .hint_text("sk-ant-...")
-                        .desired_width(300.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.api_key)
+                            .password(true)
+                            .hint_text("sk-ant-...")
+                            .desired_width(300.0),
+                    );
                 });
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
@@ -251,10 +311,12 @@ impl SetupWizard {
             LlmProviderChoice::OpenAI => {
                 ui.horizontal(|ui| {
                     ui.label("API Key: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.api_key)
-                        .password(true)
-                        .hint_text("sk-...")
-                        .desired_width(300.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.api_key)
+                            .password(true)
+                            .hint_text("sk-...")
+                            .desired_width(300.0),
+                    );
                 });
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
@@ -265,36 +327,46 @@ impl SetupWizard {
             LlmProviderChoice::OpenAICompatible => {
                 ui.horizontal(|ui| {
                     ui.label("Base URL: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.openai_base_url)
-                        .hint_text("http://localhost:1234/v1")
-                        .desired_width(300.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.openai_base_url)
+                            .hint_text("http://localhost:1234/v1")
+                            .desired_width(300.0),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Model: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.ollama_model)
-                        .hint_text("local-model")
-                        .desired_width(200.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ollama_model)
+                            .hint_text("local-model")
+                            .desired_width(200.0),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("API Key (if required): ");
-                    ui.add(egui::TextEdit::singleline(&mut self.api_key)
-                        .password(true)
-                        .hint_text("optional")
-                        .desired_width(200.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.api_key)
+                            .password(true)
+                            .hint_text("optional")
+                            .desired_width(200.0),
+                    );
                 });
             }
             LlmProviderChoice::Ollama => {
                 ui.horizontal(|ui| {
                     ui.label("Ollama URL: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.ollama_url)
-                        .hint_text("http://localhost:11434")
-                        .desired_width(250.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ollama_url)
+                            .hint_text("http://localhost:11434")
+                            .desired_width(250.0),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Model: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.ollama_model)
-                        .hint_text("llama3.2")
-                        .desired_width(150.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ollama_model)
+                            .hint_text("llama3.2")
+                            .desired_width(150.0),
+                    );
                 });
                 ui.add_space(5.0);
                 ui.small("Make sure Ollama is running: ollama serve");
@@ -447,18 +519,22 @@ impl SetupWizard {
 
                 ui.horizontal(|ui| {
                     ui.label("Bot Token: ");
-                    ui.add(egui::TextEdit::singleline(&mut self.telegram_token)
-                        .password(true)
-                        .hint_text("123456789:ABC...")
-                        .desired_width(300.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.telegram_token)
+                            .password(true)
+                            .hint_text("123456789:ABC...")
+                            .desired_width(300.0),
+                    );
                 });
 
                 ui.add_space(10.0);
 
                 ui.label("Allowed User IDs (optional, comma-separated):");
-                ui.add(egui::TextEdit::singleline(&mut self.telegram_users)
-                    .hint_text("123456789, 987654321")
-                    .desired_width(300.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.telegram_users)
+                        .hint_text("123456789, 987654321")
+                        .desired_width(300.0),
+                );
                 ui.small("Leave empty to use pairing mode (first user to message gets paired)");
                 ui.small("Get your ID from @userinfobot on Telegram");
             });
@@ -512,7 +588,10 @@ impl SetupWizard {
                             ui.label(format!("OpenAI-Compatible at {}", self.openai_base_url));
                         }
                         LlmProviderChoice::Ollama => {
-                            ui.label(format!("Ollama ({}) at {}", self.ollama_model, self.ollama_url));
+                            ui.label(format!(
+                                "Ollama ({}) at {}",
+                                self.ollama_model, self.ollama_url
+                            ));
                         }
                     };
                 });
@@ -530,9 +609,15 @@ impl SetupWizard {
                     ui.label(egui::RichText::new("[+]").strong());
                     ui.label("Search Backends: ");
                     let mut backends = vec!["DuckDuckGo"];
-                    if self.enable_searxng { backends.push("SearXNG"); }
-                    if self.enable_serper { backends.push("Serper"); }
-                    if self.enable_brave { backends.push("Brave"); }
+                    if self.enable_searxng {
+                        backends.push("SearXNG");
+                    }
+                    if self.enable_serper {
+                        backends.push("Serper");
+                    }
+                    if self.enable_brave {
+                        backends.push("Brave");
+                    }
                     ui.label(backends.join(", "));
                 });
             });
@@ -568,7 +653,11 @@ impl SetupWizard {
                     ui.label(egui::RichText::new("[+]").strong());
                     ui.label("Identity (DID): ");
                 });
-                ui.label(egui::RichText::new(self.agent.identity.did()).monospace().size(10.0));
+                ui.label(
+                    egui::RichText::new(self.agent.identity.did())
+                        .monospace()
+                        .size(10.0),
+                );
             });
 
         if let Some(err) = &self.error {
@@ -585,9 +674,13 @@ impl SetupWizard {
                 self.error = None;
             }
             ui.add_space(20.0);
-            if ui.add(egui::Button::new(
-                egui::RichText::new("  Save Configuration  ").strong()
-            ).min_size(egui::vec2(150.0, 35.0))).clicked() {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("  Save Configuration  ").strong())
+                        .min_size(egui::vec2(150.0, 35.0)),
+                )
+                .clicked()
+            {
                 if let Err(e) = self.save_config() {
                     self.error = Some(e.to_string());
                 } else {
@@ -601,13 +694,17 @@ impl SetupWizard {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
 
-            ui.label(egui::RichText::new("[OK]").size(48.0).color(egui::Color32::GREEN));
+            ui.label(
+                egui::RichText::new("[OK]")
+                    .size(48.0)
+                    .color(egui::Color32::GREEN),
+            );
             ui.add_space(10.0);
             ui.heading("Setup Complete!");
 
             ui.add_space(20.0);
 
-            ui.label("Your Crate Agent is ready to use.");
+            ui.label("Your AgentArk is ready to use.");
 
             ui.add_space(30.0);
 
@@ -621,28 +718,32 @@ impl SetupWizard {
 
                     ui.horizontal(|ui| {
                         ui.label("GUI Mode:");
-                        ui.label(egui::RichText::new("cogniark").monospace());
+                        ui.label(egui::RichText::new("agentark").monospace());
                     });
 
                     ui.horizontal(|ui| {
                         ui.label("Headless:");
-                        ui.label(egui::RichText::new("cogniark --headless").monospace());
+                        ui.label(egui::RichText::new("agentark --headless").monospace());
                     });
 
                     ui.horizontal(|ui| {
                         ui.label("Re-run Setup:");
-                        ui.label(egui::RichText::new("cogniark --setup").monospace());
+                        ui.label(egui::RichText::new("agentark --setup").monospace());
                     });
 
                     ui.add_space(10.0);
-                    ui.label("HTTP API will be available at http://127.0.0.1:17990");
+                    ui.label("HTTP API will be available at http://127.0.0.1:8990");
                 });
 
             ui.add_space(30.0);
 
-            if ui.add(egui::Button::new(
-                egui::RichText::new("  Launch Agent  ").size(16.0)
-            ).min_size(egui::vec2(150.0, 40.0))).clicked() {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("  Launch Agent  ").size(16.0))
+                        .min_size(egui::vec2(150.0, 40.0)),
+                )
+                .clicked()
+            {
                 // Return to indicate launch main app
                 std::process::exit(0);
             }
@@ -662,7 +763,11 @@ impl SetupWizard {
                 base_url: None,
             },
             LlmProviderChoice::OpenAICompatible => LlmProvider::OpenAI {
-                api_key: if self.api_key.is_empty() { "not-needed".to_string() } else { self.api_key.clone() },
+                api_key: if self.api_key.is_empty() {
+                    "not-needed".to_string()
+                } else {
+                    self.api_key.clone()
+                },
                 model: self.ollama_model.clone(),
                 base_url: Some(self.openai_base_url.clone()),
             },
@@ -696,25 +801,35 @@ impl SetupWizard {
         config.telegram = telegram;
 
         // Save main config
-        config.save(&self.agent.config_dir)?;
+        config.save(&self.agent.config_dir, Some(&self.agent.data_dir))?;
 
         // Save search config
         let search_config = SearchConfig {
             searxng: if self.enable_searxng {
-                Some(crate::actions::SearchBackend::SearXNG { base_url: self.searxng_url.clone() })
+                Some(crate::actions::SearchBackend::SearXNG {
+                    base_url: self.searxng_url.clone(),
+                })
             } else {
                 None
             },
             serper: if self.enable_serper {
-                Some(crate::actions::SearchBackend::Serper { api_key: self.serper_key.clone() })
+                Some(crate::actions::SearchBackend::Serper {
+                    api_key: self.serper_key.clone(),
+                })
             } else {
                 None
             },
             brave: if self.enable_brave {
-                Some(crate::actions::SearchBackend::Brave { api_key: self.brave_key.clone() })
+                Some(crate::actions::SearchBackend::Brave {
+                    api_key: self.brave_key.clone(),
+                })
             } else {
                 None
             },
+            playwright: None, // Auto-detected at runtime via bridge health check
+            primary: None,
+            fallback1: None,
+            fallback2: None,
         };
 
         let search_config_path = self.agent.config_dir.join("search.toml");
@@ -742,15 +857,13 @@ impl eframe::App for SetupWizard {
             ui.add_space(5.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.step {
-                SetupStep::Welcome => self.render_welcome(ui),
-                SetupStep::LlmConfig => self.render_llm_config(ui),
-                SetupStep::SearchConfig => self.render_search_config(ui),
-                SetupStep::TelegramConfig => self.render_telegram_config(ui),
-                SetupStep::Review => self.render_review(ui),
-                SetupStep::Complete => self.render_complete(ui),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.step {
+            SetupStep::Welcome => self.render_welcome(ui),
+            SetupStep::LlmConfig => self.render_llm_config(ui),
+            SetupStep::SearchConfig => self.render_search_config(ui),
+            SetupStep::TelegramConfig => self.render_telegram_config(ui),
+            SetupStep::Review => self.render_review(ui),
+            SetupStep::Complete => self.render_complete(ui),
         });
     }
 }

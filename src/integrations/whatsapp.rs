@@ -3,37 +3,13 @@
 //! Provides WhatsApp messaging via Meta Business API.
 //! Supports sending messages, receiving webhooks, and managing templates.
 
-use super::{Capability, Integration, IntegrationStatus};
 use super::oauth::{OAuthClient, OAuthConfig, OAuthTokens, TokenStorage};
-use anyhow::{Result, anyhow};
+use super::{Capability, Integration, IntegrationStatus};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-/// WhatsApp message types
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WhatsAppMessage {
-    Text { body: String },
-    Template {
-        name: String,
-        language: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        components: Option<Vec<TemplateComponent>>,
-    },
-    Image {
-        link: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        caption: Option<String>,
-    },
-    Document {
-        link: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        filename: Option<String>,
-    },
-}
 
 /// Template component for dynamic content
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,25 +26,6 @@ pub enum TemplateParameter {
     Text { text: String },
     Image { link: String },
     Document { link: String },
-}
-
-/// Incoming WhatsApp message
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncomingMessage {
-    pub from: String,
-    pub timestamp: String,
-    pub message_type: String,
-    pub text: Option<String>,
-    pub media_id: Option<String>,
-}
-
-/// WhatsApp contact
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WhatsAppContact {
-    pub phone: String,
-    pub name: Option<String>,
 }
 
 /// WhatsApp Business connector
@@ -100,49 +57,20 @@ impl WhatsAppConnector {
         }
     }
 
-    /// Initialize with Meta App credentials and token storage
-    #[allow(dead_code)]
-    pub async fn init(
-        &mut self,
-        app_id: String,
-        app_secret: String,
-        redirect_uri: String,
-        token_storage: TokenStorage,
-    ) -> Result<()> {
-        // Meta/Facebook OAuth configuration
-        self.oauth_config = Some(OAuthConfig::meta_whatsapp(app_id, app_secret, redirect_uri));
-
-        // Try to load existing tokens
-        if let Ok(Some(tokens)) = token_storage.load(Self::SERVICE_ID) {
-            *self.tokens.write().await = Some(tokens);
-            // Load WABA and phone number ID from stored config
-            self.load_business_config(&token_storage)?;
-        }
-
-        self.token_storage = Some(token_storage);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn load_business_config(&mut self, storage: &TokenStorage) -> Result<()> {
-        // Business config stored separately from tokens
-        if let Ok(Some(_tokens)) = storage.load(&format!("{}_config", Self::SERVICE_ID)) {
-            // Parse stored config (we use a simple format)
-            // In production, use a proper config struct
-        }
-        Ok(())
-    }
-
     /// Get the OAuth authorization URL
     pub fn get_auth_url(&self, state: &str) -> Result<String> {
-        let config = self.oauth_config.as_ref()
+        let config = self
+            .oauth_config
+            .as_ref()
             .ok_or_else(|| anyhow!("OAuth not configured"))?;
         Ok(config.auth_url(state))
     }
 
     /// Handle OAuth callback with authorization code
     pub async fn handle_auth_callback(&self, code: &str) -> Result<()> {
-        let config = self.oauth_config.as_ref()
+        let config = self
+            .oauth_config
+            .as_ref()
             .ok_or_else(|| anyhow!("OAuth not configured"))?;
 
         let tokens = self.oauth_client.exchange_code(config, code).await?;
@@ -166,11 +94,7 @@ impl WhatsAppConnector {
 
         // Get user's WhatsApp Business Accounts
         let url = format!("{}/me/businesses", Self::API_BASE);
-        let response = self.http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await?;
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
 
         if !response.status().is_success() {
             tracing::warn!("Failed to fetch WhatsApp business info");
@@ -193,16 +117,22 @@ impl WhatsAppConnector {
     /// Get a valid access token
     async fn get_access_token(&self) -> Result<String> {
         let mut tokens_guard = self.tokens.write().await;
-        let tokens = tokens_guard.as_mut()
+        let tokens = tokens_guard
+            .as_mut()
             .ok_or_else(|| anyhow!("Not authenticated with WhatsApp"))?;
 
         // Check if token needs refresh
         if tokens.is_expired() {
             if let Some(refresh_token) = tokens.refresh_token() {
-                let config = self.oauth_config.as_ref()
+                let config = self
+                    .oauth_config
+                    .as_ref()
                     .ok_or_else(|| anyhow!("OAuth not configured"))?;
 
-                let new_tokens = self.oauth_client.refresh_token(config, refresh_token).await?;
+                let new_tokens = self
+                    .oauth_client
+                    .refresh_token(config, refresh_token)
+                    .await?;
 
                 if let Some(ref storage) = self.token_storage {
                     storage.save(Self::SERVICE_ID, &new_tokens)?;
@@ -219,7 +149,9 @@ impl WhatsAppConnector {
 
     /// Send a text message
     pub async fn send_text(&self, to: &str, message: &str) -> Result<String> {
-        let phone_id = self.phone_number_id.as_ref()
+        let phone_id = self
+            .phone_number_id
+            .as_ref()
             .ok_or_else(|| anyhow!("Phone number ID not configured"))?;
 
         let token = self.get_access_token().await?;
@@ -236,7 +168,8 @@ impl WhatsAppConnector {
 
         let url = format!("{}/{}/messages", Self::API_BASE, phone_id);
 
-        let response = self.http
+        let response = self
+            .http
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -259,7 +192,11 @@ impl WhatsAppConnector {
         }
 
         let result: SendResponse = response.json().await?;
-        Ok(result.messages.first().map(|m| m.id.clone()).unwrap_or_default())
+        Ok(result
+            .messages
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_default())
     }
 
     /// Send a template message (for business-initiated conversations)
@@ -270,7 +207,9 @@ impl WhatsAppConnector {
         language: &str,
         components: Option<Vec<TemplateComponent>>,
     ) -> Result<String> {
-        let phone_id = self.phone_number_id.as_ref()
+        let phone_id = self
+            .phone_number_id
+            .as_ref()
             .ok_or_else(|| anyhow!("Phone number ID not configured"))?;
 
         let token = self.get_access_token().await?;
@@ -296,7 +235,8 @@ impl WhatsAppConnector {
 
         let url = format!("{}/{}/messages", Self::API_BASE, phone_id);
 
-        let response = self.http
+        let response = self
+            .http
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
@@ -319,23 +259,25 @@ impl WhatsAppConnector {
         }
 
         let result: SendResponse = response.json().await?;
-        Ok(result.messages.first().map(|m| m.id.clone()).unwrap_or_default())
+        Ok(result
+            .messages
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_default())
     }
 
     /// Get message templates
     pub async fn list_templates(&self) -> Result<Vec<serde_json::Value>> {
-        let waba_id = self.waba_id.as_ref()
+        let waba_id = self
+            .waba_id
+            .as_ref()
             .ok_or_else(|| anyhow!("WABA ID not configured"))?;
 
         let token = self.get_access_token().await?;
 
         let url = format!("{}/{}/message_templates", Self::API_BASE, waba_id);
 
-        let response = self.http
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await?;
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
@@ -371,7 +313,7 @@ impl Integration for WhatsAppConnector {
     }
 
     fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Read, Capability::Write, Capability::Subscribe]
+        vec![Capability::Read, Capability::Write, Capability::Subscribe, Capability::Notify]
     }
 
     async fn status(&self) -> IntegrationStatus {
@@ -394,10 +336,12 @@ impl Integration for WhatsAppConnector {
     async fn execute(&self, action: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
         match action {
             "send_text" => {
-                let to = params.get("to")
+                let to = params
+                    .get("to")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing 'to' parameter"))?;
-                let message = params.get("message")
+                let message = params
+                    .get("message")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing 'message' parameter"))?;
 
@@ -405,13 +349,16 @@ impl Integration for WhatsAppConnector {
                 Ok(serde_json::json!({ "message_id": msg_id }))
             }
             "send_template" => {
-                let to = params.get("to")
+                let to = params
+                    .get("to")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing 'to' parameter"))?;
-                let template = params.get("template")
+                let template = params
+                    .get("template")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing 'template' parameter"))?;
-                let language = params.get("language")
+                let language = params
+                    .get("language")
                     .and_then(|v| v.as_str())
                     .unwrap_or("en_US");
 
@@ -423,14 +370,16 @@ impl Integration for WhatsAppConnector {
                 Ok(serde_json::json!({ "templates": templates }))
             }
             "get_auth_url" => {
-                let state = params.get("state")
+                let state = params
+                    .get("state")
                     .and_then(|v| v.as_str())
                     .unwrap_or("whatsapp");
                 let url = self.get_auth_url(state)?;
                 Ok(serde_json::json!({ "url": url }))
             }
             "auth_callback" => {
-                let code = params.get("code")
+                let code = params
+                    .get("code")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing authorization code"))?;
                 self.handle_auth_callback(code).await?;
@@ -453,15 +402,21 @@ impl Integration for WhatsAppConnector {
                 if let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) {
                     for change in changes {
                         if let Some(value) = change.get("value") {
-                            if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+                            if let Some(messages) = value.get("messages").and_then(|m| m.as_array())
+                            {
                                 for msg in messages {
-                                    let from = msg.get("from").and_then(|f| f.as_str()).unwrap_or("");
-                                    let text = msg.get("text")
+                                    let _from =
+                                        msg.get("from").and_then(|f| f.as_str()).unwrap_or("");
+                                    let text = msg
+                                        .get("text")
                                         .and_then(|t| t.get("body"))
                                         .and_then(|b| b.as_str())
                                         .unwrap_or("");
 
-                                    tracing::info!("WhatsApp message from {}: {}", from, text);
+                                    tracing::info!(
+                                        "WhatsApp message received ({} chars)",
+                                        text.len()
+                                    );
                                     // TODO: Route to agent for processing
                                 }
                             }

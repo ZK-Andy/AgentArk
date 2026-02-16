@@ -10,7 +10,7 @@
 //! - Luma AI (Dream Machine video)
 
 use super::{Capability, Integration, IntegrationStatus};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -60,11 +60,28 @@ impl MediaProvider {
     }
 
     pub fn supports_video(&self) -> bool {
-        matches!(self, Self::Replicate | Self::StabilityAi | Self::Runway | Self::Luma | Self::Fal | Self::OpenAiSora | Self::GoogleVeo)
+        matches!(
+            self,
+            Self::Replicate
+                | Self::StabilityAi
+                | Self::Runway
+                | Self::Luma
+                | Self::Fal
+                | Self::OpenAiSora
+                | Self::GoogleVeo
+        )
     }
 
     pub fn supports_image(&self) -> bool {
-        matches!(self, Self::Replicate | Self::StabilityAi | Self::Fal | Self::Together | Self::OpenAiDalle | Self::GoogleGemini)
+        matches!(
+            self,
+            Self::Replicate
+                | Self::StabilityAi
+                | Self::Fal
+                | Self::Together
+                | Self::OpenAiDalle
+                | Self::GoogleGemini
+        )
     }
 }
 
@@ -88,9 +105,15 @@ pub struct ImageGenRequest {
     pub style: Option<String>,
 }
 
-fn default_width() -> u32 { 1024 }
-fn default_height() -> u32 { 1024 }
-fn default_steps() -> u32 { 30 }
+fn default_width() -> u32 {
+    1024
+}
+fn default_height() -> u32 {
+    1024
+}
+fn default_steps() -> u32 {
+    30
+}
 
 /// Video generation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +129,9 @@ pub struct VideoGenRequest {
     pub model: Option<String>,
 }
 
-fn default_duration() -> u32 { 4 }
+fn default_duration() -> u32 {
+    4
+}
 
 /// Generation result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,9 +160,6 @@ pub struct MediaGenConnector {
 }
 
 impl MediaGenConnector {
-    #[allow(dead_code)]
-    const SERVICE_ID: &'static str = "media_gen";
-
     pub fn new() -> Self {
         Self {
             providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -163,10 +185,13 @@ impl MediaGenConnector {
         };
 
         let mut providers = self.providers.write().await;
-        providers.insert(provider, ProviderConfig {
-            api_key: Zeroizing::new(api_key),
-            base_url: base_url.to_string(),
-        });
+        providers.insert(
+            provider,
+            ProviderConfig {
+                api_key: Zeroizing::new(api_key),
+                base_url: base_url.to_string(),
+            },
+        );
 
         // Set as default if first of its type
         if provider.supports_image() {
@@ -194,13 +219,18 @@ impl MediaGenConnector {
     }
 
     /// Generate an image
-    pub async fn generate_image(&self, request: ImageGenRequest, provider: Option<MediaProvider>) -> Result<MediaGenResult> {
+    pub async fn generate_image(
+        &self,
+        request: ImageGenRequest,
+        provider: Option<MediaProvider>,
+    ) -> Result<MediaGenResult> {
         let provider = provider
             .or(*self.default_image_provider.read().await)
             .ok_or_else(|| anyhow!("No image provider configured"))?;
 
         let providers = self.providers.read().await;
-        let config = providers.get(&provider)
+        let config = providers
+            .get(&provider)
             .ok_or_else(|| anyhow!("Provider {:?} not configured", provider))?;
 
         let start = std::time::Instant::now();
@@ -212,21 +242,30 @@ impl MediaGenConnector {
             MediaProvider::Together => self.generate_image_together(&request, config).await,
             MediaProvider::OpenAiDalle => self.generate_image_dalle(&request, config).await,
             MediaProvider::GoogleGemini => self.generate_image_gemini(&request, config).await,
-            _ => Err(anyhow!("Provider {:?} does not support image generation", provider)),
-        }.map(|mut r| {
+            _ => Err(anyhow!(
+                "Provider {:?} does not support image generation",
+                provider
+            )),
+        }
+        .map(|mut r| {
             r.generation_time_ms = Some(start.elapsed().as_millis() as u64);
             r
         })
     }
 
     /// Generate a video
-    pub async fn generate_video(&self, request: VideoGenRequest, provider: Option<MediaProvider>) -> Result<MediaGenResult> {
+    pub async fn generate_video(
+        &self,
+        request: VideoGenRequest,
+        provider: Option<MediaProvider>,
+    ) -> Result<MediaGenResult> {
         let provider = provider
             .or(*self.default_video_provider.read().await)
             .ok_or_else(|| anyhow!("No video provider configured"))?;
 
         let providers = self.providers.read().await;
-        let config = providers.get(&provider)
+        let config = providers
+            .get(&provider)
             .ok_or_else(|| anyhow!("Provider {:?} not configured", provider))?;
 
         let start = std::time::Instant::now();
@@ -239,8 +278,12 @@ impl MediaGenConnector {
             MediaProvider::Fal => self.generate_video_fal(&request, config).await,
             MediaProvider::OpenAiSora => self.generate_video_sora(&request, config).await,
             MediaProvider::GoogleVeo => self.generate_video_veo(&request, config).await,
-            _ => Err(anyhow!("Provider {:?} does not support video generation", provider)),
-        }.map(|mut r| {
+            _ => Err(anyhow!(
+                "Provider {:?} does not support video generation",
+                provider
+            )),
+        }
+        .map(|mut r| {
             r.generation_time_ms = Some(start.elapsed().as_millis() as u64);
             r
         })
@@ -248,9 +291,16 @@ impl MediaGenConnector {
 
     // === Replicate Implementation ===
 
-    async fn generate_image_replicate(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_image_replicate(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         // Default to Flux Schnell for fast generation
-        let model = request.model.as_deref().unwrap_or("black-forest-labs/flux-schnell");
+        let model = request
+            .model
+            .as_deref()
+            .unwrap_or("black-forest-labs/flux-schnell");
 
         let input = serde_json::json!({
             "prompt": request.prompt,
@@ -265,9 +315,13 @@ impl MediaGenConnector {
             "input": input
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/predictions", config.base_url))
-            .header("Authorization", format!("Token {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Token {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -279,8 +333,8 @@ impl MediaGenConnector {
 
         #[derive(Deserialize)]
         struct PredictionResponse {
-            #[allow(dead_code)]
-            id: String,
+            #[serde(rename = "id")]
+            _id: String,
             urls: PredictionUrls,
         }
 
@@ -304,9 +358,16 @@ impl MediaGenConnector {
         })
     }
 
-    async fn generate_video_replicate(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_replicate(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         // Default to Stable Video Diffusion
-        let model = request.model.as_deref().unwrap_or("stability-ai/stable-video-diffusion");
+        let model = request
+            .model
+            .as_deref()
+            .unwrap_or("stability-ai/stable-video-diffusion");
 
         let mut input = serde_json::json!({
             "prompt": request.prompt,
@@ -321,9 +382,13 @@ impl MediaGenConnector {
             "input": input
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/predictions", config.base_url))
-            .header("Authorization", format!("Token {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Token {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -357,12 +422,17 @@ impl MediaGenConnector {
     }
 
     async fn poll_replicate(&self, url: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..120 { // Max 2 minutes
+        for _ in 0..120 {
+            // Max 2 minutes
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-            let response = self.http
+            let response = self
+                .http
                 .get(url)
-                .header("Authorization", format!("Token {}", config.api_key.as_str()))
+                .header(
+                    "Authorization",
+                    format!("Token {}", config.api_key.as_str()),
+                )
                 .send()
                 .await?;
 
@@ -390,7 +460,10 @@ impl MediaGenConnector {
                     return Err(anyhow!("No output URL in response"));
                 }
                 "failed" => {
-                    return Err(anyhow!("Generation failed: {}", poll.error.unwrap_or_default()));
+                    return Err(anyhow!(
+                        "Generation failed: {}",
+                        poll.error.unwrap_or_default()
+                    ));
                 }
                 "canceled" => {
                     return Err(anyhow!("Generation was canceled"));
@@ -404,8 +477,15 @@ impl MediaGenConnector {
 
     // === Stability AI Implementation ===
 
-    async fn generate_image_stability(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
-        let engine = request.model.as_deref().unwrap_or("stable-diffusion-xl-1024-v1-0");
+    async fn generate_image_stability(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
+        let engine = request
+            .model
+            .as_deref()
+            .unwrap_or("stable-diffusion-xl-1024-v1-0");
 
         let body = serde_json::json!({
             "text_prompts": [{
@@ -419,9 +499,16 @@ impl MediaGenConnector {
             "seed": request.seed.unwrap_or(0),
         });
 
-        let response = self.http
-            .post(format!("{}/generation/{}/text-to-image", config.base_url, engine))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+        let response = self
+            .http
+            .post(format!(
+                "{}/generation/{}/text-to-image",
+                config.base_url, engine
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .header("Accept", "application/json")
             .json(&body)
             .send()
@@ -444,7 +531,9 @@ impl MediaGenConnector {
         }
 
         let result: StabilityResponse = response.json().await?;
-        let artifact = result.artifacts.first()
+        let artifact = result
+            .artifacts
+            .first()
             .ok_or_else(|| anyhow!("No image generated"))?;
 
         // Return as data URL
@@ -460,9 +549,15 @@ impl MediaGenConnector {
         })
     }
 
-    async fn generate_video_stability(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_stability(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         // Stable Video Diffusion - requires an image input
-        let image_url = request.image_url.as_ref()
+        let image_url = request
+            .image_url
+            .as_ref()
             .ok_or_else(|| anyhow!("Stability video requires an input image"))?;
 
         let body = serde_json::json!({
@@ -472,9 +567,13 @@ impl MediaGenConnector {
             "motion_bucket_id": 127,
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/generation/image-to-video", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -505,12 +604,20 @@ impl MediaGenConnector {
     }
 
     async fn poll_stability_video(&self, id: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..180 { // Max 3 minutes
+        for _ in 0..180 {
+            // Max 3 minutes
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-            let response = self.http
-                .get(format!("{}/generation/image-to-video/result/{}", config.base_url, id))
-                .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            let response = self
+                .http
+                .get(format!(
+                    "{}/generation/image-to-video/result/{}",
+                    config.base_url, id
+                ))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", config.api_key.as_str()),
+                )
                 .header("Accept", "application/json")
                 .send()
                 .await?;
@@ -538,7 +645,11 @@ impl MediaGenConnector {
 
     // === FAL.ai Implementation ===
 
-    async fn generate_image_fal(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_image_fal(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         let model = request.model.as_deref().unwrap_or("fal-ai/flux/schnell");
 
         let body = serde_json::json!({
@@ -551,7 +662,8 @@ impl MediaGenConnector {
             "seed": request.seed,
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/{}", config.base_url, model))
             .header("Authorization", format!("Key {}", config.api_key.as_str()))
             .json(&body)
@@ -575,7 +687,9 @@ impl MediaGenConnector {
         }
 
         let result: FalResponse = response.json().await?;
-        let image = result.images.first()
+        let image = result
+            .images
+            .first()
             .ok_or_else(|| anyhow!("No image generated"))?;
 
         Ok(MediaGenResult {
@@ -588,7 +702,11 @@ impl MediaGenConnector {
         })
     }
 
-    async fn generate_video_fal(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_fal(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         let model = request.model.as_deref().unwrap_or("fal-ai/fast-svd-lcm");
 
         let mut body = serde_json::json!({
@@ -599,7 +717,8 @@ impl MediaGenConnector {
             body["image_url"] = serde_json::json!(img);
         }
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/{}", config.base_url, model))
             .header("Authorization", format!("Key {}", config.api_key.as_str()))
             .json(&body)
@@ -635,8 +754,15 @@ impl MediaGenConnector {
 
     // === Together.ai Implementation ===
 
-    async fn generate_image_together(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
-        let model = request.model.as_deref().unwrap_or("stabilityai/stable-diffusion-xl-base-1.0");
+    async fn generate_image_together(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
+        let model = request
+            .model
+            .as_deref()
+            .unwrap_or("stabilityai/stable-diffusion-xl-base-1.0");
 
         let body = serde_json::json!({
             "model": model,
@@ -649,9 +775,13 @@ impl MediaGenConnector {
             "n": 1
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/images/generations", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -673,7 +803,9 @@ impl MediaGenConnector {
         }
 
         let result: TogetherResponse = response.json().await?;
-        let image = result.data.first()
+        let image = result
+            .data
+            .first()
             .ok_or_else(|| anyhow!("No image generated"))?;
 
         let url = if let Some(ref u) = image.url {
@@ -696,7 +828,11 @@ impl MediaGenConnector {
 
     // === OpenAI DALL-E Implementation ===
 
-    async fn generate_image_dalle(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_image_dalle(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         let model = request.model.as_deref().unwrap_or("dall-e-3");
 
         // DALL-E 3 only supports specific sizes
@@ -714,9 +850,13 @@ impl MediaGenConnector {
             "n": 1
         });
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/images/generations", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -734,12 +874,14 @@ impl MediaGenConnector {
         #[derive(Deserialize)]
         struct DalleImage {
             url: Option<String>,
-            #[allow(dead_code)]
-            revised_prompt: Option<String>,
+            #[serde(rename = "revised_prompt")]
+            _revised_prompt: Option<String>,
         }
 
         let result: DalleResponse = response.json().await?;
-        let image = result.data.first()
+        let image = result
+            .data
+            .first()
             .ok_or_else(|| anyhow!("No image generated"))?;
 
         Ok(MediaGenResult {
@@ -754,7 +896,11 @@ impl MediaGenConnector {
 
     // === Runway ML Implementation ===
 
-    async fn generate_video_runway(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_runway(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         let model = request.model.as_deref().unwrap_or("gen3a_turbo");
 
         let mut body = serde_json::json!({
@@ -771,9 +917,13 @@ impl MediaGenConnector {
             body["ratio"] = serde_json::json!(ratio);
         }
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/v1/image_to_video", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .header("X-Runway-Version", "2024-11-06")
             .json(&body)
             .send()
@@ -805,12 +955,17 @@ impl MediaGenConnector {
     }
 
     async fn poll_runway(&self, id: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..300 { // Max 5 minutes
+        for _ in 0..300 {
+            // Max 5 minutes
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-            let response = self.http
+            let response = self
+                .http
                 .get(format!("{}/v1/tasks/{}", config.base_url, id))
-                .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", config.api_key.as_str()),
+                )
                 .header("X-Runway-Version", "2024-11-06")
                 .send()
                 .await?;
@@ -834,7 +989,10 @@ impl MediaGenConnector {
                     return Err(anyhow!("No output URL"));
                 }
                 "FAILED" => {
-                    return Err(anyhow!("Generation failed: {}", task.failure.unwrap_or_default()));
+                    return Err(anyhow!(
+                        "Generation failed: {}",
+                        task.failure.unwrap_or_default()
+                    ));
                 }
                 _ => continue,
             }
@@ -845,7 +1003,11 @@ impl MediaGenConnector {
 
     // === Luma AI Implementation ===
 
-    async fn generate_video_luma(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_luma(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         let mut body = serde_json::json!({
             "prompt": request.prompt,
         });
@@ -863,9 +1025,13 @@ impl MediaGenConnector {
             body["aspect_ratio"] = serde_json::json!(ratio);
         }
 
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/generations", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -896,12 +1062,17 @@ impl MediaGenConnector {
     }
 
     async fn poll_luma(&self, id: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..300 { // Max 5 minutes
+        for _ in 0..300 {
+            // Max 5 minutes
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            let response = self.http
+            let response = self
+                .http
                 .get(format!("{}/generations/{}", config.base_url, id))
-                .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", config.api_key.as_str()),
+                )
                 .send()
                 .await?;
 
@@ -929,7 +1100,10 @@ impl MediaGenConnector {
                     return Err(anyhow!("No video URL in response"));
                 }
                 "failed" => {
-                    return Err(anyhow!("Generation failed: {}", gen.failure_reason.unwrap_or_default()));
+                    return Err(anyhow!(
+                        "Generation failed: {}",
+                        gen.failure_reason.unwrap_or_default()
+                    ));
                 }
                 _ => continue,
             }
@@ -940,7 +1114,11 @@ impl MediaGenConnector {
 
     // === OpenAI Sora Implementation ===
 
-    async fn generate_video_sora(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_sora(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         // Sora API (when available) - using OpenAI's video generation endpoint
         let model = request.model.as_deref().unwrap_or("sora");
 
@@ -956,9 +1134,13 @@ impl MediaGenConnector {
 
         // Note: Sora API is currently in limited access
         // This implementation follows the expected API pattern
-        let response = self.http
+        let response = self
+            .http
             .post(format!("{}/videos/generations", config.base_url))
-            .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.as_str()),
+            )
             .json(&body)
             .send()
             .await?;
@@ -989,12 +1171,17 @@ impl MediaGenConnector {
     }
 
     async fn poll_sora(&self, id: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..600 { // Max 10 minutes (Sora can take a while)
+        for _ in 0..600 {
+            // Max 10 minutes (Sora can take a while)
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            let response = self.http
+            let response = self
+                .http
                 .get(format!("{}/videos/generations/{}", config.base_url, id))
-                .header("Authorization", format!("Bearer {}", config.api_key.as_str()))
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", config.api_key.as_str()),
+                )
                 .send()
                 .await?;
 
@@ -1015,7 +1202,10 @@ impl MediaGenConnector {
                     return Err(anyhow!("No video URL in response"));
                 }
                 "failed" => {
-                    return Err(anyhow!("Sora generation failed: {}", status.error.unwrap_or_default()));
+                    return Err(anyhow!(
+                        "Sora generation failed: {}",
+                        status.error.unwrap_or_default()
+                    ));
                 }
                 _ => continue, // processing, pending
             }
@@ -1026,24 +1216,36 @@ impl MediaGenConnector {
 
     // === Google Gemini (Nano Banana) Implementation ===
 
-    async fn generate_image_gemini(&self, request: &ImageGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
-        // Google Gemini 2.0 Flash with image generation (Nano Banana technology)
-        let model = request.model.as_deref().unwrap_or("gemini-2.0-flash-exp");
+    async fn generate_image_gemini(
+        &self,
+        request: &ImageGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
+        // Google Gemini native image generation (Nano Banana)
+        let model = request
+            .model
+            .as_deref()
+            .unwrap_or("gemini-2.0-flash-preview-image-generation");
 
         let body = serde_json::json!({
             "contents": [{
                 "parts": [{
-                    "text": format!("Generate an image: {}", request.prompt)
+                    "text": request.prompt
                 }]
             }],
             "generationConfig": {
-                "responseModalities": ["image", "text"],
-                "responseMimeType": "image/png"
+                "responseModalities": ["TEXT", "IMAGE"]
             }
         });
 
-        let response = self.http
-            .post(format!("{}/models/{}:generateContent?key={}", config.base_url, model, config.api_key.as_str()))
+        let response = self
+            .http
+            .post(format!(
+                "{}/models/{}:generateContent?key={}",
+                config.base_url,
+                model,
+                config.api_key.as_str()
+            ))
             .json(&body)
             .send()
             .await?;
@@ -1105,7 +1307,11 @@ impl MediaGenConnector {
 
     // === Google Veo Implementation ===
 
-    async fn generate_video_veo(&self, request: &VideoGenRequest, config: &ProviderConfig) -> Result<MediaGenResult> {
+    async fn generate_video_veo(
+        &self,
+        request: &VideoGenRequest,
+        config: &ProviderConfig,
+    ) -> Result<MediaGenResult> {
         // Google Veo video generation
         let model = request.model.as_deref().unwrap_or("veo-001");
 
@@ -1122,8 +1328,14 @@ impl MediaGenConnector {
             body["image"] = serde_json::json!(img);
         }
 
-        let response = self.http
-            .post(format!("{}/models/{}:generateVideo?key={}", config.base_url, model, config.api_key.as_str()))
+        let response = self
+            .http
+            .post(format!(
+                "{}/models/{}:generateVideo?key={}",
+                config.base_url,
+                model,
+                config.api_key.as_str()
+            ))
             .json(&body)
             .send()
             .await?;
@@ -1154,11 +1366,18 @@ impl MediaGenConnector {
     }
 
     async fn poll_veo(&self, operation_name: &str, config: &ProviderConfig) -> Result<String> {
-        for _ in 0..300 { // Max 5 minutes
+        for _ in 0..300 {
+            // Max 5 minutes
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-            let response = self.http
-                .get(format!("{}/{}?key={}", config.base_url, operation_name, config.api_key.as_str()))
+            let response = self
+                .http
+                .get(format!(
+                    "{}/{}?key={}",
+                    config.base_url,
+                    operation_name,
+                    config.api_key.as_str()
+                ))
                 .send()
                 .await?;
 
@@ -1237,7 +1456,7 @@ impl MediaGenConnector {
 #[async_trait]
 impl Integration for MediaGenConnector {
     fn id(&self) -> &str {
-        Self::SERVICE_ID
+        "media_gen"
     }
 
     fn name(&self) -> &str {
@@ -1269,7 +1488,8 @@ impl Integration for MediaGenConnector {
         match action {
             "generate_image" => {
                 let request: ImageGenRequest = serde_json::from_value(params.clone())?;
-                let provider = params.get("provider")
+                let provider = params
+                    .get("provider")
                     .and_then(|v| v.as_str())
                     .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
 
@@ -1278,7 +1498,8 @@ impl Integration for MediaGenConnector {
             }
             "generate_video" => {
                 let request: VideoGenRequest = serde_json::from_value(params.clone())?;
-                let provider = params.get("provider")
+                let provider = params
+                    .get("provider")
                     .and_then(|v| v.as_str())
                     .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok());
 
@@ -1286,10 +1507,10 @@ impl Integration for MediaGenConnector {
                 Ok(serde_json::to_value(result)?)
             }
             "configure_provider" => {
-                let provider: MediaProvider = serde_json::from_value(
-                    params.get("provider").cloned().unwrap_or_default()
-                )?;
-                let api_key = params.get("api_key")
+                let provider: MediaProvider =
+                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
+                let api_key = params
+                    .get("api_key")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("Missing api_key"))?;
 
@@ -1298,28 +1519,29 @@ impl Integration for MediaGenConnector {
             }
             "list_providers" => {
                 let providers = self.list_providers().await;
-                let list: Vec<_> = providers.iter().map(|(p, configured, supports_image)| {
-                    serde_json::json!({
-                        "provider": p,
-                        "name": p.name(),
-                        "configured": configured,
-                        "supports_image": supports_image,
-                        "supports_video": p.supports_video(),
+                let list: Vec<_> = providers
+                    .iter()
+                    .map(|(p, configured, supports_image)| {
+                        serde_json::json!({
+                            "provider": p,
+                            "name": p.name(),
+                            "configured": configured,
+                            "supports_image": supports_image,
+                            "supports_video": p.supports_video(),
+                        })
                     })
-                }).collect();
+                    .collect();
                 Ok(serde_json::json!({"providers": list}))
             }
             "set_default_image_provider" => {
-                let provider: MediaProvider = serde_json::from_value(
-                    params.get("provider").cloned().unwrap_or_default()
-                )?;
+                let provider: MediaProvider =
+                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
                 self.set_default_image_provider(provider).await;
                 Ok(serde_json::json!({"status": "ok"}))
             }
             "set_default_video_provider" => {
-                let provider: MediaProvider = serde_json::from_value(
-                    params.get("provider").cloned().unwrap_or_default()
-                )?;
+                let provider: MediaProvider =
+                    serde_json::from_value(params.get("provider").cloned().unwrap_or_default())?;
                 self.set_default_video_provider(provider).await;
                 Ok(serde_json::json!({"status": "ok"}))
             }

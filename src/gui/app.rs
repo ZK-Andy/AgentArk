@@ -4,7 +4,10 @@ use eframe::egui;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::core::orchestra::SubAgentType;
+use crate::core::swarm::{AgentCapability, SpecialistConfig};
 use crate::core::Agent;
+use crate::core::LlmProvider;
 
 /// Active view in the GUI
 #[derive(Debug, Clone, PartialEq)]
@@ -19,7 +22,7 @@ pub enum ActiveView {
 }
 
 /// Main GUI application state
-pub struct CrateAgentApp {
+pub struct AgentArkApp {
     /// Shared agent instance
     agent: Arc<RwLock<Agent>>,
 
@@ -40,7 +43,55 @@ pub struct CrateAgentApp {
 
     /// Pending response receiver
     pending_response: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+
+    /// Whether the add-agent inline form is open
+    show_add_agent_form: bool,
+    /// Index of agent currently being edited (None = not editing)
+    editing_agent_index: Option<usize>,
+    /// Agent form fields (shared between add and edit)
+    agent_form: AgentFormState,
 }
+
+/// Form state for adding/editing a specialist agent
+#[derive(Debug, Clone)]
+struct AgentFormState {
+    name: String,
+    agent_type_index: usize,
+    llm_provider_index: usize,
+    model: String,
+    base_url: String,
+    api_key: String,
+    capabilities: String,
+    description: String,
+    system_prompt: String,
+}
+
+impl Default for AgentFormState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            agent_type_index: 0,
+            llm_provider_index: 2, // Ollama
+            model: String::new(),
+            base_url: "http://localhost:11434".to_string(),
+            api_key: String::new(),
+            capabilities: String::new(),
+            description: String::new(),
+            system_prompt: String::new(),
+        }
+    }
+}
+
+const AGENT_TYPES: &[&str] = &[
+    "Researcher",
+    "Coder",
+    "Analyst",
+    "Writer",
+    "Validator",
+    "Planner",
+    "Custom",
+];
+const LLM_PROVIDERS: &[&str] = &["Anthropic", "OpenAI", "Ollama"];
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -49,7 +100,7 @@ pub struct ChatMessage {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-impl CrateAgentApp {
+impl AgentArkApp {
     pub fn new(agent: Agent) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
@@ -61,11 +112,14 @@ impl CrateAgentApp {
             chat_history: Vec::new(),
             status: "Ready".to_string(),
             pending_response: None,
+            show_add_agent_form: false,
+            editing_agent_index: None,
+            agent_form: AgentFormState::default(),
         }
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Crate Agent");
+        ui.heading("AgentArk");
         ui.separator();
 
         ui.vertical(|ui| {
@@ -214,8 +268,8 @@ impl CrateAgentApp {
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Runtime::new().unwrap();
                     let result = rt.block_on(async {
-                        let mut agent = agent.write().await;
-                        agent.process_message(&message, "gui").await
+                        let agent = agent.read().await;
+                        agent.process_message(&message, "gui", None, None).await
                     });
                     let _ = tx.send(result.map_err(|e| e.to_string()));
                 });
@@ -392,28 +446,450 @@ impl CrateAgentApp {
             )
         });
 
-        ui.group(|ui| {
-            ui.label("Identity");
-            ui.label(format!("DID: {}", did));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.group(|ui| {
+                ui.label("Identity");
+                ui.label(format!("DID: {}", did));
+            });
+
+            ui.group(|ui| {
+                ui.label("LLM Provider");
+                ui.label("Configure in config.toml");
+            });
+
+            ui.group(|ui| {
+                ui.label("Telegram");
+                if has_telegram {
+                    ui.label("Configured");
+                } else {
+                    ui.label("Not configured");
+                }
+            });
+
+            ui.add_space(10.0);
+            self.render_swarm_settings(ui);
+        });
+    }
+
+    fn render_swarm_settings(&mut self, ui: &mut egui::Ui) {
+        // Read current swarm config
+        let swarm_config = self.runtime.block_on(async {
+            let agent = self.agent.read().await;
+            agent.config.swarm.clone()
         });
 
         ui.group(|ui| {
-            ui.label("LLM Provider");
-            ui.label("Configure in config.toml");
-        });
+            // Header
+            ui.horizontal(|ui| {
+                ui.heading("Custom Specialist Agents");
+                ui.label(" - Multi-agent coordination for complex tasks");
+            });
+            ui.separator();
 
-        ui.group(|ui| {
-            ui.label("Telegram");
-            if has_telegram {
-                ui.label("Configured");
-            } else {
-                ui.label("Not configured");
+            // Status row
+            ui.horizontal(|ui| {
+                ui.label("Swarm Status:");
+                ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "Active");
+
+                ui.separator();
+
+                ui.label(format!("{} Total Agents", swarm_config.specialists.len()));
+                let active = swarm_config
+                    .specialists
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .count();
+                ui.label(format!("{} Active", active));
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // Add Agent button
+            ui.horizontal(|ui| {
+                ui.strong("Specialist Agents");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.show_add_agent_form && self.editing_agent_index.is_none() {
+                        if ui.button("+ Add Specialist Agent").clicked() {
+                            self.agent_form = AgentFormState::default();
+                            self.show_add_agent_form = true;
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(5.0);
+
+            // Inline add form
+            if self.show_add_agent_form {
+                self.render_agent_form(ui, "Add Specialist Agent");
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        if let Some(config) = self.build_specialist_config() {
+                            self.runtime.block_on(async {
+                                let mut agent = self.agent.write().await;
+                                agent.config.swarm.specialists.push(config);
+                            });
+                            self.show_add_agent_form = false;
+                            self.agent_form = AgentFormState::default();
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_add_agent_form = false;
+                        self.agent_form = AgentFormState::default();
+                    }
+                });
+                ui.separator();
+            }
+
+            // List existing agents
+            let specialists = swarm_config.specialists.clone();
+            if specialists.is_empty() && !self.show_add_agent_form {
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.label("No specialist agents configured.");
+                    ui.label("Click \"+ Add Specialist Agent\" to get started.");
+                });
+            }
+
+            let mut remove_index: Option<usize> = None;
+            let mut save_edit_index: Option<usize> = None;
+
+            for (i, spec) in specialists.iter().enumerate() {
+                let is_editing = self.editing_agent_index == Some(i);
+
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(35, 35, 45))
+                    .rounding(6.0)
+                    .inner_margin(10.0)
+                    .outer_margin(egui::Margin::symmetric(0.0, 3.0))
+                    .show(ui, |ui| {
+                        if is_editing {
+                            // Edit mode
+                            self.render_agent_form(ui, &format!("Edit: {}", spec.name));
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    save_edit_index = Some(i);
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.editing_agent_index = None;
+                                    self.agent_form = AgentFormState::default();
+                                }
+                            });
+                        } else {
+                            // Display mode
+                            ui.horizontal(|ui| {
+                                // Enabled indicator
+                                let indicator = if spec.enabled { "●" } else { "○" };
+                                let color = if spec.enabled {
+                                    egui::Color32::from_rgb(100, 200, 100)
+                                } else {
+                                    egui::Color32::from_rgb(150, 150, 150)
+                                };
+                                ui.colored_label(color, indicator);
+
+                                ui.strong(&spec.name);
+
+                                ui.label(format!("({:?})", spec.agent_type));
+
+                                let model = match &spec.llm_provider {
+                                    LlmProvider::Anthropic { model, .. } => {
+                                        format!("Anthropic/{}", model)
+                                    }
+                                    LlmProvider::OpenAI { model, .. } => {
+                                        format!("OpenAI/{}", model)
+                                    }
+                                    LlmProvider::Ollama { model, .. } => {
+                                        format!("Ollama/{}", model)
+                                    }
+                                };
+                                ui.label(model);
+
+                                // Action buttons on the right
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Delete").clicked() {
+                                            remove_index = Some(i);
+                                        }
+                                        if ui.small_button("Edit").clicked() {
+                                            self.populate_form_from_config(spec);
+                                            self.editing_agent_index = Some(i);
+                                            self.show_add_agent_form = false;
+                                        }
+                                    },
+                                );
+                            });
+
+                            // Capabilities row
+                            if !spec.capabilities.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.label("Capabilities:");
+                                    for cap in &spec.capabilities {
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgb(50, 50, 70))
+                                            .rounding(3.0)
+                                            .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                            .show(ui, |ui| {
+                                                ui.small(&cap.name);
+                                            });
+                                    }
+                                });
+                            }
+                        }
+                    });
+            }
+
+            // Apply deferred mutations
+            if let Some(idx) = remove_index {
+                self.runtime.block_on(async {
+                    let mut agent = self.agent.write().await;
+                    if idx < agent.config.swarm.specialists.len() {
+                        agent.config.swarm.specialists.remove(idx);
+                    }
+                });
+            }
+
+            if let Some(idx) = save_edit_index {
+                if let Some(config) = self.build_specialist_config() {
+                    self.runtime.block_on(async {
+                        let mut agent = self.agent.write().await;
+                        if idx < agent.config.swarm.specialists.len() {
+                            agent.config.swarm.specialists[idx] = config;
+                        }
+                    });
+                    self.editing_agent_index = None;
+                    self.agent_form = AgentFormState::default();
+                }
             }
         });
     }
+
+    /// Render the agent add/edit form fields
+    fn render_agent_form(&mut self, ui: &mut egui::Ui, title: &str) {
+        ui.strong(title);
+        ui.add_space(5.0);
+
+        egui::Grid::new(format!("agent_form_{}", title))
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Agent Name:");
+                ui.text_edit_singleline(&mut self.agent_form.name);
+                ui.end_row();
+
+                ui.label("Agent Type:");
+                egui::ComboBox::from_id_salt(format!("agent_type_{}", title))
+                    .selected_text(AGENT_TYPES[self.agent_form.agent_type_index])
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in AGENT_TYPES.iter().enumerate() {
+                            ui.selectable_value(&mut self.agent_form.agent_type_index, idx, *label);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("LLM Provider:");
+                egui::ComboBox::from_id_salt(format!("llm_provider_{}", title))
+                    .selected_text(LLM_PROVIDERS[self.agent_form.llm_provider_index])
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in LLM_PROVIDERS.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.agent_form.llm_provider_index,
+                                idx,
+                                *label,
+                            );
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Model:");
+                ui.text_edit_singleline(&mut self.agent_form.model);
+                ui.end_row();
+
+                // Show base URL for OpenAI/Ollama
+                if self.agent_form.llm_provider_index != 0 {
+                    ui.label("Base URL:");
+                    ui.text_edit_singleline(&mut self.agent_form.base_url);
+                    ui.end_row();
+                }
+
+                // Show API key for Anthropic/OpenAI
+                if self.agent_form.llm_provider_index != 2 {
+                    ui.label("API Key:");
+                    ui.add(egui::TextEdit::singleline(&mut self.agent_form.api_key).password(true));
+                    ui.end_row();
+                }
+
+                ui.label("Capabilities:");
+                ui.text_edit_singleline(&mut self.agent_form.capabilities)
+                    .on_hover_text("Comma-separated capability names");
+                ui.end_row();
+
+                ui.label("Description:");
+                ui.text_edit_singleline(&mut self.agent_form.description)
+                    .on_hover_text("Describe what this agent is good at");
+                ui.end_row();
+
+                ui.label("System Prompt:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.agent_form.system_prompt)
+                        .desired_rows(3)
+                        .hint_text("Optional override"),
+                );
+                ui.end_row();
+            });
+        ui.add_space(5.0);
+    }
+
+    /// Build a SpecialistConfig from the current form state
+    fn build_specialist_config(&self) -> Option<SpecialistConfig> {
+        let name = self.agent_form.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+
+        let agent_type = match self.agent_form.agent_type_index {
+            0 => SubAgentType::Researcher,
+            1 => SubAgentType::Coder,
+            2 => SubAgentType::Analyst,
+            3 => SubAgentType::Writer,
+            4 => SubAgentType::Validator,
+            5 => SubAgentType::Planner,
+            6 => SubAgentType::Custom {
+                name: name.to_string(),
+                instructions: self.agent_form.system_prompt.clone(),
+            },
+            _ => SubAgentType::Researcher,
+        };
+
+        let model = if self.agent_form.model.trim().is_empty() {
+            match self.agent_form.llm_provider_index {
+                0 => "claude-sonnet-4-5-20250929".to_string(),
+                1 => "gpt-4o".to_string(),
+                _ => "llama3.2".to_string(),
+            }
+        } else {
+            self.agent_form.model.trim().to_string()
+        };
+
+        let llm_provider = match self.agent_form.llm_provider_index {
+            0 => LlmProvider::Anthropic {
+                api_key: self.agent_form.api_key.clone(),
+                model,
+            },
+            1 => LlmProvider::OpenAI {
+                api_key: self.agent_form.api_key.clone(),
+                model,
+                base_url: if self.agent_form.base_url.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.agent_form.base_url.trim().to_string())
+                },
+            },
+            _ => LlmProvider::Ollama {
+                base_url: if self.agent_form.base_url.trim().is_empty() {
+                    "http://localhost:11434".to_string()
+                } else {
+                    self.agent_form.base_url.trim().to_string()
+                },
+                model,
+            },
+        };
+
+        let capabilities: Vec<AgentCapability> = self
+            .agent_form
+            .capabilities
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|name| AgentCapability {
+                name: name.clone(),
+                description: self.agent_form.description.clone(),
+                keywords: name
+                    .to_lowercase()
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect(),
+            })
+            .collect();
+
+        let system_prompt_override = if self.agent_form.system_prompt.trim().is_empty() {
+            None
+        } else {
+            Some(self.agent_form.system_prompt.clone())
+        };
+
+        Some(SpecialistConfig {
+            name: name.to_string(),
+            agent_type,
+            llm_provider,
+            system_prompt_override,
+            max_memory_retrieval: 3,
+            capabilities,
+            enabled: true,
+        })
+    }
+
+    /// Populate form fields from an existing SpecialistConfig
+    fn populate_form_from_config(&mut self, config: &SpecialistConfig) {
+        self.agent_form.name = config.name.clone();
+
+        self.agent_form.agent_type_index = match &config.agent_type {
+            SubAgentType::Researcher => 0,
+            SubAgentType::Coder => 1,
+            SubAgentType::Analyst => 2,
+            SubAgentType::Writer => 3,
+            SubAgentType::Validator => 4,
+            SubAgentType::Planner => 5,
+            SubAgentType::Custom { .. } => 6,
+        };
+
+        match &config.llm_provider {
+            LlmProvider::Anthropic { api_key, model } => {
+                self.agent_form.llm_provider_index = 0;
+                self.agent_form.model = model.clone();
+                self.agent_form.api_key = api_key.clone();
+                self.agent_form.base_url.clear();
+            }
+            LlmProvider::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                self.agent_form.llm_provider_index = 1;
+                self.agent_form.model = model.clone();
+                self.agent_form.api_key = api_key.clone();
+                self.agent_form.base_url = base_url.clone().unwrap_or_default();
+            }
+            LlmProvider::Ollama { base_url, model } => {
+                self.agent_form.llm_provider_index = 2;
+                self.agent_form.model = model.clone();
+                self.agent_form.api_key.clear();
+                self.agent_form.base_url = base_url.clone();
+            }
+        }
+
+        self.agent_form.capabilities = config
+            .capabilities
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        self.agent_form.description = config
+            .capabilities
+            .first()
+            .map(|c| c.description.clone())
+            .unwrap_or_default();
+
+        self.agent_form.system_prompt = config.system_prompt_override.clone().unwrap_or_default();
+    }
 }
 
-impl eframe::App for CrateAgentApp {
+impl eframe::App for AgentArkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Sidebar
         egui::SidePanel::left("sidebar")

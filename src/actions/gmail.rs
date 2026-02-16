@@ -31,20 +31,31 @@ fn token_path(config_dir: &Path) -> PathBuf {
 
 fn get_oauth_client_with_config(config_dir: &Path) -> Result<(String, String)> {
     // Try env vars first
-    if let (Ok(id), Ok(secret)) = (std::env::var("GMAIL_CLIENT_ID"), std::env::var("GMAIL_CLIENT_SECRET")) {
+    if let (Ok(id), Ok(secret)) = (
+        std::env::var("GMAIL_CLIENT_ID"),
+        std::env::var("GMAIL_CLIENT_SECRET"),
+    ) {
         return Ok((id, secret));
     }
     // Fall back to secure config
     let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
     if let Some(json_str) = manager.get_custom_secret("gmail_oauth_config")? {
         let v: serde_json::Value = serde_json::from_str(&json_str)?;
-        let client_id = v.get("client_id").and_then(|c| c.as_str()).map(String::from)
+        let client_id = v
+            .get("client_id")
+            .and_then(|c| c.as_str())
+            .map(String::from)
             .ok_or_else(|| anyhow!("Missing client_id in gmail config"))?;
-        let client_secret = v.get("client_secret").and_then(|c| c.as_str()).map(String::from)
+        let client_secret = v
+            .get("client_secret")
+            .and_then(|c| c.as_str())
+            .map(String::from)
             .ok_or_else(|| anyhow!("Missing client_secret in gmail config"))?;
         return Ok((client_id, client_secret));
     }
-    Err(anyhow!("Gmail OAuth credentials not configured. Go to Settings > Gmail to add them."))
+    Err(anyhow!(
+        "Gmail OAuth credentials not configured. Go to Settings > Gmail to add them."
+    ))
 }
 
 async fn load_tokens(config_dir: &Path) -> Result<GmailTokens> {
@@ -164,22 +175,11 @@ struct GmailMessageRef {
     id: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct GmailMessage {
-    id: String,
-    #[serde(default)]
-    thread_id: String,
-    #[serde(default)]
-    payload: GmailPayload,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct GmailFullMessage {
     id: String,
-    #[serde(default)]
-    thread_id: String,
+    #[serde(default, rename = "threadId")]
+    _thread_id: String,
     #[serde(default, rename = "labelIds")]
     label_ids: Vec<String>,
     #[serde(default)]
@@ -206,65 +206,167 @@ fn header_value(headers: &[GmailHeader], name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Fetch message IDs from a single Gmail query
+async fn fetch_message_ids(
+    client: &reqwest::Client,
+    access_token: &str,
+    query: Option<&str>,
+    labels: &[String],
+    max_results: u32,
+) -> Result<Vec<String>> {
+    let mut url = reqwest::Url::parse(&format!("{}/users/me/messages", GMAIL_API_BASE))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("maxResults", &max_results.to_string());
+        for label in labels {
+            qp.append_pair("labelIds", label);
+        }
+        if let Some(q) = query {
+            qp.append_pair("q", q);
+        }
+    }
+
+    let resp = client.get(url).bearer_auth(access_token).send().await?;
+    if !resp.status().is_success() {
+        return Ok(vec![]);
+    }
+
+    let list: GmailListResponse = resp.json().await?;
+    Ok(list
+        .messages
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+/// Fetch full metadata for a single message
+async fn fetch_message_metadata(
+    client: &reqwest::Client,
+    access_token: &str,
+    msg_id: &str,
+) -> Option<GmailFullMessage> {
+    let url = format!(
+        "{}/users/me/messages/{}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
+        GMAIL_API_BASE, msg_id
+    );
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
 pub async fn gmail_scan(config_dir: &Path, args: &serde_json::Value) -> Result<String> {
     let args: GmailScanArgs = serde_json::from_value(args.clone())
         .map_err(|e| anyhow!("Invalid Gmail scan args: {}", e))?;
 
     let access_token = ensure_access_token(config_dir).await?;
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
+        .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let labels = if args.labels.is_empty() {
-        vec!["INBOX".to_string()]
-    } else {
-        args.labels
-    };
+    let has_specific_query = args.query.is_some() || !args.labels.is_empty();
 
-    let mut url = reqwest::Url::parse(&format!("{}/users/me/messages", GMAIL_API_BASE))?;
-    {
-        let mut qp = url.query_pairs_mut();
-        qp.append_pair("maxResults", &args.max_results.unwrap_or(10).to_string());
-        for label in &labels {
-            qp.append_pair("labelIds", label);
-        }
-        if let Some(q) = &args.query {
-            qp.append_pair("q", q);
-        }
-    }
+    // Collect unique message IDs
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
 
-    let list_resp = client
-        .get(url)
-        .bearer_auth(&access_token)
-        .send()
+    if has_specific_query {
+        // User/LLM provided a specific query — honour it directly
+        let labels = if args.labels.is_empty() {
+            vec!["INBOX".to_string()]
+        } else {
+            args.labels.clone()
+        };
+        let ids = fetch_message_ids(
+            &client,
+            &access_token,
+            args.query.as_deref(),
+            &labels,
+            args.max_results.unwrap_or(20),
+        )
         .await?;
-    if !list_resp.status().is_success() {
-        return Err(anyhow!("Gmail list failed: {}", list_resp.status()));
+        for id in ids {
+            if seen.insert(id.clone()) {
+                ordered_ids.push(id);
+            }
+        }
+    } else {
+        // No specific query — smart multi-query strategy:
+        // 1. Important + unread (Gmail's own ML importance)
+        // 2. Unread in primary category (real mail, not promos)
+        // 3. Recent unread (catch-all for last 3 days)
+        // 4. Starred (user-flagged)
+        // Run all in parallel, deduplicate.
+        let inbox = vec!["INBOX".to_string()];
+
+        let (important, primary, recent, starred) = tokio::join!(
+            fetch_message_ids(
+                &client,
+                &access_token,
+                Some("is:unread is:important"),
+                &inbox,
+                15
+            ),
+            fetch_message_ids(
+                &client,
+                &access_token,
+                Some("is:unread category:primary"),
+                &inbox,
+                15
+            ),
+            fetch_message_ids(
+                &client,
+                &access_token,
+                Some("is:unread newer_than:3d"),
+                &inbox,
+                20
+            ),
+            fetch_message_ids(
+                &client,
+                &access_token,
+                Some("is:starred newer_than:7d"),
+                &inbox,
+                5
+            ),
+        );
+
+        // Merge in priority order — important first, then primary, then recent, then starred
+        for batch in [important, primary, recent, starred] {
+            for id in batch.unwrap_or_default() {
+                if seen.insert(id.clone()) {
+                    ordered_ids.push(id);
+                }
+            }
+        }
     }
 
-    let list: GmailListResponse = list_resp.json().await?;
-    let Some(messages) = list.messages else {
+    if ordered_ids.is_empty() {
         return Ok("No messages found.".to_string());
-    };
+    }
+
+    // Fetch metadata for all messages in parallel
+    let metadata_futures: Vec<_> = ordered_ids
+        .iter()
+        .map(|id| fetch_message_metadata(&client, &access_token, id))
+        .collect();
+    let metadata_results = futures::future::join_all(metadata_futures).await;
 
     let mut summaries = Vec::new();
-    for msg in messages {
-        let msg_url = format!(
-            "{}/users/me/messages/{}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
-            GMAIL_API_BASE, msg.id
-        );
-        let msg_resp = client.get(msg_url).bearer_auth(&access_token).send().await?;
-        if !msg_resp.status().is_success() {
-            continue;
-        }
-        let message: GmailFullMessage = msg_resp.json().await?;
-        let subject = header_value(&message.payload.headers, "Subject");
-        let from = header_value(&message.payload.headers, "From");
-        let date = header_value(&message.payload.headers, "Date");
-        let labels = message.label_ids.join(", ");
+    for meta in metadata_results.into_iter().flatten() {
+        let subject = header_value(&meta.payload.headers, "Subject");
+        let from = header_value(&meta.payload.headers, "From");
+        let date = header_value(&meta.payload.headers, "Date");
+        let labels = meta.label_ids.join(", ");
         summaries.push(format!(
             "- From: {}\n  Subject: {}\n  Date: {}\n  Labels: {}\n  Id: {}",
-            from, subject, date, labels, message.id
+            from, subject, date, labels, meta.id
         ));
     }
 

@@ -11,7 +11,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VPS_HOST="${VPS_HOST:-}"
 VPS_USER="${VPS_USER:-root}"
 VPS_PORT="${VPS_PORT:-22}"
-DEPLOY_DIR="${DEPLOY_DIR:-/opt/cogniark}"
+DEPLOY_DIR="${DEPLOY_DIR:-/opt/agentark}"
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -22,7 +22,7 @@ usage() {
     echo "  -h, --host HOST     VPS hostname or IP (required)"
     echo "  -u, --user USER     SSH user (default: root)"
     echo "  -p, --port PORT     SSH port (default: 22)"
-    echo "  -d, --dir DIR       Deploy directory (default: /opt/cogniark)"
+    echo "  -d, --dir DIR       Deploy directory (default: /opt/agentark)"
     echo "  --with-ollama       Include Ollama for local LLM"
     echo "  --with-search       Include SearXNG for private search"
     echo "  --help              Show this help"
@@ -101,7 +101,7 @@ DEPLOY_FILES=(
     "Cargo.lock"
     "src"
     "config"
-    "actions"
+    "skills"
 )
 
 TEMP_DIR=$(mktemp -d)
@@ -152,8 +152,8 @@ echo ""
 echo "Crate Agent is now running on your VPS!"
 echo ""
 echo "Access points:"
-echo "  Web UI:  http://$VPS_HOST:17990"
-echo "  API:     http://$VPS_HOST:17990/status"
+echo "  Web UI:  http://$VPS_HOST:8990"
+echo "  API:     http://$VPS_HOST:8990/status"
 echo ""
 echo "Management commands (run on VPS):"
 echo "  cd $DEPLOY_DIR"

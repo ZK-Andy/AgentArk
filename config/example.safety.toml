@@ -1,5 +1,5 @@
-# CogniArk Safety Rules
-# Copy this to ~/.config/cogniark/safety.toml
+# AgentArk Safety Rules
+# Copy this to ~/.config/agentark/safety.toml
 
 # Block dangerous shell commands unless explicitly allowed
 [[rule]]
@@ -67,8 +67,8 @@ type = "not"
 [rule.condition.condition]
 type = "path_within"
 directories = [
-    "~/Documents/cogniark-workspace",
-    "/tmp/cogniark"
+    "~/Documents/agentark-workspace",
+    "/tmp/agentark"
 ]
 
 [rule.action]

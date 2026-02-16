@@ -61,7 +61,10 @@ pub enum RuleCondition {
     /// Command must be in allowlist
     CommandAllowed { commands: Vec<String> },
     /// Rate limit (max N per interval)
-    RateLimit { max_count: u32, interval_seconds: u64 },
+    RateLimit {
+        max_count: u32,
+        interval_seconds: u64,
+    },
     /// Custom expression
     Expression { expr: String },
     /// All conditions must match
@@ -95,21 +98,20 @@ pub struct SafetyEngine {
     pending_approvals: RwLock<Vec<PendingApproval>>,
 }
 
-#[allow(dead_code)]
 struct RateLimitState {
     count: u32,
     window_start: std::time::Instant,
-    interval: std::time::Duration,
+    _interval: std::time::Duration,
     max_count: u32,
 }
 
 /// A pending approval request
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
-    pub action_name: String,
-    pub arguments: serde_json::Value,
-    pub rule_name: String,
+    pub _id: String,
+    pub _action_name: String,
+    pub _arguments: serde_json::Value,
+    pub _rule_name: String,
     pub requested_at: std::time::Instant,
 }
 
@@ -140,9 +142,13 @@ impl SafetyEngine {
         })
     }
 
-    /// Check if an action is allowed by safety policies
-    /// Uses interior mutability (RwLock) so this can be called with &self
-    pub fn is_allowed(&self, action_name: &str, arguments: &serde_json::Value) -> Result<bool> {
+    /// Check if an action is allowed by safety policies.
+    /// Async so delay rules never block a Tokio worker thread.
+    pub async fn is_allowed(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<bool> {
         // Clone rules to avoid borrow issues with rate limiting
         let rules = self.rules.clone();
         for rule in &rules {
@@ -158,10 +164,9 @@ impl SafetyEngine {
                         RuleAction::Allow | RuleAction::LogAndAllow => {
                             if matches!(rule.action, RuleAction::LogAndAllow) {
                                 tracing::info!(
-                                    "Safety rule '{}' logged action: {} with {:?}",
+                                    "Safety rule '{}' logged action: {}",
                                     rule.name,
-                                    action_name,
-                                    arguments
+                                    action_name
                                 );
                             }
                             continue; // Check other rules
@@ -179,17 +184,17 @@ impl SafetyEngine {
                             // Return false to indicate approval is required
                             // The caller (agent) should create a task with TaskApproval::RequireApproval
                             tracing::info!(
-                                "Safety rule '{}' requires approval for action: {} with args: {:?}",
+                                "Safety rule '{}' requires approval for action: {}",
                                 rule.name,
-                                action_name,
-                                arguments
+                                action_name
                             );
                             // Store pending approval request for later retrieval
                             if let Ok(mut approvals) = self.pending_approvals.write() {
                                 approvals.push(PendingApproval {
-                                    action_name: action_name.to_string(),
-                                    arguments: arguments.clone(),
-                                    rule_name: rule.name.clone(),
+                                    _id: uuid::Uuid::new_v4().to_string(),
+                                    _action_name: action_name.to_string(),
+                                    _arguments: arguments.clone(),
+                                    _rule_name: rule.name.clone(),
                                     requested_at: std::time::Instant::now(),
                                 });
                             }
@@ -202,9 +207,7 @@ impl SafetyEngine {
                                 seconds,
                                 action_name
                             );
-                            // Store delay info and perform synchronous sleep
-                            // In production, this would be handled asynchronously
-                            std::thread::sleep(std::time::Duration::from_secs(*seconds));
+                            tokio::time::sleep(std::time::Duration::from_secs(*seconds)).await;
                             tracing::info!("Delay completed for action: {}", action_name);
                         }
                     }
@@ -285,11 +288,14 @@ impl SafetyEngine {
                 let now = std::time::Instant::now();
                 let interval = std::time::Duration::from_secs(*interval_seconds);
 
-                let mut rate_limits = self.rate_limits.write().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+                let mut rate_limits = self
+                    .rate_limits
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
                 let state = rate_limits.entry(key).or_insert(RateLimitState {
                     count: 0,
                     window_start: now,
-                    interval,
+                    _interval: interval,
                     max_count: *max_count,
                 });
 
@@ -329,7 +335,11 @@ impl SafetyEngine {
                 let mut context = evalexpr::HashMapContext::new();
 
                 // Add action_name as variable
-                context.set_value("action_name".into(), evalexpr::Value::String(action_name.to_string()))
+                context
+                    .set_value(
+                        "action_name".into(),
+                        evalexpr::Value::String(action_name.to_string()),
+                    )
                     .map_err(|e| anyhow::anyhow!("Failed to set context: {}", e))?;
 
                 // Add argument values to context
@@ -349,7 +359,8 @@ impl SafetyEngine {
                             serde_json::Value::Bool(b) => evalexpr::Value::Boolean(*b),
                             _ => continue,
                         };
-                        context.set_value(key.clone().into(), eval_value)
+                        context
+                            .set_value(key.clone().into(), eval_value)
                             .map_err(|e| anyhow::anyhow!("Failed to set context value: {}", e))?;
                     }
                 }
@@ -419,7 +430,6 @@ impl SafetyEngine {
     }
 
     /// Add a new safety rule
-    #[allow(dead_code)]
     pub fn add_rule(&mut self, rule: SafetyRule) {
         self.rules.push(rule);
     }
@@ -429,38 +439,7 @@ impl SafetyEngine {
         &self.rules
     }
 
-    /// Get pending approval requests (returns a cloned Vec)
-    #[allow(dead_code)]
-    pub fn pending_approvals(&self) -> Vec<PendingApproval> {
-        self.pending_approvals.read().map(|a| a.clone()).unwrap_or_default()
-    }
-
-    /// Approve a pending request by index
-    #[allow(dead_code)]
-    pub fn approve(&self, index: usize) -> Option<PendingApproval> {
-        if let Ok(mut approvals) = self.pending_approvals.write() {
-            if index < approvals.len() {
-                return Some(approvals.remove(index));
-            }
-        }
-        None
-    }
-
-    /// Deny a pending request by index
-    #[allow(dead_code)]
-    pub fn deny(&self, index: usize) -> Option<PendingApproval> {
-        if let Ok(mut approvals) = self.pending_approvals.write() {
-            if index < approvals.len() {
-                let approval = approvals.remove(index);
-                tracing::info!("Denied approval for: {}", approval.action_name);
-                return Some(approval);
-            }
-        }
-        None
-    }
-
     /// Clear expired pending approvals (older than 1 hour)
-    #[allow(dead_code)]
     pub fn clear_expired_approvals(&self) {
         let hour = std::time::Duration::from_secs(3600);
         if let Ok(mut approvals) = self.pending_approvals.write() {

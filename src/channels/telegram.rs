@@ -10,6 +10,182 @@ use crate::core::{Agent, Task, TaskApproval, TaskStatus};
 
 type SharedAgent = Arc<RwLock<Agent>>;
 
+#[derive(Clone, Copy, Debug)]
+enum TunnelControlCommand {
+    Start,
+    Stop,
+    Status,
+}
+
+fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', " ")
+        .replace('-', " ");
+    let compact = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    match compact.as_str() {
+        "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
+        "stop tunnel" | "/tunnel stop" | "/stop_tunnel" => Some(TunnelControlCommand::Stop),
+        "tunnel status" | "status tunnel" | "/tunnel" | "/tunnel status" | "/tunnel_status" => {
+            Some(TunnelControlCommand::Status)
+        }
+        _ => None,
+    }
+}
+
+fn internal_api_base_url() -> String {
+    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
+    let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some()
+        && std::env::var("AGENTARK_TLS_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{}://{}", scheme, bind_addr)
+}
+
+async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) -> String {
+    let api_key = { agent.read().await.api_key.clone() };
+    let base_url = internal_api_base_url();
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("Tunnel command failed: {}", e),
+    };
+    let url = match cmd {
+        TunnelControlCommand::Start => format!("{}/tunnel/start", base_url),
+        TunnelControlCommand::Stop => format!("{}/tunnel/stop", base_url),
+        TunnelControlCommand::Status => format!("{}/tunnel/status", base_url),
+    };
+
+    let mut request = match cmd {
+        TunnelControlCommand::Status => client.get(&url),
+        TunnelControlCommand::Start | TunnelControlCommand::Stop => client.post(&url),
+    };
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return format!("Failed to reach tunnel controller at {}: {}", base_url, e),
+    };
+    let status = response.status();
+    let json: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(e) => return format!("Tunnel command failed (invalid response): {}", e),
+    };
+
+    if !status.is_success() {
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return format!("Tunnel command failed: {}", err);
+    }
+
+    match cmd {
+        TunnelControlCommand::Start => {
+            let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if !url.is_empty() {
+                format!("Tunnel started.\nExternal URL: {}", url)
+            } else {
+                json.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Tunnel is starting; URL pending.")
+                    .to_string()
+            }
+        }
+        TunnelControlCommand::Stop => json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Tunnel stopped.")
+            .to_string(),
+        TunnelControlCommand::Status => {
+            let active = json
+                .get("active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut out = format!(
+                "Tunnel status: {}",
+                if active { "active" } else { "inactive" }
+            );
+            if let Some(url) = json.get("url").and_then(|v| v.as_str()) {
+                if !url.is_empty() {
+                    out.push_str(&format!("\nExternal URL: {}", url));
+                }
+            }
+            if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+                if !err.is_empty() {
+                    out.push_str(&format!("\nLast error: {}", err));
+                }
+            }
+            out
+        }
+    }
+}
+
+fn parse_set_secret(text: &str) -> Option<(String, String)> {
+    // Accept both:
+    // - "/setsecret KEY=VALUE" (Telegram command)
+    // - "set secret KEY=VALUE" (plain text)
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if lower.starts_with("/setsecret ") {
+        trimmed[10..].trim() // len("/setsecret ") == 10
+    } else if lower.starts_with("set secret ") {
+        trimmed[10..].trim() // len("set secret ") == 10
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+
+    let (key, value) = if let Some(eq) = rest.find('=') {
+        let (k, v) = rest.split_at(eq);
+        (k.trim(), v[1..].trim())
+    } else {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let k = parts.next().unwrap_or("").trim();
+        let v = parts.next().unwrap_or("").trim();
+        (k, v)
+    };
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    if key.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if key.contains('\n') || key.contains('\r') {
+        return None;
+    }
+    Some((key.to_string(), value.to_string()))
+}
+
+async fn store_secret_for_chat(agent: &SharedAgent, key: &str, value: &str) -> Result<(), String> {
+    let (config_dir, data_dir) = {
+        let a = agent.read().await;
+        (a.config_dir.clone(), a.data_dir.clone())
+    };
+    let k = key.to_string();
+    let v = value.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        crate::core::secrets::store_user_secret(&config_dir, Some(&data_dir), &k, &v)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
 /// Split a message into chunks for Telegram (max 4096 chars)
 /// Tries to split at paragraph boundaries for better formatting
 fn split_message_for_telegram(text: &str, max_len: usize) -> Vec<String> {
@@ -180,7 +356,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 chars.next(); // second `
                 if chars.peek() == Some(&'`') {
                     chars.next(); // third `
-                    // Skip optional language identifier
+                                  // Skip optional language identifier
                     while let Some(&next) = chars.peek() {
                         if next == '\n' {
                             chars.next();
@@ -256,6 +432,7 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("memory", "Memory stats"),
         BotCommand::new("model", "Switch LLM model - /model <name>"),
         BotCommand::new("settings", "View current settings"),
+        BotCommand::new("tunnel", "Tunnel control - /tunnel [start|stop|status]"),
         BotCommand::new("clear", "Clear conversation history"),
     ];
 
@@ -277,9 +454,12 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
         return Ok(());
     };
 
-    tracing::info!("Starting Telegram bot with token: {}...", &telegram_config.bot_token[..8.min(telegram_config.bot_token.len())]);
+    tracing::info!("Starting Telegram bot");
     if !telegram_config.allowed_users.is_empty() {
-        tracing::info!("Telegram allowed users: {:?}", telegram_config.allowed_users);
+        tracing::info!(
+            "Telegram allowed users: {} configured",
+            telegram_config.allowed_users.len()
+        );
     } else {
         tracing::info!("Telegram: All users allowed (no restriction)");
     }
@@ -295,11 +475,21 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
         let agent = agent_clone.clone();
         async move {
             let user_id = msg.from.as_ref().map(|u| u.id.0);
+            let username = msg
+                .from
+                .as_ref()
+                .and_then(|u| u.username.clone())
+                .unwrap_or_else(|| "unknown".to_string());
             let chat_id = msg.chat.id;
-            tracing::info!("Telegram message received from user {:?} in chat {}", user_id, chat_id);
 
             if let Some(text) = msg.text() {
-                tracing::info!("Telegram message text: {}", text);
+                tracing::info!(
+                    "Telegram message: user={}(@{}), chat={}, msg={}chars",
+                    user_id.unwrap_or(0),
+                    username,
+                    chat_id,
+                    text.len()
+                );
 
                 // Check authorization
                 let authorized = {
@@ -319,32 +509,133 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                 };
 
                 if !authorized {
-                    bot.send_message(chat_id, "You are not authorized.")
-                        .await?;
+                    tracing::warn!(
+                        "Telegram: unauthorized user {}(@{}) rejected",
+                        user_id.unwrap_or(0),
+                        username
+                    );
+                    bot.send_message(chat_id, "You are not authorized.").await?;
                     return Ok(());
                 }
 
                 // Persist last chat id for push notifications
                 {
                     let agent = agent.read().await;
-                    let _ = agent.storage.set(
-                        "telegram:last_chat_id",
-                        chat_id.0.to_string().as_bytes(),
-                    ).await;
+                    let _ = agent
+                        .storage
+                        .set("telegram:last_chat_id", chat_id.0.to_string().as_bytes())
+                        .await;
                 }
 
                 // Handle commands
                 if text.starts_with('/') {
-                    let response = handle_command(text, &agent).await;
+                    // Store secrets without engaging the LLM. Only allow in private chats and only
+                    // when an allowlist is configured (otherwise the bot could be public).
+                    if text.to_ascii_lowercase().starts_with("/setsecret") {
+                        let allow_set_secret = {
+                            let a = agent.read().await;
+                            a.config
+                                .telegram
+                                .as_ref()
+                                .map(|c| !c.allowed_users.is_empty())
+                                .unwrap_or(false)
+                        };
+                        let conversation_id = format!("telegram:{}", chat_id.0);
+
+                        let reply = if !msg.chat.is_private() {
+                            "Refusing to store secrets in non-private chats. Use a direct message or the web UI."
+                                .to_string()
+                        } else if !allow_set_secret {
+                            "Refusing to store secrets via Telegram until `telegram.allowed_users` is configured in Settings. Use the web UI instead."
+                                .to_string()
+                        } else if let Some((key, value)) = parse_set_secret(text) {
+                            match store_secret_for_chat(&agent, &key, &value).await {
+                                Ok(()) => {
+                                    let followup = {
+                                        let a = agent.read().await;
+                                        a.on_secret_saved_followup(&conversation_id).await
+                                    };
+                                    let mut response = format!(
+                                        "Saved secret '{}' (stored encrypted). This value was not sent to the LLM.",
+                                        key
+                                    );
+                                    if let Some(f) = followup {
+                                        response.push_str("\n\n");
+                                        response.push_str(&f);
+                                    }
+                                    response
+                                }
+                                Err(e) => format!("Failed to store secret: {}", e),
+                            }
+                        } else {
+                            "Usage: /setsecret KEY=VALUE\nExample: /setsecret OPENAI_API_KEY=sk-..."
+                                .to_string()
+                        };
+
+                        bot.send_message(chat_id, reply).await?;
+                        return Ok(());
+                    }
+
+                    let response = handle_command(text, &agent, chat_id).await;
                     bot.send_message(chat_id, response).await?;
                 } else {
+                    // Allow "set secret ..." in private chat only, and only when allowlist is configured.
+                    // This stores the secret encrypted and does not send it to the LLM.
+                    let allow_set_secret = {
+                        let a = agent.read().await;
+                        a.config
+                            .telegram
+                            .as_ref()
+                            .map(|c| !c.allowed_users.is_empty())
+                            .unwrap_or(false)
+                    };
+                    if msg.chat.is_private()
+                        && allow_set_secret
+                        && text.to_ascii_lowercase().starts_with("set secret ")
+                    {
+                        if let Some((key, value)) = parse_set_secret(text) {
+                            let conversation_id = format!("telegram:{}", chat_id.0);
+                            let reply = match store_secret_for_chat(&agent, &key, &value).await {
+                                Ok(()) => {
+                                    let followup = {
+                                        let a = agent.read().await;
+                                        a.on_secret_saved_followup(&conversation_id).await
+                                    };
+                                    let mut response = format!(
+                                        "Saved secret '{}' (stored encrypted). This value was not sent to the LLM.",
+                                        key
+                                    );
+                                    if let Some(f) = followup {
+                                        response.push_str("\n\n");
+                                        response.push_str(&f);
+                                    }
+                                    response
+                                }
+                                Err(e) => format!("Failed to store secret: {}", e),
+                            };
+                            bot.send_message(chat_id, reply).await?;
+                            return Ok(());
+                        }
+                    }
+
+                    if let Some(cmd) = parse_tunnel_command(text) {
+                        let reply = execute_tunnel_command(&agent, cmd).await;
+                        bot.send_message(chat_id, reply).await?;
+                        return Ok(());
+                    }
+
                     // Process with agent
-                    let response = {
-                        let mut agent = agent.write().await;
-                        match agent.process_message(text, "telegram").await {
+                    let conversation_id = format!("telegram:{}", chat_id.0);
+                    let (response, _trace_ref) = {
+                        let agent = agent.read().await;
+                        let r = match agent
+                            .process_message(text, "telegram", Some(&conversation_id), None)
+                            .await
+                        {
                             Ok(r) => r,
                             Err(e) => format!("Error: {}", e),
-                        }
+                        };
+                        (r, agent.last_trace.clone())
                     };
 
                     // Convert markdown to Telegram HTML
@@ -370,28 +661,91 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
 
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let Some(config) = &agent.config.telegram else {
+        tracing::debug!("Telegram send_message: no telegram config, skipping");
         return Ok(());
     };
 
-    let chat_id_bytes = agent.storage.get("telegram:last_chat_id").await?;
-    let Some(bytes) = chat_id_bytes else {
+    let Some(chat_id) = resolve_chat_id(agent, config).await else {
         return Ok(());
     };
-    let chat_id_str = String::from_utf8_lossy(&bytes);
-    let chat_id: i64 = chat_id_str.parse().unwrap_or_default();
-    if chat_id == 0 {
-        return Ok(());
-    }
 
     let bot = Bot::new(&config.bot_token);
     bot.send_message(ChatId(chat_id), text).await?;
     Ok(())
 }
 
-async fn handle_command(text: &str, agent: &SharedAgent) -> String {
+/// Resolve the chat_id to send to: stored last_chat_id > first allowed_user > None
+async fn resolve_chat_id(
+    agent: &Agent,
+    config: &crate::core::config::TelegramConfig,
+) -> Option<i64> {
+    let stored = agent
+        .storage
+        .get("telegram:last_chat_id")
+        .await
+        .ok()
+        .flatten();
+    if let Some(bytes) = stored {
+        let id: i64 = String::from_utf8_lossy(&bytes).parse().unwrap_or_default();
+        if id != 0 {
+            return Some(id);
+        }
+    }
+    // Fallback: for private chats, user_id == chat_id
+    if let Some(&first) = config.allowed_users.first() {
+        if first != 0 {
+            tracing::info!(
+                "Telegram: no last_chat_id, falling back to allowed_users[0]={}",
+                first
+            );
+            return Some(first);
+        }
+    }
+    tracing::warn!("Telegram: no chat_id available — user must send a message to the bot first");
+    None
+}
+
+/// Send a photo (screenshot) with optional caption to the last active Telegram chat
+pub async fn send_photo(agent: &Agent, image_bytes: &[u8], caption: &str) -> Result<()> {
+    let Some(config) = &agent.config.telegram else {
+        return Ok(());
+    };
+    let Some(chat_id) = resolve_chat_id(agent, config).await else {
+        return Ok(());
+    };
+
+    let bot = Bot::new(&config.bot_token);
+    let input_file =
+        teloxide::types::InputFile::memory(image_bytes.to_vec()).file_name("screenshot.png");
+    bot.send_photo(ChatId(chat_id), input_file)
+        .caption(caption)
+        .await?;
+    Ok(())
+}
+
+/// Send a video with optional caption to the last active Telegram chat
+pub async fn send_video(agent: &Agent, video_bytes: &[u8], caption: &str) -> Result<()> {
+    let Some(config) = &agent.config.telegram else {
+        return Ok(());
+    };
+    let Some(chat_id) = resolve_chat_id(agent, config).await else {
+        return Ok(());
+    };
+
+    let bot = Bot::new(&config.bot_token);
+    let input_file =
+        teloxide::types::InputFile::memory(video_bytes.to_vec()).file_name("video.mp4");
+    bot.send_video(ChatId(chat_id), input_file)
+        .caption(caption)
+        .await?;
+    Ok(())
+}
+
+async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> String {
     let parts: Vec<&str> = text.splitn(2, ' ').collect();
     let command = parts.first().unwrap_or(&"");
     let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let conversation_id = format!("telegram:{}", chat_id.0);
 
     match *command {
         "/start" | "/help" => {
@@ -414,10 +768,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 /summarize - Summarize chat\n\n\
                 ⚙️ Settings:\n\
                 /status - Agent status\n\
-                /actions - List actions\n\
+                /skills - List skills\n\
                 /memory - Memory stats\n\
                 /model <name> - Switch model\n\
                 /settings - View settings\n\
+                /tunnel [start|stop|status] - Manage public UI tunnel\n\
+                /setsecret KEY=VALUE - Store a secret encrypted (private + allowlisted only)\n\
                 /clear - Clear conversation history\n\n\
                 Or just chat with me!",
                 agent.config.name
@@ -431,7 +787,7 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 "📊 Agent Status\n\n\
                 🆔 DID: {}\n\
                 🧠 Memory: {} entries\n\
-                🛠 Actions: {} loaded\n\
+                🛠 Skills: {} loaded\n\
                 📋 Tasks: {} pending",
                 status.did, status.memory_entries, status.actions_loaded, status.tasks_pending
             )
@@ -441,16 +797,23 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             let agent = agent.read().await;
             let model = match &agent.config.llm {
                 crate::core::LlmProvider::Ollama { model, .. } => format!("Ollama: {}", model),
-                crate::core::LlmProvider::Anthropic { model, .. } => format!("Anthropic: {}", model),
+                crate::core::LlmProvider::Anthropic { model, .. } => {
+                    format!("Anthropic: {}", model)
+                }
                 crate::core::LlmProvider::OpenAI { model, .. } => format!("OpenAI: {}", model),
             };
-            let fallback = agent.config.llm_fallback.as_ref().map(|fb| {
-                match fb {
+            let fallback = agent
+                .config
+                .llm_fallback
+                .as_ref()
+                .map(|fb| match fb {
                     crate::core::LlmProvider::Ollama { model, .. } => format!("Ollama: {}", model),
-                    crate::core::LlmProvider::Anthropic { model, .. } => format!("Anthropic: {}", model),
+                    crate::core::LlmProvider::Anthropic { model, .. } => {
+                        format!("Anthropic: {}", model)
+                    }
                     crate::core::LlmProvider::OpenAI { model, .. } => format!("OpenAI: {}", model),
-                }
-            }).unwrap_or_else(|| "None".to_string());
+                })
+                .unwrap_or_else(|| "None".to_string());
 
             format!(
                 "⚙️ Current Settings\n\n\
@@ -458,18 +821,30 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 💬 Personality: {}\n\
                 🧠 Model: {}\n\
                 🔄 Fallback: {}",
-                agent.config.name,
-                agent.config.personality,
-                model,
-                fallback
+                agent.config.name, agent.config.personality, model, fallback
             )
         }
 
-        "/actions" | "/action" => {
+        "/tunnel" => {
+            let cmd = if args.is_empty() {
+                TunnelControlCommand::Status
+            } else if args.eq_ignore_ascii_case("start") {
+                TunnelControlCommand::Start
+            } else if args.eq_ignore_ascii_case("stop") {
+                TunnelControlCommand::Stop
+            } else if args.eq_ignore_ascii_case("status") {
+                TunnelControlCommand::Status
+            } else {
+                return "Usage: /tunnel [start|stop|status]\nExample: /tunnel start".to_string();
+            };
+            execute_tunnel_command(agent, cmd).await
+        }
+
+        "/skills" | "/skill" => {
             let agent = agent.read().await;
             let actions = agent.runtime.list_actions().await.unwrap_or_default();
             if actions.is_empty() {
-                "No actions loaded".to_string()
+                "No skills loaded".to_string()
             } else {
                 let list = actions
                     .iter()
@@ -482,7 +857,7 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 } else {
                     String::new()
                 };
-                format!("🛠 Available Actions:\n\n{}{}", list, more)
+                format!("🛠 Available Skills:\n\n{}{}", list, more)
             }
         }
 
@@ -492,7 +867,7 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             format!(
                 "🧠 Memory Stats\n\n\
                 📝 Entries: {}\n\
-                🛠 Actions: {}\n\
+                🛠 Skills: {}\n\
                 📋 Tasks: {}",
                 status.memory_entries, status.actions_loaded, status.tasks_pending
             )
@@ -504,9 +879,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             } else {
                 // Process through agent with image generation intent
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Generate an image of: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -517,12 +895,16 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
 
         "/video" => {
             if args.is_empty() {
-                "Usage: /video <prompt>\n\nExample: /video a rocket launching into space".to_string()
+                "Usage: /video <prompt>\n\nExample: /video a rocket launching into space"
+                    .to_string()
             } else {
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Generate a video of: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -536,9 +918,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 "Usage: /remind <time> <message>\n\nExamples:\n/remind 5m Check the oven\n/remind 2h Call mom\n/remind tomorrow 9am Meeting".to_string()
             } else {
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Set a reminder: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -550,9 +935,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
         "/weather" => {
             let location = if args.is_empty() { "my location" } else { args };
             let response = {
-                let mut agent = agent.write().await;
+                let agent = agent.read().await;
                 let prompt = format!("What's the weather in {}?", location);
-                match agent.process_message(&prompt, "telegram").await {
+                match agent
+                    .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => format!("❌ Error: {}", e),
                 }
@@ -562,12 +950,16 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
 
         "/translate" => {
             if args.is_empty() {
-                "Usage: /translate <text>\n\nExample: /translate Hello, how are you? to Spanish".to_string()
+                "Usage: /translate <text>\n\nExample: /translate Hello, how are you? to Spanish"
+                    .to_string()
             } else {
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Translate: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -581,9 +973,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 "Usage: /search <query>\n\nExample: /search latest news about AI".to_string()
             } else {
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Search the web for: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -594,8 +989,16 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
 
         "/summarize" => {
             let response = {
-                let mut agent = agent.write().await;
-                match agent.process_message("Summarize our recent conversation", "telegram").await {
+                let agent = agent.read().await;
+                match agent
+                    .process_message(
+                        "Summarize our recent conversation",
+                        "telegram",
+                        Some(&conversation_id),
+                        None,
+                    )
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => format!("❌ Error: {}", e),
                 }
@@ -607,8 +1010,16 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             if args.is_empty() {
                 // Show todo list
                 let response = {
-                    let mut agent = agent.write().await;
-                    match agent.process_message("Show my todo list", "telegram").await {
+                    let agent = agent.read().await;
+                    match agent
+                        .process_message(
+                            "Show my todo list",
+                            "telegram",
+                            Some(&conversation_id),
+                            None,
+                        )
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -617,9 +1028,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             } else if args.starts_with("add ") {
                 let item = args.strip_prefix("add ").unwrap_or("").trim();
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Add to my todo list: {}", item);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -635,9 +1049,12 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                 "Usage: /note <text>\n\nExample: /note Remember to buy milk".to_string()
             } else {
                 let response = {
-                    let mut agent = agent.write().await;
+                    let agent = agent.read().await;
                     let prompt = format!("Save this note: {}", args);
-                    match agent.process_message(&prompt, "telegram").await {
+                    match agent
+                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => format!("❌ Error: {}", e),
                     }
@@ -649,7 +1066,9 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
         "/tasks" => {
             let agent = agent.read().await;
             let tasks = agent.tasks.read().await;
-            let pending: Vec<_> = tasks.all().iter()
+            let pending: Vec<_> = tasks
+                .all()
+                .iter()
                 .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::AwaitingApproval))
                 .take(10)
                 .collect();
@@ -657,7 +1076,8 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             if pending.is_empty() {
                 "📋 No pending tasks".to_string()
             } else {
-                let list = pending.iter()
+                let list = pending
+                    .iter()
                     .map(|t| {
                         let status = match t.status {
                             TaskStatus::AwaitingApproval => "⏳",
@@ -674,7 +1094,9 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
 
         "/clear" => {
             let agent = agent.read().await;
-            agent.clear_conversation_history("telegram").await;
+            agent
+                .clear_conversation_by_id("telegram", &conversation_id, None)
+                .await;
             "🧹 Conversation cleared! Starting fresh.".to_string()
         }
 
@@ -695,14 +1117,20 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
         cmd if cmd.starts_with("/run ") => {
             let action_name = args;
             if action_name.is_empty() {
-                "Usage: /run <action_name>".to_string()
+                "Usage: /run <skill_name>".to_string()
             } else {
                 let agent = agent.read().await;
                 let actions = agent.runtime.list_actions().await.unwrap_or_default();
                 if actions.iter().any(|s| s.name == action_name) {
-                    format!("Running action: {}\n\nSend your query for this action.", action_name)
+                    format!(
+                        "Running skill: {}\n\nSend your query for this skill.",
+                        action_name
+                    )
                 } else {
-                    format!("Action '{}' not found. Use /actions to see available.", action_name)
+                    format!(
+                        "Skill '{}' not found. Use /skills to see available.",
+                        action_name
+                    )
                 }
             }
         }
@@ -725,6 +1153,10 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
                     cron: None,
                     result: None,
                     proof_id: None,
+                    priority: None,
+                    urgency: None,
+                    importance: None,
+                    eisenhower_quadrant: None,
                 };
 
                 let add_result = {
@@ -739,6 +1171,9 @@ async fn handle_command(text: &str, agent: &SharedAgent) -> String {
             }
         }
 
-        _ => format!("Unknown command: {}\n\nType /help for all commands", command),
+        _ => format!(
+            "Unknown command: {}\n\nType /help for all commands",
+            command
+        ),
     }
 }

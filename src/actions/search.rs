@@ -31,19 +31,15 @@ pub struct SearchResponse {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SearchBackend {
     /// SearXNG self-hosted instance
-    SearXNG {
-        base_url: String,
-    },
+    SearXNG { base_url: String },
     /// Serper API (Google results)
-    Serper {
-        api_key: String,
-    },
+    Serper { api_key: String },
     /// Brave Search API
-    Brave {
-        api_key: String,
-    },
+    Brave { api_key: String },
     /// DuckDuckGo (no API key, uses HTML scraping)
     DuckDuckGo,
+    /// Playwright browser automation (headless Chromium via bridge sidecar)
+    Playwright { bridge_url: String },
 }
 
 /// Web search client
@@ -75,8 +71,10 @@ impl SearchClient {
             SearchBackend::Brave { api_key } => {
                 self.search_brave(api_key, query, num_results).await
             }
-            SearchBackend::DuckDuckGo => {
-                self.search_duckduckgo(query, num_results).await
+            SearchBackend::DuckDuckGo => self.search_duckduckgo(query, num_results).await,
+            SearchBackend::Playwright { bridge_url } => {
+                self.search_playwright(&bridge_url, query, num_results)
+                    .await
             }
         }
     }
@@ -106,13 +104,7 @@ impl SearchClient {
             urlencoding::encode(query)
         );
 
-        let response: SearXNGResponse = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let response: SearXNGResponse = self.client.get(&url).send().await?.json().await?;
 
         let results = response
             .results
@@ -254,24 +246,14 @@ impl SearchClient {
     }
 
     /// Search using DuckDuckGo (HTML scraping - no API key needed)
-    async fn search_duckduckgo(
-        &self,
-        query: &str,
-        num_results: usize,
-    ) -> Result<SearchResponse> {
+    async fn search_duckduckgo(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
         // DuckDuckGo HTML search
         let url = format!(
             "https://html.duckduckgo.com/html/?q={}",
             urlencoding::encode(query)
         );
 
-        let html = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .text()
-            .await?;
+        let html = self.client.get(&url).send().await?.text().await?;
 
         // Simple HTML parsing for results
         let mut results = Vec::new();
@@ -362,6 +344,172 @@ impl SearchClient {
             backend: "duckduckgo".to_string(),
         })
     }
+
+    /// Search using Playwright browser automation (headless Chromium via bridge sidecar)
+    async fn search_playwright(
+        &self,
+        bridge_url: &str,
+        query: &str,
+        num_results: usize,
+    ) -> Result<SearchResponse> {
+        #[derive(Deserialize)]
+        struct SessionResp {
+            session_id: String,
+        }
+
+        #[derive(Deserialize)]
+        struct ContentResp {
+            body_text: Option<String>,
+            elements: Option<Vec<ContentElement>>,
+        }
+
+        #[derive(Deserialize)]
+        struct ContentElement {
+            tag: String,
+            #[serde(default)]
+            text: String,
+            #[serde(default)]
+            href: String,
+        }
+
+        // Create a browser session
+        let session: SessionResp = self
+            .client
+            .post(format!("{}/session", bridge_url))
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| anyhow!("Playwright bridge unavailable: {}", e))?
+            .json()
+            .await?;
+
+        let sid = &session.session_id;
+
+        // Navigate to Brave Search (reliable from VPS IPs, no captcha)
+        let search_url = format!(
+            "https://search.brave.com/search?q={}&count={}",
+            urlencoding::encode(query),
+            num_results + 5
+        );
+
+        let nav_result = self
+            .client
+            .post(format!("{}/session/{}/navigate", bridge_url, sid))
+            .json(&serde_json::json!({ "url": search_url }))
+            .send()
+            .await;
+
+        if let Err(e) = nav_result {
+            let _ = self
+                .client
+                .delete(format!("{}/session/{}", bridge_url, sid))
+                .send()
+                .await;
+            return Err(anyhow!("Navigation failed: {}", e));
+        }
+
+        // Brief wait for page to settle
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Get page content
+        let content_result = self
+            .client
+            .get(format!("{}/session/{}/content", bridge_url, sid))
+            .send()
+            .await;
+
+        // Close session regardless of result
+        let _ = self
+            .client
+            .delete(format!("{}/session/{}", bridge_url, sid))
+            .send()
+            .await;
+
+        let content: ContentResp = content_result?.error_for_status()?.json().await?;
+
+        let body_text = content.body_text.unwrap_or_default();
+        let elements = content.elements.unwrap_or_default();
+
+        // Extract search results from page elements
+        let mut results = Vec::new();
+
+        // Parse links that look like search results (skip search engine internal links)
+        for el in &elements {
+            if el.tag != "a" || el.href.is_empty() || el.text.is_empty() {
+                continue;
+            }
+
+            // Skip search engine internal links
+            if el.href.contains("brave.com")
+                || el.href.contains("google.com")
+                || el.href.contains("bing.com")
+                || el.href.starts_with("#")
+                || el.href.starts_with("/")
+            {
+                continue;
+            }
+
+            // Must be an external http(s) link
+            if !el.href.starts_with("http") {
+                continue;
+            }
+
+            // Skip duplicates
+            if results.iter().any(|r: &SearchResult| r.url == el.href) {
+                continue;
+            }
+
+            let title = el.text.trim().to_string();
+            if title.is_empty() || title.len() < 3 {
+                continue;
+            }
+
+            // Try to find a snippet near this URL in the body text
+            let snippet = Self::extract_snippet_near(&body_text, &title);
+
+            results.push(SearchResult {
+                title,
+                url: el.href.clone(),
+                snippet,
+                source: "playwright".to_string(),
+            });
+
+            if results.len() >= num_results {
+                break;
+            }
+        }
+
+        Ok(SearchResponse {
+            query: query.to_string(),
+            results,
+            backend: "playwright".to_string(),
+        })
+    }
+
+    /// Extract a snippet from body text near a given title string
+    fn extract_snippet_near(body_text: &str, title: &str) -> String {
+        // Find the title (or a substring) in the body text
+        let search_term = if title.len() > 20 {
+            &title[..20]
+        } else {
+            title
+        };
+        if let Some(pos) = body_text.to_lowercase().find(&search_term.to_lowercase()) {
+            // Take text after the title match, skip the title itself
+            let after = &body_text[pos..];
+            // Skip past the title
+            let snippet_start = after.find('\n').map(|p| p + 1).unwrap_or(search_term.len());
+            if snippet_start < after.len() {
+                let snippet_text = &after[snippet_start..];
+                // Take first ~200 chars, stop at sentence boundary
+                let max_len = snippet_text.len().min(200);
+                let chunk = &snippet_text[..max_len];
+                let end = chunk.rfind(". ").map(|p| p + 1).unwrap_or(max_len);
+                return chunk[..end].trim().to_string();
+            }
+        }
+        String::new()
+    }
 }
 
 /// Simple HTML entity decoder
@@ -395,28 +543,81 @@ fn default_num_results() -> usize {
 }
 
 /// Execute a web search
-pub async fn execute_search(
-    args: &SearchArgs,
-    config: &SearchConfig,
-) -> Result<String> {
-    let backend = match args.backend.as_deref() {
-        Some("searxng") => config.searxng.clone().ok_or_else(|| {
-            anyhow!("SearXNG not configured")
-        })?,
-        Some("serper") => config.serper.clone().ok_or_else(|| {
-            anyhow!("Serper not configured")
-        })?,
-        Some("brave") => config.brave.clone().ok_or_else(|| {
-            anyhow!("Brave not configured")
-        })?,
-        Some("duckduckgo") | None => SearchBackend::DuckDuckGo,
-        Some(other) => return Err(anyhow!("Unknown search backend: {}", other)),
-    };
+pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {
+    // When an explicit backend is requested, use it directly (no fallback)
+    if let Some(explicit) = args.backend.as_deref() {
+        let backend = match explicit {
+            "searxng" => config
+                .searxng
+                .clone()
+                .ok_or_else(|| anyhow!("SearXNG not configured"))?,
+            "serper" => config
+                .serper
+                .clone()
+                .ok_or_else(|| anyhow!("Serper not configured"))?,
+            "brave" => config
+                .brave
+                .clone()
+                .ok_or_else(|| anyhow!("Brave not configured"))?,
+            "playwright" => config
+                .playwright
+                .clone()
+                .ok_or_else(|| anyhow!("Playwright not configured"))?,
+            "duckduckgo" => SearchBackend::DuckDuckGo,
+            other => return Err(anyhow!("Unknown search backend: {}", other)),
+        };
+        let client = SearchClient::new(backend);
+        let response = client.search(&args.query, args.num_results).await?;
+        return Ok(format_search_results(&response));
+    }
 
+    // Build fallback chain from config (primary → fallback1 → fallback2)
+    let chain: Vec<&str> = [
+        config.primary.as_deref(),
+        config.fallback1.as_deref(),
+        config.fallback2.as_deref(),
+    ]
+    .iter()
+    .filter_map(|o| *o)
+    .filter(|s| *s != "none")
+    .collect();
+
+    if !chain.is_empty() {
+        let mut last_err = None;
+        for name in &chain {
+            if let Some(backend) = config.resolve_backend(name) {
+                let client = SearchClient::new(backend);
+                match client.search(&args.query, args.num_results).await {
+                    Ok(response) if !response.results.is_empty() => {
+                        return Ok(format_search_results(&response));
+                    }
+                    Ok(_) => {
+                        tracing::warn!("Search backend '{}' returned 0 results, trying next", name);
+                        last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Search backend '{}' failed: {}, trying next", name, e);
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")));
+    }
+
+    // No chain configured — legacy default: prefer Playwright, fall back to DuckDuckGo
+    let backend = if let Some(pw) = &config.playwright {
+        pw.clone()
+    } else {
+        SearchBackend::DuckDuckGo
+    };
     let client = SearchClient::new(backend);
     let response = client.search(&args.query, args.num_results).await?;
+    Ok(format_search_results(&response))
+}
 
-    // Format results
+/// Format search results into a human-readable string
+fn format_search_results(response: &SearchResponse) -> String {
     let mut output = format!("Search results for: {}\n\n", response.query);
     for (i, result) in response.results.iter().enumerate() {
         output.push_str(&format!(
@@ -427,8 +628,7 @@ pub async fn execute_search(
             result.snippet
         ));
     }
-
-    Ok(output)
+    output
 }
 
 /// Search configuration
@@ -437,4 +637,28 @@ pub struct SearchConfig {
     pub searxng: Option<SearchBackend>,
     pub serper: Option<SearchBackend>,
     pub brave: Option<SearchBackend>,
+    pub playwright: Option<SearchBackend>,
+    /// Preferred primary backend name (e.g. "playwright", "serper", "duckduckgo")
+    #[serde(default)]
+    pub primary: Option<String>,
+    /// First fallback backend name
+    #[serde(default)]
+    pub fallback1: Option<String>,
+    /// Second fallback backend name
+    #[serde(default)]
+    pub fallback2: Option<String>,
+}
+
+impl SearchConfig {
+    /// Resolve a backend name to a configured SearchBackend instance
+    pub fn resolve_backend(&self, name: &str) -> Option<SearchBackend> {
+        match name {
+            "playwright" => self.playwright.clone(),
+            "serper" => self.serper.clone(),
+            "searxng" => self.searxng.clone(),
+            "brave_api" | "brave" => self.brave.clone(),
+            "duckduckgo" => Some(SearchBackend::DuckDuckGo),
+            _ => None,
+        }
+    }
 }

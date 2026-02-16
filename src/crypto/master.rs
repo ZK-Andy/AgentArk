@@ -1,0 +1,256 @@
+//! Master password management for AgentArk
+//!
+//! When a master password is set, all encryption keys are derived from it
+//! via Argon2id. The password itself is never stored - only a salt and a
+//! verification hash (derived with a separate salt so it cannot reveal
+//! the encryption key).
+//!
+//! Persisted file: `config_dir/master.json`
+
+use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::{derive_key, generate_salt, KeyManager, KEY_LEN};
+
+/// Persisted master password metadata
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MasterMeta {
+    /// Salt for encryption key derivation (hex-encoded)
+    salt: String,
+    /// Salt for verification hash (hex-encoded, different from encryption salt)
+    verification_salt: String,
+    /// Argon2id hash output for password verification (hex-encoded)
+    verification_hash: String,
+    /// Schema version for future upgrades
+    version: u32,
+    /// True when this installation is using a generated bootstrap password.
+    #[serde(default)]
+    bootstrap: bool,
+}
+
+pub struct MasterPasswordManager {
+    config_dir: PathBuf,
+    _data_dir: PathBuf,
+}
+
+impl MasterPasswordManager {
+    pub fn new(config_dir: &Path, data_dir: &Path) -> Self {
+        Self {
+            config_dir: config_dir.to_path_buf(),
+            _data_dir: data_dir.to_path_buf(),
+        }
+    }
+
+    fn meta_path(&self) -> PathBuf {
+        self.config_dir.join("master.json")
+    }
+
+    fn keyfile_path(&self) -> PathBuf {
+        self.config_dir.join(".keyfile")
+    }
+
+    fn derive_bootstrap_password(&self) -> Result<String> {
+        let keyfile = self.keyfile_path();
+        // Ensure keyfile exists.
+        let _ = KeyManager::load_or_create(&keyfile)?;
+        let key_data = std::fs::read(&keyfile)
+            .map_err(|e| anyhow!("Failed to read bootstrap keyfile at {:?}: {}", keyfile, e))?;
+        if key_data.len() != KEY_LEN {
+            return Err(anyhow!(
+                "Invalid bootstrap keyfile length at {:?}: expected {} bytes, got {}",
+                keyfile,
+                KEY_LEN,
+                key_data.len()
+            ));
+        }
+
+        let mut material = Vec::with_capacity(32 + key_data.len());
+        material.extend_from_slice(b"agentark-bootstrap-v1:");
+        material.extend_from_slice(&key_data);
+        Ok(format!("ak_bootstrap_{}", URL_SAFE_NO_PAD.encode(material)))
+    }
+
+    /// Check whether a master password has been configured
+    pub fn is_password_set(&self) -> bool {
+        self.meta_path().exists()
+    }
+
+    pub fn is_bootstrap_password_active(&self) -> Result<bool> {
+        if !self.is_password_set() {
+            return Ok(false);
+        }
+        Ok(self.load_meta()?.bootstrap)
+    }
+
+    pub fn bootstrap_password_if_active(&self) -> Result<Option<String>> {
+        if self.is_bootstrap_password_active()? {
+            Ok(Some(self.derive_bootstrap_password()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Verify password and return the derived encryption key
+    pub fn unlock(&self, password: &str) -> Result<Arc<KeyManager>> {
+        let meta = self.load_meta()?;
+
+        // Verify password against stored hash
+        let v_salt = hex::decode(&meta.verification_salt)
+            .map_err(|_| anyhow!("Corrupt master.json: bad verification_salt hex"))?;
+        let v_hash = derive_key(password.as_bytes(), &v_salt)?;
+        let expected = hex::decode(&meta.verification_hash)
+            .map_err(|_| anyhow!("Corrupt master.json: bad verification_hash hex"))?;
+
+        if v_hash[..] != expected[..] {
+            return Err(anyhow!("Invalid master password"));
+        }
+
+        // Derive the encryption key (using the encryption salt, not the verification salt)
+        let enc_salt =
+            hex::decode(&meta.salt).map_err(|_| anyhow!("Corrupt master.json: bad salt hex"))?;
+        let km = KeyManager::from_password(password, &enc_salt)?;
+        Ok(Arc::new(km))
+    }
+
+    fn set_password_with_mode(&self, password: &str, bootstrap: bool) -> Result<Arc<KeyManager>> {
+        // Generate separate salts for encryption and verification
+        let enc_salt = generate_salt();
+        let v_salt = generate_salt();
+
+        // Derive the encryption key
+        let km = KeyManager::from_password(password, &enc_salt)?;
+
+        // Derive the verification hash (separate derivation, separate salt)
+        let v_hash = derive_key(password.as_bytes(), &v_salt)?;
+
+        // Write metadata
+        let meta = MasterMeta {
+            salt: hex::encode(enc_salt),
+            verification_salt: hex::encode(v_salt),
+            verification_hash: hex::encode(v_hash),
+            version: 1,
+            bootstrap,
+        };
+        let json = serde_json::to_string_pretty(&meta)?;
+        std::fs::write(self.meta_path(), json)?;
+
+        if bootstrap {
+            tracing::info!(
+                "Bootstrap master password initialized (per-install, derived from local keyfile)"
+            );
+        } else {
+            tracing::info!("Master password set - encryption keys derived from password");
+        }
+        Ok(Arc::new(km))
+    }
+
+    /// Set a master password (first time or overwrite)
+    /// Returns the new unified encryption key
+    pub fn set_password(&self, password: &str) -> Result<Arc<KeyManager>> {
+        self.set_password_with_mode(password, false)
+    }
+
+    /// Initialize a per-install bootstrap password if no master password is configured.
+    /// Returns `Some(key)` only when bootstrap initialization occurred.
+    pub fn initialize_bootstrap_password_if_needed(&self) -> Result<Option<Arc<KeyManager>>> {
+        if self.is_password_set() {
+            return Ok(None);
+        }
+        let bootstrap_password = self.derive_bootstrap_password()?;
+        let key = self.set_password_with_mode(&bootstrap_password, true)?;
+        Ok(Some(key))
+    }
+
+    /// Remove master password - revert to auto-generated keyfile
+    /// Caller is responsible for re-encrypting data with the returned key
+    pub fn remove_password(&self) -> Result<Arc<KeyManager>> {
+        let keyfile = self.config_dir.join(".keyfile");
+        let km = Arc::new(KeyManager::load_or_create(&keyfile)?);
+
+        // Remove master.json
+        let _ = std::fs::remove_file(self.meta_path());
+
+        tracing::info!("Master password removed - reverted to keyfile encryption");
+        Ok(km)
+    }
+
+    fn load_meta(&self) -> Result<MasterMeta> {
+        let path = self.meta_path();
+        if !path.exists() {
+            return Err(anyhow!(
+                "No master password configured (master.json not found)"
+            ));
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let meta: MasterMeta = serde_json::from_str(&content)?;
+        Ok(meta)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_and_unlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
+
+        assert!(!mgr.is_password_set());
+
+        let key = mgr.set_password("test-password-123").unwrap();
+        assert!(mgr.is_password_set());
+        assert!(!mgr.is_bootstrap_password_active().unwrap());
+
+        // Correct password unlocks
+        let key2 = mgr.unlock("test-password-123").unwrap();
+
+        // Both keys should produce same encryption results
+        let plaintext = b"hello world";
+        let encrypted = key.encrypt(plaintext).unwrap();
+        let decrypted = key2.decrypt(&encrypted).unwrap();
+        assert_eq!(plaintext, &decrypted[..]);
+
+        // Wrong password fails
+        assert!(mgr.unlock("wrong-password").is_err());
+    }
+
+    #[test]
+    fn test_bootstrap_password_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
+
+        let key = mgr
+            .initialize_bootstrap_password_if_needed()
+            .unwrap()
+            .expect("bootstrap should initialize on first run");
+
+        assert!(mgr.is_password_set());
+        assert!(mgr.is_bootstrap_password_active().unwrap());
+
+        let bootstrap = mgr
+            .bootstrap_password_if_active()
+            .unwrap()
+            .expect("bootstrap password should exist");
+
+        let unlocked = mgr.unlock(&bootstrap).unwrap();
+        let plaintext = b"bootstrap roundtrip";
+        let encrypted = key.encrypt(plaintext).unwrap();
+        let decrypted = unlocked.decrypt(&encrypted).unwrap();
+        assert_eq!(plaintext, &decrypted[..]);
+    }
+
+    #[test]
+    fn test_remove_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MasterPasswordManager::new(tmp.path(), tmp.path());
+
+        mgr.set_password("my-password").unwrap();
+        assert!(mgr.is_password_set());
+
+        let _new_key = mgr.remove_password().unwrap();
+        assert!(!mgr.is_password_set());
+    }
+}

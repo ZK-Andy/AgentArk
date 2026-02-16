@@ -1,5 +1,13 @@
 /target
 /dist
+node_modules/
+.npmcache/
+.npm-cache*/
+frontend/.vite/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/dist/
 
 # Secrets and user data
 *.enc
@@ -17,9 +25,15 @@ data/
 .env
 .env.*
 
+# Test artifacts
+tests/e2e/report/
+tests/e2e/test-results/
+
 # IDE / local
 .claude/
 .idea/
 .vscode/
 *.swp
 *.swo
+remotion*
+nul

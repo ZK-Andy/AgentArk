@@ -36,9 +36,9 @@ copy "%PROJECT_ROOT%\target\release\nyrbot.exe" "%BUILD_DIR%\%PACKAGE_NAME%\" >n
 mkdir "%BUILD_DIR%\%PACKAGE_NAME%\config" 2>nul
 xcopy /E /I /Y "%PROJECT_ROOT%\config" "%BUILD_DIR%\%PACKAGE_NAME%\config" >nul 2>&1
 
-:: Copy actions
-mkdir "%BUILD_DIR%\%PACKAGE_NAME%\actions" 2>nul
-xcopy /E /I /Y "%PROJECT_ROOT%\actions" "%BUILD_DIR%\%PACKAGE_NAME%\actions" >nul 2>&1
+:: Copy skills
+mkdir "%BUILD_DIR%\%PACKAGE_NAME%\skills" 2>nul
+xcopy /E /I /Y "%PROJECT_ROOT%\skills" "%BUILD_DIR%\%PACKAGE_NAME%\skills" >nul 2>&1
 
 :: Create install script
 (
@@ -53,11 +53,11 @@ echo.
 echo mkdir "%%INSTALL_DIR%%\bin" 2^>nul
 echo mkdir "%%INSTALL_DIR%%\config" 2^>nul
 echo mkdir "%%INSTALL_DIR%%\data" 2^>nul
-echo mkdir "%%INSTALL_DIR%%\actions" 2^>nul
+echo mkdir "%%INSTALL_DIR%%\skills" 2^>nul
 echo.
 echo copy /Y nyrbot.exe "%%INSTALL_DIR%%\bin\" ^>nul
 echo xcopy /E /I /Y config "%%INSTALL_DIR%%\config" ^>nul 2^>^&1
-echo xcopy /E /I /Y actions "%%INSTALL_DIR%%\actions" ^>nul 2^>^&1
+echo xcopy /E /I /Y skills "%%INSTALL_DIR%%\skills" ^>nul 2^>^&1
 echo.
 echo echo @echo off ^> "%%INSTALL_DIR%%\run.bat"
 echo echo set CRATE_AGENT_CONFIG=%%INSTALL_DIR%%\config ^>^> "%%INSTALL_DIR%%\run.bat"

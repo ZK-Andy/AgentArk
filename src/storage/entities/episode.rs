@@ -24,6 +24,9 @@ pub struct Model {
     /// Number of times this memory has been accessed
     #[sea_orm(default_value = "0")]
     pub access_count: i32,
+    /// Optional project scope
+    #[sea_orm(nullable)]
+    pub project_id: Option<String>,
 }
 
 #[allow(dead_code)]

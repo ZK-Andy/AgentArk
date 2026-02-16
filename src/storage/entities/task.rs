@@ -22,6 +22,14 @@ pub struct Model {
     pub result: Option<String>,
     #[sea_orm(nullable)]
     pub proof_id: Option<String>,
+    #[sea_orm(nullable)]
+    pub priority: Option<f64>,
+    #[sea_orm(nullable)]
+    pub urgency: Option<f64>,
+    #[sea_orm(nullable)]
+    pub importance: Option<f64>,
+    #[sea_orm(nullable)]
+    pub eisenhower_quadrant: Option<i32>,
 }
 
 #[allow(dead_code)]

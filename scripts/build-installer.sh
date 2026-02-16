@@ -8,7 +8,7 @@ VERSION="0.1.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/dist"
-PACKAGE_NAME="cogniark-$VERSION"
+PACKAGE_NAME="agentark-$VERSION"
 
 echo "╔═══════════════════════════════════════════════════════════╗"
 echo "║          Crate Agent - Build Installer v$VERSION            ║"
@@ -26,16 +26,16 @@ cargo build --release
 
 # Copy binary
 echo "Packaging files..."
-cp "$PROJECT_ROOT/target/release/cogniark" "$BUILD_DIR/$PACKAGE_NAME/" 2>/dev/null || \
-cp "$PROJECT_ROOT/target/release/cogniark.exe" "$BUILD_DIR/$PACKAGE_NAME/"
+cp "$PROJECT_ROOT/target/release/agentark" "$BUILD_DIR/$PACKAGE_NAME/" 2>/dev/null || \
+cp "$PROJECT_ROOT/target/release/agentark.exe" "$BUILD_DIR/$PACKAGE_NAME/"
 
 # Copy config templates
 mkdir -p "$BUILD_DIR/$PACKAGE_NAME/config"
 cp -r "$PROJECT_ROOT/config/"* "$BUILD_DIR/$PACKAGE_NAME/config/" 2>/dev/null || true
 
-# Copy actions
-mkdir -p "$BUILD_DIR/$PACKAGE_NAME/actions"
-cp -r "$PROJECT_ROOT/actions/"* "$BUILD_DIR/$PACKAGE_NAME/actions/" 2>/dev/null || true
+# Copy skills
+mkdir -p "$BUILD_DIR/$PACKAGE_NAME/skills"
+cp -r "$PROJECT_ROOT/skills/"* "$BUILD_DIR/$PACKAGE_NAME/skills/" 2>/dev/null || true
 
 # Create install script
 cat > "$BUILD_DIR/$PACKAGE_NAME/install.sh" << 'INSTALL_EOF'
@@ -44,22 +44,22 @@ cat > "$BUILD_DIR/$PACKAGE_NAME/install.sh" << 'INSTALL_EOF'
 
 set -e
 
-INSTALL_DIR="${1:-$HOME/.cogniark}"
+INSTALL_DIR="${1:-$HOME/.agentark}"
 
 echo "Installing Crate Agent to $INSTALL_DIR..."
 
 mkdir -p "$INSTALL_DIR/bin"
 mkdir -p "$INSTALL_DIR/config"
 mkdir -p "$INSTALL_DIR/data"
-mkdir -p "$INSTALL_DIR/actions"
+mkdir -p "$INSTALL_DIR/skills"
 
 # Copy files
-cp cogniark* "$INSTALL_DIR/bin/"
+cp agentark* "$INSTALL_DIR/bin/"
 cp -r config/* "$INSTALL_DIR/config/" 2>/dev/null || true
-cp -r actions/* "$INSTALL_DIR/actions/" 2>/dev/null || true
+cp -r skills/* "$INSTALL_DIR/skills/" 2>/dev/null || true
 
 # Make executable
-chmod +x "$INSTALL_DIR/bin/cogniark"*
+chmod +x "$INSTALL_DIR/bin/agentark"*
 
 # Create launcher script
 cat > "$INSTALL_DIR/run.sh" << 'EOF'
@@ -67,7 +67,7 @@ cat > "$INSTALL_DIR/run.sh" << 'EOF'
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CRATE_AGENT_CONFIG="$SCRIPT_DIR/config"
 export CRATE_AGENT_DATA="$SCRIPT_DIR/data"
-exec "$SCRIPT_DIR/bin/cogniark" "$@"
+exec "$SCRIPT_DIR/bin/agentark" "$@"
 EOF
 chmod +x "$INSTALL_DIR/run.sh"
 
@@ -87,7 +87,7 @@ cat > "$BUILD_DIR/$PACKAGE_NAME/install.bat" << 'INSTALL_BAT'
 @echo off
 setlocal
 
-set INSTALL_DIR=%USERPROFILE%\.cogniark
+set INSTALL_DIR=%USERPROFILE%\.agentark
 if not "%~1"=="" set INSTALL_DIR=%~1
 
 echo Installing Crate Agent to %INSTALL_DIR%...
@@ -95,16 +95,16 @@ echo Installing Crate Agent to %INSTALL_DIR%...
 mkdir "%INSTALL_DIR%\bin" 2>nul
 mkdir "%INSTALL_DIR%\config" 2>nul
 mkdir "%INSTALL_DIR%\data" 2>nul
-mkdir "%INSTALL_DIR%\actions" 2>nul
+mkdir "%INSTALL_DIR%\skills" 2>nul
 
-copy /Y cogniark.exe "%INSTALL_DIR%\bin\" >nul
+copy /Y agentark.exe "%INSTALL_DIR%\bin\" >nul
 xcopy /E /I /Y config "%INSTALL_DIR%\config" >nul 2>&1
-xcopy /E /I /Y actions "%INSTALL_DIR%\actions" >nul 2>&1
+xcopy /E /I /Y skills "%INSTALL_DIR%\skills" >nul 2>&1
 
 echo @echo off > "%INSTALL_DIR%\run.bat"
 echo set CRATE_AGENT_CONFIG=%INSTALL_DIR%\config >> "%INSTALL_DIR%\run.bat"
 echo set CRATE_AGENT_DATA=%INSTALL_DIR%\data >> "%INSTALL_DIR%\run.bat"
-echo "%INSTALL_DIR%\bin\cogniark.exe" %%* >> "%INSTALL_DIR%\run.bat"
+echo "%INSTALL_DIR%\bin\agentark.exe" %%* >> "%INSTALL_DIR%\run.bat"
 
 echo.
 echo Installation complete!

@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use super::search::{SearchBackend, SearchClient, SearchConfig, SearchResult};
 
 /// Research request parameters
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResearchArgs {
     /// The topic or question to research
@@ -20,8 +19,8 @@ pub struct ResearchArgs {
     #[serde(default = "default_max_sources")]
     pub max_sources: usize,
     /// Whether to include source URLs in output
-    #[serde(default = "default_include_sources")]
-    pub include_sources: bool,
+    #[serde(default = "default_include_sources", rename = "include_sources")]
+    pub _include_sources: bool,
     /// Preferred search backend
     pub backend: Option<String>,
     /// Depth of research (quick, standard, deep)
@@ -120,7 +119,9 @@ impl ResearchClient {
 
     /// Quick research - just search results
     async fn quick_research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
-        let search_results = self.search(&args.query, args.max_sources, &args.backend).await?;
+        let search_results = self
+            .search(&args.query, args.max_sources, &args.backend)
+            .await?;
 
         let findings: Vec<Finding> = search_results
             .iter()
@@ -155,7 +156,9 @@ impl ResearchClient {
 
     /// Standard research - search + fetch content
     async fn standard_research(&self, args: &ResearchArgs) -> Result<ResearchResult> {
-        let search_results = self.search(&args.query, args.max_sources, &args.backend).await?;
+        let search_results = self
+            .search(&args.query, args.max_sources, &args.backend)
+            .await?;
 
         let mut sources: Vec<Source> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
@@ -273,27 +276,91 @@ impl ResearchClient {
         })
     }
 
-    /// Search using configured backend
+    /// Search using configured backend with fallback chain
     async fn search(
         &self,
         query: &str,
         num_results: usize,
         backend_preference: &Option<String>,
     ) -> Result<Vec<SearchResult>> {
-        let backend = match backend_preference.as_deref() {
-            Some("searxng") => self.search_config.searxng.clone().ok_or_else(|| {
-                anyhow!("SearXNG not configured")
-            })?,
-            Some("serper") => self.search_config.serper.clone().ok_or_else(|| {
-                anyhow!("Serper not configured")
-            })?,
-            Some("brave") => self.search_config.brave.clone().ok_or_else(|| {
-                anyhow!("Brave not configured")
-            })?,
-            Some("duckduckgo") | None => SearchBackend::DuckDuckGo,
-            Some(other) => return Err(anyhow!("Unknown search backend: {}", other)),
-        };
+        // Explicit backend requested — use it directly
+        if let Some(explicit) = backend_preference.as_deref() {
+            let backend = match explicit {
+                "searxng" => self
+                    .search_config
+                    .searxng
+                    .clone()
+                    .ok_or_else(|| anyhow!("SearXNG not configured"))?,
+                "serper" => self
+                    .search_config
+                    .serper
+                    .clone()
+                    .ok_or_else(|| anyhow!("Serper not configured"))?,
+                "brave" => self
+                    .search_config
+                    .brave
+                    .clone()
+                    .ok_or_else(|| anyhow!("Brave not configured"))?,
+                "playwright" => self
+                    .search_config
+                    .playwright
+                    .clone()
+                    .ok_or_else(|| anyhow!("Playwright not configured"))?,
+                "duckduckgo" => SearchBackend::DuckDuckGo,
+                other => return Err(anyhow!("Unknown search backend: {}", other)),
+            };
+            let client = SearchClient::new(backend);
+            let response = client.search(query, num_results).await?;
+            return Ok(response.results);
+        }
 
+        // Build fallback chain from config
+        let chain: Vec<&str> = [
+            self.search_config.primary.as_deref(),
+            self.search_config.fallback1.as_deref(),
+            self.search_config.fallback2.as_deref(),
+        ]
+        .iter()
+        .filter_map(|o| *o)
+        .filter(|s| *s != "none")
+        .collect();
+
+        if !chain.is_empty() {
+            let mut last_err = None;
+            for name in &chain {
+                if let Some(backend) = self.search_config.resolve_backend(name) {
+                    let client = SearchClient::new(backend);
+                    match client.search(query, num_results).await {
+                        Ok(response) if !response.results.is_empty() => {
+                            return Ok(response.results);
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "Research: search backend '{}' returned 0 results, trying next",
+                                name
+                            );
+                            last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Research: search backend '{}' failed: {}, trying next",
+                                name,
+                                e
+                            );
+                            last_err = Some(e);
+                        }
+                    }
+                }
+            }
+            return Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")));
+        }
+
+        // No chain configured — legacy default
+        let backend = if let Some(pw) = &self.search_config.playwright {
+            pw.clone()
+        } else {
+            SearchBackend::DuckDuckGo
+        };
         let client = SearchClient::new(backend);
         let response = client.search(query, num_results).await?;
         Ok(response.results)
@@ -362,7 +429,10 @@ impl ResearchClient {
     /// Extract key points from content relevant to the query
     fn extract_key_points(&self, content: &str, query: &str) -> Vec<String> {
         let query_lower = query.to_lowercase();
-        let query_words: Vec<String> = query_lower.split_whitespace().map(|s| s.to_string()).collect();
+        let query_words: Vec<String> = query_lower
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
         let mut key_points = Vec::new();
 
         // Split content into sentences
@@ -401,9 +471,18 @@ impl ResearchClient {
 
         // Known reliable domains
         let reliable_domains = [
-            "wikipedia.org", "arxiv.org", "nature.com", "science.org",
-            "bbc.com", "reuters.com", "apnews.com", "nytimes.com",
-            "github.com", "stackoverflow.com", "docs.rs", "crates.io",
+            "wikipedia.org",
+            "arxiv.org",
+            "nature.com",
+            "science.org",
+            "bbc.com",
+            "reuters.com",
+            "apnews.com",
+            "nytimes.com",
+            "github.com",
+            "stackoverflow.com",
+            "docs.rs",
+            "crates.io",
         ];
 
         for domain in &reliable_domains {
@@ -446,11 +525,11 @@ impl ResearchClient {
             return format!("No relevant information found for: {}", query);
         }
 
-        let avg_confidence: f32 = findings.iter().map(|f| f.confidence).sum::<f32>()
-            / findings.len() as f32;
+        let avg_confidence: f32 =
+            findings.iter().map(|f| f.confidence).sum::<f32>() / findings.len() as f32;
 
-        let avg_reliability: f32 = sources.iter().map(|s| s.reliability).sum::<f32>()
-            / sources.len().max(1) as f32;
+        let avg_reliability: f32 =
+            sources.iter().map(|s| s.reliability).sum::<f32>() / sources.len().max(1) as f32;
 
         let key_findings: Vec<String> = findings
             .iter()
@@ -511,9 +590,9 @@ impl ResearchClient {
         let mut unique: Vec<Finding> = Vec::new();
 
         for finding in findings {
-            let is_duplicate = unique.iter().any(|existing| {
-                self.similarity(&existing.content, &finding.content) > 0.7
-            });
+            let is_duplicate = unique
+                .iter()
+                .any(|existing| self.similarity(&existing.content, &finding.content) > 0.7);
 
             if !is_duplicate {
                 unique.push(finding);
@@ -528,10 +607,8 @@ impl ResearchClient {
         let a_lower = a.to_lowercase();
         let b_lower = b.to_lowercase();
 
-        let words_a: std::collections::HashSet<&str> =
-            a_lower.split_whitespace().collect();
-        let words_b: std::collections::HashSet<&str> =
-            b_lower.split_whitespace().collect();
+        let words_a: std::collections::HashSet<&str> = a_lower.split_whitespace().collect();
+        let words_b: std::collections::HashSet<&str> = b_lower.split_whitespace().collect();
 
         let intersection = words_a.intersection(&words_b).count();
         let union = words_a.union(&words_b).count();

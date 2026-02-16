@@ -1,0 +1,14 @@
+{
+  "name": "agentark-playwright-bridge",
+  "version": "1.0.0",
+  "description": "Playwright browser automation sidecar for AgentArk",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "playwright": "^1.50.0",
+    "uuid": "^10.0.0"
+  }
+}

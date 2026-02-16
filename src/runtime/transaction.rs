@@ -7,24 +7,23 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// A filesystem transaction
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Transaction {
     /// Transaction ID
     pub id: Uuid,
 
     /// When the transaction started
-    pub started_at: DateTime<Utc>,
+    pub _started_at: DateTime<Utc>,
 
     /// Snapshot directory
-    pub snapshot_dir: PathBuf,
+    pub _snapshot_dir: PathBuf,
 
     /// Files that were modified
-    pub modified_files: Vec<PathBuf>,
+    pub _modified_files: Vec<PathBuf>,
 
     /// Original file contents (for rollback)
     pub original_contents: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -34,27 +33,11 @@ impl Transaction {
     pub fn new(snapshot_dir: PathBuf) -> Self {
         Self {
             id: Uuid::new_v4(),
-            started_at: Utc::now(),
-            snapshot_dir,
-            modified_files: vec![],
+            _started_at: Utc::now(),
+            _snapshot_dir: snapshot_dir,
+            _modified_files: vec![],
             original_contents: vec![],
         }
-    }
-
-    /// Record a file modification
-    #[allow(dead_code)]
-    pub fn record_modification(&mut self, path: &Path) -> Result<()> {
-        // Store original content
-        let original = if path.exists() {
-            Some(std::fs::read(path)?)
-        } else {
-            None
-        };
-
-        self.original_contents.push((path.to_path_buf(), original));
-        self.modified_files.push(path.to_path_buf());
-
-        Ok(())
     }
 
     /// Rollback all changes
@@ -80,15 +63,14 @@ impl Transaction {
 /// Manages transactions
 pub struct TransactionManager {
     snapshot_dir: PathBuf,
-    #[allow(dead_code)]
-    active_transactions: Vec<Transaction>,
+    _active_transactions: Vec<Transaction>,
 }
 
 impl TransactionManager {
     pub fn new(snapshot_dir: PathBuf) -> Self {
         Self {
             snapshot_dir,
-            active_transactions: vec![],
+            _active_transactions: vec![],
         }
     }
 
@@ -123,87 +105,4 @@ impl TransactionManager {
 
         Ok(())
     }
-
-    /// Create a full filesystem snapshot (for heavy operations)
-    #[allow(dead_code)]
-    pub async fn create_snapshot(&self, paths: &[PathBuf]) -> Result<Uuid> {
-        let snapshot_id = Uuid::new_v4();
-        let snapshot_path = self.snapshot_dir.join(snapshot_id.to_string());
-        std::fs::create_dir_all(&snapshot_path)?;
-
-        for path in paths {
-            if path.exists() {
-                let dest = snapshot_path.join(
-                    path.file_name()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
-                );
-
-                // Try to use copy-on-write if available
-                if let Err(_) = reflink_copy::reflink(path, &dest) {
-                    // Fall back to regular copy
-                    if path.is_dir() {
-                        copy_dir_all(path, &dest)?;
-                    } else {
-                        std::fs::copy(path, &dest)?;
-                    }
-                }
-            }
-        }
-
-        Ok(snapshot_id)
-    }
-
-    /// Restore from a snapshot
-    #[allow(dead_code)]
-    pub async fn restore_snapshot(&self, snapshot_id: Uuid, paths: &[PathBuf]) -> Result<()> {
-        let snapshot_path = self.snapshot_dir.join(snapshot_id.to_string());
-
-        if !snapshot_path.exists() {
-            return Err(anyhow::anyhow!("Snapshot not found: {}", snapshot_id));
-        }
-
-        for path in paths {
-            let src = snapshot_path.join(
-                path.file_name()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid path"))?,
-            );
-
-            if src.exists() {
-                if path.exists() {
-                    if path.is_dir() {
-                        std::fs::remove_dir_all(path)?;
-                    } else {
-                        std::fs::remove_file(path)?;
-                    }
-                }
-
-                if src.is_dir() {
-                    copy_dir_all(&src, path)?;
-                } else {
-                    std::fs::copy(&src, path)?;
-                }
-            }
-        }
-
-        // Clean up snapshot
-        std::fs::remove_dir_all(snapshot_path)?;
-
-        Ok(())
-    }
-}
-
-/// Recursively copy a directory
-#[allow(dead_code)]
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
 }

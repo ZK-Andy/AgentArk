@@ -1,0 +1,6 @@
+# Override for E2E testing — disables API auth
+# Usage: docker compose -f docker-compose.yml -f tests/e2e/docker-compose.test.yml up -d --build
+services:
+  agentark:
+    environment:
+      - AGENTARK_INSECURE_NO_AUTH=true

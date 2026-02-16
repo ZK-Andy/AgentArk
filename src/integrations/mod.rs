@@ -1,17 +1,48 @@
 //! External Service Integrations
 //!
-//! Connects CogniArk to external services like Google Calendar, WhatsApp, etc.
+//! Connects AgentArk to external services like Google Calendar, WhatsApp, etc.
 //! Each integration implements the `Integration` trait for unified handling.
 
+pub mod browser;
 pub mod calendar;
-pub mod oauth;
-pub mod whatsapp;
+pub mod ga4;
+pub mod garmin;
+pub mod github;
+pub mod gsc;
 pub mod media_gen;
+pub mod mem0;
+pub mod moltbook;
+pub mod notion;
+pub mod oauth;
+pub mod onepassword;
+pub mod ordering;
+pub mod places;
+pub mod social_analytics;
+pub mod twilio;
+pub mod twitter;
+pub mod whatsapp;
+pub mod whoop;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+fn integration_enabled_key(id: &str) -> String {
+    format!("integration_enabled:{}", id)
+}
+
+fn parse_boolish(value: &str) -> Option<bool> {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    match v.as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
 
 /// Capabilities an integration can provide
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -26,6 +57,8 @@ pub enum Capability {
     Search,
     /// Can delete data
     Delete,
+    /// Can send notifications/messages to the user
+    Notify,
 }
 
 /// Integration status
@@ -78,17 +111,16 @@ pub trait Integration: Send + Sync {
 }
 
 /// Integration manager - holds all configured integrations
-#[allow(dead_code)]
 pub struct IntegrationManager {
     integrations: HashMap<String, Box<dyn Integration>>,
-    config_dir: std::path::PathBuf,
+    _config_dir: std::path::PathBuf,
 }
 
 impl IntegrationManager {
     pub fn new(config_dir: &std::path::Path) -> Self {
         let mut manager = Self {
             integrations: HashMap::new(),
-            config_dir: config_dir.to_path_buf(),
+            _config_dir: config_dir.to_path_buf(),
         };
 
         // Register available integrations
@@ -98,29 +130,97 @@ impl IntegrationManager {
 
     /// Register default integrations (Google Calendar, WhatsApp, Media Gen)
     fn register_default_integrations(&mut self) {
+        let config_dir = self._config_dir.clone();
+
         // Register Google Calendar
         let calendar = calendar::GoogleCalendarConnector::new();
-        self.integrations.insert("google_calendar".to_string(), Box::new(calendar));
+        self.integrations
+            .insert("google_calendar".to_string(), Box::new(calendar));
 
         // Register WhatsApp
         let whatsapp = whatsapp::WhatsAppConnector::new();
-        self.integrations.insert("whatsapp".to_string(), Box::new(whatsapp));
+        self.integrations
+            .insert("whatsapp".to_string(), Box::new(whatsapp));
 
         // Register AI Media Generation (Image/Video)
         let media_gen = media_gen::MediaGenConnector::new();
-        self.integrations.insert("media_gen".to_string(), Box::new(media_gen));
-    }
+        self.integrations
+            .insert("media_gen".to_string(), Box::new(media_gen));
 
-    /// Register an integration
-    #[allow(dead_code)]
-    pub fn register(&mut self, integration: Box<dyn Integration>) {
-        let id = integration.id().to_string();
-        self.integrations.insert(id, integration);
+        // Register GitHub
+        let github = github::GitHubConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("github".to_string(), Box::new(github));
+
+        // Register Notion
+        let notion = notion::NotionConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("notion".to_string(), Box::new(notion));
+
+        // Register Twitter/X
+        let twitter = twitter::TwitterConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("twitter".to_string(), Box::new(twitter));
+
+        // Register 1Password
+        let onepassword =
+            onepassword::OnePasswordConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("onepassword".to_string(), Box::new(onepassword));
+
+        // Register Google Places
+        let places = places::GooglePlacesConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("google_places".to_string(), Box::new(places));
+
+        // Register Twilio Voice & SMS
+        let twilio = twilio::TwilioConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("twilio".to_string(), Box::new(twilio));
+
+        // Register Ordering & Purchasing
+        let ordering = ordering::OrderingConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("ordering".to_string(), Box::new(ordering));
+
+        // Register Browser Automation (Playwright sidecar)
+        let browser = browser::BrowserIntegration::new();
+        self.integrations
+            .insert("browser".to_string(), Box::new(browser));
+
+        // Curated health + analytics connectors
+        let garmin = garmin::GarminConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("garmin".to_string(), Box::new(garmin));
+
+        let whoop = whoop::WhoopConnector::new_with_config_dir(config_dir.clone());
+        self.integrations
+            .insert("whoop".to_string(), Box::new(whoop));
+
+        let ga4 = ga4::Ga4Connector::new_with_config_dir(config_dir.clone());
+        self.integrations.insert("ga4".to_string(), Box::new(ga4));
+
+        let gsc = gsc::GscConnector::new_with_config_dir(config_dir.clone());
+        self.integrations.insert("gsc".to_string(), Box::new(gsc));
+
+        let social = social_analytics::SocialAnalyticsConnector::new_with_config_dir(config_dir);
+        self.integrations
+            .insert("social_analytics".to_string(), Box::new(social));
+
+        // Register Moltbook
+        let moltbook = moltbook::MoltbookConnector::new_with_config_dir(self._config_dir.clone());
+        self.integrations
+            .insert("moltbook".to_string(), Box::new(moltbook));
     }
 
     /// Get an integration by ID
     pub fn get(&self, id: &str) -> Option<&dyn Integration> {
         self.integrations.get(id).map(|i| i.as_ref())
+    }
+
+    /// List registered integration IDs.
+    pub fn ids(&self) -> Vec<String> {
+        self.integrations.keys().cloned().collect()
     }
 
     /// List all integrations with their status
@@ -139,10 +239,44 @@ impl IntegrationManager {
         result
     }
 
+    /// Return all connected integrations that support notifications
+    pub async fn notifiable_integrations(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for (id, integration) in &self.integrations {
+            if integration.capabilities().contains(&Capability::Notify)
+                && integration.is_connected().await
+            {
+                result.push(id.clone());
+            }
+        }
+        result
+    }
+
     /// Execute an action on an integration
-    #[allow(dead_code)]
-    pub async fn execute(&self, integration_id: &str, action: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
-        let integration = self.integrations.get(integration_id)
+    pub async fn execute(
+        &self,
+        integration_id: &str,
+        action: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        // Enforce user enable/disable toggle (stored in encrypted secrets).
+        if let Ok(manager) = crate::core::config::SecureConfigManager::new(&self._config_dir) {
+            if let Ok(Some(v)) = manager.get_custom_secret(&integration_enabled_key(integration_id))
+            {
+                if let Some(enabled) = parse_boolish(&v) {
+                    if !enabled {
+                        return Err(anyhow::anyhow!(
+                            "Integration '{}' is disabled",
+                            integration_id
+                        ));
+                    }
+                }
+            }
+        }
+
+        let integration = self
+            .integrations
+            .get(integration_id)
             .ok_or_else(|| anyhow::anyhow!("Integration '{}' not found", integration_id))?;
 
         integration.execute(action, params).await

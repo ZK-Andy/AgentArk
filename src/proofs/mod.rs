@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -60,20 +60,6 @@ impl ExecutionProof {
         hex::encode(hasher.finalize())
     }
 
-    /// Verify the proof signature
-    #[allow(dead_code)]
-    pub fn verify(&self, verifying_key: &ed25519_dalek::VerifyingKey) -> bool {
-        let data_to_verify = self.data_for_signing();
-        let sig_bytes = match hex::decode(&self.signature) {
-            Ok(b) if b.len() == 64 => b,
-            _ => return false,
-        };
-        let mut sig_array = [0u8; 64];
-        sig_array.copy_from_slice(&sig_bytes);
-        let signature = Signature::from_bytes(&sig_array);
-        verifying_key.verify_strict(&data_to_verify, &signature).is_ok()
-    }
-
     fn data_for_signing(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(self.id.as_bytes());
@@ -110,38 +96,6 @@ impl ExecutionTrace {
             latest_hash: None,
         }
     }
-
-    /// Verify the entire chain
-    #[allow(dead_code)]
-    pub fn verify_chain(&self, verifying_key: &ed25519_dalek::VerifyingKey) -> bool {
-        if self.proofs.is_empty() {
-            return true;
-        }
-
-        let mut prev_hash: Option<String> = None;
-
-        for proof in &self.proofs {
-            // Verify signature
-            if !proof.verify(verifying_key) {
-                return false;
-            }
-
-            // Verify chain linkage
-            if proof.prev_hash != prev_hash {
-                return false;
-            }
-
-            prev_hash = Some(proof.hash());
-        }
-
-        true
-    }
-
-    /// Export trace for external verification
-    #[allow(dead_code)]
-    pub fn export(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
 }
 
 impl Default for ExecutionTrace {
@@ -158,8 +112,8 @@ pub struct ProofEngine {
     /// Agent's DID
     agent_did: String,
 
-    /// Current execution trace
-    trace: ExecutionTrace,
+    /// Current execution trace (interior mutability for concurrent access)
+    trace: std::sync::Mutex<ExecutionTrace>,
 
     /// Storage path
     data_dir: std::path::PathBuf,
@@ -187,14 +141,14 @@ impl ProofEngine {
         Ok(Self {
             signing_key: signing_key.clone(),
             agent_did,
-            trace,
+            trace: std::sync::Mutex::new(trace),
             data_dir: data_dir.to_path_buf(),
         })
     }
 
     /// Generate a proof for an execution
     pub fn generate_proof(
-        &mut self,
+        &self,
         input: &str,
         output: &str,
         tool_calls: &[ToolCall],
@@ -211,8 +165,13 @@ impl ProofEngine {
         // Hash output
         let output_hash = Self::hash_data(output.as_bytes());
 
+        let mut trace = self
+            .trace
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
+
         // Get previous hash for chaining
-        let prev_hash = self.trace.latest_hash.clone();
+        let prev_hash = trace.latest_hash.clone();
 
         // Create unsigned proof
         let mut proof = ExecutionProof {
@@ -233,13 +192,14 @@ impl ProofEngine {
 
         // Update trace
         let proof_hash = proof.hash();
-        if self.trace.root_hash.is_none() {
-            self.trace.root_hash = Some(proof_hash.clone());
+        if trace.root_hash.is_none() {
+            trace.root_hash = Some(proof_hash.clone());
         }
-        self.trace.latest_hash = Some(proof_hash);
-        self.trace.proofs.push(proof.clone());
+        trace.latest_hash = Some(proof_hash);
+        trace.proofs.push(proof.clone());
 
-        // Persist trace
+        drop(trace); // Release lock before I/O
+                     // Persist trace
         self.save_trace()?;
 
         Ok(proof)
@@ -255,27 +215,18 @@ impl ProofEngine {
     /// Save trace to disk
     fn save_trace(&self) -> Result<()> {
         let trace_path = self.data_dir.join("execution_trace.json");
-        let content = serde_json::to_string_pretty(&self.trace)?;
+        let trace = self
+            .trace
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
+        let content = serde_json::to_string_pretty(&*trace)?;
         std::fs::write(trace_path, content)?;
         Ok(())
     }
 
-    /// Get the current execution trace
-    pub fn trace(&self) -> &ExecutionTrace {
-        &self.trace
-    }
-
-    /// Export trace for external verification
-    #[allow(dead_code)]
-    pub fn export_trace(&self) -> Result<String> {
-        self.trace.export()
-    }
-
-    /// Verify a proof
-    #[allow(dead_code)]
-    pub fn verify_proof(&self, proof: &ExecutionProof) -> bool {
-        let verifying_key = self.signing_key.verifying_key();
-        proof.verify(&verifying_key)
+    /// Get a clone of the current execution trace
+    pub fn trace(&self) -> ExecutionTrace {
+        self.trace.lock().map(|t| t.clone()).unwrap_or_default()
     }
 }
 

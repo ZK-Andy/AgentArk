@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::core::Agent;
 
-pub use app::CrateAgentApp;
+pub use app::AgentArkApp;
 
 /// Run the GUI application
 pub async fn run(agent: Agent) -> Result<()> {
@@ -15,14 +15,14 @@ pub async fn run(agent: Agent) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("Crate Agent"),
+            .with_title("AgentArk"),
         ..Default::default()
     };
 
-    let app = CrateAgentApp::new(agent);
+    let app = AgentArkApp::new(agent);
 
     eframe::run_native(
-        "Crate Agent",
+        "AgentArk",
         options,
         Box::new(|cc| {
             // Configure fonts and style
@@ -43,14 +43,14 @@ pub async fn run_setup_wizard(agent: Agent) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 500.0])
-            .with_title("Crate Agent Setup"),
+            .with_title("AgentArk Setup"),
         ..Default::default()
     };
 
     let app = views::SetupWizard::new(agent);
 
     eframe::run_native(
-        "Crate Agent Setup",
+        "AgentArk Setup",
         options,
         Box::new(|_cc| Ok(Box::new(app))),
     )

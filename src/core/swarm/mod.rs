@@ -1,0 +1,20 @@
+//! Agent Swarm - Multi-agent coordination framework
+//!
+//! Enables multiple specialized agents to work together on complex tasks.
+//! Uses tokio channels for inter-agent communication (no external deps).
+
+#![allow(dead_code)]
+
+pub mod agent_trait;
+pub mod bus;
+pub mod coordinator;
+pub mod messages;
+pub mod registry;
+pub mod specialist;
+
+pub use agent_trait::{AgentCapability, AgentId};
+pub use coordinator::{SwarmConfig, SwarmManager};
+pub use specialist::SpecialistConfig;
+
+#[cfg(test)]
+mod tests;

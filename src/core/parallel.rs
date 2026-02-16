@@ -9,8 +9,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
+use super::intent::has_action_intent_default;
 use super::llm::{LlmClient, LlmResponse};
 use crate::actions::ActionDef;
 use crate::memory::MemoryEntry;
@@ -57,11 +57,10 @@ pub enum AggregationStrategy {
 }
 
 /// A single reasoning path result
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PathResult {
     /// The path identifier
-    pub path_id: usize,
+    pub _path_id: usize,
     /// Strategy used for this path
     pub strategy: ReasoningStrategy,
     /// The LLM response
@@ -69,7 +68,7 @@ pub struct PathResult {
     /// Confidence score (0.0-1.0)
     pub confidence: f32,
     /// Execution time in milliseconds
-    pub execution_time_ms: u64,
+    pub _execution_time_ms: u64,
 }
 
 /// Different reasoning strategies for diverse paths
@@ -131,113 +130,6 @@ impl ParallelThinkingController {
         Self { config }
     }
 
-    /// Execute parallel thinking on a query
-    #[allow(dead_code)]
-    pub async fn think(
-        &self,
-        _llm: &LlmClient,
-        system_prompt: &str,
-        user_message: &str,
-        memories: &[MemoryEntry],
-        actions: &[ActionDef],
-    ) -> Result<ParallelResult> {
-        let start_time = std::time::Instant::now();
-
-        // Select strategies based on config
-        let strategies = if self.config.diverse_strategies {
-            ReasoningStrategy::all()
-                .into_iter()
-                .take(self.config.num_paths)
-                .collect::<Vec<_>>()
-        } else {
-            vec![ReasoningStrategy::Direct; self.config.num_paths]
-        };
-
-        // Create tasks for parallel execution
-        let results = Arc::new(RwLock::new(Vec::new()));
-        let mut handles = Vec::new();
-
-        for (path_id, strategy) in strategies.into_iter().enumerate() {
-            let results = results.clone();
-            let system_prompt = system_prompt.to_string();
-            let user_message = user_message.to_string();
-            let _memories = memories.to_vec();
-            let _actions = actions.to_vec();
-            let _timeout = self.config.path_timeout_secs;
-            let confidence_threshold = self.config.confidence_threshold;
-
-            // Build modified prompt for this strategy
-            let _modified_prompt = format!(
-                "{}\n\n## Reasoning Approach\n{}",
-                system_prompt,
-                strategy.prompt_modifier()
-            );
-
-            // We need to clone the LLM client configuration for parallel execution
-            // In a real implementation, you'd share the client properly
-            handles.push(tokio::spawn(async move {
-                let path_start = std::time::Instant::now();
-
-                // Simulate the LLM call (in real impl, clone client or use Arc)
-                // For now, we'll create a placeholder result
-                let response = LlmResponse {
-                    content: format!(
-                        "[Path {} - {:?}] Processing: {}",
-                        path_id, strategy, user_message
-                    ),
-                    tool_calls: vec![],
-                };
-
-                let execution_time_ms = path_start.elapsed().as_millis() as u64;
-
-                // Calculate confidence based on response characteristics
-                let confidence = calculate_confidence(&response);
-
-                let result = PathResult {
-                    path_id,
-                    strategy,
-                    response,
-                    confidence,
-                    execution_time_ms,
-                };
-
-                // Store result
-                let mut results_guard = results.write().await;
-                results_guard.push(result.clone());
-
-                // Check for early termination
-                if confidence >= confidence_threshold {
-                    tracing::debug!(
-                        "Path {} achieved confidence {:.2}, potential early termination",
-                        path_id,
-                        confidence
-                    );
-                }
-
-                result
-            }));
-        }
-
-        // Wait for all paths (or implement early termination)
-        let path_results: Vec<PathResult> = futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let total_time_ms = start_time.elapsed().as_millis() as u64;
-
-        // Aggregate results
-        let final_response = self.aggregate_results(&path_results).await?;
-
-        Ok(ParallelResult {
-            final_response,
-            path_results,
-            total_time_ms,
-            aggregation_strategy: self.config.aggregation.clone(),
-        })
-    }
-
     /// Execute parallel thinking with actual LLM calls
     pub async fn think_with_llm(
         &self,
@@ -279,11 +171,11 @@ impl ParallelThinkingController {
             let confidence = calculate_confidence(&response);
 
             path_results.push(PathResult {
-                path_id,
+                _path_id: path_id,
                 strategy,
                 response,
                 confidence,
-                execution_time_ms,
+                _execution_time_ms: execution_time_ms,
             });
 
             // Early termination check
@@ -298,13 +190,27 @@ impl ParallelThinkingController {
         }
 
         let total_time_ms = start_time.elapsed().as_millis() as u64;
-        let final_response = self.aggregate_results(&path_results).await?;
+        let mut final_response = self.aggregate_results(&path_results).await?;
+        // Safety net: if this is clearly an app/deploy ask and aggregation dropped tool calls,
+        // recover an app_deploy call from any successful path.
+        if has_action_intent_default(user_message, actions, "app_deploy")
+            && final_response.tool_calls.is_empty()
+        {
+            if let Some(app_call) = path_results
+                .iter()
+                .flat_map(|r| r.response.tool_calls.iter())
+                .find(|tc| tc.name == "app_deploy")
+                .cloned()
+            {
+                final_response.tool_calls.push(app_call);
+            }
+        }
 
         Ok(ParallelResult {
             final_response,
             path_results,
-            total_time_ms,
-            aggregation_strategy: self.config.aggregation.clone(),
+            _total_time_ms: total_time_ms,
+            _aggregation_strategy: self.config.aggregation.clone(),
         })
     }
 
@@ -314,6 +220,10 @@ impl ParallelThinkingController {
             return Ok(LlmResponse {
                 content: "No results from parallel thinking paths".to_string(),
                 tool_calls: vec![],
+                reasoning: None,
+                usage: None,
+                provider: "internal".to_string(),
+                model: "".to_string(),
             });
         }
 
@@ -349,7 +259,10 @@ impl ParallelThinkingController {
 
                     // Collect unique tool calls
                     for tc in &result.response.tool_calls {
-                        if !all_tool_calls.iter().any(|t: &super::llm::ToolCall| t.name == tc.name) {
+                        if !all_tool_calls
+                            .iter()
+                            .any(|t: &super::llm::ToolCall| t.name == tc.name)
+                        {
                             all_tool_calls.push(tc.clone());
                         }
                     }
@@ -358,6 +271,10 @@ impl ParallelThinkingController {
                 Ok(LlmResponse {
                     content: merged_content,
                     tool_calls: all_tool_calls,
+                    reasoning: None,
+                    usage: None,
+                    provider: "internal".to_string(),
+                    model: "".to_string(),
                 })
             }
             AggregationStrategy::MajorityVote => {
@@ -410,7 +327,6 @@ impl ParallelThinkingController {
 }
 
 /// Result of parallel thinking
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ParallelResult {
     /// The final aggregated response
@@ -418,9 +334,9 @@ pub struct ParallelResult {
     /// Results from each path
     pub path_results: Vec<PathResult>,
     /// Total execution time in milliseconds
-    pub total_time_ms: u64,
+    pub _total_time_ms: u64,
     /// Aggregation strategy used
-    pub aggregation_strategy: AggregationStrategy,
+    pub _aggregation_strategy: AggregationStrategy,
 }
 
 impl ParallelResult {

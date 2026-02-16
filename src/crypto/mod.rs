@@ -3,22 +3,23 @@
 //! Uses AES-256-GCM for encryption and Argon2 for key derivation.
 //! All sensitive data (API keys, tokens, memories) are encrypted at rest.
 
+pub mod master;
+
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
+use anyhow::{anyhow, Result};
 use argon2::{Argon2, Params};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::RngCore;
-use zeroize::Zeroizing;
-use anyhow::{Result, anyhow};
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// Encrypted data format: salt (16 bytes) + nonce (12 bytes) + ciphertext
-#[allow(dead_code)]
-const SALT_LEN: usize = 16;
+pub(crate) const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
-const KEY_LEN: usize = 32; // AES-256
+pub(crate) const KEY_LEN: usize = 32; // AES-256
 
 /// Master encryption key manager
 ///
@@ -32,16 +33,11 @@ pub struct KeyManager {
 
 impl KeyManager {
     /// Create a new KeyManager from a password
-    #[allow(dead_code)]
     pub fn from_password(password: &str, salt: &[u8]) -> Result<Self> {
         let key = derive_key(password.as_bytes(), salt)?;
-        Ok(Self { key: Zeroizing::new(key) })
-    }
-
-    /// Create a KeyManager from an existing key
-    #[allow(dead_code)]
-    pub fn from_key(key: [u8; KEY_LEN]) -> Self {
-        Self { key: Zeroizing::new(key) }
+        Ok(Self {
+            key: Zeroizing::new(key),
+        })
     }
 
     /// Load or create the master key from a keyfile
@@ -51,12 +47,18 @@ impl KeyManager {
             let key_data = std::fs::read(keyfile_path)
                 .map_err(|e| anyhow!("Failed to read keyfile at {:?}: {}", keyfile_path, e))?;
             if key_data.len() != KEY_LEN {
-                return Err(anyhow!("Invalid keyfile length: expected {} bytes, got {} bytes at {:?}",
-                    KEY_LEN, key_data.len(), keyfile_path));
+                return Err(anyhow!(
+                    "Invalid keyfile length: expected {} bytes, got {} bytes at {:?}",
+                    KEY_LEN,
+                    key_data.len(),
+                    keyfile_path
+                ));
             }
             let mut key = [0u8; KEY_LEN];
             key.copy_from_slice(&key_data);
-            Ok(Self { key: Zeroizing::new(key) })
+            Ok(Self {
+                key: Zeroizing::new(key),
+            })
         } else {
             // Generate a new random key
             let mut key = [0u8; KEY_LEN];
@@ -74,7 +76,9 @@ impl KeyManager {
             }
             std::fs::write(keyfile_path, &key)?;
 
-            Ok(Self { key: Zeroizing::new(key) })
+            Ok(Self {
+                key: Zeroizing::new(key),
+            })
         }
     }
 
@@ -89,7 +93,8 @@ impl KeyManager {
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         // Encrypt
-        let ciphertext = cipher.encrypt(nonce, plaintext)
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
             .map_err(|e| anyhow!("Encryption failed: {}", e))?;
 
         // Combine nonce + ciphertext
@@ -112,21 +117,21 @@ impl KeyManager {
         let nonce = Nonce::from_slice(&encrypted[..NONCE_LEN]);
         let ciphertext = &encrypted[NONCE_LEN..];
 
-        cipher.decrypt(nonce, ciphertext)
+        cipher
+            .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow!("Decryption failed: {}", e))
     }
 
     /// Encrypt a string, returning base64-encoded result
-    #[allow(dead_code)]
     pub fn encrypt_string(&self, plaintext: &str) -> Result<String> {
         let encrypted = self.encrypt(plaintext.as_bytes())?;
         Ok(BASE64.encode(&encrypted))
     }
 
     /// Decrypt a base64-encoded string
-    #[allow(dead_code)]
     pub fn decrypt_string(&self, encrypted_b64: &str) -> Result<String> {
-        let encrypted = BASE64.decode(encrypted_b64)
+        let encrypted = BASE64
+            .decode(encrypted_b64)
             .map_err(|e| anyhow!("Invalid base64: {}", e))?;
         let decrypted = self.decrypt(&encrypted)?;
         String::from_utf8(decrypted).map_err(|e| anyhow!("Invalid UTF-8: {}", e))
@@ -134,129 +139,67 @@ impl KeyManager {
 }
 
 /// Derive an encryption key from a password using Argon2id
-#[allow(dead_code)]
-fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+pub(crate) fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
     // Use Argon2id with secure parameters
     let params = Params::new(
-        65536,  // 64 MiB memory
-        3,      // 3 iterations
-        4,      // 4 parallel lanes
+        65536, // 64 MiB memory
+        3,     // 3 iterations
+        4,     // 4 parallel lanes
         Some(KEY_LEN),
-    ).map_err(|e| anyhow!("Invalid Argon2 params: {}", e))?;
+    )
+    .map_err(|e| anyhow!("Invalid Argon2 params: {}", e))?;
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut key = [0u8; KEY_LEN];
-    argon2.hash_password_into(password, salt, &mut key)
+    argon2
+        .hash_password_into(password, salt, &mut key)
         .map_err(|e| anyhow!("Key derivation failed: {}", e))?;
 
     Ok(key)
 }
 
 /// Generate a random salt for key derivation
-#[allow(dead_code)]
-pub fn generate_salt() -> [u8; SALT_LEN] {
+pub(crate) fn generate_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     salt
 }
 
-/// Encrypted configuration wrapper
-///
-/// Stores sensitive config values (API keys, tokens) in encrypted form
-#[allow(dead_code)]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EncryptedValue {
-    /// Base64-encoded encrypted data (nonce + ciphertext)
-    pub data: String,
-    /// Marker to indicate this is an encrypted value
-    #[serde(default = "default_true")]
-    pub encrypted: bool,
-}
+/// Generate a self-signed TLS certificate for localhost
+/// Returns (cert_pem, key_pem) as strings
+#[cfg(feature = "tls")]
+pub fn generate_self_signed_cert(data_dir: &Path) -> Result<(String, String)> {
+    let cert_path = data_dir.join("tls_cert.pem");
+    let key_path = data_dir.join("tls_key.pem");
 
-#[allow(dead_code)]
-fn default_true() -> bool {
-    true
-}
-
-impl EncryptedValue {
-    /// Create a new encrypted value
-    #[allow(dead_code)]
-    pub fn new(plaintext: &str, key_manager: &KeyManager) -> Result<Self> {
-        let data = key_manager.encrypt_string(plaintext)?;
-        Ok(Self { data, encrypted: true })
+    // Reuse existing cert if available
+    if cert_path.exists() && key_path.exists() {
+        let cert_pem = std::fs::read_to_string(&cert_path)?;
+        let key_pem = std::fs::read_to_string(&key_path)?;
+        return Ok((cert_pem, key_pem));
     }
 
-    /// Decrypt and return the value
-    #[allow(dead_code)]
-    pub fn decrypt(&self, key_manager: &KeyManager) -> Result<String> {
-        if self.encrypted {
-            key_manager.decrypt_string(&self.data)
-        } else {
-            // Legacy unencrypted value
-            Ok(self.data.clone())
-        }
-    }
-}
+    // Generate new self-signed certificate
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
+    params.subject_alt_names = vec![
+        rcgen::SanType::DnsName("localhost".try_into()?),
+        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+    ];
 
-/// Sensitive string that auto-encrypts when serialized
-/// and auto-decrypts when deserialized (with the right context)
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct SensitiveString {
-    /// The actual value (plaintext in memory)
-    value: String,
-    /// Whether this was loaded from encrypted storage
-    was_encrypted: bool,
-}
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
 
-impl SensitiveString {
-    #[allow(dead_code)]
-    pub fn new(value: String) -> Self {
-        Self { value, was_encrypted: false }
-    }
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
 
-    #[allow(dead_code)]
-    pub fn value(&self) -> &str {
-        &self.value
-    }
+    // Save for reuse
+    std::fs::write(&cert_path, &cert_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
 
-    #[allow(dead_code)]
-    pub fn into_value(self) -> String {
-        self.value
-    }
+    tracing::info!("Generated self-signed TLS certificate at {:?}", cert_path);
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.value.is_empty()
-    }
-}
-
-// Thread-local key manager for serialization context
-thread_local! {
-    static ENCRYPTION_KEY: std::cell::RefCell<Option<std::sync::Arc<KeyManager>>> = std::cell::RefCell::new(None);
-}
-
-/// Set the encryption key for the current thread (for serialization)
-#[allow(dead_code)]
-pub fn set_thread_key(key: std::sync::Arc<KeyManager>) {
-    ENCRYPTION_KEY.with(|k| {
-        *k.borrow_mut() = Some(key);
-    });
-}
-
-/// Clear the encryption key for the current thread
-#[allow(dead_code)]
-pub fn clear_thread_key() {
-    ENCRYPTION_KEY.with(|k| {
-        *k.borrow_mut() = None;
-    });
-}
-
-/// Get the current thread's encryption key
-#[allow(dead_code)]
-pub fn get_thread_key() -> Option<std::sync::Arc<KeyManager>> {
-    ENCRYPTION_KEY.with(|k| k.borrow().clone())
+    Ok((cert_pem, key_pem))
 }
 
 #[cfg(test)]
@@ -265,9 +208,8 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt() {
-        let mut key = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut key);
-        let km = KeyManager::from_key(key);
+        let salt = generate_salt();
+        let km = KeyManager::from_password("test-password", &salt).unwrap();
 
         let plaintext = "Hello, World! This is a secret message.";
         let encrypted = km.encrypt(plaintext.as_bytes()).unwrap();
@@ -278,9 +220,8 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_string() {
-        let mut key = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut key);
-        let km = KeyManager::from_key(key);
+        let salt = generate_salt();
+        let km = KeyManager::from_password("test-password", &salt).unwrap();
 
         let plaintext = "API_KEY_12345";
         let encrypted = km.encrypt_string(plaintext).unwrap();

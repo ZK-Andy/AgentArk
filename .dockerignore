@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.md
+nul
+tests/
+install.sh
+start.bat
+start.sh
+scripts/

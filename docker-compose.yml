@@ -1,17 +1,17 @@
 # =============================================================================
-# CogniArk - AI Agent with Automatic Data Persistence
+# AgentArk - AI Agent with Automatic Data Persistence
 # =============================================================================
 #
 # QUICK START:
-#   ./start.sh        (Linux/Mac)
-#   start.bat         (Windows)
+#   ./scripts/start.sh   (Linux/Mac)
+#   scripts/start.bat    (Windows)
 #
 # OR manually:
 #   docker-compose up -d --build
 #
 # YOUR DATA IS AUTOMATICALLY PRESERVED:
 #   - Conversations and memory
-#   - Custom actions you create
+#   - Custom skills you create
 #   - Settings and API keys
 #   - Scheduled tasks
 #
@@ -23,28 +23,42 @@
 # =============================================================================
 
 services:
-  cogniark:
+  agentark:
     build: .
-    image: cogniark:latest
-    container_name: cogniark
+    image: agentark:latest
+    container_name: agentark
     restart: unless-stopped
     ports:
-      - "17990:17990"
+      - "8990:8990"
     volumes:
       # === PERSISTENT DATA VOLUMES ===
       # These volumes are managed by Docker and NEVER deleted on rebuild
-      - cogniark-data:/app/data      # Database, memories, user actions
-      - cogniark-config:/app/config  # Settings, identity keys, API keys
+      - agentark-data:/app/data      # Database, memories, user skills
+      - agentark-config:/app/config  # Settings, identity keys, API keys
+      # No raw Docker socket mount — use docker-socket-proxy instead
+    depends_on:
+      - docker-socket-proxy
     environment:
       # Secure logging: suppress SQLx queries to prevent sensitive data exposure
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
-      - COGNIARK_CONFIG=/app/config
-      - COGNIARK_DATA=/app/data
-      - COGNIARK_BIND=0.0.0.0:17990
+      - AGENTARK_CONFIG=/app/config
+      - AGENTARK_DATA=/app/data
+      - AGENTARK_BIND=0.0.0.0:8990
+      - PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
+      # Connect to Docker via proxy instead of raw socket
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      # Set to "true" to enable debug logging:  AGENTARK_DEBUG=true docker-compose up
+      - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
+      # Set to "true" for remote access via Cloudflare tunnel (required for VPS):
+      #   AGENTARK_TUNNEL=true docker compose up -d
+      - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
+      # Master password for encryption (optional — default is built-in, change in Settings → Security)
+      #   AGENTARK_MASTER_PASSWORD=your-password docker compose up -d
+      - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
     networks:
       - agent-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:17990/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8990/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -59,10 +73,45 @@ services:
           cpus: '0.5'
           memory: 512M
 
+  # Docker socket proxy: restricts Docker API access to only container management
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: agentark-docker-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Allow container and image operations for sandboxed code execution
+      - CONTAINERS=1
+      - IMAGES=1
+      - POST=1
+      # Block dangerous operations
+      - EXEC=0
+      - VOLUMES=0
+      - NETWORKS=0
+      - SWARM=0
+      - SECRETS=0
+      - NODES=0
+      - SERVICES=0
+      - TASKS=0
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - DISTRIBUTION=0
+      - PLUGINS=0
+      - SYSTEM=0
+    networks:
+      - agent-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+
   # Optional: Ollama for local LLM
   ollama:
     image: ollama/ollama:latest
-    container_name: cogniark-ollama
+    container_name: agentark-ollama
     restart: unless-stopped
     ports:
       - "11434:11434"
@@ -81,7 +130,7 @@ services:
   # Optional: SearXNG for private search
   searxng:
     image: searxng/searxng:latest
-    container_name: cogniark-searxng
+    container_name: agentark-searxng
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -95,10 +144,10 @@ services:
       - SEARXNG_BASE_URL=http://localhost:8080
 
 volumes:
-  cogniark-data:
-    name: cogniark-data
-  cogniark-config:
-    name: cogniark-config
+  agentark-data:
+    name: agentark-data
+  agentark-config:
+    name: agentark-config
   ollama-data:
   searxng-data:
 
