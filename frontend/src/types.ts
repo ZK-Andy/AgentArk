@@ -22,6 +22,7 @@ export type Notification = {
   body: string;
   created_at: string;
   read: boolean;
+  source?: string;
   metadata?: Record<string, unknown>;
 };
 

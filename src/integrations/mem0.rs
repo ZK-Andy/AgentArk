@@ -79,6 +79,8 @@ struct CleanupRequest {
 struct SearchResponse {
     #[serde(default)]
     memories: Vec<Mem0Memory>,
+    #[serde(default)]
+    warning: Option<String>,
 }
 
 impl Mem0Client {
@@ -181,6 +183,10 @@ impl Mem0Client {
             .await?;
 
         if resp.status().is_success() {
+            let warmup_resp: SearchResponse = resp.json().await?;
+            if let Some(warning) = warmup_resp.warning.filter(|w| !w.trim().is_empty()) {
+                anyhow::bail!("Mem0 warmup degraded: {}", warning);
+            }
             tracing::info!("Mem0 warmup completed");
             Ok(())
         } else {
@@ -201,16 +207,17 @@ impl Mem0Client {
         // Code blocks and execution output are not useful for memory anyway.
         const MAX_CHARS: usize = 4000;
         let truncate = |s: &str| -> String {
-            if s.len() <= MAX_CHARS {
+            if s.chars().count() <= MAX_CHARS {
                 return s.to_string();
             }
+            let head: String = s.chars().take(MAX_CHARS).collect();
             // Try to cut before code blocks if possible
-            if let Some(pos) = s[..MAX_CHARS].rfind("```") {
+            if let Some(pos) = head.rfind("```") {
                 if pos > MAX_CHARS / 2 {
-                    return format!("{}...[truncated]", &s[..pos]);
+                    return format!("{}...[truncated]", &head[..pos]);
                 }
             }
-            format!("{}...[truncated]", &s[..MAX_CHARS])
+            format!("{}...[truncated]", head)
         };
 
         let req = AddRequest {
@@ -265,6 +272,11 @@ impl Mem0Client {
 
         if resp.status().is_success() {
             let search_resp: SearchResponse = resp.json().await?;
+            if let Some(warning) = search_resp.warning.as_deref() {
+                if !warning.trim().is_empty() {
+                    tracing::warn!("Mem0 search degraded: {}", warning);
+                }
+            }
             Ok(search_resp.memories)
         } else {
             let status = resp.status();

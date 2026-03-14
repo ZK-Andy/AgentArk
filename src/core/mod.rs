@@ -1,6 +1,7 @@
 //! Core agent module - the brain of AgentArk
 
 mod agent;
+pub mod automation;
 pub mod autonomy;
 pub mod browser_session;
 pub mod config;
@@ -8,6 +9,8 @@ pub mod connect_flow;
 pub mod connector;
 pub mod intent;
 mod llm;
+pub mod net;
+pub mod observability;
 pub mod orchestra;
 pub mod parallel;
 pub mod pipeline;
@@ -22,7 +25,13 @@ pub mod watcher;
 
 pub use agent::{
     Agent, ConversationMessage, ExecutionStep, ExecutionTrace, SecurityEvents, SecuritySnapshot,
-    StreamEvent, UserProfile,
+    StreamEvent, UserProfile, RequestExecutionHints,
+};
+pub use automation::{
+    list_runs as list_automation_runs,
+    list_supervisor_states as list_automation_supervisor_states,
+    AutomationRunStatus,
+    AutomationSupervisorState,
 };
 pub use autonomy::{
     score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,

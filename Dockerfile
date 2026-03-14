@@ -46,12 +46,15 @@ RUN --mount=type=cache,target=/app/target \
     cargo build --release && rm -rf src
 
 # Copy source + assets (logo.svg is included at compile time via include_str!)
+# CACHEBUST invalidates the layer when source changes aren't detected by Docker
+ARG CACHEBUST=0
 COPY src ./src
 COPY assets ./assets
 
 # Build for release with cache mount, then copy binary out of cache
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
+    rm -f target/release/agentark target/release/deps/agentark-* && \
     touch src/main.rs && cargo build --release && \
     cp target/release/agentark /app/agentark-bin
 
@@ -59,7 +62,7 @@ RUN --mount=type=cache,target=/app/target \
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
+RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci || npm install
 COPY frontend/src ./src
 COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts ./
 RUN npm run build

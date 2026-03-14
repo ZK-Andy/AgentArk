@@ -242,7 +242,7 @@ pub async fn resolve_required_env_values(
 ) -> Result<(HashMap<String, String>, Vec<String>, Vec<String>)> {
     let mgr =
         crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
-    let secrets = mgr.load_secrets().unwrap_or_default();
+    let secrets = mgr.load_secrets()?;
     let mut resolved = HashMap::new();
     let mut missing_sensitive = Vec::new();
     let mut missing_config = Vec::new();
@@ -735,47 +735,6 @@ fn command_arg_candidates(args: &[String]) -> Vec<Vec<String>> {
         }
     }
     deduped
-}
-
-async fn run_local_args_with_fallback(
-    args: &[String],
-    label: &str,
-    cwd: &Path,
-    envs: &HashMap<String, String>,
-    timeout_secs: u64,
-) -> Result<std::process::Output> {
-    let mut attempted: Vec<String> = Vec::new();
-    for candidate in command_arg_candidates(args) {
-        if candidate.is_empty() {
-            continue;
-        }
-        let program = candidate[0].clone();
-        attempted.push(candidate.join(" "));
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(candidate.iter().skip(1))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .current_dir(cwd)
-            .envs(envs);
-
-        let fut = cmd.output();
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
-            Err(_) => anyhow::bail!("{} timed out", label),
-            Ok(Ok(output)) => return Ok(output),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Ok(Err(e)) => {
-                anyhow::bail!("failed to execute {} '{}': {}", label, program, e);
-            }
-        }
-    }
-    anyhow::bail!(
-        "failed to execute {}: no executable found (tried: {})",
-        label,
-        attempted.join(" | ")
-    );
 }
 
 async fn spawn_local_process_with_fallback(
@@ -1312,20 +1271,36 @@ pub async fn launch_dynamic_process(
 
 pub enum DynamicRuntimeHandle {
     Container(String),
-    Process(tokio::process::Child),
+    Process(Box<tokio::process::Child>),
+}
+
+pub struct DynamicRuntimeLaunch<'a> {
+    pub app_id: &'a str,
+    pub app_dir: &'a Path,
+    pub entry_command: &'a str,
+    pub install_command: Option<&'a str>,
+    pub port: u16,
+    pub extra_env: &'a HashMap<String, String>,
+    pub runtime_image: Option<&'a str>,
+    pub runtime_preference: RuntimePreference,
+    pub stream_tx: Option<Sender<StreamEvent>>,
 }
 
 pub async fn launch_dynamic_runtime(
-    app_id: &str,
-    app_dir: &Path,
-    entry_command: &str,
-    install_command: Option<&str>,
-    port: u16,
-    extra_env: &HashMap<String, String>,
-    runtime_image: Option<&str>,
-    runtime_preference: RuntimePreference,
-    stream_tx: Option<Sender<StreamEvent>>,
+    request: DynamicRuntimeLaunch<'_>,
 ) -> Result<DynamicRuntimeHandle> {
+    let DynamicRuntimeLaunch {
+        app_id,
+        app_dir,
+        entry_command,
+        install_command,
+        port,
+        extra_env,
+        runtime_image,
+        runtime_preference,
+        stream_tx,
+    } = request;
+
     if matches!(runtime_preference, RuntimePreference::Local) && !docker_required() {
         match launch_dynamic_process(
             app_id,
@@ -1338,7 +1313,7 @@ pub async fn launch_dynamic_runtime(
         )
         .await
         {
-            Ok(child) => return Ok(DynamicRuntimeHandle::Process(child)),
+            Ok(child) => return Ok(DynamicRuntimeHandle::Process(Box::new(child))),
             Err(local_err) => {
                 tracing::warn!(
                     "Local runtime launch unavailable for app {}: {}. Trying container fallback.",
@@ -1401,7 +1376,7 @@ pub async fn launch_dynamic_runtime(
             )
             .await
             {
-                Ok(child) => Ok(DynamicRuntimeHandle::Process(child)),
+                Ok(child) => Ok(DynamicRuntimeHandle::Process(Box::new(child))),
                 Err(local_err) => Err(anyhow::anyhow!(
                     "container runtime failed: {} | local runtime fallback failed: {}",
                     container_err,
@@ -2061,17 +2036,17 @@ impl AppRegistry {
                                 .await;
                                 continue;
                             }
-                            match launch_dynamic_runtime(
-                                &id,
-                                &path,
-                                &entry_cmd,
-                                install_command.as_deref(),
+                            match launch_dynamic_runtime(DynamicRuntimeLaunch {
+                                app_id: &id,
+                                app_dir: &path,
+                                entry_command: &entry_cmd,
+                                install_command: install_command.as_deref(),
                                 port,
-                                &resolved_env,
-                                runtime_image.as_deref(),
+                                extra_env: &resolved_env,
+                                runtime_image: runtime_image.as_deref(),
                                 runtime_preference,
-                                None,
-                            )
+                                stream_tx: None,
+                            })
                             .await
                             {
                                 Ok(runtime_handle) => {
@@ -2079,7 +2054,9 @@ impl AppRegistry {
                                         DynamicRuntimeHandle::Container(container_id) => {
                                             (Some(container_id), None)
                                         }
-                                        DynamicRuntimeHandle::Process(child) => (None, Some(child)),
+                                        DynamicRuntimeHandle::Process(child) => {
+                                            (None, Some(*child))
+                                        }
                                     };
                                     self.register_dynamic(
                                         id.clone(),
@@ -2424,17 +2401,17 @@ pub async fn app_deploy(
     );
     emit_progress(&stream_tx, &format!("Starting server on port {}", port)).await;
 
-    let runtime_handle = launch_dynamic_runtime(
-        &app_id,
-        &app_dir,
-        entry,
-        effective_install_cmd.as_deref(),
+    let runtime_handle = launch_dynamic_runtime(DynamicRuntimeLaunch {
+        app_id: &app_id,
+        app_dir: &app_dir,
+        entry_command: entry,
+        install_command: effective_install_cmd.as_deref(),
         port,
-        &resolved_env,
-        runtime_image.as_deref(),
+        extra_env: &resolved_env,
+        runtime_image: runtime_image.as_deref(),
         runtime_preference,
-        stream_tx.clone(),
-    )
+        stream_tx: stream_tx.clone(),
+    })
     .await?;
     let (container_id, child, runtime_label) = match runtime_handle {
         DynamicRuntimeHandle::Container(container_id) => {
@@ -2443,7 +2420,7 @@ pub async fn app_deploy(
         }
         DynamicRuntimeHandle::Process(child) => {
             emit_progress(&stream_tx, "Docker unavailable; started local app process").await;
-            (None, Some(child), "local_process")
+            (None, Some(*child), "local_process")
         }
     };
     let app_dir_for_diagnostics = app_dir.clone();

@@ -9,9 +9,11 @@ import {
   DialogContent,
   DialogTitle,
   Grid2,
+  IconButton,
   Stack,
   Typography,
 } from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
@@ -27,14 +29,107 @@ import type { RecommendedSkill } from "../types";
 
 const REFRESH_MS = 8000;
 type PausePhase = "idle" | "stopping" | "stopped" | "resuming" | "resumed";
+type AutomationObject = {
+  id: string;
+  kind: string;
+  title: string;
+  subtitle?: string | null;
+  status: string;
+  detail?: string | null;
+  created_at?: string | null;
+  next_run_at?: string | null;
+  view: string;
+  url?: string | null;
+  enabled?: boolean | null;
+  connected?: boolean | null;
+};
+
+type AutomationRun = {
+  id: string;
+  automation_id: string;
+  kind: string;
+  title: string;
+  action: string;
+  trigger: string;
+  status: string;
+  current_status?: string | null;
+  attempt: number;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  summary: string;
+  output_preview?: string | null;
+  error?: string | null;
+  next_retry_at?: string | null;
+  conversation_id?: string | null;
+  project_id?: string | null;
+  view: string;
+};
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function pickAutomationObjects(raw: unknown): AutomationObject[] {
+  const root = asRecord(raw);
+  const items = root.objects;
+  return Array.isArray(items) ? (items as AutomationObject[]) : [];
+}
+
+function pickAutomationRuns(raw: unknown): AutomationRun[] {
+  const root = asRecord(raw);
+  const items = root.runs;
+  return Array.isArray(items) ? (items as AutomationRun[]) : [];
+}
+
+function automationKindLabel(kind: string): string {
+  const normalized = (kind || "").toLowerCase();
+  if (normalized === "task") return "Task";
+  if (normalized === "watcher") return "Watcher";
+  if (normalized === "app") return "App";
+  if (normalized === "integration") return "Integration";
+  return kind || "Automation";
+}
+
+function automationStatusColor(status: string): "success" | "warning" | "error" | "default" | "info" {
+  const normalized = (status || "").toLowerCase();
+  if (["running", "active", "connected", "completed", "triggered"].some((token) => normalized.includes(token))) {
+    return "success";
+  }
+  if (["pending", "paused", "awaiting", "needs_auth", "not_configured"].some((token) => normalized.includes(token))) {
+    return "warning";
+  }
+  if (["failed", "error", "cancelled", "stopped", "timed_out"].some((token) => normalized.includes(token))) {
+    return "error";
+  }
+  if (normalized.includes("in_progress")) return "info";
+  return "default";
+}
+
+function formatAutomationTime(value?: string | null): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function targetViewForAutomation(item: AutomationObject): string {
+  if (item.view) return item.view;
+  if (item.kind === "integration") return "settings";
+  if (item.kind === "watcher") return "watchers";
+  return item.kind;
+}
+
+function targetViewForAutomationRun(item: AutomationRun): string {
+  if (item.view) return item.view;
+  if (item.kind === "watcher") return "watchers";
+  if (item.kind === "task") return "tasks";
+  if (item.kind === "app") return "apps";
+  return "trace";
+}
+
 function errMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
-  return "Failed to update pause state.";
+  return "Request failed.";
 }
 
 type Props = {
@@ -52,6 +147,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const [pausePhase, setPausePhase] = useState<PausePhase>("idle");
   const [pauseError, setPauseError] = useState<string | null>(null);
   const [pauseTarget, setPauseTarget] = useState<"pause" | "resume" | null>(null);
+  const [inventoryOpen, setInventoryOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
 
   // --- Data hooks ---
   const tasksQ = useQuery({ queryKey: ["tasks"], queryFn: api.getTasks, refetchInterval: interval });
@@ -63,6 +160,16 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     queryKey: ["security-logs-dashboard"],
     queryFn: () => api.getSecurityLogs(5),
     refetchInterval: autoRefresh ? 30_000 : false,
+  });
+  const automationQ = useQuery({
+    queryKey: ["automation-objects-dashboard"],
+    queryFn: () => api.rawGet("/automation/objects"),
+    refetchInterval: interval,
+  });
+  const automationRunsQ = useQuery({
+    queryKey: ["automation-runs-dashboard"],
+    queryFn: () => api.rawGet("/automation/runs"),
+    refetchInterval: interval,
   });
   const settingsQ = useQuery({
     queryKey: ["settings-dashboard"],
@@ -83,6 +190,23 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
   const securityLogs = (securityQ.data as { logs?: Array<{ event_type: string; severity: string; message: string }> })?.logs || [];
   const nudges = nudgesQ.data?.nudges || [];
+  const automationObjects = useMemo(() => pickAutomationObjects(automationQ.data), [automationQ.data]);
+  const automationPreview = automationObjects.slice(0, 8);
+  const automationRuns = useMemo(() => pickAutomationRuns(automationRunsQ.data), [automationRunsQ.data]);
+  const automationRunsPreview = automationRuns.slice(0, 6);
+  const automationCounts = useMemo(() => {
+    return automationObjects.reduce(
+      (acc, item) => {
+        const kind = (item.kind || "").toLowerCase();
+        if (kind === "task") acc.tasks += 1;
+        if (kind === "watcher") acc.watchers += 1;
+        if (kind === "app") acc.apps += 1;
+        if (kind === "integration") acc.integrations += 1;
+        return acc;
+      },
+      { tasks: 0, watchers: 0, apps: 0, integrations: 0 }
+    );
+  }, [automationObjects]);
 
   const currentTask = useMemo(() => {
     const inProgress = tasks.find((t) => {
@@ -133,7 +257,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   });
   const retryMutation = useMutation({
     mutationFn: api.retryTask,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["briefing"] });
+      await queryClient.invalidateQueries({ queryKey: ["trace"] });
+    },
   });
   const executeSkillMutation = useMutation({
     mutationFn: api.executeRecommendedSkill,
@@ -194,7 +322,14 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     }
   }
 
-  const hasErrors = !!(tasksQ.error || traceQ.error || briefingQ.error || autonomySettingsQ.error);
+  const hasErrors = !!(
+    tasksQ.error ||
+    traceQ.error ||
+    briefingQ.error ||
+    autonomySettingsQ.error ||
+    automationQ.error ||
+    automationRunsQ.error
+  );
 
   return (
     <Box
@@ -258,15 +393,231 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         onTogglePause={() => {
           void handleTogglePause();
         }}
-        onViewTasks={() => navigateToView("skills")}
+        onViewTasks={() => navigateToView("tasks")}
         briefingLoading={runBriefingMutation.isPending}
         pauseLoading={pauseMutation.isPending}
       />
 
-      <ActivityFeed
-        traces={traces}
-        onViewAll={() => navigateToView("settings")}
-      />
+      {/* Collapsed Automation Inventory row */}
+      <Box
+        className="action-row"
+        onClick={() => setInventoryOpen(true)}
+        sx={{ cursor: "pointer", py: 1.25, px: 1.5 }}
+      >
+        <Stack direction="row" justifyContent="space-between" alignItems="center">
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+              Automation Inventory
+            </Typography>
+            <Chip size="small" label={`${automationCounts.tasks} tasks`} />
+            <Chip size="small" label={`${automationCounts.watchers} watchers`} />
+            <Chip size="small" label={`${automationCounts.apps} apps`} />
+            <Chip size="small" label={`${automationCounts.integrations} integrations`} />
+          </Stack>
+          <Typography variant="caption" color="text.secondary">Expand</Typography>
+        </Stack>
+      </Box>
+
+      {/* Collapsed Recent Activity row */}
+      <Box
+        className="action-row"
+        onClick={() => setActivityOpen(true)}
+        sx={{ cursor: "pointer", py: 1.25, px: 1.5 }}
+      >
+        <Stack direction="row" justifyContent="space-between" alignItems="center">
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+              Recent Activity
+            </Typography>
+            <Chip size="small" label={`${traces.length} traces`} />
+          </Stack>
+          <Typography variant="caption" color="text.secondary">Expand</Typography>
+        </Stack>
+      </Box>
+
+      {/* Automation Inventory Dialog */}
+      <Dialog
+        open={inventoryOpen}
+        onClose={() => setInventoryOpen(false)}
+        maxWidth="md"
+        fullWidth
+        PaperProps={{
+          sx: {
+            background: "rgba(10, 15, 28, 0.97)",
+            border: "1px solid rgba(47, 212, 255, 0.18)",
+            backdropFilter: "blur(20px)",
+          },
+        }}
+      >
+        <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Box>
+            <Typography variant="h6">Automation Inventory</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Unified runtime view of active tasks, watchers, deployed apps, and integrations.
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={() => setInventoryOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" mb={2}>
+            <Chip size="small" label={`${automationCounts.tasks} tasks`} />
+            <Chip size="small" label={`${automationCounts.watchers} watchers`} />
+            <Chip size="small" label={`${automationCounts.apps} apps`} />
+            <Chip size="small" label={`${automationCounts.integrations} integrations`} />
+          </Stack>
+
+          {automationQ.error ? (
+            <Alert severity="error">{errMessage(automationQ.error)}</Alert>
+          ) : automationPreview.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              No active automation objects yet.
+            </Typography>
+          ) : (
+            <Stack spacing={1} mb={3}>
+              {automationPreview.map((item) => (
+                <Box key={`${item.kind}-${item.id}`} className="action-row">
+                  <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.25}>
+                    <Stack spacing={0.35} sx={{ minWidth: 0 }}>
+                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                        <Chip size="small" label={automationKindLabel(item.kind)} />
+                        <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={item.title}>
+                          {item.title}
+                        </Typography>
+                      </Stack>
+                      {item.subtitle ? (
+                        <Typography variant="caption" color="text.secondary" noWrap title={item.subtitle}>
+                          {item.subtitle}
+                        </Typography>
+                      ) : null}
+                      {item.detail ? (
+                        <Typography variant="caption" color="text.secondary" noWrap title={item.detail}>
+                          {item.detail}
+                        </Typography>
+                      ) : null}
+                      {item.next_run_at ? (
+                        <Typography variant="caption" color="text.secondary">
+                          Next run: {formatAutomationTime(item.next_run_at)}
+                        </Typography>
+                      ) : null}
+                    </Stack>
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+                      <Chip size="small" label={item.status || "-"} color={automationStatusColor(item.status || "")} />
+                      {item.url ? (
+                        <Button
+                          size="small"
+                          onClick={() => window.open(item.url || "", "_blank", "noopener,noreferrer")}
+                        >
+                          Open
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="small"
+                        onClick={() => navigateToView(targetViewForAutomation(item))}
+                      >
+                        View
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+          )}
+
+          {/* Recent Automation Runs subsection */}
+          <Typography variant="h6" mb={0.5}>Recent Automation Runs</Typography>
+          <Typography variant="body2" color="text.secondary" mb={1.5}>
+            Supervisor history for background tasks and watchers, including retries and validation summaries.
+          </Typography>
+
+          {automationRunsQ.error ? (
+            <Alert severity="error">{errMessage(automationRunsQ.error)}</Alert>
+          ) : automationRunsPreview.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              No automation runs recorded yet.
+            </Typography>
+          ) : (
+            <Stack spacing={1}>
+              {automationRunsPreview.map((item) => (
+                <Box key={item.id} className="action-row">
+                  <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1.25}>
+                    <Stack spacing={0.35} sx={{ minWidth: 0 }}>
+                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                        <Chip size="small" label={automationKindLabel(item.kind)} />
+                        <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={item.title}>
+                          {item.title}
+                        </Typography>
+                        <Chip size="small" label={`Attempt ${item.attempt}`} />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary" noWrap title={item.summary}>
+                        {item.summary}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Started: {formatAutomationTime(item.started_at)}
+                        {item.next_retry_at ? ` | Next retry: ${formatAutomationTime(item.next_retry_at)}` : ""}
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+                      <Chip
+                        size="small"
+                        label={item.current_status || item.status || "-"}
+                        color={automationStatusColor(item.current_status || item.status || "")}
+                      />
+                      <Button
+                        size="small"
+                        onClick={() => navigateToView(targetViewForAutomationRun(item))}
+                      >
+                        View
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setInventoryOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Recent Activity Dialog */}
+      <Dialog
+        open={activityOpen}
+        onClose={() => setActivityOpen(false)}
+        maxWidth="md"
+        fullWidth
+        PaperProps={{
+          sx: {
+            background: "rgba(10, 15, 28, 0.97)",
+            border: "1px solid rgba(47, 212, 255, 0.18)",
+            backdropFilter: "blur(20px)",
+          },
+        }}
+      >
+        <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Typography variant="h6">Recent Activity</Typography>
+          <IconButton size="small" onClick={() => setActivityOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <ActivityFeed
+            traces={traces}
+            onViewAll={() => {
+              setActivityOpen(false);
+              navigateToView("trace");
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setActivityOpen(false); navigateToView("trace"); }}>
+            View All Traces
+          </Button>
+          <Button onClick={() => setActivityOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
 
       {hasErrors ? (
         <Alert severity="error">

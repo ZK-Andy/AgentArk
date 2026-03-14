@@ -9,6 +9,7 @@ pub mod agent_trait;
 pub mod bus;
 pub mod coordinator;
 pub mod messages;
+pub mod persistence;
 pub mod registry;
 pub mod specialist;
 

@@ -97,6 +97,16 @@ pub struct CognitiveMemory {
     decay_config: MemoryDecayConfig,
 }
 
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
+
 impl CognitiveMemory {
     pub async fn new(
         _data_dir: &Path,
@@ -513,11 +523,7 @@ impl CognitiveMemory {
                 .enumerate()
                 .map(|(i, ep)| {
                     let timestamp = &ep.timestamp;
-                    let content = if ep.content.len() > 300 {
-                        format!("{}...", &ep.content[..300])
-                    } else {
-                        ep.content.clone()
-                    };
+                    let content = truncate_chars(&ep.content, 300);
                     format!("{}. [{}] {}", i + 1, timestamp, content)
                 })
                 .collect::<Vec<_>>()
@@ -664,5 +670,17 @@ Output ONLY prefixed lines (FACT:/PATTERN:/PREF:) or "NO_FACTS". Nothing else."#
     /// Get total entry count
     pub fn entry_count(&self) -> usize {
         self.episode_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncate_chars_preserves_utf8_boundaries() {
+        let input = "Search results: Reuters › World › Iran";
+        let output = truncate_chars(input, 26);
+        assert_eq!(output, "Search results: Reuters ›...");
     }
 }

@@ -16,8 +16,10 @@ pub use transaction::TransactionManager;
 use anyhow::Result;
 #[cfg(feature = "docker")]
 use futures::TryStreamExt;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use crate::actions::{ActionDef, ActionSource};
@@ -67,6 +69,11 @@ pub struct ActionRuntime {
     /// MCP registry for external tools/resources
     mcp_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::registry::McpRegistry>>>,
 }
+
+const LOCAL_APP_HTTP_PORT: u16 = 8990;
+const HTTP_GET_TIMEOUT_SECS: u64 = 10;
+const HTTP_GET_MAX_BODY_BYTES: usize = 1_000_000;
+const MAX_NATIVE_ENV_OVERRIDES: usize = 32;
 
 /// A loaded action ready for execution
 struct LoadedAction {
@@ -130,6 +137,306 @@ enum ContainerIsolation {
 }
 
 impl ActionRuntime {
+    fn remap_workspace_alias_path(&self, raw: &str) -> Option<PathBuf> {
+        let trimmed = raw.trim();
+        const PREFIXES: &[&str] = &["/workspace", "/repo", "/project"];
+        let matched = PREFIXES.iter().find(|prefix| {
+            trimmed == **prefix
+                || trimmed
+                    .strip_prefix(**prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })?;
+        let cwd = std::env::current_dir().ok()?;
+        let suffix = trimmed.strip_prefix(matched).unwrap_or("");
+        let relative = suffix.trim_start_matches('/');
+        if relative.is_empty() {
+            Some(cwd)
+        } else {
+            Some(cwd.join(relative))
+        }
+    }
+
+    fn allowed_file_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![
+            self.data_dir().to_path_buf(),
+            self.actions_dir.clone(),
+            self.config_dir.clone(),
+        ];
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+
+        let mut deduped = Vec::new();
+        for root in roots {
+            let candidate = root.canonicalize().unwrap_or(root);
+            if !deduped
+                .iter()
+                .any(|existing: &PathBuf| existing == &candidate)
+            {
+                deduped.push(candidate);
+            }
+        }
+        deduped
+    }
+
+    fn absolutize_tool_path(&self, raw: &str) -> Result<PathBuf> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Path cannot be empty");
+        }
+
+        if let Some(remapped) = self.remap_workspace_alias_path(trimmed) {
+            return Ok(remapped);
+        }
+
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    }
+
+    fn ensure_tool_path_allowed(&self, candidate: &Path) -> Result<()> {
+        let allowed_roots = self.allowed_file_roots();
+        if allowed_roots.iter().any(|root| candidate.starts_with(root)) {
+            return Ok(());
+        }
+
+        let roots = allowed_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Path '{}' is outside allowed roots: {}",
+            candidate.display(),
+            roots
+        );
+    }
+
+    fn resolve_tool_read_path(&self, raw: &str) -> Result<PathBuf> {
+        let candidate = self.absolutize_tool_path(raw)?;
+        let resolved = candidate.canonicalize()?;
+        self.ensure_tool_path_allowed(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn resolve_tool_write_path(&self, raw: &str) -> Result<PathBuf> {
+        let candidate = self.absolutize_tool_path(raw)?;
+        if candidate.exists() {
+            let resolved = candidate.canonicalize()?;
+            self.ensure_tool_path_allowed(&resolved)?;
+            if resolved.is_dir() {
+                anyhow::bail!("Refusing to overwrite directory '{}'", resolved.display());
+            }
+            return Ok(resolved);
+        }
+
+        let mut missing_components = Vec::new();
+        let mut cursor = candidate.as_path();
+        while !cursor.exists() {
+            let name = cursor
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Path '{}' has no existing parent", raw))?;
+            missing_components.push(name.to_os_string());
+            cursor = cursor
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("Path '{}' has no existing parent", raw))?;
+        }
+
+        let mut rebuilt = cursor.canonicalize()?;
+        self.ensure_tool_path_allowed(&rebuilt)?;
+        for component in missing_components.into_iter().rev() {
+            let component_text = component.to_string_lossy();
+            if component_text.is_empty() || component_text == "." || component_text == ".." {
+                anyhow::bail!("Invalid path component '{}'", component_text);
+            }
+            rebuilt.push(component);
+        }
+        Ok(rebuilt)
+    }
+
+    fn loopback_http_get_allowed(url: &reqwest::Url) -> Result<()> {
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("URL is missing a usable port"))?;
+        if port != LOCAL_APP_HTTP_PORT {
+            anyhow::bail!(
+                "Loopback http_get is restricted to the local app host on port {}",
+                LOCAL_APP_HTTP_PORT
+            );
+        }
+
+        let path = url.path();
+        if path != "/apps" && !path.starts_with("/apps/") {
+            anyhow::bail!("Loopback http_get is restricted to deployed app URLs under /apps/");
+        }
+        Ok(())
+    }
+
+    fn host_is_explicitly_local(host: &str) -> bool {
+        let normalized = host.trim().to_ascii_lowercase();
+        if normalized == "localhost" {
+            return true;
+        }
+        normalized.parse::<IpAddr>().is_ok_and(|ip| match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        })
+    }
+
+    fn ipv4_is_public(ip: Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        !(ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_multicast()
+            || ip.is_unspecified()
+            || octets == [255, 255, 255, 255]
+            || octets[0] == 0
+            || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+            || (octets[0] == 169 && octets[1] == 254)
+            || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+            || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+            || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+            || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+            || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113))
+    }
+
+    fn ipv6_is_public(ip: Ipv6Addr) -> bool {
+        !(ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip.is_unique_local()
+            || ip.is_unicast_link_local())
+    }
+
+    fn ip_is_public(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => Self::ipv4_is_public(v4),
+            IpAddr::V6(v6) => Self::ipv6_is_public(v6),
+        }
+    }
+
+    async fn validate_http_get_url(&self, raw_url: &str) -> Result<reqwest::Url> {
+        let parsed = reqwest::Url::parse(raw_url)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("http_get only supports http:// and https:// URLs");
+        }
+        if parsed.host_str().is_none() {
+            anyhow::bail!("URL must include a host");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("Embedded credentials are not allowed in http_get URLs");
+        }
+
+        let host = parsed
+            .host_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if Self::host_is_explicitly_local(&host) {
+            Self::loopback_http_get_allowed(&parsed)?;
+            return Ok(parsed);
+        }
+        if host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host.ends_with(".home")
+            || host.ends_with(".lan")
+        {
+            anyhow::bail!("Local network hostnames are blocked by http_get");
+        }
+
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if !Self::ip_is_public(ip) {
+                anyhow::bail!("http_get cannot target private or link-local IP addresses");
+            }
+            return Ok(parsed);
+        }
+
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let mut resolved_any = false;
+        for addr in tokio::net::lookup_host((host.as_str(), port)).await? {
+            resolved_any = true;
+            if !Self::ip_is_public(addr.ip()) {
+                anyhow::bail!(
+                    "http_get cannot target internal address {} resolved from {}",
+                    addr.ip(),
+                    host
+                );
+            }
+        }
+        if !resolved_any {
+            anyhow::bail!("Unable to resolve host '{}'", host);
+        }
+
+        Ok(parsed)
+    }
+
+    fn collect_native_env_overrides(
+        arguments: &serde_json::Value,
+    ) -> Result<Vec<(String, String)>> {
+        let Some(obj) = arguments.get("env").and_then(|v| v.as_object()) else {
+            return Ok(Vec::new());
+        };
+
+        if obj.len() > MAX_NATIVE_ENV_OVERRIDES {
+            anyhow::bail!(
+                "Too many environment overrides: {} (max {})",
+                obj.len(),
+                MAX_NATIVE_ENV_OVERRIDES
+            );
+        }
+
+        let mut out = Vec::with_capacity(obj.len());
+        for (key, value) in obj {
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                || key.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            {
+                anyhow::bail!("Invalid environment variable name '{}'", key);
+            }
+
+            let upper = key.to_ascii_uppercase();
+            let blocked = matches!(
+                upper.as_str(),
+                "PATH"
+                    | "HOME"
+                    | "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "PWD"
+                    | "SHELL"
+                    | "ENV"
+                    | "BASH_ENV"
+                    | "NODE_OPTIONS"
+                    | "PYTHONPATH"
+                    | "PYTHONHOME"
+                    | "RUBYLIB"
+                    | "RUBYOPT"
+                    | "PERL5OPT"
+            ) || upper.starts_with("LD_")
+                || upper.starts_with("DYLD_");
+            if blocked {
+                anyhow::bail!("Environment override '{}' is not allowed", key);
+            }
+
+            let string_value = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Environment override '{}' must be a string", key))?
+                .to_string();
+            if string_value.contains('\0') {
+                anyhow::bail!("Environment override '{}' contains a NUL byte", key);
+            }
+            out.push((key.clone(), string_value));
+        }
+
+        Ok(out)
+    }
+
     fn load_disabled_actions(path: &Path) -> HashSet<String> {
         let raw = match std::fs::read(path) {
             Ok(v) => v,
@@ -299,6 +606,27 @@ impl ActionRuntime {
         })
         .await;
 
+        self.register_builtin_action(ActionDef {
+            name: "memory_lookup".to_string(),
+            description: "Look up relevant user memory on demand. Use when the answer may depend on prior user facts, preferences, saved links/data, or knowledge base context that is not already in the recent conversation.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What memory or prior context to look up" },
+                    "limit": { "type": "integer", "description": "Maximum number of memory hits to return (default: 5)" },
+                    "include_semantic": { "type": "boolean", "description": "Include semantic memory matches (default: true)" },
+                    "include_structured": { "type": "boolean", "description": "Include structured preferences, user data, and knowledge base context (default: true)" }
+                },
+                "required": ["query"]
+            }),
+            capabilities: vec!["memory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
         // HTTP requests
         self.register_builtin_action(ActionDef {
             name: "http_get".to_string(),
@@ -411,7 +739,35 @@ impl ActionRuntime {
                 "properties": {
                     "task": { "type": "string", "description": "Task description - what to do" },
                     "cron": { "type": "string", "description": "Cron expression for recurring tasks. Format: 'minute hour day month weekday'. Examples: '0 9 * * *' = daily at 9am, '0 9 * * 1' = every Monday 9am, '*/30 * * * *' = every 30 minutes" },
-                    "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. Example: '2026-02-06T09:00:00+05:30'" }
+                    "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. Example: '2026-02-06T09:00:00+05:30'" },
+                    "action": { "type": "string", "description": "Optional explicit action name to run for each task occurrence" },
+                    "action_arguments": { "type": "object", "description": "Optional explicit arguments for the selected action" },
+                    "report_to": { "type": "string", "description": "Preferred notification channel for results" },
+                    "allow_duplicate": { "type": "boolean", "description": "Create a separate task even if a matching one already exists. Default false: matching tasks are updated/reused." },
+                    "validation": {
+                        "type": "object",
+                        "description": "Optional generic validation policy for each run",
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["none", "non_empty_result", "structured_success", "contains_text", "regex_match", "json_field_exists", "json_field_equals", "json_array_non_empty"] },
+                            "text": { "type": "string" },
+                            "field_path": { "type": "string" },
+                            "expected": {},
+                            "pattern": { "type": "string" }
+                        }
+                    },
+                    "max_attempts": { "type": "integer", "description": "Maximum supervised retry attempts" },
+                    "stall_timeout_secs": { "type": "integer", "description": "Maximum seconds a single run may take before timing out" },
+                    "retry_backoff_secs": { "type": "integer", "description": "Base backoff before retrying failed runs" },
+                    "automation_policy": {
+                        "type": "object",
+                        "description": "Advanced automation execution policy override",
+                        "properties": {
+                            "max_attempts": { "type": "integer" },
+                            "stall_timeout_secs": { "type": "integer" },
+                            "retry_backoff_secs": { "type": "integer" },
+                            "validation": { "type": "object" }
+                        }
+                    }
                 },
                 "required": ["task"]
             }),
@@ -425,12 +781,14 @@ impl ActionRuntime {
         // Tunnel control for remote UI access
         self.register_builtin_action(ActionDef {
             name: "tunnel_control".to_string(),
-            description: "Manage public UI tunnel. Use action=start to create an external link, action=status to check current URL, action=stop to disable it.".to_string(),
+            description: "Manage public UI tunnel. Use action=start to create an external link, action=status to check current URL, action=stop to disable it. Optionally pass provider=cloudflare|ngrok|tailscale_funnel|bore when starting.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "Tunnel operation" }
+                    "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "Tunnel operation" },
+                    "provider": { "type": "string", "description": "Optional provider id for start: cloudflare, ngrok, tailscale_funnel, or bore." },
+                    "allow_duplicate": { "type": "boolean", "description": "Repeat an identical tunnel command in the same request. Default false." }
                 },
                 "required": ["action"]
             }),
@@ -441,7 +799,7 @@ impl ActionRuntime {
         }).await;
         self.register_builtin_action(ActionDef {
             name: "watch".to_string(),
-            description: "Spawn a background watcher that polls an action at regular intervals until a condition is met, then executes follow-up instructions. Use when asked to 'watch for', 'wait for', 'monitor', 'let me know when', or 'poll until'. The watcher runs autonomously and notifies the user when triggered or timed out.".to_string(),
+            description: "Spawn a background watcher that polls an action at regular intervals until a condition is met, then executes follow-up instructions. Use when asked to 'watch for', 'wait for', 'monitor', 'let me know when', or 'poll until'. The watcher runs autonomously and notifies the user when triggered or timed out. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -454,12 +812,78 @@ impl ActionRuntime {
                     "condition_custom": { "type": "string", "description": "Natural language condition description" },
                     "on_trigger": { "type": "string", "description": "What to do when condition is met — natural language instructions for the agent" },
                     "interval_secs": { "type": "integer", "description": "Seconds between polls (default: 60)" },
-                    "timeout_secs": { "type": "integer", "description": "Max seconds to watch before giving up (default: 1800 = 30 min)" },
-                    "notify_channel": { "type": "string", "description": "Channel to notify: 'telegram' or 'http' (default: 'telegram')" }
+                    "timeout_secs": { "type": "integer", "description": "Max seconds to watch before giving up (default: 86400 = 24 hours)" },
+                    "timeout_hours": { "type": "integer", "description": "Convenience timeout override in hours. Supports very large values." },
+                    "timeout_days": { "type": "integer", "description": "Convenience timeout override in days. Supports very large values." },
+                    "until_stopped": { "type": "boolean", "description": "Keep watching until the user stops it. Internally stored as a very large timeout." },
+                    "notify_channel": { "type": "string", "description": "Channel to notify: 'telegram' or 'http' (default: 'telegram')" },
+                    "allow_duplicate": { "type": "boolean", "description": "Create a separate watcher even if a matching one already exists. Default false: matching watchers are updated/reused." },
+                    "validation": {
+                        "type": "object",
+                        "description": "Optional validation policy for successful poll results",
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["none", "non_empty_result", "structured_success", "contains_text", "regex_match", "json_field_exists", "json_field_equals", "json_array_non_empty"] },
+                            "text": { "type": "string" },
+                            "field_path": { "type": "string" },
+                            "expected": {},
+                            "pattern": { "type": "string" }
+                        }
+                    },
+                    "max_attempts": { "type": "integer", "description": "Maximum supervised retry attempts for the follow-up trigger action" },
+                    "stall_timeout_secs": { "type": "integer", "description": "Maximum seconds the trigger follow-up may run before timing out" },
+                    "retry_backoff_secs": { "type": "integer", "description": "Base backoff before retrying failed trigger follow-ups" },
+                    "automation_policy": {
+                        "type": "object",
+                        "description": "Advanced automation execution policy override",
+                        "properties": {
+                            "max_attempts": { "type": "integer" },
+                            "stall_timeout_secs": { "type": "integer" },
+                            "retry_backoff_secs": { "type": "integer" },
+                            "validation": { "type": "object" }
+                        }
+                    }
                 },
                 "required": ["description", "poll_action", "on_trigger"]
             }),
             capabilities: vec!["watcher".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "capability_acquire".to_string(),
+            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom ACTION.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Action name to create in kebab-case" },
+                    "description": { "type": "string", "description": "What the new capability should do" },
+                    "kind": { "type": "string", "enum": ["rest_api", "oauth_api", "openapi", "web_automation"], "description": "Scaffold mode" },
+                    "base_url": { "type": "string", "description": "Base URL for the provider/API" },
+                    "method": { "type": "string", "enum": ["get", "post", "put", "patch", "delete"], "description": "Primary HTTP method" },
+                    "path": { "type": "string", "description": "Primary path or endpoint path" },
+                    "required_inputs": { "type": "array", "items": { "type": "string" }, "description": "Runtime inputs the generated action should require" },
+                    "auth_type": { "type": "string", "enum": ["none", "bearer", "api_key_header", "api_key_query", "oauth2", "basic"], "description": "Primary auth strategy" },
+                    "auth_secret_name": { "type": "string", "description": "Secret/config key the generated action should reference" },
+                    "auth_header_name": { "type": "string", "description": "Header name for api_key_header auth" },
+                    "default_headers": { "type": "object", "description": "Static default headers" },
+                    "default_query": { "type": "object", "description": "Static default query params" },
+                    "body_template": { "description": "Optional request body template" },
+                    "pagination": { "type": "object", "description": "connector_request pagination configuration" },
+                    "response_notes": { "type": "string", "description": "How the action should summarize/return results" },
+                    "source_notes": { "type": "string", "description": "OpenAPI/docs notes to preserve in the scaffold" },
+                    "openapi_url": { "type": "string", "description": "Optional URL to an OpenAPI/Swagger JSON document" },
+                    "openapi_text": { "type": "string", "description": "Inline OpenAPI/Swagger JSON content" },
+                    "docs_url": { "type": "string", "description": "Optional provider documentation URL" },
+                    "docs_text": { "type": "string", "description": "Inline documentation or API notes" },
+                    "force": { "type": "boolean", "description": "Force-load even if the security guard warns" },
+                    "allow_duplicate": { "type": "boolean", "description": "Create another matching capability scaffold instead of updating/reusing an existing one. Default false." }
+                },
+                "required": ["name", "description"]
+            }),
+            capabilities: vec!["integration_builder".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -708,6 +1132,73 @@ impl ActionRuntime {
             file_path: None,
         }).await;
 
+        self.register_builtin_action(ActionDef {
+            name: "list_watchers".to_string(),
+            description: "List background watchers and their live status, poll counts, conditions, and next poll timing. Use when the user asks what the agent is watching, which watchers are active, or whether a watcher has triggered/paused/failed.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "enum": ["active", "paused", "triggered", "failed", "timed_out", "cancelled", "all"],
+                        "description": "Watcher status filter (default: active)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum watchers to return (default: 20)"
+                    }
+                }
+            }),
+            capabilities: vec!["watcher_inventory".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "goal_manage".to_string(),
+            description: "Create, list, delete, or report on goals. Use when the user asks about goals, deadlines, progress toward a goal, or wants to save a new goal for later tracking.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["create", "list", "delete", "report"],
+                        "description": "Goal operation to perform"
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Goal description. Required for create. May also be used to delete a goal by exact text."
+                    },
+                    "goal_id": {
+                        "type": "string",
+                        "description": "Specific goal identifier for delete or report."
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": "Optional due date for create. Accepts YYYY-MM-DD or RFC3339 timestamp."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum number of goals to list (default 10)."
+                    },
+                    "allow_duplicate": {
+                        "type": "boolean",
+                        "description": "Create another matching goal-management item instead of updating/reusing an existing one. Default false."
+                    }
+                },
+                "required": ["operation"]
+            }),
+            capabilities: vec!["goal_management".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
         // Browser automation - fetch and extract content from web pages
         self.register_builtin_action(ActionDef {
             name: "browse".to_string(),
@@ -752,7 +1243,7 @@ impl ActionRuntime {
         // Action management — create/update/delete/list custom actions via chat
         self.register_builtin_action(ActionDef {
             name: "manage_actions".to_string(),
-            description: "Create, update, delete, or list custom actions/workflows. Use when the user wants to add a new integration, action, or workflow.".to_string(),
+            description: "Create, update, delete, or list bundled and user-added actions/skills/workflows. Use when the user wants to inspect their installed skills, add a new action, or modify the action library.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -769,11 +1260,38 @@ impl ActionRuntime {
                     "content": {
                         "type": "string",
                         "description": "ACTION.md content with YAML frontmatter. Required for create/update. Format:\n---\nname: action-name\ndescription: What this action does\nversion: \"1.0.0\"\n---\n\n# Action Title\n\n## Steps\n..."
+                    },
+                    "allow_duplicate": {
+                        "type": "boolean",
+                        "description": "Repeat an identical action-management operation in the same request. Default false."
                     }
                 },
                 "required": ["operation"]
             }),
             capabilities: vec![],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "list_integrations".to_string(),
+            description: "List registered integrations, their enablement/connectivity status, and any integration-backed tools currently available. Use when the user asks what integrations are connected, enabled, configured, or available.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "include_disabled": {
+                        "type": "boolean",
+                        "description": "Include integrations that are currently disabled for agent dispatch. Default true."
+                    },
+                    "only_connected": {
+                        "type": "boolean",
+                        "description": "Only show integrations that are currently connected. Default false."
+                    }
+                }
+            }),
+            capabilities: vec!["integration_inventory".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1176,7 +1694,7 @@ impl ActionRuntime {
         // Moltbook (agent social network)
         self.register_builtin_action(ActionDef {
             name: "moltbook".to_string(),
-            description: "Interact with Moltbook (agent social network). Actions: register, status, me, feed, search, create_post, comment, upvote_post. Outbound posting is privacy-guarded (no user/PII/secrets).".to_string(),
+            description: "Interact with Moltbook (agent social network). Actions: register, status, me, feed, search, create_post, comment, upvote_post. When the user points you at a specific submolt/community and asks you to contribute or explore, start by reading context there and then take one concrete contribution step if it is safe. Posts/comments should be original agent-authored contributions, not a verbatim rewrite of the user's instruction. Outbound posting is privacy-guarded (no user/PII/secrets).".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1191,7 +1709,8 @@ impl ActionRuntime {
                     "title": { "type": "string", "description": "Post title" },
                     "content": { "type": "string", "description": "Post/comment content" },
                     "post_id": { "type": "string", "description": "Post ID for comment/upvote" },
-                    "parent_id": { "type": "string", "description": "Parent comment ID for threaded reply" }
+                    "parent_id": { "type": "string", "description": "Parent comment ID for threaded reply" },
+                    "allow_duplicate": { "type": "boolean", "description": "Repeat an identical Moltbook action in the same request. Default false." }
                 },
                 "required": ["action"]
             }),
@@ -1442,7 +1961,7 @@ impl ActionRuntime {
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the Cloudflare tunnel when available. Default: true."
+                        "description": "Whether to expose the app on the configured public tunnel provider when available. Default: true."
                     },
                     "access_guard": {
                         "type": "boolean",
@@ -1451,6 +1970,10 @@ impl ActionRuntime {
                     "replace_existing": {
                         "type": "boolean",
                         "description": "Force recreation even if a matching deployed app already exists. Default: false."
+                    },
+                    "allow_duplicate": {
+                        "type": "boolean",
+                        "description": "Create another matching app deployment instead of reusing/updating a matching existing app. Default false."
                     }
                 },
                 "required": ["files"]
@@ -1664,6 +2187,14 @@ impl ActionRuntime {
                     action_name
                 ));
             }
+        } else if !self.is_builtin_integration_action_enabled(action_name) {
+            let integration_id =
+                Self::builtin_integration_for_action(action_name).unwrap_or("required");
+            return Err(anyhow::anyhow!(
+                "Action '{}' is unavailable because integration '{}' is disabled.",
+                action_name,
+                integration_id
+            ));
         }
 
         // Resolve secrets at execution time so they never appear in LLM-visible
@@ -1725,7 +2256,7 @@ impl ActionRuntime {
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mgr = SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))?;
-        let secrets = mgr.load_secrets().unwrap_or_default();
+        let secrets = mgr.load_secrets()?;
         let config = mgr.load().ok();
 
         fn builtin_env_from_config(cfg: &AgentConfig, env: &str) -> Option<String> {
@@ -1948,7 +2479,8 @@ impl ActionRuntime {
                 let path = arguments["path"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
-                let content = tokio::fs::read_to_string(path).await?;
+                let path = self.resolve_tool_read_path(path)?;
+                let content = tokio::fs::read_to_string(&path).await?;
                 Ok(content)
             }
             "file_write" => {
@@ -1958,8 +2490,12 @@ impl ActionRuntime {
                 let content = arguments["content"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Missing content"))?;
-                tokio::fs::write(path, content).await?;
-                Ok(format!("Written to {}", path))
+                let path = self.resolve_tool_write_path(path)?;
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&path, content).await?;
+                Ok(format!("Written to {}", path.display()))
             }
             "clipboard_read" => {
                 let mut clipboard = arboard::Clipboard::new()
@@ -2000,6 +2536,7 @@ impl ActionRuntime {
                             crate::core::TaskStatus::Pending
                                 | crate::core::TaskStatus::AwaitingApproval
                         ),
+                        "paused" => matches!(t.status, crate::core::TaskStatus::Paused),
                         "goals" => t.action == "goal",
                         "routines" => t.cron.is_some(),
                         "completed" => matches!(t.status, crate::core::TaskStatus::Completed),
@@ -2017,6 +2554,7 @@ impl ActionRuntime {
                     let status_str = match &t.status {
                         crate::core::TaskStatus::Pending => "Pending",
                         crate::core::TaskStatus::AwaitingApproval => "Awaiting Approval",
+                        crate::core::TaskStatus::Paused => "Paused",
                         crate::core::TaskStatus::InProgress => "In Progress",
                         crate::core::TaskStatus::Completed => "Completed",
                         crate::core::TaskStatus::Failed { .. } => "Failed",
@@ -2607,6 +3145,30 @@ print(result["text"])
                 output.push_str(&format!("\n**Pending Tasks** ({})\n", pending.len()));
                 for t in &pending {
                     output.push_str(&format!("  - {}\n", t.description));
+                }
+
+                let paused: Vec<_> = tasks
+                    .all()
+                    .iter()
+                    .filter(|t| matches!(t.status, crate::core::TaskStatus::Paused))
+                    .collect();
+                if !paused.is_empty() {
+                    output.push_str(&format!("\n**Paused Tasks** ({})\n", paused.len()));
+                    for t in &paused {
+                        output.push_str(&format!("  - {}\n", t.description));
+                    }
+                }
+
+                let paused: Vec<_> = tasks
+                    .all()
+                    .iter()
+                    .filter(|t| matches!(t.status, crate::core::TaskStatus::Paused))
+                    .collect();
+                if !paused.is_empty() {
+                    output.push_str(&format!("\n**Paused Tasks** ({})\n", paused.len()));
+                    for t in &paused {
+                        output.push_str(&format!("  - {}\n", t.description));
+                    }
                 }
 
                 // Failed tasks
@@ -3350,6 +3912,39 @@ print(result["text"])
         has_dangerous_cap || (source != ActionSource::System && capabilities.is_empty())
     }
 
+    fn builtin_integration_for_action(action_name: &str) -> Option<&'static str> {
+        match action_name {
+            "gmail_scan" | "gmail_reply" => Some("gmail"),
+            "calendar_today" | "calendar_list" | "calendar_create" | "calendar_free" => {
+                Some("google_calendar")
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_boolish_flag(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "enabled" => Some(true),
+            "0" | "false" | "no" | "off" | "disabled" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn is_builtin_integration_action_enabled(&self, action_name: &str) -> bool {
+        let Some(integration_id) = Self::builtin_integration_for_action(action_name) else {
+            return true;
+        };
+        let Ok(manager) = SecureConfigManager::new(&self.config_dir) else {
+            return true;
+        };
+        manager
+            .get_custom_secret(&format!("integration_enabled:{}", integration_id))
+            .ok()
+            .flatten()
+            .and_then(|value| Self::parse_boolish_flag(&value))
+            .unwrap_or(true)
+    }
+
     fn pipeline_key_slug(input: &str) -> String {
         let mut out = String::with_capacity(input.len());
         for ch in input.chars() {
@@ -3460,23 +4055,15 @@ print(result["text"])
             .and_then(|v| v.as_str())
             .unwrap_or("status")
             .to_ascii_lowercase();
+        let provider = arguments
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
 
-        let bind_addr =
-            std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-        let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some()
-            && std::env::var("AGENTARK_TLS_KEY")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .is_some();
-        let scheme = if tls_enabled { "https" } else { "http" };
-        let base_url = format!("{}://{}", scheme, bind_addr);
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
+        let base_url = crate::core::net::internal_api_base_url();
+        let client = crate::core::net::build_internal_control_client(5)
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
         let endpoint = match action.as_str() {
@@ -3493,7 +4080,16 @@ print(result["text"])
 
         let mut req = match action.as_str() {
             "status" => client.get(format!("{}{}", base_url, endpoint)),
-            _ => client.post(format!("{}{}", base_url, endpoint)),
+            "start" => {
+                let body = match provider.as_deref() {
+                    Some(value) => serde_json::json!({ "provider": value }),
+                    None => serde_json::json!({}),
+                };
+                client.post(format!("{}{}", base_url, endpoint)).json(&body)
+            }
+            _ => client
+                .post(format!("{}{}", base_url, endpoint))
+                .json(&serde_json::json!({})),
         };
 
         if let Ok(mgr) =
@@ -3511,13 +4107,25 @@ print(result["text"])
             .await
             .map_err(|e| anyhow::anyhow!("Failed to reach tunnel controller: {}", e))?;
         let status = resp.status();
+        let raw_body = resp.text().await.unwrap_or_default();
         let payload: serde_json::Value =
-            resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::from_str(&raw_body).unwrap_or_else(|_| serde_json::json!({}));
         if !status.is_success() {
             let err = payload
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
+                .or_else(|| payload.get("message").and_then(|v| v.as_str()))
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+                .or_else(|| {
+                    let trimmed = raw_body.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.chars().take(400).collect::<String>())
+                    }
+                })
+                .unwrap_or_else(|| format!("HTTP {}", status));
             return Err(anyhow::anyhow!("Tunnel command failed: {}", err));
         }
 
@@ -3633,18 +4241,45 @@ print(result["text"])
                 let url = arguments["url"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Missing url"))?;
+                let parsed_url = self.validate_http_get_url(url).await?;
 
-                let client = reqwest::Client::new();
-                let mut req = client.get(url);
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(HTTP_GET_TIMEOUT_SECS))
+                    .redirect(reqwest::redirect::Policy::limited(5))
+                    .build()?;
+                let mut req = client.get(parsed_url);
                 if let Some(headers) = arguments.get("headers").and_then(|v| v.as_object()) {
                     for (k, v) in headers {
+                        let blocked = matches!(
+                            k.to_ascii_lowercase().as_str(),
+                            "host"
+                                | "connection"
+                                | "content-length"
+                                | "transfer-encoding"
+                                | "proxy-authorization"
+                                | "x-forwarded-for"
+                                | "x-forwarded-host"
+                                | "x-real-ip"
+                        );
+                        if blocked {
+                            anyhow::bail!("Header '{}' is not allowed for http_get", k);
+                        }
                         if let Some(s) = v.as_str() {
                             req = req.header(k, s);
                         }
                     }
                 }
                 let response = req.send().await?;
-                let body = response.text().await?;
+                let body_bytes = response.bytes().await?;
+                let body = if body_bytes.len() > HTTP_GET_MAX_BODY_BYTES {
+                    format!(
+                        "{}\n\n(response truncated at {} bytes)",
+                        String::from_utf8_lossy(&body_bytes[..HTTP_GET_MAX_BODY_BYTES]),
+                        HTTP_GET_MAX_BODY_BYTES
+                    )
+                } else {
+                    String::from_utf8_lossy(&body_bytes).to_string()
+                };
 
                 Ok(body)
             }
@@ -3753,6 +4388,80 @@ print(result["text"])
                     )),
                 }
             }
+            "capability_acquire" => {
+                let arguments = Self::enrich_capability_acquisition_arguments(arguments).await;
+                let raw_name = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'name' for capability acquisition"))?;
+                let description = arguments
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing 'description' for capability acquisition")
+                    })?;
+                let name = Self::normalize_generated_action_name(raw_name);
+                if name.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "Generated action name is empty after normalization"
+                    ));
+                }
+                let content =
+                    self.render_capability_action_markdown(&arguments, &name, description);
+                let force = arguments
+                    .get("force")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let verdict = self.create_action(&name, &content, force).await?;
+                let mut lines = vec![
+                    format!("Capability scaffolded as action `{}`.", name),
+                    "It is now available immediately in the action catalog.".to_string(),
+                ];
+                if let Some(kind) = arguments.get("kind").and_then(|value| value.as_str()) {
+                    lines.push(format!("Mode: {}", kind));
+                }
+                if let Some(base_url) = arguments.get("base_url").and_then(|value| value.as_str()) {
+                    lines.push(format!("Base URL: {}", base_url));
+                }
+                if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
+                    lines.push(format!("Primary endpoint: {}", path));
+                }
+                if let Some(method) = arguments.get("method").and_then(|value| value.as_str()) {
+                    lines.push(format!("Method: {}", method.to_ascii_uppercase()));
+                }
+                if let Some(secret_name) = arguments
+                    .get("auth_secret_name")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    lines.push(format!(
+                        "Expected secret/config key for auth: `{}`.",
+                        secret_name
+                    ));
+                }
+                if let Some(source_notes) = arguments
+                    .get("source_notes")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    lines.push(format!("Derived from: {}", source_notes));
+                }
+                if let Some(verdict) = verdict {
+                    if !verdict.warnings.is_empty() {
+                        lines.push(format!(
+                            "Security review notes: {}",
+                            verdict.warnings.join(", ")
+                        ));
+                    }
+                    if !verdict.allow_load {
+                        lines.push(
+                            "The scaffold was blocked by security policy and was not loaded."
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(lines.join("\n"))
+            }
             _ => {
                 // Check if we have a WASM module for this action
                 let actions = self.actions.read().await;
@@ -3801,8 +4510,9 @@ print(result["text"])
 
             match action_name {
                 "shell" => {
+                    const PUBLIC_SHELL_SANDBOX_IMAGE: &str = "alpine:3.20";
                     self.run_isolated_container(
-                        &self.config.docker_image,
+                        PUBLIC_SHELL_SANDBOX_IMAGE,
                         vec![
                             "sh".to_string(),
                             "-c".to_string(),
@@ -4768,12 +5478,8 @@ print(result["text"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        if let Some(obj) = arguments.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    cmd.env(k, s);
-                }
-            }
+        for (key, value) in Self::collect_native_env_overrides(arguments)? {
+            cmd.env(key, value);
         }
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await;
@@ -4805,15 +5511,19 @@ print(result["text"])
     }
 
     /// List only actions that are currently executable by the agent.
-    /// System actions are always included; non-system actions honor the disabled set.
+    /// Non-system actions honor the disabled set; integration-backed system actions honor
+    /// the integration enable/disable toggle.
     pub async fn list_enabled_actions(&self) -> Result<Vec<ActionDef>> {
         let actions = self.actions.read().await;
         let disabled = self.disabled_actions.read().await;
         Ok(actions
             .values()
             .filter(|loaded| {
-                loaded.info.source == ActionSource::System
-                    || !disabled.contains(loaded.info.name.as_str())
+                if loaded.info.source == ActionSource::System {
+                    self.is_builtin_integration_action_enabled(&loaded.info.name)
+                } else {
+                    !disabled.contains(loaded.info.name.as_str())
+                }
             })
             .map(|loaded| loaded.info.clone())
             .collect())
@@ -5041,6 +5751,916 @@ print(result["text"])
                 Err(anyhow::anyhow!("Failed to parse action: {}", e))
             }
         }
+    }
+
+    fn capability_acquire_required_inputs(arguments: &serde_json::Value) -> Vec<String> {
+        arguments
+            .get("required_inputs")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn capability_string_argument(arguments: &serde_json::Value, key: &str) -> Option<String> {
+        arguments
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn merge_capability_string_field(
+        root: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        value: Option<String>,
+    ) {
+        let Some(value) = value
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+        else {
+            return;
+        };
+        let should_set = root
+            .get(key)
+            .and_then(|existing| existing.as_str())
+            .map(|existing| existing.trim().is_empty())
+            .unwrap_or(true);
+        if should_set {
+            root.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+
+    fn merge_capability_required_inputs(
+        root: &mut serde_json::Map<String, serde_json::Value>,
+        values: Vec<String>,
+    ) {
+        let mut merged = root
+            .get("required_inputs")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for value in values {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || merged.iter().any(|existing| existing == trimmed) {
+                continue;
+            }
+            merged.push(trimmed.to_string());
+        }
+
+        if !merged.is_empty() {
+            root.insert(
+                "required_inputs".to_string(),
+                serde_json::Value::Array(
+                    merged
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+    }
+
+    fn capability_base_url_from_url(raw_url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(raw_url).ok()?;
+        let host = parsed.host_str()?;
+        let mut base = format!("{}://{}", parsed.scheme(), host);
+        if let Some(port) = parsed.port() {
+            base.push(':');
+            base.push_str(&port.to_string());
+        }
+        Some(base)
+    }
+
+    fn first_openapi_operation(
+        paths: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<(String, String, serde_json::Map<String, serde_json::Value>)> {
+        for (path, item) in paths {
+            let Some(item_obj) = item.as_object() else {
+                continue;
+            };
+            for method in ["get", "post", "put", "patch", "delete"] {
+                let Some(operation) = item_obj.get(method).and_then(|value| value.as_object())
+                else {
+                    continue;
+                };
+                return Some((path.clone(), method.to_string(), operation.clone()));
+            }
+        }
+        None
+    }
+
+    fn derive_capability_from_openapi_json(
+        spec_text: &str,
+        source_url: Option<&str>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let spec = serde_json::from_str::<serde_json::Value>(spec_text).ok()?;
+        let mut derived = serde_json::Map::new();
+
+        if let Some(server_url) = spec
+            .get("servers")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|value| value.get("url"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            derived.insert(
+                "base_url".to_string(),
+                serde_json::Value::String(server_url),
+            );
+        } else if let Some(host) = spec.get("host").and_then(|value| value.as_str()) {
+            let scheme = spec
+                .get("schemes")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|value| value.as_str())
+                .unwrap_or("https");
+            let base_path = spec
+                .get("basePath")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim_end_matches('/');
+            derived.insert(
+                "base_url".to_string(),
+                serde_json::Value::String(format!("{}://{}{}", scheme, host, base_path)),
+            );
+        } else if let Some(url) = source_url.and_then(Self::capability_base_url_from_url) {
+            derived.insert("base_url".to_string(), serde_json::Value::String(url));
+        }
+
+        if let Some((path, method, operation)) = spec
+            .get("paths")
+            .and_then(|value| value.as_object())
+            .and_then(Self::first_openapi_operation)
+        {
+            derived.insert("path".to_string(), serde_json::Value::String(path.clone()));
+            derived.insert(
+                "method".to_string(),
+                serde_json::Value::String(method.clone()),
+            );
+
+            let mut required_inputs = Vec::new();
+            for parameter in operation
+                .get("parameters")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let is_required = parameter
+                    .get("required")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !is_required {
+                    continue;
+                }
+                if let Some(name) = parameter.get("name").and_then(|value| value.as_str()) {
+                    required_inputs.push(name.to_string());
+                }
+            }
+            if operation
+                .get("requestBody")
+                .and_then(|value| value.get("required"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                required_inputs.push("body".to_string());
+            }
+            if !required_inputs.is_empty() {
+                derived.insert(
+                    "required_inputs".to_string(),
+                    serde_json::Value::Array(
+                        required_inputs
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect::<Vec<_>>(),
+                    ),
+                );
+            }
+
+            let mut response_notes = operation
+                .get("summary")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    operation
+                        .get("description")
+                        .and_then(|value| value.as_str())
+                })
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            if response_notes.is_empty() {
+                if let Some(description) = operation
+                    .get("responses")
+                    .and_then(|value| value.as_object())
+                    .and_then(|responses| {
+                        ["200", "201", "default"]
+                            .iter()
+                            .find_map(|code| responses.get(*code))
+                    })
+                    .and_then(|value| value.get("description"))
+                    .and_then(|value| value.as_str())
+                {
+                    response_notes = description.trim().to_string();
+                }
+            }
+            if !response_notes.is_empty() {
+                derived.insert(
+                    "response_notes".to_string(),
+                    serde_json::Value::String(response_notes),
+                );
+            }
+        }
+
+        let security_schemes = spec
+            .get("components")
+            .and_then(|value| value.get("securitySchemes"))
+            .and_then(|value| value.as_object())
+            .or_else(|| {
+                spec.get("securityDefinitions")
+                    .and_then(|value| value.as_object())
+            });
+        if let Some((scheme_name, scheme)) =
+            security_schemes.and_then(|schemes| schemes.iter().next())
+        {
+            let scheme_type = scheme
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match scheme_type.as_str() {
+                "http" => {
+                    let auth_scheme = scheme
+                        .get("scheme")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if auth_scheme == "bearer" {
+                        derived.insert(
+                            "auth_type".to_string(),
+                            serde_json::Value::String("bearer".to_string()),
+                        );
+                    } else if auth_scheme == "basic" {
+                        derived.insert(
+                            "auth_type".to_string(),
+                            serde_json::Value::String("basic".to_string()),
+                        );
+                    }
+                }
+                "apikey" | "api_key" => {
+                    let location = scheme
+                        .get("in")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("header")
+                        .to_ascii_lowercase();
+                    let auth_type = if location == "query" {
+                        "api_key_query"
+                    } else {
+                        "api_key_header"
+                    };
+                    derived.insert(
+                        "auth_type".to_string(),
+                        serde_json::Value::String(auth_type.to_string()),
+                    );
+                    if let Some(name) = scheme.get("name").and_then(|value| value.as_str()) {
+                        derived.insert(
+                            "auth_header_name".to_string(),
+                            serde_json::Value::String(name.to_string()),
+                        );
+                    }
+                }
+                "oauth2" => {
+                    derived.insert(
+                        "auth_type".to_string(),
+                        serde_json::Value::String("oauth2".to_string()),
+                    );
+                }
+                _ => {}
+            }
+            derived.insert(
+                "auth_secret_name".to_string(),
+                serde_json::Value::String(format!(
+                    "{}_auth",
+                    Self::normalize_generated_action_name(scheme_name)
+                )),
+            );
+        }
+
+        let mut notes = Vec::new();
+        if let Some(title) = spec
+            .get("info")
+            .and_then(|value| value.get("title"))
+            .and_then(|value| value.as_str())
+        {
+            notes.push(format!("Spec title: {}", title.trim()));
+        }
+        if let Some(version) = spec
+            .get("info")
+            .and_then(|value| value.get("version"))
+            .and_then(|value| value.as_str())
+        {
+            notes.push(format!("Spec version: {}", version.trim()));
+        }
+        if let Some(url) = source_url {
+            notes.push(format!("Source URL: {}", url.trim()));
+        }
+        if !notes.is_empty() {
+            derived.insert(
+                "source_notes".to_string(),
+                serde_json::Value::String(notes.join(" | ")),
+            );
+        }
+
+        Some(derived)
+    }
+
+    fn derive_capability_from_docs_text(
+        docs_text: &str,
+        docs_url: Option<&str>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut derived = serde_json::Map::new();
+        let endpoint_re = Regex::new(
+            r#"(?i)\b(GET|POST|PUT|PATCH|DELETE)\s+(https?://[^\s`"'<>]+|/[A-Za-z0-9._~!$&'()*+,;=:@/%?-]+)"#,
+        )
+        .ok()?;
+        if let Some(captures) = endpoint_re.captures(docs_text) {
+            let method = captures.get(1).map(|m| m.as_str().to_ascii_lowercase());
+            let endpoint = captures.get(2).map(|m| m.as_str().trim().to_string());
+            if let Some(method) = method {
+                derived.insert("method".to_string(), serde_json::Value::String(method));
+            }
+            if let Some(endpoint) = endpoint {
+                if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                    if let Ok(url) = reqwest::Url::parse(&endpoint) {
+                        if let Some(base) = Self::capability_base_url_from_url(url.as_str()) {
+                            derived.insert("base_url".to_string(), serde_json::Value::String(base));
+                        }
+                        derived.insert(
+                            "path".to_string(),
+                            serde_json::Value::String(url.path().to_string()),
+                        );
+                    }
+                } else {
+                    derived.insert("path".to_string(), serde_json::Value::String(endpoint));
+                    if let Some(base) = docs_url.and_then(Self::capability_base_url_from_url) {
+                        derived.insert("base_url".to_string(), serde_json::Value::String(base));
+                    }
+                }
+            }
+        }
+
+        let mut required_inputs = Vec::new();
+        let path_param_re = Regex::new(r#"\{([A-Za-z0-9_]+)\}|:([A-Za-z0-9_]+)"#).ok()?;
+        for captures in path_param_re.captures_iter(docs_text) {
+            if let Some(name) = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .map(|m| m.as_str().trim().to_string())
+            {
+                if !required_inputs.iter().any(|existing| existing == &name) {
+                    required_inputs.push(name);
+                }
+            }
+        }
+        if !required_inputs.is_empty() {
+            derived.insert(
+                "required_inputs".to_string(),
+                serde_json::Value::Array(
+                    required_inputs
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+
+        let lower = docs_text.to_ascii_lowercase();
+        if lower.contains("oauth") {
+            derived.insert(
+                "auth_type".to_string(),
+                serde_json::Value::String("oauth2".to_string()),
+            );
+        } else if lower.contains("bearer token") || lower.contains("authorization: bearer") {
+            derived.insert(
+                "auth_type".to_string(),
+                serde_json::Value::String("bearer".to_string()),
+            );
+        } else if lower.contains("x-api-key") || lower.contains("api key") {
+            derived.insert(
+                "auth_type".to_string(),
+                serde_json::Value::String("api_key_header".to_string()),
+            );
+            if lower.contains("x-api-key") {
+                derived.insert(
+                    "auth_header_name".to_string(),
+                    serde_json::Value::String("X-API-Key".to_string()),
+                );
+            }
+        }
+
+        let summary = docs_text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.chars().take(180).collect::<String>());
+        if let Some(summary) = summary {
+            derived.insert(
+                "source_notes".to_string(),
+                serde_json::Value::String(summary),
+            );
+        }
+
+        if derived.is_empty() {
+            None
+        } else {
+            Some(derived)
+        }
+    }
+
+    async fn load_capability_source_text(raw_url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(raw_url.trim()).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+        let response = reqwest::Client::new().get(parsed).send().await.ok()?;
+        let response = response.error_for_status().ok()?;
+        response
+            .text()
+            .await
+            .ok()
+            .map(|text| text.trim().to_string())
+    }
+
+    async fn enrich_capability_acquisition_arguments(
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut enriched = arguments.clone();
+        if !enriched.is_object() {
+            enriched = serde_json::json!({});
+        }
+        let Some(root) = enriched.as_object_mut() else {
+            return enriched;
+        };
+
+        let openapi_url = Self::capability_string_argument(arguments, "openapi_url");
+        let docs_url = Self::capability_string_argument(arguments, "docs_url");
+        let openapi_text =
+            if let Some(text) = Self::capability_string_argument(arguments, "openapi_text") {
+                Some(text)
+            } else if let Some(url) = openapi_url.as_deref() {
+                Self::load_capability_source_text(url).await
+            } else {
+                None
+            };
+        let docs_text = if let Some(text) = Self::capability_string_argument(arguments, "docs_text")
+        {
+            Some(text)
+        } else if let Some(url) = docs_url.as_deref() {
+            Self::load_capability_source_text(url).await
+        } else {
+            None
+        };
+
+        let mut derived_from_openapi = false;
+        if let Some(ref spec_text) = openapi_text {
+            if let Some(derived) =
+                Self::derive_capability_from_openapi_json(spec_text, openapi_url.as_deref())
+            {
+                derived_from_openapi = true;
+                Self::merge_capability_string_field(
+                    root,
+                    "base_url",
+                    derived
+                        .get("base_url")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "path",
+                    derived
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "method",
+                    derived
+                        .get("method")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "auth_type",
+                    derived
+                        .get("auth_type")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "auth_secret_name",
+                    derived
+                        .get("auth_secret_name")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "auth_header_name",
+                    derived
+                        .get("auth_header_name")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "response_notes",
+                    derived
+                        .get("response_notes")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_string_field(
+                    root,
+                    "source_notes",
+                    derived
+                        .get("source_notes")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string),
+                );
+                Self::merge_capability_required_inputs(
+                    root,
+                    derived
+                        .get("required_inputs")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                );
+                if root
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .map(|kind| kind.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    root.insert(
+                        "kind".to_string(),
+                        serde_json::Value::String("openapi".to_string()),
+                    );
+                }
+            }
+        }
+        if !derived_from_openapi {
+            if let Some(ref docs_text) = docs_text {
+                if let Some(derived) =
+                    Self::derive_capability_from_docs_text(docs_text, docs_url.as_deref())
+                {
+                    Self::merge_capability_string_field(
+                        root,
+                        "base_url",
+                        derived
+                            .get("base_url")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_string_field(
+                        root,
+                        "path",
+                        derived
+                            .get("path")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_string_field(
+                        root,
+                        "method",
+                        derived
+                            .get("method")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_string_field(
+                        root,
+                        "auth_type",
+                        derived
+                            .get("auth_type")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_string_field(
+                        root,
+                        "auth_header_name",
+                        derived
+                            .get("auth_header_name")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_string_field(
+                        root,
+                        "source_notes",
+                        derived
+                            .get("source_notes")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
+                    );
+                    Self::merge_capability_required_inputs(
+                        root,
+                        derived
+                            .get("required_inputs")
+                            .and_then(|value| value.as_array())
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|item| item.as_str())
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+
+        if root.get("docs_url").is_none() {
+            if let Some(url) = docs_url {
+                root.insert("docs_url".to_string(), serde_json::Value::String(url));
+            }
+        }
+        if root.get("openapi_url").is_none() {
+            if let Some(url) = openapi_url {
+                root.insert("openapi_url".to_string(), serde_json::Value::String(url));
+            }
+        }
+
+        enriched
+    }
+
+    fn normalize_generated_action_name(raw: &str) -> String {
+        let mut out = String::new();
+        let mut prev_dash = false;
+        for ch in raw.chars() {
+            let mapped = if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            };
+            if mapped == '-' {
+                if !prev_dash && !out.is_empty() {
+                    out.push('-');
+                }
+                prev_dash = true;
+            } else {
+                out.push(mapped);
+                prev_dash = false;
+            }
+        }
+        out.trim_matches('-').to_string()
+    }
+
+    fn render_capability_action_markdown(
+        &self,
+        arguments: &serde_json::Value,
+        name: &str,
+        description: &str,
+    ) -> String {
+        let kind = arguments
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("rest_api");
+        let method = arguments
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or("get")
+            .to_ascii_uppercase();
+        let base_url = arguments
+            .get("base_url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let path = arguments
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let auth_type = arguments
+            .get("auth_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("none");
+        let auth_secret_name = arguments
+            .get("auth_secret_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let auth_header_name = arguments
+            .get("auth_header_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or(if auth_type == "api_key_header" {
+                "X-API-Key"
+            } else {
+                "Authorization"
+            });
+        let response_notes = arguments
+            .get("response_notes")
+            .and_then(|value| value.as_str())
+            .unwrap_or(
+                "Return a concise user-facing summary plus any stable identifiers and links.",
+            );
+        let source_notes = arguments
+            .get("source_notes")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let required_inputs = Self::capability_acquire_required_inputs(arguments);
+        let required_block = if required_inputs.is_empty() {
+            " []".to_string()
+        } else {
+            format!(
+                "\n{}",
+                required_inputs
+                    .iter()
+                    .map(|item| format!("  - {}", item))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
+        let connector_template = serde_json::json!({
+            "url": if path.is_empty() { base_url.to_string() } else { format!("{}{}", base_url, path) },
+            "method": method.to_ascii_lowercase(),
+            "headers": arguments
+                .get("default_headers")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            "query": arguments
+                .get("default_query")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            "body": arguments
+                .get("body_template")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "pagination": arguments
+                .get("pagination")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        });
+        let connector_template =
+            serde_json::to_string_pretty(&connector_template).unwrap_or_else(|_| "{}".to_string());
+
+        let auth_notes = match auth_type {
+            "bearer" => format!(
+                "- Read the bearer token from secret storage key `{}`.\n- Send it in the `{}` header as `Bearer <token>`.\n- If the token is unavailable, report that auth still needs to be configured.",
+                if auth_secret_name.is_empty() {
+                    format!("{}_token", name)
+                } else {
+                    auth_secret_name.to_string()
+                },
+                auth_header_name
+            ),
+            "api_key_header" => format!(
+                "- Read the API key from secret storage key `{}`.\n- Send it in the `{}` header.\n- If the key is unavailable, report that auth still needs to be configured.",
+                if auth_secret_name.is_empty() {
+                    format!("{}_api_key", name)
+                } else {
+                    auth_secret_name.to_string()
+                },
+                auth_header_name
+            ),
+            "api_key_query" => format!(
+                "- Read the API key from secret storage key `{}`.\n- Add it to the provider query params before calling `connector_request`.\n- If the key is unavailable, report that auth still needs to be configured.",
+                if auth_secret_name.is_empty() {
+                    format!("{}_api_key", name)
+                } else {
+                    auth_secret_name.to_string()
+                }
+            ),
+            "oauth2" => format!(
+                "- Prefer an existing connected integration if one already covers this provider.\n- Otherwise use secret/config key `{}` for OAuth credentials or refresh tokens.\n- If OAuth is not connected yet, say that the capability is scaffolded but still needs OAuth setup.",
+                if auth_secret_name.is_empty() {
+                    format!("{}_oauth", name)
+                } else {
+                    auth_secret_name.to_string()
+                }
+            ),
+            "basic" => format!(
+                "- Read credentials from secret storage key `{}`.\n- Use HTTP Basic auth when calling `connector_request`.\n- If credentials are unavailable, report that auth still needs to be configured.",
+                if auth_secret_name.is_empty() {
+                    format!("{}_basic_auth", name)
+                } else {
+                    auth_secret_name.to_string()
+                }
+            ),
+            _ => "- No provider auth is required for this capability.".to_string(),
+        };
+
+        let acquisition_mode = match kind {
+            "web_automation" => {
+                "If the provider has no stable API, use `browser_auto` as the fallback execution path after trying the connector flow."
+            }
+            "oauth_api" => {
+                "Prefer the direct API path, but explicitly report missing OAuth setup when credentials are not connected yet."
+            }
+            "openapi" => {
+                "Preserve the documented API structure from the supplied spec/notes and keep request/response handling predictable."
+            }
+            _ => "Use the documented HTTP surface directly with `connector_request`.",
+        };
+
+        let required_inputs_section = if required_inputs.is_empty() {
+            "- No additional required inputs beyond optional `query`.".to_string()
+        } else {
+            required_inputs
+                .iter()
+                .map(|item| format!("- `{}`", item))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        format!(
+            r#"---
+name: {name}
+description: {description}
+version: "1.0.0"
+permissions: [network]
+required:{required_block}
+---
+
+# {name}
+
+## Purpose
+{description}
+
+## Required Inputs
+{required_inputs_section}
+
+## Capability Acquisition Context
+- Kind: `{kind}`
+- Base URL: `{base_url}`
+- Path: `{path}`
+- Method: `{method}`
+- {acquisition_mode}
+
+## Authentication
+{auth_notes}
+
+## Execution
+1. Gather any missing required inputs before making a request.
+2. Prefer a direct `connector_request` call using this template:
+
+```json
+{connector_template}
+```
+
+3. Merge user-provided inputs into the request path, query, and body instead of ignoring them.
+4. Preserve pagination, retries, and auth requirements when the provider needs them.
+5. If the capability cannot run yet because auth/config is missing, say exactly what must be connected or stored next.
+
+## Response Contract
+- {response_notes}
+- Include stable IDs, URLs, and next steps when available.
+- Never reveal raw secrets or credential values.
+
+## Source Notes
+{source_notes}
+"#,
+            name = name,
+            description = description,
+            required_block = required_block,
+            required_inputs_section = required_inputs_section,
+            kind = kind,
+            base_url = if base_url.is_empty() { "-" } else { base_url },
+            path = if path.is_empty() { "-" } else { path },
+            method = method,
+            acquisition_mode = acquisition_mode,
+            auth_notes = auth_notes,
+            connector_template = connector_template,
+            response_notes = response_notes,
+            source_notes = if source_notes.trim().is_empty() {
+                "- No additional provider notes supplied.".to_string()
+            } else {
+                source_notes.to_string()
+            },
+        )
     }
 
     /// Preview security verdict for an action without persisting or registering it.
@@ -5759,6 +7379,40 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
         Err(_) => crate::actions::SearchConfig::default(),
     };
 
+    if let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) {
+        if let Ok(secrets) = manager.load_secrets() {
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_serper_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.serper = Some(crate::actions::search::SearchBackend::Serper { api_key });
+            } else if matches!(
+                &config.serper,
+                Some(crate::actions::search::SearchBackend::Serper { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.serper = None;
+            }
+
+            if let Some(api_key) = secrets
+                .custom
+                .get("search_brave_key")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+            {
+                config.brave = Some(crate::actions::search::SearchBackend::Brave { api_key });
+            } else if matches!(
+                &config.brave,
+                Some(crate::actions::search::SearchBackend::Brave { api_key })
+                    if api_key.trim().is_empty()
+            ) {
+                config.brave = None;
+            }
+        }
+    }
+
     // Auto-detect Playwright bridge if not already set
     if config.playwright.is_none() {
         let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
@@ -5782,4 +7436,73 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
     }
 
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_http_get_rejects_non_app_paths() {
+        let url = reqwest::Url::parse("http://127.0.0.1:8990/api/secret").unwrap();
+        let err = ActionRuntime::loopback_http_get_allowed(&url).unwrap_err();
+        assert!(err.to_string().contains("/apps/"));
+    }
+
+    #[test]
+    fn loopback_http_get_allows_local_app_paths() {
+        let url = reqwest::Url::parse("http://localhost:8990/apps/demo/health").unwrap();
+        assert!(ActionRuntime::loopback_http_get_allowed(&url).is_ok());
+    }
+
+    #[test]
+    fn native_env_overrides_block_runtime_control_keys() {
+        let args = serde_json::json!({
+            "env": {
+                "PATH": "/tmp/bin"
+            }
+        });
+        let err = ActionRuntime::collect_native_env_overrides(&args).unwrap_err();
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn workspace_alias_paths_remap_to_current_dir() {
+        let runtime = ActionRuntime {
+            config: RuntimeConfig::default(),
+            _sandbox: ActionSandbox::new(&RuntimeConfig::default()).unwrap(),
+            transactions: tokio::sync::Mutex::new(TransactionManager::new(PathBuf::from(
+                "snapshots",
+            ))),
+            actions: tokio::sync::RwLock::new(HashMap::new()),
+            disabled_actions: tokio::sync::RwLock::new(HashSet::new()),
+            disabled_actions_file: PathBuf::from("./disabled_actions.json"),
+            actions_dir: PathBuf::from("./skills"),
+            config_dir: PathBuf::from("."),
+            task_queue: None,
+            action_guard: None,
+            storage: None,
+            mcp_registry: None,
+        };
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            runtime
+                .absolutize_tool_path("/workspace/demo/index.html")
+                .unwrap(),
+            cwd.join("demo").join("index.html")
+        );
+    }
+
+    #[test]
+    fn private_ips_are_not_treated_as_public() {
+        assert!(!ActionRuntime::ip_is_public(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!ActionRuntime::ip_is_public(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 10
+        ))));
+        assert!(ActionRuntime::ip_is_public(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
+    }
 }

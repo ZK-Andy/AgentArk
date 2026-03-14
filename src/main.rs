@@ -62,6 +62,10 @@ struct Args {
     /// Enable debug logging (shows all internal details: LLM calls, actions, memory, Docker)
     #[arg(long, env = "AGENTARK_DEBUG")]
     debug: bool,
+
+    /// Interactive CLI chat mode (like OpenClaw)
+    #[arg(long)]
+    chat: bool,
 }
 
 #[tokio::main]
@@ -70,7 +74,9 @@ async fn main() -> Result<()> {
 
     // Initialize tracing
     // --debug enables verbose logging for agentark while keeping noisy deps quiet
-    let default_filter = if args.debug {
+    let default_filter = if args.chat {
+        "error".to_string()
+    } else if args.debug {
         "debug,agentark=trace,sqlx::query=info,sea_orm=info,hyper=warn,reqwest=info,bollard=debug,tower=warn,h2=warn,rustls=warn".to_string()
     } else {
         format!(
@@ -78,11 +84,15 @@ async fn main() -> Result<()> {
             args.log_level
         )
     };
+    let env_filter = if args.chat {
+        // In chat mode, force error-only — ignore RUST_LOG env var
+        "error".parse().expect("Invalid log filter")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| default_filter.parse().expect("Invalid log filter"))
+    };
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.parse().expect("Invalid log filter")),
-        )
+        .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -269,6 +279,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    if args.chat {
+        return run_chat_repl(agent).await;
+    }
+
     if args.headless {
         run_headless(agent).await
     } else {
@@ -282,6 +296,84 @@ async fn main() -> Result<()> {
             run_headless(agent).await
         }
     }
+}
+
+/// Interactive CLI chat mode — talk to the agent from your terminal.
+async fn run_chat_repl(agent: core::Agent) -> Result<()> {
+    let agent = std::sync::Arc::new(agent);
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+
+    println!();
+    println!("╔═══════════════════════════════════════════════════════════╗");
+    println!(
+        "║           AgentArk v{} — CLI Chat                    ║",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("╠═══════════════════════════════════════════════════════════╣");
+    println!("║  Type your message and press Enter.                      ║");
+    println!("║  Commands: /exit  /new  /help                            ║");
+    println!("╚═══════════════════════════════════════════════════════════╝");
+    println!();
+
+    let mut conv_id = conversation_id;
+
+    loop {
+        print!("\x1b[36myou ➜\x1b[0m ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        let mut input = String::new();
+        if std::io::stdin().lock().read_line(&mut input)? == 0 {
+            break; // EOF
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        match input {
+            "/exit" | "/quit" | "/q" => {
+                println!("Goodbye!");
+                break;
+            }
+            "/new" => {
+                conv_id = uuid::Uuid::new_v4().to_string();
+                println!("\x1b[33m— New conversation started —\x1b[0m");
+                println!();
+                continue;
+            }
+            "/help" => {
+                println!();
+                println!("  /new   — Start a new conversation");
+                println!("  /exit  — Quit the CLI");
+                println!("  /help  — Show this help");
+                println!();
+                continue;
+            }
+            _ => {}
+        }
+
+        print!("\x1b[90m⏳ Thinking...\x1b[0m");
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        match agent
+            .process_message(input, "cli", Some(&conv_id), None)
+            .await
+        {
+            Ok(response) => {
+                // Clear the "Thinking..." text
+                print!("\r\x1b[K");
+                println!("\x1b[32magentark ➜\x1b[0m {}", response);
+                println!();
+            }
+            Err(e) => {
+                print!("\r\x1b[K");
+                eprintln!("\x1b[31merror:\x1b[0m {}", e);
+                println!();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// CLI-based setup wizard for headless mode
@@ -441,6 +533,36 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => res?,
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+}
+
+fn mask_api_key_for_console(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    if trimmed.len() <= 8 {
+        return "configured".to_string();
+    }
+    format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
+}
+
 async fn run_headless(agent: core::Agent) -> Result<()> {
     tracing::info!("Running in headless mode");
 
@@ -457,10 +579,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     if let Some(ref api_key) = agent.api_key {
         println!("┌─────────────────────────────────────────────────────────┐");
         println!("│  Authentication enabled                                 │");
-        println!(
-            "│  API Key: {}...  │",
-            &api_key[..std::cmp::min(api_key.len(), 32)]
-        );
+        println!("│  API Key: {}...  │", mask_api_key_for_console(api_key));
         println!("│  Use: Authorization: Bearer <key>                       │");
         println!("└─────────────────────────────────────────────────────────┘");
         println!();
@@ -495,11 +614,14 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 
     // Daily brief task is opt-in via Settings — not auto-created on fresh install
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Start HTTP server for local IPC
     let http_handle = {
         let agent = agent.clone();
+        let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) = channels::http::serve(agent).await {
+            if let Err(e) = channels::http::serve(agent, shutdown).await {
                 tracing::error!("HTTP server error: {}", e);
             }
         })
@@ -507,7 +629,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
 
     // Start Telegram bot if configured
     #[cfg(feature = "telegram")]
-    let _telegram_handle = {
+    let telegram_handle = {
         let agent = agent.clone();
         tokio::spawn(async move {
             if let Err(e) = channels::telegram::serve(agent).await {
@@ -517,17 +639,42 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     };
 
     // Start ArkSentinel — unified background engine (scheduler, watchers, consolidation, ArkPulse)
-    let sentinel_handles = sentinel::start(agent.clone(), sentinel::SentinelConfig::default());
+    let sentinel_handles = sentinel::start(
+        agent.clone(),
+        sentinel::SentinelConfig::default(),
+        shutdown_rx.clone(),
+    );
 
     // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
     println!();
     tracing::info!("Shutdown signal received");
 
-    http_handle.abort();
-    for h in sentinel_handles {
-        h.abort();
+    let _ = shutdown_tx.send(true);
+
+    let mut http_handle = http_handle;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut http_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("HTTP server join failed during shutdown: {}", e),
+        Err(_) => {
+            tracing::warn!("HTTP server did not stop within 10s; aborting task");
+            http_handle.abort();
+        }
     }
+
+    for mut handle in sentinel_handles {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("Sentinel task join failed during shutdown: {}", e),
+            Err(_) => {
+                tracing::warn!("Sentinel task did not stop within 10s; aborting task");
+                handle.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "telegram")]
+    telegram_handle.abort();
 
     Ok(())
 }

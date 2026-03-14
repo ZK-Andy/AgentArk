@@ -12,6 +12,8 @@ Memory tiers:
 LLM config is pushed dynamically from AgentArk's model pool via /configure.
 """
 
+import copy
+import gc
 import logging
 import math
 import os
@@ -31,10 +33,14 @@ app = FastAPI(title="AgentArk Mem0 Bridge", version="2.0.0")
 memory_instance = None
 configured = False
 last_valid_config = None
+active_qdrant_generation = 0
 
 # Paths for persistent data
 QDRANT_PATH = os.environ.get("QDRANT_PATH", "/data/qdrant")
 MODEL_CACHE = os.environ.get("MODEL_CACHE", "/data/models")
+DEFAULT_COLLECTION_NAME = os.environ.get("MEM0_COLLECTION_NAME", "agentark_memories")
+MIGRATIONS_COLLECTION_NAME = "mem0migrations"
+DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_EMBEDDER_MODEL", "all-MiniLM-L6-v2")
 
 # ── Decay Configuration ─────────────────────────────────────────────────
 
@@ -185,7 +191,129 @@ class CleanupRequest(BaseModel):
     max_memories: int = MAX_MEMORIES
 
 
-def _reset_qdrant_collection(qdrant_path: str, expected_dim: int):
+def _build_mem0_config(req: ConfigureRequest) -> dict:
+    llm_config: dict = {"model": req.model}
+
+    if req.provider == "openai":
+        if req.api_key:
+            llm_config["api_key"] = req.api_key
+            os.environ["OPENAI_API_KEY"] = req.api_key
+        if req.base_url:
+            llm_config["openai_base_url"] = req.base_url
+            os.environ["OPENAI_BASE_URL"] = req.base_url
+        else:
+            os.environ.pop("OPENAI_BASE_URL", None)
+    elif req.provider == "anthropic":
+        if req.api_key:
+            llm_config["api_key"] = req.api_key
+            os.environ["ANTHROPIC_API_KEY"] = req.api_key
+    elif req.provider == "ollama":
+        if req.base_url:
+            llm_config["ollama_base_url"] = req.base_url
+
+    config = {
+        "llm": {
+            "provider": req.provider,
+            "config": llm_config,
+        },
+        "embedder": {
+            "provider": "huggingface",
+            "config": {
+                "model": DEFAULT_EMBEDDER_MODEL,
+                "model_kwargs": {"cache_folder": MODEL_CACHE},
+            },
+        },
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "collection_name": DEFAULT_COLLECTION_NAME,
+                "path": QDRANT_PATH,
+                "embedding_model_dims": 384,
+            },
+        },
+    }
+    config["vector_store"]["config"]["path"] = _qdrant_path_for_config(config)
+    return config
+
+
+def _embedder_dimension(config: Optional[dict]) -> Optional[int]:
+    if not config:
+        return None
+    embedder = config.get("embedder", {})
+    provider = str(embedder.get("provider", "")).strip().lower()
+    if provider != "huggingface":
+        return None
+
+    embedder_cfg = embedder.get("config", {}) or {}
+    model_name = str(embedder_cfg.get("model", DEFAULT_EMBEDDER_MODEL)).strip()
+    model_kwargs = embedder_cfg.get("model_kwargs", {}) or {}
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        model = SentenceTransformer(model_name, **model_kwargs)
+        dim = model.get_sentence_embedding_dimension()
+        return int(dim) if dim else None
+    except Exception as e:
+        logger.warning("Could not determine embedder dimension for %s: %s", model_name, e)
+        return None
+
+
+def _safe_slug(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+    return normalized.strip("-") or "default"
+
+
+def _qdrant_path_for_config(config: Optional[dict], generation: Optional[int] = None) -> str:
+    if generation is None:
+        generation = active_qdrant_generation
+
+    embedder = config.get("embedder", {}) if config else {}
+    provider = str(embedder.get("provider", "default")).strip()
+    embedder_cfg = embedder.get("config", {}) or {}
+    model_name = str(embedder_cfg.get("model", DEFAULT_EMBEDDER_MODEL)).strip()
+    dim = _embedder_dimension(config)
+
+    parts = [_safe_slug(provider), _safe_slug(model_name)]
+    if dim is not None:
+        parts.append(f"{dim}d")
+    if generation:
+        parts.append(f"g{generation}")
+    return os.path.join(QDRANT_PATH, "-".join(parts))
+
+
+def _configured_qdrant_path(config: Optional[dict]) -> str:
+    if not config:
+        return QDRANT_PATH
+    return (
+        config.get("vector_store", {})
+        .get("config", {})
+        .get("path", QDRANT_PATH)
+    )
+
+
+def _configured_collection_names(config: Optional[dict]) -> list[str]:
+    names = {DEFAULT_COLLECTION_NAME, MIGRATIONS_COLLECTION_NAME}
+    if config:
+        collection_name = (
+            config.get("vector_store", {})
+            .get("config", {})
+            .get("collection_name")
+        )
+        if isinstance(collection_name, str) and collection_name.strip():
+            names.add(collection_name.strip())
+    return sorted(names)
+
+
+def _check_known_qdrant_dimensions(qdrant_path: str, config: Optional[dict]) -> Optional[int]:
+    expected_dim = _embedder_dimension(config)
+    if expected_dim is None:
+        return None
+    for collection_name in _configured_collection_names(config):
+        _check_qdrant_dimensions(qdrant_path, collection_name, expected_dim)
+    return expected_dim
+
+
+def _reset_qdrant_collection(qdrant_path: str, expected_dim: Optional[int] = None):
     """Wipe the entire Qdrant storage directory so it gets recreated fresh."""
     import shutil
     if os.path.isdir(qdrant_path):
@@ -196,6 +324,22 @@ def _reset_qdrant_collection(qdrant_path: str, expected_dim: int):
     _decay_meta = {}
     _save_metadata()
     logger.info("Qdrant storage reset — will be recreated with dim=%d", expected_dim)
+
+
+def _reset_all_qdrant_storage(expected_dim: Optional[int] = None):
+    """Wipe the full Qdrant root, including all derived generation paths."""
+    import shutil
+
+    if os.path.isdir(QDRANT_PATH):
+        shutil.rmtree(QDRANT_PATH)
+    os.makedirs(QDRANT_PATH, exist_ok=True)
+    global _decay_meta
+    _decay_meta = {}
+    _save_metadata()
+    logger.info(
+        "All Qdrant storage reset - all generations cleared, expected dim=%s",
+        expected_dim if expected_dim is not None else "unknown",
+    )
 
 
 def _check_qdrant_dimensions(qdrant_path: str, collection_name: str, expected_dim: int):
@@ -243,6 +387,141 @@ def _check_qdrant_dimensions(qdrant_path: str, collection_name: str, expected_di
                 continue
 
 
+def _reinitialize_memory_from_last_config(reset_storage: bool, reason: str) -> bool:
+    global memory_instance, configured, last_valid_config, active_qdrant_generation
+
+    if not last_valid_config:
+        logger.warning(
+            "Mem0 re-initialization skipped (%s): no last valid config available",
+            reason,
+        )
+        memory_instance = None
+        configured = False
+        return False
+
+    try:
+        from mem0 import Memory
+        max_attempts = 2 if reset_storage else 1
+        for attempt in range(max_attempts):
+            config = copy.deepcopy(last_valid_config)
+            expected_dim = _embedder_dimension(config)
+            doing_clean_reset = reset_storage or attempt > 0
+            if doing_clean_reset:
+                active_qdrant_generation += 1
+            config.setdefault("vector_store", {}).setdefault("config", {})["path"] = (
+                _qdrant_path_for_config(config, active_qdrant_generation)
+            )
+            qdrant_path = _configured_qdrant_path(config)
+
+            old_instance = memory_instance
+            memory_instance = None
+            del old_instance
+            gc.collect()
+
+            if doing_clean_reset:
+                _reset_all_qdrant_storage(expected_dim)
+                _reset_qdrant_collection(qdrant_path, expected_dim)
+            else:
+                _check_known_qdrant_dimensions(qdrant_path, config)
+
+            candidate = Memory.from_config(config)
+            try:
+                candidate.search(
+                    "bridge validation",
+                    user_id="system:bridge_validate",
+                    limit=1,
+                )
+            except Exception as validation_err:
+                validation_msg = str(validation_err).strip()
+                del candidate
+                gc.collect()
+                if (
+                    ("not aligned" in validation_msg or "dimension" in validation_msg.lower())
+                    and attempt + 1 < max_attempts
+                ):
+                    logger.warning(
+                        "Mem0 re-init validation failed (%s), retrying from clean storage: %s",
+                        reason,
+                        validation_err,
+                    )
+                    continue
+                raise
+
+            memory_instance = candidate
+            configured = True
+            last_valid_config = copy.deepcopy(config)
+            logger.info(
+                "Mem0 re-initialized successfully (%s)%s",
+                reason,
+                f" with dim={expected_dim}" if expected_dim is not None else "",
+            )
+            return True
+    except Exception as e:
+        logger.error("Failed to re-initialize Mem0 (%s): %s", reason, e)
+        memory_instance = None
+        configured = False
+        return False
+
+
+def _ensure_memory_ready() -> bool:
+    if configured and memory_instance is not None:
+        return True
+    if last_valid_config:
+        return _reinitialize_memory_from_last_config(
+            reset_storage=False,
+            reason="lazy_restore",
+        )
+    return False
+
+
+def _format_search_results(results, limit: int) -> dict:
+    if isinstance(results, dict) and "results" in results:
+        raw = results["results"]
+    elif isinstance(results, dict) and "memories" in results:
+        raw = results["memories"]
+    elif isinstance(results, list):
+        raw = results
+    else:
+        raw = []
+
+    now = time.time()
+    scored = []
+    for item in raw:
+        mem_id = item.get("id", "")
+        mem_text = item.get("memory", "")
+        semantic_score = item.get("score", 0.0)
+
+        meta = _get_meta(mem_id)
+        if not meta.get("is_core") and is_core_fact(mem_text):
+            meta["is_core"] = True
+
+        decay = calculate_decay_score(
+            created_at=meta["created_at"],
+            last_accessed=meta["last_accessed"],
+            access_count=meta.get("access_count", 0),
+            is_core=meta.get("is_core", False),
+            now=now,
+        )
+
+        combined = semantic_score * (0.5 + 0.5 * decay)
+        scored.append({
+            "id": mem_id,
+            "memory": mem_text,
+            "score": round(combined, 4),
+            "is_core": meta.get("is_core", False),
+            "decay": round(decay, 4),
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:limit]
+
+    for item in top:
+        _touch(item["id"])
+    _save_metadata()
+
+    return {"memories": top}
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 
@@ -264,55 +543,15 @@ def configure(req: ConfigureRequest):
     global memory_instance, configured, last_valid_config
 
     from mem0 import Memory
+    config = _build_mem0_config(req)
 
-    llm_config: dict = {"model": req.model}
-
-    if req.provider == "openai":
-        if req.api_key:
-            llm_config["api_key"] = req.api_key
-            os.environ["OPENAI_API_KEY"] = req.api_key
-        if req.base_url:
-            llm_config["openai_base_url"] = req.base_url
-            # Also set env var so Mem0's internal OpenAI client uses the custom endpoint
-            os.environ["OPENAI_BASE_URL"] = req.base_url
-
-    elif req.provider == "anthropic":
-        if req.api_key:
-            llm_config["api_key"] = req.api_key
-            os.environ["ANTHROPIC_API_KEY"] = req.api_key
-
-    elif req.provider == "ollama":
-        if req.base_url:
-            llm_config["ollama_base_url"] = req.base_url
-
-    config = {
-        "llm": {
-            "provider": req.provider,
-            "config": llm_config,
-        },
-        "embedder": {
-            "provider": "huggingface",
-            "config": {
-                "model": "all-MiniLM-L6-v2",
-                "model_kwargs": {"cache_folder": MODEL_CACHE},
-            },
-        },
-        "vector_store": {
-            "provider": "qdrant",
-            "config": {
-                "collection_name": "agentark_memories",
-                "path": QDRANT_PATH,
-            },
-        },
-    }
-
-    # Auto-fix dimension mismatch from stale data
-    _check_qdrant_dimensions(QDRANT_PATH, "agentark_memories", expected_dim=384)
+    # Auto-fix dimension mismatch from stale data across known collections.
+    _check_known_qdrant_dimensions(_configured_qdrant_path(config), config)
 
     try:
-        memory_instance = Memory.from_config(config)
+        memory_instance = Memory.from_config(copy.deepcopy(config))
         configured = True
-        last_valid_config = config
+        last_valid_config = copy.deepcopy(config)
         display_provider = req.provider
         if req.provider == "openai" and req.base_url:
             if "openrouter" in req.base_url:
@@ -328,8 +567,13 @@ def configure(req: ConfigureRequest):
 
 @app.post("/memories")
 def add_memories(req: AddRequest):
-    if not configured or memory_instance is None:
-        raise HTTPException(status_code=503, detail="not_configured")
+    global memory_instance, configured, last_valid_config
+    if not _ensure_memory_ready():
+        return {
+            "status": "degraded",
+            "result": {"results": []},
+            "warning": "mem0 unavailable; skipped memory write",
+        }
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
@@ -351,15 +595,48 @@ def add_memories(req: AddRequest):
         logger.info("Added memories for user=%s", req.user_id)
         return {"status": "ok", "result": result}
     except Exception as e:
+        err_msg = str(e).strip()
+        if "not aligned" in err_msg or "dimension" in err_msg.lower():
+            logger.warning(
+                "Embedding dimension mismatch during add; resetting Mem0 storage: %s",
+                err_msg,
+            )
+            if _reinitialize_memory_from_last_config(
+                reset_storage=True,
+                reason="add_dimension_mismatch",
+            ):
+                try:
+                    result = memory_instance.add(messages, user_id=req.user_id)
+                    logger.info("Added memories for user=%s (after reset)", req.user_id)
+                    return {"status": "ok", "result": result}
+                except Exception as retry_err:
+                    logger.error(
+                        "Mem0 add retry failed after reset for user=%s: %s",
+                        req.user_id,
+                        retry_err,
+                    )
+            return {
+                "status": "degraded",
+                "result": {"results": []},
+                "warning": "mem0 reset after embedding mismatch; skipped this memory write",
+            }
+
         logger.error("Failed to add memories: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "status": "degraded",
+            "result": {"results": []},
+            "warning": "mem0 add failed; skipped memory write",
+        }
 
 
 @app.post("/memories/search")
 def search_memories(req: SearchRequest):
-    global memory_instance
-    if not configured or memory_instance is None:
-        raise HTTPException(status_code=503, detail="not_configured")
+    global memory_instance, configured, last_valid_config
+    if not _ensure_memory_ready():
+        return {
+            "memories": [],
+            "warning": "mem0 unavailable; search skipped",
+        }
 
     try:
         # Ask for more than needed so we can re-rank after decay
@@ -369,85 +646,45 @@ def search_memories(req: SearchRequest):
                 req.query, user_id=req.user_id, limit=fetch_limit
             )
         except Exception as search_err:
-            err_msg = str(search_err)
-            # Detect embedding dimension mismatch and auto-reset
+            err_msg = str(search_err).strip()
             if "not aligned" in err_msg or "dimension" in err_msg.lower():
                 logger.warning(
-                    "Embedding dimension mismatch during search — resetting Qdrant: %s",
+                    "Embedding dimension mismatch during search; resetting Mem0 storage: %s",
                     err_msg,
                 )
-                _reset_qdrant_collection(QDRANT_PATH, expected_dim=384)
-                # Reconfigure mem0 with fresh collection
-                try:
-                    from mem0 import Memory
-                    reinit_config = last_valid_config if last_valid_config else {
-                        "llm": {"provider": "openai", "config": {"model": "gpt-4o-mini"}},
-                        "embedder": {"provider": "huggingface", "config": {"model": "all-MiniLM-L6-v2", "model_kwargs": {"cache_folder": MODEL_CACHE}}},
-                        "vector_store": {"provider": "qdrant", "config": {"collection_name": "agentark_memories", "path": QDRANT_PATH}},
+                if _reinitialize_memory_from_last_config(
+                    reset_storage=True,
+                    reason="search_dimension_mismatch",
+                ):
+                    try:
+                        results = memory_instance.search(
+                            req.query, user_id=req.user_id, limit=fetch_limit
+                        )
+                        return _format_search_results(results, req.limit)
+                    except Exception as retry_err:
+                        logger.error(
+                            "Mem0 search retry failed after reset for user=%s: %s",
+                            req.user_id,
+                            retry_err,
+                        )
+                        return {
+                            "memories": [],
+                            "warning": "mem0 reset after embedding mismatch; search skipped",
+                        }
+                else:
+                    return {
+                        "memories": [],
+                        "warning": "mem0 reset failed after embedding mismatch; search skipped",
                     }
-                    memory_instance = Memory.from_config(reinit_config)
-                    logger.info("Mem0 re-initialized after dimension reset")
-                except Exception as reinit_err:
-                    logger.error("Failed to re-initialize Mem0: %s", reinit_err)
-                # Return empty results rather than error — memories will rebuild
-                return {"memories": []}
             raise
 
-        # Normalize response format
-        if isinstance(results, dict) and "results" in results:
-            raw = results["results"]
-        elif isinstance(results, dict) and "memories" in results:
-            raw = results["memories"]
-        elif isinstance(results, list):
-            raw = results
-        else:
-            raw = []
-
-        now = time.time()
-        scored = []
-        for item in raw:
-            mem_id = item.get("id", "")
-            mem_text = item.get("memory", "")
-            semantic_score = item.get("score", 0.0)
-
-            # Get or init metadata
-            meta = _get_meta(mem_id)
-            # Auto-classify if not yet classified
-            if not meta.get("is_core") and is_core_fact(mem_text):
-                meta["is_core"] = True
-
-            decay = calculate_decay_score(
-                created_at=meta["created_at"],
-                last_accessed=meta["last_accessed"],
-                access_count=meta.get("access_count", 0),
-                is_core=meta.get("is_core", False),
-                now=now,
-            )
-
-            # Combined score: semantic relevance * decay factor
-            combined = semantic_score * (0.5 + 0.5 * decay)
-
-            scored.append({
-                "id": mem_id,
-                "memory": mem_text,
-                "score": round(combined, 4),
-                "is_core": meta.get("is_core", False),
-                "decay": round(decay, 4),
-            })
-
-        # Sort by combined score (highest first) and take top N
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        top = scored[: req.limit]
-
-        # Touch accessed memories (updates last_accessed + access_count)
-        for item in top:
-            _touch(item["id"])
-        _save_metadata()
-
-        return {"memories": top}
+        return _format_search_results(results, req.limit)
     except Exception as e:
         logger.error("Failed to search memories: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "memories": [],
+            "warning": "mem0 search failed; returning no memories",
+        }
 
 
 @app.get("/memories")

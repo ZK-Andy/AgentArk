@@ -30,6 +30,12 @@ struct MasterMeta {
     bootstrap: bool,
 }
 
+pub struct PreparedMasterPassword {
+    pub(crate) key_manager: Arc<KeyManager>,
+    meta_json: String,
+    bootstrap: bool,
+}
+
 pub struct MasterPasswordManager {
     config_dir: PathBuf,
     _data_dir: PathBuf,
@@ -115,6 +121,21 @@ impl MasterPasswordManager {
     }
 
     fn set_password_with_mode(&self, password: &str, bootstrap: bool) -> Result<Arc<KeyManager>> {
+        let prepared = self.prepare_password_with_mode(password, bootstrap)?;
+        let key = prepared.key_manager.clone();
+        self.commit_prepared_password(prepared)?;
+        Ok(key)
+    }
+
+    pub fn prepare_password(&self, password: &str) -> Result<PreparedMasterPassword> {
+        self.prepare_password_with_mode(password, false)
+    }
+
+    fn prepare_password_with_mode(
+        &self,
+        password: &str,
+        bootstrap: bool,
+    ) -> Result<PreparedMasterPassword> {
         // Generate separate salts for encryption and verification
         let enc_salt = generate_salt();
         let v_salt = generate_salt();
@@ -134,16 +155,24 @@ impl MasterPasswordManager {
             bootstrap,
         };
         let json = serde_json::to_string_pretty(&meta)?;
-        std::fs::write(self.meta_path(), json)?;
+        Ok(PreparedMasterPassword {
+            key_manager: Arc::new(km),
+            meta_json: json,
+            bootstrap,
+        })
+    }
 
-        if bootstrap {
+    pub fn commit_prepared_password(&self, prepared: PreparedMasterPassword) -> Result<()> {
+        crate::crypto::atomic_write_file(&self.meta_path(), prepared.meta_json.as_bytes())?;
+
+        if prepared.bootstrap {
             tracing::info!(
                 "Bootstrap master password initialized (per-install, derived from local keyfile)"
             );
         } else {
             tracing::info!("Master password set - encryption keys derived from password");
         }
-        Ok(Arc::new(km))
+        Ok(())
     }
 
     /// Set a master password (first time or overwrite)
@@ -166,14 +195,24 @@ impl MasterPasswordManager {
     /// Remove master password - revert to auto-generated keyfile
     /// Caller is responsible for re-encrypting data with the returned key
     pub fn remove_password(&self) -> Result<Arc<KeyManager>> {
-        let keyfile = self.config_dir.join(".keyfile");
-        let km = Arc::new(KeyManager::load_or_create(&keyfile)?);
+        let km = self.prepare_keyfile_encryption()?;
+        self.commit_password_removal()?;
+        Ok(km)
+    }
 
-        // Remove master.json
-        let _ = std::fs::remove_file(self.meta_path());
+    pub fn prepare_keyfile_encryption(&self) -> Result<Arc<KeyManager>> {
+        let keyfile = self.config_dir.join(".keyfile");
+        Ok(Arc::new(KeyManager::load_or_create(&keyfile)?))
+    }
+
+    pub fn commit_password_removal(&self) -> Result<()> {
+        let meta_path = self.meta_path();
+        if meta_path.exists() {
+            std::fs::remove_file(&meta_path)?;
+        }
 
         tracing::info!("Master password removed - reverted to keyfile encryption");
-        Ok(km)
+        Ok(())
     }
 
     fn load_meta(&self) -> Result<MasterMeta> {

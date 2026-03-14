@@ -36,26 +36,13 @@ fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
 }
 
 fn internal_api_base_url() -> String {
-    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-    let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_some()
-        && std::env::var("AGENTARK_TLS_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some();
-    let scheme = if tls_enabled { "https" } else { "http" };
-    format!("{}://{}", scheme, bind_addr)
+    crate::core::net::internal_api_base_url()
 }
 
 async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) -> String {
     let api_key = { agent.read().await.api_key.clone() };
     let base_url = internal_api_base_url();
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
+    let client = match crate::core::net::build_internal_control_client(10) {
         Ok(c) => c,
         Err(e) => return format!("Tunnel command failed: {}", e),
     };
@@ -586,32 +573,52 @@ async fn mark_as_read(config: &WhatsAppChannelConfig, message_id: &str) -> Resul
 /// Routes through the Baileys bridge or Meta Cloud API depending on config mode.
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let Some(config) = &agent.config.whatsapp else {
-        return Ok(());
+        let message = "WhatsApp is not configured";
+        tracing::warn!("WhatsApp send_message: {}", message);
+        return Err(anyhow!(message));
     };
 
     let phone_bytes = agent.storage.get("whatsapp:last_sender").await?;
     let Some(bytes) = phone_bytes else {
-        tracing::debug!("WhatsApp send_message: no last_sender stored, skipping");
-        return Ok(());
+        let message =
+            "WhatsApp has no delivery target yet. Send the agent a WhatsApp message first.";
+        tracing::warn!("WhatsApp send_message: {}", message);
+        return Err(anyhow!(message));
     };
 
     let phone_number = String::from_utf8_lossy(&bytes).to_string();
     if phone_number.is_empty() {
+        let message =
+            "WhatsApp has no delivery target yet. Send the agent a WhatsApp message first.";
+        tracing::warn!("WhatsApp send_message: {}", message);
+        return Err(anyhow!(message));
+    }
+
+    send_message_to_recipient(config, &phone_number, &agent.config.name, text).await
+}
+
+pub async fn send_message_to_recipient(
+    config: &WhatsAppChannelConfig,
+    phone_number: &str,
+    agent_name: &str,
+    text: &str,
+) -> Result<()> {
+    if phone_number.trim().is_empty() || text.trim().is_empty() {
         return Ok(());
     }
 
     // Prefix with agent name so WhatsApp recipients know who's messaging
-    let prefix = format!("[{}] ", agent.config.name);
+    let prefix = format!("[{}] ", agent_name);
     let prefixed_text =
-        if text.starts_with(&prefix) || text.starts_with(&format!("[{}]", agent.config.name)) {
+        if text.starts_with(&prefix) || text.starts_with(&format!("[{}]", agent_name)) {
             text.to_string()
         } else {
             format!("{}{}", prefix, text)
         };
 
     match config.mode {
-        WhatsAppMode::Baileys => send_via_bridge(config, &phone_number, &prefixed_text).await,
-        WhatsAppMode::CloudApi => send_whatsapp_text(config, &phone_number, &prefixed_text).await,
+        WhatsAppMode::Baileys => send_via_bridge(config, phone_number, &prefixed_text).await,
+        WhatsAppMode::CloudApi => send_whatsapp_text(config, phone_number, &prefixed_text).await,
     }
 }
 
@@ -648,7 +655,11 @@ async fn send_via_bridge(config: &WhatsAppChannelConfig, to: &str, text: &str) -
 }
 
 /// Send a presence update (e.g. "composing" or "paused") via the Baileys bridge.
-async fn send_presence(config: &WhatsAppChannelConfig, to: &str, presence_type: &str) -> Result<()> {
+async fn send_presence(
+    config: &WhatsAppChannelConfig,
+    to: &str,
+    presence_type: &str,
+) -> Result<()> {
     let client = http_client();
     let url = format!("{}/presence", config.bridge_url);
 
@@ -667,7 +678,11 @@ async fn send_presence(config: &WhatsAppChannelConfig, to: &str, presence_type: 
     if !resp.status().is_success() {
         let status = resp.status();
         let error_body = resp.text().await.unwrap_or_default();
-        tracing::warn!("WhatsApp bridge presence error ({}): {}", status, error_body);
+        tracing::warn!(
+            "WhatsApp bridge presence error ({}): {}",
+            status,
+            error_body
+        );
     }
 
     Ok(())

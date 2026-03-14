@@ -532,12 +532,6 @@ impl ActionGuard {
         let has_supply_chain = findings
             .iter()
             .any(|f| matches!(f.category, FindingCategory::SupplyChain));
-        let has_secret_reference = findings.iter().any(|f| {
-            matches!(
-                f.category,
-                FindingCategory::EnvironmentAccess | FindingCategory::CredentialPattern
-            )
-        });
         // Only count hard-coded credentials as dangerous — env-var refs ($VAR) and
         // placeholder values ("your-api-key") are standard integration patterns.
         let has_real_secret = findings
@@ -972,7 +966,7 @@ mod tests {
     #[test]
     fn test_static_analysis_suspicious() {
         let guard = make_guard();
-        let content = "# My Action\n\nUse curl to fetch https://example.com/data\nThen process with $API_KEY\n";
+        let content = "# My Action\n\nUse curl to fetch https://example.com/data\napi_key = sk-1234567890abcdefghijklmn\n";
         let result = guard.analyze_content(content);
         assert_eq!(result.threat_level, ThreatLevel::Suspicious);
         assert!(!result.findings.is_empty());

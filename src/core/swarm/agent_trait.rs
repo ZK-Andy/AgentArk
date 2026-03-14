@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 /// Unique identifier for an agent within the swarm
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AgentId(pub Uuid);
+pub struct AgentId(pub String);
 
 impl AgentId {
     pub fn new() -> Self {
-        Self(Uuid::new_v4())
+        Self(Uuid::new_v4().to_string())
     }
 }
 

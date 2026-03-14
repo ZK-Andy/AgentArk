@@ -16,6 +16,119 @@ import type {
 } from "../types";
 
 let sessionRefreshInFlight: Promise<void> | null = null;
+let promptedUiApiKey: string | null = null;
+
+declare global {
+  interface Window {
+    __AGENTARK_BOOTSTRAP_TOKEN__?: string;
+  }
+}
+
+function extractErrorMessage(text: string): string {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    const message =
+      (typeof parsed.error === "string" && parsed.error) ||
+      (typeof parsed.message === "string" && parsed.message) ||
+      (typeof parsed.detail === "string" && parsed.detail) ||
+      "";
+    return message || trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
+function isLocalBrowserHost(): boolean {
+  if (typeof window === "undefined") return false;
+  const host = (window.location.hostname || "").trim().toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+}
+
+function buildHeaders(initHeaders?: HeadersInit, options?: { json?: boolean }): Headers {
+  const headers = new Headers(initHeaders || undefined);
+  if (options?.json !== false && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (promptedUiApiKey && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${promptedUiApiKey}`);
+  }
+  return headers;
+}
+
+function extractBootstrapTokenFromHash(): string | null {
+  const rawHash = window.location.hash || "";
+  const cleaned = rawHash.startsWith("#") ? rawHash.slice(1) : rawHash;
+  if (!cleaned) return null;
+  const params = new URLSearchParams(cleaned);
+  const token = (params.get("bootstrap") || "").trim();
+  return token || null;
+}
+
+function clearBootstrapTokenFromLocation(): void {
+  if (!window.location.hash) return;
+  const rawHash = window.location.hash.startsWith("#")
+    ? window.location.hash.slice(1)
+    : window.location.hash;
+  const params = new URLSearchParams(rawHash);
+  if (!params.has("bootstrap")) return;
+  params.delete("bootstrap");
+  const nextHash = params.toString();
+  const nextUrl = `${window.location.pathname}${window.location.search}${nextHash ? `#${nextHash}` : ""}`;
+  window.history.replaceState(null, "", nextUrl);
+}
+
+async function redeemLocalBootstrapToken(token: string): Promise<boolean> {
+  if (!token.trim()) return false;
+  try {
+    const response = await fetch("/session/bootstrap/local", {
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+      headers: buildHeaders({ Accept: "application/json" }),
+      body: JSON.stringify({ token })
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function requestLocalBootstrapToken(): Promise<string | null> {
+  try {
+    const response = await fetch("/session/bootstrap/local", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      headers: buildHeaders({ Accept: "application/json" }, { json: false })
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as Record<string, unknown>;
+    const token = typeof payload.token === "string" ? payload.token.trim() : "";
+    return token || null;
+  } catch {
+    return null;
+  }
+}
+
+async function trySilentBootstrap(): Promise<boolean> {
+  const tokenFromHash = extractBootstrapTokenFromHash();
+  const tokenFromWindow = (window.__AGENTARK_BOOTSTRAP_TOKEN__ || "").trim() || null;
+  const token = tokenFromHash || tokenFromWindow || (await requestLocalBootstrapToken());
+  if (!token) return false;
+
+  const redeemed = await redeemLocalBootstrapToken(token);
+  if (redeemed) {
+    clearBootstrapTokenFromLocation();
+  }
+  try {
+    delete window.__AGENTARK_BOOTSTRAP_TOKEN__;
+  } catch {
+    window.__AGENTARK_BOOTSTRAP_TOKEN__ = undefined;
+  }
+  return redeemed;
+}
 
 function isMissingAuthError(status: number, text: string): boolean {
   if (status !== 401 && status !== 403) return false;
@@ -30,7 +143,46 @@ function isMissingAuthError(status: number, text: string): boolean {
 
 async function refreshUiSessionCookie(): Promise<void> {
   if (sessionRefreshInFlight) return sessionRefreshInFlight;
+
+  const bootstrapWithApiKey = async (apiKey: string): Promise<boolean> => {
+    try {
+      const response = await fetch("/session/bootstrap", {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        headers: buildHeaders(
+          {
+            Accept: "application/json",
+            Authorization: `Bearer ${apiKey}`
+          },
+          { json: false }
+        )
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const probeProtectedSession = async (): Promise<boolean> => {
+    try {
+      const response = await fetch("/autonomy/settings", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: buildHeaders({ Accept: "application/json" }, { json: false })
+      });
+      if (response.ok) return true;
+      const text = extractErrorMessage(await response.text());
+      return !isMissingAuthError(response.status, text);
+    } catch {
+      return false;
+    }
+  };
+
   sessionRefreshInFlight = (async () => {
+    if (await trySilentBootstrap()) return;
+
     try {
       await fetch("/ui/v2", {
         method: "GET",
@@ -40,31 +192,57 @@ async function refreshUiSessionCookie(): Promise<void> {
       });
     } catch {
       // best effort only
-    } finally {
-      sessionRefreshInFlight = null;
     }
-  })();
+
+    if (await probeProtectedSession()) return;
+
+    if (await trySilentBootstrap()) {
+      if (await probeProtectedSession()) return;
+    }
+
+    if (promptedUiApiKey) {
+      if (await bootstrapWithApiKey(promptedUiApiKey)) {
+        if (await probeProtectedSession()) return;
+      }
+      promptedUiApiKey = null;
+    }
+
+    if (isLocalBrowserHost()) {
+      throw new Error(
+        "Could not authorize this local browser session automatically. Restart AgentArk and refresh the page."
+      );
+    }
+
+    throw new Error(
+      "This browser session is not authorized. Open AgentArk locally, or use the public-link password sign-in page."
+    );
+  })().finally(() => {
+    sessionRefreshInFlight = null;
+  });
+
   return sessionRefreshInFlight;
+}
+
+export async function initializeUiSession(): Promise<void> {
+  await trySilentBootstrap();
 }
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const doFetch = () =>
     fetch(path, {
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...(init?.headers || {})
-      },
       ...init
+      ,
+      headers: buildHeaders(init?.headers)
     });
   let res = await doFetch();
   if (!res.ok) {
-    let text = await res.text();
+    let text = extractErrorMessage(await res.text());
     if (isMissingAuthError(res.status, text)) {
       await refreshUiSessionCookie();
       res = await doFetch();
       if (!res.ok) {
-        text = await res.text();
+        text = extractErrorMessage(await res.text());
         throw new Error(text || `Request failed (${res.status})`);
       }
       return (await res.json()) as T;
@@ -75,22 +253,21 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export async function requestForm<T>(path: string, formData: FormData, init?: RequestInit): Promise<T> {
-  const headers = { ...(init?.headers || {}) };
   const doFetch = () =>
     fetch(path, {
       credentials: "include",
       ...init,
-      headers,
+      headers: buildHeaders(init?.headers, { json: false }),
       body: formData
     });
   let res = await doFetch();
   if (!res.ok) {
-    let text = await res.text();
+    let text = extractErrorMessage(await res.text());
     if (isMissingAuthError(res.status, text)) {
       await refreshUiSessionCookie();
       res = await doFetch();
       if (!res.ok) {
-        text = await res.text();
+        text = extractErrorMessage(await res.text());
         throw new Error(text || `Request failed (${res.status})`);
       }
       return (await res.json()) as T;
@@ -105,6 +282,7 @@ type ChatStreamPayload = {
   channel?: string;
   conversation_id?: string | null;
   project_id?: string | null;
+  deep_research?: boolean;
 };
 
 type ChatStreamHandlers = {
@@ -158,21 +336,20 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
     fetch("/chat/stream", {
       method: "POST",
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
+      headers: buildHeaders({
         Accept: "text/event-stream"
-      },
+      }),
       body: JSON.stringify(payload)
     });
   let res = await doFetch();
 
   if (!res.ok) {
-    let text = await res.text();
+    let text = extractErrorMessage(await res.text());
     if (isMissingAuthError(res.status, text)) {
       await refreshUiSessionCookie();
       res = await doFetch();
       if (!res.ok) {
-        text = await res.text();
+        text = extractErrorMessage(await res.text());
         throw new Error(text || `Request failed (${res.status})`);
       }
     } else {
@@ -395,7 +572,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ action, dry_run: false })
     }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {

@@ -41,7 +41,7 @@ fn authed_client() -> reqwest::Client {
 
 async fn server_available() -> bool {
     reqwest::Client::new()
-        .get(&format!("{}/health", BASE_URL))
+        .get(format!("{}/health", BASE_URL))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -52,7 +52,7 @@ async fn server_available() -> bool {
 /// (i.e. AGENTARK_INSECURE_NO_AUTH=true on the server side).
 async fn server_allows_no_auth() -> bool {
     reqwest::Client::new()
-        .get(&format!("{}/status", BASE_URL))
+        .get(format!("{}/status", BASE_URL))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -95,7 +95,7 @@ async fn test_api_swarm_status() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/swarm/status", BASE_URL))
+        .get(format!("{}/swarm/status", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -119,7 +119,7 @@ async fn test_api_swarm_config_get() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/swarm/config", BASE_URL))
+        .get(format!("{}/swarm/config", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -142,7 +142,7 @@ async fn test_api_swarm_agents_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/swarm/agents", BASE_URL))
+        .get(format!("{}/swarm/agents", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -157,7 +157,7 @@ async fn test_api_swarm_delegations_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/swarm/delegations", BASE_URL))
+        .get(format!("{}/swarm/delegations", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -177,7 +177,7 @@ async fn test_api_swarm_config_update() {
 
     // Get original config
     let original: serde_json::Value = client
-        .get(&format!("{}/swarm/config", BASE_URL))
+        .get(format!("{}/swarm/config", BASE_URL))
         .send()
         .await
         .unwrap()
@@ -188,7 +188,7 @@ async fn test_api_swarm_config_update() {
 
     // Toggle
     let resp = client
-        .post(&format!("{}/swarm/config", BASE_URL))
+        .post(format!("{}/swarm/config", BASE_URL))
         .json(&serde_json::json!({ "enabled": !was_enabled }))
         .send()
         .await
@@ -197,7 +197,7 @@ async fn test_api_swarm_config_update() {
 
     // Verify
     let updated: serde_json::Value = client
-        .get(&format!("{}/swarm/config", BASE_URL))
+        .get(format!("{}/swarm/config", BASE_URL))
         .send()
         .await
         .unwrap()
@@ -208,7 +208,7 @@ async fn test_api_swarm_config_update() {
 
     // Restore
     let _ = client
-        .post(&format!("{}/swarm/config", BASE_URL))
+        .post(format!("{}/swarm/config", BASE_URL))
         .json(&serde_json::json!({ "enabled": was_enabled }))
         .send()
         .await;
@@ -222,7 +222,7 @@ async fn test_api_swarm_agent_crud() {
 
     // 1. Add agent
     let add_resp = client
-        .post(&format!("{}/swarm/agents", BASE_URL))
+        .post(format!("{}/swarm/agents", BASE_URL))
         .json(&serde_json::json!({
             "name": "TestBot-CRUD",
             "agent_type": "Researcher",
@@ -241,7 +241,7 @@ async fn test_api_swarm_agent_crud() {
 
     // 2. Verify in list
     let list_resp = client
-        .get(&format!("{}/swarm/agents", BASE_URL))
+        .get(format!("{}/swarm/agents", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -254,7 +254,7 @@ async fn test_api_swarm_agent_crud() {
 
     // 3. Remove agent
     let del_resp = client
-        .delete(&format!("{}/swarm/agents/{}", BASE_URL, agent_id))
+        .delete(format!("{}/swarm/agents/{}", BASE_URL, agent_id))
         .send()
         .await
         .unwrap();
@@ -306,7 +306,7 @@ async fn test_api_swarm_add_different_providers() {
         }
 
         let resp = client
-            .post(&format!("{}/swarm/agents", BASE_URL))
+            .post(format!("{}/swarm/agents", BASE_URL))
             .json(&body)
             .send()
             .await
@@ -319,7 +319,7 @@ async fn test_api_swarm_add_different_providers() {
     // Clean up
     for id in &created_ids {
         let _ = client
-            .delete(&format!("{}/swarm/agents/{}", BASE_URL, id))
+            .delete(format!("{}/swarm/agents/{}", BASE_URL, id))
             .send()
             .await;
     }
@@ -344,7 +344,7 @@ async fn test_api_swarm_add_agent_types() {
 
     for agent_type in &agent_types {
         let resp = client
-            .post(&format!("{}/swarm/agents", BASE_URL))
+            .post(format!("{}/swarm/agents", BASE_URL))
             .json(&serde_json::json!({
                 "name": format!("Test-{}", agent_type),
                 "agent_type": agent_type,
@@ -364,7 +364,7 @@ async fn test_api_swarm_add_agent_types() {
     // Clean up
     for id in &created_ids {
         let _ = client
-            .delete(&format!("{}/swarm/agents/{}", BASE_URL, id))
+            .delete(format!("{}/swarm/agents/{}", BASE_URL, id))
             .send()
             .await;
     }
@@ -379,7 +379,7 @@ async fn test_api_hooks_crud_with_action_name() {
     let action_name = "demo-action";
 
     let create_resp = client
-        .post(&format!("{}/hooks", BASE_URL))
+        .post(format!("{}/hooks", BASE_URL))
         .json(&serde_json::json!({
             "name": hook_name,
             "trigger": "on_error",
@@ -395,7 +395,7 @@ async fn test_api_hooks_crud_with_action_name() {
     let id = create_body["id"].as_str().unwrap().to_string();
 
     let list_resp = client
-        .get(&format!("{}/hooks", BASE_URL))
+        .get(format!("{}/hooks", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -409,7 +409,7 @@ async fn test_api_hooks_crud_with_action_name() {
     assert_eq!(found["action_name"].as_str().unwrap_or(""), action_name);
 
     let del_resp = client
-        .delete(&format!("{}/hooks/{}", BASE_URL, id))
+        .delete(format!("{}/hooks/{}", BASE_URL, id))
         .send()
         .await
         .unwrap();
@@ -424,7 +424,7 @@ async fn test_api_browser_session_missing_returns_404() {
     let missing_id = format!("missing-session-{}", unique_suffix());
 
     let status_resp = client
-        .get(&format!(
+        .get(format!(
             "{}/browser/sessions/{}/status",
             BASE_URL, missing_id
         ))
@@ -434,7 +434,7 @@ async fn test_api_browser_session_missing_returns_404() {
     assert_eq!(status_resp.status(), 404);
 
     let respond_resp = client
-        .post(&format!(
+        .post(format!(
             "{}/browser/sessions/{}/respond",
             BASE_URL, missing_id
         ))
@@ -445,7 +445,7 @@ async fn test_api_browser_session_missing_returns_404() {
     assert_eq!(respond_resp.status(), 404);
 
     let empty_response_resp = client
-        .post(&format!(
+        .post(format!(
             "{}/browser/sessions/{}/respond",
             BASE_URL, missing_id
         ))
@@ -463,7 +463,7 @@ async fn test_api_mcp_ssh_and_autonomy_surface_smoke() {
     let client = authed_client();
 
     let mcp_resp = client
-        .get(&format!("{}/mcp/servers?include_details=true", BASE_URL))
+        .get(format!("{}/mcp/servers?include_details=true", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -478,7 +478,7 @@ async fn test_api_mcp_ssh_and_autonomy_surface_smoke() {
     );
 
     let ssh_keys_resp = client
-        .get(&format!("{}/ssh/keys", BASE_URL))
+        .get(format!("{}/ssh/keys", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -493,7 +493,7 @@ async fn test_api_mcp_ssh_and_autonomy_surface_smoke() {
     );
 
     let ssh_conn_resp = client
-        .get(&format!("{}/ssh/connections", BASE_URL))
+        .get(format!("{}/ssh/connections", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -508,7 +508,7 @@ async fn test_api_mcp_ssh_and_autonomy_surface_smoke() {
     );
 
     let incidents_resp = client
-        .get(&format!("{}/autonomy/incidents/live", BASE_URL))
+        .get(format!("{}/autonomy/incidents/live", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -523,7 +523,7 @@ async fn test_api_mcp_ssh_and_autonomy_surface_smoke() {
     );
 
     let timeline_resp = client
-        .get(&format!("{}/autonomy/timeline?limit=20", BASE_URL))
+        .get(format!("{}/autonomy/timeline?limit=20", BASE_URL))
         .send()
         .await
         .unwrap();

@@ -1,0 +1,1405 @@
+use super::*;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TunnelControlCommand {
+    Start,
+    Stop,
+    Status,
+}
+
+/// Manages the active public tunnel process and discovered URL.
+pub(super) struct TunnelState {
+    /// Child process handle
+    pub(super) process: Option<tokio::process::Child>,
+    /// Active provider for the running tunnel
+    pub provider: TunnelProviderKind,
+    /// Public URL assigned by the active tunnel provider
+    pub url: Option<String>,
+    /// If set, only this deployed app is reachable through the public tunnel.
+    pub selected_app_id: Option<String>,
+    /// Whether the tunnel is actively running
+    pub active: bool,
+    /// Error message if tunnel failed
+    pub error: Option<String>,
+}
+
+impl TunnelState {
+    pub(super) fn new() -> Self {
+        Self {
+            process: None,
+            provider: TunnelProviderKind::Cloudflare,
+            url: None,
+            selected_app_id: None,
+            active: false,
+            error: None,
+        }
+    }
+}
+
+trait TunnelProvider {
+    fn kind(&self) -> TunnelProviderKind;
+    fn label(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn config_fields(&self) -> Vec<IntegrationConfigField>;
+    fn config_help(&self) -> Option<&'static str>;
+}
+
+struct CloudflareTunnelProvider;
+struct NgrokTunnelProvider;
+struct TailscaleTunnelProvider;
+struct BoreTunnelProvider;
+
+impl TunnelProvider for CloudflareTunnelProvider {
+    fn kind(&self) -> TunnelProviderKind {
+        TunnelProviderKind::Cloudflare
+    }
+
+    fn label(&self) -> &'static str {
+        "Cloudflare"
+    }
+
+    fn description(&self) -> &'static str {
+        "Free public HTTPS link using Cloudflare Quick Tunnel."
+    }
+
+    fn config_fields(&self) -> Vec<IntegrationConfigField> {
+        vec![IntegrationConfigField {
+            key: "binary_path".to_string(),
+            label: "Binary Path".to_string(),
+            input_type: "text".to_string(),
+            placeholder: Some("/usr/local/bin/cloudflared".to_string()),
+            required: true,
+            options: None,
+        }]
+    }
+
+    fn config_help(&self) -> Option<&'static str> {
+        Some(
+            "Click Start Tunnel to get a temporary public HTTPS link. No Cloudflare account or token is required.",
+        )
+    }
+}
+
+impl TunnelProvider for NgrokTunnelProvider {
+    fn kind(&self) -> TunnelProviderKind {
+        TunnelProviderKind::Ngrok
+    }
+
+    fn label(&self) -> &'static str {
+        "ngrok"
+    }
+
+    fn description(&self) -> &'static str {
+        "Public HTTPS tunnel using the local ngrok agent."
+    }
+
+    fn config_fields(&self) -> Vec<IntegrationConfigField> {
+        vec![
+            IntegrationConfigField {
+                key: "binary_path".to_string(),
+                label: "Binary Path".to_string(),
+                input_type: "text".to_string(),
+                placeholder: Some("ngrok".to_string()),
+                required: true,
+                options: None,
+            },
+            IntegrationConfigField {
+                key: "authtoken".to_string(),
+                label: "Auth Token".to_string(),
+                input_type: "password".to_string(),
+                placeholder: Some("ngrok auth token".to_string()),
+                required: true,
+                options: None,
+            },
+        ]
+    }
+
+    fn config_help(&self) -> Option<&'static str> {
+        Some("Save an ngrok auth token, then AgentArk will start an `ngrok http` tunnel for the local control plane.")
+    }
+}
+
+impl TunnelProvider for TailscaleTunnelProvider {
+    fn kind(&self) -> TunnelProviderKind {
+        TunnelProviderKind::TailscaleFunnel
+    }
+
+    fn label(&self) -> &'static str {
+        "Tailscale Funnel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Public tunnel using `tailscale funnel`."
+    }
+
+    fn config_fields(&self) -> Vec<IntegrationConfigField> {
+        vec![
+            IntegrationConfigField {
+                key: "binary_path".to_string(),
+                label: "Binary Path".to_string(),
+                input_type: "text".to_string(),
+                placeholder: Some("tailscale".to_string()),
+                required: true,
+                options: None,
+            },
+            IntegrationConfigField {
+                key: "auth_key".to_string(),
+                label: "Auth Key".to_string(),
+                input_type: "password".to_string(),
+                placeholder: Some("Optional auth key for tailscale up".to_string()),
+                required: false,
+                options: None,
+            },
+            IntegrationConfigField {
+                key: "hostname".to_string(),
+                label: "Hostname".to_string(),
+                input_type: "text".to_string(),
+                placeholder: Some("Optional fixed ts.net hostname".to_string()),
+                required: false,
+                options: None,
+            },
+        ]
+    }
+
+    fn config_help(&self) -> Option<&'static str> {
+        Some("Requires a working Tailscale client, Funnel enabled for the device, and a reachable local service on port 8990.")
+    }
+}
+
+impl TunnelProvider for BoreTunnelProvider {
+    fn kind(&self) -> TunnelProviderKind {
+        TunnelProviderKind::Bore
+    }
+
+    fn label(&self) -> &'static str {
+        "Bore"
+    }
+
+    fn description(&self) -> &'static str {
+        "Simple TCP tunnel using the `bore` CLI."
+    }
+
+    fn config_fields(&self) -> Vec<IntegrationConfigField> {
+        vec![
+            IntegrationConfigField {
+                key: "binary_path".to_string(),
+                label: "Binary Path".to_string(),
+                input_type: "text".to_string(),
+                placeholder: Some("bore".to_string()),
+                required: true,
+                options: None,
+            },
+            IntegrationConfigField {
+                key: "server".to_string(),
+                label: "Server".to_string(),
+                input_type: "text".to_string(),
+                placeholder: Some("bore.pub".to_string()),
+                required: true,
+                options: None,
+            },
+        ]
+    }
+
+    fn config_help(&self) -> Option<&'static str> {
+        Some("Bore exposes the HTTP service over a raw TCP tunnel. AgentArk will surface the resulting public HTTP base URL.")
+    }
+}
+
+fn tunnel_provider_defs() -> Vec<Box<dyn TunnelProvider>> {
+    vec![
+        Box::new(CloudflareTunnelProvider),
+        Box::new(NgrokTunnelProvider),
+        Box::new(TailscaleTunnelProvider),
+        Box::new(BoreTunnelProvider),
+    ]
+}
+
+//  - - - WhatsApp Bridge State  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+pub(super) fn parse_tunnel_command(message: &str) -> Option<TunnelControlCommand> {
+    let normalized = message.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    let text = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    match text.as_str() {
+        "start tunnel" | "/tunnel start" | "/start_tunnel" => Some(TunnelControlCommand::Start),
+        "stop tunnel" | "/tunnel stop" | "/stop_tunnel" => Some(TunnelControlCommand::Stop),
+        "tunnel status" | "status tunnel" | "/tunnel" | "/tunnel status" | "/tunnel_status" => {
+            Some(TunnelControlCommand::Status)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TunnelProviderResponse {
+    id: String,
+    label: String,
+    description: String,
+    available: bool,
+    configured: bool,
+    config_fields: Vec<IntegrationConfigField>,
+    config_values: HashMap<String, String>,
+    stored_secret_fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_help: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct TunnelProvidersResponse {
+    selected_provider: String,
+    active: bool,
+    active_provider: String,
+    url: Option<String>,
+    selected_app_id: Option<String>,
+    error: Option<String>,
+    providers: Vec<TunnelProviderResponse>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct ConfigureTunnelRequest {
+    provider: Option<String>,
+    #[serde(default)]
+    values: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct TunnelTestRequest {
+    provider: Option<String>,
+}
+
+fn parse_tunnel_provider_kind(value: &str) -> Option<TunnelProviderKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cloudflare" => Some(TunnelProviderKind::Cloudflare),
+        "ngrok" => Some(TunnelProviderKind::Ngrok),
+        "tailscale" | "tailscale_funnel" | "tailscale-funnel" => {
+            Some(TunnelProviderKind::TailscaleFunnel)
+        }
+        "bore" => Some(TunnelProviderKind::Bore),
+        _ => None,
+    }
+}
+
+fn tunnel_provider_label(kind: TunnelProviderKind) -> &'static str {
+    match kind {
+        TunnelProviderKind::Cloudflare => "Cloudflare",
+        TunnelProviderKind::Ngrok => "ngrok",
+        TunnelProviderKind::TailscaleFunnel => "Tailscale Funnel",
+        TunnelProviderKind::Bore => "Bore",
+    }
+}
+
+fn tunnel_provider_binary_path(kind: TunnelProviderKind, config: &TunnelConfig) -> &str {
+    match kind {
+        TunnelProviderKind::Cloudflare => config.cloudflare.binary_path.trim(),
+        TunnelProviderKind::Ngrok => config.ngrok.binary_path.trim(),
+        TunnelProviderKind::TailscaleFunnel => config.tailscale_funnel.binary_path.trim(),
+        TunnelProviderKind::Bore => config.bore.binary_path.trim(),
+    }
+}
+
+fn binary_path_available(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let path = FsPath::new(trimmed);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.exists();
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let path_exts: Vec<String> = if cfg!(windows) {
+        std::env::var_os("PATHEXT")
+            .map(|raw| {
+                raw.to_string_lossy()
+                    .split(';')
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![".exe".to_string(), ".cmd".to_string(), ".bat".to_string()])
+    } else {
+        vec![String::new()]
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        if cfg!(windows)
+            && path_exts
+                .iter()
+                .any(|ext| dir.join(format!("{}{}", trimmed, ext)).exists())
+        {
+            return true;
+        }
+        dir.join(trimmed).exists()
+    })
+}
+
+fn resolve_cloudflared_binary(config: &TunnelCloudflareConfig) -> Option<String> {
+    let configured = config.binary_path.trim();
+    let mut candidates: Vec<String> = Vec::new();
+    if !configured.is_empty() {
+        candidates.push(configured.to_string());
+    }
+    for candidate in [
+        "cloudflared",
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+        "/opt/homebrew/bin/cloudflared",
+        "/snap/bin/cloudflared",
+    ] {
+        if !candidates.iter().any(|value| value == candidate) {
+            candidates.push(candidate.to_string());
+        }
+    }
+    if cfg!(windows) {
+        for candidate in [
+            "cloudflared.exe",
+            r"C:\Program Files\cloudflared\cloudflared.exe",
+            r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+        ] {
+            if !candidates.iter().any(|value| value == candidate) {
+                candidates.push(candidate.to_string());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| binary_path_available(candidate))
+}
+
+fn tunnel_provider_available(kind: TunnelProviderKind, config: &TunnelConfig) -> bool {
+    match kind {
+        TunnelProviderKind::Cloudflare => resolve_cloudflared_binary(&config.cloudflare).is_some(),
+        _ => binary_path_available(tunnel_provider_binary_path(kind, config)),
+    }
+}
+
+fn tunnel_provider_configured(kind: TunnelProviderKind, config: &TunnelConfig) -> bool {
+    match kind {
+        TunnelProviderKind::Cloudflare => true,
+        TunnelProviderKind::Ngrok => !config.ngrok.authtoken.trim().is_empty(),
+        TunnelProviderKind::TailscaleFunnel => true,
+        TunnelProviderKind::Bore => !config.bore.server.trim().is_empty(),
+    }
+}
+
+fn tunnel_provider_config_values(
+    kind: TunnelProviderKind,
+    config: &TunnelConfig,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut values = HashMap::new();
+    let mut stored_secrets = Vec::new();
+    match kind {
+        TunnelProviderKind::Cloudflare => {
+            values.insert(
+                "binary_path".to_string(),
+                config.cloudflare.binary_path.clone(),
+            );
+        }
+        TunnelProviderKind::Ngrok => {
+            values.insert("binary_path".to_string(), config.ngrok.binary_path.clone());
+            if let Some(domain) = config.ngrok.domain.as_deref() {
+                if !domain.trim().is_empty() {
+                    values.insert("domain".to_string(), domain.to_string());
+                }
+            }
+            if !config.ngrok.authtoken.trim().is_empty() {
+                stored_secrets.push("authtoken".to_string());
+            }
+        }
+        TunnelProviderKind::TailscaleFunnel => {
+            values.insert(
+                "binary_path".to_string(),
+                config.tailscale_funnel.binary_path.clone(),
+            );
+            if let Some(hostname) = config.tailscale_funnel.hostname.as_deref() {
+                if !hostname.trim().is_empty() {
+                    values.insert("hostname".to_string(), hostname.to_string());
+                }
+            }
+            if !config.tailscale_funnel.auth_key.trim().is_empty() {
+                stored_secrets.push("auth_key".to_string());
+            }
+        }
+        TunnelProviderKind::Bore => {
+            values.insert("binary_path".to_string(), config.bore.binary_path.clone());
+            values.insert("server".to_string(), config.bore.server.clone());
+        }
+    }
+    (values, stored_secrets)
+}
+
+fn tunnel_provider_summary(
+    kind: TunnelProviderKind,
+    config: &TunnelConfig,
+) -> TunnelProviderResponse {
+    let defs = tunnel_provider_defs();
+    let provider = defs
+        .into_iter()
+        .find(|item| item.kind() == kind)
+        .expect("provider definition missing");
+    let (config_values, stored_secret_fields) = tunnel_provider_config_values(kind, config);
+    TunnelProviderResponse {
+        id: kind.as_str().to_string(),
+        label: provider.label().to_string(),
+        description: provider.description().to_string(),
+        available: tunnel_provider_available(kind, config),
+        configured: tunnel_provider_configured(kind, config),
+        config_fields: provider.config_fields(),
+        config_values,
+        stored_secret_fields,
+        config_help: provider.config_help().map(|value| value.to_string()),
+    }
+}
+
+fn tunnel_providers_response(
+    runtime: &TunnelState,
+    config: &TunnelConfig,
+) -> TunnelProvidersResponse {
+    TunnelProvidersResponse {
+        selected_provider: config.provider.as_str().to_string(),
+        active: runtime.active,
+        active_provider: if runtime.active {
+            runtime.provider.as_str().to_string()
+        } else {
+            config.provider.as_str().to_string()
+        },
+        url: runtime.url.clone(),
+        selected_app_id: runtime.selected_app_id.clone(),
+        error: runtime.error.clone(),
+        providers: [
+            TunnelProviderKind::Cloudflare,
+            TunnelProviderKind::Ngrok,
+            TunnelProviderKind::TailscaleFunnel,
+            TunnelProviderKind::Bore,
+        ]
+        .into_iter()
+        .map(|kind| tunnel_provider_summary(kind, config))
+        .collect(),
+    }
+}
+
+pub(super) async fn handle_tunnel_control_command(
+    state: &AppState,
+    cmd: TunnelControlCommand,
+) -> Result<String, String> {
+    match cmd {
+        TunnelControlCommand::Start => {
+            let config = load_tunnel_config(state).await;
+            spawn_tunnel(state, None).await?;
+            persist_public_tunnel_state(state, None, None).await;
+
+            let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
+            let (provider, tunnel_url, tunnel_error) = {
+                let tunnel = state.tunnel.read().await;
+                (
+                    if tunnel.active {
+                        tunnel.provider
+                    } else {
+                        config.provider
+                    },
+                    tunnel.url.clone(),
+                    tunnel.error.clone(),
+                )
+            };
+            if let Some(found) = url.or(tunnel_url) {
+                persist_public_tunnel_state(state, Some(&found), None).await;
+                Ok(format!(
+                    "{} tunnel started.\nExternal URL: {}",
+                    tunnel_provider_label(provider),
+                    found
+                ))
+            } else if let Some(err) = tunnel_error {
+                Err(format!(
+                    "{} tunnel start failed: {}",
+                    tunnel_provider_label(provider),
+                    err
+                ))
+            } else {
+                Ok(format!(
+                    "{} tunnel is starting. URL is pending; try 'tunnel status' in ~10s.",
+                    tunnel_provider_label(provider)
+                ))
+            }
+        }
+        TunnelControlCommand::Stop => {
+            stop_tunnel_internal(state).await;
+            Ok("Tunnel stopped.".to_string())
+        }
+        TunnelControlCommand::Status => {
+            let config = load_tunnel_config(state).await;
+            let tunnel = state.tunnel.read().await;
+            let provider = if tunnel.active {
+                tunnel.provider
+            } else {
+                config.provider
+            };
+            let available = tunnel_provider_available(provider, &config);
+            let configured = tunnel_provider_configured(provider, &config);
+            let status = if tunnel.active { "active" } else { "inactive" };
+            let mut out = format!(
+                "Tunnel status: {} ({})",
+                status,
+                tunnel_provider_label(provider)
+            );
+            if let Some(url) = tunnel.url.clone() {
+                out.push_str(&format!("\nExternal URL: {}", url));
+            }
+            if let Some(err) = tunnel.error.clone() {
+                out.push_str(&format!("\nLast error: {}", err));
+            }
+            if !available {
+                out.push_str("\nProvider binary is not available on this runtime.");
+            } else if !configured {
+                out.push_str("\nProvider settings are incomplete.");
+            }
+            Ok(out)
+        }
+    }
+}
+
+pub(super) async fn load_tunnel_config(state: &AppState) -> TunnelConfig {
+    let agent = state.agent.read().await;
+    agent.config.tunnel.clone()
+}
+
+fn clean_logged_url(candidate: &str) -> String {
+    candidate
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '}' | ',' | ';'))
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn extract_logged_https_urls(line: &str) -> Vec<String> {
+    line.split_whitespace()
+        .filter_map(|part| {
+            let start = part.find("https://")?;
+            let raw = &part[start..];
+            let cleaned = clean_logged_url(raw);
+            if cleaned.is_empty() {
+                return None;
+            }
+            reqwest::Url::parse(&cleaned).ok().map(|_| cleaned)
+        })
+        .collect()
+}
+
+fn tunnel_https_url_matches_provider(provider: TunnelProviderKind, url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    match provider {
+        TunnelProviderKind::Cloudflare => {
+            host.ends_with(".trycloudflare.com") || host.ends_with(".cfargotunnel.com")
+        }
+        TunnelProviderKind::Ngrok => host.contains("ngrok"),
+        TunnelProviderKind::TailscaleFunnel => host.ends_with(".ts.net"),
+        TunnelProviderKind::Bore => true,
+    }
+}
+
+fn extract_bore_url(line: &str, server: &str) -> Option<String> {
+    let host = server.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let pattern = format!(r"{}\:(\d{{2,5}})", regex::escape(host));
+    let re = Regex::new(&pattern).ok()?;
+    let captures = re.captures(line)?;
+    let port = captures.get(1)?.as_str();
+    Some(format!("http://{}:{}", host, port))
+}
+
+fn extract_tunnel_url_from_log(
+    provider: TunnelProviderKind,
+    line: &str,
+    bore_server: Option<&str>,
+) -> Option<String> {
+    for url in extract_logged_https_urls(line) {
+        if tunnel_https_url_matches_provider(provider, &url) {
+            return Some(url);
+        }
+    }
+    if provider == TunnelProviderKind::TailscaleFunnel {
+        for token in line.split_whitespace() {
+            let cleaned = clean_logged_url(token);
+            if cleaned.ends_with(".ts.net") {
+                return Some(format!("https://{}", cleaned));
+            }
+        }
+    }
+    if provider == TunnelProviderKind::Bore {
+        return extract_bore_url(line, bore_server.unwrap_or("bore.pub"));
+    }
+    None
+}
+
+fn line_looks_like_tunnel_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("failed to sufficiently increase receive buffer size")
+        || lower.contains("udp-buffer-sizes")
+    {
+        return false;
+    }
+    (lower.contains("error") || lower.contains("failed") || lower.contains("panic"))
+        && !lower.contains("no error")
+}
+
+fn spawn_tunnel_output_reader<R>(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    provider: TunnelProviderKind,
+    reader: R,
+    bore_server: Option<String>,
+    stream_label: &'static str,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(
+                "{} tunnel {}: {}",
+                tunnel_provider_label(provider),
+                stream_label,
+                line
+            );
+            if let Some(url) = extract_tunnel_url_from_log(provider, &line, bore_server.as_deref())
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                if tunnel.url.as_deref() != Some(url.as_str()) {
+                    tracing::info!("{} tunnel URL: {}", tunnel_provider_label(provider), url);
+                    tunnel.url = Some(url);
+                    tunnel.error = None;
+                }
+            }
+            if line_looks_like_tunnel_error(&line) {
+                let mut tunnel = tunnel_arc.write().await;
+                tunnel.error = Some(line);
+                tunnel.active = false;
+            }
+        }
+    });
+}
+
+fn set_tunnel_running(
+    tunnel: &mut TunnelState,
+    child: tokio::process::Child,
+    provider: TunnelProviderKind,
+) {
+    tunnel.process = Some(child);
+    tunnel.provider = provider;
+    tunnel.active = true;
+    tunnel.error = None;
+    tunnel.url = None;
+}
+
+async fn spawn_ngrok_url_probe(tunnel_arc: Arc<RwLock<TunnelState>>) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let active = { tunnel_arc.read().await.active };
+        if !active {
+            break;
+        }
+        let Ok(resp) = client.get("http://127.0.0.1:4040/api/tunnels").send().await else {
+            continue;
+        };
+        let Ok(payload) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let tunnels = payload
+            .get("tunnels")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let found = tunnels.iter().find_map(|item| {
+            item.get("public_url")
+                .and_then(|value| value.as_str())
+                .map(clean_logged_url)
+                .filter(|value| value.starts_with("https://"))
+        });
+        if let Some(url) = found {
+            let mut tunnel = tunnel_arc.write().await;
+            tunnel.url = Some(url);
+            tunnel.error = None;
+            break;
+        }
+    }
+}
+
+pub(super) async fn persist_public_tunnel_state(
+    state: &AppState,
+    url: Option<&str>,
+    selected_app_id: Option<&str>,
+) {
+    let agent = state.agent.read().await;
+    match url {
+        Some(value) if !value.trim().is_empty() => {
+            let _ = agent
+                .storage
+                .set("public_base_url", value.trim().as_bytes())
+                .await;
+        }
+        _ => {
+            let _ = agent.storage.delete("public_base_url").await;
+        }
+    }
+    match selected_app_id {
+        Some(value) if !value.trim().is_empty() => {
+            let _ = agent
+                .storage
+                .set(PUBLIC_SELECTED_APP_KEY, value.trim().as_bytes())
+                .await;
+        }
+        _ => {
+            let _ = agent.storage.delete(PUBLIC_SELECTED_APP_KEY).await;
+        }
+    }
+}
+
+async fn run_tunnel_test_command(
+    binary: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, String> {
+    if !binary_path_available(binary) {
+        return Err(format!("Binary not found: {}", binary));
+    }
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra_env {
+        if !value.trim().is_empty() {
+            cmd.env(key, value);
+        }
+    }
+    let output = tokio::time::timeout(Duration::from_secs(8), cmd.output())
+        .await
+        .map_err(|_| format!("Timed out running {}", binary))?
+        .map_err(|e| format!("Failed to run {}: {}", binary, e))?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            Ok(format!("{} is available.", binary))
+        } else {
+            Ok(stdout)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("{} exited with {}", binary, output.status)
+        } else {
+            stderr
+        })
+    }
+}
+
+async fn test_tunnel_provider_connection(
+    kind: TunnelProviderKind,
+    config: &TunnelConfig,
+) -> Result<String, String> {
+    match kind {
+        TunnelProviderKind::Cloudflare => {
+            let Some(binary) = resolve_cloudflared_binary(&config.cloudflare) else {
+                return Err(
+                    "cloudflared was not found on this server. Install cloudflared or set a custom binary path in advanced tunnel settings."
+                        .to_string(),
+                );
+            };
+            run_tunnel_test_command(binary.trim(), &["--version"], &[]).await
+        }
+        TunnelProviderKind::Ngrok => {
+            if config.ngrok.authtoken.trim().is_empty() {
+                return Err("Save an ngrok auth token before testing the provider.".to_string());
+            }
+            run_tunnel_test_command(
+                config.ngrok.binary_path.trim(),
+                &["version"],
+                &[("NGROK_AUTHTOKEN", config.ngrok.authtoken.trim())],
+            )
+            .await
+        }
+        TunnelProviderKind::TailscaleFunnel => {
+            run_tunnel_test_command(
+                config.tailscale_funnel.binary_path.trim(),
+                &["status", "--json"],
+                &[("TS_AUTHKEY", config.tailscale_funnel.auth_key.trim())],
+            )
+            .await
+        }
+        TunnelProviderKind::Bore => {
+            run_tunnel_test_command(config.bore.binary_path.trim(), &["--help"], &[]).await
+        }
+    }
+}
+
+pub(super) async fn get_tunnel_providers(
+    State(state): State<AppState>,
+) -> Json<TunnelProvidersResponse> {
+    let config = load_tunnel_config(&state).await;
+    let tunnel = state.tunnel.read().await;
+    Json(tunnel_providers_response(&tunnel, &config))
+}
+
+pub(super) async fn configure_tunnel(
+    State(state): State<AppState>,
+    Json(request): Json<ConfigureTunnelRequest>,
+) -> Response {
+    let save_result = {
+        let mut agent = state.agent.write().await;
+        let mut next = agent.config.tunnel.clone();
+        if let Some(provider_raw) = request.provider.as_deref() {
+            let Some(provider) = parse_tunnel_provider_kind(provider_raw) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Unknown tunnel provider" })),
+                )
+                    .into_response();
+            };
+            next.provider = provider;
+        }
+
+        let values = request.values;
+        if let Some(value) = values
+            .get("binary_path")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            match next.provider {
+                TunnelProviderKind::Cloudflare => next.cloudflare.binary_path = value.to_string(),
+                TunnelProviderKind::Ngrok => next.ngrok.binary_path = value.to_string(),
+                TunnelProviderKind::TailscaleFunnel => {
+                    next.tailscale_funnel.binary_path = value.to_string()
+                }
+                TunnelProviderKind::Bore => next.bore.binary_path = value.to_string(),
+            }
+        }
+        match next.provider {
+            TunnelProviderKind::Cloudflare => {}
+            TunnelProviderKind::Ngrok => {
+                if let Some(value) = values.get("authtoken") {
+                    if !value.trim().is_empty() {
+                        next.ngrok.authtoken = value.trim().to_string();
+                    }
+                }
+            }
+            TunnelProviderKind::TailscaleFunnel => {
+                if let Some(value) = values.get("auth_key") {
+                    if !value.trim().is_empty() {
+                        next.tailscale_funnel.auth_key = value.trim().to_string();
+                    }
+                }
+                if let Some(value) = values.get("hostname") {
+                    next.tailscale_funnel.hostname = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(value.trim().to_string())
+                    };
+                }
+            }
+            TunnelProviderKind::Bore => {
+                if let Some(value) = values.get("server") {
+                    if value.trim().is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "Bore server cannot be empty" })),
+                        )
+                            .into_response();
+                    }
+                    next.bore.server = value.trim().to_string();
+                }
+            }
+        }
+
+        agent.config.tunnel = next.clone();
+        let result = agent.config.save(&agent.config_dir, Some(&agent.data_dir));
+        (result, next)
+    };
+
+    let (result, config) = save_result;
+    if let Err(error) = result {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to save tunnel settings: {}", error)
+            })),
+        )
+            .into_response();
+    }
+
+    {
+        let mut tunnel = state.tunnel.write().await;
+        if tunnel.active {
+            tunnel.error = Some(
+                "Tunnel configuration changed. Restart the tunnel to apply the new provider settings."
+                    .to_string(),
+            );
+        }
+    }
+    let tunnel = state.tunnel.read().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "message": "Tunnel settings saved.",
+            "settings": tunnel_providers_response(&tunnel, &config),
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn test_tunnel_connection(
+    State(state): State<AppState>,
+    Json(request): Json<TunnelTestRequest>,
+) -> Response {
+    let config = load_tunnel_config(&state).await;
+    let provider = request
+        .provider
+        .as_deref()
+        .and_then(parse_tunnel_provider_kind)
+        .unwrap_or(config.provider);
+    match test_tunnel_provider_connection(provider, &config).await {
+        Ok(detail) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "provider": provider.as_str(),
+                "message": format!("{} is reachable and ready for tunnel startup.", tunnel_provider_label(provider)),
+                "detail": detail,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "provider": provider.as_str(),
+                "error": error,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn get_tunnel_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let config = load_tunnel_config(&state).await;
+    let tunnel = state.tunnel.read().await;
+    let provider = if tunnel.active {
+        tunnel.provider
+    } else {
+        config.provider
+    };
+    Json(serde_json::json!({
+        "active": tunnel.active,
+        "url": tunnel.url,
+        "selected_app_id": tunnel.selected_app_id,
+        "error": tunnel.error,
+        "provider": provider.as_str(),
+        "provider_label": tunnel_provider_label(provider),
+        "available": tunnel_provider_available(provider, &config),
+        "configured": tunnel_provider_configured(provider, &config)
+    }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct StartTunnelRequest {
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// POST /tunnel/start - start the selected public tunnel provider
+/// Core tunnel start logic  - used by both the API endpoint and auto-start
+async fn spawn_cloudflare_tunnel(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    config: &TunnelCloudflareConfig,
+) -> Result<(), String> {
+    let Some(binary) = resolve_cloudflared_binary(config) else {
+        return Err(
+            "cloudflared was not found on this server. Install cloudflared or set a custom binary path in advanced tunnel settings."
+                .to_string(),
+        );
+    };
+    match tokio::process::Command::new(&binary)
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            "http://127.0.0.1:8990",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                set_tunnel_running(&mut tunnel, child, TunnelProviderKind::Cloudflare);
+            }
+            if let Some(stdout) = stdout {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::Cloudflare,
+                    stdout,
+                    None,
+                    "stdout",
+                );
+            }
+            if let Some(stderr) = stderr {
+                spawn_tunnel_output_reader(
+                    tunnel_arc,
+                    TunnelProviderKind::Cloudflare,
+                    stderr,
+                    None,
+                    "stderr",
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to start Cloudflare tunnel: {}", e)),
+    }
+}
+
+async fn spawn_ngrok_tunnel(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    config: &TunnelNgrokConfig,
+) -> Result<(), String> {
+    let binary = config.binary_path.trim();
+    if !binary_path_available(binary) {
+        return Err(format!("ngrok binary not found: {}", binary));
+    }
+    if config.authtoken.trim().is_empty() {
+        return Err("ngrok auth token is required before starting the tunnel.".to_string());
+    }
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args([
+            "http",
+            "http://127.0.0.1:8990",
+            "--log=stdout",
+            "--log-format=json",
+        ])
+        .env("NGROK_AUTHTOKEN", config.authtoken.trim())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match command.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                set_tunnel_running(&mut tunnel, child, TunnelProviderKind::Ngrok);
+            }
+            if let Some(stdout) = stdout {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::Ngrok,
+                    stdout,
+                    None,
+                    "stdout",
+                );
+            }
+            if let Some(stderr) = stderr {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::Ngrok,
+                    stderr,
+                    None,
+                    "stderr",
+                );
+            }
+            tokio::spawn(spawn_ngrok_url_probe(tunnel_arc));
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to start ngrok tunnel: {}", e)),
+    }
+}
+
+async fn spawn_tailscale_tunnel(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    config: &TunnelTailscaleConfig,
+) -> Result<(), String> {
+    let binary = config.binary_path.trim();
+    if !binary_path_available(binary) {
+        return Err(format!("Tailscale binary not found: {}", binary));
+    }
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .arg("funnel")
+        .arg("8990")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if !config.auth_key.trim().is_empty() {
+        command.env("TS_AUTHKEY", config.auth_key.trim());
+    }
+    if let Some(hostname) = config
+        .hostname
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.env("TS_HOSTNAME", hostname.trim());
+    }
+    match command.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                set_tunnel_running(&mut tunnel, child, TunnelProviderKind::TailscaleFunnel);
+            }
+            if let Some(stdout) = stdout {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::TailscaleFunnel,
+                    stdout,
+                    None,
+                    "stdout",
+                );
+            }
+            if let Some(stderr) = stderr {
+                spawn_tunnel_output_reader(
+                    tunnel_arc,
+                    TunnelProviderKind::TailscaleFunnel,
+                    stderr,
+                    None,
+                    "stderr",
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to start Tailscale Funnel: {}", e)),
+    }
+}
+
+async fn spawn_bore_tunnel(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    config: &crate::core::config::TunnelBoreConfig,
+) -> Result<(), String> {
+    let binary = config.binary_path.trim();
+    if !binary_path_available(binary) {
+        return Err(format!("Bore binary not found: {}", binary));
+    }
+    if config.server.trim().is_empty() {
+        return Err("Bore server is required before starting the tunnel.".to_string());
+    }
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["local", "8990", "--to", config.server.trim()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match command.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                set_tunnel_running(&mut tunnel, child, TunnelProviderKind::Bore);
+            }
+            let bore_server = Some(config.server.trim().to_string());
+            if let Some(stdout) = stdout {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::Bore,
+                    stdout,
+                    bore_server.clone(),
+                    "stdout",
+                );
+            }
+            if let Some(stderr) = stderr {
+                spawn_tunnel_output_reader(
+                    tunnel_arc,
+                    TunnelProviderKind::Bore,
+                    stderr,
+                    bore_server,
+                    "stderr",
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to start Bore tunnel: {}", e)),
+    }
+}
+
+pub(super) async fn spawn_tunnel(
+    state: &AppState,
+    requested_provider: Option<TunnelProviderKind>,
+) -> Result<(), String> {
+    let config = load_tunnel_config(state).await;
+    let provider = requested_provider.unwrap_or(config.provider);
+    {
+        let tunnel = state.tunnel.read().await;
+        if tunnel.active {
+            if tunnel.provider == provider {
+                return Ok(());
+            }
+            return Err(format!(
+                "{} tunnel is already active. Stop it before switching providers.",
+                tunnel_provider_label(tunnel.provider)
+            ));
+        }
+    }
+
+    match provider {
+        TunnelProviderKind::Cloudflare => {
+            spawn_cloudflare_tunnel(state.tunnel.clone(), &config.cloudflare).await
+        }
+        TunnelProviderKind::Ngrok => spawn_ngrok_tunnel(state.tunnel.clone(), &config.ngrok).await,
+        TunnelProviderKind::TailscaleFunnel => {
+            spawn_tailscale_tunnel(state.tunnel.clone(), &config.tailscale_funnel).await
+        }
+        TunnelProviderKind::Bore => spawn_bore_tunnel(state.tunnel.clone(), &config.bore).await,
+    }
+}
+
+/// POST /tunnel/start - start the selected public tunnel provider
+pub(super) async fn start_tunnel(
+    State(state): State<AppState>,
+    Json(request): Json<StartTunnelRequest>,
+) -> Response {
+    let requested_app_id = request
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(app_id) = requested_app_id.as_deref() {
+        if !is_valid_app_id(app_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid app_id" })),
+            )
+                .into_response();
+        }
+        if state.app_registry.get_dir(app_id).await.is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "App not found" })),
+            )
+                .into_response();
+        }
+    }
+
+    let requested_provider = match request.provider.as_deref() {
+        Some(raw) => {
+            let Some(provider) = parse_tunnel_provider_kind(raw) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Unknown tunnel provider" })),
+                )
+                    .into_response();
+            };
+            Some(provider)
+        }
+        None => None,
+    };
+    let effective_provider =
+        requested_provider.unwrap_or(load_tunnel_config(&state).await.provider);
+    if requested_app_id.is_none() {
+        if let Err(err) =
+            tunnel_auth::ensure_control_plane_tunnel_ready(&state, effective_provider).await
+        {
+            return err.into_response();
+        }
+    }
+
+    match spawn_tunnel(&state, requested_provider).await {
+        Ok(()) => {
+            {
+                let mut tunnel = state.tunnel.write().await;
+                tunnel.selected_app_id = requested_app_id.clone();
+            }
+            persist_public_tunnel_state(&state, None, requested_app_id.as_deref()).await;
+            let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
+            if let Some(found) = url.as_deref() {
+                persist_public_tunnel_state(&state, Some(found), requested_app_id.as_deref()).await;
+            }
+            let config = load_tunnel_config(&state).await;
+            let (provider, tunnel_url, selected_app_id) = {
+                let tunnel = state.tunnel.read().await;
+                (
+                    if tunnel.active {
+                        tunnel.provider
+                    } else {
+                        config.provider
+                    },
+                    tunnel.url.clone(),
+                    tunnel.selected_app_id.clone(),
+                )
+            };
+            Json(serde_json::json!({
+                "ok": true,
+                "url": tunnel_url,
+                "selected_app_id": selected_app_id,
+                "provider": provider.as_str(),
+                "provider_label": tunnel_provider_label(provider),
+                "message": if tunnel_url.is_some() {
+                    format!("{} tunnel started", tunnel_provider_label(provider))
+                } else {
+                    format!("{} tunnel starting, URL pending...", tunnel_provider_label(provider))
+                }
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": e
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn stop_tunnel_internal(state: &AppState) {
+    let mut tunnel = state.tunnel.write().await;
+    if let Some(ref mut child) = tunnel.process {
+        let _ = child.kill().await;
+    }
+    tunnel.process = None;
+    tunnel.active = false;
+    tunnel.url = None;
+    tunnel.selected_app_id = None;
+    tunnel.error = None;
+    tracing::info!("Tunnel stopped by user");
+    drop(tunnel);
+    persist_public_tunnel_state(state, None, None).await;
+}
+
+/// POST /tunnel/stop - stop the active public tunnel
+pub(super) async fn stop_tunnel(State(state): State<AppState>) -> Json<serde_json::Value> {
+    stop_tunnel_internal(&state).await;
+    Json(serde_json::json!({ "ok": true, "message": "Tunnel stopped" }))
+}
+
+pub(super) async fn wait_for_tunnel_url(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    attempts: usize,
+) -> Option<String> {
+    for _ in 0..attempts {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let tunnel = tunnel_arc.read().await;
+        if let Some(url) = tunnel
+            .url
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(url);
+        }
+    }
+    None
+}

@@ -1,6 +1,6 @@
 //! Telegram bot channel
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ParseMode};
@@ -31,26 +31,13 @@ fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
 }
 
 fn internal_api_base_url() -> String {
-    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-    let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_some()
-        && std::env::var("AGENTARK_TLS_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some();
-    let scheme = if tls_enabled { "https" } else { "http" };
-    format!("{}://{}", scheme, bind_addr)
+    crate::core::net::internal_api_base_url()
 }
 
 async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) -> String {
     let api_key = { agent.read().await.api_key.clone() };
     let base_url = internal_api_base_url();
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
+    let client = match crate::core::net::build_internal_control_client(10) {
         Ok(c) => c,
         Err(e) => return format!("Tunnel command failed: {}", e),
     };
@@ -518,6 +505,16 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
 
     let bot = Bot::new(&telegram_config.bot_token);
 
+    match bot.get_me().await {
+        Ok(me) => {
+            let username = me.user.username.unwrap_or_else(|| "unknown".to_string());
+            tracing::info!("Telegram bot authenticated as @{}", username);
+        }
+        Err(e) => {
+            return Err(anyhow!("Telegram bot token validation failed: {}", e));
+        }
+    }
+
     // Register commands with Telegram (shows in / menu)
     register_commands(&bot).await;
 
@@ -768,14 +765,31 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
 
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let Some(config) = &agent.config.telegram else {
-        tracing::debug!("Telegram send_message: no telegram config, skipping");
-        return Ok(());
+        let message = "Telegram is not configured";
+        tracing::warn!("Telegram send_message: {}", message);
+        return Err(anyhow!(message));
     };
 
     let Some(chat_id) = resolve_chat_id(agent, config).await else {
-        return Ok(());
+        let message =
+            "Telegram has no delivery target yet. Message the bot once or add an allowed user ID.";
+        tracing::warn!("Telegram send_message: {}", message);
+        return Err(anyhow!(message));
     };
 
+    let bot = Bot::new(&config.bot_token);
+    bot.send_message(ChatId(chat_id), text).await?;
+    Ok(())
+}
+
+pub async fn send_message_to_chat(
+    config: &crate::core::config::TelegramConfig,
+    chat_id: i64,
+    text: &str,
+) -> Result<()> {
+    if chat_id == 0 || text.trim().is_empty() {
+        return Ok(());
+    }
     let bot = Bot::new(&config.bot_token);
     bot.send_message(ChatId(chat_id), text).await?;
     Ok(())

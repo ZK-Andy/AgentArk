@@ -1,9 +1,162 @@
 use super::*;
 
+#[derive(Default)]
+struct AppDeployProgressRelayState {
+    announced_file_writes: bool,
+    sent_messages: HashSet<String>,
+}
+
+fn app_deploy_chat_progress_message(
+    ev: &crate::core::StreamEvent,
+    state: &mut AppDeployProgressRelayState,
+) -> Option<String> {
+    let content = match ev {
+        crate::core::StreamEvent::ToolProgress { name, content, .. }
+        | crate::core::StreamEvent::ToolResult { name, content }
+            if name == "app_deploy" =>
+        {
+            content.trim()
+        }
+        _ => return None,
+    };
+    if content.is_empty() {
+        return None;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    let mut message = if lower.starts_with("deploying '") {
+        Some(format!("I'm deploying the app now. {}", content))
+    } else if lower.starts_with("writing ") || lower.contains(" line ") {
+        if state.announced_file_writes {
+            None
+        } else {
+            state.announced_file_writes = true;
+            Some("I'm writing the generated app files now.".to_string())
+        }
+    } else if lower.contains("files ready") {
+        Some("The app files are ready. I'm preparing the runtime now.".to_string())
+    } else if lower == "saved app metadata" {
+        Some("I saved the app metadata and deployment settings.".to_string())
+    } else if lower.starts_with("assigned port ") {
+        Some(
+            "I reserved the app runtime port. Next I'm checking whether any required setup is still missing."
+                .to_string(),
+        )
+    } else if lower == "installing dependencies..." {
+        Some("I'm installing the app dependencies now.".to_string())
+    } else if lower == "no dependencies to install" {
+        Some("No dependency install is needed. I'm starting the app now.".to_string())
+    } else if lower.starts_with("starting server on port ") {
+        Some("I'm starting the app server now.".to_string())
+    } else if lower == "server container started" {
+        Some("The app container started. I'm checking that it comes up cleanly.".to_string())
+    } else if lower == "docker unavailable; started local app process" {
+        Some(
+            "Docker was unavailable, so I started the app locally instead. I'm checking it now."
+                .to_string(),
+        )
+    } else if lower.starts_with("validating deployed app") {
+        Some("I'm validating the deployed app now.".to_string())
+    } else if lower.starts_with("starting public tunnel for app access")
+        || lower.starts_with("starting cloudflare tunnel for public app access")
+    {
+        Some("I'm trying to start a public tunnel so you can open the app externally.".to_string())
+    } else if lower.starts_with("app created but waiting for required inputs:") {
+        Some(content.to_string())
+    } else if lower.starts_with("static app ready at ") {
+        Some("The static app is ready. I'm preparing the access link now.".to_string())
+    } else if lower.starts_with("dynamic app ready at ") {
+        Some(
+            "The app process is up. I'm validating that it stays healthy before I share the final status."
+                .to_string(),
+        )
+    } else {
+        None
+    }?;
+
+    message = safe_truncate(&message, 220);
+    if !state.sent_messages.insert(message.clone()) {
+        return None;
+    }
+    Some(message)
+}
+
+fn merge_chat_visible_progress_payload(
+    payload: Option<serde_json::Value>,
+    chat_message: &str,
+) -> Option<serde_json::Value> {
+    let mut merged = match payload {
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(other) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("payload".to_string(), other);
+            obj
+        }
+        None => serde_json::Map::new(),
+    };
+    merged.insert("chat_visible".to_string(), serde_json::json!(true));
+    merged.insert("chat_message".to_string(), serde_json::json!(chat_message));
+    Some(serde_json::Value::Object(merged))
+}
+
+async fn send_app_deploy_progress_to_conversation(
+    request_channel: &str,
+    conversation_id: Option<&str>,
+    telegram_config: Option<&crate::core::config::TelegramConfig>,
+    whatsapp_config: Option<&crate::channels::whatsapp::WhatsAppChannelConfig>,
+    agent_name: &str,
+    message: &str,
+) {
+    if message.trim().is_empty() {
+        return;
+    }
+    match request_channel {
+        #[cfg(feature = "telegram")]
+        "telegram" => {
+            let Some(config) = telegram_config else {
+                return;
+            };
+            let Some(chat_id) = conversation_id
+                .and_then(|cid| cid.strip_prefix("telegram:"))
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::channels::telegram::send_message_to_chat(config, chat_id, message),
+            )
+            .await;
+        }
+        "whatsapp" => {
+            let Some(config) = whatsapp_config else {
+                return;
+            };
+            let Some(phone_number) = conversation_id.and_then(|cid| cid.strip_prefix("whatsapp:"))
+            else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                crate::channels::whatsapp::send_message_to_recipient(
+                    config,
+                    phone_number,
+                    agent_name,
+                    message,
+                ),
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
 pub(crate) struct ToolExecutionContext<'a> {
     pub request_channel: &'a str,
+    pub current_turn_is_explicit_approval: bool,
     pub trace_id: Option<&'a str>,
     pub conversation_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
     pub strategy_version: Option<&'a str>,
     pub policy_version: Option<&'a str>,
     pub prompt_version: Option<&'a str>,
@@ -19,6 +172,37 @@ pub(crate) struct ToolCallOutput {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolExecutionBatch {
     pub outputs: Vec<ToolCallOutput>,
+}
+
+fn action_has_dangerous_capabilities(action_def: Option<&crate::actions::ActionDef>) -> bool {
+    action_def.is_some_and(|action| {
+        action.capabilities.iter().any(|cap| {
+            matches!(
+                crate::security::action_guard::ActionGuard::permission_risk(
+                    &crate::security::action_guard::ActionGuard::parse_permission(cap)
+                ),
+                crate::security::action_guard::PermissionRisk::Dangerous
+            )
+        })
+    })
+}
+
+fn tool_call_has_structural_side_effect_markers(call: &crate::core::llm::ToolCall) -> bool {
+    call.arguments.get("notify_channel").is_some()
+        || call.arguments.get("on_trigger").is_some()
+        || call.arguments.get("files").is_some()
+}
+
+fn blocked_by_saved_rule_message(constraints: &super::UserExecutionConstraints) -> String {
+    if constraints.require_explicit_approval_before_side_effects
+        && constraints.show_plan_before_side_effects
+    {
+        "Blocked by saved user rule: show the plan first, then wait for explicit approval before any side-effecting action.".to_string()
+    } else if constraints.require_explicit_approval_before_side_effects {
+        "Blocked by saved user rule: explicit approval is required before any side-effecting action.".to_string()
+    } else {
+        "Blocked by saved user rule: show the plan before any side-effecting action.".to_string()
+    }
 }
 
 impl ToolExecutionBatch {
@@ -77,10 +261,137 @@ impl Agent {
         }
     }
 
-    fn tool_call_signature(call: &crate::core::llm::ToolCall) -> String {
+    async fn classify_tool_call_side_effecting(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        action_def: Option<&crate::actions::ActionDef>,
+    ) -> bool {
+        if action_has_dangerous_capabilities(action_def)
+            || tool_call_has_structural_side_effect_markers(call)
+        {
+            return true;
+        }
+
+        let Some(action) = action_def else {
+            return true;
+        };
+        let Some(candidate) = self
+            .llm_candidates_for_role(&crate::core::config::ModelRole::Fast)
+            .into_iter()
+            .next()
+        else {
+            return true;
+        };
+
+        let schema = action.input_schema.as_object().cloned().unwrap_or_default();
+        let required = schema
+            .get("required")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .take(12)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let properties = schema
+            .get("properties")
+            .and_then(|value| value.as_object())
+            .map(|props| {
+                let mut keys = props.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys.into_iter().take(16).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let prompt = format!(
+            "Classify the following tool call.\n\nAction name: {name}\nDescription: {description}\nCapabilities: {capabilities}\nRequired fields: {required}\nSchema fields: {properties}\nArguments: {arguments}\n\nReturn JSON only with this shape:\n{{\"side_effecting\":true}}\n\nRule:\n- true if executing the tool call would create, update, delete, send, schedule, notify, persist, deploy, restart, or otherwise mutate state outside pure read/inspection.\n- false only for read-only inspection, search, retrieval, listing, validation, or analysis actions that do not change state.",
+            name = action.name,
+            description = action.description,
+            capabilities = if action.capabilities.is_empty() {
+                "(none)".to_string()
+            } else {
+                action.capabilities.join(", ")
+            },
+            required = if required.is_empty() {
+                "(none)".to_string()
+            } else {
+                required.join(", ")
+            },
+            properties = if properties.is_empty() {
+                "(none)".to_string()
+            } else {
+                properties.join(", ")
+            },
+            arguments = serde_json::to_string(&call.arguments).unwrap_or_default(),
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(900),
+            candidate.client.chat(
+                "You classify tool calls as side-effecting or read-only. Output JSON only.",
+                &prompt,
+                &[],
+                &[],
+            ),
+        )
+        .await;
+        let Ok(Ok(resp)) = result else {
+            return true;
+        };
+        self.record_llm_usage("system", "tool_side_effect_classifier", &resp)
+            .await;
+        extract_json_object_from_text(&resp.content)
+            .and_then(|payload| {
+                payload
+                    .get("side_effecting")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn tool_call_signature(call: &crate::core::llm::ToolCall) -> String {
+        let normalized_name = call.name.trim().to_ascii_lowercase();
+        if normalized_name == "watch" {
+            return format!(
+                "watch:{}",
+                crate::core::watcher::watcher_tool_call_signature_from_arguments(&call.arguments)
+            );
+        }
+        if normalized_name == "schedule_task" {
+            let description = call
+                .arguments
+                .get("task")
+                .and_then(|value| value.as_str())
+                .unwrap_or("scheduled task");
+            let action_name = call
+                .arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let action_arguments = call
+                .arguments
+                .get("action_arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let cron_expr = call.arguments.get("cron").and_then(|value| value.as_str());
+            let at_time = call.arguments.get("at").and_then(|value| value.as_str());
+            return format!(
+                "schedule_task:{}",
+                crate::core::task::task_request_signature_from_fields(
+                    action_name,
+                    description,
+                    &action_arguments,
+                    cron_expr,
+                    at_time
+                )
+            );
+        }
         let canonical_args = Self::canonicalize_json_value(&call.arguments);
         let args = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
-        format!("{}:{}", call.name, args)
+        format!("{}:{}", normalized_name, args)
     }
 
     fn find_json_object_bounds(raw: &str) -> Option<(usize, usize)> {
@@ -555,6 +866,9 @@ impl Agent {
         None
     }
 
+    // App deploy self-heal is currently parked, but keep its helpers available
+    // for the planned re-enable path without widening dead-code allowances.
+    #[allow(dead_code)]
     fn app_deploy_files_signature(arguments: &serde_json::Value) -> Option<String> {
         let files = arguments.get("files")?;
         let canonical = Self::canonicalize_json_value(files);
@@ -918,7 +1232,7 @@ impl Agent {
     ) -> (Vec<serde_json::Value>, usize, u64, bool) {
         let root = app_dir.to_path_buf();
         let capped_max = max_files.clamp(1, 200);
-        match tokio::task::spawn_blocking(move || {
+        (tokio::task::spawn_blocking(move || {
             let mut rows: Vec<(usize, String, u64)> = Vec::new();
             let mut total_files = 0usize;
             let mut total_bytes = 0u64;
@@ -964,11 +1278,8 @@ impl Agent {
                 .collect::<Vec<_>>();
             (files, total_files, total_bytes, truncated)
         })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => (Vec::new(), 0, 0, false),
-        }
+        .await)
+            .unwrap_or_default()
     }
 
     async fn build_deployed_app_inspection(
@@ -1350,6 +1661,7 @@ impl Agent {
         best_fuzzy
     }
 
+    #[allow(dead_code)]
     async fn build_app_deploy_self_heal_arguments(
         &self,
         current_args: &serde_json::Value,
@@ -1482,19 +1794,20 @@ Do not include any extra prose.",
 
         for attempt in 1..=MAX_APP_VERIFY_ATTEMPTS {
             if let Some(tx) = stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
+                let _ = tx.try_send(StreamEvent::ToolProgress {
                     name: "app_deploy".to_string(),
                     content: format!(
                         "Validating deployed app (attempt {}/{})",
                         attempt, MAX_APP_VERIFY_ATTEMPTS
                     ),
+                    payload: None,
                 });
             }
 
             // Primary readiness signal: direct HTTP probe to the deployed app URL.
             if let Some(client) = &http_client {
                 match client.get(&internal_probe_url).send().await {
-                    Ok(mut resp) if !resp.status().is_server_error() => {
+                    Ok(resp) if !resp.status().is_server_error() => {
                         let status = resp.status();
                         if let Some(integration) = &integration {
                             let sidecar_session = match integration.create_session().await {
@@ -1711,6 +2024,7 @@ Do not include any extra prose.",
         }
         if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
             details["content_chars"] = serde_json::Value::from(content.chars().count() as u64);
+            details["content_preview"] = serde_json::Value::String(safe_truncate(content, 220));
         }
         if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
             details["title_preview"] = serde_json::Value::String(safe_truncate(title, 120));
@@ -1845,18 +2159,7 @@ Do not include any extra prose.",
     }
 
     fn internal_api_base_url() -> String {
-        let bind_addr =
-            std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
-        let tls_enabled = std::env::var("AGENTARK_TLS_CERT")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some()
-            && std::env::var("AGENTARK_TLS_KEY")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .is_some();
-        let scheme = if tls_enabled { "https" } else { "http" };
-        format!("{}://{}", scheme, bind_addr)
+        crate::core::net::internal_api_base_url()
     }
 
     fn user_facing_local_base_url() -> String {
@@ -1874,10 +2177,7 @@ Do not include any extra prose.",
     }
 
     fn build_internal_control_client() -> Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(5))
-            .build()?)
+        crate::core::net::build_internal_control_client(5)
     }
 
     async fn ensure_public_tunnel_base_url(
@@ -1900,23 +2200,31 @@ Do not include any extra prose.",
         if let Some(key) = self.api_key.as_ref().filter(|k| !k.trim().is_empty()) {
             start_req = start_req.bearer_auth(key);
         }
-        match start_req.send().await {
+        let start_accepted = match start_req.send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     tracing::debug!("Tunnel start request returned {}", resp.status());
+                    false
+                } else {
+                    true
                 }
             }
             Err(e) => {
                 tracing::debug!("Tunnel start request failed: {}", e);
                 return None;
             }
-        }
+        };
 
-        if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: "app_deploy".to_string(),
-                content: "Starting Cloudflare tunnel for public app access...".to_string(),
-            });
+        if start_accepted {
+            if let Some(tx) = stream_tx {
+                let _ = tx.try_send(StreamEvent::ToolProgress {
+                    name: "app_deploy".to_string(),
+                    content: "Starting public tunnel for app access...".to_string(),
+                    payload: None,
+                });
+            }
+        } else {
+            return self.load_public_base_url().await;
         }
 
         for _ in 0..10 {
@@ -1949,11 +2257,7 @@ Do not include any extra prose.",
         let api_key = self.api_key.clone();
         let base_url = Self::internal_api_base_url();
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(std::time::Duration::from_secs(4))
-                .build()
-            {
+            let client = match crate::core::net::build_internal_control_client(4) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!("ArkPulse refresh client init failed: {}", e);
@@ -2104,6 +2408,7 @@ Do not include any extra prose.",
     pub(crate) async fn execute_integration_tool_call(
         &self,
         call: &crate::core::llm::ToolCall,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
         integration_id: &str,
@@ -2143,6 +2448,21 @@ Do not include any extra prose.",
                         None,
                     )
                     .await;
+                    let (title, detail, step_type, data) = build_moltbook_trace_result_step(
+                        sub_action,
+                        &resolved_args,
+                        Some(&result),
+                        None,
+                    );
+                    trace_ref.write().await.steps.push(ExecutionStep {
+                        icon: "[ok]".to_string(),
+                        title,
+                        detail,
+                        step_type,
+                        data,
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
                 }
                 let formatted =
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
@@ -2172,6 +2492,22 @@ Do not include any extra prose.",
                         Some(&e.to_string()),
                     )
                     .await;
+                    let error_text = e.to_string();
+                    let (title, detail, step_type, data) = build_moltbook_trace_result_step(
+                        sub_action,
+                        &resolved_args,
+                        None,
+                        Some(&error_text),
+                    );
+                    trace_ref.write().await.steps.push(ExecutionStep {
+                        icon: "[warn]".to_string(),
+                        title,
+                        detail,
+                        step_type,
+                        data,
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
                 }
                 tracing::error!("{} integration error: {}", call.name, e);
                 self.fire_action_hook(
@@ -2496,15 +2832,17 @@ Do not include any extra prose.",
             }
 
             let runtime_handle = crate::actions::app::launch_dynamic_runtime(
-                app_id,
-                &app_dir,
-                &entry_command,
-                install_command.as_deref(),
-                port,
-                &resolved_env,
-                runtime_image.as_deref(),
-                runtime_preference,
-                None,
+                crate::actions::app::DynamicRuntimeLaunch {
+                    app_id,
+                    app_dir: &app_dir,
+                    entry_command: &entry_command,
+                    install_command: install_command.as_deref(),
+                    port,
+                    extra_env: &resolved_env,
+                    runtime_image: runtime_image.as_deref(),
+                    runtime_preference,
+                    stream_tx: None,
+                },
             )
             .await?;
 
@@ -2513,7 +2851,7 @@ Do not include any extra prose.",
                     (None, Some(container_id), "container")
                 }
                 crate::actions::app::DynamicRuntimeHandle::Process(child) => {
-                    (Some(child), None, "local_process")
+                    (Some(*child), None, "local_process")
                 }
             };
             let diagnostics_dir = app_dir.clone();
@@ -2853,15 +3191,759 @@ Do not include any extra prose.",
         call: &crate::core::llm::ToolCall,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
+        conversation_id: Option<&str>,
         _public_base_url: Option<&str>,
     ) -> Result<String> {
-        self.execute_single_tool_call_legacy(
-            call,
-            &Arc::new(RwLock::new(ExecutionTrace::default())),
-            stream_tx.cloned(),
-            request_channel,
-        )
-        .await
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+        let upstream_tx = stream_tx.cloned();
+        let request_channel_owned = request_channel.to_string();
+        let conversation_id_owned = conversation_id.map(str::to_string);
+        let telegram_config = self.config.telegram.clone();
+        let whatsapp_config = self.config.whatsapp.clone();
+        let agent_name = self.config.name.clone();
+        let relay_task = tokio::spawn(async move {
+            let mut relay_state = AppDeployProgressRelayState::default();
+            while let Some(ev) = progress_rx.recv().await {
+                let chat_message = app_deploy_chat_progress_message(&ev, &mut relay_state);
+                if let Some(tx) = upstream_tx.as_ref() {
+                    let forwarded = match ev {
+                        StreamEvent::ToolProgress {
+                            name,
+                            content,
+                            payload,
+                        } => StreamEvent::ToolProgress {
+                            name,
+                            content,
+                            payload: if let Some(msg) = chat_message.as_ref() {
+                                merge_chat_visible_progress_payload(payload, msg)
+                            } else {
+                                payload
+                            },
+                        },
+                        other => other,
+                    };
+                    let _ = tx.send(forwarded).await;
+                }
+                if let Some(msg) = chat_message.as_ref() {
+                    let request_channel = request_channel_owned.clone();
+                    let conversation_id = conversation_id_owned.clone();
+                    let telegram_config = telegram_config.clone();
+                    let whatsapp_config = whatsapp_config.clone();
+                    let agent_name = agent_name.clone();
+                    let message = msg.clone();
+                    tokio::spawn(async move {
+                        send_app_deploy_progress_to_conversation(
+                            &request_channel,
+                            conversation_id.as_deref(),
+                            telegram_config.as_ref(),
+                            whatsapp_config.as_ref(),
+                            &agent_name,
+                            &message,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        let result = self
+            .execute_single_tool_call_legacy(
+                call,
+                &Arc::new(RwLock::new(ExecutionTrace::default())),
+                Some(progress_tx.clone()),
+                request_channel,
+            )
+            .await;
+        drop(progress_tx);
+        let _ = relay_task.await;
+        result
+    }
+
+    pub(crate) async fn handle_memory_lookup_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        request_channel: &str,
+        conversation_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolStart {
+                name: call.name.clone(),
+                payload: None,
+            });
+        }
+
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("memory_lookup requires a non-empty 'query'"))?;
+        let limit = call
+            .arguments
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.clamp(1, 10) as usize)
+            .unwrap_or(5);
+        let include_semantic = call
+            .arguments
+            .get("include_semantic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let include_structured = call
+            .arguments
+            .get("include_structured")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let mut sections: Vec<String> = Vec::new();
+
+        if include_semantic {
+            let mem0_scope =
+                self.mem0_scope_for_request(request_channel, conversation_id, project_id);
+            let semantic_lines = if self.mem0.is_available() {
+                match self.mem0.search(query, &mem0_scope, limit).await {
+                    Ok(memories) => memories
+                        .into_iter()
+                        .take(limit)
+                        .map(|m| format!("- {}", safe_truncate(&m.memory, 220)))
+                        .collect::<Vec<_>>(),
+                    Err(e) => {
+                        tracing::warn!("memory_lookup mem0 search failed: {}", e);
+                        Vec::new()
+                    }
+                }
+            } else {
+                match self
+                    .memory
+                    .retrieve_relevant(query, limit.min(5), project_id)
+                    .await
+                {
+                    Ok(memories) => memories
+                        .into_iter()
+                        .take(limit)
+                        .map(|m| format!("- {}", safe_truncate(&m.content, 220)))
+                        .collect::<Vec<_>>(),
+                    Err(e) => {
+                        tracing::warn!("memory_lookup built-in retrieval failed: {}", e);
+                        Vec::new()
+                    }
+                }
+            };
+
+            if !semantic_lines.is_empty() {
+                sections.push(format!("## Relevant Memory\n{}", semantic_lines.join("\n")));
+            }
+        }
+
+        if include_structured {
+            if let Some(domain_ctx) = self.build_memory_domain_context(query, project_id).await {
+                sections.push(domain_ctx);
+            }
+        }
+
+        let output = if sections.is_empty() {
+            format!(
+                "No relevant memory was found for `{}`.",
+                safe_truncate(query, 120)
+            )
+        } else {
+            format!(
+                "Memory lookup for `{}`.\n\n{}",
+                safe_truncate(query, 120),
+                sections.join("\n\n")
+            )
+        };
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: output.clone(),
+            });
+        }
+
+        Ok(output)
+    }
+
+    pub(crate) async fn handle_goal_manage_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolStart {
+                name: call.name.clone(),
+                payload: None,
+            });
+        }
+
+        let operation = call
+            .arguments
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("goal_manage requires an 'operation'"))?;
+
+        let result = match operation {
+            "list" => {
+                let limit = call
+                    .arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.clamp(1, 50) as usize)
+                    .unwrap_or(10);
+
+                let mut goals = {
+                    let tasks = self.tasks.read().await;
+                    tasks
+                        .all()
+                        .iter()
+                        .filter(|task| task.action == "goal")
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                goals.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| a.description.cmp(&b.description))
+                });
+
+                if goals.is_empty() {
+                    "No goals are currently saved.".to_string()
+                } else {
+                    let mut lines = Vec::new();
+                    for goal in goals.into_iter().take(limit) {
+                        let goal_text = goal
+                            .arguments
+                            .get("goal")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or(goal.description.as_str());
+                        let goal_id = goal
+                            .arguments
+                            .get("goal_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let status = match &goal.status {
+                            crate::core::TaskStatus::Pending => "pending",
+                            crate::core::TaskStatus::AwaitingApproval => "awaiting approval",
+                            crate::core::TaskStatus::Paused => "paused",
+                            crate::core::TaskStatus::InProgress => "in progress",
+                            crate::core::TaskStatus::Completed => "saved",
+                            crate::core::TaskStatus::Failed { .. } => "failed",
+                            crate::core::TaskStatus::Cancelled => "cancelled",
+                        };
+                        let mut line = format!("- {} [{}]", safe_truncate(goal_text, 160), status);
+                        if let Some(due) = goal.scheduled_for {
+                            line.push_str(&format!(" due {}", due.format("%Y-%m-%d")));
+                        }
+                        if !goal_id.is_empty() {
+                            line.push_str(&format!(" | id `{}`", goal_id));
+                        }
+                        lines.push(line);
+                    }
+                    format!("Saved goals ({}):\n{}", lines.len(), lines.join("\n"))
+                }
+            }
+            "create" => {
+                let goal = call
+                    .arguments
+                    .get("goal")
+                    .or_else(|| call.arguments.get("description"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("goal_manage create requires a non-empty 'goal'")
+                    })?;
+
+                let due_date = if let Some(raw) = call
+                    .arguments
+                    .get("due_date")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+                        Some(dt.with_timezone(&chrono::Utc))
+                    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+                        Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                            date.and_hms_opt(23, 59, 59).unwrap(),
+                            chrono::Utc,
+                        ))
+                    } else {
+                        anyhow::bail!("Invalid due_date. Use YYYY-MM-DD or RFC3339");
+                    }
+                } else {
+                    None
+                };
+                let allow_duplicate = call
+                    .arguments
+                    .get("allow_duplicate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let goal_id = uuid::Uuid::new_v4().to_string();
+                let mut task = crate::core::Task::new(
+                    format!("Goal: {}", goal),
+                    "goal".to_string(),
+                    serde_json::json!({
+                        "goal_id": goal_id.clone(),
+                        "goal": goal,
+                    }),
+                );
+                task.scheduled_for = due_date;
+                task.status = crate::core::TaskStatus::Completed;
+                task.result = Some("Goal registered.".to_string());
+                if !allow_duplicate {
+                    let existing_goal_id = {
+                        let tasks = self.tasks.read().await;
+                        tasks
+                            .all()
+                            .iter()
+                            .filter(|existing| existing.action == "goal")
+                            .find(|existing| {
+                                crate::core::task::tasks_are_semantically_similar(existing, &task)
+                            })
+                            .and_then(|existing| {
+                                existing
+                                    .arguments
+                                    .get("goal_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(ToString::to_string)
+                            })
+                    };
+                    if let Some(existing_goal_id) = existing_goal_id {
+                        if let Some(args) = task.arguments.as_object_mut() {
+                            args.insert(
+                                "goal_id".to_string(),
+                                serde_json::Value::String(existing_goal_id),
+                            );
+                        }
+                    }
+                }
+                let (_, reused_existing, _) = self
+                    .add_or_update_similar_task(task, allow_duplicate)
+                    .await?;
+
+                if !reused_existing {
+                    if let Some(due) = due_date {
+                        let now = chrono::Utc::now();
+                        let days_until = (due - now).num_days();
+                        let mut reminders = Vec::new();
+                        if days_until > 1 {
+                            let mut reminder = crate::core::Task::new(
+                                format!("Reminder: \"{}\" is due tomorrow", goal),
+                                "goal_reminder".to_string(),
+                                serde_json::json!({
+                                    "goal_id": goal_id.clone(),
+                                    "goal": goal,
+                                    "days_left": 1
+                                }),
+                            );
+                            reminder.scheduled_for = Some(due - chrono::Duration::days(1));
+                            reminders.push(reminder);
+                        }
+                        if days_until > 3 {
+                            let mut reminder = crate::core::Task::new(
+                                format!("Reminder: \"{}\" is due in 3 days", goal),
+                                "goal_reminder".to_string(),
+                                serde_json::json!({
+                                    "goal_id": goal_id.clone(),
+                                    "goal": goal,
+                                    "days_left": 3
+                                }),
+                            );
+                            reminder.scheduled_for = Some(due - chrono::Duration::days(3));
+                            reminders.push(reminder);
+                        }
+                        for reminder in reminders {
+                            let _ = self.add_task(reminder).await;
+                        }
+                    }
+                }
+
+                let mut message = if reused_existing {
+                    format!("Updated existing goal `{}`.", safe_truncate(goal, 160))
+                } else {
+                    format!("Saved goal `{}`.", safe_truncate(goal, 160))
+                };
+                if let Some(due) = due_date.as_ref() {
+                    message.push_str(&format!(" Due {}.", due.format("%Y-%m-%d")));
+                }
+                message.push_str(&format!(" Goal ID: `{}`.", goal_id));
+                message
+            }
+            "delete" => {
+                let target_goal_id = call
+                    .arguments
+                    .get("goal_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let target_goal_text = call
+                    .arguments
+                    .get("goal")
+                    .or_else(|| call.arguments.get("description"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                if target_goal_id.is_none() && target_goal_text.is_none() {
+                    anyhow::bail!("goal_manage delete requires 'goal_id' or 'goal'");
+                }
+
+                let snapshot = {
+                    let tasks = self.tasks.read().await;
+                    tasks.all().to_vec()
+                };
+
+                let matching_goal_tasks = snapshot
+                    .iter()
+                    .filter(|task| {
+                        if task.action != "goal" {
+                            return false;
+                        }
+                        let task_goal_id = task
+                            .arguments
+                            .get("goal_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let task_goal_text = task
+                            .arguments
+                            .get("goal")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(task.description.as_str());
+                        target_goal_id
+                            .as_ref()
+                            .map(|id| task_goal_id == id || task.id.to_string() == *id)
+                            .unwrap_or(false)
+                            || target_goal_text
+                                .as_ref()
+                                .map(|goal| task_goal_text.eq_ignore_ascii_case(goal))
+                                .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if matching_goal_tasks.is_empty() {
+                    "No matching goal was found.".to_string()
+                } else {
+                    let goal_ids = matching_goal_tasks
+                        .iter()
+                        .filter_map(|task| {
+                            task.arguments
+                                .get("goal_id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let goal_texts = matching_goal_tasks
+                        .iter()
+                        .filter_map(|task| {
+                            task.arguments
+                                .get("goal")
+                                .and_then(|v| v.as_str())
+                                .or(Some(task.description.as_str()))
+                                .map(str::to_string)
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+
+                    let to_delete = snapshot
+                        .iter()
+                        .filter(|task| {
+                            let task_goal_id = task
+                                .arguments
+                                .get("goal_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let task_goal_text = task
+                                .arguments
+                                .get("goal")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            matching_goal_tasks
+                                .iter()
+                                .any(|goal_task| goal_task.id == task.id)
+                                || (!goal_ids.is_empty() && goal_ids.contains(task_goal_id))
+                                || (task.action == "goal_reminder"
+                                    && !goal_texts.is_empty()
+                                    && goal_texts
+                                        .iter()
+                                        .any(|goal| task_goal_text.eq_ignore_ascii_case(goal)))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    for task in &to_delete {
+                        let _ = self.storage.delete_task(&task.id.to_string()).await;
+                    }
+                    let mut deleted = 0usize;
+                    {
+                        let mut tasks = self.tasks.write().await;
+                        for task in &to_delete {
+                            if tasks.remove(task.id) {
+                                deleted += 1;
+                            }
+                        }
+                    }
+
+                    let deleted_goals = matching_goal_tasks
+                        .iter()
+                        .map(|task| {
+                            task.arguments
+                                .get("goal")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(task.description.as_str())
+                                .to_string()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+                    format!(
+                        "Deleted goal(s): {}. Removed {} related item(s).",
+                        deleted_goals.into_iter().collect::<Vec<_>>().join(", "),
+                        deleted
+                    )
+                }
+            }
+            "report" => {
+                let goal_id = call
+                    .arguments
+                    .get("goal_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                self.build_goal_progress_report(goal_id).await?
+            }
+            other => anyhow::bail!(
+                "Unknown goal_manage operation '{}'. Use create, list, delete, or report.",
+                other
+            ),
+        };
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: result.clone(),
+            });
+        }
+
+        Ok(result)
+    }
+
+    pub(crate) async fn handle_list_integrations_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolStart {
+                name: call.name.clone(),
+                payload: None,
+            });
+        }
+
+        let include_disabled = call
+            .arguments
+            .get("include_disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let only_connected = call
+            .arguments
+            .get("only_connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let integration_aliases = self.load_tool_integration_aliases().await;
+        let mut tools_by_integration: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (tool_name, integration_id) in integration_aliases {
+            tools_by_integration
+                .entry(integration_id)
+                .or_default()
+                .push(tool_name);
+        }
+
+        let mut enabled_actions = self
+            .runtime
+            .list_enabled_actions()
+            .await
+            .unwrap_or_default();
+        self.append_dynamic_integration_actions(&mut enabled_actions)
+            .await;
+        let builtin_integration_actions = enabled_actions
+            .iter()
+            .filter_map(|action| match action.name.as_str() {
+                "gmail_scan" | "gmail_reply" | "calendar_today" | "calendar_list"
+                | "calendar_create" | "calendar_free" => Some(action.name.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut lines = Vec::new();
+        let mut infos = self.integrations.list().await;
+        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        for info in infos {
+            let enabled = self.integrations.is_enabled(&info.id);
+            if !include_disabled && !enabled {
+                continue;
+            }
+            let status = match &info.status {
+                crate::integrations::IntegrationStatus::NotConfigured => "not configured",
+                crate::integrations::IntegrationStatus::NeedsAuth => "needs auth",
+                crate::integrations::IntegrationStatus::Connected => "connected",
+                crate::integrations::IntegrationStatus::Error(_) => "error",
+            };
+            if only_connected && status != "connected" {
+                continue;
+            }
+            let capabilities = info
+                .capabilities
+                .iter()
+                .map(|cap| match cap {
+                    crate::integrations::Capability::Read => "read",
+                    crate::integrations::Capability::Write => "write",
+                    crate::integrations::Capability::Subscribe => "subscribe",
+                    crate::integrations::Capability::Search => "search",
+                    crate::integrations::Capability::Delete => "delete",
+                    crate::integrations::Capability::Notify => "notify",
+                })
+                .collect::<Vec<_>>();
+            let mut line = format!(
+                "- {} (`{}`): {} | {}",
+                info.name,
+                info.id,
+                if enabled { "enabled" } else { "disabled" },
+                status
+            );
+            if !capabilities.is_empty() {
+                line.push_str(&format!(" | capabilities: {}", capabilities.join(", ")));
+            }
+            if let Some(tools) = tools_by_integration.get(&info.id) {
+                if !tools.is_empty() {
+                    line.push_str(&format!(" | tools: {}", tools.join(", ")));
+                }
+            }
+            lines.push(line);
+        }
+
+        if !builtin_integration_actions.is_empty() {
+            lines.push(format!(
+                "- Built-in integration-backed actions: {}",
+                builtin_integration_actions
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let result = if lines.is_empty() {
+            "No integrations matched the requested filter.".to_string()
+        } else {
+            format!("Integration inventory:\n{}", lines.join("\n"))
+        };
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: result.clone(),
+            });
+        }
+
+        Ok(result)
+    }
+
+    pub(crate) async fn handle_list_watchers_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolStart {
+                name: call.name.clone(),
+                payload: None,
+            });
+        }
+
+        let filter = call
+            .arguments
+            .get("filter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("active")
+            .to_ascii_lowercase();
+        let limit = call
+            .arguments
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20) as usize;
+
+        let mut watchers = self.watcher_manager.list().await;
+        watchers.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        let filtered: Vec<_> = watchers
+            .into_iter()
+            .filter(|watcher| {
+                let status = match &watcher.status {
+                    crate::core::watcher::WatcherStatus::Active => "active",
+                    crate::core::watcher::WatcherStatus::Paused => "paused",
+                    crate::core::watcher::WatcherStatus::Triggered => "triggered",
+                    crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
+                    crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
+                    crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
+                };
+                filter == "all" || filter == status
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        let result = if filtered.is_empty() {
+            format!("No {} watcher(s) found.", filter)
+        } else {
+            let mut lines = vec![format!("Found {} {} watcher(s):", filtered.len(), filter)];
+            for watcher in filtered {
+                let status = match &watcher.status {
+                    crate::core::watcher::WatcherStatus::Active => "active".to_string(),
+                    crate::core::watcher::WatcherStatus::Paused => "paused".to_string(),
+                    crate::core::watcher::WatcherStatus::Triggered => "triggered".to_string(),
+                    crate::core::watcher::WatcherStatus::TimedOut => "timed_out".to_string(),
+                    crate::core::watcher::WatcherStatus::Cancelled => "cancelled".to_string(),
+                    crate::core::watcher::WatcherStatus::Failed { error } => {
+                        format!(
+                            "failed ({})",
+                            crate::core::automation::truncate_text(error, 80)
+                        )
+                    }
+                };
+                let next_poll = watcher
+                    .last_poll_at
+                    .map(|last| last + chrono::Duration::seconds(watcher.interval_secs as i64))
+                    .unwrap_or(watcher.created_at);
+                lines.push(format!(
+                    "- {} [{}] poll=`{}` every {}s timeout {}s polls={} next_poll={}",
+                    watcher.description,
+                    status,
+                    watcher.poll_action,
+                    watcher.interval_secs,
+                    watcher.timeout_secs,
+                    watcher.poll_count,
+                    next_poll.to_rfc3339()
+                ));
+            }
+            lines.join("\n")
+        };
+
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: result.clone(),
+            });
+        }
+
+        Ok(result)
     }
 
     pub(crate) async fn handle_runtime_tool_call(
@@ -2870,8 +3952,47 @@ Do not include any extra prose.",
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
-        _public_base_url: Option<&str>,
+        conversation_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<String> {
+        if call.name == "schedule_task" {
+            let result = self
+                .handle_schedule_task(
+                    &call.arguments,
+                    request_channel,
+                    conversation_id,
+                    project_id,
+                )
+                .await
+                .unwrap_or_else(|| "Failed to schedule task.".to_string());
+            if let Some(tx) = stream_tx {
+                let _ = tx.try_send(StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: result.clone(),
+                });
+            }
+            return Ok(result);
+        }
+
+        if call.name == "watch" {
+            let result = self
+                .handle_watch(
+                    &call.arguments,
+                    request_channel,
+                    conversation_id,
+                    project_id,
+                )
+                .await
+                .unwrap_or_else(|| "Failed to create watcher.".to_string());
+            if let Some(tx) = stream_tx {
+                let _ = tx.try_send(StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: result.clone(),
+                });
+            }
+            return Ok(result);
+        }
+
         self.execute_single_tool_call_legacy(call, trace_ref, stream_tx.cloned(), request_channel)
             .await
     }
@@ -3528,8 +4649,10 @@ Do not include any extra prose.",
             return Ok(ToolExecutionBatch::default());
         }
         let request_channel = ctx.request_channel;
+        let current_turn_is_explicit_approval = ctx.current_turn_is_explicit_approval;
         let trace_id = ctx.trace_id;
         let conversation_id = ctx.conversation_id;
+        let project_id = ctx.project_id;
         let strategy_version = ctx.strategy_version;
         let policy_version = ctx.policy_version;
         let prompt_version = ctx.prompt_version;
@@ -3538,6 +4661,16 @@ Do not include any extra prose.",
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
         let handlers = default_tool_handlers();
+        let action_map = self
+            .runtime
+            .list_actions()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|action| (action.name.to_ascii_lowercase(), action))
+            .collect::<HashMap<_, _>>();
+        let user_execution_constraints = self.load_user_execution_constraints(project_id).await;
+        let mut side_effect_cache: HashMap<String, bool> = HashMap::new();
 
         let mut seen_signatures: HashSet<String> = HashSet::new();
         let mut unique_calls: Vec<&crate::core::llm::ToolCall> = Vec::new();
@@ -3551,14 +4684,69 @@ Do not include any extra prose.",
         let mut results: Vec<ToolCallOutput> = Vec::new();
         for call in unique_calls {
             let call_started = std::time::Instant::now();
+            let action_def = action_map.get(&call.name.to_ascii_lowercase());
             let ctx = ToolHandlerContext {
                 trace_ref,
                 stream_tx: stream_tx.as_ref(),
                 request_channel,
                 conversation_id,
+                project_id,
                 public_base_url: public_base_url.as_deref(),
                 integration_aliases: &integration_aliases,
             };
+
+            let side_effecting = if let Some(cached) = side_effect_cache
+                .get(&Self::tool_call_signature(call))
+                .copied()
+            {
+                cached
+            } else {
+                let classified = self
+                    .classify_tool_call_side_effecting(call, action_def)
+                    .await;
+                side_effect_cache.insert(Self::tool_call_signature(call), classified);
+                classified
+            };
+
+            if !current_turn_is_explicit_approval
+                && (user_execution_constraints.require_explicit_approval_before_side_effects
+                    || user_execution_constraints.show_plan_before_side_effects)
+                && side_effecting
+            {
+                let msg = blocked_by_saved_rule_message(&user_execution_constraints);
+                let payload = serde_json::json!({
+                    "handler": "user_execution_constraints",
+                    "output_preview": safe_truncate(&msg, 260),
+                });
+                self.log_operational_event(super::operational::OperationalEvent {
+                    event_type: "tool_call",
+                    channel: request_channel,
+                    success: false,
+                    outcome: "blocked_by_saved_user_rule",
+                    trace_id,
+                    conversation_id,
+                    tool_name: Some(&call.name),
+                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                    arguments: Some(&call.arguments),
+                    payload: Some(&payload),
+                    strategy_version,
+                    policy_version,
+                    prompt_version,
+                    model_slot,
+                })
+                .await;
+                if let Some(ref tx) = stream_tx {
+                    let _ = tx.try_send(StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: msg.clone(),
+                    });
+                }
+                results.push(ToolCallOutput {
+                    name: call.name.clone(),
+                    content: msg,
+                });
+                continue;
+            }
 
             let mut handled = false;
             for handler in &handlers {
@@ -4226,6 +5414,7 @@ Do not include any extra prose.",
                 let formatted = self
                     .execute_integration_tool_call(
                         call,
+                        trace_ref,
                         stream_tx.as_ref(),
                         request_channel,
                         &integration_id,
@@ -4532,12 +5721,12 @@ Do not include any extra prose.",
                                 continue;
                             }
                             if parsed.get("url").is_some() || parsed.get("app_id").is_some() {
-                                let mut title = parsed
+                                let title = parsed
                                     .get("title")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("App")
                                     .to_string();
-                                let mut app_type = parsed
+                                let app_type = parsed
                                     .get("type")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("static")
@@ -4547,17 +5736,17 @@ Do not include any extra prose.",
                                     .and_then(|v| v.as_str())
                                     .map(|v| v.trim())
                                     .unwrap_or("");
-                                let mut app_id = if app_id_raw.is_empty() {
+                                let app_id = if app_id_raw.is_empty() {
                                     "app".to_string()
                                 } else {
                                     app_id_raw.to_string()
                                 };
-                                let mut access_key = parsed
+                                let access_key = parsed
                                     .get("access_key")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let mut access_guard_enabled = parsed
+                                let access_guard_enabled = parsed
                                     .get("access_guard_enabled")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(!access_key.is_empty());
@@ -4591,12 +5780,7 @@ Do not include any extra prose.",
                                     public_base_url.clone()
                                 };
 
-                                let (
-                                    mut preview_url,
-                                    mut verified,
-                                    mut verify_attempts,
-                                    mut verify_detail,
-                                ) = self
+                                let (preview_url, verified, verify_attempts, verify_detail) = self
                                     .validate_and_capture_app_preview(
                                         &url_with_key,
                                         &app_id,
@@ -4814,8 +5998,9 @@ Do not include any extra prose.",
                     }
                     // Special handling for schedule_task - actually create the task
                     if call.name == "schedule_task" && result.starts_with("Task scheduled:") {
-                        if let Some(schedule_result) =
-                            self.handle_schedule_task(&call.arguments).await
+                        if let Some(schedule_result) = self
+                            .handle_schedule_task(&call.arguments, request_channel, None, None)
+                            .await
                         {
                             if let Some(ref tx) = stream_tx {
                                 let _ = tx.try_send(StreamEvent::ToolResult {
@@ -4830,7 +6015,10 @@ Do not include any extra prose.",
 
                     // Special handling for watch - spawn background watcher
                     if call.name == "watch" && result.starts_with("Watch created:") {
-                        if let Some(watch_result) = self.handle_watch(&call.arguments).await {
+                        if let Some(watch_result) = self
+                            .handle_watch(&call.arguments, request_channel, None, None)
+                            .await
+                        {
                             if let Some(ref tx) = stream_tx {
                                 let _ = tx.try_send(StreamEvent::ToolResult {
                                     name: call.name.clone(),
@@ -5561,6 +6749,25 @@ mod tests {
             Agent::tool_call_signature(&a),
             Agent::tool_call_signature(&b)
         );
+    }
+
+    #[test]
+    fn action_has_dangerous_capabilities_uses_permission_metadata() {
+        let read_only = crate::actions::ActionDef {
+            name: "app_inspect".to_string(),
+            description: "Inspect deployed apps and return status.".to_string(),
+            capabilities: vec![],
+            ..Default::default()
+        };
+        let mutating = crate::actions::ActionDef {
+            name: "schedule_task".to_string(),
+            description: "Schedule a recurring task to run automatically.".to_string(),
+            capabilities: vec!["scheduler".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!action_has_dangerous_capabilities(Some(&read_only)));
+        assert!(action_has_dangerous_capabilities(Some(&mutating)));
     }
 
     #[test]

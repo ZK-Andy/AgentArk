@@ -10,17 +10,23 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// Default max watch duration: 3 hours
-pub const DEFAULT_TIMEOUT_SECS: u64 = 10800;
+/// Default watch duration: 24 hours
+pub const DEFAULT_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
-/// Max allowed timeout: 24 hours
-pub const MAX_TIMEOUT_SECS: u64 = 86400;
+/// Max allowed timeout: 9999 days
+pub const MAX_TIMEOUT_SECS: u64 = 9999 * 24 * 60 * 60;
+
+/// Cap persisted watcher payloads so a noisy poller cannot bloat state/UI.
+const MAX_STORED_RESULT_CHARS: usize = 16_000;
+const MAX_STORED_NOTIFICATION_MESSAGE_CHARS: usize = 8_000;
+const MAX_NOTIFICATION_ATTEMPTS: usize = 12;
 
 /// Status of a watcher
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,6 +34,8 @@ pub const MAX_TIMEOUT_SECS: u64 = 86400;
 pub enum WatcherStatus {
     /// Actively polling
     Active,
+    /// Temporarily suspended by user
+    Paused,
     /// Condition was met — follow-up actions queued
     Triggered,
     /// Timed out without finding a match
@@ -36,6 +44,26 @@ pub enum WatcherStatus {
     Cancelled,
     /// Error during polling
     Failed { error: String },
+}
+
+/// Outcome of the most recent poll attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherPollOutcome {
+    NoMatch,
+    Matched,
+    Error,
+}
+
+/// Delivery attempt made on behalf of a watcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherNotificationAttempt {
+    pub attempted_at: DateTime<Utc>,
+    pub channel: String,
+    pub success: bool,
+    pub message: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Condition to evaluate against poll results
@@ -96,7 +124,7 @@ pub struct Watcher {
     pub on_trigger: String,
     /// Polling interval in seconds (default: 60)
     pub interval_secs: u64,
-    /// Maximum time to watch in seconds (default: 10800 = 3 hours)
+    /// Maximum time to watch in seconds (default: 24 hours)
     pub timeout_secs: u64,
     /// Channel to notify when triggered or timed out
     pub notify_channel: String,
@@ -110,12 +138,194 @@ pub struct Watcher {
     pub poll_count: u32,
     /// The result that triggered the watcher (if triggered)
     pub trigger_result: Option<String>,
+    /// The most recent successful poll payload, whether or not it matched.
+    #[serde(default)]
+    pub last_result: Option<String>,
+    /// The most recent poll error, if the latest poll failed.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// The outcome of the latest poll attempt.
+    #[serde(default)]
+    pub last_poll_outcome: Option<WatcherPollOutcome>,
+    /// Recent watcher-originated notification deliveries.
+    #[serde(default)]
+    pub notification_attempts: Vec<WatcherNotificationAttempt>,
 }
 
 /// Manages all active watchers with persistent storage
 pub struct WatcherManager {
     watchers: Arc<RwLock<HashMap<Uuid, Watcher>>>,
     storage_path: Option<PathBuf>,
+}
+
+fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut next = serde_json::Map::new();
+            for (key, inner) in map {
+                if key == "_automation" {
+                    continue;
+                }
+                next.insert(key.clone(), strip_automation_meta(inner));
+            }
+            serde_json::Value::Object(next)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(strip_automation_meta).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn normalize_signature_text(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .take(40)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn watcher_topic_signature(poll_arguments: &serde_json::Value, description: &str) -> String {
+    let cleaned = strip_automation_meta(poll_arguments);
+    let preferred = ["query", "url", "topic", "target", "app_id", "id"]
+        .iter()
+        .find_map(|key| cleaned.get(*key).and_then(|value| value.as_str()))
+        .unwrap_or(description);
+    normalize_signature_text(preferred)
+}
+
+fn normalized_topic_tokens(value: &str) -> BTreeSet<String> {
+    normalize_signature_text(value)
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn topics_are_similar(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left.contains(right) || right.contains(left) {
+        return true;
+    }
+
+    let left_tokens = normalized_topic_tokens(left);
+    let right_tokens = normalized_topic_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+
+    let shared = left_tokens.intersection(&right_tokens).count();
+    let largest = left_tokens.len().max(right_tokens.len());
+    shared >= 4 && (shared as f32 / largest as f32) >= 0.6
+}
+
+fn topics_overlap_lightly(left: &str, right: &str) -> bool {
+    let left_tokens = normalized_topic_tokens(left);
+    let right_tokens = normalized_topic_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return false;
+    }
+    left_tokens.intersection(&right_tokens).count() >= 2
+}
+
+fn watcher_origin_scope_signature(
+    poll_arguments: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    let origin = super::automation::origin_from_arguments(poll_arguments);
+    let channel = origin
+        .channel
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let conversation_id = origin
+        .conversation_id
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let project_id = origin.project_id.unwrap_or_default().trim().to_string();
+    if channel.is_empty() && conversation_id.is_empty() && project_id.is_empty() {
+        None
+    } else {
+        Some((channel, conversation_id, project_id))
+    }
+}
+
+pub fn watcher_request_signature_from_arguments(arguments: &serde_json::Value) -> String {
+    let description = arguments
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or("background watcher");
+    let poll_action = arguments
+        .get("poll_action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let notify_channel = arguments
+        .get("notify_channel")
+        .and_then(|value| value.as_str())
+        .unwrap_or("telegram")
+        .trim()
+        .to_ascii_lowercase();
+    let poll_arguments = arguments
+        .get("poll_arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    format!(
+        "{}|{}|{}",
+        poll_action,
+        notify_channel,
+        watcher_topic_signature(&poll_arguments, description)
+    )
+}
+
+pub fn watcher_tool_call_signature_from_arguments(arguments: &serde_json::Value) -> String {
+    let base = watcher_request_signature_from_arguments(arguments);
+    let interval_secs = arguments
+        .get("interval_secs")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(60);
+    let timeout_signature = if arguments
+        .get("until_stopped")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        "until_stopped".to_string()
+    } else if let Some(days) = arguments
+        .get("timeout_days")
+        .and_then(|value| value.as_u64())
+    {
+        format!("days:{}", days)
+    } else if let Some(hours) = arguments
+        .get("timeout_hours")
+        .and_then(|value| value.as_u64())
+    {
+        format!("hours:{}", hours)
+    } else if let Some(secs) = arguments
+        .get("timeout_secs")
+        .and_then(|value| value.as_u64())
+    {
+        format!("secs:{}", secs)
+    } else {
+        format!("secs:{}", DEFAULT_TIMEOUT_SECS)
+    };
+    format!("{}|interval:{}|{}", base, interval_secs, timeout_signature)
 }
 
 impl WatcherManager {
@@ -128,11 +338,17 @@ impl WatcherManager {
                 Ok(contents) => {
                     match serde_json::from_str::<HashMap<Uuid, Watcher>>(&contents) {
                         Ok(mut loaded) => {
-                            // Only restore Active watchers that haven't timed out
+                            // Only restore watchers that can continue later.
                             let now = Utc::now();
                             loaded.retain(|_, w| {
-                                if w.status != WatcherStatus::Active {
+                                if !matches!(
+                                    w.status,
+                                    WatcherStatus::Active | WatcherStatus::Paused
+                                ) {
                                     return false;
+                                }
+                                if w.status == WatcherStatus::Paused {
+                                    return true;
                                 }
                                 let elapsed = (now - w.created_at).num_seconds() as u64;
                                 elapsed < w.timeout_secs
@@ -166,7 +382,7 @@ impl WatcherManager {
         // Only persist Active watchers — completed ones get cleaned up
         let active: HashMap<&Uuid, &Watcher> = watchers
             .iter()
-            .filter(|(_, w)| w.status == WatcherStatus::Active)
+            .filter(|(_, w)| matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused))
             .collect();
 
         if let Ok(json) = serde_json::to_string_pretty(&active) {
@@ -193,6 +409,96 @@ impl WatcherManager {
         self.watchers.write().await.insert(id, watcher);
         self.persist().await;
         id
+    }
+
+    pub fn semantic_signature(watcher: &Watcher) -> String {
+        format!(
+            "{}|{}|{}",
+            watcher.poll_action.trim().to_ascii_lowercase(),
+            watcher.notify_channel.trim().to_ascii_lowercase(),
+            watcher_topic_signature(&watcher.poll_arguments, &watcher.description)
+        )
+    }
+
+    pub fn watchers_are_semantically_similar(existing: &Watcher, candidate: &Watcher) -> bool {
+        if !existing
+            .poll_action
+            .eq_ignore_ascii_case(candidate.poll_action.as_str())
+        {
+            return false;
+        }
+        if !existing
+            .notify_channel
+            .eq_ignore_ascii_case(candidate.notify_channel.as_str())
+        {
+            return false;
+        }
+
+        let existing_topic =
+            watcher_topic_signature(&existing.poll_arguments, &existing.description);
+        let candidate_topic =
+            watcher_topic_signature(&candidate.poll_arguments, &candidate.description);
+        if topics_are_similar(&existing_topic, &candidate_topic) {
+            return true;
+        }
+
+        match (
+            watcher_origin_scope_signature(&existing.poll_arguments),
+            watcher_origin_scope_signature(&candidate.poll_arguments),
+        ) {
+            (Some(left_scope), Some(right_scope)) if left_scope == right_scope => {
+                topics_overlap_lightly(&existing_topic, &candidate_topic)
+            }
+            _ => false,
+        }
+    }
+
+    pub async fn upsert_similar(&self, watcher: Watcher) -> (Uuid, bool, usize) {
+        let mut watchers = self.watchers.write().await;
+        let matching_ids = watchers
+            .iter()
+            .filter(|(_, existing)| {
+                matches!(
+                    existing.status,
+                    WatcherStatus::Active | WatcherStatus::Paused | WatcherStatus::Failed { .. }
+                ) && Self::watchers_are_semantically_similar(existing, &watcher)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+
+        if let Some(keeper_id) = matching_ids.first().copied() {
+            if let Some(existing) = watchers.get_mut(&keeper_id) {
+                existing.description = watcher.description;
+                existing.poll_action = watcher.poll_action;
+                existing.poll_arguments = watcher.poll_arguments;
+                existing.condition = watcher.condition;
+                existing.on_trigger = watcher.on_trigger;
+                existing.interval_secs = watcher.interval_secs;
+                existing.timeout_secs = watcher.timeout_secs;
+                existing.notify_channel = watcher.notify_channel;
+                existing.status = WatcherStatus::Active;
+                existing.created_at = Utc::now();
+                existing.last_poll_at = None;
+                existing.poll_count = 0;
+                existing.trigger_result = None;
+                existing.last_result = None;
+                existing.last_error = None;
+                existing.last_poll_outcome = None;
+                existing.notification_attempts.clear();
+            }
+            for duplicate_id in matching_ids.iter().skip(1) {
+                watchers.remove(duplicate_id);
+            }
+            drop(watchers);
+            self.persist().await;
+            return (keeper_id, true, matching_ids.len().saturating_sub(1));
+        }
+
+        let id = watcher.id;
+        watchers.insert(id, watcher);
+        drop(watchers);
+        self.persist().await;
+        (id, false, 0)
     }
 
     /// Get all watchers
@@ -225,11 +531,35 @@ impl WatcherManager {
             .collect()
     }
 
-    /// Update a watcher after polling
-    pub async fn update_poll(&self, id: Uuid, poll_count: u32) {
+    /// Update a watcher after a successful poll.
+    pub async fn record_poll_success(
+        &self,
+        id: Uuid,
+        poll_count: u32,
+        result: String,
+        matched: bool,
+    ) {
         if let Some(w) = self.watchers.write().await.get_mut(&id) {
             w.last_poll_at = Some(Utc::now());
             w.poll_count = poll_count;
+            w.last_result = Some(truncate_for_storage(&result, MAX_STORED_RESULT_CHARS));
+            w.last_error = None;
+            w.last_poll_outcome = Some(if matched {
+                WatcherPollOutcome::Matched
+            } else {
+                WatcherPollOutcome::NoMatch
+            });
+        }
+        self.persist().await;
+    }
+
+    /// Update a watcher after a failed poll attempt.
+    pub async fn record_poll_error(&self, id: Uuid, poll_count: u32, error: String) {
+        if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            w.last_poll_at = Some(Utc::now());
+            w.poll_count = poll_count;
+            w.last_error = Some(truncate_for_storage(&error, MAX_STORED_RESULT_CHARS));
+            w.last_poll_outcome = Some(WatcherPollOutcome::Error);
         }
         self.persist().await;
     }
@@ -238,7 +568,29 @@ impl WatcherManager {
     pub async fn mark_triggered(&self, id: Uuid, result: String) {
         if let Some(w) = self.watchers.write().await.get_mut(&id) {
             w.status = WatcherStatus::Triggered;
-            w.trigger_result = Some(result);
+            w.trigger_result = Some(truncate_for_storage(&result, MAX_STORED_RESULT_CHARS));
+        }
+        self.persist().await;
+    }
+
+    /// Record a watcher notification delivery attempt.
+    pub async fn push_notification_attempt(
+        &self,
+        id: Uuid,
+        mut attempt: WatcherNotificationAttempt,
+    ) {
+        if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            attempt.message =
+                truncate_for_storage(&attempt.message, MAX_STORED_NOTIFICATION_MESSAGE_CHARS);
+            attempt.error = attempt
+                .error
+                .as_ref()
+                .map(|value| truncate_for_storage(value, MAX_STORED_RESULT_CHARS));
+            w.notification_attempts.push(attempt);
+            if w.notification_attempts.len() > MAX_NOTIFICATION_ATTEMPTS {
+                let overflow = w.notification_attempts.len() - MAX_NOTIFICATION_ATTEMPTS;
+                w.notification_attempts.drain(0..overflow);
+            }
         }
         self.persist().await;
     }
@@ -267,7 +619,7 @@ impl WatcherManager {
     /// Cancel a watcher by ID
     pub async fn cancel(&self, id: Uuid) -> bool {
         let cancelled = if let Some(w) = self.watchers.write().await.get_mut(&id) {
-            if w.status == WatcherStatus::Active {
+            if matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused) {
                 w.status = WatcherStatus::Cancelled;
                 true
             } else {
@@ -282,16 +634,139 @@ impl WatcherManager {
         cancelled
     }
 
+    /// Pause an active watcher by ID
+    pub async fn pause(&self, id: Uuid) -> bool {
+        let paused = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if w.status == WatcherStatus::Active {
+                w.status = WatcherStatus::Paused;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if paused {
+            self.persist().await;
+        }
+        paused
+    }
+
+    /// Resume a paused watcher by ID
+    pub async fn resume(&self, id: Uuid) -> bool {
+        let resumed = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if w.status == WatcherStatus::Paused {
+                w.status = WatcherStatus::Active;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if resumed {
+            self.persist().await;
+        }
+        resumed
+    }
+
+    /// Delete a watcher by ID
+    pub async fn delete(&self, id: Uuid) -> bool {
+        let deleted = self.watchers.write().await.remove(&id).is_some();
+        if deleted {
+            self.persist().await;
+        }
+        deleted
+    }
+
     /// Clean up completed/failed/timed-out watchers (older than 1 hour)
     pub async fn cleanup(&self) {
         let cutoff = Utc::now() - chrono::Duration::hours(1);
         let mut watchers = self.watchers.write().await;
         let before = watchers.len();
-        watchers.retain(|_, w| w.status == WatcherStatus::Active || w.created_at > cutoff);
+        watchers.retain(|_, w| {
+            matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused)
+                || w.created_at > cutoff
+        });
         let removed = before - watchers.len();
         drop(watchers);
         if removed > 0 {
             self.persist().await;
         }
+    }
+}
+
+fn truncate_for_storage(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("\n\n[truncated]");
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watcher_with_origin(
+        description: &str,
+        query: &str,
+        conversation_id: &str,
+        project_id: &str,
+    ) -> Watcher {
+        Watcher {
+            id: Uuid::new_v4(),
+            description: description.to_string(),
+            poll_action: "web_search".to_string(),
+            poll_arguments: serde_json::json!({
+                "query": query,
+                "_automation": {
+                    "origin": {
+                        "channel": "web",
+                        "conversation_id": conversation_id,
+                        "project_id": project_id,
+                        "source": "watcher"
+                    }
+                }
+            }),
+            condition: WatchCondition::Contains {
+                keyword: "breaking".to_string(),
+            },
+            on_trigger: "Notify me".to_string(),
+            interval_secs: 60,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            notify_channel: "telegram".to_string(),
+            status: WatcherStatus::Active,
+            created_at: Utc::now(),
+            last_poll_at: None,
+            poll_count: 0,
+            trigger_result: None,
+            last_result: None,
+            last_error: None,
+            last_poll_outcome: None,
+            notification_attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn watchers_are_semantically_similar_for_same_origin_fix_attempts() {
+        let existing = watcher_with_origin(
+            "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
+            "Monitor current external updates every minute and notify on Telegram when materially important developments occur.",
+            "conv-1",
+            "proj-1",
+        );
+        let candidate = watcher_with_origin(
+            "Update the existing monitor so it uses a real query and still alerts Telegram for materially important developments.",
+            "Update the existing monitor so it uses a real query and still alerts Telegram for materially important developments.",
+            "conv-1",
+            "proj-1",
+        );
+
+        assert!(WatcherManager::watchers_are_semantically_similar(
+            &existing, &candidate
+        ));
     }
 }

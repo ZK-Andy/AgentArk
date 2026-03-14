@@ -136,8 +136,15 @@ case "${1:-start}" in
         echo -e "${BOLD}AgentArk Status:${NC}"
         docker compose ps
         ;;
+    chat)
+        docker exec -it agentark /app/agentark --chat
+        ;;
+    pulse)
+        echo -e "${CYAN}Running ArkPulse health check...${NC}"
+        docker exec -it agentark /app/agentark --chat <<< "run arkpulse now"
+        ;;
     *)
-        echo "Usage: ./scripts/start.sh [start|tunnel|stop|restart|logs|update|backup|status]"
+        echo "Usage: ./scripts/start.sh [start|tunnel|stop|restart|logs|update|backup|status|chat|pulse]"
         echo ""
         echo "  start          Start AgentArk (local access only)"
         echo "  tunnel         Start with remote access (auto-starts Cloudflare tunnel)"
@@ -148,6 +155,8 @@ case "${1:-start}" in
         echo "  update         Rebuild and restart (preserves data)"
         echo "  backup         Backup your data"
         echo "  status         Show running containers"
+        echo "  chat           Interactive CLI chat with the agent"
+        echo "  pulse          Run ArkPulse health check"
         exit 1
         ;;
 esac

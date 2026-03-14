@@ -1,7 +1,7 @@
 //! Unit tests for the swarm system
 
 #[cfg(test)]
-mod tests {
+mod swarm_tests {
     use crate::core::llm::LlmProvider;
     use crate::core::orchestra::SubAgentType;
     use crate::core::swarm::agent_trait::*;
@@ -328,6 +328,7 @@ mod tests {
     fn test_specialist_can_handle_with_capabilities() {
         let agent = SpecialistAgent::new(
             SpecialistConfig {
+                id: None,
                 name: "DataExpert".into(),
                 agent_type: SubAgentType::Analyst,
                 llm_provider: ollama_provider(),
@@ -363,6 +364,7 @@ mod tests {
 
         let anthropic = SpecialistAgent::new(
             SpecialistConfig {
+                id: None,
                 name: "A".into(),
                 agent_type: SubAgentType::Coder,
                 llm_provider: LlmProvider::Anthropic {
@@ -381,6 +383,7 @@ mod tests {
 
         let openai = SpecialistAgent::new(
             SpecialistConfig {
+                id: None,
                 name: "G".into(),
                 agent_type: SubAgentType::Writer,
                 llm_provider: LlmProvider::OpenAI {
@@ -531,6 +534,7 @@ mod tests {
 
     fn make_spec_config(name: &str, agent_type: SubAgentType) -> SpecialistConfig {
         SpecialistConfig {
+            id: None,
             name: name.into(),
             agent_type,
             llm_provider: ollama_provider(),

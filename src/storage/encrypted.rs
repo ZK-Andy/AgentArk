@@ -9,6 +9,7 @@ use super::entities::{episode, semantic_fact};
 use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
+use parking_lot::RwLock;
 use std::sync::Arc;
 
 /// Encrypted storage that wraps the base storage
@@ -16,7 +17,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct EncryptedStorage {
     storage: Storage,
-    key_manager: Arc<KeyManager>,
+    key_manager: Arc<RwLock<Arc<KeyManager>>>,
 }
 
 impl EncryptedStorage {
@@ -24,16 +25,37 @@ impl EncryptedStorage {
     pub fn new(storage: Storage, key_manager: Arc<KeyManager>) -> Self {
         Self {
             storage,
-            key_manager,
+            key_manager: Arc::new(RwLock::new(key_manager)),
         }
+    }
+
+    pub fn current_key_manager(&self) -> Arc<KeyManager> {
+        self.key_manager.read().clone()
+    }
+
+    pub fn replace_key_manager(&self, key_manager: Arc<KeyManager>) {
+        *self.key_manager.write() = key_manager;
+    }
+
+    pub async fn reencrypt_all_sensitive_data(
+        &self,
+        old_key: Arc<KeyManager>,
+        new_key: Arc<KeyManager>,
+    ) -> Result<()> {
+        self.storage
+            .reencrypt_sensitive_payloads(old_key.as_ref(), new_key.as_ref(), &["user_profile"])
+            .await?;
+        self.replace_key_manager(new_key);
+        Ok(())
     }
 
     // ==================== Decrypt Helpers ====================
 
     /// Decrypt the content field of episodes, falling back to plaintext for legacy data
     fn decrypt_episode_content(&self, mut episodes: Vec<episode::Model>) -> Vec<episode::Model> {
+        let key_manager = self.current_key_manager();
         for ep in &mut episodes {
-            if let Ok(decrypted) = self.key_manager.decrypt_string(&ep.content) {
+            if let Ok(decrypted) = key_manager.decrypt_string(&ep.content) {
                 ep.content = decrypted;
             }
             // If decrypt fails, content is already plaintext (legacy) — leave as-is
@@ -46,8 +68,9 @@ impl EncryptedStorage {
         &self,
         mut facts: Vec<semantic_fact::Model>,
     ) -> Vec<semantic_fact::Model> {
+        let key_manager = self.current_key_manager();
         for f in &mut facts {
-            if let Ok(decrypted) = self.key_manager.decrypt_string(&f.fact) {
+            if let Ok(decrypted) = key_manager.decrypt_string(&f.fact) {
                 f.fact = decrypted;
             }
         }
@@ -66,7 +89,7 @@ impl EncryptedStorage {
         importance: f32,
         project_id: Option<&str>,
     ) -> Result<()> {
-        let encrypted_content = self.key_manager.encrypt_string(content)?;
+        let encrypted_content = self.current_key_manager().encrypt_string(content)?;
         self.storage
             .insert_episode(
                 id,
@@ -132,7 +155,7 @@ impl EncryptedStorage {
         embedding: Option<Vec<u8>>,
         project_id: Option<&str>,
     ) -> Result<()> {
-        let encrypted_fact = self.key_manager.encrypt_string(fact)?;
+        let encrypted_fact = self.current_key_manager().encrypt_string(fact)?;
         self.storage
             .insert_fact(
                 id,
@@ -169,20 +192,102 @@ impl EncryptedStorage {
 
     /// Set an encrypted value in the KV store
     pub async fn set_encrypted(&self, key: &str, value: &[u8]) -> Result<()> {
-        let encrypted = self.key_manager.encrypt(value)?;
+        let encrypted = self.current_key_manager().encrypt(value)?;
         self.storage.set(key, &encrypted).await
     }
 
     /// Get and decrypt a value from the KV store
     pub async fn get_decrypted(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let key_manager = self.current_key_manager();
         match self.storage.get(key).await? {
             Some(encrypted) => {
-                match self.key_manager.decrypt(&encrypted) {
+                match key_manager.decrypt(&encrypted) {
                     Ok(decrypted) => Ok(Some(decrypted)),
                     Err(_) => Ok(Some(encrypted)), // Legacy unencrypted data
                 }
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reencrypt_all_sensitive_data_updates_rows_and_live_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let old_key = Arc::new(
+            KeyManager::from_password("old-password", &[1_u8; crate::crypto::SALT_LEN]).unwrap(),
+        );
+        let new_key = Arc::new(
+            KeyManager::from_password("new-password", &[2_u8; crate::crypto::SALT_LEN]).unwrap(),
+        );
+        let encrypted_storage = EncryptedStorage::new(storage.clone(), old_key.clone());
+        let clone = encrypted_storage.clone();
+
+        encrypted_storage
+            .insert_episode_encrypted("ep-1", "episode secret", "ctx", None, 0.5, None)
+            .await
+            .unwrap();
+        encrypted_storage
+            .insert_fact_encrypted("fact-1", "fact secret", 0.9, "[]", None, None)
+            .await
+            .unwrap();
+        encrypted_storage
+            .set_encrypted("user_profile", br#"{"name":"Ada"}"#)
+            .await
+            .unwrap();
+
+        let raw_episode_before = storage
+            .get_all_episodes_for_scoring()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "ep-1")
+            .unwrap()
+            .content;
+        assert!(old_key.decrypt_string(&raw_episode_before).is_ok());
+        assert!(new_key.decrypt_string(&raw_episode_before).is_err());
+
+        encrypted_storage
+            .reencrypt_all_sensitive_data(old_key.clone(), new_key.clone())
+            .await
+            .unwrap();
+
+        let raw_episode_after = storage
+            .get_all_episodes_for_scoring()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "ep-1")
+            .unwrap()
+            .content;
+        assert!(old_key.decrypt_string(&raw_episode_after).is_err());
+        assert_eq!(
+            new_key.decrypt_string(&raw_episode_after).unwrap(),
+            "episode secret"
+        );
+
+        let raw_profile = storage.get("user_profile").await.unwrap().unwrap();
+        assert!(old_key.decrypt(&raw_profile).is_err());
+        assert_eq!(
+            new_key.decrypt(&raw_profile).unwrap(),
+            br#"{"name":"Ada"}"#.to_vec()
+        );
+
+        let episodes = clone
+            .get_all_episodes_for_scoring_decrypted()
+            .await
+            .unwrap();
+        assert_eq!(episodes[0].content, "episode secret");
+        let facts = clone.get_facts_decrypted().await.unwrap();
+        assert_eq!(facts[0].fact, "fact secret");
+        assert_eq!(
+            clone.get_decrypted("user_profile").await.unwrap().unwrap(),
+            br#"{"name":"Ada"}"#.to_vec()
+        );
     }
 }

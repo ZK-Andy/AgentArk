@@ -3,12 +3,14 @@
 pub mod encrypted;
 pub mod entities;
 
+use crate::crypto::KeyManager;
 use anyhow::Result;
+use sea_orm::sea_query::Expr;
 #[allow(unused_imports)]
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection,
     DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
-    Statement, TransactionTrait, TryGetable,
+    Statement, TransactionTrait, TryGetable, Unchanged,
 };
 use std::path::Path;
 
@@ -33,6 +35,16 @@ pub struct NewUserDataItem<'a> {
 }
 
 impl Storage {
+    const EXECUTION_TRACE_RETENTION_DAYS: i64 = 30;
+    const EXECUTION_PROOF_RETENTION_DAYS: i64 = 30;
+    const OPERATIONAL_LOG_RETENTION_DAYS: i64 = 30;
+    const APPROVAL_LOG_RETENTION_DAYS: i64 = 30;
+    const MESSAGE_RETENTION_DAYS: i64 = 365;
+    const HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
+    const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
+    const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
+    const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
+
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
         let normalized_key = key.trim().to_ascii_lowercase();
         let scope = project_id
@@ -74,11 +86,29 @@ impl Storage {
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
         let db = Database::connect(&db_url).await?;
+        Self::configure_sqlite(&db).await?;
 
         // Create tables if they don't exist
         Self::create_tables(&db).await?;
 
         Ok(Self { db })
+    }
+
+    async fn configure_sqlite(db: &DatabaseConnection) -> Result<()> {
+        if db.get_database_backend() != DbBackend::Sqlite {
+            return Ok(());
+        }
+
+        db.execute_unprepared(
+            "\
+PRAGMA journal_mode = WAL;\n\
+PRAGMA synchronous = NORMAL;\n\
+PRAGMA foreign_keys = ON;\n\
+PRAGMA busy_timeout = 5000;\n",
+        )
+        .await?;
+
+        Ok(())
     }
 
     /// Create all tables
@@ -150,6 +180,12 @@ impl Storage {
                 steps_json TEXT NOT NULL,
                 response TEXT,
                 proof_id TEXT,
+                model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0.0,
+                complexity TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -414,6 +450,23 @@ impl Storage {
         )
         .await?;
 
+        // ── Migrations for existing databases ──────────────────────────────
+        // SQLite silently ignores ALTER TABLE ADD COLUMN if the column already exists
+        // when we wrap each in a try-catch. We use a helper approach: attempt each
+        // ALTER and ignore "duplicate column" errors.
+        let alter_stmts = vec![
+            "ALTER TABLE execution_traces ADD COLUMN model TEXT",
+            "ALTER TABLE execution_traces ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE execution_traces ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE execution_traces ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE execution_traces ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE execution_traces ADD COLUMN complexity TEXT",
+        ];
+        for stmt in alter_stmts {
+            // Ignore errors — column already exists on fresh DBs or after first migration
+            let _ = db.execute_unprepared(stmt).await;
+        }
+
         Ok(())
     }
 
@@ -467,6 +520,74 @@ impl Storage {
         kv_store::Entity::delete_by_id(key.to_string())
             .exec(&self.db)
             .await?;
+        Ok(())
+    }
+
+    pub async fn reencrypt_sensitive_payloads(
+        &self,
+        old_key: &KeyManager,
+        new_key: &KeyManager,
+        encrypted_kv_keys: &[&str],
+    ) -> Result<()> {
+        let txn = self.db.begin().await?;
+
+        let episodes = episode::Entity::find().all(&txn).await?;
+        for row in episodes {
+            let plaintext = old_key
+                .decrypt_string(&row.content)
+                .unwrap_or_else(|_| row.content.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            episode::ActiveModel {
+                id: Unchanged(row.id),
+                content: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        let facts = semantic_fact::Entity::find().all(&txn).await?;
+        for row in facts {
+            let plaintext = old_key
+                .decrypt_string(&row.fact)
+                .unwrap_or_else(|_| row.fact.clone());
+            let encrypted = new_key.encrypt_string(&plaintext)?;
+            semantic_fact::ActiveModel {
+                id: Unchanged(row.id),
+                fact: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        if !encrypted_kv_keys.is_empty() {
+            let keys = encrypted_kv_keys
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect::<Vec<_>>();
+            let rows = kv_store::Entity::find()
+                .filter(kv_store::Column::Key.is_in(keys))
+                .all(&txn)
+                .await?;
+            let now = chrono::Utc::now().to_rfc3339();
+            for row in rows {
+                let plaintext = old_key
+                    .decrypt(&row.value)
+                    .unwrap_or_else(|_| row.value.clone());
+                let encrypted = new_key.encrypt(&plaintext)?;
+                kv_store::ActiveModel {
+                    key: Unchanged(row.key),
+                    value: Set(encrypted),
+                    updated_at: Set(now.clone()),
+                    ..Default::default()
+                }
+                .update(&txn)
+                .await?;
+            }
+        }
+
+        txn.commit().await?;
         Ok(())
     }
 
@@ -538,11 +659,15 @@ impl Storage {
     pub async fn touch_episode(&self, id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Use raw SQL to increment access_count atomically
-        self.db.execute_unprepared(&format!(
-            "UPDATE episodes SET last_accessed = '{}', access_count = access_count + 1 WHERE id = '{}'",
-            now, id
-        )).await?;
+        episode::Entity::update_many()
+            .col_expr(episode::Column::LastAccessed, Expr::value(now))
+            .col_expr(
+                episode::Column::AccessCount,
+                Expr::col(episode::Column::AccessCount).add(1),
+            )
+            .filter(episode::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
 
         Ok(())
     }
@@ -551,6 +676,7 @@ impl Storage {
     pub async fn get_all_episodes_for_scoring(&self) -> Result<Vec<episode::Model>> {
         let episodes = episode::Entity::find()
             .order_by_desc(episode::Column::Timestamp)
+            .limit(Self::MAX_EPISODES_FOR_SCORING)
             .all(&self.db)
             .await?;
 
@@ -726,7 +852,10 @@ impl Storage {
                     .add(episode::Column::ProjectId.is_null()),
             );
         }
-        let episodes = query.all(&self.db).await?;
+        let episodes = query
+            .limit(Self::MAX_EPISODES_FOR_SCORING)
+            .all(&self.db)
+            .await?;
         Ok(episodes)
     }
 
@@ -1093,6 +1222,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Reset a failed/cancelled task so it can be retried.
+    pub async fn retry_task(
+        &self,
+        id: &str,
+        status: &str,
+        scheduled_for: Option<String>,
+    ) -> Result<()> {
+        task::ActiveModel {
+            id: Set(id.to_string()),
+            status: Set(status.to_string()),
+            scheduled_for: Set(scheduled_for),
+            result: Set(None),
+            proof_id: Set(None),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
     /// Delete a task
     pub async fn delete_task(&self, id: &str) -> Result<()> {
         task::Entity::delete_by_id(id.to_string())
@@ -1197,6 +1347,23 @@ impl Storage {
         Ok(agents)
     }
 
+    /// Update a persisted swarm agent
+    pub async fn update_swarm_agent(&self, agent: &swarm_agent::Model) -> Result<()> {
+        swarm_agent::ActiveModel {
+            id: Unchanged(agent.id.clone()),
+            name: Set(agent.name.clone()),
+            agent_type: Set(agent.agent_type.clone()),
+            llm_provider: Set(agent.llm_provider.clone()),
+            capabilities: Set(agent.capabilities.clone()),
+            system_prompt: Set(agent.system_prompt.clone()),
+            enabled: Set(agent.enabled),
+            created_at: Set(agent.created_at.clone()),
+        }
+        .update(&self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Delete a swarm agent
     pub async fn delete_swarm_agent(&self, id: &str) -> Result<()> {
         swarm_agent::Entity::delete_by_id(id.to_string())
@@ -1290,6 +1457,15 @@ impl Storage {
         Ok(delegations)
     }
 
+    /// Get all swarm delegations
+    pub async fn get_all_delegations(&self) -> Result<Vec<swarm_delegation::Model>> {
+        let delegations = swarm_delegation::Entity::find()
+            .order_by_desc(swarm_delegation::Column::CreatedAt)
+            .all(&self.db)
+            .await?;
+        Ok(delegations)
+    }
+
     /// Insert a swarm delegation record
     pub async fn insert_swarm_delegation(
         &self,
@@ -1348,6 +1524,41 @@ impl Storage {
         Ok(convs)
     }
 
+    /// List conversations in ascending update order, optionally continuing after a cursor.
+    pub async fn list_conversations_after_cursor(
+        &self,
+        updated_after: Option<&str>,
+        conversation_id_after: Option<&str>,
+        limit: u64,
+        project_id: Option<&str>,
+    ) -> Result<Vec<conversation::Model>> {
+        let mut query = conversation::Entity::find()
+            .order_by_asc(conversation::Column::UpdatedAt)
+            .order_by_asc(conversation::Column::Id);
+
+        if let Some(pid) = project_id {
+            query = query.filter(conversation::Column::ProjectId.eq(pid));
+        }
+
+        if let Some(updated_at) = updated_after {
+            let cursor_filter = if let Some(conversation_id) = conversation_id_after {
+                Condition::any()
+                    .add(conversation::Column::UpdatedAt.gt(updated_at))
+                    .add(
+                        Condition::all()
+                            .add(conversation::Column::UpdatedAt.eq(updated_at))
+                            .add(conversation::Column::Id.gt(conversation_id)),
+                    )
+            } else {
+                Condition::all().add(conversation::Column::UpdatedAt.gte(updated_at))
+            };
+            query = query.filter(cursor_filter);
+        }
+
+        let convs = query.limit(limit).all(&self.db).await?;
+        Ok(convs)
+    }
+
     /// Count conversations
     pub async fn count_conversations(&self, project_id: Option<&str>) -> Result<u64> {
         let mut query = conversation::Entity::find();
@@ -1390,16 +1601,15 @@ impl Storage {
 
     /// Delete a conversation and its messages
     pub async fn delete_conversation(&self, id: &str) -> Result<()> {
-        // Delete messages first
-        self.db
-            .execute_unprepared(&format!(
-                "DELETE FROM messages WHERE conversation_id = '{}'",
-                id
-            ))
+        let txn = self.db.begin().await?;
+        message::Entity::delete_many()
+            .filter(message::Column::ConversationId.eq(id))
+            .exec(&txn)
             .await?;
         conversation::Entity::delete_by_id(id.to_string())
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -1421,10 +1631,22 @@ impl Storage {
 
         // Update conversation message count and updated_at
         let now = chrono::Utc::now().to_rfc3339();
-        self.db.execute_unprepared(&format!(
-            "UPDATE conversations SET message_count = message_count + 1, updated_at = '{}' WHERE id = '{}'",
-            now, msg.conversation_id
-        )).await?;
+        conversation::Entity::update_many()
+            .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                conversation::Column::MessageCount,
+                Expr::col(conversation::Column::MessageCount).add(1),
+            )
+            .filter(conversation::Column::Id.eq(msg.conversation_id.clone()))
+            .exec(&self.db)
+            .await?;
+
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after message insert: {}",
+                e
+            );
+        }
 
         Ok(())
     }
@@ -1459,6 +1681,17 @@ impl Storage {
             .all(&self.db)
             .await?;
         msgs.reverse();
+        Ok(msgs)
+    }
+
+    /// Get most recent user-authored chat messages across conversations.
+    pub async fn get_recent_user_messages(&self, limit: u64) -> Result<Vec<message::Model>> {
+        let msgs = message::Entity::find()
+            .filter(message::Column::Role.eq("user"))
+            .order_by_desc(message::Column::Timestamp)
+            .limit(limit)
+            .all(&self.db)
+            .await?;
         Ok(msgs)
     }
 
@@ -1676,21 +1909,26 @@ impl Storage {
 
     /// Get all chunks (across all documents, for search)
     pub async fn get_all_document_chunks(&self) -> Result<Vec<document_chunk::Model>> {
-        let chunks = document_chunk::Entity::find().all(&self.db).await?;
+        let chunks = document_chunk::Entity::find()
+            .order_by_asc(document_chunk::Column::DocumentId)
+            .order_by_asc(document_chunk::Column::ChunkIndex)
+            .limit(Self::MAX_DOCUMENT_CHUNKS_FOR_SEARCH)
+            .all(&self.db)
+            .await?;
         Ok(chunks)
     }
 
     /// Delete a document and its chunks
     pub async fn delete_document(&self, id: &str) -> Result<()> {
-        self.db
-            .execute_unprepared(&format!(
-                "DELETE FROM document_chunks WHERE document_id = '{}'",
-                id
-            ))
+        let txn = self.db.begin().await?;
+        document_chunk::Entity::delete_many()
+            .filter(document_chunk::Column::DocumentId.eq(id))
+            .exec(&txn)
             .await?;
         document::Entity::delete_by_id(id.to_string())
-            .exec(&self.db)
+            .exec(&txn)
             .await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -2058,14 +2296,14 @@ impl Storage {
 
     /// Mark episodes as consolidated
     pub async fn mark_episodes_consolidated(&self, ids: &[String]) -> Result<()> {
-        for id in ids {
-            self.db
-                .execute_unprepared(&format!(
-                    "UPDATE episodes SET consolidated = 1 WHERE id = '{}'",
-                    id
-                ))
-                .await?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        episode::Entity::update_many()
+            .col_expr(episode::Column::Consolidated, Expr::value(true))
+            .filter(episode::Column::Id.is_in(ids.to_vec()))
+            .exec(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -2126,10 +2364,22 @@ impl Storage {
             steps_json: Set(steps_json),
             response: Set(trace.response.clone()),
             proof_id: Set(trace.proof_id.clone()),
+            model: Set(trace.model.clone()),
+            input_tokens: Set(trace.input_tokens),
+            output_tokens: Set(trace.output_tokens),
+            total_tokens: Set(trace.total_tokens),
+            cost_usd: Set(trace.cost_usd),
+            complexity: Set(trace.complexity.clone()),
             created_at: Set(created_at),
         }
         .insert(&self.db)
         .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after trace insert: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -2247,6 +2497,12 @@ impl Storage {
         }
         .insert(&self.db)
         .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after operational log insert: {}",
+                e
+            );
+        }
         Ok(())
     }
 
@@ -2268,11 +2524,88 @@ impl Storage {
     /// Expire old pending approvals (older than max_age_secs)
     pub async fn expire_old_approvals(&self, max_age_secs: i64) -> Result<u64> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
-        let result = self.db.execute_unprepared(&format!(
-            "UPDATE approval_log SET status = 'expired', resolved_at = '{}', resolved_by = 'auto_timeout' WHERE status = 'pending' AND requested_at < '{}'",
-            chrono::Utc::now().to_rfc3339(), cutoff
-        )).await?;
-        Ok(result.rows_affected())
+        let resolved_at = chrono::Utc::now().to_rfc3339();
+        let result = approval_log::Entity::update_many()
+            .col_expr(approval_log::Column::Status, Expr::value("expired"))
+            .col_expr(approval_log::Column::ResolvedAt, Expr::value(resolved_at))
+            .col_expr(
+                approval_log::Column::ResolvedBy,
+                Expr::value("auto_timeout"),
+            )
+            .filter(approval_log::Column::Status.eq("pending"))
+            .filter(approval_log::Column::RequestedAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    async fn maybe_purge_housekeeping_tables(&self) -> Result<()> {
+        let now = chrono::Utc::now();
+        if let Some(bytes) = self.get(Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY).await? {
+            if let Ok(raw) = String::from_utf8(bytes) {
+                if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&raw) {
+                    if (now - last.with_timezone(&chrono::Utc)).num_seconds()
+                        < Self::HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let trace_cutoff =
+            (now - chrono::Duration::days(Self::EXECUTION_TRACE_RETENTION_DAYS)).to_rfc3339();
+        let proof_cutoff =
+            (now - chrono::Duration::days(Self::EXECUTION_PROOF_RETENTION_DAYS)).to_rfc3339();
+        let operational_cutoff =
+            (now - chrono::Duration::days(Self::OPERATIONAL_LOG_RETENTION_DAYS)).to_rfc3339();
+        let approval_cutoff =
+            (now - chrono::Duration::days(Self::APPROVAL_LOG_RETENTION_DAYS)).to_rfc3339();
+        let message_cutoff =
+            (now - chrono::Duration::days(Self::MESSAGE_RETENTION_DAYS)).to_rfc3339();
+
+        let txn = self.db.begin().await?;
+        let message_delete = message::Entity::delete_many()
+            .filter(message::Column::Timestamp.lt(message_cutoff.clone()))
+            .exec(&txn)
+            .await?;
+        if message_delete.rows_affected > 0 {
+            txn.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.conversation_id = conversations.id);".to_string(),
+            ))
+            .await?;
+            conversation::Entity::delete_many()
+                .filter(conversation::Column::MessageCount.eq(0))
+                .filter(conversation::Column::UpdatedAt.lt(message_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        crate::storage::entities::execution_trace::Entity::delete_many()
+            .filter(crate::storage::entities::execution_trace::Column::CreatedAt.lt(trace_cutoff))
+            .exec(&txn)
+            .await?;
+        crate::storage::entities::execution_proof::Entity::delete_many()
+            .filter(crate::storage::entities::execution_proof::Column::Timestamp.lt(proof_cutoff))
+            .exec(&txn)
+            .await?;
+        operational_log::Entity::delete_many()
+            .filter(operational_log::Column::CreatedAt.lt(operational_cutoff))
+            .exec(&txn)
+            .await?;
+        approval_log::Entity::delete_many()
+            .filter(approval_log::Column::RequestedAt.lt(approval_cutoff))
+            .filter(approval_log::Column::Status.ne("pending"))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+
+        self.set(
+            Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY,
+            now.to_rfc3339().as_bytes(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Run SQLite quick integrity check.

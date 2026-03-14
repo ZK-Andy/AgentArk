@@ -15,6 +15,11 @@ import {
   MenuItem,
   Stack,
   Switch,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
   TextField,
   Typography
 } from "@mui/material";
@@ -25,8 +30,17 @@ import { api } from "../api/client";
 import type { IntegrationConfigField, IntegrationItem } from "../types";
 
 const REFRESH_MS = 8000;
+const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
+const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
 
 type JsonRecord = Record<string, unknown>;
+type OAuthSignalPayload = {
+  type?: string;
+  service_id?: string;
+  integration_id?: string;
+  status?: string;
+  detail?: string;
+};
 
 type McpTransportType = "http" | "stdio";
 type McpAuthType = "none" | "bearer" | "basic" | "header" | "query";
@@ -161,6 +175,32 @@ function extractAuthUrl(payload: unknown): string {
   if (nestedAuthUrl) return nestedAuthUrl;
   const nestedUrl = str(nested.url, "").trim();
   return nestedUrl;
+}
+
+function parseOAuthSignalPayload(value: unknown): OAuthSignalPayload | null {
+  if (typeof value === "string") {
+    try {
+      return parseOAuthSignalPayload(JSON.parse(value));
+    } catch {
+      return null;
+    }
+  }
+  if (!isRecord(value)) return null;
+  const payload = value as OAuthSignalPayload;
+  const targetId = str(payload.integration_id ?? payload.service_id, "").trim();
+  if (!targetId) return null;
+  return payload;
+}
+
+function normalizeIntegrationId(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "calendar") return "google_calendar";
+  return normalized;
+}
+
+function integrationDisplayName(id: string, integrations: IntegrationItem[]): string {
+  const normalized = normalizeIntegrationId(id);
+  return integrations.find((item) => item.id === normalized)?.name || normalized || "Integration";
 }
 
 function parseCsvList(input: string): string[] {
@@ -323,6 +363,7 @@ export function IntegrationsPanel({
   const [sshConnError, setSshConnError] = useState<string | null>(null);
   const [showDisabledIntegrations, setShowDisabledIntegrations] = useState(false);
   const [oauthBusyId, setOauthBusyId] = useState<string | null>(null);
+  const [oauthPendingId, setOauthPendingId] = useState<string | null>(null);
   const [channelsDirty, setChannelsDirty] = useState(false);
   const [searchSetupOpen, setSearchSetupOpen] = useState(false);
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
@@ -460,7 +501,9 @@ export function IntegrationsPanel({
     }
   });
 
-  const integrations = showIntegrations ? integrationsQ.data?.integrations || [] : [];
+  const integrations = showIntegrations
+    ? (integrationsQ.data?.integrations || []).filter((item) => normalizeIntegrationId(item.id) !== "moltbook")
+    : [];
   const settings = asRecord(settingsQ.data);
   const waBridge = asRecord(waBridgeQ.data);
   const telegramStatus = asRecord(telegramStatusQ.data);
@@ -503,6 +546,131 @@ export function IntegrationsPanel({
   const sshKeyNames = asStringList(asRecord(sshKeysQ.data).keys).sort((a, b) => a.localeCompare(b));
   const sshConnectionsText = str(asRecord(sshConnectionsQ.data).connections, "");
   const sshConnectionNames = parseSshConnectionNames(sshConnectionsText);
+
+  async function refreshIntegrationState(targetId?: string | null) {
+    const normalizedTargetId = normalizeIntegrationId(str(targetId, ""));
+    const refreshedIntegrations = showIntegrations ? await integrationsQ.refetch() : null;
+    if (showIntegrations) {
+      await Promise.allSettled([
+        settingsQ.refetch(),
+        telegramStatusQ.refetch(),
+        channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "baileys"
+          ? waBridgeQ.refetch()
+          : Promise.resolve(null),
+      ]);
+    }
+    const refreshedItems = refreshedIntegrations?.data?.integrations || [];
+    const targetForActive = normalizedTargetId || active?.id || "";
+    if (targetForActive) {
+      const updatedActive = refreshedItems.find((item) => item.id === targetForActive);
+      if (updatedActive) {
+        setActive((current) =>
+          current && current.id === targetForActive ? updatedActive : current
+        );
+      }
+    }
+    if (!normalizedTargetId) return;
+    const updated = refreshedItems.find((item) => item.id === normalizedTargetId);
+    if (updated) {
+      const resolved =
+        updated.status === "connected" ||
+        updated.status === "error" ||
+        (updated.status !== "needs_auth" && !str(updated.auth_url, "").trim());
+      if (resolved) {
+        setOauthPendingId((current) =>
+          normalizeIntegrationId(str(current, "")) === normalizedTargetId ? null : current
+        );
+      }
+    }
+  }
+
+  const needsPendingConnectionRefresh =
+    !!oauthPendingId ||
+    (channelForm.telegram_enabled &&
+      telegramTokenConfigured &&
+      !["connected", "ready", "disabled"].includes(telegramConnectionStatusRaw)) ||
+    (channelForm.whatsapp_enabled &&
+      channelForm.whatsapp_mode === "baileys" &&
+      !["connected", "ready", "disabled"].includes(whatsappConnectionStatusRaw));
+
+  useEffect(() => {
+    if (!showIntegrations) return;
+
+    const handleSignal = (value: unknown) => {
+      const payload = parseOAuthSignalPayload(value);
+      if (!payload) return;
+      const targetId = normalizeIntegrationId(str(payload.integration_id ?? payload.service_id, ""));
+      if (!targetId) return;
+      const targetName = integrationDisplayName(targetId, integrations);
+      const status = str(payload.status, "").trim().toLowerCase();
+      const detail = str(payload.detail, "").trim();
+      if (status === "connected") {
+        setNotice({ kind: "success", text: `${targetName} connected.` });
+      } else if (status === "error") {
+        setNotice({
+          kind: "error",
+          text: detail ? `${targetName} connection failed: ${detail}` : `${targetName} connection failed.`
+        });
+      }
+      try {
+        window.localStorage.removeItem(OAUTH_SIGNAL_STORAGE_KEY);
+      } catch {
+        // Best effort.
+      }
+      void refreshIntegrationState(targetId);
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== OAUTH_SIGNAL_STORAGE_KEY || !event.newValue) return;
+      handleSignal(event.newValue);
+    };
+
+    const handleWindowFocus = () => {
+      void refreshIntegrationState(oauthPendingId);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void refreshIntegrationState(oauthPendingId);
+      }
+    };
+
+    const existingSignal = (() => {
+      try {
+        return window.localStorage.getItem(OAUTH_SIGNAL_STORAGE_KEY);
+      } catch {
+        return null;
+      }
+    })();
+    if (existingSignal) {
+      handleSignal(existingSignal);
+    }
+
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    let oauthChannel: BroadcastChannel | null = null;
+    if ("BroadcastChannel" in window) {
+      oauthChannel = new BroadcastChannel(OAUTH_SIGNAL_CHANNEL);
+      oauthChannel.addEventListener("message", (event) => handleSignal(event.data));
+    }
+
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      oauthChannel?.close();
+    };
+  }, [showIntegrations, integrations, oauthPendingId, active?.id]);
+
+  useEffect(() => {
+    if (!showIntegrations || !needsPendingConnectionRefresh) return;
+    const intervalId = window.setInterval(() => {
+      void refreshIntegrationState(oauthPendingId);
+    }, 3500);
+    return () => window.clearInterval(intervalId);
+  }, [showIntegrations, needsPendingConnectionRefresh, oauthPendingId, telegramConnectionStatusRaw, whatsappConnectionStatusRaw]);
 
   useEffect(() => {
     if (!showIntegrations || !settingsQ.data || channelsDirty) return;
@@ -892,7 +1060,8 @@ export function IntegrationsPanel({
 
   const submitConfig = async () => {
     if (!active) return;
-    const fields = active.config_fields || [];
+    const current = active;
+    const fields = current.config_fields || [];
     for (const field of fields) {
       if (field.required && !(formValues[field.key] || "").trim()) {
         setFormError(`Missing required field: ${field.label}`);
@@ -910,12 +1079,23 @@ export function IntegrationsPanel({
           payload[field.key] = value;
         }
       }
-      await configureMutation.mutateAsync({ id: active.id, payload });
-      await integrationsQ.refetch();
+      await configureMutation.mutateAsync({ id: current.id, payload });
+      const refreshed = await integrationsQ.refetch();
+      const refreshedItems = refreshed.data?.integrations || [];
+      const updated = refreshedItems.find((item) => item.id === current.id) || current;
+      setActive(updated);
       setConfigSuccess(true);
-      setTimeout(() => {
-        closeConfig();
-      }, 850);
+      setSaving(false);
+      const needsOauthFollowup =
+        updated.id === "gmail" ||
+        updated.id === "google_calendar" ||
+        updated.status === "needs_auth" ||
+        !!str(updated.auth_url, "").trim();
+      if (!needsOauthFollowup) {
+        setTimeout(() => {
+          closeConfig();
+        }, 850);
+      }
     } catch (err) {
       setFormError(asErrorMessage(err));
       // Backend disables integration on failed validation; refresh to reflect it.
@@ -948,15 +1128,24 @@ export function IntegrationsPanel({
         authUrl = extractAuthUrl(payload);
       }
       if (!authUrl) throw new Error("No OAuth URL is available yet. Configure this integration first.");
+      setOauthPendingId(normalizeIntegrationId(integration.id));
       window.open(authUrl, "_blank", "noopener,noreferrer");
-      setNotice({ kind: "success", text: "OAuth window opened. Finish sign-in, then run Test." });
+      setNotice({ kind: "success", text: "OAuth window opened. Finish sign-in and AgentArk will update this automatically." });
     } catch (err) {
+      setOauthPendingId(null);
       setNotice({ kind: "error", text: asErrorMessage(err) });
     } finally {
       setOauthBusyId(null);
       await queryClient.invalidateQueries({ queryKey: ["integrations"] });
     }
   };
+
+  const activeNeedsOauth =
+    !!active &&
+    (active.id === "gmail" ||
+      active.id === "google_calendar" ||
+      active.status === "needs_auth" ||
+      !!str(active.auth_url, "").trim());
 
   const renderField = (field: IntegrationConfigField) => {
     const value = formValues[field.key] || "";
@@ -1058,114 +1247,73 @@ export function IntegrationsPanel({
               Failed to load channels: {settingsQ.error instanceof Error ? settingsQ.error.message : "Unknown error"}
             </Alert>
           ) : (
-            <Grid2 container spacing={1.5}>
-              <Grid2 size={{ xs: 12 }}>
-                <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Stack spacing={1.25}>
-                    <Typography variant="subtitle1" fontWeight={700}>
-                      Web Search
+            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
+                  <TableCell sx={{ fontWeight: 600, width: "18%" }}>Status</TableCell>
+                  <TableCell sx={{ fontWeight: 600 }}>Details</TableCell>
+                  <TableCell sx={{ fontWeight: 600, width: "10%", textAlign: "right" }} />
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                <TableRow>
+                  <TableCell>Web Search</TableCell>
+                  <TableCell>
+                    <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: "rgba(74,210,157,0.85)" }} />
+                      <Typography variant="body2" color="text.secondary" noWrap>Active</Typography>
+                    </Box>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {channelForm.search_primary || "playwright"} → {channelForm.search_fallback1 || "none"} → {channelForm.search_fallback2 || "none"}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Primary: {channelForm.search_primary || "-"} | Fallback 1: {channelForm.search_fallback1 || "-"} | Fallback 2: {channelForm.search_fallback2 || "-"}
+                  </TableCell>
+                  <TableCell align="right">
+                    <Button size="small" variant="text" onClick={openSearchSetup} sx={{ minWidth: 0 }}>Setup</Button>
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell>Telegram</TableCell>
+                  <TableCell>
+                    <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: channelForm.telegram_enabled ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(telegramConnectionStatusRaw)}</Typography>
+                    </Box>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured")}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Serper key configured: {searchSerperConfigured ? "yes" : "no"} | Brave key configured: {searchBraveConfigured ? "yes" : "no"}
+                  </TableCell>
+                  <TableCell align="right">
+                    <Button size="small" variant="text" onClick={() => openTelegramSetup(!channelForm.telegram_enabled)} sx={{ minWidth: 0 }}>
+                      {channelForm.telegram_enabled ? "Setup" : "Enable"}
+                    </Button>
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell>WhatsApp</TableCell>
+                  <TableCell>
+                    <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: channelForm.whatsapp_enabled ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(whatsappConnectionStatusRaw)}</Typography>
+                    </Box>
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {whatsappConnectionDetail || (channelForm.whatsapp_mode === "cloud_api" ? "Cloud API" : "QR pairing")}
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Primary fails over to fallbacks in order. Playwright requires no API key.
-                    </Typography>
-                    <Stack direction="row" spacing={1}>
-                      <Button size="small" variant="contained" onClick={openSearchSetup}>
-                        Manage
-                      </Button>
-                    </Stack>
-                  </Stack>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 12 }}>
-                <Box className="list-shell" sx={{ minHeight: 0, height: "100%" }}>
-                  <Stack spacing={1.25}>
-                    <Typography variant="subtitle1" fontWeight={700}>
-                      Telegram
-                    </Typography>
-                    <Stack direction="row" spacing={1} alignItems="center">
-                      <Typography variant="body2" color="text.secondary">
-                        Connection:
-                      </Typography>
-                      <Chip
-                        size="small"
-                        label={channelStatusLabel(telegramConnectionStatusRaw)}
-                        color={channelStatusColor(telegramConnectionStatusRaw)}
-                        variant="outlined"
-                      />
-                    </Stack>
-                    <Typography variant="caption" color="text.secondary">
-                      Token configured: {telegramTokenConfigured ? "yes" : "no"}
-                    </Typography>
-                    {telegramConnectionDetail ? (
-                      <Typography variant="caption" color="text.secondary">
-                        {telegramConnectionDetail}
-                      </Typography>
-                    ) : null}
-                    <Typography variant="caption" color="text.secondary">
-                      Connect your bot token and allowed user IDs so only approved users can message the agent.
-                    </Typography>
-                    <Stack direction="row" spacing={1}>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        onClick={() => openTelegramSetup(!channelForm.telegram_enabled)}
-                      >
-                        {channelForm.telegram_enabled ? "Manage" : "Enable"}
-                      </Button>
-                    </Stack>
-                  </Stack>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 12 }}>
-                <Box className="list-shell" sx={{ minHeight: 0, height: "100%" }}>
-                  <Stack spacing={1.25}>
-                    <Typography variant="subtitle1" fontWeight={700}>
-                      WhatsApp
-                    </Typography>
-                    <Stack direction="row" spacing={1} alignItems="center">
-                      <Typography variant="body2" color="text.secondary">
-                        Connection:
-                      </Typography>
-                      <Chip
-                        size="small"
-                        label={channelStatusLabel(whatsappConnectionStatusRaw)}
-                        color={channelStatusColor(whatsappConnectionStatusRaw)}
-                        variant="outlined"
-                      />
-                    </Stack>
-                    <Typography variant="caption" color="text.secondary">
-                      Mode: {channelForm.whatsapp_mode === "cloud_api" ? "Enterprise Cloud API" : "Scan QR"}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Token configured (Enterprise Cloud API): {whatsappTokenConfigured ? "yes" : "no"}
-                    </Typography>
-                    {whatsappConnectionDetail ? (
-                      <Typography variant="caption" color="text.secondary">
-                        {whatsappConnectionDetail}
-                      </Typography>
-                    ) : null}
-                    <Typography variant="caption" color="text.secondary">
-                      Choose between quick QR pairing or Meta Cloud API enterprise setup.
-                    </Typography>
-                    <Stack direction="row" spacing={1}>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        onClick={() => openWhatsAppSetup(!channelForm.whatsapp_enabled)}
-                      >
-                        {channelForm.whatsapp_enabled ? "Manage" : "Enable"}
-                      </Button>
-                    </Stack>
-                  </Stack>
-                </Box>
-              </Grid2>
-            </Grid2>
+                  </TableCell>
+                  <TableCell align="right">
+                    <Button size="small" variant="text" onClick={() => openWhatsAppSetup(!channelForm.whatsapp_enabled)} sx={{ minWidth: 0 }}>
+                      {channelForm.whatsapp_enabled ? "Setup" : "Enable"}
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
           )}
         </Box>
       ) : null}
@@ -1870,11 +2018,20 @@ export function IntegrationsPanel({
               {active?.description}
             </Typography>
             <Typography variant="caption" color="text.secondary">
-              {active?.status === "connected" ? "Connected" : "Not configured"}
+              {active?.status === "connected"
+                ? "Connected"
+                : active?.status === "needs_auth"
+                  ? "Needs sign-in"
+                  : "Not configured"}
             </Typography>
             {!active?.enabled ? (
               <Alert severity="info">
                 This integration is disabled. Enter credentials and validate to enable it.
+              </Alert>
+            ) : null}
+            {activeNeedsOauth ? (
+              <Alert severity="info">
+                Save your Google OAuth client credentials here, then click Connect to finish sign-in.
               </Alert>
             ) : null}
             {(active?.config_fields || []).map(renderField)}
@@ -1885,7 +2042,11 @@ export function IntegrationsPanel({
             ) : null}
             {formError ? <Alert severity="error">{formError}</Alert> : null}
             {configSuccess ? (
-              <Alert severity="success">API keys validated and saved.</Alert>
+              <Alert severity="success">
+                {activeNeedsOauth
+                  ? "Credentials saved. Click Connect to finish authorization."
+                  : "API keys validated and saved."}
+              </Alert>
             ) : null}
           </Stack>
         </DialogContent>
@@ -1903,8 +2064,17 @@ export function IntegrationsPanel({
           <Button onClick={closeConfig} disabled={saving}>
             Close
           </Button>
+          {activeNeedsOauth ? (
+            <Button
+              variant="outlined"
+              onClick={() => active && startIntegrationAuth(active)}
+              disabled={saving || oauthBusyId === active?.id}
+            >
+              {oauthBusyId === active?.id ? "Opening..." : "Connect"}
+            </Button>
+          ) : null}
           <Button variant="contained" onClick={submitConfig} disabled={saving || !(active?.config_fields?.length)}>
-            {saving ? "Validating..." : "Validate & Enable"}
+            {saving ? "Saving..." : activeNeedsOauth ? "Save Credentials" : "Validate & Enable"}
           </Button>
         </DialogActions>
       </Dialog>

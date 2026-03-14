@@ -22,6 +22,14 @@ pub struct Model {
     pub response: Option<String>,
     #[sea_orm(nullable)]
     pub proof_id: Option<String>,
+    #[sea_orm(nullable)]
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cost_usd: f64,
+    #[sea_orm(nullable)]
+    pub complexity: Option<String>,
     pub created_at: String,
 }
 

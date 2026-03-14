@@ -8,30 +8,39 @@ use super::swarm::SwarmConfig;
 use crate::crypto::KeyManager;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Global key manager set at startup (from master password or keyfile).
 /// All SecureConfigManager instances use this when available, ensuring
 /// consistent encryption across the entire process after password changes.
-static GLOBAL_KEY_MANAGER: std::sync::OnceLock<Arc<KeyManager>> = std::sync::OnceLock::new();
-static CUSTOM_SECRETS_UPDATE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+static GLOBAL_KEY_MANAGER: std::sync::OnceLock<std::sync::RwLock<Option<Arc<KeyManager>>>> =
     std::sync::OnceLock::new();
+static SECRETS_FILE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 pub const HTTP_API_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 
-/// Set the global key manager (called once at startup from main.rs)
+fn global_key_manager_cell() -> &'static std::sync::RwLock<Option<Arc<KeyManager>>> {
+    GLOBAL_KEY_MANAGER.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn secrets_file_lock() -> &'static std::sync::Mutex<()> {
+    SECRETS_FILE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Set or replace the global key manager (called at startup and after password rotation)
 pub fn set_global_key_manager(km: Arc<KeyManager>) {
-    let _ = GLOBAL_KEY_MANAGER.set(km);
+    if let Ok(mut guard) = global_key_manager_cell().write() {
+        *guard = Some(km);
+    }
 }
 
 /// Get the global key manager if set
 pub fn global_key_manager() -> Option<Arc<KeyManager>> {
-    GLOBAL_KEY_MANAGER.get().cloned()
-}
-
-fn custom_secrets_update_lock() -> &'static std::sync::Mutex<()> {
-    CUSTOM_SECRETS_UPDATE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    global_key_manager_cell()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
 }
 
 /// Role determines when a model slot is used
@@ -86,6 +95,141 @@ impl Default for ModelPoolConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelProviderKind {
+    #[default]
+    Cloudflare,
+    Ngrok,
+    TailscaleFunnel,
+    Bore,
+}
+
+impl TunnelProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Ngrok => "ngrok",
+            Self::TailscaleFunnel => "tailscale_funnel",
+            Self::Bore => "bore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelCloudflareConfig {
+    #[serde(default = "default_cloudflared_binary")]
+    pub binary_path: String,
+}
+
+impl Default for TunnelCloudflareConfig {
+    fn default() -> Self {
+        Self {
+            binary_path: default_cloudflared_binary(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelNgrokConfig {
+    #[serde(default = "default_ngrok_binary")]
+    pub binary_path: String,
+    #[serde(default)]
+    pub authtoken: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+impl Default for TunnelNgrokConfig {
+    fn default() -> Self {
+        Self {
+            binary_path: default_ngrok_binary(),
+            authtoken: String::new(),
+            domain: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelTailscaleConfig {
+    #[serde(default = "default_tailscale_binary")]
+    pub binary_path: String,
+    #[serde(default)]
+    pub auth_key: String,
+    #[serde(default)]
+    pub hostname: Option<String>,
+}
+
+impl Default for TunnelTailscaleConfig {
+    fn default() -> Self {
+        Self {
+            binary_path: default_tailscale_binary(),
+            auth_key: String::new(),
+            hostname: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelBoreConfig {
+    #[serde(default = "default_bore_binary")]
+    pub binary_path: String,
+    #[serde(default = "default_bore_server")]
+    pub server: String,
+}
+
+impl Default for TunnelBoreConfig {
+    fn default() -> Self {
+        Self {
+            binary_path: default_bore_binary(),
+            server: default_bore_server(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TunnelConfig {
+    #[serde(default)]
+    pub provider: TunnelProviderKind,
+    #[serde(default)]
+    pub cloudflare: TunnelCloudflareConfig,
+    #[serde(default)]
+    pub ngrok: TunnelNgrokConfig,
+    #[serde(default)]
+    pub tailscale_funnel: TunnelTailscaleConfig,
+    #[serde(default)]
+    pub bore: TunnelBoreConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_observability_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default = "default_observability_service_name")]
+    pub service_name: String,
+    #[serde(default = "default_observability_header_name")]
+    pub header_name: String,
+    #[serde(default = "default_observability_privacy_mode")]
+    pub privacy_mode: String,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_observability_provider(),
+            endpoint: String::new(),
+            service_name: default_observability_service_name(),
+            header_name: default_observability_header_name(),
+            privacy_mode: default_observability_privacy_mode(),
+        }
+    }
+}
+
 /// Main agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -123,6 +267,12 @@ pub struct AgentConfig {
     /// Browser automation configuration
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Public remote-access tunnel configuration
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
+    /// Optional external trace export
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
     /// Mem0 memory layer configuration
     #[serde(default)]
     pub mem0: Mem0Config,
@@ -158,6 +308,8 @@ impl Default for AgentConfig {
             media_gen: MediaGenConfig::default(),
             swarm: SwarmConfig::default(),
             browser: BrowserConfig::default(),
+            tunnel: TunnelConfig::default(),
+            observability: ObservabilityConfig::default(),
             mem0: Mem0Config::default(),
             mcp: McpConfig::default(),
             tls_cert_path: None,
@@ -209,6 +361,46 @@ pub struct BrowserConfig {
 
 fn default_browser_bridge_url() -> String {
     "http://127.0.0.1:3100".to_string()
+}
+
+fn default_cloudflared_binary() -> String {
+    if cfg!(windows) {
+        "cloudflared.exe".to_string()
+    } else {
+        "cloudflared".to_string()
+    }
+}
+
+fn default_ngrok_binary() -> String {
+    "ngrok".to_string()
+}
+
+fn default_tailscale_binary() -> String {
+    "tailscale".to_string()
+}
+
+fn default_bore_binary() -> String {
+    "bore".to_string()
+}
+
+fn default_bore_server() -> String {
+    "bore.pub".to_string()
+}
+
+fn default_observability_provider() -> String {
+    "langtrace".to_string()
+}
+
+fn default_observability_service_name() -> String {
+    "agentark".to_string()
+}
+
+fn default_observability_header_name() -> String {
+    "x-api-key".to_string()
+}
+
+fn default_observability_privacy_mode() -> String {
+    "metadata_only".to_string()
 }
 
 fn default_max_browser_sessions() -> usize {
@@ -373,6 +565,11 @@ pub struct Secrets {
     /// WhatsApp access token
     #[serde(default)]
     pub whatsapp_access_token: Option<String>,
+    /// Tunnel provider auth tokens/keys
+    #[serde(default)]
+    pub tunnel_ngrok_authtoken: Option<String>,
+    #[serde(default)]
+    pub tunnel_tailscale_auth_key: Option<String>,
     /// HTTP API authentication key (auto-generated on first run)
     #[serde(default)]
     pub api_key: Option<String>,
@@ -475,10 +672,101 @@ impl SecureConfigManager {
         }
     }
 
+    fn secrets_path(&self) -> PathBuf {
+        self.config_dir.join("secrets.enc")
+    }
+
+    pub(crate) fn load_secrets_unlocked(&self) -> Result<Secrets> {
+        let secrets_path = self.secrets_path();
+        if !secrets_path.exists() {
+            return Ok(Secrets::default());
+        }
+        let encrypted_data = std::fs::read(&secrets_path)?;
+        if encrypted_data.is_empty() {
+            tracing::warn!("secrets.enc is empty, returning defaults");
+            return Ok(Secrets::default());
+        }
+        match self.key_manager.decrypt(&encrypted_data) {
+            Ok(decrypted) => {
+                let secrets: Secrets = serde_json::from_slice(&decrypted)?;
+                Ok(secrets)
+            }
+            Err(e) => {
+                let backup_path = self.config_dir.join("secrets.enc.bak");
+                if let Err(copy_err) = std::fs::copy(&secrets_path, &backup_path) {
+                    tracing::warn!("Failed to back up secrets.enc: {}", copy_err);
+                } else {
+                    tracing::info!("Backed up secrets.enc to secrets.enc.bak for recovery");
+                }
+                Err(anyhow!(
+                    "Failed to decrypt secrets.enc with the active encryption key: {}",
+                    e
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn save_secrets_unlocked(&self, secrets: &Secrets) -> Result<()> {
+        let json = serde_json::to_vec(secrets)?;
+        let encrypted = self.key_manager.encrypt(&json)?;
+        crate::crypto::atomic_write_file(&self.secrets_path(), &encrypted)
+    }
+
+    pub(crate) fn with_secrets_lock<T, F>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&Self) -> Result<T>,
+    {
+        let _guard = secrets_file_lock()
+            .lock()
+            .map_err(|_| anyhow!("secrets file lock poisoned"))?;
+        op(self)
+    }
+
+    pub fn update_secrets<T, F>(&self, update: F) -> Result<T>
+    where
+        F: FnOnce(&mut Secrets) -> Result<T>,
+    {
+        self.with_secrets_lock(|manager| {
+            let mut secrets = manager.load_secrets_unlocked()?;
+            let out = update(&mut secrets)?;
+            manager.save_secrets_unlocked(&secrets)?;
+            Ok(out)
+        })
+    }
+
+    fn has_real_secrets(secrets: &Secrets) -> bool {
+        secrets.llm_api_key.as_ref().is_some_and(|k| !k.is_empty())
+            || secrets
+                .llm_fallback_api_key
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .telegram_bot_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .whatsapp_access_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .tunnel_ngrok_authtoken
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .tunnel_tailscale_auth_key
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets.api_key.as_ref().is_some_and(|k| !k.is_empty())
+            || !secrets.media_provider_keys.is_empty()
+            || !secrets.model_pool_keys.is_empty()
+            || !secrets.mcp_auth.is_empty()
+            || !secrets.custom.is_empty()
+    }
+
     /// Load configuration with decrypted secrets
     pub fn load(&self) -> Result<AgentConfig> {
         let config_path = self.config_dir.join("config.toml");
-        let secrets_path = self.config_dir.join("secrets.enc");
+        let secrets_path = self.secrets_path();
 
         // Load base config
         let mut config = if config_path.exists() {
@@ -492,10 +780,16 @@ impl SecureConfigManager {
 
         // Load and decrypt secrets
         if secrets_path.exists() {
-            let mut secrets = self.load_secrets()?;
-            let (changed, created, rotated) = Self::ensure_http_api_key_in_secrets(&mut secrets);
+            let (secrets, changed, created, rotated) = self.with_secrets_lock(|manager| {
+                let mut secrets = manager.load_secrets_unlocked()?;
+                let (changed, created, rotated) =
+                    Self::ensure_http_api_key_in_secrets(&mut secrets);
+                if changed {
+                    manager.save_secrets_unlocked(&secrets)?;
+                }
+                Ok((secrets, changed, created, rotated))
+            })?;
             if changed {
-                self.save_secrets(&secrets)?;
                 if rotated {
                     tracing::info!("Rotated expired HTTP API key");
                 } else if created {
@@ -509,10 +803,16 @@ impl SecureConfigManager {
             self.migrate_from_plain_config(&mut config)?;
 
             // Ensure API key exists even on first run (no secrets.enc yet)
-            let mut secrets = self.load_secrets().unwrap_or_default();
-            let (changed, created, rotated) = Self::ensure_http_api_key_in_secrets(&mut secrets);
+            let (changed, created, rotated) = self.with_secrets_lock(|manager| {
+                let mut secrets = manager.load_secrets_unlocked()?;
+                let (changed, created, rotated) =
+                    Self::ensure_http_api_key_in_secrets(&mut secrets);
+                if changed {
+                    manager.save_secrets_unlocked(&secrets)?;
+                }
+                Ok((changed, created, rotated))
+            })?;
             if changed {
-                self.save_secrets(&secrets)?;
                 if rotated {
                     tracing::info!("Rotated expired HTTP API key");
                 } else if created {
@@ -558,9 +858,6 @@ impl SecureConfigManager {
 
     /// Save configuration with encrypted secrets
     pub fn save(&self, config: &AgentConfig) -> Result<()> {
-        // Extract secrets from config
-        let secrets = self.extract_secrets(config);
-
         // Create sanitized config (without secrets)
         let sanitized = self.sanitize_config(config);
 
@@ -570,34 +867,20 @@ impl SecureConfigManager {
         // Guard: don't overwrite existing secrets.enc with empty data.
         // This prevents data loss when decryption fails (key mismatch)
         // but the user saves settings via the web UI.
-        let secrets_path = self.config_dir.join("secrets.enc");
-        let has_real_secrets = secrets.llm_api_key.as_ref().is_some_and(|k| !k.is_empty())
-            || secrets
-                .llm_fallback_api_key
-                .as_ref()
-                .is_some_and(|k| !k.is_empty())
-            || secrets
-                .telegram_bot_token
-                .as_ref()
-                .is_some_and(|k| !k.is_empty())
-            || secrets
-                .whatsapp_access_token
-                .as_ref()
-                .is_some_and(|k| !k.is_empty())
-            || secrets.api_key.as_ref().is_some_and(|k| !k.is_empty())
-            || !secrets.media_provider_keys.is_empty()
-            || !secrets.model_pool_keys.is_empty()
-            || !secrets.mcp_auth.is_empty()
-            || !secrets.custom.is_empty();
-
-        if !has_real_secrets && secrets_path.exists() {
-            tracing::warn!(
-                "Skipping secrets.enc overwrite: extracted secrets are empty but file exists. \
+        self.with_secrets_lock(|manager| {
+            let secrets_path = manager.secrets_path();
+            let existing = manager.load_secrets_unlocked()?;
+            let secrets = manager.extract_secrets_from_base(existing, config);
+            if !Self::has_real_secrets(&secrets) && secrets_path.exists() {
+                tracing::warn!(
+                    "Skipping secrets.enc overwrite: extracted secrets are empty but file exists. \
                  This likely means decryption failed — preserving existing encrypted secrets."
-            );
-        } else {
-            self.save_secrets(&secrets)?;
-        }
+                );
+            } else {
+                manager.save_secrets_unlocked(&secrets)?;
+            }
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -606,21 +889,18 @@ impl SecureConfigManager {
     fn save_config_only(&self, config: &AgentConfig) -> Result<()> {
         let config_path = self.config_dir.join("config.toml");
         let content = toml::to_string_pretty(config)?;
-        std::fs::write(config_path, content)?;
+        crate::crypto::atomic_write_file(&config_path, content.as_bytes())?;
         Ok(())
     }
 
     /// Save encrypted secrets
     pub(crate) fn save_secrets(&self, secrets: &Secrets) -> Result<()> {
-        let secrets_path = self.config_dir.join("secrets.enc");
-        let json = serde_json::to_vec(secrets)?;
-        let encrypted = self.key_manager.encrypt(&json)?;
-        std::fs::write(secrets_path, encrypted)?;
-        Ok(())
+        self.with_secrets_lock(|manager| manager.save_secrets_unlocked(secrets))
     }
 
     pub(crate) fn load_secrets(&self) -> Result<Secrets> {
-        let secrets_path = self.config_dir.join("secrets.enc");
+        self.with_secrets_lock(|manager| manager.load_secrets_unlocked())
+        /*
         if !secrets_path.exists() {
             return Ok(Secrets::default());
         }
@@ -653,6 +933,7 @@ impl SecureConfigManager {
                 Ok(Secrets::default())
             }
         }
+        */
     }
 
     /// Atomically update custom secret keys in a single read-modify-write cycle.
@@ -663,13 +944,7 @@ impl SecureConfigManager {
     where
         F: FnOnce(&mut std::collections::HashMap<String, String>) -> Result<T>,
     {
-        let _guard = custom_secrets_update_lock()
-            .lock()
-            .map_err(|_| anyhow!("custom secret update lock poisoned"))?;
-        let mut secrets = self.load_secrets()?;
-        let out = update(&mut secrets.custom)?;
-        self.save_secrets(&secrets)?;
-        Ok(out)
+        self.update_secrets(|secrets| update(&mut secrets.custom))
     }
 
     /// Read a custom secret string by key
@@ -694,11 +969,7 @@ impl SecureConfigManager {
     }
 
     /// Extract secrets from config
-    fn extract_secrets(&self, config: &AgentConfig) -> Secrets {
-        // Start from existing secrets so we don't lose fields not tracked in AgentConfig
-        // (e.g., api_key for HTTP auth, custom secrets from integrations)
-        let mut secrets = self.load_secrets().unwrap_or_default();
-
+    fn extract_secrets_from_base(&self, mut secrets: Secrets, config: &AgentConfig) -> Secrets {
         // Extract primary LLM API key
         match &config.llm {
             LlmProvider::Anthropic { api_key, .. }
@@ -743,6 +1014,18 @@ impl SecureConfigManager {
             if !wa.access_token.is_empty() && wa.access_token != "[ENCRYPTED]" {
                 secrets.whatsapp_access_token = Some(wa.access_token.clone());
             }
+        }
+
+        if !config.tunnel.ngrok.authtoken.is_empty()
+            && config.tunnel.ngrok.authtoken != "[ENCRYPTED]"
+        {
+            secrets.tunnel_ngrok_authtoken = Some(config.tunnel.ngrok.authtoken.clone());
+        }
+        if !config.tunnel.tailscale_funnel.auth_key.is_empty()
+            && config.tunnel.tailscale_funnel.auth_key != "[ENCRYPTED]"
+        {
+            secrets.tunnel_tailscale_auth_key =
+                Some(config.tunnel.tailscale_funnel.auth_key.clone());
         }
 
         // Extract media provider API keys
@@ -826,6 +1109,13 @@ impl SecureConfigManager {
             if !wa.access_token.is_empty() {
                 wa.access_token = "[ENCRYPTED]".to_string();
             }
+        }
+
+        if !sanitized.tunnel.ngrok.authtoken.is_empty() {
+            sanitized.tunnel.ngrok.authtoken = "[ENCRYPTED]".to_string();
+        }
+        if !sanitized.tunnel.tailscale_funnel.auth_key.is_empty() {
+            sanitized.tunnel.tailscale_funnel.auth_key = "[ENCRYPTED]".to_string();
         }
 
         // Replace media provider API keys with placeholder
@@ -927,6 +1217,17 @@ impl SecureConfigManager {
             }
         }
 
+        if let Some(token) = &secrets.tunnel_ngrok_authtoken {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                config.tunnel.ngrok.authtoken = token.clone();
+            }
+        }
+        if let Some(token) = &secrets.tunnel_tailscale_auth_key {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                config.tunnel.tailscale_funnel.auth_key = token.clone();
+            }
+        }
+
         // Inject media provider API keys (skip placeholder values)
         for (provider, key) in &secrets.media_provider_keys {
             if !key.is_empty() && key != "[ENCRYPTED]" {
@@ -957,7 +1258,7 @@ impl SecureConfigManager {
 
     /// Migrate secrets from old plain config to encrypted storage
     fn migrate_from_plain_config(&self, config: &mut AgentConfig) -> Result<()> {
-        let secrets = self.extract_secrets(config);
+        let secrets = self.extract_secrets_from_base(Secrets::default(), config);
 
         // Only migrate if there are actual secrets
         let has_secrets = secrets
@@ -977,6 +1278,16 @@ impl SecureConfigManager {
                 .unwrap_or(false)
             || secrets
                 .whatsapp_access_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .tunnel_ngrok_authtoken
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .tunnel_tailscale_auth_key
                 .as_ref()
                 .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
                 .unwrap_or(false)
@@ -1010,12 +1321,14 @@ impl SecureConfigManager {
     /// Ensure API key exists and rotate if expired.
     /// Returns the current key info and whether rotation happened in this call.
     pub fn ensure_api_key_info(&self) -> Result<(Option<HttpApiKeyInfo>, bool)> {
-        let mut secrets = self.load_secrets()?;
-        let (changed, _created, rotated) = Self::ensure_http_api_key_in_secrets(&mut secrets);
-        if changed {
-            self.save_secrets(&secrets)?;
-        }
-        Ok((Self::api_key_info_from_secrets(&secrets), rotated))
+        self.with_secrets_lock(|manager| {
+            let mut secrets = manager.load_secrets_unlocked()?;
+            let (changed, _created, rotated) = Self::ensure_http_api_key_in_secrets(&mut secrets);
+            if changed {
+                manager.save_secrets_unlocked(&secrets)?;
+            }
+            Ok((Self::api_key_info_from_secrets(&secrets), rotated))
+        })
     }
 
     /// Regenerate the HTTP API key and return the new one
@@ -1026,19 +1339,20 @@ impl SecureConfigManager {
 
     /// Regenerate the HTTP API key and return key + TTL metadata
     pub fn regenerate_api_key_info(&self) -> Result<HttpApiKeyInfo> {
-        let mut secrets = self.load_secrets().unwrap_or_default();
-        let now = Self::current_unix_ts();
-        let api_key = Self::generate_http_api_key();
-        secrets.api_key = Some(api_key);
-        secrets.api_key_issued_at = Some(now);
-        secrets.api_key_expires_at = Some(now + HTTP_API_KEY_TTL_SECS);
-        self.save_secrets(&secrets)?;
+        let info = self.update_secrets(|secrets| {
+            let now = Self::current_unix_ts();
+            let api_key = Self::generate_http_api_key();
+            secrets.api_key = Some(api_key);
+            secrets.api_key_issued_at = Some(now);
+            secrets.api_key_expires_at = Some(now + HTTP_API_KEY_TTL_SECS);
+            Self::api_key_info_from_secrets(secrets)
+                .ok_or_else(|| anyhow!("Failed to build regenerated API key metadata"))
+        })?;
         tracing::info!(
             "HTTP API key regenerated (expires in {} seconds)",
             HTTP_API_KEY_TTL_SECS
         );
-        Self::api_key_info_from_secrets(&secrets)
-            .ok_or_else(|| anyhow!("Failed to build regenerated API key metadata"))
+        Ok(info)
     }
 
     fn current_unix_ts() -> i64 {

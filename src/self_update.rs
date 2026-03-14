@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// Self-update is intentionally parked until the runtime/control-plane wiring lands.
+// Keep the dormant module lint-clean without masking dead code elsewhere.
+
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

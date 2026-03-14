@@ -32,7 +32,7 @@ fn authed_client() -> reqwest::Client {
 
 async fn server_available() -> bool {
     reqwest::Client::new()
-        .get(&format!("{}/health", BASE_URL))
+        .get(format!("{}/health", BASE_URL))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -43,7 +43,7 @@ async fn server_available() -> bool {
 /// (i.e. AGENTARK_INSECURE_NO_AUTH=true on the server side).
 async fn server_allows_no_auth() -> bool {
     reqwest::Client::new()
-        .get(&format!("{}/status", BASE_URL))
+        .get(format!("{}/status", BASE_URL))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -80,7 +80,7 @@ async fn test_notifications_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/notifications", BASE_URL))
+        .get(format!("{}/notifications", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -96,7 +96,7 @@ async fn test_notifications_count() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/notifications/count", BASE_URL))
+        .get(format!("{}/notifications/count", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -113,7 +113,7 @@ async fn test_notifications_mark_all_read() {
 
     // Mark all read
     let resp = client
-        .post(&format!("{}/notifications/read-all", BASE_URL))
+        .post(format!("{}/notifications/read-all", BASE_URL))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -122,7 +122,7 @@ async fn test_notifications_mark_all_read() {
 
     // Verify unread count is 0
     let count_resp = client
-        .get(&format!("{}/notifications/count?unread=true", BASE_URL))
+        .get(format!("{}/notifications/count?unread=true", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -138,14 +138,14 @@ async fn test_notifications_unread_filter() {
 
     // First mark all read
     let _ = client
-        .post(&format!("{}/notifications/read-all", BASE_URL))
+        .post(format!("{}/notifications/read-all", BASE_URL))
         .json(&serde_json::json!({}))
         .send()
         .await;
 
     // Fetch with unread filter — should be empty
     let resp = client
-        .get(&format!("{}/notifications?unread=true", BASE_URL))
+        .get(format!("{}/notifications?unread=true", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -162,7 +162,7 @@ async fn test_tasks_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/tasks", BASE_URL))
+        .get(format!("{}/tasks", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -181,7 +181,7 @@ async fn test_task_create() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .post(&format!("{}/tasks", BASE_URL))
+        .post(format!("{}/tasks", BASE_URL))
         .json(&serde_json::json!({
             "description": "Integration test task — safe to delete",
             "schedule": "manual"
@@ -203,7 +203,7 @@ async fn test_chat_endpoint_exists() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .post(&format!("{}/chat", BASE_URL))
+        .post(format!("{}/chat", BASE_URL))
         .json(&serde_json::json!({
             "message": "ping",
             "channel": "web"
@@ -225,7 +225,7 @@ async fn test_conversations_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/conversations", BASE_URL))
+        .get(format!("{}/conversations", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -240,7 +240,7 @@ async fn test_integrations_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/integrations", BASE_URL))
+        .get(format!("{}/integrations", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -257,7 +257,7 @@ async fn test_skills_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/skills", BASE_URL))
+        .get(format!("{}/skills", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -272,7 +272,7 @@ async fn test_security_logs() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/security/logs?limit=5", BASE_URL))
+        .get(format!("{}/security/logs?limit=5", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -287,7 +287,7 @@ async fn test_master_password_status() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/security/master-password/status", BASE_URL))
+        .get(format!("{}/security/master-password/status", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -304,7 +304,7 @@ async fn test_autonomy_briefing() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/autonomy/briefing", BASE_URL))
+        .get(format!("{}/autonomy/briefing", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -317,7 +317,7 @@ async fn test_autonomy_nudges() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/autonomy/nudges", BASE_URL))
+        .get(format!("{}/autonomy/nudges", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -332,7 +332,7 @@ async fn test_autonomy_settings() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/autonomy/settings", BASE_URL))
+        .get(format!("{}/autonomy/settings", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -347,7 +347,7 @@ async fn test_memory_stats() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/memory/stats", BASE_URL))
+        .get(format!("{}/memory/stats", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -360,7 +360,7 @@ async fn test_memory_episodes() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/memory/episodes", BASE_URL))
+        .get(format!("{}/memory/episodes", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -373,7 +373,7 @@ async fn test_memory_facts() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/memory/facts", BASE_URL))
+        .get(format!("{}/memory/facts", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -388,7 +388,7 @@ async fn test_llm_analytics() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/analytics/llm?range=24h&bucket=hour", BASE_URL))
+        .get(format!("{}/analytics/llm?range=24h&bucket=hour", BASE_URL))
         .send()
         .await
         .unwrap();
@@ -403,7 +403,7 @@ async fn test_documents_list() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(&format!("{}/documents", BASE_URL))
+        .get(format!("{}/documents", BASE_URL))
         .send()
         .await
         .unwrap();

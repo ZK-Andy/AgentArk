@@ -11,6 +11,7 @@ pub struct ToolHandlerContext<'a> {
     pub stream_tx: Option<&'a Sender<StreamEvent>>,
     pub request_channel: &'a str,
     pub conversation_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
     pub public_base_url: Option<&'a str>,
     pub integration_aliases: &'a HashMap<String, String>,
 }
@@ -37,6 +38,10 @@ pub struct SelfEvolveToolHandler;
 pub struct AppInspectToolHandler;
 pub struct AppRestartToolHandler;
 pub struct AppDeployToolHandler;
+pub struct MemoryLookupToolHandler;
+pub struct GoalManageToolHandler;
+pub struct ListWatchersToolHandler;
+pub struct ListIntegrationsToolHandler;
 pub struct RuntimeToolHandler;
 
 #[async_trait]
@@ -222,6 +227,7 @@ impl ToolHandler for IntegrationToolHandler {
         let out = agent
             .execute_integration_tool_call(
                 call,
+                ctx.trace_ref,
                 ctx.stream_tx,
                 ctx.request_channel,
                 &integration_id,
@@ -331,8 +337,107 @@ impl ToolHandler for AppDeployToolHandler {
                 call,
                 ctx.stream_tx,
                 ctx.request_channel,
+                ctx.conversation_id,
                 ctx.public_base_url,
             )
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for MemoryLookupToolHandler {
+    fn id(&self) -> &'static str {
+        "memory_lookup"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "memory_lookup"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_memory_lookup_tool_call(
+                call,
+                ctx.stream_tx,
+                ctx.request_channel,
+                ctx.conversation_id,
+                ctx.project_id,
+            )
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for GoalManageToolHandler {
+    fn id(&self) -> &'static str {
+        "goal_manage"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "goal_manage"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_goal_manage_tool_call(call, ctx.stream_tx)
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListWatchersToolHandler {
+    fn id(&self) -> &'static str {
+        "list_watchers"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "list_watchers"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_list_watchers_tool_call(call, ctx.stream_tx)
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListIntegrationsToolHandler {
+    fn id(&self) -> &'static str {
+        "list_integrations"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "list_integrations"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_list_integrations_tool_call(call, ctx.stream_tx)
             .await?;
         Ok(Some(out))
     }
@@ -360,7 +465,8 @@ impl ToolHandler for RuntimeToolHandler {
                 ctx.trace_ref,
                 ctx.stream_tx,
                 ctx.request_channel,
-                ctx.public_base_url,
+                ctx.conversation_id,
+                ctx.project_id,
             )
             .await?;
         Ok(Some(out))
@@ -379,6 +485,10 @@ pub fn default_tool_handlers() -> Vec<Box<dyn ToolHandler>> {
         Box::new(AppInspectToolHandler),
         Box::new(AppRestartToolHandler),
         Box::new(AppDeployToolHandler),
+        Box::new(MemoryLookupToolHandler),
+        Box::new(GoalManageToolHandler),
+        Box::new(ListWatchersToolHandler),
+        Box::new(ListIntegrationsToolHandler),
         Box::new(RuntimeToolHandler),
     ]
 }

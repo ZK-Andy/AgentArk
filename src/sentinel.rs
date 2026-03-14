@@ -1874,18 +1874,45 @@ impl Default for SentinelConfig {
     }
 }
 
+async fn sleep_or_shutdown(
+    duration: std::time::Duration,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = shutdown_rx.changed() => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+async fn tick_or_shutdown(
+    interval: &mut tokio::time::Interval,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = shutdown_rx.changed() => false,
+        _ = interval.tick() => true,
+    }
+}
+
 /// Start all ArkSentinel background loops. Returns join handles for graceful shutdown.
-pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::JoinHandle<()>> {
+pub fn start(
+    agent: SharedAgent,
+    config: SentinelConfig,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
     // ── Task Scheduler ──────────────────────────────────────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(config.scheduler_interval));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 if is_agent_autonomy_paused(&agent).await {
                     continue;
                 }
@@ -1897,11 +1924,14 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // ── Watcher Poller ──────────────────────────────────────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(config.watcher_interval));
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 if is_agent_autonomy_paused(&agent).await {
                     continue;
                 }
@@ -1913,13 +1943,16 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // ── Memory Consolidation ────────────────────────────────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.consolidation_interval,
             ));
             interval.tick().await; // Skip first immediate tick
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "consolidation",
@@ -1938,13 +1971,16 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // ── Approval Expiry ─────────────────────────────────────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.approval_expiry_interval,
             ));
             interval.tick().await; // Skip first immediate tick
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_approval_expiry(&agent).await;
             }
         })
@@ -1954,14 +1990,19 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     if config.pulse_interval > 0 {
         handles.push({
             let agent = agent.clone();
+            let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 // Wait for initial startup to settle
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if !sleep_or_shutdown(std::time::Duration::from_secs(60), &mut shutdown).await {
+                    return;
+                }
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(config.pulse_interval));
                 interval.tick().await; // Skip first tick (we already waited)
                 loop {
-                    interval.tick().await;
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
                     if is_agent_autonomy_paused(&agent).await {
                         continue;
                     }
@@ -1985,14 +2026,19 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     if config.auto_analysis_interval > 0 {
         handles.push({
             let agent = agent.clone();
+            let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+                if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
+                    return;
+                }
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                     config.auto_analysis_interval,
                 ));
                 interval.tick().await;
                 loop {
-                    interval.tick().await;
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
                     if is_agent_autonomy_paused(&agent).await {
                         continue;
                     }
@@ -2021,15 +2067,20 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // ── Mem0 Memory Decay Cleanup (monthly, idle-only) ─────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Wait for startup to settle
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            if !sleep_or_shutdown(std::time::Duration::from_secs(300), &mut shutdown).await {
+                return;
+            }
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.mem0_cleanup_check_interval,
             ));
             interval.tick().await; // Skip first tick
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "mem0_cleanup",
@@ -2048,12 +2099,17 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // Mem0 retry queue drain (frequent, lightweight)
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if !sleep_or_shutdown(std::time::Duration::from_secs(30), &mut shutdown).await {
+                return;
+            }
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
             interval.tick().await;
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_mem0_retry_drain(&agent).await;
             }
         })
@@ -2063,14 +2119,19 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // Episodic memory retention cleanup (safe-by-default, idle-only, bounded).
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Wait for startup to settle.
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
+                return;
+            }
             // Check a few times a day; function is internally rate-limited (days).
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
             interval.tick().await;
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "episode_retention_cleanup",
@@ -2088,15 +2149,20 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
 
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Wait for startup to settle
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            if !sleep_or_shutdown(std::time::Duration::from_secs(120), &mut shutdown).await {
+                return;
+            }
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.unused_app_check_interval,
             ));
             interval.tick().await; // Skip first tick
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 if is_agent_autonomy_paused(&agent).await {
                     continue;
                 }
@@ -2118,13 +2184,18 @@ pub fn start(agent: SharedAgent, config: SentinelConfig) -> Vec<tokio::task::Joi
     // ── Security Log Cleanup (every 15 days, idle-only) ─────────────────
     handles.push({
         let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Check every 6 hours, but only actually cleanup every 15 days when idle
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
+                return;
+            }
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
             interval.tick().await;
             loop {
-                interval.tick().await;
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "security_log_cleanup",
@@ -2181,70 +2252,44 @@ async fn run_scheduler(agent: &SharedAgent) {
 
     for task in due_tasks {
         tracing::info!(
-            "ArkSentinel: executing task '{}' (action={})",
+            "ArkSentinel: queueing supervised task '{}' (action={})",
             task.description,
             task.action
         );
-        let task_start = std::time::Instant::now();
-
-        let result = {
-            let agent = agent.read().await;
-            agent.execute_task(&task).await
-        };
-
-        let task_elapsed = task_start.elapsed();
-        let (status, output) = match result {
-            Ok(out) => {
-                tracing::info!(
-                    "ArkSentinel: task '{}' completed ({}ms, output={}chars)",
-                    task.description,
-                    task_elapsed.as_millis(),
-                    out.len()
-                );
-                (TaskStatus::Completed, Some(out))
-            }
-            Err(e) => {
-                tracing::error!(
-                    "ArkSentinel: task '{}' failed ({}ms): {}",
-                    task.description,
-                    task_elapsed.as_millis(),
-                    e
-                );
-                (
-                    TaskStatus::Failed {
-                        error: e.to_string(),
-                    },
-                    Some(format!("Error: {}", e)),
-                )
-            }
-        };
-
-        let agent_guard = agent.read().await;
-        let _ = agent_guard
-            .finalize_task(task.id, status, output.clone())
-            .await;
-
-        // Push result to the configured channel (generic dispatch)
-        let report_to = task
-            .arguments
-            .get("report_to")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if let Some(ref text) = output {
-            if !report_to.is_empty() {
-                tracing::info!("ArkSentinel: sending task result to channel={}", report_to);
-                agent_guard.try_send_notification(report_to, text).await;
-            } else if task.action == "daily_brief" {
-                agent_guard.notify_preferred_channel(text).await;
-            }
-        }
+        let agent = Arc::clone(agent);
+        tokio::spawn(async move {
+            let agent_guard = agent.read().await;
+            agent_guard.execute_task_supervised(task).await;
+        });
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Watcher Poller — check conditions and fire triggers
 // ═══════════════════════════════════════════════════════════════════════════
+
+async fn persist_watcher_notification_attempt(
+    agent: &crate::core::Agent,
+    watcher_id: uuid::Uuid,
+    channel: String,
+    success: bool,
+    message: &str,
+    error: Option<String>,
+) {
+    agent
+        .watcher_manager
+        .push_notification_attempt(
+            watcher_id,
+            crate::core::watcher::WatcherNotificationAttempt {
+                attempted_at: chrono::Utc::now(),
+                channel,
+                success,
+                message: message.to_string(),
+                error,
+            },
+        )
+        .await;
+}
 
 async fn run_watchers(agent: &SharedAgent) {
     if is_agent_autonomy_paused(agent).await {
@@ -2263,13 +2308,48 @@ async fn run_watchers(agent: &SharedAgent) {
             "Watcher timed out: **{}**\n\nPolled `{}` {} times over {} minutes without finding a match.",
             w.description, w.poll_action, w.poll_count, w.timeout_secs / 60
         );
-        agent
-            .emit_notification("Watcher Timed Out", &msg, "warning", "watcher")
+        let web_outcome = agent
+            .emit_notification_with_status("Watcher Timed Out", &msg, "warning", "watcher")
             .await;
+        persist_watcher_notification_attempt(
+            &agent,
+            w.id,
+            web_outcome.channel,
+            web_outcome.success,
+            &msg,
+            web_outcome.error,
+        )
+        .await;
         if !w.notify_channel.is_empty() {
-            agent.try_send_notification(&w.notify_channel, &msg).await;
+            if !w.notify_channel.eq_ignore_ascii_case("web") {
+                let outcome = agent
+                    .try_send_notification_reported(&w.notify_channel, &msg)
+                    .await;
+                persist_watcher_notification_attempt(
+                    &agent,
+                    w.id,
+                    outcome.channel,
+                    outcome.success,
+                    &msg,
+                    outcome.error,
+                )
+                .await;
+            }
         } else {
-            agent.notify_preferred_channel(&msg).await;
+            for outcome in agent.notify_preferred_channel_reported(&msg).await {
+                if outcome.channel.eq_ignore_ascii_case("web") {
+                    continue;
+                }
+                persist_watcher_notification_attempt(
+                    &agent,
+                    w.id,
+                    outcome.channel,
+                    outcome.success,
+                    &msg,
+                    outcome.error,
+                )
+                .await;
+            }
         }
     }
 
@@ -2289,17 +2369,29 @@ async fn run_watchers(agent: &SharedAgent) {
         };
 
         let new_count = watcher.poll_count + 1;
-        {
-            let agent = agent.read().await;
-            agent
-                .watcher_manager
-                .update_poll(watcher.id, new_count)
-                .await;
-        }
 
         match poll_result {
             Ok(result) => {
-                let matched = watcher.condition.evaluate(&result);
+                let matched = match &watcher.condition {
+                    crate::core::watcher::WatchCondition::Custom { description } => {
+                        let agent = agent.read().await;
+                        agent
+                            .evaluate_custom_watcher_condition(
+                                &watcher.description,
+                                description,
+                                &result,
+                            )
+                            .await
+                    }
+                    _ => watcher.condition.evaluate(&result),
+                };
+                {
+                    let agent = agent.read().await;
+                    agent
+                        .watcher_manager
+                        .record_poll_success(watcher.id, new_count, result.clone(), matched)
+                        .await;
+                }
                 tracing::info!(
                     "Watcher '{}' poll #{}: action={}, result_len={}, condition_matched={}",
                     watcher.description,
@@ -2317,40 +2409,24 @@ async fn run_watchers(agent: &SharedAgent) {
                             .await;
                     }
 
-                    let trigger_prompt = format!(
-                        "[WATCHER TRIGGERED] {}\n\nPoll result:\n{}\n\nInstructions: {}",
-                        watcher.description, result, watcher.on_trigger
-                    );
-
-                    let response = {
-                        let agent = agent.read().await;
-                        agent
-                            .process_message(&trigger_prompt, "watcher", None, None)
-                            .await
-                    };
-
-                    let notify_text = match response {
-                        Ok(resp) => format!("**{}**\n\n{}", watcher.description, resp),
-                        Err(e) => format!(
-                            "Watcher triggered for **{}** but follow-up failed: {}\n\nRaw result:\n{}",
-                            watcher.description, e, result
-                        ),
-                    };
-
-                    let agent = agent.read().await;
-                    agent
-                        .emit_notification("Watcher Triggered", &notify_text, "info", "watcher")
-                        .await;
-                    if !watcher.notify_channel.is_empty() {
-                        agent
-                            .try_send_notification(&watcher.notify_channel, &notify_text)
+                    let agent = Arc::clone(agent);
+                    tokio::spawn(async move {
+                        let agent_guard = agent.read().await;
+                        agent_guard
+                            .handle_watcher_trigger_supervised(watcher, result)
                             .await;
-                    } else {
-                        agent.notify_preferred_channel(&notify_text).await;
-                    }
+                    });
                 }
             }
             Err(e) => {
+                let error_text = e.to_string();
+                {
+                    let agent = agent.read().await;
+                    agent
+                        .watcher_manager
+                        .record_poll_error(watcher.id, new_count, error_text.clone())
+                        .await;
+                }
                 tracing::debug!("ArkSentinel: watcher {} poll error: {}", watcher.id, e);
             }
         }

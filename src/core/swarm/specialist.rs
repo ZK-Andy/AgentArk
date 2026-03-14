@@ -11,6 +11,8 @@ use async_trait::async_trait;
 /// Configuration for a specialist agent
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpecialistConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub agent_type: SubAgentType,
     pub llm_provider: LlmProvider,
@@ -42,8 +44,14 @@ pub struct SpecialistAgent {
 impl SpecialistAgent {
     pub fn new(config: SpecialistConfig, available_actions: Vec<ActionDef>) -> Result<Self> {
         let llm = LlmClient::new(&config.llm_provider)?;
+        let id = config
+            .id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .map(AgentId)
+            .unwrap_or_default();
         Ok(Self {
-            id: AgentId::new(),
+            id,
             config,
             llm,
             available_actions,

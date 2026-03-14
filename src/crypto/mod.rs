@@ -13,7 +13,10 @@ use anyhow::{anyhow, Result};
 use argon2::{Argon2, Params};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::RngCore;
+use std::io::Write;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 /// Encrypted data format: salt (16 bytes) + nonce (12 bytes) + ciphertext
@@ -164,6 +167,72 @@ pub(crate) fn generate_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     salt
+}
+
+#[cfg(windows)]
+fn move_file_replace_windows(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let source_wide = wide(source.as_os_str());
+    let destination_wide = wide(destination.as_os_str());
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if moved == 0 {
+        return Err(anyhow!(
+            "Failed to atomically replace {:?}: {}",
+            destination,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Cannot determine parent directory for {:?}", path))?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(contents)?;
+    temp.as_file_mut().sync_all()?;
+    let temp_path = temp.into_temp_path();
+
+    #[cfg(windows)]
+    {
+        let source_path: PathBuf = temp_path.to_path_buf();
+        move_file_replace_windows(&source_path, path)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        temp_path
+            .persist(path)
+            .map_err(|err| anyhow!("Failed to atomically replace {:?}: {}", path, err.error))?;
+        Ok(())
+    }
 }
 
 /// Generate a self-signed TLS certificate for localhost

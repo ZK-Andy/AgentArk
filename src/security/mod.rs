@@ -35,25 +35,230 @@ pub enum SecretInputType {
     ApiKeyOrToken,
 }
 
-static SECRET_INPUT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    let patterns = [
-        // Private keys / key material
-        r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
-        r"-----BEGIN CERTIFICATE-----",
-        // Common API token prefixes
-        r"\bsk-[A-Za-z0-9]{20,}\b",          // OpenAI-style
-        r"\bghp_[A-Za-z0-9]{30,}\b",         // GitHub PAT
-        r"\bsecret_[A-Za-z0-9]{20,}\b",      // Notion token
-        r"\bAIza[0-9A-Za-z\-_]{20,}\b",      // Google API key
-        r"\bya29\.[0-9A-Za-z\-_]+\b",        // Google OAuth access token
-        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", // Slack token
-        // Bearer tokens / generic credential assignments with long values
-        r"(?i)\bbearer\s+[A-Za-z0-9._-]{20,}\b",
-        r#"(?i)\b(?:api[_-]?key|secret|token|password|client_secret)\b\s*[:=]\s*['"]?[A-Za-z0-9_\-./+=]{16,}['"]?"#,
-        r"\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*[^\s]{16,}",
-    ];
-    patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecretRedactionResult {
+    pub text: String,
+    pub redactions: Vec<String>,
+    pub kinds: Vec<SecretInputType>,
+}
+
+impl SecretRedactionResult {
+    pub fn had_secret(&self) -> bool {
+        !self.redactions.is_empty()
+    }
+
+    pub fn primary_kind(&self) -> Option<SecretInputType> {
+        self.kinds.first().cloned()
+    }
+
+    pub fn is_mostly_secret_payload(&self) -> bool {
+        if !self.had_secret() {
+            return false;
+        }
+        let placeholder_pattern = Regex::new(r"\[REDACTED_[A-Z_]+\]").unwrap();
+        let stripped = placeholder_pattern.replace_all(&self.text, " ");
+        let meaningful: String = stripped
+            .chars()
+            .filter(|ch| ch.is_alphanumeric() || ch.is_whitespace())
+            .collect();
+        meaningful.trim().chars().count() < 24
+    }
+}
+
+static PRIVATE_KEY_BLOCK_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?s)-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+    )
+    .unwrap()
 });
+static CERT_BLOCK_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----").unwrap()
+});
+static OPENAI_KEY_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").unwrap());
+static GITHUB_PAT_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bghp_[A-Za-z0-9]{30,}\b").unwrap());
+static NOTION_TOKEN_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bsecret_[A-Za-z0-9]{20,}\b").unwrap());
+static GOOGLE_API_KEY_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bAIza[0-9A-Za-z\-_]{20,}\b").unwrap());
+static GOOGLE_OAUTH_TOKEN_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bya29\.[0-9A-Za-z\-_]+\b").unwrap());
+static SLACK_TOKEN_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b").unwrap());
+static MOLTBOOK_TOKEN_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bmoltbook_sk_[A-Za-z0-9_-]{20,}\b").unwrap());
+static BEARER_TOKEN_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._-]{20,}\b").unwrap());
+static SECRET_ASSIGNMENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)(\b(?:api[_-]?key|secret|token|password|client_secret)\b\s*[:=]\s*['"]?)[A-Za-z0-9_\-./+=]{16,}(['"]?)"#,
+    )
+    .unwrap()
+});
+static ENV_STYLE_SECRET_ASSIGNMENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*)[^\s]{16,}").unwrap()
+});
+static URL_SECRET_QUERY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)([?&](?:access_token|token|sig|signature|api[_-]?key|key|auth|password|client_secret)=)[^&\s]+",
+    )
+    .unwrap()
+});
+
+fn push_secret_kind(kinds: &mut Vec<SecretInputType>, kind: SecretInputType) {
+    if !kinds.contains(&kind) {
+        kinds.push(kind);
+    }
+}
+
+fn apply_secret_redaction(
+    text: &mut String,
+    redactions: &mut Vec<String>,
+    kinds: &mut Vec<SecretInputType>,
+    pattern: &Regex,
+    replacement: &str,
+    label: &str,
+    kind: SecretInputType,
+) {
+    let count = pattern.find_iter(text).count();
+    if count == 0 {
+        return;
+    }
+    *text = pattern.replace_all(text, replacement).to_string();
+    redactions.push(format!("{} x{}", label, count));
+    push_secret_kind(kinds, kind);
+}
+
+pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
+    let mut redacted = text.to_string();
+    let mut redactions = Vec::new();
+    let mut kinds = Vec::new();
+
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &PRIVATE_KEY_BLOCK_PATTERN,
+        "[REDACTED_PRIVATE_KEY]",
+        "private_key",
+        SecretInputType::PrivateKeyMaterial,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &CERT_BLOCK_PATTERN,
+        "[REDACTED_CERTIFICATE]",
+        "certificate",
+        SecretInputType::PrivateKeyMaterial,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &OPENAI_KEY_PATTERN,
+        "[REDACTED_SECRET]",
+        "openai_key",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &GITHUB_PAT_PATTERN,
+        "[REDACTED_SECRET]",
+        "github_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &NOTION_TOKEN_PATTERN,
+        "[REDACTED_SECRET]",
+        "notion_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &GOOGLE_API_KEY_PATTERN,
+        "[REDACTED_SECRET]",
+        "google_api_key",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &GOOGLE_OAUTH_TOKEN_PATTERN,
+        "[REDACTED_SECRET]",
+        "google_oauth_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &SLACK_TOKEN_PATTERN,
+        "[REDACTED_SECRET]",
+        "slack_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &MOLTBOOK_TOKEN_PATTERN,
+        "[REDACTED_SECRET]",
+        "moltbook_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &BEARER_TOKEN_PATTERN,
+        "Bearer [REDACTED_SECRET]",
+        "bearer_token",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &SECRET_ASSIGNMENT_PATTERN,
+        "${1}[REDACTED_SECRET]${2}",
+        "secret_assignment",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &ENV_STYLE_SECRET_ASSIGNMENT_PATTERN,
+        "${1}[REDACTED_SECRET]",
+        "env_secret_assignment",
+        SecretInputType::ApiKeyOrToken,
+    );
+    apply_secret_redaction(
+        &mut redacted,
+        &mut redactions,
+        &mut kinds,
+        &URL_SECRET_QUERY_PATTERN,
+        "${1}[REDACTED_SECRET]",
+        "secret_query_param",
+        SecretInputType::ApiKeyOrToken,
+    );
+
+    SecretRedactionResult {
+        text: redacted,
+        redactions,
+        kinds,
+    }
+}
 
 impl SecurityGuard {
     pub fn new(strict_mode: bool) -> Self {
@@ -63,24 +268,6 @@ impl SecurityGuard {
             sensitive_keywords: Self::build_sensitive_keywords(),
             strict_mode,
         }
-    }
-
-    /// Best-effort detection of secrets in user input so we can avoid sending them to the LLM.
-    pub fn detect_secret_input(&self, input: &str) -> Option<SecretInputType> {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        for re in SECRET_INPUT_PATTERNS.iter() {
-            if re.is_match(trimmed) {
-                // Keep the taxonomy simple: key material is handled separately.
-                if trimmed.contains("PRIVATE KEY") || trimmed.contains("CERTIFICATE") {
-                    return Some(SecretInputType::PrivateKeyMaterial);
-                }
-                return Some(SecretInputType::ApiKeyOrToken);
-            }
-        }
-        None
     }
 
     /// Build patterns that detect prompt injection attempts
@@ -240,8 +427,9 @@ impl SecurityGuard {
 
     /// Filter output to prevent sensitive data leakage
     pub fn filter_output(&self, output: &str) -> FilteredOutput {
-        let mut filtered = output.to_string();
-        let mut redactions = Vec::new();
+        let redacted_secret_output = redact_secret_input(output);
+        let filtered = redacted_secret_output.text;
+        let mut redactions = redacted_secret_output.redactions;
 
         // Check for sensitive keywords
         let lower = output.to_lowercase();
@@ -250,27 +438,6 @@ impl SecurityGuard {
                 redactions.push(format!("Potential sensitive data: {}", keyword));
             }
         }
-
-        // Redact anything that looks like an API key
-        let api_key_pattern = Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap();
-        filtered = api_key_pattern
-            .replace_all(&filtered, "[REDACTED_API_KEY]")
-            .to_string();
-
-        // Redact bearer tokens
-        let bearer_pattern = Regex::new(r"(?i)bearer\s+[a-zA-Z0-9._-]+").unwrap();
-        filtered = bearer_pattern
-            .replace_all(&filtered, "[REDACTED_TOKEN]")
-            .to_string();
-
-        // Redact anything that looks like base64-encoded secrets
-        let b64_secret_pattern = Regex::new(
-            r#"(?i)(api_key|secret|token|password)\s*[=:]\s*['"]?[A-Za-z0-9+/=]{20,}['"]?"#,
-        )
-        .unwrap();
-        filtered = b64_secret_pattern
-            .replace_all(&filtered, "[REDACTED_SECRET]")
-            .to_string();
 
         let _is_clean = redactions.is_empty();
         FilteredOutput {
@@ -411,16 +578,42 @@ mod tests {
 
     #[test]
     fn test_secret_input_detection() {
-        let guard = SecurityGuard::new(true);
+        let token = redact_secret_input("sk-1234567890abcdefghijklmnop");
+        assert!(token.had_secret());
+        assert_eq!(token.primary_kind(), Some(SecretInputType::ApiKeyOrToken));
+
+        let private_key =
+            redact_secret_input("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----");
+        assert!(private_key.had_secret());
         assert_eq!(
-            guard.detect_secret_input("sk-1234567890abcdefghijklmnop"),
-            Some(SecretInputType::ApiKeyOrToken)
-        );
-        assert_eq!(
-            guard
-                .detect_secret_input("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"),
+            private_key.primary_kind(),
             Some(SecretInputType::PrivateKeyMaterial)
         );
-        assert_eq!(guard.detect_secret_input("Hello world"), None);
+
+        let plain_text = redact_secret_input("Hello world");
+        assert!(!plain_text.had_secret());
+        assert_eq!(plain_text.primary_kind(), None);
+    }
+
+    #[test]
+    fn test_secret_redaction_masks_bare_and_inline_secrets() {
+        let result = redact_secret_input(
+            "Use moltbook_sk_8ghQ92XoaW4VsHGUrOv00Ox17zc2__Y2 and api_key=sk-1234567890abcdefghijklmnop",
+        );
+        assert!(result.had_secret());
+        assert!(!result
+            .text
+            .contains("moltbook_sk_8ghQ92XoaW4VsHGUrOv00Ox17zc2__Y2"));
+        assert!(!result.text.contains("sk-1234567890abcdefghijklmnop"));
+        assert!(result.text.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn test_secret_redaction_masks_sensitive_query_params() {
+        let result =
+            redact_secret_input("Open https://example.com/callback?token=supersecretvalue123456");
+        assert!(result.had_secret());
+        assert!(result.text.contains("token=[REDACTED_SECRET]"));
+        assert!(!result.text.contains("supersecretvalue123456"));
     }
 }

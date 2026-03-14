@@ -1,0 +1,631 @@
+use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+const AUTOMATION_RUNS_KEY: &str = "automation_runs_v1";
+const AUTOMATION_SUPERVISOR_STATES_KEY: &str = "automation_supervisor_states_v1";
+const AUTOMATION_RUNS_LIMIT: usize = 600;
+const AUTOMATION_MAX_ATTEMPTS_CAP: u32 = 12;
+const AUTOMATION_MAX_STALL_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutomationOriginContext {
+    pub channel: Option<String>,
+    pub conversation_id: Option<String>,
+    pub project_id: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationValidationMode {
+    #[default]
+    None,
+    NonEmptyResult,
+    StructuredSuccess,
+    ContainsText,
+    RegexMatch,
+    JsonFieldExists,
+    JsonFieldEquals,
+    JsonArrayNonEmpty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationValidation {
+    pub mode: AutomationValidationMode,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub field_path: Option<String>,
+    #[serde(default)]
+    pub expected: Option<Value>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+impl Default for AutomationValidation {
+    fn default() -> Self {
+        Self {
+            mode: AutomationValidationMode::None,
+            text: None,
+            field_path: None,
+            expected: None,
+            pattern: None,
+        }
+    }
+}
+
+impl AutomationValidation {
+    pub fn is_unset(&self) -> bool {
+        self.mode == AutomationValidationMode::None
+            && self.text.is_none()
+            && self.field_path.is_none()
+            && self.expected.is_none()
+            && self.pattern.is_none()
+    }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            mode: self.mode.clone(),
+            text: normalize_optional_text(self.text.as_deref()),
+            field_path: normalize_optional_text(self.field_path.as_deref()),
+            expected: self.expected.clone(),
+            pattern: normalize_optional_text(self.pattern.as_deref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationExecutionPolicy {
+    pub max_attempts: u32,
+    pub stall_timeout_secs: u64,
+    pub retry_backoff_secs: u64,
+    pub validation: AutomationValidation,
+}
+
+impl Default for AutomationExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            stall_timeout_secs: 300,
+            retry_backoff_secs: 60,
+            validation: AutomationValidation::default(),
+        }
+    }
+}
+
+impl AutomationExecutionPolicy {
+    pub fn normalized(&self) -> Self {
+        Self {
+            max_attempts: self.max_attempts.clamp(1, AUTOMATION_MAX_ATTEMPTS_CAP),
+            stall_timeout_secs: self
+                .stall_timeout_secs
+                .clamp(30, AUTOMATION_MAX_STALL_TIMEOUT_SECS),
+            retry_backoff_secs: self.retry_backoff_secs.clamp(10, 24 * 60 * 60),
+            validation: self.validation.normalized(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Retrying,
+    TimedOut,
+    Triggered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutomationCritique {
+    pub summary: String,
+    pub retryable: bool,
+    pub validation_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationRunRecord {
+    pub id: String,
+    pub automation_id: String,
+    pub automation_kind: String,
+    pub title: String,
+    pub action: String,
+    pub trigger: String,
+    pub status: AutomationRunStatus,
+    pub attempt: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub origin: AutomationOriginContext,
+    pub policy: AutomationExecutionPolicy,
+    pub critique: AutomationCritique,
+    pub output_preview: Option<String>,
+    pub error: Option<String>,
+    pub next_retry_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutomationSupervisorState {
+    pub automation_id: String,
+    pub automation_kind: String,
+    pub title: String,
+    pub action: String,
+    pub status: String,
+    pub attempt_count: u32,
+    pub consecutive_failures: u32,
+    pub last_run_id: Option<String>,
+    pub last_run_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_error: Option<String>,
+    pub next_retry_at: Option<String>,
+    pub stalled_count: u32,
+    #[serde(default)]
+    pub origin: AutomationOriginContext,
+}
+
+pub async fn list_runs(
+    storage: &crate::storage::Storage,
+    limit: usize,
+) -> Result<Vec<AutomationRunRecord>> {
+    let raw = storage.get(AUTOMATION_RUNS_KEY).await?;
+    let mut runs = raw
+        .and_then(|bytes| serde_json::from_slice::<Vec<AutomationRunRecord>>(&bytes).ok())
+        .unwrap_or_default();
+    runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    if runs.len() > limit {
+        runs.truncate(limit);
+    }
+    Ok(runs)
+}
+
+pub async fn append_run(
+    storage: &crate::storage::Storage,
+    run: AutomationRunRecord,
+) -> Result<()> {
+    let raw = storage.get(AUTOMATION_RUNS_KEY).await?;
+    let mut runs = raw
+        .and_then(|bytes| serde_json::from_slice::<Vec<AutomationRunRecord>>(&bytes).ok())
+        .unwrap_or_default();
+    runs.push(run);
+    if runs.len() > AUTOMATION_RUNS_LIMIT {
+        let overflow = runs.len() - AUTOMATION_RUNS_LIMIT;
+        runs.drain(0..overflow);
+    }
+    storage
+        .set(AUTOMATION_RUNS_KEY, &serde_json::to_vec(&runs)?)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_supervisor_states(
+    storage: &crate::storage::Storage,
+) -> Result<Vec<AutomationSupervisorState>> {
+    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
+    let map = raw
+        .and_then(|bytes| {
+            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
+        })
+        .unwrap_or_default();
+    Ok(map.into_values().collect())
+}
+
+pub async fn load_supervisor_state(
+    storage: &crate::storage::Storage,
+    automation_id: &str,
+) -> Result<Option<AutomationSupervisorState>> {
+    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
+    let map = raw
+        .and_then(|bytes| {
+            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
+        })
+        .unwrap_or_default();
+    Ok(map.get(automation_id).cloned())
+}
+
+pub async fn upsert_supervisor_state(
+    storage: &crate::storage::Storage,
+    state: AutomationSupervisorState,
+) -> Result<()> {
+    let raw = storage.get(AUTOMATION_SUPERVISOR_STATES_KEY).await?;
+    let mut map = raw
+        .and_then(|bytes| {
+            serde_json::from_slice::<HashMap<String, AutomationSupervisorState>>(&bytes).ok()
+        })
+        .unwrap_or_default();
+    map.insert(state.automation_id.clone(), state);
+    storage
+        .set(
+            AUTOMATION_SUPERVISOR_STATES_KEY,
+            &serde_json::to_vec(&map)?,
+        )
+        .await?;
+    Ok(())
+}
+
+pub fn inject_context(
+    arguments: &Value,
+    origin: AutomationOriginContext,
+    default_policy: AutomationExecutionPolicy,
+) -> Value {
+    let mut next = arguments.clone();
+    if !next.is_object() {
+        next = serde_json::json!({});
+    }
+    let Some(root) = next.as_object_mut() else {
+        return next;
+    };
+
+    let existing_meta = root
+        .remove("_automation")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut meta = serde_json::Map::from_iter(existing_meta);
+    if !meta.contains_key("origin") {
+        meta.insert("origin".to_string(), serde_json::to_value(origin).unwrap_or(Value::Null));
+    }
+    if !meta.contains_key("policy") {
+        meta.insert(
+            "policy".to_string(),
+            serde_json::to_value(default_policy.normalized()).unwrap_or(Value::Null),
+        );
+    }
+    root.insert("_automation".to_string(), Value::Object(meta));
+    next
+}
+
+pub fn origin_from_arguments(arguments: &Value) -> AutomationOriginContext {
+    arguments
+        .get("_automation")
+        .and_then(|value| value.get("origin"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AutomationOriginContext>(value).ok())
+        .unwrap_or_default()
+}
+
+pub fn policy_from_arguments(
+    arguments: &Value,
+    fallback_validation: AutomationValidation,
+) -> AutomationExecutionPolicy {
+    let mut policy = arguments
+        .get("_automation")
+        .and_then(|value| value.get("policy"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AutomationExecutionPolicy>(value).ok())
+        .unwrap_or_default();
+    if policy.validation.is_unset() && !fallback_validation.is_unset() {
+        policy.validation = fallback_validation;
+    }
+    policy.normalized()
+}
+
+pub fn validation_from_request_argument(
+    arguments: &Value,
+    fallback_validation: AutomationValidation,
+) -> AutomationValidation {
+    arguments
+        .get("validation")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AutomationValidation>(value).ok())
+        .map(|value| value.normalized())
+        .filter(|value| !value.is_unset())
+        .unwrap_or_else(|| fallback_validation.normalized())
+}
+
+pub fn policy_from_request_argument(
+    arguments: &Value,
+    default_policy: AutomationExecutionPolicy,
+) -> AutomationExecutionPolicy {
+    let mut policy = arguments
+        .get("automation_policy")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AutomationExecutionPolicy>(value).ok())
+        .unwrap_or_else(|| default_policy.normalized());
+
+    if let Some(max_attempts) = arguments.get("max_attempts").and_then(|value| value.as_u64()) {
+        policy.max_attempts = max_attempts.clamp(1, AUTOMATION_MAX_ATTEMPTS_CAP as u64) as u32;
+    }
+    if let Some(stall_timeout_secs) = arguments
+        .get("stall_timeout_secs")
+        .and_then(|value| value.as_u64())
+    {
+        policy.stall_timeout_secs = stall_timeout_secs;
+    }
+    if let Some(retry_backoff_secs) = arguments
+        .get("retry_backoff_secs")
+        .and_then(|value| value.as_u64())
+    {
+        policy.retry_backoff_secs = retry_backoff_secs;
+    }
+
+    policy.validation =
+        validation_from_request_argument(arguments, default_policy.validation.clone());
+    policy.normalized()
+}
+
+pub fn increment_attempt(arguments: &mut Value, attempt: u32) {
+    let Some(root) = arguments.as_object_mut() else {
+        return;
+    };
+    let meta = root
+        .entry("_automation".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(meta_obj) = meta.as_object_mut() else {
+        return;
+    };
+    meta_obj.insert("attempt".to_string(), serde_json::json!(attempt));
+}
+
+pub fn current_attempt(arguments: &Value) -> u32 {
+    arguments
+        .get("_automation")
+        .and_then(|value| value.get("attempt"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(1, AUTOMATION_MAX_ATTEMPTS_CAP as u64) as u32)
+        .unwrap_or(1)
+}
+
+pub fn compute_retry_at(
+    now: DateTime<Utc>,
+    policy: &AutomationExecutionPolicy,
+    attempt: u32,
+) -> DateTime<Utc> {
+    let exponent = attempt.saturating_sub(1).min(8);
+    let multiplier = 2u64.saturating_pow(exponent);
+    let delay_secs = policy
+        .retry_backoff_secs
+        .saturating_mul(multiplier)
+        .min(7 * 24 * 60 * 60);
+    now + Duration::seconds(delay_secs as i64)
+}
+
+pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool {
+    let trimmed = output.trim();
+    let normalized = validation.normalized();
+    let parsed_json = serde_json::from_str::<Value>(trimmed).ok();
+    match validation.mode {
+        AutomationValidationMode::None => true,
+        AutomationValidationMode::NonEmptyResult => !trimmed.is_empty(),
+        AutomationValidationMode::StructuredSuccess => {
+            if trimmed.is_empty() {
+                return false;
+            }
+            if let Some(value) = parsed_json.as_ref() {
+                if value
+                    .get("success")
+                    .and_then(|item| item.as_bool())
+                    .unwrap_or(false)
+                    || value.get("ok").and_then(|item| item.as_bool()).unwrap_or(false)
+                {
+                    return true;
+                }
+                let status = value
+                    .get("status")
+                    .or_else(|| value.get("state"))
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                return matches!(
+                    status.as_str(),
+                    "ok"
+                        | "success"
+                        | "connected"
+                        | "completed"
+                        | "running"
+                        | "triggered"
+                        | "posted"
+                        | "claimed"
+                        | "published"
+                );
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            lower.contains("success")
+                || lower.contains("connected")
+                || lower.contains("completed")
+                || lower.contains("running")
+        }
+        AutomationValidationMode::ContainsText => normalized
+            .text
+            .as_ref()
+            .map(|text| {
+                validation_target_text(&normalized, trimmed, parsed_json.as_ref())
+                    .to_ascii_lowercase()
+                    .contains(&text.to_ascii_lowercase())
+            })
+            .unwrap_or(false),
+        AutomationValidationMode::RegexMatch => normalized
+            .pattern
+            .as_ref()
+            .or(normalized.text.as_ref())
+            .and_then(|pattern| Regex::new(pattern).ok())
+            .map(|regex| regex.is_match(&validation_target_text(&normalized, trimmed, parsed_json.as_ref())))
+            .unwrap_or(false),
+        AutomationValidationMode::JsonFieldExists => parsed_json
+            .as_ref()
+            .and_then(|value| {
+                normalized
+                    .field_path
+                    .as_deref()
+                    .and_then(|path| json_value_at_path(value, path))
+            })
+            .is_some(),
+        AutomationValidationMode::JsonFieldEquals => parsed_json
+            .as_ref()
+            .and_then(|value| {
+                normalized
+                    .field_path
+                    .as_deref()
+                    .and_then(|path| json_value_at_path(value, path))
+                    .map(|actual| {
+                        if let Some(expected) = normalized.expected.as_ref() {
+                            actual == expected
+                        } else if let Some(expected_text) = normalized.text.as_ref() {
+                            json_value_to_text(actual).eq_ignore_ascii_case(expected_text)
+                        } else {
+                            false
+                        }
+                    })
+            })
+            .unwrap_or(false),
+        AutomationValidationMode::JsonArrayNonEmpty => parsed_json
+            .as_ref()
+            .and_then(|value| {
+                let target = normalized
+                    .field_path
+                    .as_deref()
+                    .and_then(|path| json_value_at_path(value, path))
+                    .unwrap_or(value);
+                target.as_array().map(|items| !items.is_empty())
+            })
+            .unwrap_or(false),
+    }
+}
+
+pub fn critique_result(
+    validation: &AutomationValidation,
+    output: Option<&str>,
+    error: Option<&str>,
+) -> AutomationCritique {
+    let validation_passed = output
+        .map(|value| validate_result(validation, value))
+        .unwrap_or(false);
+    let normalized = validation.normalized();
+    let error_text = error.unwrap_or_default().trim();
+    let output_text = output.unwrap_or_default().trim();
+    let haystack = if !error_text.is_empty() {
+        error_text
+    } else {
+        output_text
+    }
+    .to_ascii_lowercase();
+    let retryable = !haystack.is_empty()
+        && [
+            "timeout",
+            "temporar",
+            "rate limit",
+            "429",
+            "unavailable",
+            "busy",
+            "pending",
+            "connection reset",
+            "network",
+            "retry later",
+        ]
+        .iter()
+        .any(|token| haystack.contains(token));
+    let summary = if !error_text.is_empty() {
+        format!("Execution failed: {}", truncate_text(error_text, 180))
+    } else if !validation_passed {
+        match validation.mode {
+            AutomationValidationMode::None => "Execution completed without validation.".to_string(),
+            AutomationValidationMode::NonEmptyResult => {
+                "Execution finished but did not produce a usable result.".to_string()
+            }
+            AutomationValidationMode::StructuredSuccess => {
+                "Execution finished but did not report a structured success state.".to_string()
+            }
+            AutomationValidationMode::ContainsText => format!(
+                "Execution finished but did not contain the required text{}.",
+                normalized
+                    .text
+                    .as_ref()
+                    .map(|text| format!(" `{}`", truncate_text(text, 80)))
+                    .unwrap_or_default()
+            ),
+            AutomationValidationMode::RegexMatch => format!(
+                "Execution finished but did not match the required pattern{}.",
+                normalized
+                    .pattern
+                    .as_ref()
+                    .or(normalized.text.as_ref())
+                    .map(|text| format!(" `{}`", truncate_text(text, 80)))
+                    .unwrap_or_default()
+            ),
+            AutomationValidationMode::JsonFieldExists => format!(
+                "Execution finished but the expected JSON field{} was missing.",
+                normalized
+                    .field_path
+                    .as_ref()
+                    .map(|path| format!(" `{}`", truncate_text(path, 80)))
+                    .unwrap_or_default()
+            ),
+            AutomationValidationMode::JsonFieldEquals => format!(
+                "Execution finished but JSON field{} did not match the expected value.",
+                normalized
+                    .field_path
+                    .as_ref()
+                    .map(|path| format!(" `{}`", truncate_text(path, 80)))
+                    .unwrap_or_default()
+            ),
+            AutomationValidationMode::JsonArrayNonEmpty => format!(
+                "Execution finished but JSON array{} was empty or missing.",
+                normalized
+                    .field_path
+                    .as_ref()
+                    .map(|path| format!(" `{}`", truncate_text(path, 80)))
+                    .unwrap_or_default()
+            ),
+        }
+    } else {
+        "Execution and validation completed successfully.".to_string()
+    };
+    AutomationCritique {
+        summary,
+        retryable,
+        validation_passed,
+    }
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn json_value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in path.split('.').map(str::trim).filter(|segment| !segment.is_empty()) {
+        if let Ok(index) = segment.parse::<usize>() {
+            current = current.as_array()?.get(index)?;
+        } else {
+            current = current.get(segment)?;
+        }
+    }
+    Some(current)
+}
+
+fn json_value_to_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(num) => num.to_string(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+fn validation_target_text(
+    validation: &AutomationValidation,
+    raw_output: &str,
+    parsed_json: Option<&Value>,
+) -> String {
+    if let (Some(value), Some(path)) = (parsed_json, validation.field_path.as_deref()) {
+        if let Some(target) = json_value_at_path(value, path) {
+            return json_value_to_text(target);
+        }
+    }
+    raw_output.to_string()
+}
+
+pub fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        format!("{}...", value.chars().take(max_chars).collect::<String>())
+    }
+}

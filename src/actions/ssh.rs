@@ -246,11 +246,11 @@ struct Handler;
 impl russh::client::Handler for Handler {
     type Error = anyhow::Error;
 
-    fn check_server_key(
+    async fn check_server_key(
         &mut self,
         _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> impl std::future::Future<Output = std::result::Result<bool, Self::Error>> + Send {
+    ) -> std::result::Result<bool, Self::Error> {
         // Accept all host keys - trust is managed by the user configuring connections
-        async { Ok(true) }
+        Ok(true)
     }
 }

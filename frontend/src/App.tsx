@@ -31,11 +31,13 @@ import FlagRoundedIcon from "@mui/icons-material/FlagRounded";
 import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import NotificationsNoneRoundedIcon from "@mui/icons-material/NotificationsNoneRounded";
 import FolderRoundedIcon from "@mui/icons-material/FolderRounded";
+import ForumRoundedIcon from "@mui/icons-material/ForumRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import SpaceDashboardRoundedIcon from "@mui/icons-material/SpaceDashboardRounded";
 import QueryStatsRoundedIcon from "@mui/icons-material/QueryStatsRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
+import TaskAltRoundedIcon from "@mui/icons-material/TaskAltRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -56,6 +58,7 @@ type ViewKey =
   | "skills"
   | "tasks"
   | "apps"
+  | "moltbook"
   | "arkpulse"
   | "memory"
   | "goals"
@@ -86,14 +89,17 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { key: "skills", label: "Skills", icon: <BoltRoundedIcon fontSize="small" /> },
       { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
+      { key: "swarm", label: "Agents", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
-      { key: "autonomy", label: "Autonomy", icon: <AutoAwesomeRoundedIcon fontSize="small" /> }
+      { key: "moltbook", label: "Moltbook", icon: <ForumRoundedIcon fontSize="small" /> }
     ]
   },
   {
     id: "operations",
     label: "Operations",
     items: [
+      { key: "tasks", label: "Tasks", icon: <TaskAltRoundedIcon fontSize="small" /> },
+      { key: "status", label: "Watchers", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
       { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
       { key: "trace", label: "Trace", icon: <HubRoundedIcon fontSize="small" /> }
     ]
@@ -106,8 +112,6 @@ const NAV_GROUPS: NavGroup[] = [
       { key: "analytics", label: "Analytics", icon: <QueryStatsRoundedIcon fontSize="small" /> }
     ]
   }
-  // { key: "swarm", label: "Swarm", icon: <HubRoundedIcon fontSize="small" /> },
-  // { key: "status", label: "Status", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
 ];
 
 const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
@@ -116,12 +120,13 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   skills: "skills",
   tasks: "tasks",
   apps: "apps",
+  moltbook: "moltbook",
   arkpulse: "arkpulse",
   memory: "memory",
   goals: "goals",
   autonomy: "autonomy",
   trace: "trace",
-  status: "status",
+  status: "watchers",
   swarm: "swarm",
   projects: "projects",
   documents: "documents",
@@ -153,15 +158,15 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
   }
 
   if (normalized.startsWith("/ui/")) {
-    const segment = normalized.slice("/ui/".length).split("/")[0]?.toLowerCase() || "";
-    if (segment === "actions") return { view: "skills", matched: true };
-    if (segment === "integrations") return { view: "settings", matched: true };
-    if (segment === "memory") return { view: "settings", matched: true };
-    const view = PATH_SEGMENT_TO_VIEW[segment];
-    if (view) {
-      if (view === "tasks") return { view: "skills", matched: true };
-      return { view, matched: true };
-    }
+      const segment = normalized.slice("/ui/".length).split("/")[0]?.toLowerCase() || "";
+      if (segment === "actions") return { view: "skills", matched: true };
+      if (segment === "integrations") return { view: "settings", matched: true };
+      if (segment === "memory") return { view: "settings", matched: true };
+      if (segment === "status") return { view: "status", matched: true };
+      const view = PATH_SEGMENT_TO_VIEW[segment];
+      if (view) {
+        return { view, matched: true };
+      }
   }
 
   return { view: "overview", matched: false };
@@ -189,6 +194,29 @@ function formatMetaValue(value: unknown): { text: string; href?: string } {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function notifTimeAgo(raw?: string | null): { label: string; tip: string } {
+  if (!raw) return { label: "", tip: "" };
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return { label: raw, tip: raw };
+  const tip = new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+  }).format(dt);
+  const diffMs = Date.now() - dt.getTime();
+  const isPast = diffMs >= 0;
+  const absSec = Math.round(Math.abs(diffMs) / 1000);
+  if (absSec < 30) return { label: "just now", tip };
+  const absMin = Math.round(absSec / 60);
+  if (absMin < 60) { const s = absMin === 1 ? "1 min" : `${absMin} mins`; return { label: isPast ? `${s} ago` : `in ${s}`, tip }; }
+  const absHours = Math.round(absMin / 60);
+  if (absHours < 24) { const s = absHours === 1 ? "1 hour" : `${absHours} hours`; return { label: isPast ? `${s} ago` : `in ${s}`, tip }; }
+  const absDays = Math.round(absHours / 24);
+  if (absDays < 7) { const s = absDays === 1 ? "1 day" : `${absDays} days`; return { label: isPast ? `${s} ago` : `in ${s}`, tip }; }
+  const absWeeks = Math.round(absDays / 7);
+  if (absWeeks < 5) { const s = absWeeks === 1 ? "1 week" : `${absWeeks} weeks`; return { label: isPast ? `${s} ago` : `in ${s}`, tip }; }
+  return { label: tip, tip };
 }
 
 function isAutomationFailureNotification(notification: {
@@ -227,8 +255,9 @@ function shouldSurfaceNotification(notification: {
   level?: string;
 }): boolean {
   const source = (notification.source || "").toLowerCase();
-  if (!source.includes("arkpulse")) return true;
   const title = (notification.title || "").toLowerCase();
+  if (source.includes("watcher") || title.includes("watcher triggered")) return false;
+  if (!source.includes("arkpulse")) return true;
   const body = (notification.body || "").toLowerCase();
   const level = (notification.level || "").toLowerCase();
   return (
@@ -870,8 +899,8 @@ export default function App() {
                         >
                           {n.title || "Notification"}
                         </Typography>
-                        <Typography variant="caption" noWrap sx={{ flexShrink: 0, color: "rgba(195, 221, 252, 0.35)" }}>
-                          {n.created_at?.slice(0, 19) || ""}
+                        <Typography variant="caption" noWrap sx={{ flexShrink: 0, color: "rgba(195, 221, 252, 0.35)" }} title={notifTimeAgo(n.created_at).tip}>
+                          {notifTimeAgo(n.created_at).label}
                         </Typography>
                       </Stack>
                     }
@@ -929,8 +958,8 @@ export default function App() {
               </Button>
             ) : null}
           </Stack>
-          <Typography variant="caption" color="text.secondary">
-            {selectedNotification?.created_at?.slice(0, 19) || ""}
+          <Typography variant="caption" color="text.secondary" title={notifTimeAgo(selectedNotification?.created_at).tip}>
+            {notifTimeAgo(selectedNotification?.created_at).label}
           </Typography>
           <Divider />
           <Box sx={{ flex: 1, minHeight: 0, overflow: "auto" }}>

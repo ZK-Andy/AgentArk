@@ -17,7 +17,17 @@ type AttentionItem = {
   kind: "approval" | "failed" | "security" | "setup";
   title: string;
   detail?: string;
+  targetView?: string;
 };
+
+function notificationTargetView(notification: Notification): string {
+  const title = String(notification.title || "").toLowerCase();
+  const body = String(notification.body || "").toLowerCase();
+  const source = String(notification.source || notification.metadata?.source || "").toLowerCase();
+  const hay = `${title} ${body} ${source}`;
+  if (hay.includes("arkpulse")) return "arkpulse";
+  return "settings";
+}
 
 type Props = {
   tasks: Task[];
@@ -109,6 +119,7 @@ function buildItems(
         kind: "security",
         title: n.title || "Alert",
         detail: n.body?.slice(0, 80),
+        targetView: notificationTargetView(n),
       });
     }
   }
@@ -225,7 +236,7 @@ export function NeedsAttentionInbox({
                       <Button
                         variant="text"
                         size="small"
-                        onClick={() => onNavigate("settings")}
+                        onClick={() => onNavigate(item.targetView || "settings")}
                         sx={{ textTransform: "none" }}
                       >
                         View

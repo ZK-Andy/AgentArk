@@ -104,6 +104,7 @@ start_playwright_bridge() {
         echo -e "${GREEN}Starting Playwright bridge (localhost:3100)...${NC}"
         PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright} \
         PORT=${PLAYWRIGHT_BRIDGE_PORT:-3100} \
+        PLAYWRIGHT_BRIDGE_HOST=${PLAYWRIGHT_BRIDGE_HOST:-127.0.0.1} \
         gosu agent node /app/playwright-bridge/index.js &
         PLAYWRIGHT_PID=$!
         echo -e "${GREEN}Playwright bridge started (PID: $PLAYWRIGHT_PID)${NC}"

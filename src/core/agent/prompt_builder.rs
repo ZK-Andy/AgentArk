@@ -67,14 +67,23 @@ impl Agent {
 
 ## Core Operating Rules
 - Understand the user's goal from natural language and choose the best matching action from the request-specific action catalog.
-- Execute immediately when the request is actionable and required inputs are already available.
-- Ask for clarification only when a required input is missing or the action would be destructive under unresolved ambiguity.
+  - Execute immediately when the request is actionable and required inputs are already available.
+  - Ask for clarification only when a required input is missing or the action would be destructive under unresolved ambiguity.
+  - If the execution shape itself is unclear (for example chat vs app vs task vs watcher vs integration), ask one short confirmation instead of guessing.
+- If the user names a concrete destination, community, page, app, account, or workspace and asks you to explore, contribute, engage, or "try something", start with the nearest safe read/inspect step and then take one concrete action if the available tools allow it. Do not bounce back with a clarification when you already have enough context to begin.
 - Prefer working in the current workspace when the user refers to files, routes, APIs, containers, scripts, the repo, or existing UI.
 - Use recent artifact context when present, but ignore it if the user has clearly changed topics.
 - Never ask the user to provide raw JSON payloads. Map natural language to tool arguments yourself.
 - Never hardcode secrets into generated code or tool arguments. Use secret storage or sensitive runtime inputs.
 - Keep retries bounded. State or enforce a maximum attempt count and stop at the cap.
 - Be honest about uncertainty. If the available actions do not fully cover the request, say so briefly and take the closest safe path.
+- Lightweight saved user facts may already be included later in this prompt. Richer semantic memory, saved items, and durable knowledge are not prefetched; if prior context outside the visible prompt may affect the answer, use the relevant memory action from the catalog before answering.
+- When the user asks what the agent has access to, what is configured, or what is available in the workspace, inspect live platform state with the relevant inventory/manage actions instead of guessing.
+- Treat the system as broadly inspectable for operational state: apps, tasks, watchers, goals, traces, logs, integrations, documents, and runtime status are all fair game when the relevant actions exist. Never reveal raw keys, tokens, passwords, or secret values.
+- For community/social posting actions, write original agent-authored content based on the current situation and your own grounded reasoning. Do not simply restate the user's instruction as the post or comment, and never include user data, PII, conversation text, or secrets.
+- For ongoing or indefinite monitoring ("every minute", "every hour", "every day", "keep watching"), create a scheduled task/routine. Use a watcher only for bounded poll-until-condition workflows with a clear timeout.
+- For persistent resources such as apps, tasks, watchers, and reusable capabilities, default to updating/reusing an existing matching item instead of creating a duplicate. Create a second one only when the user explicitly asks for another separate copy.
+- If the request needs a capability that does not already exist, first inspect existing integrations/actions. If the capability is still missing and the catalog exposes capability acquisition/scaffolding, use it to generate a reusable connector-backed action instead of failing immediately.
 
 ## Action Selection
 - The action catalog appears later in this prompt and is the source of truth for available capabilities.
@@ -110,15 +119,16 @@ impl Agent {
                 .iter()
                 .filter(|t| {
                     t.action == "goal"
-                        && matches!(
+                        && !matches!(
                             t.status,
-                            crate::core::TaskStatus::Pending | crate::core::TaskStatus::InProgress
+                            crate::core::TaskStatus::Failed { .. }
+                                | crate::core::TaskStatus::Cancelled
                         )
                 })
                 .collect();
 
             if !goals.is_empty() {
-                prompt.push_str("\n## Active Goals\n");
+                prompt.push_str("\n## Saved Goals\n");
                 for g in &goals {
                     let deadline_note = if let Some(due) = g.scheduled_for {
                         let days_left = (due - now).num_days();
@@ -151,6 +161,152 @@ impl Agent {
         Ok(crate::security::SecurityGuard::protect_system_prompt(
             &prompt,
         ))
+    }
+
+    pub(crate) fn build_runtime_access_summary(actions: &[crate::actions::ActionDef]) -> String {
+        if actions.is_empty() {
+            return String::new();
+        }
+
+        let system_count = actions
+            .iter()
+            .filter(|action| matches!(action.source, crate::actions::ActionSource::System))
+            .count();
+        let mut bundled = actions
+            .iter()
+            .filter(|action| matches!(action.source, crate::actions::ActionSource::Bundled))
+            .map(|action| action.name.clone())
+            .collect::<Vec<_>>();
+        bundled.sort();
+        let mut custom = actions
+            .iter()
+            .filter(|action| matches!(action.source, crate::actions::ActionSource::Custom))
+            .map(|action| action.name.clone())
+            .collect::<Vec<_>>();
+        custom.sort();
+
+        let mut lines = vec![format!(
+            "## Runtime Access Summary\n- Scoped executable actions: {} total ({} system, {} bundled, {} user-added).",
+            actions.len(),
+            system_count,
+            bundled.len(),
+            custom.len()
+        )];
+
+        let mut surfaces = Vec::new();
+        if actions.iter().any(|action| action.name == "list_tasks") {
+            surfaces.push("tasks/routines");
+        }
+        if actions.iter().any(|action| action.name == "schedule_task") {
+            surfaces.push("scheduling");
+        }
+        if actions
+            .iter()
+            .any(|action| action.name == "watch" || action.name == "list_watchers")
+        {
+            surfaces.push("watchers");
+        }
+        if actions.iter().any(|action| action.name == "goal_manage") {
+            surfaces.push("goals");
+        }
+        if actions.iter().any(|action| action.name == "manage_actions") {
+            surfaces.push("action library and user-added skills");
+        }
+        if actions
+            .iter()
+            .any(|action| action.name == "list_integrations")
+        {
+            surfaces.push("integration inventory");
+        }
+        if actions.iter().any(|action| action.name == "app_inspect") {
+            surfaces.push("deployed apps");
+        }
+        if actions.iter().any(|action| action.name == "security_logs") {
+            surfaces.push("security logs");
+        }
+        if actions.iter().any(|action| action.name == "memory_lookup") {
+            surfaces.push("durable memory");
+        }
+        if !surfaces.is_empty() {
+            lines.push(format!(
+                "- Platform surfaces reachable in this request: {}.",
+                surfaces.join(", ")
+            ));
+        }
+
+        let app_tools = ["app_inspect", "app_restart", "app_deploy"]
+            .into_iter()
+            .filter(|name| actions.iter().any(|action| action.name == *name))
+            .collect::<Vec<_>>();
+        if !app_tools.is_empty() {
+            lines.push(format!(
+                "- App/deployment tools available now: {}.",
+                app_tools
+                    .iter()
+                    .map(|name| format!("`{}`", name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let dynamic_integration_tool_count = actions
+            .iter()
+            .filter(|action| action.description.starts_with("Integration tool '"))
+            .count();
+        if dynamic_integration_tool_count > 0 {
+            lines.push(format!(
+                "- Integration-backed tools already present in this scoped catalog: {}.",
+                dynamic_integration_tool_count
+            ));
+        }
+
+        if actions
+            .iter()
+            .any(|action| action.name == "capability_acquire")
+        {
+            lines.push(
+                "- Missing capabilities can be scaffolded into reusable user-added actions when needed."
+                    .to_string(),
+            );
+        }
+
+        if !custom.is_empty() {
+            let preview = custom.iter().take(6).cloned().collect::<Vec<_>>();
+            let more = custom.len().saturating_sub(preview.len());
+            lines.push(format!(
+                "- User-added skills/actions loaded: {}{}.",
+                preview
+                    .iter()
+                    .map(|name| format!("`{}`", name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if more > 0 {
+                    format!(" (+{} more)", more)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+
+        if !bundled.is_empty() {
+            let preview = bundled.iter().take(6).cloned().collect::<Vec<_>>();
+            let more = bundled.len().saturating_sub(preview.len());
+            lines.push(format!(
+                "- Bundled skills/actions loaded: {}{}.",
+                preview
+                    .iter()
+                    .map(|name| format!("`{}`", name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if more > 0 {
+                    format!(" (+{} more)", more)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+
+        format!("{}\n", lines.join("\n"))
     }
 
     pub(crate) fn build_action_catalog_prompt(actions: &[crate::actions::ActionDef]) -> String {

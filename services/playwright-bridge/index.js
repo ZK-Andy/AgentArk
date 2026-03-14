@@ -6,6 +6,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3100;
+const HOST = process.env.PLAYWRIGHT_BRIDGE_HOST || process.env.HOST || '127.0.0.1';
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 min inactivity timeout
 
 // Active browser sessions: id -> { context, page, lastActivity, cleanupTimer }
@@ -279,6 +280,6 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Playwright bridge listening on port ${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Playwright bridge listening on ${HOST}:${PORT}`);
 });

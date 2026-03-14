@@ -278,6 +278,7 @@ impl IntegrationManager {
         let mut result = Vec::new();
         for (id, integration) in &self.integrations {
             if integration.capabilities().contains(&Capability::Notify)
+                && self.is_enabled(id)
                 && integration.is_connected().await
             {
                 result.push(id.clone());

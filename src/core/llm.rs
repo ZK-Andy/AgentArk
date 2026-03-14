@@ -1421,7 +1421,7 @@ impl LlmClient {
                                 serde_json::Value::Null
                             } else {
                                 serde_json::from_str(trimmed)
-                                    .unwrap_or_else(|_| serde_json::Value::String(raw))
+                                    .unwrap_or(serde_json::Value::String(raw))
                             }
                         }
                         Some(OpenAIFunctionArguments::Json(v)) => v,
