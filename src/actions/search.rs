@@ -492,7 +492,11 @@ impl SearchClient {
     fn extract_snippet_near(body_text: &str, title: &str) -> String {
         // Find the title (or a substring) in the body text
         let search_term = if title.chars().count() > 20 {
-            &title[..title.char_indices().nth(20).map(|(i, _)| i).unwrap_or(title.len())]
+            &title[..title
+                .char_indices()
+                .nth(20)
+                .map(|(i, _)| i)
+                .unwrap_or(title.len())]
         } else {
             title
         };
@@ -514,11 +518,7 @@ impl SearchClient {
     }
 
     /// Search using Lightpanda + DuckDuckGo HTML
-    async fn search_lightpanda(
-        &self,
-        query: &str,
-        num_results: usize,
-    ) -> Result<SearchResponse> {
+    async fn search_lightpanda(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
         let search_url = format!(
             "https://html.duckduckgo.com/html/?q={}",
             urlencoding::encode(query)

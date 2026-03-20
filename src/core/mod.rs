@@ -7,6 +7,7 @@ pub mod browser_session;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
+pub(crate) mod document_search;
 pub mod intent;
 mod llm;
 pub mod net;

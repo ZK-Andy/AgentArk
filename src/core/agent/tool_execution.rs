@@ -57,10 +57,14 @@ fn app_deploy_chat_progress_message(
         )
     } else if lower.starts_with("validating deployed app") {
         Some("I'm validating the deployed app now.".to_string())
-    } else if lower.starts_with("starting public tunnel for app access")
+    } else if lower.starts_with("starting remote access for app sharing")
+        || lower.starts_with("starting public tunnel for app access")
         || lower.starts_with("starting cloudflare tunnel for public app access")
     {
-        Some("I'm trying to start a public tunnel so you can open the app externally.".to_string())
+        Some(
+            "I'm preparing the remote access link so you can open the app from another device."
+                .to_string(),
+        )
     } else if lower.starts_with("app created but waiting for required inputs:") {
         Some(content.to_string())
     } else if lower.starts_with("static app ready at ") {
@@ -2395,7 +2399,7 @@ Do not include any extra prose.",
             if let Some(tx) = stream_tx {
                 let _ = tx.try_send(StreamEvent::ToolProgress {
                     name: "app_deploy".to_string(),
-                    content: "Starting public tunnel for app access...".to_string(),
+                    content: "Starting remote access for app sharing...".to_string(),
                     payload: None,
                 });
             }
@@ -6157,7 +6161,7 @@ Do not include any extra prose.",
                                 };
                                 let public_access_note = if expose_public_requested {
                                     match self
-                                        .ensure_public_tunnel_base_url(Some(&app_id), stream_tx.as_ref())
+                                        .ensure_public_tunnel_base_url(Some(app_id), stream_tx.as_ref())
                                         .await
                                     {
                                         Some(base) => {
@@ -6274,7 +6278,7 @@ Do not include any extra prose.",
                                 }
                                 let mut public_base_for_app = if expose_public_requested {
                                     self.ensure_public_tunnel_base_url(
-                                        Some(&app_id),
+                                        Some(app_id.as_str()),
                                         stream_tx.as_ref(),
                                     )
                                     .await

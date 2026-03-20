@@ -2,9 +2,11 @@
 
 pub mod encrypted;
 pub mod entities;
+pub mod legacy_recovery;
 
 use crate::crypto::KeyManager;
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::sea_query::Expr;
 #[allow(unused_imports)]
 use sea_orm::{
@@ -24,9 +26,16 @@ pub struct Storage {
 }
 
 static STORAGE_KEY_MANAGER: OnceLock<RwLock<Option<Arc<KeyManager>>>> = OnceLock::new();
+static STORAGE_FALLBACK_KEY_MANAGERS: OnceLock<RwLock<Vec<Arc<KeyManager>>>> = OnceLock::new();
+
+pub(crate) const ENCRYPTED_STORAGE_UNAVAILABLE: &str = "[Encrypted content unavailable]";
 
 fn storage_key_manager_slot() -> &'static RwLock<Option<Arc<KeyManager>>> {
     STORAGE_KEY_MANAGER.get_or_init(|| RwLock::new(None))
+}
+
+fn storage_fallback_key_manager_slot() -> &'static RwLock<Vec<Arc<KeyManager>>> {
+    STORAGE_FALLBACK_KEY_MANAGERS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 pub fn install_storage_key_manager(key_manager: Arc<KeyManager>) {
@@ -35,11 +44,24 @@ pub fn install_storage_key_manager(key_manager: Arc<KeyManager>) {
     }
 }
 
+pub fn install_storage_fallback_key_managers(key_managers: Vec<Arc<KeyManager>>) {
+    if let Ok(mut guard) = storage_fallback_key_manager_slot().write() {
+        *guard = key_managers;
+    }
+}
+
 fn current_storage_key_manager() -> Option<Arc<KeyManager>> {
     storage_key_manager_slot()
         .read()
         .ok()
         .and_then(|guard| guard.clone())
+}
+
+fn current_storage_fallback_key_managers() -> Vec<Arc<KeyManager>> {
+    storage_fallback_key_manager_slot()
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
 }
 
 fn encrypt_storage_string(value: &str) -> Result<String> {
@@ -53,14 +75,46 @@ fn encrypt_storage_string(value: &str) -> Result<String> {
     }
 }
 
+fn decode_storage_ciphertext_bytes(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.trim();
+    if trimmed.len() < 24 || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+    {
+        return None;
+    }
+    let mut padded = trimmed.to_string();
+    while !padded.len().is_multiple_of(4) {
+        padded.push('=');
+    }
+    BASE64.decode(padded.as_bytes()).ok()
+}
+
+fn looks_like_encrypted_storage_string(value: &str) -> bool {
+    decode_storage_ciphertext_bytes(value)
+        .map(|bytes| bytes.len() >= 24)
+        .unwrap_or(false)
+}
+
 fn decrypt_storage_string(value: &str) -> String {
     if value.is_empty() {
         return String::new();
     }
     if let Some(key_manager) = current_storage_key_manager() {
-        key_manager
-            .decrypt_string(value)
-            .unwrap_or_else(|_| value.to_string())
+        if let Ok(decrypted) = key_manager.decrypt_string(value) {
+            return decrypted;
+        }
+    }
+    for key_manager in current_storage_fallback_key_managers() {
+        if let Ok(decrypted) = key_manager.decrypt_string(value) {
+            return decrypted;
+        }
+    }
+    if looks_like_encrypted_storage_string(value) {
+        ENCRYPTED_STORAGE_UNAVAILABLE.to_string()
     } else {
         value.to_string()
     }
@@ -123,6 +177,7 @@ impl Storage {
     const HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
     const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
     const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
+    const MAX_DOCUMENTS_FOR_SEARCH: u64 = 5_000;
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
     const SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY: &'static str =
         "storage_sensitive_payload_backfill_v4";
@@ -2720,6 +2775,25 @@ PRAGMA busy_timeout = 5000;\n",
         Ok(query.count(&self.db).await?)
     }
 
+    /// List a bounded set of documents for metadata search.
+    pub async fn list_documents_for_search(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<document::Model>> {
+        let mut query = document::Entity::find().order_by_desc(document::Column::CreatedAt);
+        if let Some(pid) = project_id {
+            query = query.filter(document::Column::ProjectId.eq(pid));
+        }
+        let mut docs = query
+            .limit(Self::MAX_DOCUMENTS_FOR_SEARCH)
+            .all(&self.db)
+            .await?;
+        for doc in &mut docs {
+            doc.filename = decrypt_storage_string(&doc.filename);
+        }
+        Ok(docs)
+    }
+
     /// Get document chunks for search
     pub async fn get_document_chunks(
         &self,
@@ -2736,9 +2810,17 @@ PRAGMA busy_timeout = 5000;\n",
         Ok(chunks)
     }
 
-    /// Get all chunks (across all documents, for search)
-    pub async fn get_all_document_chunks(&self) -> Result<Vec<document_chunk::Model>> {
+    /// Get document chunks for a bounded set of documents.
+    pub async fn list_document_chunks_for_documents(
+        &self,
+        document_ids: &[String],
+    ) -> Result<Vec<document_chunk::Model>> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut chunks = document_chunk::Entity::find()
+            .filter(document_chunk::Column::DocumentId.is_in(document_ids.iter().cloned()))
             .order_by_asc(document_chunk::Column::DocumentId)
             .order_by_asc(document_chunk::Column::ChunkIndex)
             .limit(Self::MAX_DOCUMENT_CHUNKS_FOR_SEARCH)
@@ -2748,6 +2830,23 @@ PRAGMA busy_timeout = 5000;\n",
             chunk.content = decrypt_storage_string(&chunk.content);
         }
         Ok(chunks)
+    }
+
+    /// Update the stored embedding for a document chunk.
+    pub async fn update_document_chunk_embedding(
+        &self,
+        chunk_id: &str,
+        embedding: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(existing) = document_chunk::Entity::find_by_id(chunk_id.to_string())
+            .one(&self.db)
+            .await?
+        {
+            let mut model: document_chunk::ActiveModel = existing.into();
+            model.embedding = Set(embedding);
+            model.update(&self.db).await?;
+        }
+        Ok(())
     }
 
     /// Delete a document and its chunks

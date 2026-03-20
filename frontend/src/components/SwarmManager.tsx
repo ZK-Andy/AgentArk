@@ -194,11 +194,17 @@ export function SwarmManager({ autoRefresh }: Props) {
     queryFn: () => api.rawGet("/swarm/delegations?limit=all"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
+  const traceHistoryQ = useQuery({
+    queryKey: ["swarm-history-fallback"],
+    queryFn: () => api.rawGet(`/trace?limit=${HISTORY_LIMIT}`),
+    refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
 
   const status = asRecord(statusQ.data);
   const config = asRecord(configQ.data);
   const agents = pickRecords(agentsQ.data, "agents");
   const delegations = pickRecords(delegationsQ.data, "delegations");
+  const traceHistory = pickRecords(traceHistoryQ.data, "history");
   const liveAgents = pickRecords(status.agents, "agents");
   const liveById = new Map(
     liveAgents.map((agent) => [str(agent.id, ""), normalizeLifecycleStatus(agent.status)])
@@ -229,7 +235,7 @@ export function SwarmManager({ autoRefresh }: Props) {
     });
 
   const runningAgents = provisionedAgents.filter((agent) => agent.status === "running");
-  const historyItems: HistoryItem[] = delegations
+  const delegationHistoryItems: HistoryItem[] = delegations
     .map((row) => {
       const completedAt = str(row.completed_at, "");
       const createdAt = str(row.created_at, "");
@@ -269,11 +275,39 @@ export function SwarmManager({ autoRefresh }: Props) {
     })
     .slice(0, HISTORY_LIMIT);
 
+  const traceFallbackItems: HistoryItem[] = traceHistory
+    .map((row) => {
+      const traceId = str(row.id, "").trim();
+      const channel = str(row.channel, "").trim();
+      const model = str(row.model, "").trim();
+      const complexity = str(row.complexity, "").trim();
+      const duration = num(row.duration_ms, 0);
+      const detailParts: string[] = [];
+      if (model) detailParts.push(model);
+      if (complexity) detailParts.push(`complexity: ${complexity}`);
+      if (duration > 0) detailParts.push(`${duration}ms`);
+      return {
+        id: `trace-${traceId || Math.random().toString(36).slice(2)}`,
+        agentName: "AgentArk",
+        triggerText: channel ? `Run on ${channel}` : "Recent run",
+        workText: str(row.message_preview, "Execution run"),
+        status: normalizeLifecycleStatus(row.status),
+        timestamp: str(row.started_at, ""),
+        detail: detailParts.length > 0 ? detailParts.join(" | ") : "Execution trace"
+      };
+    })
+    .filter((item) => item.timestamp || item.workText)
+    .slice(0, HISTORY_LIMIT);
+
+  const usingTraceFallback = delegationHistoryItems.length === 0 && traceFallbackItems.length > 0;
+  const historyItems = usingTraceFallback ? traceFallbackItems : delegationHistoryItems;
+
   const runningCount = runningAgents.length;
   const completedCount = historyItems.filter((item) => item.status === "completed").length;
   const failedCount = historyItems.filter((item) => item.status === "failed").length;
   const cancelledCount = historyItems.filter((item) => item.status === "cancelled").length;
-  const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error;
+  const queryError =
+    statusQ.error || configQ.error || agentsQ.error || delegationsQ.error || traceHistoryQ.error;
 
   return (
     <Stack spacing={2.5}>
@@ -340,6 +374,11 @@ export function SwarmManager({ autoRefresh }: Props) {
                   AgentArk only shows live agents here while they are actively running. Finished work moves into history,
                   and idle specialists stay hidden from this page.
                 </Typography>
+                {usingTraceFallback ? (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                    Showing recent execution history because no specialist delegation records were found for this runtime yet.
+                  </Typography>
+                ) : null}
               </Box>
             </Stack>
 

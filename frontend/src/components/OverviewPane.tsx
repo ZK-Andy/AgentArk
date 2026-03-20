@@ -24,9 +24,10 @@ import { NeedsAttentionInbox } from "./NeedsAttentionInbox";
 import { TodaysHighlights } from "./TodaysHighlights";
 import { SmartSuggestions } from "./SmartSuggestions";
 import { ActivityFeed } from "./ActivityFeed";
-import type { RecommendedSkill } from "../types";
+import type { RecommendedSkill, Task } from "../types";
 
 const REFRESH_MS = 8000;
+const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
 type PausePhase = "idle" | "stopping" | "stopped" | "resuming" | "resumed";
 type AutomationObject = {
   id: string;
@@ -131,6 +132,14 @@ function errMessage(error: unknown): string {
   return "Request failed.";
 }
 
+function isFreshInProgressTask(task: Task): boolean {
+  const status = String(task?.status || "").toLowerCase();
+  if (!status.includes("inprogress")) return false;
+  const createdAt = Date.parse(String(task?.created_at || ""));
+  if (Number.isNaN(createdAt)) return true;
+  return Date.now() - createdAt <= ACTIVE_TASK_STALE_MS;
+}
+
 type Props = {
   navigateToView: (view: string, replace?: boolean) => void;
   serverStatus?: { at: number; rtt_ms: number; status: import("../types").StatusResponse };
@@ -208,12 +217,62 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   }, [automationObjects]);
 
   const currentTask = useMemo(() => {
-    const inProgress = tasks.find((t) => {
-      const s = String(t?.status || "").toLowerCase();
-      return s.includes("inprogress");
-    });
+    const inProgress = tasks.find((task) => isFreshInProgressTask(task));
     return inProgress?.description;
   }, [tasks]);
+  const waitingTask = useMemo(() => {
+    return tasks.find((task) => {
+      const status = String(task?.status || "").toLowerCase();
+      return status.includes("awaitingapproval") || status.includes("paused");
+    });
+  }, [tasks]);
+  const recentFailedAutomationRun = useMemo(() => {
+    return automationRuns.find((run) => {
+      const status = `${run.status || ""} ${run.current_status || ""}`.toLowerCase();
+      return status.includes("failed") || status.includes("error");
+    });
+  }, [automationRuns]);
+  const heroPrompts = useMemo(() => {
+    const prompts: string[] = [];
+    const seen = new Set<string>();
+    const pushPrompt = (value?: string | null) => {
+      const next = (value || "").trim();
+      if (!next || seen.has(next)) return;
+      seen.add(next);
+      prompts.push(next);
+    };
+    const clean = (value?: string | null) =>
+      (value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 110);
+
+    pushPrompt(
+      currentTask
+        ? `Continue "${clean(currentTask)}" and only surface blockers that need me.`
+        : null
+    );
+    pushPrompt(
+      waitingTask
+        ? `Review "${clean(waitingTask.description || "the waiting task")}" and recommend the safest next decision.`
+        : null
+    );
+    pushPrompt(
+      recentFailedAutomationRun
+        ? `Inspect "${clean(recentFailedAutomationRun.title || recentFailedAutomationRun.summary)}" and tell me what failed and how to fix it.`
+        : null
+    );
+    pushPrompt(
+      traces[0]?.message_preview
+        ? `Summarize the latest run: "${clean(traces[0].message_preview)}" and tell me the next move.`
+        : null
+    );
+    pushPrompt("Review recent changes and list only the critical risks.");
+    pushPrompt("Build a small app to track competitor launches and deploy it.");
+    pushPrompt("Import this skill URL and wire up any required secrets.");
+    pushPrompt("Inspect active automations and surface anything that needs intervention.");
+    return prompts.slice(0, 6);
+  }, [currentTask, recentFailedAutomationRun, traces, waitingTask]);
 
   // Check if LLM is configured from settings
   const hasLlmConfigured = useMemo(() => {
@@ -360,6 +419,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           agentPaused={agentPaused}
           briefingLoading={runBriefingMutation.isPending}
           pauseLoading={pauseMutation.isPending}
+          prompts={heroPrompts}
         />
       </Box>
 
@@ -439,11 +499,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
         </Stack>
       </Box>
 
-      <Grid2 container spacing={1.2} className="overview-secondary-grid">
-        <Grid2 size={{ xs: 12, lg: 7 }}>
+      <Grid2 container spacing={1} className="overview-secondary-grid">
+        <Grid2 size={{ xs: 12, lg: 6 }}>
           <TodaysHighlights tasks={tasks} traces={traces} />
         </Grid2>
-        <Grid2 size={{ xs: 12, lg: 5 }}>
+        <Grid2 size={{ xs: 12, lg: 6 }}>
           <SmartSuggestions
             briefing={briefingQ.data}
             nudges={nudges}

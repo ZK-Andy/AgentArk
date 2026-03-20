@@ -35,6 +35,16 @@ pub struct KeyManager {
 }
 
 impl KeyManager {
+    pub(crate) fn from_raw_key_bytes(key: [u8; KEY_LEN]) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+        }
+    }
+
+    pub(crate) fn export_key_bytes(&self) -> [u8; KEY_LEN] {
+        *self.key
+    }
+
     /// Create a new KeyManager from a password
     pub fn from_password(password: &str, salt: &[u8]) -> Result<Self> {
         let key = derive_key(password.as_bytes(), salt)?;

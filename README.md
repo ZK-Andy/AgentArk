@@ -113,7 +113,7 @@ It doesn't just respond - it **schedules the watcher**, **deploys the app**, **s
 | **Remembers** | Persistent memory across every conversation, channel, and restart |
 | **Monitors** | Background watchers that poll conditions and alert you when they trigger |
 | **Schedules** | Cron tasks, recurring goals, autonomous routines that run unattended |
-| **Deploys** | Builds apps from a prompt and exposes them through a Cloudflare tunnel |
+| **Deploys** | Builds apps from a prompt and shares them through the configured remote-access provider |
 | **Evolves** | Self-improving - rewrites its own prompts and strategies based on outcomes |
 | **Connects** | One agent reachable from web UI, CLI, Telegram, and WhatsApp |
 
@@ -190,7 +190,7 @@ cargo build --release
 
 ### Remote access
 
-Built-in Cloudflare tunnel, toggleable from the Settings page in the web UI. No ports to open, no signup, traffic encrypted end-to-end.
+Built-in remote access is toggleable from the Settings page in the web UI. Cloudflare Quick Tunnel is the default public-link mode: no ports to open, no signup, traffic encrypted in transit. For private end-to-end encrypted access, choose Tailscale private access from Settings and use your tailnet devices.
 
 ### Management
 
@@ -251,6 +251,53 @@ What you can do from CLI:
 > All capabilities available in the Web UI work in CLI mode - the agent has the same tools, memory, and integrations.
 
 `agentark pulse` is not chat wrapped. It runs a dedicated ArkPulse CLI path, prints the latest health snapshot directly, and avoids the chat banner / stdin quirks that came from piping a prompt into `--chat`.
+
+### External Launchers (Optional)
+
+AgentArk can manage **optional external launchers** in the **Apps** view through Ollama Launch. These are companion tools that AgentArk can prepare or invoke. They are **not** AgentArk modes or rebrands.
+
+- Claude Code
+- Codex
+- OpenCode
+- OpenClaw
+
+These tools are still **terminal-first**. AgentArk can generate the exact commands, show runtime readiness, and attempt a server-side launch, but the full interactive experience is still best in your own terminal.
+
+Optional external tool commands:
+
+```bash
+# Docker-hosted AgentArk: run from your host terminal
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch claude
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch claude --model minimax-m2.5:cloud
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch claude --config
+
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch codex
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch codex --model gpt-oss:120b
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch codex --config
+
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch opencode
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch opencode --model qwen3.5:cloud
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch opencode --config
+
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch openclaw
+docker exec -it -e OLLAMA_HOST=http://agentark-ollama:11434 agentark ollama launch openclaw --model kimi-k2.5:cloud
+```
+
+If AgentArk is running directly on the host instead of Docker, use the in-runtime commands:
+
+```bash
+ollama launch claude
+ollama launch codex
+ollama launch opencode
+ollama launch openclaw
+```
+
+Notes:
+
+- The Apps → External Launchers panel uses your configured Ollama base URL from AgentArk settings.
+- If AgentArk is running in Docker and Ollama is running on your host machine, use `http://host.docker.internal:11434` instead of `http://localhost:11434`.
+- If you start AgentArk with `docker compose --profile with-ollama up -d --build`, the registry will default to the bundled Ollama service at `http://agentark-ollama:11434`.
+- OpenCode and OpenClaw work best with models that support **64K context or more**.
 
 ### Upcoming: Self-Update
 
@@ -390,7 +437,7 @@ config/
 | `AGENTARK_DATA`   | `/app/data`      | Data directory                               |
 | `AGENTARK_BIND`   | `127.0.0.1:8990` | HTTP bind address                            |
 | `AGENTARK_DEBUG`  | `false`          | Enable debug logging                         |
-| `TUNNEL_TOKEN`    | _(empty)_        | Cloudflare Tunnel token for permanent domain |
+| `TUNNEL_TOKEN`    | _(empty)_        | Legacy Cloudflare Tunnel token for permanent domain |
 | `RUST_LOG`        | `info`           | Log level (`debug`, `info`, `warn`, `error`) |
 
 ---
@@ -539,7 +586,8 @@ AgentArk is built on the shoulders of outstanding open-source projects:
 | [Playwright](https://playwright.dev/) | Browser automation for screenshots and complex SPA interaction |
 | [Lightpanda](https://github.com/lightpanda-io/browser) | Fast headless browser for content extraction and web scraping |
 | [Mem0](https://github.com/mem0ai/mem0) | Semantic memory layer with vector search and decay |
-| [Cloudflared](https://github.com/cloudflare/cloudflared) | Zero-config tunnels for remote access |
+| [Cloudflared](https://github.com/cloudflare/cloudflared) | Default public-link remote access via Cloudflare Tunnel |
+| [Tailscale](https://tailscale.com/) | Private tailnet access with end-to-end encryption |
 | [ECharts](https://echarts.apache.org/) | Analytics charts and data visualization |
 | [Wasmtime](https://wasmtime.dev/) | WebAssembly sandbox for secure code execution |
 | [Bollard](https://github.com/fussybeaver/bollard) | Docker API client for container management |

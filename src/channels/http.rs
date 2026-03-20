@@ -33,6 +33,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as Tungs
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod actions;
+mod applications;
 mod auth;
 mod integrations;
 mod moltbook;
@@ -433,6 +434,8 @@ pub struct AppState {
     pub security_events: Arc<crate::core::SecurityEvents>,
     /// App registry for deployed apps (static + dynamic)
     pub app_registry: crate::actions::app::AppRegistry,
+    /// Registry of terminal-first external application launchers.
+    application_registry: applications::ApplicationLauncherRegistry,
     /// Deployment posture of the control plane.
     pub deployment_mode: DeploymentMode,
     /// Which surface this listener serves.
@@ -1773,12 +1776,13 @@ pub struct SettingsUpdate {
     pub llm_fallback_base_url: Option<String>,
     pub llm_fallback_api_key: Option<String>,
     // Telegram
-    pub telegram_enabled: bool,
+    #[serde(default)]
+    pub telegram_enabled: Option<bool>,
     pub telegram_bot_token: Option<String>,
     pub telegram_allowed_users: Option<Vec<i64>>,
     // WhatsApp
     #[serde(default)]
-    pub whatsapp_enabled: bool,
+    pub whatsapp_enabled: Option<bool>,
     #[serde(default)]
     pub whatsapp_mode: Option<String>,
     pub whatsapp_access_token: Option<String>,
@@ -2992,6 +2996,7 @@ pub async fn serve(
             whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
             security_events: agent_guard.security_events.clone(),
             app_registry: agent_guard.app_registry.clone(),
+            application_registry: applications::ApplicationLauncherRegistry::default(),
             deployment_mode,
             server_role: HttpServerRole::ControlPlane,
             public_app_bind_addr,
@@ -3348,6 +3353,18 @@ pub async fn serve(
             post(update_app_access_guard),
         )
         .route("/api/apps/{app_id}", axum::routing::delete(delete_app))
+        .route(
+            "/api/applications",
+            get(applications::list_application_launchers),
+        )
+        .route(
+            "/api/applications/{app_id}/launch",
+            post(applications::launch_application),
+        )
+        .route(
+            "/api/applications/{app_id}/stop",
+            post(applications::stop_application),
+        )
         // Output file serving (code execution artifacts)
         .route("/api/outputs/{exec_id}/{filename}", get(serve_output_file))
         .route(
@@ -3530,7 +3547,7 @@ pub async fn serve(
         let state_for_tunnel = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            tracing::info!("AGENTARK_TUNNEL=true - auto-starting public tunnel...");
+            tracing::info!("AGENTARK_TUNNEL=true - auto-starting remote access tunnel...");
             let provider = tunnel::load_tunnel_config(&state_for_tunnel).await.provider;
             if let Err(err) =
                 tunnel_auth::ensure_control_plane_tunnel_ready(&state_for_tunnel, provider).await
@@ -4563,6 +4580,24 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     add("/api/apps/{app_id}/stop", "POST", "Stop app", "Apps");
     add("/api/apps/{app_id}/restart", "POST", "Restart app", "Apps");
     add("/api/apps/{app_id}", "DELETE", "Delete app", "Apps");
+    add(
+        "/api/applications",
+        "GET",
+        "List built-in Ollama application launchers",
+        "Apps",
+    );
+    add(
+        "/api/applications/{app_id}/launch",
+        "POST",
+        "Launch a built-in application through Ollama Launch",
+        "Apps",
+    );
+    add(
+        "/api/applications/{app_id}/stop",
+        "POST",
+        "Stop a running built-in application launch",
+        "Apps",
+    );
 
     paths
 }
@@ -4606,7 +4641,7 @@ async fn openapi_spec(State(state): State<AppState>, headers: HeaderMap) -> Resp
             { "name": "Conversations", "description": "Conversation history and messages" },
             { "name": "MCP", "description": "Model Context Protocol servers and tools" },
             { "name": "Security", "description": "Security logs and master password" },
-            { "name": "Tunnel", "description": "Public tunnel for remote access" },
+            { "name": "Tunnel", "description": "Remote access providers and status" },
             { "name": "Moltbook", "description": "Moltbook lifecycle engine" },
             { "name": "Swarm", "description": "Multi-agent swarm coordination" },
             { "name": "Apps", "description": "Deployed app management" }
@@ -8273,7 +8308,7 @@ async fn run_arkpulse_fix(
             let url = tunnel.url.clone();
             let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
                 format!(
-                    "Tunnel is active and publicly reachable at {}.",
+                    "Remote access is active at {}.",
                     url.clone().unwrap_or_default()
                 )
             } else {
@@ -8313,7 +8348,7 @@ async fn run_arkpulse_fix(
             let url = tunnel.url.clone();
             let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
                 format!(
-                    "Tunnel restarted successfully and is reachable at {}.",
+                    "Remote access restarted successfully at {}.",
                     url.clone().unwrap_or_default()
                 )
             } else {
@@ -8435,6 +8470,11 @@ async fn get_pulse_log(
         .unwrap_or(0usize);
     let agent = state.agent.read().await;
     let mut all_events = crate::sentinel::get_pulse_log(&agent).await;
+    let had_raw_payload = crate::storage::legacy_recovery::encrypted_payload_exists(
+        &agent.storage,
+        crate::sentinel::PULSE_LOG_KEY,
+    )
+    .await;
     all_events.sort_by(|a, b| {
         let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
             .map(|ts| ts.timestamp_millis())
@@ -8451,7 +8491,13 @@ async fn get_pulse_log(
         "total": total,
         "limit": limit,
         "offset": offset,
-        "running": crate::sentinel::is_pulse_running()
+        "running": crate::sentinel::is_pulse_running(),
+        "history_unavailable": total == 0 && had_raw_payload,
+        "history_unavailable_reason": if total == 0 && had_raw_payload {
+            Some("An older ArkPulse history payload exists but could not be decrypted after a past password rotation. New runs will appear normally.")
+        } else {
+            None::<&str>
+        }
     }))
 }
 
@@ -9179,9 +9225,7 @@ fn classify_chat_task_work_type(
         "import"
     } else if chat_message_requests_automation(&lower) {
         "automation"
-    } else if attachments_present {
-        "workspace"
-    } else if chat_message_requests_workspace_changes(&lower) {
+    } else if attachments_present || chat_message_requests_workspace_changes(&lower) {
         "workspace"
     } else {
         "task"
@@ -9888,7 +9932,11 @@ async fn list_tasks(
         .take(limit)
         .map(|t| TaskInfo {
             id: t.id.to_string(),
-            description: t.description.clone(),
+            description: if t.description == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE {
+                "Older task details unavailable".to_string()
+            } else {
+                t.description.clone()
+            },
             action: t.action.clone(),
             arguments: t.arguments.clone(),
             status: format!("{:?}", t.status),
@@ -14360,107 +14408,161 @@ async fn update_settings(
             None
         };
 
-        // Build telegram config
-        let new_telegram = if settings.telegram_enabled {
-            let token = settings
-                .telegram_bot_token
-                .clone()
-                .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
-                .or(existing_telegram_token.filter(|t| t != "[ENCRYPTED]"));
+        let telegram_update_requested = settings.telegram_enabled.is_some()
+            || settings.telegram_bot_token.is_some()
+            || settings.telegram_allowed_users.is_some();
+        let current_telegram = agent_guard.config.telegram.clone();
 
-            if token.as_deref().unwrap_or("").trim().is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "Telegram bot token is required when Telegram is enabled"
-                            .to_string(),
+        // Build telegram config only if that section was explicitly touched.
+        let new_telegram = if telegram_update_requested {
+            let telegram_enabled = settings
+                .telegram_enabled
+                .unwrap_or(current_telegram.is_some());
+            if telegram_enabled {
+                let token = settings
+                    .telegram_bot_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_telegram_token.filter(|t| t != "[ENCRYPTED]"));
+
+                if token.as_deref().unwrap_or("").trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Telegram bot token is required when Telegram is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                Some(TelegramConfig {
+                    bot_token: token.unwrap(),
+                    allowed_users: settings.telegram_allowed_users.clone().unwrap_or_else(|| {
+                        current_telegram
+                            .as_ref()
+                            .map(|t| t.allowed_users.clone())
+                            .unwrap_or_default()
                     }),
-                )
-                    .into_response();
+                    dm_policy: current_telegram
+                        .as_ref()
+                        .map(|t| t.dm_policy.clone())
+                        .unwrap_or_else(|| "pairing".to_string()),
+                })
+            } else {
+                None
             }
-
-            Some(TelegramConfig {
-                bot_token: token.unwrap(),
-                allowed_users: settings.telegram_allowed_users.clone().unwrap_or_default(),
-                dm_policy: "pairing".to_string(),
-            })
         } else {
-            None
+            current_telegram
         };
 
-        // Build WhatsApp config
-        let new_whatsapp = if settings.whatsapp_enabled {
-            let mode_str = settings.whatsapp_mode.as_deref().unwrap_or("baileys");
-            let mode = match mode_str {
-                "cloud_api" => crate::channels::whatsapp::WhatsAppMode::CloudApi,
-                _ => crate::channels::whatsapp::WhatsAppMode::Baileys,
-            };
+        let whatsapp_update_requested = settings.whatsapp_enabled.is_some()
+            || settings.whatsapp_mode.is_some()
+            || settings.whatsapp_access_token.is_some()
+            || settings.whatsapp_phone_number_id.is_some()
+            || settings.whatsapp_verify_token.is_some()
+            || settings.whatsapp_bridge_url.is_some()
+            || settings.whatsapp_dm_policy.is_some()
+            || settings.whatsapp_allowed_numbers.is_some();
+        let current_whatsapp = agent_guard.config.whatsapp.clone();
 
-            let token = settings
-                .whatsapp_access_token
-                .clone()
-                .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
-                .or(existing_whatsapp_token.filter(|t| t != "[ENCRYPTED]"))
-                .unwrap_or_default();
+        // Build WhatsApp config only if that section was explicitly touched.
+        let new_whatsapp = if whatsapp_update_requested {
+            let whatsapp_enabled = settings
+                .whatsapp_enabled
+                .unwrap_or(current_whatsapp.is_some());
+            if whatsapp_enabled {
+                let mode_str = settings
+                    .whatsapp_mode
+                    .as_deref()
+                    .or_else(|| {
+                        current_whatsapp.as_ref().map(|w| match w.mode {
+                            crate::channels::whatsapp::WhatsAppMode::CloudApi => "cloud_api",
+                            crate::channels::whatsapp::WhatsAppMode::Baileys => "baileys",
+                        })
+                    })
+                    .unwrap_or("baileys");
+                let mode = match mode_str {
+                    "cloud_api" => crate::channels::whatsapp::WhatsAppMode::CloudApi,
+                    _ => crate::channels::whatsapp::WhatsAppMode::Baileys,
+                };
 
-            let phone_id = settings
-                .whatsapp_phone_number_id
-                .clone()
-                .unwrap_or_default();
-
-            let verify_tok = settings
-                .whatsapp_verify_token
-                .clone()
-                .unwrap_or_else(|| "agentark_verify".to_string());
-
-            let bridge_url = settings
-                .whatsapp_bridge_url
-                .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8999".to_string());
-
-            let dm_policy = settings
-                .whatsapp_dm_policy
-                .clone()
-                .unwrap_or_else(|| "pairing".to_string());
-
-            // Cloud API mode requires access token and phone number ID
-            if mode == crate::channels::whatsapp::WhatsAppMode::CloudApi {
-                if token.trim().is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "WhatsApp access token is required for Cloud API mode"
-                                .to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-                if phone_id.trim().is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "WhatsApp Phone Number ID is required for Cloud API mode"
-                                .to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-
-            Some(crate::channels::whatsapp::WhatsAppChannelConfig {
-                mode,
-                access_token: token,
-                phone_number_id: phone_id,
-                verify_token: verify_tok,
-                bridge_url,
-                allowed_numbers: settings
-                    .whatsapp_allowed_numbers
+                let token = settings
+                    .whatsapp_access_token
                     .clone()
-                    .unwrap_or_default(),
-                dm_policy,
-            })
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_whatsapp_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+
+                let phone_id = settings
+                    .whatsapp_phone_number_id
+                    .clone()
+                    .or_else(|| current_whatsapp.as_ref().map(|w| w.phone_number_id.clone()))
+                    .unwrap_or_default();
+
+                let verify_tok = settings
+                    .whatsapp_verify_token
+                    .clone()
+                    .or_else(|| current_whatsapp.as_ref().map(|w| w.verify_token.clone()))
+                    .unwrap_or_else(|| "agentark_verify".to_string());
+
+                let bridge_url = settings
+                    .whatsapp_bridge_url
+                    .clone()
+                    .or_else(|| current_whatsapp.as_ref().map(|w| w.bridge_url.clone()))
+                    .unwrap_or_else(|| "http://127.0.0.1:8999".to_string());
+
+                let dm_policy = settings
+                    .whatsapp_dm_policy
+                    .clone()
+                    .or_else(|| current_whatsapp.as_ref().map(|w| w.dm_policy.clone()))
+                    .unwrap_or_else(|| "pairing".to_string());
+
+                // Cloud API mode requires access token and phone number ID
+                if mode == crate::channels::whatsapp::WhatsAppMode::CloudApi {
+                    if token.trim().is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "WhatsApp access token is required for Cloud API mode"
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    if phone_id.trim().is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "WhatsApp Phone Number ID is required for Cloud API mode"
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+
+                Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                    mode,
+                    access_token: token,
+                    phone_number_id: phone_id,
+                    verify_token: verify_tok,
+                    bridge_url,
+                    allowed_numbers: settings.whatsapp_allowed_numbers.clone().unwrap_or_else(
+                        || {
+                            current_whatsapp
+                                .as_ref()
+                                .map(|w| w.allowed_numbers.clone())
+                                .unwrap_or_default()
+                        },
+                    ),
+                    dm_policy,
+                })
+            } else {
+                None
+            }
         } else {
-            None
+            current_whatsapp
         };
 
         // Defer network connectivity probing until after lock is released to avoid
@@ -16723,8 +16825,10 @@ async fn get_conversation_messages(
         .await
     {
         Ok(msgs) => {
+            let unavailable_message =
+                "Older message unavailable after a past password/key change.".to_string();
             let list: Vec<serde_json::Value> = msgs.iter().map(|m| serde_json::json!({
-                "id": m.id, "role": m.role, "content": m.content,
+                "id": m.id, "role": m.role, "content": if m.content == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE { unavailable_message.clone() } else { m.content.clone() },
                 "timestamp": m.timestamp, "model_used": m.model_used, "trace_id": m.trace_id,
             })).collect();
             (StatusCode::OK, Json(serde_json::json!({"messages": list}))).into_response()
@@ -18113,7 +18217,7 @@ async fn query_knowledge_brain(
     let limit = request.limit.unwrap_or(8).clamp(1, 20);
     let agent = state.agent.read().await;
     let docs = agent
-        .search_documents(&request.query, limit)
+        .search_documents(&request.query, limit, request.project_id.as_deref())
         .await
         .unwrap_or_default();
     let facts = agent
@@ -18124,11 +18228,16 @@ async fn query_knowledge_brain(
 
     let evidence_docs: Vec<serde_json::Value> = docs
         .iter()
-        .map(|(doc_id, content, score)| {
+        .map(|hit| {
             serde_json::json!({
-                "document_id": doc_id,
-                "score": score,
-                "snippet": content.chars().take(260).collect::<String>(),
+                "document_id": &hit.document_id,
+                "filename": &hit.filename,
+                "content_type": &hit.content_type,
+                "project_id": &hit.project_id,
+                "chunk_index": hit.chunk_index,
+                "score": hit.score,
+                "match_reason": &hit.match_reason,
+                "snippet": hit.content.chars().take(260).collect::<String>(),
             })
         })
         .collect();
@@ -20267,16 +20376,34 @@ async fn insert_document_from_text(
         .await
         .map_err(|e| e.to_string())?;
 
+    let mut chunk_rows: Vec<crate::storage::entities::document_chunk::Model> = chunks
+        .iter()
+        .enumerate()
+        .map(
+            |(i, chunk_content)| crate::storage::entities::document_chunk::Model {
+                id: uuid::Uuid::new_v4().to_string(),
+                document_id: doc_id.clone(),
+                chunk_index: i as i32,
+                content: chunk_content.clone(),
+                embedding: None,
+            },
+        )
+        .collect();
+    if let Err(e) = crate::core::document_search::embed_document_chunks(
+        agent.mem0.as_ref(),
+        &filename,
+        &doc.content_type,
+        doc.project_id.as_deref(),
+        &mut chunk_rows,
+    )
+    .await
+    {
+        tracing::warn!("Document embedding failed for {}: {}", filename, e);
+    }
+
     // Insert chunks
-    for (i, chunk_content) in chunks.iter().enumerate() {
-        let chunk = crate::storage::entities::document_chunk::Model {
-            id: uuid::Uuid::new_v4().to_string(),
-            document_id: doc_id.clone(),
-            chunk_index: i as i32,
-            content: chunk_content.clone(),
-            embedding: None,
-        };
-        if let Err(e) = agent.storage.insert_document_chunk(&chunk).await {
+    for (i, chunk) in chunk_rows.iter().enumerate() {
+        if let Err(e) = agent.storage.insert_document_chunk(chunk).await {
             tracing::warn!("Failed to insert chunk {}: {}", i, e);
         }
     }
@@ -21284,12 +21411,27 @@ async fn mcp_handler(
             "document_search" => {
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let project_id = args.get("project_id").and_then(|v| v.as_str());
                 let agent = state.agent.read().await;
-                match agent.search_documents(query, limit).await {
+                match agent.search_documents(query, limit, project_id).await {
                     Ok(results) => {
-                        let items: Vec<serde_json::Value> = results.iter().map(|(doc_id, content, score)| {
-                            serde_json::json!({ "document_id": doc_id, "content": content, "score": score })
-                        }).collect();
+                        let items: Vec<serde_json::Value> = results
+                            .iter()
+                            .map(|hit| {
+                                serde_json::json!({
+                                    "document_id": &hit.document_id,
+                                    "filename": &hit.filename,
+                                    "content_type": &hit.content_type,
+                                    "project_id": &hit.project_id,
+                                    "chunk_index": hit.chunk_index,
+                                    "content": &hit.content,
+                                    "score": hit.score,
+                                    "lexical_score": hit.lexical_score,
+                                    "dense_score": hit.dense_score,
+                                    "match_reason": &hit.match_reason
+                                })
+                            })
+                            .collect();
                         serde_json::json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&items).unwrap_or_default() }] })
                     }
                     Err(e) => {
@@ -22057,6 +22199,9 @@ pub async fn serve_locked(
 
     let app = Router::new()
         .route("/", get(locked_page))
+        .route("/ui", get(locked_page))
+        .route("/ui/", get(locked_page))
+        .route("/ui/{*path}", get(locked_page))
         .route("/health", get(locked_health))
         .route("/unlock", post(handle_unlock))
         .route("/logo.svg", get(serve_logo_svg_locked))
@@ -22064,13 +22209,24 @@ pub async fn serve_locked(
 
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let display_addr = bind_addr
+        .strip_prefix("0.0.0.0:")
+        .map(|port| format!("localhost:{}", port))
+        .or_else(|| {
+            bind_addr
+                .strip_prefix("[::]:")
+                .map(|port| format!("localhost:{}", port))
+        })
+        .unwrap_or_else(|| bind_addr.clone());
 
     println!();
     println!(" -");
     println!(" - AgentArk is LOCKED -");
     println!(" -");
-    println!(" - Open http://{} to unlock -", bind_addr);
-    println!(" - Or set AGENTARK_MASTER_PASSWORD env var -");
+    println!(
+        " - Open http://{} to unlock in your browser -",
+        display_addr
+    );
     println!(" -");
     println!();
 
@@ -22096,8 +22252,9 @@ pub async fn serve_locked(
        }
 }
 
-async fn locked_page() -> Html<&'static str> {
-    Html(super::web::UNLOCK_PAGE_HTML)
+async fn locked_page(uri: Uri) -> Html<String> {
+    let requested = requested_unlock_return_path(&uri);
+    Html(super::web::render_unlock_page_html(&requested))
 }
 
 async fn locked_health() -> Json<serde_json::Value> {
@@ -22115,6 +22272,20 @@ async fn serve_logo_svg_locked() -> Response {
         svg,
     )
         .into_response()
+}
+
+fn requested_unlock_return_path(uri: &Uri) -> String {
+    let path = uri.path();
+    if path == "/" || path.starts_with("/ui") {
+        let mut target = path.to_string();
+        if let Some(query) = uri.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        target
+    } else {
+        "/".to_string()
+    }
 }
 
 #[derive(Deserialize)]
@@ -22272,6 +22443,42 @@ where
         });
     }
 
+    if let Err(archive_err) = crate::storage::legacy_recovery::remember_legacy_storage_key(
+        &agent.storage,
+        old_storage_key.as_ref(),
+    )
+    .await
+    {
+        let storage_rollback_err = agent
+            .encrypted_storage
+            .reencrypt_all_sensitive_data(new_key.clone(), old_storage_key.clone())
+            .await
+            .err();
+        let secrets_rollback_err = old_mgr.save_secrets_unlocked(&secrets).err();
+        return Err(match (storage_rollback_err, secrets_rollback_err) {
+            (Some(storage_rollback_err), Some(secrets_rollback_err)) => anyhow::anyhow!(
+                "Failed to archive prior storage key: {}. Encrypted storage rollback also failed: {}. secrets.enc rollback also failed: {}",
+                archive_err,
+                storage_rollback_err,
+                secrets_rollback_err
+            ),
+            (Some(storage_rollback_err), None) => anyhow::anyhow!(
+                "Failed to archive prior storage key: {}. Encrypted storage rollback also failed: {}",
+                archive_err,
+                storage_rollback_err
+            ),
+            (None, Some(secrets_rollback_err)) => anyhow::anyhow!(
+                "Failed to archive prior storage key: {}. secrets.enc rollback also failed: {}",
+                archive_err,
+                secrets_rollback_err
+            ),
+            (None, None) => anyhow::anyhow!(
+                "Failed to archive prior storage key: {}",
+                archive_err
+            ),
+        });
+    }
+
     if let Err(commit_err) = commit_metadata() {
         let storage_rollback_err = agent
             .encrypted_storage
@@ -22374,11 +22581,7 @@ async fn set_master_password(
                 old_secrets_key,
                 old_storage_key,
                 new_key.clone(),
-                || {
-                    master_mgr
-                        .commit_prepared_password(prepared)
-                        .map_err(anyhow::Error::from)
-                },
+                || master_mgr.commit_prepared_password(prepared),
             )
             .await
             {
@@ -22493,11 +22696,7 @@ async fn change_master_password(
                 old_secrets_key,
                 old_storage_key,
                 new_key.clone(),
-                || {
-                    master_mgr
-                        .commit_prepared_password(prepared)
-                        .map_err(anyhow::Error::from)
-                },
+                || master_mgr.commit_prepared_password(prepared),
             )
             .await
             {
@@ -22586,11 +22785,7 @@ async fn remove_master_password(
                 old_secrets_key,
                 old_storage_key,
                 new_key.clone(),
-                || {
-                    master_mgr
-                        .commit_password_removal()
-                        .map_err(anyhow::Error::from)
-                },
+                || master_mgr.commit_password_removal(),
             )
             .await
             {

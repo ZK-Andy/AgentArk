@@ -786,13 +786,13 @@ impl ActionRuntime {
         // Tunnel control for remote UI access
         self.register_builtin_action(ActionDef {
             name: "tunnel_control".to_string(),
-            description: "Manage public UI tunnel. Use action=start to create an external link, action=status to check current URL, action=stop to disable it. Optionally pass provider=cloudflare|ngrok|tailscale_funnel|bore when starting.".to_string(),
+            description: "Manage remote UI access. Use action=start to create an access URL, action=status to check the current URL, and action=stop to disable it. Optionally pass provider=cloudflare|tailscale_private|tailscale_funnel|ngrok|bore when starting.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["start", "stop", "status"], "description": "Tunnel operation" },
-                    "provider": { "type": "string", "description": "Optional provider id for start: cloudflare, ngrok, tailscale_funnel, or bore." },
+                    "provider": { "type": "string", "description": "Optional provider id for start: cloudflare, tailscale_private, tailscale_funnel, ngrok, or bore." },
                     "allow_duplicate": { "type": "boolean", "description": "Repeat an identical tunnel command in the same request. Default false." }
                 },
                 "required": ["action"]
@@ -1966,11 +1966,11 @@ impl ActionRuntime {
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the configured public tunnel provider when available. Default: true."
+                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: true."
                     },
                     "access_guard": {
                         "type": "boolean",
-                        "description": "Enable access-key guard for the app URL. Default: false (public app URL)."
+                        "description": "Enable access-key guard for the shared app URL. Default: false."
                     },
                     "replace_existing": {
                         "type": "boolean",

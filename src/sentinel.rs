@@ -385,10 +385,12 @@ async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
 
 /// Get the ArkPulse log from storage
 pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
-    let raw: Vec<PulseEvent> = match agent.storage.get_encrypted(PULSE_LOG_KEY).await {
-        Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-        _ => Vec::new(),
-    };
+    let raw = crate::storage::legacy_recovery::load_json_vec_with_legacy_key_recovery(
+        &agent.storage,
+        &agent.config_dir,
+        PULSE_LOG_KEY,
+    )
+    .await;
     let pruned = prune_pulse_events(raw.clone());
     if pruned.len() != raw.len() {
         if let Ok(json) = serde_json::to_vec(&pruned) {
@@ -1133,9 +1135,9 @@ async fn run_attack_surface_checks(
                     "high",
                     "attack_surface",
                     public_health_url.clone(),
-                    "Public tunnel health probe failed",
+                    "Managed tunnel health probe failed",
                     format!("GET {} returned {}", public_health_url, resp.status()),
-                    "Tunnel endpoint is reachable but unhealthy for public traffic.",
+                    "Tunnel endpoint is reachable but unhealthy for remote access traffic.",
                     "Restart tunnel and inspect cloudflared logs".to_string(),
                     DoctorRemediationSpec::TunnelRestartVerify,
                 );
@@ -1159,9 +1161,9 @@ async fn run_attack_surface_checks(
                     "high",
                     "attack_surface",
                     public_health_url.clone(),
-                    "Public tunnel unreachable",
+                    "Managed tunnel unreachable",
                     e.to_string(),
-                    "Cannot reach service through the currently active public tunnel URL.",
+                    "Cannot reach service through the currently active managed tunnel URL.",
                     "Restart tunnel and verify DNS/TLS connectivity".to_string(),
                     DoctorRemediationSpec::TunnelRestartVerify,
                 );
@@ -1191,7 +1193,7 @@ async fn run_attack_surface_checks(
                 "active={}, url_present={}",
                 tunnel_active, tunnel_url_present
             ),
-            "Managed tunnel should stay active while public app access is in use.",
+            "Managed tunnel should stay active while shared app access is in use.",
             "Restart the tunnel and confirm URL discovery".to_string(),
             DoctorRemediationSpec::TunnelRestartVerify,
         );
@@ -1209,8 +1211,8 @@ async fn run_attack_surface_checks(
                     public_apps_probe,
                     "Public app surface exposed protected inventory endpoint",
                     format!("GET /api/apps over public surface returned {}", code),
-                    "Sensitive management endpoint is reachable from the public app surface without auth.",
-                    "Require auth middleware for publicly reachable management routes".to_string(),
+                    "Sensitive management endpoint is reachable from the shared app surface without auth.",
+                    "Require auth middleware for remotely reachable management routes".to_string(),
                 );
             }
         }
@@ -1222,8 +1224,8 @@ async fn run_attack_surface_checks(
                 "/api/apps",
                 "Public app-inventory auth probe failed",
                 e.to_string(),
-                "Could not verify auth enforcement of /api/apps over the public app surface.",
-                "Retry when the public app surface is stable".to_string(),
+                "Could not verify auth enforcement of /api/apps over the shared app surface.",
+                "Retry when the shared app surface is stable".to_string(),
             );
         }
     }

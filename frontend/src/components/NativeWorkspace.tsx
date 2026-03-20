@@ -59,10 +59,26 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent
 import ReactECharts from "echarts-for-react";
 import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
+import { MetricBarCard } from "./analytics/MetricBarCard";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { ObservabilityPanel } from "./ObservabilityPanel";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { SwarmManager } from "./SwarmManager";
+import {
+  getAppShareLinkLabel,
+  getAppShareOpenLabel,
+  getAppSharePublicCaption,
+  getTunnelAccessMeta,
+  getTunnelPanelPasswordPrompt,
+  getTunnelPanelResumeMessage,
+  getTunnelPanelStartMessage,
+  getTunnelPanelStartingMessage,
+  getTunnelPanelWarning,
+  getTunnelProviderHelp,
+  getTunnelStartButtonLabel,
+  getTunnelStopButtonLabel,
+  getTunnelUrlFieldLabel
+} from "../lib/tunnelAccess";
 import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest, SkillImportResponse, LlmAnalyticsResponse } from "../types";
 import { useUiStore } from "../store/uiStore";
 
@@ -3167,7 +3183,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(
+    () => typeof window !== "undefined" && window.innerWidth >= 1280
+  );
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
@@ -3437,7 +3455,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const toolStartCopy = (name: string): { label: string; detail: string } => {
     const normalized = (name || "").trim().toLowerCase();
     const byTool: Record<string, { label: string; detail: string }> = {
-      app_deploy: { label: "Deploying public link", detail: "Starting deployment and publishing access link." },
+      app_deploy: { label: "Deploying access link", detail: "Starting deployment and publishing access link." },
       build_check: { label: "Running checks", detail: "Checking compile and build health." },
       run_tests: { label: "Running checks", detail: "Running tests to validate behavior." },
       lint_check: { label: "Running checks", detail: "Checking code quality and style." },
@@ -3845,7 +3863,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       }
     }
     const primaryCard = safeBuildStepCard(steps[primaryIndex], primaryIndex);
-    return `${steps.length} update${steps.length === 1 ? "" : "s"} â€¢ Now: ${primaryCard.label}`;
+    return `${steps.length} update${steps.length === 1 ? "" : "s"} - Now: ${primaryCard.label}`;
   };
 
   const parseTraceSteps = (payload: unknown): JsonRecord[] => {
@@ -4466,7 +4484,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       projectIdOverride?: string;
       statusSource?: string;
       deepResearch?: boolean;
-      executionMode?: ChatExecutionMode;
     }
   ): Promise<boolean> => {
     const requestedConversationOverride = (opts?.conversationIdOverride || "").trim();
@@ -4486,7 +4503,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (!activeMessage || isStreaming || streamLockRef.current) return false;
     const now = Date.now();
     const deepResearch = Boolean(opts?.deepResearch);
-    const executionMode = opts?.executionMode || chatExecutionMode;
+    const executionMode: ChatExecutionMode = "auto";
     const fingerprint = `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
       .toLowerCase()
       .replace(/\s+/g, " ")
@@ -5095,6 +5112,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   });
   const workspaceApps = pickRecords(appsWorkspaceQ.data, "apps");
   const workspaceTunnel = asRecord(tunnelWorkspaceQ.data);
+  const workspaceTunnelMeta = getTunnelAccessMeta(workspaceTunnel);
   const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "").trim().replace(/\/+$/, "");
   const workspaceSelectedPublicAppId = str(workspaceTunnel.selected_app_id, "").trim();
   const activeWorkspaceApp = useMemo(() => {
@@ -5323,7 +5341,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
             <Typography variant="h6">Conversations</Typography>
             <Button size="small" onClick={startNewConversation}>
-              New
+              New chat
             </Button>
           </Stack>
 
@@ -5441,11 +5459,22 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             >
               {showConversationSidebar ? "Hide conversations" : "Conversations"}
             </Button>
+            {!showConversationSidebar ? (
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={startNewConversation}
+                disabled={isStreaming}
+                sx={{ textTransform: "none", borderRadius: 999 }}
+              >
+                New chat
+              </Button>
+            ) : null}
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
             <Box sx={{ minWidth: 0 }}>
-              <Typography variant="h6">Chat</Typography>
+              <Typography variant="h6">AgentArk Console</Typography>
               <Typography variant="caption" color="text.secondary">
-                Keep the active task centered.
+                Open workspace chat with live activity, file writes, and agent output.
               </Typography>
             </Box>
           </Stack>
@@ -5481,29 +5510,48 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             flexDirection: "column"
           }}
         >
-          <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }}>
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="Project Scope"
-              value={selectedConversationProjectId || draftProjectId}
-              onChange={(e) => setDraftProjectId(e.target.value)}
-              disabled={Boolean(selectedConversation)}
-              sx={{ maxWidth: { xs: "100%", md: 360 } }}
-            >
-              <MenuItem value="">No project</MenuItem>
-              {projects.map((project) => {
-                const id = str(project.id, "");
-                if (!id) return null;
-                return (
-                  <MenuItem key={id} value={id}>
-                    {str(project.name, id)}
-                  </MenuItem>
-                );
-              })}
-            </TextField>
-          </Stack>
+          {!selectedConversation ? (
+            <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }} alignItems={{ xs: "stretch", md: "center" }}>
+              <TextField
+                fullWidth
+                size="small"
+                select
+                label="Project (optional)"
+                value={draftProjectId}
+                onChange={(e) => setDraftProjectId(e.target.value)}
+                sx={{ maxWidth: { xs: "100%", md: 360 } }}
+              >
+                <MenuItem value="">Open workspace (no project)</MenuItem>
+                {projects.map((project) => {
+                  const id = str(project.id, "");
+                  if (!id) return null;
+                  return (
+                    <MenuItem key={id} value={id}>
+                      {str(project.name, id)}
+                    </MenuItem>
+                  );
+                })}
+              </TextField>
+              <Typography variant="caption" color="text.secondary">
+                Leave this blank to chat in the open workspace across all accessible context.
+              </Typography>
+            </Stack>
+          ) : (
+            <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 1 }} useFlexGap flexWrap="wrap">
+              <Chip
+                size="small"
+                variant="outlined"
+                label={
+                  selectedConversationProjectId
+                    ? `Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`
+                    : "Open workspace"
+                }
+              />
+              <Typography variant="caption" color="text.secondary">
+                This conversation is not restricted to a project unless one is explicitly attached.
+              </Typography>
+            </Stack>
+          )}
 
           <Box
             ref={threadRef}
@@ -5892,8 +5940,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 (e.target as HTMLTextAreaElement).style.height = "auto";
                 setChatError(null);
                 void runStreamingChat(msg, attachedFiles, {
-                  deepResearch: deepResearchEnabled,
-                  executionMode: chatExecutionMode
+                  deepResearch: deepResearchEnabled
                 });
               }
             }}
@@ -5901,7 +5948,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             disabled={false}
           />
           <div className="chat-composer-actions">
-            <Stack direction="row" spacing={0.5} alignItems="center" sx={{ mr: 0.5 }}>
+            {false ? (
+              <Stack direction="row" spacing={0.5} alignItems="center" sx={{ mr: 0.5 }}>
               {([
                 {
                   value: "auto",
@@ -5934,7 +5982,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   />
                 </Tooltip>
               ))}
-            </Stack>
+              </Stack>
+            ) : null}
             <Tooltip title={deepResearchEnabled ? "Deep Research enabled — slower, source-backed" : "Enable Deep Research"}>
               <FormControlLabel
                 control={
@@ -5987,8 +6036,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   const ta = document.querySelector(".chat-composer-textarea") as HTMLTextAreaElement | null;
                   if (ta) ta.style.height = "auto";
                   await runStreamingChat(msg, attachedFiles, {
-                    deepResearch: deepResearchEnabled,
-                    executionMode: chatExecutionMode
+                    deepResearch: deepResearchEnabled
                   });
                 }}
               >
@@ -6149,7 +6197,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                         noWrap
                         title={publicPreviewUrl}
                       >
-                        Public:{" "}
+                        {workspaceTunnelMeta.isPrivate ? "Private access:" : "Public:"}{" "}
                         <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
                         {publicPreviewUrl}
                       </Link>
@@ -6258,7 +6306,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             </Typography>
             {publicPreviewUrl ? (
               <Typography variant="body2">
-                Public:{" "}
+                {workspaceTunnelMeta.isPrivate ? "Private access:" : "Public:"}{" "}
                 <Link href={publicPreviewUrl} target="_blank" rel="noopener noreferrer" underline="hover">
                   {publicPreviewUrl}
                 </Link>
@@ -8186,6 +8234,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const apps = pickRecords(appsQ.data, "apps");
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const tunnel = asRecord(tunnelQ.data);
+  const tunnelMeta = getTunnelAccessMeta(tunnel);
   const tunnelBaseUrl = str(tunnel.url, "").trim().replace(/\/+$/, "");
   const tunnelActive = toBool(tunnel.active);
   const tunnelAvailable = toBool(tunnel.available);
@@ -8354,19 +8403,17 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const canRestartApp = !isStaticApp || isRunning;
                   const appTunnelActive = tunnelActive && !!tunnelBaseUrl && !!selectedPublicAppId;
                   const publicUrl = appTunnelActive ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
-                  const publicAccessUrl =
-                    appTunnelActive ? toAbsoluteAppUrl(accessUrl || url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
                   const controlPlaneTunnelOnly = tunnelActive && !!tunnelBaseUrl && !selectedPublicAppId;
-                  const publicLinkUrl = hasProtectedVariant ? publicAccessUrl || publicUrl : publicUrl;
-                  const publicShareUrl = publicLinkUrl;
-                  const localShareUrl = hasProtectedVariant ? localAccessUrl : localUrl;
+                  const publicShareUrl = publicUrl;
+                  const localShareUrl = localUrl;
                   const shareUrl = publicShareUrl || localShareUrl;
+                  const shareCaptionLabel = getAppSharePublicCaption(tunnelMeta);
+                  const shareOpenLabel = getAppShareOpenLabel(tunnelMeta);
+                  const shareCopyLabel = getAppShareLinkLabel(tunnelMeta);
                   const openTargets = dedupeLinkTargets([
                     { label: "Open Local", url: localUrl },
-                    { label: "Open Local (Guarded)", url: hasProtectedVariant ? localAccessUrl : "" },
-                    { label: "Open Public", url: publicUrl },
-                    { label: "Open Public (Guarded)", url: hasProtectedVariant ? publicAccessUrl : "" }
+                    { label: shareOpenLabel, url: publicUrl }
                   ]);
                   return (
                     <TableRow key={id}>
@@ -8395,30 +8442,35 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                           <Typography variant="caption" component="div" color={toBool(appItem.access_guard_enabled) ? "warning.main" : "text.secondary"} noWrap>
                             Guard: {toBool(appItem.access_guard_enabled) ? "enabled" : "disabled"}
                           </Typography>
-                          {publicLinkUrl ? (
-                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicLinkUrl}>
-                              Public:{" "}
-                              <Link href={publicLinkUrl} target="_blank" rel="noopener noreferrer" underline="hover">
-                                {publicLinkUrl}
+                          {publicShareUrl ? (
+                            <Typography variant="caption" component="div" color="info.main" noWrap title={publicShareUrl}>
+                              {shareCaptionLabel}{" "}
+                              <Link href={publicShareUrl} target="_blank" rel="noopener noreferrer" underline="hover">
+                                {publicShareUrl}
                               </Link>
                             </Typography>
                           ) : tunnelStarting && tunnelActionAppId === id ? (
                             <Typography variant="caption" component="div" color="info.main">
-                              Public: starting tunnel...
+                              {shareCaptionLabel} starting tunnel...
                             </Typography>
                           ) : tunnelStopping && isSelectedPublicApp ? (
                             <Typography variant="caption" component="div" color="text.secondary">
-                              Public: stopping tunnel...
+                              {shareCaptionLabel} stopping tunnel...
                             </Typography>
                           ) : controlPlaneTunnelOnly ? (
                             <Typography variant="caption" component="div" color="text.secondary">
-                              Public: control-plane tunnel active. Expose this app publicly to get a working app link.
+                              {shareCaptionLabel} control-plane access is active. Expose this app to get a working app link.
                             </Typography>
                           ) : (
                             <Typography variant="caption" component="div" color="text.secondary">
-                              Public: tunnel inactive
+                              {shareCaptionLabel} inactive
                             </Typography>
                           )}
+                          {toBool(appItem.access_guard_enabled) && (publicShareUrl || localShareUrl) ? (
+                            <Typography variant="caption" component="div" color="warning.main" noWrap>
+                              Visitors will be asked for the access key.
+                            </Typography>
+                          ) : null}
                         </Stack>
                       </TableCell>
                       <TableCell align="right">
@@ -8432,7 +8484,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               }
                             })),
                             {
-                              label: publicShareUrl ? "Copy Public Link" : "Copy Local Link",
+                              label: publicShareUrl ? shareCopyLabel : "Copy Local Link",
                               divider: openTargets.length > 0,
                               disabled: !shareUrl,
                               onClick: async () => {
@@ -8484,23 +8536,23 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             {
                               label:
                                 tunnelStarting
-                                  ? "Starting Public Tunnel..."
+                                  ? (tunnelMeta.isPrivate ? "Starting Private Access..." : "Starting Public Tunnel...")
                                   : tunnelActive && selectedPublicAppId === id
-                                    ? "Refresh Public Exposure"
+                                    ? (tunnelMeta.isPrivate ? "Refresh Private Exposure" : "Refresh Public Exposure")
                                     : tunnelActive && selectedPublicAppId && selectedPublicAppId !== id
-                                      ? "Set as Public Landing App"
-                                      : "Start Public Tunnel",
+                                      ? (tunnelMeta.isPrivate ? "Set as Private Landing App" : "Set as Public Landing App")
+                                      : (tunnelMeta.isPrivate ? "Start Private Access" : "Start Public Tunnel"),
                               divider: true,
                               disabled: tunnelStarting || !tunnelAvailable,
                               onClick: () => startTunnel(id)
                             },
                             {
-                              label: tunnelStopping ? "Stopping Public Tunnel..." : "Stop Public Tunnel",
+                              label: tunnelStopping ? "Stopping..." : (tunnelMeta.isPrivate ? "Stop Private Access" : "Stop Public Tunnel"),
                               disabled: tunnelStopping || !tunnelActive,
                               onClick: stopTunnel
                             },
                             {
-                              label: "Refresh Public Link",
+                              label: tunnelMeta.isPrivate ? "Refresh Private URL" : "Refresh Public Link",
                               onClick: refreshLinks
                             },
                             {
@@ -13298,16 +13350,43 @@ function SettingsManager({
     return out;
   }
 
+  function pickRecommendedTunnelProvider(providers: JsonRecord[]): JsonRecord | null {
+    const publicProviders = providers.filter((provider) => !getTunnelAccessMeta(provider).isPrivate);
+    return (
+      publicProviders.find((provider) => toBool(provider.available) && toBool(provider.configured)) ||
+      publicProviders.find((provider) => toBool(provider.available)) ||
+      providers.find((provider) => toBool(provider.available) && toBool(provider.configured)) ||
+      providers.find((provider) => toBool(provider.available)) ||
+      providers[0] ||
+      null
+    );
+  }
+
   function syncTunnelDraftFromPayload(payloadLike: unknown, preferredProviderId?: string) {
     const payload = asRecord(payloadLike);
     const providers = pickRecords(payload, "providers");
     if (providers.length === 0) return;
-    const preferred =
-      preferredProviderId?.trim() ||
-      str(payload.selected_provider, "").trim() ||
-      str(providers[0]?.id, "").trim();
+    const explicitPreferred = preferredProviderId?.trim() || "";
+    const runtimeActive = toBool(payload.active);
+    const activeProviderId = str(payload.active_provider, "").trim();
+    const selectedProviderId = str(payload.selected_provider, "").trim();
+    const explicitlySelected = explicitPreferred
+      ? providers.find((provider) => str(provider.id, "").trim() === explicitPreferred)
+      : null;
+    const activeProvider = activeProviderId
+      ? providers.find((provider) => str(provider.id, "").trim() === activeProviderId)
+      : null;
+    const serverSelected = selectedProviderId
+      ? providers.find((provider) => str(provider.id, "").trim() === selectedProviderId)
+      : null;
+    const serverSelectedAvailable =
+      serverSelected && toBool(serverSelected.available) ? serverSelected : null;
     const selected =
-      providers.find((provider) => str(provider.id, "").trim() === preferred) || providers[0];
+      explicitlySelected ||
+      (runtimeActive ? activeProvider : null) ||
+      serverSelectedAvailable ||
+      pickRecommendedTunnelProvider(providers);
+    if (!selected) return;
     const nextId = str(selected.id, "").trim();
     if (!nextId) return;
     setTunnelSelectedProviderId(nextId);
@@ -13450,6 +13529,22 @@ function SettingsManager({
     mutationFn: async () => {
       const mediaKeys = parseMediaProvidersJson(form.media_provider_keys_json);
       const mediaProviders: Record<string, string> = { ...mediaKeys };
+      const savedSnapshot = parseSavedSettingsSnapshot();
+      const fieldChanged = <K extends keyof typeof form>(key: K): boolean =>
+        !savedSnapshot || savedSnapshot[key] !== form[key];
+      const includeTelegramSettings =
+        form.telegram_bot_token.trim().length > 0 ||
+        fieldChanged("telegram_enabled") ||
+        fieldChanged("telegram_allowed_users_csv");
+      const includeWhatsappSettings =
+        form.whatsapp_access_token.trim().length > 0 ||
+        fieldChanged("whatsapp_enabled") ||
+        fieldChanged("whatsapp_mode") ||
+        fieldChanged("whatsapp_phone_number_id") ||
+        fieldChanged("whatsapp_verify_token") ||
+        fieldChanged("whatsapp_bridge_url") ||
+        fieldChanged("whatsapp_dm_policy") ||
+        fieldChanged("whatsapp_allowed_numbers_csv");
       const mediaFieldKeys: Array<[string, string]> = [
         ["replicate", form.media_key_replicate],
         ["fal", form.media_key_fal],
@@ -13492,19 +13587,6 @@ function SettingsManager({
         llm_fallback_base_url: form.llm_fallback_base_url || null,
         llm_fallback_api_key: form.llm_fallback_api_key || null,
 
-        telegram_enabled: !!form.telegram_enabled,
-        telegram_bot_token: form.telegram_bot_token || null,
-        telegram_allowed_users: parseTelegramUsers(form.telegram_allowed_users_csv),
-
-        whatsapp_enabled: !!form.whatsapp_enabled,
-        whatsapp_mode: form.whatsapp_mode || null,
-        whatsapp_access_token: form.whatsapp_access_token || null,
-        whatsapp_phone_number_id: form.whatsapp_phone_number_id || null,
-        whatsapp_verify_token: form.whatsapp_verify_token || null,
-        whatsapp_bridge_url: form.whatsapp_bridge_url || null,
-        whatsapp_dm_policy: form.whatsapp_dm_policy || null,
-        whatsapp_allowed_numbers: parseCsvList(form.whatsapp_allowed_numbers_csv),
-
         auto_approve: parseCsvList(form.auto_approve_csv),
 
         media_providers: mediaProviders,
@@ -13539,6 +13621,23 @@ function SettingsManager({
           ...(form.observability_auth_token.trim() ? { auth_token: form.observability_auth_token } : {})
         }
       };
+
+      if (includeTelegramSettings) {
+        payload.telegram_enabled = !!form.telegram_enabled;
+        payload.telegram_bot_token = form.telegram_bot_token || null;
+        payload.telegram_allowed_users = parseTelegramUsers(form.telegram_allowed_users_csv);
+      }
+
+      if (includeWhatsappSettings) {
+        payload.whatsapp_enabled = !!form.whatsapp_enabled;
+        payload.whatsapp_mode = form.whatsapp_mode || null;
+        payload.whatsapp_access_token = form.whatsapp_access_token || null;
+        payload.whatsapp_phone_number_id = form.whatsapp_phone_number_id || null;
+        payload.whatsapp_verify_token = form.whatsapp_verify_token || null;
+        payload.whatsapp_bridge_url = form.whatsapp_bridge_url || null;
+        payload.whatsapp_dm_policy = form.whatsapp_dm_policy || null;
+        payload.whatsapp_allowed_numbers = parseCsvList(form.whatsapp_allowed_numbers_csv);
+      }
 
       return await api.rawPost("/settings", payload);
     },
@@ -14021,15 +14120,19 @@ function SettingsManager({
   const tunnel = asRecord(tunnelQ.data);
   const tunnelProvidersPayload = asRecord(tunnelProvidersQ.data);
   const tunnelProviders = pickRecords(tunnelProvidersPayload, "providers");
-  const serverSelectedTunnelProviderId = str(
-    tunnelProvidersPayload.selected_provider,
-    str(tunnel.provider, "cloudflare")
-  );
-  const selectedTunnelProviderRecord =
-    tunnelProviders.find((provider) => str(provider.id, "") === tunnelSelectedProviderId) ||
-    tunnelProviders.find((provider) => str(provider.id, "") === serverSelectedTunnelProviderId) ||
-    tunnelProviders[0] ||
-    null;
+    const serverSelectedTunnelProviderId = str(
+      tunnelProvidersPayload.selected_provider,
+      str(tunnel.provider, "cloudflare")
+    );
+    const activeTunnelProviderId = str(
+      tunnelProvidersPayload.active_provider,
+      str(tunnel.provider, "cloudflare")
+    ).trim();
+    const selectedTunnelProviderRecord =
+      tunnelProviders.find((provider) => str(provider.id, "") === tunnelSelectedProviderId) ||
+      tunnelProviders.find((provider) => str(provider.id, "") === serverSelectedTunnelProviderId) ||
+      tunnelProviders[0] ||
+      null;
   const selectedTunnelConfigFields = selectedTunnelProviderRecord
     ? pickRecords(selectedTunnelProviderRecord, "config_fields")
     : [];
@@ -14038,23 +14141,60 @@ function SettingsManager({
         (value): value is string => typeof value === "string" && value.trim().length > 0
       )
     : [];
-  const selectedTunnelConfigHelp = str(selectedTunnelProviderRecord?.config_help, "").trim();
   const selectedTunnelDescription = str(selectedTunnelProviderRecord?.description, "").trim();
   const selectedTunnelAvailable = toBool(selectedTunnelProviderRecord?.available);
   const selectedTunnelConfigured = toBool(selectedTunnelProviderRecord?.configured);
-  const hasTunnelAdvancedFields = selectedTunnelConfigFields.some(
-    (field) => str(field.key, "").trim() === "binary_path"
-  );
-  const visibleTunnelConfigFields = selectedTunnelConfigFields.filter(
-    (field) => showTunnelAdvanced || str(field.key, "").trim() !== "binary_path"
-  );
-  const tunnelStatusSummary = toBool(tunnel.active) ? "Public link is live" : "Public link is off";
-  const tunnelSetupSummary = !selectedTunnelAvailable
-    ? "Tunnel tool not found on this server"
-    : !selectedTunnelConfigured
-      ? "Setup incomplete"
-      : "Ready";
-  const sec = asRecord(securityStatusQ.data);
+  const selectedTunnelMeta = getTunnelAccessMeta(selectedTunnelProviderRecord);
+  const activeTunnelMeta = getTunnelAccessMeta(tunnel);
+    const recommendedPublicTunnelProvider = useMemo(() => {
+      const publicProviders = tunnelProviders.filter((provider) => !getTunnelAccessMeta(provider).isPrivate);
+      return (
+        publicProviders.find((provider) => toBool(provider.available) && toBool(provider.configured)) ||
+        publicProviders.find((provider) => toBool(provider.available)) ||
+      publicProviders[0] ||
+      null
+      );
+    }, [tunnelProviders]);
+    const tunnelProviderOptions = useMemo(() => {
+      if (showTunnelAdvanced) return tunnelProviders;
+      const keepIds = new Set(
+        [tunnelSelectedProviderId, serverSelectedTunnelProviderId, activeTunnelProviderId]
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+      );
+      const preferred = tunnelProviders.filter((provider) => {
+        const id = str(provider.id, "").trim();
+        return keepIds.has(id) || toBool(provider.available);
+      });
+      return preferred.length > 0 ? preferred : tunnelProviders;
+    }, [
+      activeTunnelProviderId,
+      serverSelectedTunnelProviderId,
+      showTunnelAdvanced,
+      tunnelProviders,
+      tunnelSelectedProviderId
+    ]);
+    const selectedTunnelHelp =
+      str(selectedTunnelProviderRecord?.config_help, "").trim() || getTunnelProviderHelp(selectedTunnelMeta);
+    const basicTunnelConfigFields = selectedTunnelConfigFields.filter(
+      (field) => str(field.key, "").trim() !== "binary_path"
+    );
+    const advancedTunnelConfigFields = selectedTunnelConfigFields.filter(
+      (field) => str(field.key, "").trim() === "binary_path"
+    );
+    const selectedTunnelLabel = str(selectedTunnelProviderRecord?.label, str(tunnel.provider_label, "Tunnel"));
+    const tunnelSummaryTone: "success" | "warning" | "info" =
+      toBool(tunnel.active) ? "success" : !selectedTunnelAvailable || !selectedTunnelConfigured ? "warning" : "info";
+    const tunnelGuidanceText = !selectedTunnelAvailable
+      ? selectedTunnelMeta.isPrivate
+        ? "Private tailnet access needs the Tailscale CLI on the same runtime as AgentArk. In Docker, that means the container itself must have Tailscale available."
+        : "This provider's tunnel binary is not available on this runtime. Use an installed provider or open advanced options to set a custom binary path."
+      : selectedTunnelMeta.isPrivate
+        ? "Private access only works from devices already connected to your tailnet. It does not create a public internet URL."
+        : str(selectedTunnelProviderRecord?.id, "") === "bore"
+          ? "Bore is a raw TCP tunnel. It is fine for app sharing, but the AgentArk control plane works best with an HTTPS provider such as Cloudflare, ngrok, or Tailscale Funnel."
+          : selectedTunnelHelp;
+    const sec = asRecord(securityStatusQ.data);
 
   useEffect(() => {
     if (tunnelProviders.length === 0) return;
@@ -14075,6 +14215,54 @@ function SettingsManager({
   const usingDefaultMasterPassword = toBool(sec.using_default);
   const hasCustomMasterPassword = toBool(sec.master_password_set) && !usingDefaultMasterPassword;
   const vaultSecrets = pickRecords(vaultSecretsQ.data, "entries");
+  const securityStatusTone: "success" | "warning" | "info" = hasCustomMasterPassword
+    ? "success"
+    : usingDefaultMasterPassword
+      ? "warning"
+      : "info";
+  const securityStatusLabel = hasCustomMasterPassword
+    ? "Custom password active"
+    : usingDefaultMasterPassword
+      ? "Default password active"
+      : "Local-only encryption";
+  const securityStatusText = hasCustomMasterPassword
+    ? "Change or remove it here. Remote access can use it immediately."
+    : usingDefaultMasterPassword
+      ? "Set your own password before using remote access or sharing AgentArk outside this device."
+      : "Everything is still encrypted locally. Set a custom password only when you want sign-in or remote access.";
+  const tunnelNeedsPassword = !hasCustomMasterPassword;
+  const tunnelAccessLabel = selectedTunnelMeta.isPrivate ? "Private access" : "Public access";
+  const tunnelStateLabel = toBool(tunnel.active) ? "Live" : "Off";
+  const tunnelPrimaryText = toBool(tunnel.active)
+    ? `${selectedTunnelLabel} is live and ready.`
+    : !selectedTunnelAvailable
+      ? `${selectedTunnelLabel} is not available on this AgentArk runtime yet.`
+      : !selectedTunnelConfigured
+        ? `${selectedTunnelLabel} needs setup before it can start.`
+        : tunnelNeedsPassword
+          ? `Set a custom password first, then start ${selectedTunnelLabel}.`
+          : `${selectedTunnelLabel} is ready to start.`;
+  const tunnelPrimaryDetail = !selectedTunnelAvailable
+    ? tunnelGuidanceText
+    : !selectedTunnelConfigured
+      ? selectedTunnelHelp
+      : toBool(tunnel.active)
+        ? selectedTunnelMeta.isPrivate
+          ? "Only devices already connected to your tailnet can reach this sign-in page."
+          : "Visitors reach the sign-in page through this link and still need your AgentArk password."
+        : tunnelNeedsPassword
+          ? "Remote access stays locked until you set your own password."
+          : selectedTunnelMeta.isPrivate
+            ? "Only devices already connected to your tailnet will be able to reach it."
+            : "This will expose the sign-in page with password protection.";
+  const tunnelHasDetails =
+    advancedTunnelConfigFields.length > 0 ||
+    selectedTunnelDescription.length > 0 ||
+    selectedTunnelHelp.length > 0 ||
+    tunnelGuidanceText.length > 0;
+  const vaultSummaryText = hasCustomMasterPassword
+    ? `${vaultSecrets.length} stored secret${vaultSecrets.length === 1 ? "" : "s"}. Password is required only for protected add or delete actions.`
+    : `${vaultSecrets.length} stored secret${vaultSecrets.length === 1 ? "" : "s"}. Secrets stay encrypted even without a custom password.`;
   const pulseEvents = pickRecords(pulseQ.data, "events").sort((a, b) => {
     const aTs = Date.parse(str(a.timestamp, ""));
     const bTs = Date.parse(str(b.timestamp, ""));
@@ -14082,6 +14270,8 @@ function SettingsManager({
   });
   const pulseMeta = asRecord(pulseQ.data);
   const pulseRunning = toBool(pulseMeta.running);
+  const pulseHistoryUnavailable = toBool(pulseMeta.history_unavailable);
+  const pulseHistoryUnavailableReason = str(pulseMeta.history_unavailable_reason, "").trim();
   const latestPulseEventId = str(asRecord(pulseEvents[0]).id, "");
   const moltbookStatus = asRecord(moltbookStatusQ.data);
   const latestMoltbookEventId = str(asRecord(moltbookEvents[0]).id, "");
@@ -14215,7 +14405,9 @@ function SettingsManager({
     pulseRunning
       ? "ArkPulse is currently running."
       : pulseEvents.length === 0
-      ? "No health checks yet."
+      ? pulseHistoryUnavailable
+        ? "Earlier ArkPulse history is unavailable."
+        : "No health checks yet."
       : latestPulseFindingsCount > 0
       ? `${latestPulseFindingsCount} issue${latestPulseFindingsCount === 1 ? "" : "s"} need attention.`
       : latestPulseStatus === "ok" || latestPulseScore >= 90
@@ -14225,7 +14417,9 @@ function SettingsManager({
     pulseRunning
       ? "Please wait for this run to finish before starting another."
       : pulseEvents.length === 0
-      ? "Click Run now to generate your first ArkPulse report."
+      ? pulseHistoryUnavailable
+        ? pulseHistoryUnavailableReason || "A previous ArkPulse payload exists, but this runtime could not decrypt it. New runs will appear normally."
+        : "Click Run now to generate your first ArkPulse report."
       : latestPulseFindingsCount > 0
       ? "Open the latest report and start with Fix #1."
       : "No urgent action needed right now.";
@@ -14970,8 +15164,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     );
     const startedUrl = str(response.url, "").trim();
     const startMessage = startedUrl
-      ? `Public link is ready. ${startedUrl}`
-      : "Tunnel is starting. The public link will appear here in a few seconds.";
+      ? getTunnelPanelStartMessage(selectedTunnelMeta, startedUrl)
+      : getTunnelPanelStartingMessage(selectedTunnelMeta);
     setTunnelPanelNotice({
       severity: startedUrl ? "success" : "info",
       text: startMessage
@@ -14984,7 +15178,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     setResumeTunnelStartAfterPassword(false);
     setTunnelPanelNotice({
       severity: "info",
-      text: "Custom password saved. Creating your public link now..."
+      text: getTunnelPanelResumeMessage(selectedTunnelMeta)
     });
     try {
       await performTunnelStart();
@@ -15034,9 +15228,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       setResumeTunnelStartAfterPassword(true);
       setTunnelPanelNotice({
         severity: "info",
-        text: "Set a custom AgentArk password first. The public link will start right after that."
+        text: getTunnelPanelPasswordPrompt(selectedTunnelMeta)
       });
-      openPasswordDialog(toBool(sec.master_password_set) ? "change" : "set");
+      openPasswordDialog("set");
       return;
     }
     try {
@@ -15052,7 +15246,10 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       const response = asRecord(await tunnelStopMutation.mutateAsync());
       setTunnelPanelNotice({
         severity: "info",
-        text: str(response.message, "Public link stopped.")
+        text: str(
+          response.message,
+          activeTunnelMeta.isPrivate ? "Private access stopped." : "Public link stopped."
+        )
       });
       setSuccess(str(response.message, "Tunnel stopped."));
     } catch (e) {
@@ -16205,34 +16402,15 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   ) : securityStatusQ.error ? (
                     <Alert severity="error">{errMessage(securityStatusQ.error)}</Alert>
                   ) : (
-                    <Stack spacing={1}>
-                      <Typography variant="caption" color="text.secondary">
-                        Mode: {str(sec.encryption_mode) === "password" ? "password" : "keyfile"}
-                      </Typography>
-                      {str(sec.encryption_mode) !== "password" ? (
-                        <Alert
-                          severity="warning"
-                          sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                        >
-                          No master password is active yet.
-                        </Alert>
-                      ) : toBool(sec.using_default) ? (
-                        <Alert
-                          severity="warning"
-                          sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                        >
-                          Default password is active. Treat this as not configured until you set your own custom master password.
-                        </Alert>
-                      ) : (
-                        <Alert
-                          severity="success"
-                          sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                        >
-                          Custom master password active.
-                        </Alert>
-                      )}
-                      <Typography variant="caption" color="text.secondary">
-                        Password setup opens a secure dialog. Changes apply immediately in this running AgentArk session.
+                    <Stack spacing={1.1}>
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                        <Chip size="small" color={securityStatusTone} label={securityStatusLabel} />
+                        {hasCustomMasterPassword ? null : (
+                          <Chip size="small" variant="outlined" color="warning" label="Remote access locked" />
+                        )}
+                      </Stack>
+                      <Typography variant="body2" color="text.secondary">
+                        {securityStatusText}
                       </Typography>
                       <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
                         {hasCustomMasterPassword ? (
@@ -16248,7 +16426,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           <Button
                             variant="contained"
                             size="large"
-                            onClick={() => openPasswordDialog(toBool(sec.master_password_set) ? "change" : "set")}
+                            onClick={() => openPasswordDialog("set")}
                             disabled={passwordMutationPending}
                           >
                             Set Custom Password
@@ -16272,204 +16450,280 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               </Box>
 
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>
-                  Remote Access (Tunnel)
-                </Typography>
+                <Stack spacing={1.25}>
+                  <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    justifyContent="space-between"
+                    alignItems={{ xs: "flex-start", sm: "center" }}
+                    spacing={1}
+                  >
+                    <Stack spacing={0.4}>
+                      <Typography variant="h6">Remote Access</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        Start private or public sign-in access only when you need it.
+                      </Typography>
+                    </Stack>
+                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      <Chip size="small" color={tunnelSummaryTone} label={tunnelStateLabel} />
+                      <Chip size="small" variant="outlined" label={tunnelAccessLabel} />
+                    </Stack>
+                  </Stack>
                 {tunnelQ.isLoading || tunnelProvidersQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">
                     Loading tunnel settings...
                   </Typography>
-                ) : tunnelQ.error || tunnelProvidersQ.error ? (
-                  <Alert severity="error">{errMessage(tunnelQ.error || tunnelProvidersQ.error)}</Alert>
-                ) : (
-                  <Stack spacing={1}>
-                    <Typography variant="caption" color="text.secondary">
-                      Status: {tunnelStatusSummary} | Provider: {str(tunnel.provider_label, str(selectedTunnelProviderRecord?.label, "-"))} | Setup: {tunnelSetupSummary}
-                    </Typography>
-                    <TextField
-                      label="Provider"
-                      select
-                      size="small"
-                      fullWidth
-                      value={tunnelSelectedProviderId || serverSelectedTunnelProviderId}
-                      onChange={(e) => {
-                        const next = e.target.value;
-                        syncTunnelDraftFromPayload(tunnelProvidersPayload, next);
-                      }}
-                    >
-                      {tunnelProviders.map((provider) => {
-                        const id = str(provider.id, "");
-                        const label = str(provider.label, id || "Provider");
-                        return (
-                          <MenuItem key={id} value={id}>
-                            {label}
+                  ) : tunnelQ.error || tunnelProvidersQ.error ? (
+                    <Alert severity="error">{errMessage(tunnelQ.error || tunnelProvidersQ.error)}</Alert>
+                  ) : (
+                    <Stack spacing={1.1}>
+                      <Alert severity={tunnelSummaryTone} sx={{ py: 0.25, "& .MuiAlert-message": { width: "100%" } }}>
+                        <Stack spacing={0.35}>
+                          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                            {tunnelPrimaryText}
+                          </Typography>
+                          <Typography variant="body2" color="inherit">
+                            {tunnelPrimaryDetail}
+                          </Typography>
+                        </Stack>
+                      </Alert>
+                      <TextField
+                        label="Access method"
+                        select
+                        size="small"
+                        fullWidth
+                        value={tunnelSelectedProviderId || serverSelectedTunnelProviderId}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          syncTunnelDraftFromPayload(tunnelProvidersPayload, next);
+                        }}
+                      >
+                        {tunnelProviderOptions.map((provider) => {
+                          const id = str(provider.id, "");
+                          const label = str(provider.label, id || "Provider");
+                          const available = toBool(provider.available);
+                          return (
+                            <MenuItem key={id} value={id}>
+                              {available ? label : `${label} (not available)`}
                           </MenuItem>
                         );
                       })}
                     </TextField>
-                    {selectedTunnelDescription ? (
-                      <Typography variant="caption" color="text.secondary">
-                        {selectedTunnelDescription}
-                      </Typography>
-                    ) : null}
-                    {selectedTunnelConfigHelp ? (
-                      <Alert severity="info" sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}>
-                        {selectedTunnelConfigHelp}
-                      </Alert>
-                    ) : null}
-                    {str(selectedTunnelProviderRecord?.id, "") === "bore" ? (
-                      <Alert severity="warning" sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}>
-                        Bore is fine for raw app sharing, but AgentArk control-plane remote access requires an HTTPS tunnel provider such as Cloudflare, ngrok, or Tailscale Funnel.
-                      </Alert>
-                    ) : null}
-                    {hasTunnelAdvancedFields ? (
-                      <Button
-                        size="small"
-                        variant="text"
-                        sx={{ alignSelf: "flex-start", px: 0 }}
-                        onClick={() => setShowTunnelAdvanced((prev) => !prev)}
-                      >
-                        {showTunnelAdvanced ? "Hide advanced options" : "Show advanced options"}
-                      </Button>
-                    ) : null}
-                    {visibleTunnelConfigFields.length === 0 ? (
-                      <Typography variant="caption" color="text.secondary">
-                        {selectedTunnelAvailable
-                          ? "No extra setup is needed for this provider."
-                          : "Install the tunnel tool on the server, then retry. Advanced options let you override the binary path if needed."}
-                      </Typography>
-                    ) : null}
-                    {visibleTunnelConfigFields.map((field) => {
-                      const key = str(field.key, "");
-                      const inputType = str(field.input_type, "text");
-                      const options = Array.isArray(field.options)
-                        ? field.options.filter((value): value is string => typeof value === "string")
-                        : [];
-                      const value = tunnelDraftValues[key] ?? "";
-                      const storedSecret = inputType === "password" && selectedTunnelStoredSecretFields.includes(key);
-                      const helperText =
-                        inputType === "password" && storedSecret && !value.trim()
-                          ? "A value is already saved. Enter a new value only if you want to replace it."
-                          : undefined;
-                      return (
+                      {basicTunnelConfigFields.map((field) => {
+                        const key = str(field.key, "");
+                        const inputType = str(field.input_type, "text");
+                        const options = Array.isArray(field.options)
+                          ? field.options.filter((value): value is string => typeof value === "string")
+                          : [];
+                        const value = tunnelDraftValues[key] ?? "";
+                        const storedSecret = inputType === "password" && selectedTunnelStoredSecretFields.includes(key);
+                        const helperText =
+                          inputType === "password" && storedSecret && !value.trim()
+                            ? "A value is already saved. Enter a new value only if you want to replace it."
+                            : undefined;
+                        return (
+                          <TextField
+                            key={key}
+                            label={str(field.label, key || "Field")}
+                            value={value}
+                            onChange={(e) =>
+                              setTunnelDraftValues((prev) => ({
+                                ...prev,
+                                [key]: e.target.value
+                              }))
+                            }
+                            fullWidth
+                            size="small"
+                            required={toBool(field.required)}
+                            placeholder={str(field.placeholder, "") || undefined}
+                            type={inputType === "password" ? "password" : "text"}
+                            multiline={inputType === "textarea"}
+                            minRows={inputType === "textarea" ? 3 : undefined}
+                            select={inputType === "select"}
+                            helperText={helperText}
+                          >
+                            {inputType === "select"
+                              ? options.map((option) => (
+                                  <MenuItem key={option} value={option}>
+                                    {option}
+                                  </MenuItem>
+                                ))
+                              : null}
+                          </TextField>
+                        );
+                      })}
+                      {tunnelPanelNotice ? (
+                        <Alert severity={tunnelPanelNotice.severity}>{tunnelPanelNotice.text}</Alert>
+                      ) : null}
+                      {str(tunnel.error, "").trim() ? <Alert severity="error">{str(tunnel.error)}</Alert> : null}
+                      {str(tunnel.url, "").trim() ? (
                         <TextField
-                          key={key}
-                          label={str(field.label, key || "Field")}
-                          value={value}
-                          onChange={(e) =>
-                            setTunnelDraftValues((prev) => ({
-                              ...prev,
-                              [key]: e.target.value
-                            }))
-                          }
+                          label={getTunnelUrlFieldLabel(selectedTunnelMeta)}
+                          value={str(tunnel.url)}
                           fullWidth
                           size="small"
-                          required={toBool(field.required)}
-                          placeholder={str(field.placeholder, "") || undefined}
-                          type={inputType === "password" ? "password" : "text"}
-                          multiline={inputType === "textarea"}
-                          minRows={inputType === "textarea" ? 3 : undefined}
-                          select={inputType === "select"}
-                          helperText={helperText}
+                          InputProps={{ readOnly: true }}
+                        />
+                      ) : null}
+                      <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap flexWrap="wrap">
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={handleTunnelProviderSave}
+                          disabled={tunnelSaveMutation.isPending}
                         >
-                          {inputType === "select"
-                            ? options.map((option) => (
-                                <MenuItem key={option} value={option}>
-                                  {option}
-                                </MenuItem>
-                              ))
-                            : null}
-                        </TextField>
-                      );
-                    })}
-                    {str(tunnel.url, "").trim() ? (
-                      <TextField
-                        label="Public Link"
-                        value={str(tunnel.url)}
-                        fullWidth
-                        size="small"
-                        InputProps={{ readOnly: true }}
-                      />
-                    ) : null}
-                    {tunnelPanelNotice ? (
-                      <Alert severity={tunnelPanelNotice.severity}>{tunnelPanelNotice.text}</Alert>
-                    ) : null}
-                    {str(tunnel.error, "").trim() ? <Alert severity="error">{str(tunnel.error)}</Alert> : null}
-                    <Stack direction="row" spacing={1}>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={handleTunnelProviderSave}
-                        disabled={tunnelSaveMutation.isPending}
-                      >
-                        {tunnelSaveMutation.isPending ? "Saving..." : "Save"}
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={handleTunnelProviderTest}
-                        disabled={tunnelSaveMutation.isPending || tunnelTestMutation.isPending}
-                      >
-                        {tunnelTestMutation.isPending ? "Checking..." : "Check Setup"}
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="contained"
-                        onClick={handleTunnelStart}
-                        disabled={
-                          tunnelSaveMutation.isPending ||
-                          tunnelStartMutation.isPending ||
-                          toBool(tunnel.active) ||
-                          !selectedTunnelAvailable
-                        }
-                      >
-                        {tunnelStartMutation.isPending
-                          ? "Starting..."
-                          : hasCustomMasterPassword
-                            ? "Get Public Link"
-                            : "Set Password & Get Public Link"}
-                      </Button>
-                      <Button
-                        size="small"
-                        onClick={handleTunnelStop}
-                        disabled={tunnelStopMutation.isPending || !toBool(tunnel.active)}
-                      >
-                        {tunnelStopMutation.isPending ? "Stopping..." : "Stop Public Link"}
-                      </Button>
-                      <Button
-                        size="small"
-                        onClick={async () => {
-                          const url = str(tunnel.url, "");
-                          if (!url) return;
-                          await navigator.clipboard.writeText(url);
-                          setSuccess("Tunnel URL copied.");
-                        }}
-                        disabled={!str(tunnel.url, "").trim()}
-                      >
-                        Copy Link
-                      </Button>
+                          {tunnelSaveMutation.isPending ? "Saving..." : "Save"}
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={handleTunnelProviderTest}
+                          disabled={tunnelSaveMutation.isPending || tunnelTestMutation.isPending}
+                        >
+                          {tunnelTestMutation.isPending ? "Checking..." : "Check setup"}
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="contained"
+                          onClick={handleTunnelStart}
+                          disabled={
+                            tunnelSaveMutation.isPending ||
+                            tunnelStartMutation.isPending ||
+                            toBool(tunnel.active) ||
+                            !selectedTunnelAvailable
+                          }
+                        >
+                          {tunnelStartMutation.isPending
+                            ? "Starting..."
+                            : getTunnelStartButtonLabel(selectedTunnelMeta, hasCustomMasterPassword)}
+                        </Button>
+                        <Button
+                          size="small"
+                          onClick={handleTunnelStop}
+                          disabled={tunnelStopMutation.isPending || !toBool(tunnel.active)}
+                        >
+                          {tunnelStopMutation.isPending ? "Stopping..." : getTunnelStopButtonLabel(selectedTunnelMeta)}
+                        </Button>
+                        <Button
+                          size="small"
+                          onClick={async () => {
+                            const url = str(tunnel.url, "");
+                            if (!url) return;
+                            await navigator.clipboard.writeText(url);
+                            setSuccess("Tunnel URL copied.");
+                          }}
+                          disabled={!str(tunnel.url, "").trim()}
+                        >
+                          Copy link
+                        </Button>
+                      </Stack>
+                      {tunnelHasDetails ? (
+                        <Accordion
+                          expanded={showTunnelAdvanced}
+                          onChange={(_, expanded) => setShowTunnelAdvanced(expanded)}
+                          disableGutters
+                          sx={{
+                            background: "transparent",
+                            boxShadow: "none",
+                            border: "1px solid rgba(62,143,214,0.18)",
+                            borderRadius: 1
+                          }}
+                        >
+                          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                              Setup details
+                            </Typography>
+                          </AccordionSummary>
+                          <AccordionDetails sx={{ pt: 0 }}>
+                            <Stack spacing={1}>
+                              {selectedTunnelDescription ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  {selectedTunnelDescription}
+                                </Typography>
+                              ) : null}
+                              {tunnelGuidanceText ? (
+                                <Alert
+                                  severity={!selectedTunnelAvailable || str(selectedTunnelProviderRecord?.id, "") === "bore" ? "warning" : "info"}
+                                  sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
+                                  action={
+                                    !selectedTunnelAvailable &&
+                                    recommendedPublicTunnelProvider &&
+                                    str(recommendedPublicTunnelProvider.id, "").trim() !== str(selectedTunnelProviderRecord?.id, "").trim() ? (
+                                      <Button
+                                        color="inherit"
+                                        size="small"
+                                        onClick={() => syncTunnelDraftFromPayload(tunnelProvidersPayload, str(recommendedPublicTunnelProvider.id, "").trim())}
+                                      >
+                                        Use {str(recommendedPublicTunnelProvider.label, "Cloudflare")}
+                                      </Button>
+                                    ) : undefined
+                                  }
+                                >
+                                  {tunnelGuidanceText}
+                                </Alert>
+                              ) : null}
+                              {advancedTunnelConfigFields.map((field) => {
+                                const key = str(field.key, "");
+                                const inputType = str(field.input_type, "text");
+                                const value = tunnelDraftValues[key] ?? "";
+                                return (
+                                  <TextField
+                                    key={key}
+                                    label={str(field.label, key || "Field")}
+                                    value={value}
+                                    onChange={(e) =>
+                                      setTunnelDraftValues((prev) => ({
+                                        ...prev,
+                                        [key]: e.target.value
+                                      }))
+                                    }
+                                    fullWidth
+                                    size="small"
+                                    required={toBool(field.required)}
+                                    placeholder={str(field.placeholder, "") || undefined}
+                                    type={inputType === "password" ? "password" : "text"}
+                                  />
+                                );
+                              })}
+                            </Stack>
+                          </AccordionDetails>
+                        </Accordion>
+                      ) : null}
+                      {!hasCustomMasterPassword ? (
+                        <Alert
+                          severity="info"
+                          sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
+                        >
+                          Set a custom password first. AgentArk will keep remote sign-in blocked until then.
+                        </Alert>
+                      ) : (
+                        <Typography variant="caption" color="text.secondary">
+                          {getTunnelPanelWarning(selectedTunnelMeta)}
+                        </Typography>
+                      )}
                     </Stack>
-                    <Alert
-                      severity="warning"
-                      sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                    >
-                      {hasCustomMasterPassword
-                        ? "Anyone with the URL reaches your AgentArk sign-in page. They still need your custom AgentArk password to get in, and you should stop the public link when you no longer need it."
-                        : "Public control-plane links stay blocked until you set a custom AgentArk password. After that, visitors sign in with that password and AgentArk keeps the internal server key private."}
-                    </Alert>
-                  </Stack>
-                )}
+                  )}
+                </Stack>
               </Box>
 
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 <Stack spacing={1}>
-                  <Typography variant="h6">Secrets Vault</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    View encrypted secrets used by models, integrations, search, and workflows. Values stay masked in the UI.
-                  </Typography>
+                  <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    justifyContent="space-between"
+                    alignItems={{ xs: "flex-start", sm: "center" }}
+                    spacing={1}
+                  >
+                    <Stack spacing={0.4}>
+                      <Typography variant="h6">Secrets Vault</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {vaultSummaryText}
+                      </Typography>
+                    </Stack>
+                    <Chip size="small" variant="outlined" label={`${vaultSecrets.length} saved`} />
+                  </Stack>
                   {hasCustomMasterPassword ? (
                     <TextField
-                      label="Master password (required for add/delete when set)"
+                      label="Master password for protected edits"
                       value={vaultPassword}
                       onChange={(e) => setVaultPassword(e.target.value)}
                       fullWidth
@@ -16477,9 +16731,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       type="password"
                     />
                   ) : (
-                    <Alert severity="info">
-                      No custom master password is set. Secrets are still encrypted at rest, and the vault only shows masked snippets.
-                    </Alert>
+                    <Typography variant="caption" color="text.secondary">
+                      Using built-in local encryption. Set a custom password only if you want password-protected sign-in and remote access.
+                    </Typography>
                   )}
                   <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
                     <Button
@@ -16512,8 +16766,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       No encrypted secrets stored yet.
                     </Typography>
                   ) : (
-                    <TableContainer className="table-shell">
-                      <Table size="small">
+                    <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+                      <Table size="small" sx={{ minWidth: 760 }}>
                         <TableHead>
                           <TableRow>
                             <TableCell>Key</TableCell>
@@ -16530,13 +16784,21 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                             const deletable = toBool(row.deletable);
                             return (
                               <TableRow key={`${key}-${idx}`}>
-                                <TableCell sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{key}</TableCell>
-                                <TableCell>
+                                <TableCell
+                                  sx={{
+                                    maxWidth: 260,
+                                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                                    wordBreak: "break-all"
+                                  }}
+                                >
+                                  {key}
+                                </TableCell>
+                                <TableCell sx={{ whiteSpace: "nowrap" }}>
                                   <Typography variant="body2" sx={{ textTransform: "capitalize" }}>
                                     {source.replace(/[-_]+/g, " ")}
                                   </Typography>
                                 </TableCell>
-                                <TableCell sx={{ maxWidth: 360 }}>
+                                <TableCell sx={{ minWidth: 180, maxWidth: 360 }}>
                                   <Typography
                                     variant="body2"
                                     title={shownValue}
@@ -16549,12 +16811,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                                     {shownValue || "-"}
                                   </Typography>
                                 </TableCell>
-                                <TableCell align="right">
+                                <TableCell align="right" sx={{ whiteSpace: "nowrap", width: "1%" }}>
                                   <Stack direction="row" spacing={0.5} justifyContent="flex-end">
                                     {deletable ? (
                                       <Button
                                         size="small"
                                         color="error"
+                                        sx={{ minWidth: 72, whiteSpace: "nowrap" }}
                                         onClick={async () => {
                                           const ok = window.confirm(`Delete secret '${key}'?`);
                                           if (!ok) return;
@@ -17350,7 +17613,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 </Stack>
                 {pulseQ.error ? <Alert severity="error">{errMessage(pulseQ.error)}</Alert> : null}
                 {!pulseQ.error ? (
-                  <Alert severity={pulseRunning ? "info" : latestPulseFindingsCount > 0 ? "warning" : "success"} sx={{ mb: 1 }}>
+                  <Alert severity={pulseRunning ? "info" : pulseHistoryUnavailable || latestPulseFindingsCount > 0 ? "warning" : "success"} sx={{ mb: 1 }}>
                     <Typography variant="subtitle2">{latestPulseHeadline}</Typography>
                     <Typography variant="body2" color="text.secondary">
                       {latestPulseSubtitle}
@@ -17360,7 +17623,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 {pulseEvents.length === 0 ? (
                   <Stack spacing={1} sx={{ flex: 1 }}>
                     <Typography variant="body2" color="text.secondary">
-                      No ArkPulse events yet.
+                      {pulseHistoryUnavailable ? "Stored ArkPulse history could not be loaded in this runtime." : "No ArkPulse events yet."}
                     </Typography>
                     <Box className="metadata-box" sx={{ maxHeight: "none" }}>
                       <Typography variant="caption" color="text.secondary">
@@ -18450,7 +18713,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <Stack spacing={1.2} sx={{ mt: 0.5 }}>
             <Alert severity="warning">
               {resumeTunnelStartAfterPassword
-                ? "Save a custom AgentArk password to finish creating the public link."
+                ? (selectedTunnelMeta.isPrivate
+                    ? "Save a custom AgentArk password to finish creating the private access URL."
+                    : "Save a custom AgentArk password to finish creating the public link.")
                 : "Password changes apply immediately to this running AgentArk session."}
             </Alert>
             <FormControlLabel
@@ -18703,69 +18968,9 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
         : resp?.by_purpose || [];
 
   const palette = ["#2fd4ff", "#14f195", "#fbbf24", "#d946ef", "#60a5fa", "#f97316"];
-  const seriesNames = byModelRows.map((r) => str(r.model, str(r.provider, "Other")));
   const spendSeries = byModelRows.map((r) => (typeof r.cost_usd === "number" ? r.cost_usd : 0));
   const requestSeries = byModelRows.map((r) => num(r.request_count, 0));
   const tokenSeries = byModelRows.map((r) => num(r.total_tokens, 0));
-
-  function miniBarsOption(values: number[]) {
-    return {
-      backgroundColor: "transparent",
-      animationDuration: 400,
-      grid: { left: 2, right: 2, top: 10, bottom: 8, containLabel: false },
-      tooltip: {
-        trigger: "axis",
-        backgroundColor: "rgba(6,14,28,0.95)",
-        borderColor: "rgba(84,198,255,0.25)",
-        textStyle: { color: "#d8edff" },
-        axisPointer: {
-          type: "shadow",
-          shadowStyle: {
-            color: "rgba(84,198,255,0.08)"
-          }
-        }
-      },
-      xAxis: {
-        type: "category",
-        data: seriesNames,
-        boundaryGap: true,
-        axisLine: { show: false },
-        axisTick: { show: false },
-        axisLabel: { show: false }
-      },
-      yAxis: {
-        type: "value",
-        max: (value: { max: number }) => (value.max > 0 ? value.max * 1.18 : 1),
-        splitLine: { show: false },
-        axisLine: { show: false },
-        axisTick: { show: false },
-        axisLabel: { show: false }
-      },
-      series: [
-        {
-          type: "bar",
-          data: values.map((v, idx) => ({
-            value: v,
-            itemStyle: {
-              color: palette[idx % palette.length],
-              borderRadius: [999, 999, 0, 0],
-              shadowBlur: 10,
-              shadowColor: "rgba(0,0,0,0.22)"
-            }
-          })),
-          showBackground: true,
-          backgroundStyle: {
-            color: "rgba(108,156,212,0.08)",
-            borderRadius: [999, 999, 0, 0]
-          },
-          barWidth: 14,
-          barMaxWidth: 14,
-          barMinHeight: 6,
-          barCategoryGap: "62%"
-        }
-      ]
-    };
-  }
 
   const spendValue = typeof totals?.cost_usd === "number" ? `$${totals.cost_usd.toFixed(4)}` : "n/a";
   const requestsValue = compactNumber(num(totals?.request_count, 0));
@@ -18926,48 +19131,29 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
           gap: 1.5
         }}
       >
-        {[
+        {[ 
           { title: "Spend", value: spendValue, values: spendSeries },
           { title: "Requests", value: requestsValue, values: requestSeries },
           { title: "Tokens", value: tokensValue, values: tokenSeries }
         ].map((card) => (
-          <Box
+          <MetricBarCard
             key={card.title}
-            className="list-shell"
-            sx={{
-              p: 1.6,
-              borderRadius: "12px",
-              border: "1px solid rgba(108,156,212,0.18)",
-              background: "linear-gradient(170deg, rgba(6,15,29,0.95), rgba(3,9,21,0.9))"
-            }}
-          >
-            <Typography variant="subtitle1" sx={{ color: "#d8edff", fontWeight: 600 }}>
-              {card.title}
-            </Typography>
-            <Typography variant="h4" sx={{ color: "#f3fbff", fontWeight: 700, mb: 0.6 }}>
-              {card.value}
-            </Typography>
-            <ReactECharts option={miniBarsOption(card.values)} style={{ height: 104 }} />
-            <Stack spacing={0.5} sx={{ mt: 0.8 }}>
-              {byModelRows.map((row, idx) => (
-                <Stack key={`${card.title}-legend-${idx}`} direction="row" justifyContent="space-between" alignItems="center">
-                  <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
-                    <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: palette[idx % palette.length], flex: "0 0 auto" }} />
-                    <Typography variant="body2" noWrap title={str(row.model, str(row.provider, "Other"))}>
-                      {str(row.model, str(row.provider, "Other"))}
-                    </Typography>
-                  </Stack>
-                  <Typography variant="body2" color="text.secondary">
-                    {card.title === "Spend"
-                      ? (typeof row.cost_usd === "number" ? `$${row.cost_usd.toFixed(4)}` : "n/a")
-                      : card.title === "Requests"
-                        ? compactNumber(num(row.request_count, 0))
-                        : compactNumber(num(row.total_tokens, 0))}
-                  </Typography>
-                </Stack>
-              ))}
-            </Stack>
-          </Box>
+            title={card.title}
+            value={card.value}
+            values={card.values}
+            rows={byModelRows.map((row) => ({
+              label: str(row.model, str(row.provider, "Other")),
+              value:
+                card.title === "Spend"
+                  ? typeof row.cost_usd === "number"
+                    ? `$${row.cost_usd.toFixed(4)}`
+                    : "n/a"
+                  : card.title === "Requests"
+                    ? compactNumber(num(row.request_count, 0))
+                    : compactNumber(num(row.total_tokens, 0)),
+            }))}
+            palette={palette}
+          />
         ))}
       </Box>
 

@@ -44,8 +44,15 @@ impl EncryptedStorage {
         old_key: Arc<KeyManager>,
         new_key: Arc<KeyManager>,
     ) -> Result<()> {
+        const ROTATED_KV_KEYS: &[&str] = &[
+            "user_profile",
+            crate::core::observability::OBSERVABILITY_LOG_KEY,
+            crate::sentinel::PULSE_LOG_KEY,
+            crate::storage::legacy_recovery::LEGACY_STORAGE_KEYS_KEY,
+        ];
+
         self.storage
-            .reencrypt_sensitive_payloads(old_key.as_ref(), new_key.as_ref(), &["user_profile"])
+            .reencrypt_sensitive_payloads(old_key.as_ref(), new_key.as_ref(), ROTATED_KV_KEYS)
             .await?;
         self.replace_key_manager(new_key);
         Ok(())
@@ -323,6 +330,20 @@ mod tests {
             .set_encrypted("user_profile", br#"{"name":"Ada"}"#)
             .await
             .unwrap();
+        encrypted_storage
+            .set_encrypted(
+                crate::core::observability::OBSERVABILITY_LOG_KEY,
+                br#"[{"id":"obs-1","timestamp":"2026-03-19T00:00:00Z","level":"info","event":"test","message":"ok","provider":"langtrace","endpoint":"https://example.com","trace_id":null,"status_code":200}]"#,
+            )
+            .await
+            .unwrap();
+        encrypted_storage
+            .set_encrypted(
+                crate::sentinel::PULSE_LOG_KEY,
+                br#"[{"timestamp":"2026-03-19T00:00:00Z","status":"ok","message":"healthy","summary":"","flags":[],"overdue_tasks":0,"failed_tasks":0,"details":{"pending_tasks":0,"running_tasks":0,"completed_tasks":0,"total_tasks":0,"active_watchers":0,"total_memories":0,"overdue_list":[],"failed_list":[],"uptime_secs":0,"health_checks":[],"security":null,"deployed_apps":[],"doctor_findings":[],"doctor_score":100}}]"#,
+            )
+            .await
+            .unwrap();
 
         let raw_episode_before = storage
             .get_all_episodes_for_scoring()
@@ -360,6 +381,20 @@ mod tests {
             new_key.decrypt(&raw_profile).unwrap(),
             br#"{"name":"Ada"}"#.to_vec()
         );
+        let raw_observability = storage
+            .get(crate::core::observability::OBSERVABILITY_LOG_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old_key.decrypt(&raw_observability).is_err());
+        assert!(new_key.decrypt(&raw_observability).is_ok());
+        let raw_pulse = storage
+            .get(crate::sentinel::PULSE_LOG_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old_key.decrypt(&raw_pulse).is_err());
+        assert!(new_key.decrypt(&raw_pulse).is_ok());
 
         let episodes = clone
             .get_all_episodes_for_scoring_decrypted()

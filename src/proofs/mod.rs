@@ -245,8 +245,33 @@ impl ProofEngine {
         if encrypted_path.exists() {
             let payload = std::fs::read(&encrypted_path)?;
             if let Some(key_manager) = trace_encryption_key {
-                let decrypted = key_manager.decrypt(&payload)?;
-                return Ok(serde_json::from_slice(&decrypted)?);
+                match key_manager.decrypt(&payload) {
+                    Ok(decrypted) => match serde_json::from_slice(&decrypted) {
+                        Ok(trace) => return Ok(trace),
+                        Err(error) => {
+                            let backup_path = Self::quarantine_trace_file(&encrypted_path);
+                            tracing::error!(
+                                "Failed to parse encrypted execution trace at {}: {}. \
+                                 Starting with an empty trace and preserving the original at {}.",
+                                encrypted_path.display(),
+                                error,
+                                backup_path.display()
+                            );
+                            return Ok(ExecutionTrace::new());
+                        }
+                    },
+                    Err(error) => {
+                        let backup_path = Self::quarantine_trace_file(&encrypted_path);
+                        tracing::error!(
+                            "Failed to decrypt execution trace at {}: {}. \
+                             Starting with an empty trace and preserving the original at {}.",
+                            encrypted_path.display(),
+                            error,
+                            backup_path.display()
+                        );
+                        return Ok(ExecutionTrace::new());
+                    }
+                }
             }
             anyhow::bail!("Encrypted proof trace exists but no trace encryption key is available");
         }
@@ -258,6 +283,55 @@ impl ProofEngine {
         }
 
         Ok(ExecutionTrace::new())
+    }
+
+    fn quarantine_trace_file(path: &Path) -> std::path::PathBuf {
+        let mut candidate = path.with_extension("enc.bak");
+        if candidate == path {
+            candidate = path.with_extension("bak");
+        }
+        if !candidate.exists() {
+            if let Err(error) = std::fs::rename(path, &candidate) {
+                tracing::warn!(
+                    "Failed to move incompatible execution trace '{}' to '{}': {}",
+                    path.display(),
+                    candidate.display(),
+                    error
+                );
+            }
+            return candidate;
+        }
+
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("execution_trace");
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        for idx in 1..=32 {
+            let file_name = if ext.is_empty() {
+                format!("{}.bak.{}", stem, idx)
+            } else {
+                format!("{}.{}.bak.{}", stem, ext, idx)
+            };
+            let next = path.with_file_name(file_name);
+            if next.exists() {
+                continue;
+            }
+            if let Err(error) = std::fs::rename(path, &next) {
+                tracing::warn!(
+                    "Failed to move incompatible execution trace '{}' to '{}': {}",
+                    path.display(),
+                    next.display(),
+                    error
+                );
+            }
+            return next;
+        }
+
+        candidate
     }
 
     /// Get a clone of the current execution trace

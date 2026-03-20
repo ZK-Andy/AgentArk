@@ -1,0 +1,860 @@
+//! Document retrieval helpers for metadata-aware and embedding-aware search.
+//!
+//! Keep this module free of agent orchestration concerns so document retrieval
+//! can evolve without expanding `agent.rs`.
+
+use anyhow::Result;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
+use crate::integrations::mem0::Mem0Client;
+use crate::storage::{document, document_chunk, Storage};
+
+const MAX_EMBED_BATCH: usize = 64;
+const MAX_DENSE_BACKFILL_CHUNKS: usize = 512;
+const MAX_FILENAME_MATCH_DOCS: usize = 4;
+const MAX_FILENAME_MATCH_CHUNKS: usize = 3;
+const MAX_EXPLICIT_MATCH_CHUNKS: usize = 4;
+const MIN_LEXICAL_SCORE: f32 = 0.08;
+const MIN_DENSE_SCORE: f32 = 0.22;
+
+/// A scored document chunk returned by retrieval helpers.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentSearchHit {
+    pub document_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub project_id: Option<String>,
+    pub chunk_index: Option<i32>,
+    pub created_at: Option<String>,
+    pub content: String,
+    pub lexical_score: f32,
+    pub dense_score: Option<f32>,
+    pub score: f32,
+    pub match_reason: String,
+}
+
+impl DocumentSearchHit {
+    pub(crate) fn new(
+        document_id: impl Into<String>,
+        filename: impl Into<String>,
+        content_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            document_id: document_id.into(),
+            filename: filename.into(),
+            content_type: content_type.into(),
+            project_id: None,
+            chunk_index: None,
+            created_at: None,
+            content: content.into(),
+            lexical_score: 0.0,
+            dense_score: None,
+            score: 0.0,
+            match_reason: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SearchableDocumentMeta {
+    document: document::Model,
+    normalized_filename: String,
+    normalized_stem: String,
+    filename_tokens: HashSet<String>,
+}
+
+/// Normalize lookup text for filename and chunk matching.
+pub(crate) fn normalize_document_lookup_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Tokenize document search text into a set of useful query tokens.
+pub(crate) fn document_search_tokens(text: &str) -> HashSet<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|word| {
+            let trimmed = word.trim();
+            if trimmed.len() < 3
+                || trimmed.chars().all(|c| c.is_ascii_digit())
+                || is_generic_document_query_token(trimmed)
+            {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Tokens that usually indicate a generic document question rather than a
+/// filename-specific lookup.
+pub(crate) fn is_generic_document_query_token(token: &str) -> bool {
+    matches!(
+        token,
+        "what"
+            | "does"
+            | "talk"
+            | "about"
+            | "summarize"
+            | "summary"
+            | "explain"
+            | "review"
+            | "document"
+            | "documents"
+            | "file"
+            | "files"
+            | "attachment"
+            | "attachments"
+            | "pdf"
+            | "docx"
+            | "txt"
+            | "md"
+            | "csv"
+    )
+}
+
+/// Detect whether the user is asking about a document rather than issuing a
+/// general chat request.
+pub(crate) fn looks_like_document_question(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let question_like = lower.ends_with('?')
+        || lower.contains("summarize")
+        || lower.contains("summary")
+        || lower.contains("what does")
+        || lower.contains("what is in")
+        || lower.contains("explain")
+        || lower.contains("review");
+    let document_like = lower.contains("doc:")
+        || lower.contains("document")
+        || lower.contains("attachment")
+        || lower.contains(".pdf")
+        || lower.contains(".docx")
+        || lower.contains(".txt")
+        || lower.contains(".md")
+        || lower.contains(".csv");
+
+    question_like && document_like
+}
+
+/// Decide whether clarification should be skipped when document context is
+/// already available.
+pub(crate) fn should_skip_clarification_for_document_context(
+    text: &str,
+    doc_context_available: bool,
+    execution_intent: bool,
+) -> bool {
+    doc_context_available && !execution_intent && looks_like_document_question(text)
+}
+
+/// Build the text fed into the embedding model for a document chunk.
+pub(crate) fn build_embedding_text(
+    filename: &str,
+    content_type: &str,
+    chunk_text: &str,
+    project_id: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    let filename = filename.trim();
+    if !filename.is_empty() {
+        parts.push(format!("filename: {}", filename));
+    }
+    let content_type = content_type.trim();
+    if !content_type.is_empty() {
+        parts.push(format!("content_type: {}", content_type));
+    }
+    if let Some(pid) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(format!("project_id: {}", pid));
+    }
+    let content = chunk_text.trim();
+    if !content.is_empty() {
+        parts.push(format!("content: {}", content));
+    }
+    parts.join("\n")
+}
+
+/// Pack f32 embeddings into little-endian bytes for storage.
+pub(crate) fn pack_embedding(embedding: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    for value in embedding {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// Unpack little-endian f32 embeddings from storage bytes.
+pub(crate) fn unpack_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+    )
+}
+
+/// Compute a dot product for equally sized vectors.
+pub(crate) fn dot_product(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    Some(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
+}
+
+/// Compute cosine similarity for arbitrary vectors.
+#[cfg(test)]
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    let dot = dot_product(a, b)?;
+    let norm_a = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let norm_b = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        None
+    } else {
+        Some(dot / (norm_a * norm_b))
+    }
+}
+
+/// For normalized embeddings, dot product is already the cosine score.
+pub(crate) fn normalized_embedding_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    dot_product(a, b)
+}
+
+/// Blend lexical and dense scores into a single ranking score.
+pub(crate) fn combine_search_scores(
+    lexical_score: f32,
+    dense_score: Option<f32>,
+    filename_boost: f32,
+) -> f32 {
+    let dense = dense_score.unwrap_or(0.0).clamp(0.0, 1.0);
+    (0.55 * lexical_score.clamp(0.0, 1.0) + 0.40 * dense + filename_boost.clamp(0.0, 0.35))
+        .clamp(0.0, 1.0)
+}
+
+fn document_filename_stem(filename: &str) -> &str {
+    filename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(filename)
+}
+
+fn build_document_meta(doc: document::Model) -> SearchableDocumentMeta {
+    SearchableDocumentMeta {
+        normalized_filename: normalize_document_lookup_text(&doc.filename),
+        normalized_stem: normalize_document_lookup_text(document_filename_stem(&doc.filename)),
+        filename_tokens: document_search_tokens(&doc.filename),
+        document: doc,
+    }
+}
+
+fn filename_match_boost(
+    query_normalized: &str,
+    filename_query_tokens: &HashSet<String>,
+    doc: &SearchableDocumentMeta,
+) -> f32 {
+    if query_normalized.is_empty() {
+        return 0.0;
+    }
+
+    let exactish = (!doc.normalized_filename.is_empty()
+        && (query_normalized.contains(&doc.normalized_filename)
+            || doc.normalized_filename.contains(query_normalized)))
+        || (!doc.normalized_stem.is_empty()
+            && (query_normalized.contains(&doc.normalized_stem)
+                || doc.normalized_stem.contains(query_normalized)));
+    if exactish {
+        return 0.30;
+    }
+
+    if filename_query_tokens.is_empty() || doc.filename_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let overlap = filename_query_tokens
+        .intersection(&doc.filename_tokens)
+        .count();
+    if overlap == 0 {
+        return 0.0;
+    }
+
+    (0.10 + 0.18 * overlap as f32 / filename_query_tokens.len() as f32).min(0.28)
+}
+
+fn lexical_chunk_score(
+    query_normalized: &str,
+    query_tokens: &HashSet<String>,
+    content: &str,
+) -> f32 {
+    if query_normalized.is_empty() || query_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let content_normalized = normalize_document_lookup_text(content);
+    let content_tokens = document_search_tokens(content);
+    if content_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let overlap = query_tokens.intersection(&content_tokens).count();
+    if overlap == 0 && !content_normalized.contains(query_normalized) {
+        return 0.0;
+    }
+
+    let coverage = overlap as f32 / query_tokens.len() as f32;
+    let phrase_boost = if content_normalized.contains(query_normalized) {
+        0.25
+    } else {
+        0.0
+    };
+    (coverage + phrase_boost).min(1.0)
+}
+
+fn dense_chunk_score(query_embedding: &[f32], embedding_bytes: Option<&[u8]>) -> Option<f32> {
+    let candidate = unpack_embedding(embedding_bytes?)?;
+    normalized_embedding_similarity(query_embedding, &candidate).map(|score| score.clamp(0.0, 1.0))
+}
+
+fn hit_key(hit: &DocumentSearchHit) -> String {
+    match hit.chunk_index {
+        Some(chunk_index) => format!("{}::{}", hit.document_id, chunk_index),
+        None => format!("{}::{}", hit.document_id, hit.content),
+    }
+}
+
+fn merge_match_reasons(existing: &str, new_reason: &str) -> String {
+    let mut merged = Vec::new();
+    for reason in [existing, new_reason]
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !merged
+            .iter()
+            .any(|existing_reason: &String| existing_reason == reason)
+        {
+            merged.push(reason.to_string());
+        }
+    }
+    merged.join(", ")
+}
+
+fn merge_hit(hits: &mut HashMap<String, DocumentSearchHit>, hit: DocumentSearchHit) {
+    let key = hit_key(&hit);
+    match hits.get_mut(&key) {
+        Some(existing) => {
+            existing.score = existing.score.max(hit.score);
+            existing.lexical_score = existing.lexical_score.max(hit.lexical_score);
+            existing.dense_score = match (existing.dense_score, hit.dense_score) {
+                (Some(lhs), Some(rhs)) => Some(lhs.max(rhs)),
+                (None, Some(rhs)) => Some(rhs),
+                (Some(lhs), None) => Some(lhs),
+                (None, None) => None,
+            };
+            existing.match_reason = merge_match_reasons(&existing.match_reason, &hit.match_reason);
+        }
+        None => {
+            hits.insert(key, hit);
+        }
+    }
+}
+
+fn sort_and_truncate_hits(
+    mut hits: Vec<DocumentSearchHit>,
+    limit: usize,
+) -> Vec<DocumentSearchHit> {
+    hits.sort_by(|lhs, rhs| {
+        rhs.score
+            .partial_cmp(&lhs.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                rhs.dense_score
+                    .unwrap_or(0.0)
+                    .partial_cmp(&lhs.dense_score.unwrap_or(0.0))
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                rhs.lexical_score
+                    .partial_cmp(&lhs.lexical_score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| lhs.filename.cmp(&rhs.filename))
+            .then_with(|| {
+                lhs.chunk_index
+                    .unwrap_or_default()
+                    .cmp(&rhs.chunk_index.unwrap_or_default())
+            })
+    });
+    hits.truncate(limit);
+    hits
+}
+
+fn build_chunk_hit(
+    doc: &SearchableDocumentMeta,
+    chunk: &document_chunk::Model,
+) -> DocumentSearchHit {
+    let mut hit = DocumentSearchHit::new(
+        chunk.document_id.clone(),
+        doc.document.filename.clone(),
+        doc.document.content_type.clone(),
+        chunk.content.clone(),
+    );
+    hit.project_id = doc.document.project_id.clone();
+    hit.chunk_index = Some(chunk.chunk_index);
+    hit.created_at = Some(doc.document.created_at.clone());
+    hit
+}
+
+fn build_match_reason(
+    explicit_ref: bool,
+    filename_boost: f32,
+    lexical_score: f32,
+    dense_score: Option<f32>,
+) -> String {
+    let mut reasons = Vec::new();
+    if explicit_ref {
+        reasons.push("explicit_doc_ref");
+    }
+    if filename_boost >= 0.28 {
+        reasons.push("filename_exact");
+    } else if filename_boost > 0.0 {
+        reasons.push("filename");
+    }
+    if lexical_score >= MIN_LEXICAL_SCORE {
+        reasons.push("lexical");
+    }
+    if dense_score.unwrap_or(0.0) >= MIN_DENSE_SCORE {
+        reasons.push("dense");
+    }
+    if reasons.is_empty() {
+        reasons.push("document");
+    }
+    reasons.join(", ")
+}
+
+async fn embed_chunks_with_metadata(
+    mem0: &Mem0Client,
+    filename: &str,
+    content_type: &str,
+    project_id: Option<&str>,
+    chunks: &mut [document_chunk::Model],
+    chunk_indices: &[usize],
+) -> Result<usize> {
+    let mut updated = 0usize;
+    for batch in chunk_indices.chunks(MAX_EMBED_BATCH) {
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|index| {
+                build_embedding_text(filename, content_type, &chunks[*index].content, project_id)
+            })
+            .collect();
+        let embeddings = mem0.embed_texts(&texts).await?;
+        if embeddings.len() != batch.len() {
+            tracing::warn!(
+                "Document embedding batch mismatch: expected {}, got {}",
+                batch.len(),
+                embeddings.len()
+            );
+            continue;
+        }
+
+        for (offset, embedding) in embeddings.into_iter().enumerate() {
+            let chunk_index = batch[offset];
+            chunks[chunk_index].embedding = Some(pack_embedding(&embedding));
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
+/// Generate embeddings for newly created document chunks before they are stored.
+pub(crate) async fn embed_document_chunks(
+    mem0: &Mem0Client,
+    filename: &str,
+    content_type: &str,
+    project_id: Option<&str>,
+    chunks: &mut [document_chunk::Model],
+) -> Result<usize> {
+    let candidate_indices: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!chunk.content.trim().is_empty()).then_some(index))
+        .collect();
+    if candidate_indices.is_empty() {
+        return Ok(0);
+    }
+    embed_chunks_with_metadata(
+        mem0,
+        filename,
+        content_type,
+        project_id,
+        chunks,
+        &candidate_indices,
+    )
+    .await
+}
+
+async fn backfill_missing_embeddings(
+    storage: &Storage,
+    mem0: &Mem0Client,
+    documents_by_id: &HashMap<String, SearchableDocumentMeta>,
+    chunks: &mut [document_chunk::Model],
+    priority_doc_ids: &HashSet<String>,
+) -> usize {
+    let mut missing_priority_indices = Vec::new();
+    let mut missing_other_indices = Vec::new();
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.embedding.is_some() || chunk.content.trim().is_empty() {
+            continue;
+        }
+        if priority_doc_ids.contains(&chunk.document_id) {
+            missing_priority_indices.push(index);
+        } else {
+            missing_other_indices.push(index);
+        }
+    }
+
+    let backfill_indices: Vec<usize> = if chunks.len() <= MAX_DENSE_BACKFILL_CHUNKS {
+        missing_priority_indices
+            .into_iter()
+            .chain(missing_other_indices)
+            .collect()
+    } else if !priority_doc_ids.is_empty() {
+        missing_priority_indices
+            .into_iter()
+            .take(MAX_DENSE_BACKFILL_CHUNKS)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if backfill_indices.is_empty() {
+        return 0;
+    }
+
+    let mut updated = 0usize;
+    for batch in backfill_indices.chunks(MAX_EMBED_BATCH) {
+        let texts: Vec<String> = batch
+            .iter()
+            .filter_map(|index| {
+                let chunk = &chunks[*index];
+                let doc = documents_by_id.get(&chunk.document_id)?;
+                Some(build_embedding_text(
+                    &doc.document.filename,
+                    &doc.document.content_type,
+                    &chunk.content,
+                    doc.document.project_id.as_deref(),
+                ))
+            })
+            .collect();
+        if texts.len() != batch.len() {
+            continue;
+        }
+
+        let embeddings = match mem0.embed_texts(&texts).await {
+            Ok(values) => values,
+            Err(error) => {
+                tracing::debug!("Document embedding backfill unavailable: {}", error);
+                return updated;
+            }
+        };
+        if embeddings.len() != batch.len() {
+            tracing::warn!(
+                "Document embedding backfill mismatch: expected {}, got {}",
+                batch.len(),
+                embeddings.len()
+            );
+            continue;
+        }
+
+        for (offset, embedding) in embeddings.into_iter().enumerate() {
+            let index = batch[offset];
+            let packed = pack_embedding(&embedding);
+            chunks[index].embedding = Some(packed.clone());
+            if storage
+                .update_document_chunk_embedding(&chunks[index].id, Some(packed))
+                .await
+                .is_ok()
+            {
+                updated += 1;
+            }
+        }
+    }
+
+    updated
+}
+
+/// Search indexed document chunks using explicit refs, filename metadata,
+/// lexical overlap, and dense similarity from the local embedding model.
+pub(crate) async fn search_documents(
+    storage: &Storage,
+    mem0: &Mem0Client,
+    query: &str,
+    limit: usize,
+    project_id: Option<&str>,
+) -> Result<Vec<DocumentSearchHit>> {
+    if limit == 0 || query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let doc_ref_re = regex::Regex::new(r"(?i)\bdoc:([a-z0-9-]{6,})\b").ok();
+    let explicit_doc_ids: HashSet<String> = doc_ref_re
+        .as_ref()
+        .map(|re| {
+            re.captures_iter(query)
+                .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let query_without_refs = if let Some(re) = doc_ref_re.as_ref() {
+        re.replace_all(query, " ").to_string()
+    } else {
+        query.to_string()
+    };
+    let query_normalized = normalize_document_lookup_text(&query_without_refs);
+    let query_tokens = document_search_tokens(&query_without_refs);
+    let filename_query_tokens: HashSet<String> = query_tokens
+        .iter()
+        .filter(|token| !is_generic_document_query_token(token))
+        .cloned()
+        .collect();
+
+    let docs = storage.list_documents_for_search(project_id).await?;
+    if docs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let documents_by_id: HashMap<String, SearchableDocumentMeta> = docs
+        .into_iter()
+        .map(build_document_meta)
+        .map(|doc| (doc.document.id.clone(), doc))
+        .collect();
+
+    let filename_boosts: HashMap<String, f32> = documents_by_id
+        .iter()
+        .filter_map(|(doc_id, doc)| {
+            let boost = filename_match_boost(&query_normalized, &filename_query_tokens, doc);
+            (boost > 0.0).then_some((doc_id.clone(), boost))
+        })
+        .collect();
+
+    let mut hits = HashMap::new();
+
+    for doc_id in &explicit_doc_ids {
+        let Some(doc) = documents_by_id.get(doc_id) else {
+            continue;
+        };
+        if let Ok(doc_chunks) = storage.get_document_chunks(doc_id).await {
+            for (position, chunk) in doc_chunks
+                .into_iter()
+                .take(MAX_EXPLICIT_MATCH_CHUNKS)
+                .enumerate()
+            {
+                let mut hit = build_chunk_hit(doc, &chunk);
+                hit.score = (0.98 - position as f32 * 0.02).clamp(0.0, 1.0);
+                hit.match_reason = "explicit_doc_ref".to_string();
+                merge_hit(&mut hits, hit);
+            }
+        }
+    }
+
+    let mut filename_docs: Vec<(&SearchableDocumentMeta, f32)> = filename_boosts
+        .iter()
+        .filter_map(|(doc_id, boost)| documents_by_id.get(doc_id).map(|doc| (doc, *boost)))
+        .collect();
+    filename_docs.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
+
+    for (doc, boost) in filename_docs
+        .into_iter()
+        .take(MAX_FILENAME_MATCH_DOCS.max(limit))
+    {
+        if let Ok(doc_chunks) = storage.get_document_chunks(&doc.document.id).await {
+            for (position, chunk) in doc_chunks
+                .into_iter()
+                .take(MAX_FILENAME_MATCH_CHUNKS)
+                .enumerate()
+            {
+                let mut hit = build_chunk_hit(doc, &chunk);
+                hit.score = (0.58 + boost - position as f32 * 0.03).clamp(0.0, 1.0);
+                hit.match_reason = if boost >= 0.28 {
+                    "filename_exact".to_string()
+                } else {
+                    "filename".to_string()
+                };
+                merge_hit(&mut hits, hit);
+            }
+        }
+    }
+
+    if query_tokens.is_empty() {
+        return Ok(sort_and_truncate_hits(hits.into_values().collect(), limit));
+    }
+
+    let doc_ids: Vec<String> = documents_by_id.keys().cloned().collect();
+    let mut chunks = storage.list_document_chunks_for_documents(&doc_ids).await?;
+    if chunks.is_empty() {
+        return Ok(sort_and_truncate_hits(hits.into_values().collect(), limit));
+    }
+
+    let priority_doc_ids: HashSet<String> = explicit_doc_ids
+        .iter()
+        .cloned()
+        .chain(filename_boosts.keys().cloned())
+        .collect();
+    let query_embedding = mem0
+        .embed_texts(std::slice::from_ref(&query_without_refs))
+        .await
+        .ok()
+        .and_then(|mut embeddings| embeddings.drain(..).next());
+
+    if query_embedding.is_some() {
+        let _ = backfill_missing_embeddings(
+            storage,
+            mem0,
+            &documents_by_id,
+            &mut chunks,
+            &priority_doc_ids,
+        )
+        .await;
+    }
+
+    for chunk in chunks {
+        let Some(doc) = documents_by_id.get(&chunk.document_id) else {
+            continue;
+        };
+
+        let filename_boost = filename_boosts
+            .get(&chunk.document_id)
+            .copied()
+            .unwrap_or(0.0);
+        let lexical_score = lexical_chunk_score(&query_normalized, &query_tokens, &chunk.content);
+        let dense_score = query_embedding
+            .as_deref()
+            .and_then(|embedding| dense_chunk_score(embedding, chunk.embedding.as_deref()));
+
+        if lexical_score < MIN_LEXICAL_SCORE && dense_score.unwrap_or(0.0) < MIN_DENSE_SCORE {
+            continue;
+        }
+
+        let mut hit = build_chunk_hit(doc, &chunk);
+        hit.lexical_score = lexical_score;
+        hit.dense_score = dense_score;
+        hit.score = combine_search_scores(lexical_score, dense_score, filename_boost);
+        hit.match_reason = build_match_reason(
+            explicit_doc_ids.contains(&chunk.document_id),
+            filename_boost,
+            lexical_score,
+            dense_score,
+        );
+        merge_hit(&mut hits, hit);
+    }
+
+    Ok(sort_and_truncate_hits(hits.into_values().collect(), limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_normalization_splits_punctuation() {
+        let normalized =
+            normalize_document_lookup_text("NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf");
+        assert_eq!(normalized, "new tenancy agreement 2026 under 200kb pdf");
+    }
+
+    #[test]
+    fn document_tokens_drop_noise_but_keep_filename_terms() {
+        let tokens = document_search_tokens(
+            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
+        );
+        assert!(tokens.contains("new"));
+        assert!(tokens.contains("tenancy"));
+        assert!(tokens.contains("agreement"));
+        assert!(tokens.contains("200kb"));
+        assert!(!tokens.contains("what"));
+        assert!(!tokens.contains("does"));
+    }
+
+    #[test]
+    fn document_question_detection_is_filename_aware() {
+        assert!(looks_like_document_question(
+            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?"
+        ));
+        assert!(looks_like_document_question(
+            "summarize doc:123abcde for me"
+        ));
+        assert!(!looks_like_document_question("what time is it?"));
+    }
+
+    #[test]
+    fn clarification_skip_requires_context_and_document_question() {
+        assert!(should_skip_clarification_for_document_context(
+            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
+            true,
+            false
+        ));
+        assert!(!should_skip_clarification_for_document_context(
+            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
+            false,
+            false
+        ));
+        assert!(!should_skip_clarification_for_document_context(
+            "what does NEW_TENANCY_AGREEMENT_2026_under_200kb.pdf talk about?",
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn embedding_text_includes_metadata() {
+        let text = build_embedding_text(
+            "lease.pdf",
+            "application/pdf",
+            "rent is due on the first",
+            Some("project-123"),
+        );
+        assert!(text.contains("filename: lease.pdf"));
+        assert!(text.contains("content_type: application/pdf"));
+        assert!(text.contains("project_id: project-123"));
+        assert!(text.contains("content: rent is due on the first"));
+    }
+
+    #[test]
+    fn embedding_pack_unpack_roundtrips() {
+        let values = vec![0.0, 0.25, -1.5, 42.0];
+        let packed = pack_embedding(&values);
+        let unpacked = unpack_embedding(&packed).unwrap();
+        assert_eq!(values, unpacked);
+    }
+
+    #[test]
+    fn similarity_matches_for_normalized_vectors() {
+        let a = vec![0.6, 0.8];
+        let b = vec![0.6, 0.8];
+        assert_eq!(dot_product(&a, &b), Some(1.0));
+        assert_eq!(cosine_similarity(&a, &b), Some(1.0));
+        assert_eq!(normalized_embedding_similarity(&a, &b), Some(1.0));
+    }
+
+    #[test]
+    fn combine_scores_weights_dense_and_lexical() {
+        let score = combine_search_scores(0.8, Some(0.5), 0.1);
+        assert!(score > 0.0);
+        assert!(score <= 1.0);
+    }
+}

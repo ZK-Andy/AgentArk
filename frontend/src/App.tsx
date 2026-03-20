@@ -20,32 +20,36 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
-import AppsRoundedIcon from "@mui/icons-material/AppsRounded";
-import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
-import BoltRoundedIcon from "@mui/icons-material/BoltRounded";
 import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
 import ChevronLeftRoundedIcon from "@mui/icons-material/ChevronLeftRounded";
 import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import DescriptionRoundedIcon from "@mui/icons-material/DescriptionRounded";
+import InboxRoundedIcon from "@mui/icons-material/InboxRounded";
+import ExtensionRoundedIcon from "@mui/icons-material/ExtensionRounded";
+import AppsRoundedIcon from "@mui/icons-material/AppsRounded";
+import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import FlagRoundedIcon from "@mui/icons-material/FlagRounded";
+import TaskRoundedIcon from "@mui/icons-material/TaskRounded";
+import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
+import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
+import AutoStoriesRoundedIcon from "@mui/icons-material/AutoStoriesRounded";
+import AnalyticsRoundedIcon from "@mui/icons-material/AnalyticsRounded";
+import PsychologyRoundedIcon from "@mui/icons-material/PsychologyRounded";
+import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import NotificationsNoneRoundedIcon from "@mui/icons-material/NotificationsNoneRounded";
-import FolderRoundedIcon from "@mui/icons-material/FolderRounded";
-import ForumRoundedIcon from "@mui/icons-material/ForumRounded";
-import HubRoundedIcon from "@mui/icons-material/HubRounded";
-import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import SpaceDashboardRoundedIcon from "@mui/icons-material/SpaceDashboardRounded";
-import QueryStatsRoundedIcon from "@mui/icons-material/QueryStatsRounded";
 import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
-import TaskAltRoundedIcon from "@mui/icons-material/TaskAltRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api/client";
 import { GuidedTour } from "./components/GuidedTour";
-import { NativeWorkspace } from "./components/NativeWorkspace";
+import { NativeWorkspace, type WorkspaceView } from "./components/NativeWorkspace";
 import { OverviewPane } from "./components/OverviewPane";
 import { ApprovalPromptOverlay } from "./components/ApprovalPromptOverlay";
+import { InboxPane } from "./components/InboxPane";
+import { LibraryPane } from "./components/LibraryPane";
 import { useUiStore } from "./store/uiStore";
 import type { Task } from "./types";
 
@@ -55,7 +59,9 @@ const APPROVAL_FALLBACK_POLL_MS = 2500;
 const SIDEBAR_COLLAPSED_KEY = "agentark.sidebar.collapsed";
 type ViewKey =
   | "overview"
+  | "inbox"
   | "chat"
+  | "library"
   | "skills"
   | "tasks"
   | "apps"
@@ -80,34 +86,74 @@ type NotificationStreamPayload = {
   title?: string;
 };
 
+const VIEW_ALIASES: Record<string, ViewKey> = {
+  home: "overview",
+  overview: "overview",
+  workspace: "chat",
+  chat: "chat",
+  inbox: "inbox",
+  project: "projects",
+  projects: "projects",
+  library: "library",
+  watchers: "status",
+  watcher: "status",
+  status: "status",
+  memory: "settings",
+  integrations: "settings",
+  settings: "settings",
+};
+
+const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
+  "overview",
+  "inbox",
+  "chat",
+  "library",
+  "skills",
+  "tasks",
+  "apps",
+  "moltbook",
+  "arkpulse",
+  "memory",
+  "goals",
+  "autonomy",
+  "trace",
+  "status",
+  "swarm",
+  "projects",
+  "documents",
+  "analytics",
+  "settings",
+]);
+
 const NAV_GROUPS: NavGroup[] = [
   {
     id: "core",
     label: "Core",
     items: [
       { key: "overview", label: "Mission Control", icon: <SpaceDashboardRoundedIcon fontSize="small" /> },
-      { key: "chat", label: "Chat", icon: <ChatRoundedIcon fontSize="small" /> }
+      { key: "chat", label: "Chat", icon: <ChatRoundedIcon fontSize="small" /> },
+      { key: "inbox", label: "Inbox", icon: <InboxRoundedIcon fontSize="small" /> },
     ]
   },
   {
     id: "agent",
     label: "Agent",
     items: [
-      { key: "skills", label: "Skills", icon: <BoltRoundedIcon fontSize="small" /> },
+      { key: "skills", label: "Skills", icon: <ExtensionRoundedIcon fontSize="small" /> },
       { key: "apps", label: "Apps", icon: <AppsRoundedIcon fontSize="small" /> },
       { key: "swarm", label: "Agents", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "goals", label: "Goals", icon: <FlagRoundedIcon fontSize="small" /> },
-      { key: "moltbook", label: "Moltbook", icon: <ForumRoundedIcon fontSize="small" /> }
+      { key: "moltbook", label: "Moltbook", icon: <AutoStoriesRoundedIcon fontSize="small" /> },
     ]
   },
   {
     id: "operations",
     label: "Operations",
     items: [
-      { key: "tasks", label: "Tasks", icon: <TaskAltRoundedIcon fontSize="small" /> },
-      { key: "status", label: "Watchers", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
+      { key: "tasks", label: "Tasks", icon: <TaskRoundedIcon fontSize="small" /> },
+      { key: "status", label: "Watchers", icon: <VisibilityRoundedIcon fontSize="small" /> },
       { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
-      { key: "trace", label: "Trace", icon: <HubRoundedIcon fontSize="small" /> }
+      { key: "trace", label: "Trace", icon: <TimelineRoundedIcon fontSize="small" /> },
     ]
   },
   {
@@ -115,14 +161,16 @@ const NAV_GROUPS: NavGroup[] = [
     label: "Data",
     items: [
       { key: "documents", label: "Documents", icon: <DescriptionRoundedIcon fontSize="small" /> },
-      { key: "analytics", label: "Analytics", icon: <QueryStatsRoundedIcon fontSize="small" /> }
+      { key: "analytics", label: "Analytics", icon: <AnalyticsRoundedIcon fontSize="small" /> },
     ]
-  }
+  },
 ];
 
 const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
-  overview: "overview",
+  overview: "home",
+  inbox: "inbox",
   chat: "chat",
+  library: "library",
   skills: "skills",
   tasks: "tasks",
   apps: "apps",
@@ -140,16 +188,27 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   settings: "settings"
 };
 
-const PATH_SEGMENT_TO_VIEW: Record<string, ViewKey> = Object.entries(VIEW_PATH_SEGMENTS).reduce(
-  (acc, [view, segment]) => {
+const PATH_SEGMENT_TO_VIEW: Record<string, ViewKey> = (() => {
+  const base = Object.entries(VIEW_PATH_SEGMENTS).reduce((acc, [view, segment]) => {
     acc[segment] = view as ViewKey;
     return acc;
-  },
-  {} as Record<string, ViewKey>
-);
+  }, {} as Record<string, ViewKey>);
+  base.overview = "overview";
+  base.chat = "chat";
+  base.workspace = "chat";
+  return base;
+})();
 
 function viewPath(view: ViewKey): string {
   return `/ui/${VIEW_PATH_SEGMENTS[view]}`;
+}
+
+function normalizeViewKey(rawView: string): ViewKey {
+  const normalized = rawView.trim().toLowerCase();
+  if (VIEW_KEYS.has(normalized as ViewKey)) {
+    return normalized as ViewKey;
+  }
+  return VIEW_ALIASES[normalized] || "chat";
 }
 
 function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolean } {
@@ -332,7 +391,8 @@ export default function App() {
   const [notificationsStreamConnected, setNotificationsStreamConnected] = useState(false);
   const [approvalBusyTaskId, setApprovalBusyTaskId] = useState<string | null>(null);
   const [approvalPopupError, setApprovalPopupError] = useState<string | null>(null);
-  const navigateToView = (nextView: ViewKey, replace = false) => {
+  const navigateToView = (nextViewRaw: ViewKey | string, replace = false) => {
+    const nextView = normalizeViewKey(nextViewRaw);
     const nextPath = viewPath(nextView);
     if (window.location.pathname !== nextPath) {
       const nextUrl = `${nextPath}${window.location.search}`;
@@ -625,7 +685,7 @@ export default function App() {
 
   const settingsModalOpen = view === "settings";
   const activeView: ViewKey = settingsModalOpen ? lastNonSettingsView : view;
-  const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings">;
+  const workspaceView = activeView as Exclude<ViewKey, "overview" | "settings" | "inbox" | "library">;
   const stageClassName = [
     "workspace-stage",
     activeView === "overview"
@@ -689,11 +749,6 @@ export default function App() {
                   </Badge>
                 </IconButton>
               </Tooltip>
-              <Tooltip title="Projects">
-                <IconButton color="primary" onClick={() => navigateToView("projects")}>
-                  <FolderRoundedIcon />
-                </IconButton>
-              </Tooltip>
               <Tooltip title="Settings">
                 <IconButton color="primary" onClick={() => openSettingsView("settings")}>
                   <SettingsRoundedIcon />
@@ -738,7 +793,7 @@ export default function App() {
                       disableHoverListener={!sidebarCollapsed}
                     >
                       <ListItemButton
-                        selected={view === item.key}
+                        selected={activeView === item.key}
                         onClick={() => navigateToView(item.key)}
                         className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
                         data-tour-target={`nav-${item.key}`}
@@ -760,21 +815,39 @@ export default function App() {
             </List>
           </Box>
 
-          <Box className={mainPaneClassName}>
-            <Box className={stageClassName}>
-              {activeView === "overview" ? (
-                <OverviewPane
-                  navigateToView={navigateToView as (view: string, replace?: boolean) => void}
-                  serverStatus={serverQ.data}
-                  serverError={serverQ.isError}
-                  serverLoading={serverQ.isLoading && !serverQ.data}
-                />
-              ) : (
-                <NativeWorkspace
-                  view={workspaceView}
-                  autoRefresh={settingsModalOpen ? false : autoRefresh}
-                  showAdvanced={showAdvanced}
-                />
+            <Box className={mainPaneClassName}>
+              <Box className={stageClassName}>
+                {activeView === "overview" ? (
+                  <OverviewPane
+                    navigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                    serverStatus={serverQ.data}
+                    serverError={serverQ.isError}
+                    serverLoading={serverQ.isLoading && !serverQ.data}
+                  />
+                ) : activeView === "inbox" ? (
+                  <InboxPane
+                    tasks={approvalTasks}
+                    notifications={visibleNotifications}
+                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                  />
+                ) : activeView === "chat" ? (
+                  <NativeWorkspace
+                    view="chat"
+                    autoRefresh={settingsModalOpen ? false : autoRefresh}
+                    showAdvanced={showAdvanced}
+                  />
+                ) : activeView === "library" ? (
+                  <LibraryPane
+                    autoRefresh={settingsModalOpen ? false : autoRefresh}
+                    showAdvanced={showAdvanced}
+                    onNavigateToView={navigateToView as (view: string, replace?: boolean) => void}
+                  />
+                ) : (
+                  <NativeWorkspace
+                    view={workspaceView as WorkspaceView}
+                    autoRefresh={settingsModalOpen ? false : autoRefresh}
+                    showAdvanced={showAdvanced}
+                  />
               )}
             </Box>
           </Box>

@@ -71,6 +71,11 @@ struct SearchRequest {
 }
 
 #[derive(Serialize)]
+struct EmbedRequest {
+    texts: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct CleanupRequest {
     user_id: String,
 }
@@ -79,6 +84,14 @@ struct CleanupRequest {
 struct SearchResponse {
     #[serde(default)]
     memories: Vec<Mem0Memory>,
+    #[serde(default)]
+    warning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EmbedResponse {
+    #[serde(default)]
+    embeddings: Vec<Vec<f32>>,
     #[serde(default)]
     warning: Option<String>,
 }
@@ -282,6 +295,37 @@ impl Mem0Client {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Mem0 search failed ({}): {}", status, body)
+        }
+    }
+
+    /// Generate normalized embeddings for arbitrary text payloads.
+    /// This endpoint is bridge-local and does not require Mem0 memory extraction to be enabled.
+    pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}/embed", self.bridge_url))
+            .json(&EmbedRequest {
+                texts: texts.to_vec(),
+            })
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let embed_resp: EmbedResponse = resp.json().await?;
+            if let Some(warning) = embed_resp.warning.as_deref() {
+                if !warning.trim().is_empty() {
+                    tracing::warn!("Mem0 embed degraded: {}", warning);
+                }
+            }
+            Ok(embed_resp.embeddings)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Mem0 embed failed ({}): {}", status, body)
         }
     }
 

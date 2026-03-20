@@ -25,9 +25,11 @@
 services:
   agentark:
     build: .
-    image: agentark:latest
+    image: agentark:local
     container_name: agentark
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:8990:8990"
     volumes:
@@ -59,7 +61,13 @@ services:
     networks:
       - agent-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8990/health"]
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -79,6 +87,8 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     container_name: agentark-docker-proxy
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
@@ -111,9 +121,11 @@ services:
 
   # Optional: Ollama for local LLM
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.13.5
     container_name: agentark-ollama
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "11434:11434"
     volumes:
@@ -133,6 +145,8 @@ services:
     image: searxng/searxng:latest
     container_name: agentark-searxng
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "8080:8080"
     volumes:

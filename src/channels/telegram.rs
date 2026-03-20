@@ -896,7 +896,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /model <name> - Switch model\n\
                 /settings - View settings\n\
                 /install <url> - Install a skill from URL\n\
-                /tunnel [start|stop|status] - Manage public UI tunnel\n\
+                /tunnel [start|stop|status] - Manage remote UI access\n\
                 /run <skill> [query] - Run a custom/bundled skill\n\
                 /setsecret KEY=VALUE - Store a secret encrypted (private + allowlisted only)\n\
                 /clear - Clear conversation history\n\n\

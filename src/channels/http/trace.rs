@@ -102,6 +102,9 @@ pub(super) struct TraceDetailResponse {
 }
 
 fn trace_message_preview(message: &str) -> String {
+    if message == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE {
+        return "Older run details unavailable".to_string();
+    }
     if message.len() > 120 {
         format!("{}...", &message[..120])
     } else {
@@ -294,7 +297,11 @@ fn format_trace_detail_from_persisted(
 
     TraceDetailResponse {
         id: t.id.clone(),
-        message: t.message.clone(),
+        message: if t.message == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE {
+            "Older run details are unavailable after a past password/key change.".to_string()
+        } else {
+            t.message.clone()
+        },
         channel: t.channel.clone(),
         status: trace_status_from_steps(&parsed_steps, t.completed_at.is_some()),
         started_at: parse_rfc3339_to_local_display(&t.started_at),

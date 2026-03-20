@@ -132,7 +132,7 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
                 <h1>Sign in to AgentArk</h1>
             </div>
         </div>
-        <p>This public link opens your full AgentArk console. Enter the custom AgentArk password you set in Settings to continue.</p>
+        <p>This remote access URL opens your full AgentArk console. Enter the custom AgentArk password you set in Settings to continue.</p>
         <div class="note">AgentArk keeps the internal server API key private. Remote access on this link uses your AgentArk password and a secure session cookie.</div>
         <form id="login-form">
             <input
@@ -145,7 +145,7 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
             <button type="submit" id="login-btn">Sign In</button>
             <div id="msg"></div>
         </form>
-        <div class="hint">Stop the public link when you no longer need remote access.</div>
+        <div class="hint">Disable remote access when you no longer need it.</div>
     </div>
     <script>
         const nextTarget = __NEXT_TARGET__;
@@ -211,12 +211,12 @@ impl ControlPlaneTunnelError {
     pub(super) fn message(&self) -> String {
         match self {
             Self::CustomPasswordRequired => {
-                "Set a custom AgentArk password before creating a public link.".to_string()
+                "Set a custom AgentArk password before enabling remote access.".to_string()
             }
             Self::InsecureNoAuthMode => {
-                "Disable insecure no-auth mode before creating a public link.".to_string()
+                "Disable insecure no-auth mode before enabling remote access.".to_string()
             }
-            Self::HttpsProviderRequired => "Full AgentArk remote access requires an HTTPS tunnel provider. Choose Cloudflare, ngrok, or Tailscale Funnel.".to_string(),
+            Self::HttpsProviderRequired => "Full AgentArk remote access requires an HTTPS-capable provider. Choose Cloudflare, ngrok, Tailscale Funnel, or Tailscale Private.".to_string(),
             Self::AuthUnavailable(detail) => {
                 format!("Failed to prepare secure remote access: {}", detail)
             }

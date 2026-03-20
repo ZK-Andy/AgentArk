@@ -262,7 +262,7 @@ pub async fn on_interaction_completed(
         .set(TUNE_INTERACTION_COUNT_KEY, next.to_string().as_bytes())
         .await;
 
-    if next % TUNE_INTERVAL == 0 {
+    if next.is_multiple_of(TUNE_INTERVAL) {
         tracing::info!(
             "Self-tune: analyzing user style after {} interactions",
             next

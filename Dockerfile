@@ -34,16 +34,16 @@ COPY Cargo.toml Cargo.lock ./
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Low-memory build: thin LTO + more codegen units to reduce linker peak RAM
-# Full LTO needs 3-4GB+ for wasmtime; thin LTO fits in 2GB RAM + swap
-ENV CARGO_BUILD_JOBS=2
+# Low-memory build: thin LTO + single-job cargo to reduce peak RAM in Docker
+# This is slower, but it rebuilds reliably on 2GB-class Docker Desktop setups.
+ENV CARGO_BUILD_JOBS=1
 ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
 
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release && rm -rf src
+    cargo build --release -j 1 && rm -rf src
 
 # Copy source + assets (logo.svg is included at compile time via include_str!)
 # CACHEBUST invalidates the layer when source changes aren't detected by Docker
@@ -55,14 +55,14 @@ COPY assets ./assets
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     rm -f target/release/agentark target/release/deps/agentark-* && \
-    touch src/main.rs && cargo build --release && \
+    touch src/main.rs && cargo build --release -j 1 && \
     cp target/release/agentark /app/agentark-bin
 
 # ── Stage 2: Frontend build ──────────────────────────────────────────────────
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci || npm install
+RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
 ARG FRONTEND_CACHEBUST=0
 COPY frontend/src ./src
 COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts ./
@@ -104,29 +104,43 @@ COPY services/remotion-template/tsconfig.json services/remotion-template/remotio
 # ── Stage 4: Minimal runtime ────────────────────────────────────────────────
 FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3 \
     curl \
-    docker.io \
-    docker-compose \
     gosu \
     ffmpeg \
     git \
     python3 \
-    python3-pip \
+    python3-venv \
+    zstd \
+    && mkdir -p --mode=0755 /usr/share/keyrings \
+    && curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
+    && curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+        -o /etc/apt/sources.list.d/tailscale.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends tailscale \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Create non-root user + all directories in one layer
-RUN useradd -m agent && \
-    mkdir -p /app/data /app/data/skills /app/data/whatsapp-auth /app/config /app/whatsapp-bridge /app/playwright-bridge /app/mem0-bridge && \
+RUN useradd --create-home --shell /usr/sbin/nologin agent && \
+    mkdir -p /app/data /app/data/skills /app/data/whatsapp-auth /app/data/tailscale /app/config /app/whatsapp-bridge /app/playwright-bridge /app/mem0-bridge && \
     chown -R agent:agent /app
 
-# Install Mem0 Python dependencies (runs as root, before dropping privileges)
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MEM0_VENV=/opt/mem0-venv \
+    MEM0_PYTHON=/opt/mem0-venv/bin/python
+
+# Install Mem0 Python dependencies in an isolated virtualenv.
 COPY services/mem0-bridge/requirements.txt /app/mem0-bridge/
-RUN pip3 install --no-cache-dir --break-system-packages -r /app/mem0-bridge/requirements.txt
+RUN python3 -m venv "${MEM0_VENV}" && \
+    "${MEM0_VENV}/bin/pip" install --upgrade pip setuptools wheel && \
+    "${MEM0_VENV}/bin/pip" install -r /app/mem0-bridge/requirements.txt
 
 # Copy Mem0 bridge app
 COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
@@ -134,14 +148,26 @@ COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
 
 # Download cloudflared for built-in tunnel support (zero-friction remote access)
 # Pinned version for reproducible builds — update deliberately after testing.
-ADD https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64 /usr/local/bin/cloudflared
-RUN chmod +x /usr/local/bin/cloudflared
+ARG CLOUDFLARED_VERSION=2026.2.0
+RUN curl -fsSL --retry 3 \
+    "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+    -o /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared
 
 # Download Lightpanda for fast headless content extraction (~6MB vs ~1.5GB Chromium)
 # Used as fast-path for http_get, web search scraping, and research content fetching.
 # Playwright remains for screenshots and complex SPA interaction.
-ADD https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux /usr/local/bin/lightpanda
-RUN chmod +x /usr/local/bin/lightpanda
+ARG LIGHTPANDA_RELEASE=nightly
+RUN curl -fsSL --retry 3 \
+    "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/lightpanda-x86_64-linux" \
+    -o /usr/local/bin/lightpanda && \
+    chmod +x /usr/local/bin/lightpanda
+
+# Install the Ollama CLI so AgentArk can expose `ollama launch` application registry actions.
+ARG OLLAMA_LINUX_URL=https://ollama.com/download/ollama-linux-amd64.tar.zst
+RUN curl -fsSL --retry 3 "${OLLAMA_LINUX_URL}" | tar --zstd -x -C /usr
+
+RUN apt-get purge -y --auto-remove curl && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built bridges with node_modules (owned by agent)
 COPY --from=node-builder --chown=agent:agent /bridge/whatsapp-bridge /app/whatsapp-bridge
@@ -171,6 +197,9 @@ RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoin
 # Environment
 ENV AGENTARK_CONFIG=/app/config
 ENV AGENTARK_DATA=/app/data
+ENV TS_STATE_DIR=/app/data/tailscale
+ENV TS_SOCKET=/app/data/tailscale/tailscaled.sock
+ENV TS_USERSPACE=true
 # Playwright browsers are preinstalled in the base image
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 # Default bridge URL for in-container Playwright service
@@ -183,7 +212,7 @@ EXPOSE 8990
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8990/health || exit 1
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)" || exit 1
 
 # Run with entrypoint script that checks for volume mounts
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

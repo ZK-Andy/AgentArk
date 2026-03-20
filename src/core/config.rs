@@ -101,6 +101,7 @@ pub enum TunnelProviderKind {
     #[default]
     Cloudflare,
     Ngrok,
+    TailscalePrivate,
     TailscaleFunnel,
     Bore,
 }
@@ -110,6 +111,7 @@ impl TunnelProviderKind {
         match self {
             Self::Cloudflare => "cloudflare",
             Self::Ngrok => "ngrok",
+            Self::TailscalePrivate => "tailscale_private",
             Self::TailscaleFunnel => "tailscale_funnel",
             Self::Bore => "bore",
         }
@@ -743,6 +745,20 @@ impl SecureConfigManager {
         }
     }
 
+    fn load_secrets_runtime_state_unlocked(&self) -> Result<(Secrets, bool)> {
+        match self.load_secrets_unlocked() {
+            Ok(secrets) => Ok((secrets, false)),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to decrypt secrets.enc with the active key: {}. \
+                     Starting with empty runtime secrets; encrypted data was preserved for recovery.",
+                    e
+                );
+                Ok((Secrets::default(), true))
+            }
+        }
+    }
+
     pub(crate) fn save_secrets_unlocked(&self, secrets: &Secrets) -> Result<()> {
         let json = serde_json::to_vec(secrets)?;
         let encrypted = self.key_manager.encrypt(&json)?;
@@ -764,8 +780,13 @@ impl SecureConfigManager {
         F: FnOnce(&mut Secrets) -> Result<T>,
     {
         self.with_secrets_lock(|manager| {
-            let mut secrets = manager.load_secrets_unlocked()?;
+            let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
             let out = update(&mut secrets)?;
+            if degraded {
+                tracing::warn!(
+                    "Rewriting secrets.enc from degraded state with the currently available secrets. The unreadable prior file remains backed up for recovery."
+                );
+            }
             manager.save_secrets_unlocked(&secrets)?;
             Ok(out)
         })
@@ -817,16 +838,18 @@ impl SecureConfigManager {
 
         // Load and decrypt secrets
         if secrets_path.exists() {
-            let (secrets, changed, created, rotated) = self.with_secrets_lock(|manager| {
-                let mut secrets = manager.load_secrets_unlocked()?;
-                let (changed, created, rotated) =
-                    Self::ensure_http_api_key_in_secrets(&mut secrets);
-                if changed {
-                    manager.save_secrets_unlocked(&secrets)?;
-                }
-                Ok((secrets, changed, created, rotated))
-            })?;
-            if changed {
+            let (secrets, _changed, created, rotated, persisted_change) =
+                self.with_secrets_lock(|manager| {
+                    let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
+                    let (changed, created, rotated) =
+                        Self::ensure_http_api_key_in_secrets(&mut secrets);
+                    let persisted_change = changed && !degraded;
+                    if persisted_change {
+                        manager.save_secrets_unlocked(&secrets)?;
+                    }
+                    Ok((secrets, changed, created, rotated, persisted_change))
+                })?;
+            if persisted_change {
                 if rotated {
                     tracing::info!("Rotated expired HTTP API key");
                 } else if created {
@@ -906,7 +929,7 @@ impl SecureConfigManager {
         // but the user saves settings via the web UI.
         self.with_secrets_lock(|manager| {
             let secrets_path = manager.secrets_path();
-            let existing = manager.load_secrets_unlocked()?;
+            let (existing, degraded) = manager.load_secrets_runtime_state_unlocked()?;
             let secrets = manager.extract_secrets_from_base(existing, config);
             if !Self::has_real_secrets(&secrets) && secrets_path.exists() {
                 tracing::warn!(
@@ -914,6 +937,11 @@ impl SecureConfigManager {
                  This likely means decryption failed — preserving existing encrypted secrets."
                 );
             } else {
+                if degraded {
+                    tracing::warn!(
+                        "Rewriting secrets.enc from the current runtime config because the prior file could not be decrypted with the active key. The unreadable copy remains backed up."
+                    );
+                }
                 manager.save_secrets_unlocked(&secrets)?;
             }
             Ok(())
@@ -936,7 +964,10 @@ impl SecureConfigManager {
     }
 
     pub(crate) fn load_secrets(&self) -> Result<Secrets> {
-        self.with_secrets_lock(|manager| manager.load_secrets_unlocked())
+        self.with_secrets_lock(|manager| {
+            let (secrets, _degraded) = manager.load_secrets_runtime_state_unlocked()?;
+            Ok(secrets)
+        })
         /*
         if !secrets_path.exists() {
             return Ok(Secrets::default());
@@ -1359,9 +1390,9 @@ impl SecureConfigManager {
     /// Returns the current key info and whether rotation happened in this call.
     pub fn ensure_api_key_info(&self) -> Result<(Option<HttpApiKeyInfo>, bool)> {
         self.with_secrets_lock(|manager| {
-            let mut secrets = manager.load_secrets_unlocked()?;
+            let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
             let (changed, _created, rotated) = Self::ensure_http_api_key_in_secrets(&mut secrets);
-            if changed {
+            if changed && !degraded {
                 manager.save_secrets_unlocked(&secrets)?;
             }
             Ok((Self::api_key_info_from_secrets(&secrets), rotated))

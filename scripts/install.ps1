@@ -65,7 +65,7 @@ services:
     networks:
       - agent-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8990/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -77,7 +77,7 @@ services:
           memory: 2G
 
   docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    image: tecnativa/docker-socket-proxy:0.4.2
     container_name: agentark-docker-proxy
     restart: unless-stopped
     volumes:

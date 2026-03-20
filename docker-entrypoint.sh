@@ -14,6 +14,7 @@ NC='\033[0m'
 # Ensure directories exist with proper permissions
 ensure_directories() {
     mkdir -p /app/data/skills 2>/dev/null || true
+    mkdir -p /app/data/tailscale 2>/dev/null || true
     mkdir -p /app/config 2>/dev/null || true
     chown -R agent:agent /app/data /app/config 2>/dev/null || true
 }
@@ -81,17 +82,50 @@ echo "  Web UI: http://localhost:8990"
 echo "============================================"
 echo ""
 
+start_tailscale_daemon() {
+    export TS_STATE_DIR=${TS_STATE_DIR:-/app/data/tailscale}
+    export TS_SOCKET=${TS_SOCKET:-/app/data/tailscale/tailscaled.sock}
+    export TS_USERSPACE=${TS_USERSPACE:-true}
+
+    if command -v tailscaled >/dev/null 2>&1 && command -v tailscale >/dev/null 2>&1; then
+        mkdir -p "$TS_STATE_DIR"
+        chown -R agent:agent "$TS_STATE_DIR" 2>/dev/null || true
+        rm -f "$TS_SOCKET" 2>/dev/null || true
+        echo -e "${GREEN}Starting Tailscale daemon (userspace, persistent state)...${NC}"
+        gosu agent tailscaled \
+            --statedir="$TS_STATE_DIR" \
+            --socket="$TS_SOCKET" \
+            --tun=userspace-networking &
+        TAILSCALE_PID=$!
+
+        for _ in $(seq 1 20); do
+            if [ -S "$TS_SOCKET" ]; then
+                echo -e "${GREEN}Tailscale daemon started (PID: $TAILSCALE_PID)${NC}"
+                return
+            fi
+            sleep 1
+        done
+
+        echo -e "${YELLOW}Tailscale daemon did not expose its socket in time; Tailscale tunnel actions may fail.${NC}"
+    else
+        echo -e "${YELLOW}Tailscale runtime not installed; Tailscale tunnel providers will stay unavailable.${NC}"
+    fi
+}
+
+start_tailscale_daemon
+
 # Start Mem0 memory bridge in background (localhost-only)
 start_mem0_bridge() {
-    if command -v python3 >/dev/null 2>&1 && [ -f /app/mem0-bridge/app.py ]; then
+    MEM0_PYTHON_BIN=${MEM0_PYTHON:-/opt/mem0-venv/bin/python}
+    if [ -x "$MEM0_PYTHON_BIN" ] && [ -f /app/mem0-bridge/app.py ]; then
         echo -e "${GREEN}Starting Mem0 memory bridge (localhost:8991)...${NC}"
         QDRANT_PATH=/app/data/qdrant \
         MODEL_CACHE=/app/data/models \
-        gosu agent python3 -m uvicorn app:app --host 127.0.0.1 --port 8991 --app-dir /app/mem0-bridge &
+        gosu agent "$MEM0_PYTHON_BIN" -m uvicorn app:app --host 127.0.0.1 --port 8991 --app-dir /app/mem0-bridge &
         MEM0_PID=$!
         echo -e "${GREEN}Mem0 bridge started (PID: $MEM0_PID)${NC}"
     else
-        echo -e "${YELLOW}Mem0 bridge not available (Python or bridge files missing)${NC}"
+        echo -e "${YELLOW}Mem0 bridge not available (Mem0 Python runtime or bridge files missing)${NC}"
     fi
 }
 

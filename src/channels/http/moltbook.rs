@@ -396,19 +396,36 @@ async fn persist_moltbook_external_knowledge(
         .map_err(|e| e.to_string())
 }
 
-async fn distill_moltbook_memory_insights(
-    state: &AppState,
-    trigger: &str,
-    settings: &MoltbookSettings,
-    feed_posts_raw: &[serde_json::Value],
-    decision_summary: &str,
-    engaged_post_ids: &[String],
+#[derive(Debug, Clone, Copy)]
+struct MoltbookMemoryDistillationInput<'a> {
+    trigger: &'a str,
+    settings: &'a MoltbookSettings,
+    feed_posts_raw: &'a [serde_json::Value],
+    decision_summary: &'a str,
+    engaged_post_ids: &'a [String],
     comment_count: usize,
     upvote_count: usize,
     post_count: usize,
-    engagement_failures: &[String],
-    posted_url: Option<&str>,
+    engagement_failures: &'a [String],
+    posted_url: Option<&'a str>,
+}
+
+async fn distill_moltbook_memory_insights(
+    state: &AppState,
+    input: MoltbookMemoryDistillationInput<'_>,
 ) -> std::result::Result<Option<MoltbookMemoryInsights>, String> {
+    let MoltbookMemoryDistillationInput {
+        trigger,
+        settings,
+        feed_posts_raw,
+        decision_summary,
+        engaged_post_ids,
+        comment_count,
+        upvote_count,
+        post_count,
+        engagement_failures,
+        posted_url,
+    } = input;
     if feed_posts_raw.is_empty() && comment_count + upvote_count + post_count == 0 {
         return Ok(None);
     }
@@ -1720,16 +1737,18 @@ Rules:
 
     let external_memory = match distill_moltbook_memory_insights(
         state,
-        trigger,
-        &settings,
-        &feed_posts_raw,
-        &decision_summary,
-        &engaged_post_ids,
-        comment_count,
-        upvote_count,
-        post_count,
-        &engagement_failures,
-        posted_url.as_deref(),
+        MoltbookMemoryDistillationInput {
+            trigger,
+            settings: &settings,
+            feed_posts_raw: &feed_posts_raw,
+            decision_summary: &decision_summary,
+            engaged_post_ids: &engaged_post_ids,
+            comment_count,
+            upvote_count,
+            post_count,
+            engagement_failures: &engagement_failures,
+            posted_url: posted_url.as_deref(),
+        },
     )
     .await
     {

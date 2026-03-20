@@ -34,6 +34,7 @@ memory_instance = None
 configured = False
 last_valid_config = None
 active_qdrant_generation = 0
+embedder_instance = None
 
 # Paths for persistent data
 QDRANT_PATH = os.environ.get("QDRANT_PATH", "/data/qdrant")
@@ -185,6 +186,10 @@ class SearchRequest(BaseModel):
     limit: int = 5
 
 
+class EmbedRequest(BaseModel):
+    texts: list[str]
+
+
 class CleanupRequest(BaseModel):
     user_id: str = "default"
     decay_floor: float = DECAY_FLOOR
@@ -234,6 +239,18 @@ def _build_mem0_config(req: ConfigureRequest) -> dict:
     }
     config["vector_store"]["config"]["path"] = _qdrant_path_for_config(config)
     return config
+
+
+def _get_embedder():
+    global embedder_instance
+    if embedder_instance is None:
+        from sentence_transformers import SentenceTransformer
+
+        embedder_instance = SentenceTransformer(
+            DEFAULT_EMBEDDER_MODEL,
+            cache_folder=MODEL_CACHE,
+        )
+    return embedder_instance
 
 
 def _embedder_dimension(config: Optional[dict]) -> Optional[int]:
@@ -685,6 +702,34 @@ def search_memories(req: SearchRequest):
             "memories": [],
             "warning": "mem0 search failed; returning no memories",
         }
+
+
+@app.post("/embed")
+def embed_texts(req: EmbedRequest):
+    if not req.texts:
+        return {
+            "model": DEFAULT_EMBEDDER_MODEL,
+            "dimensions": 0,
+            "embeddings": [],
+        }
+
+    try:
+        model = _get_embedder()
+        vectors = model.encode(
+            req.texts,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        embeddings = vectors.tolist() if hasattr(vectors, "tolist") else list(vectors)
+        dimensions = len(embeddings[0]) if embeddings else 0
+        return {
+            "model": DEFAULT_EMBEDDER_MODEL,
+            "dimensions": dimensions,
+            "embeddings": embeddings,
+        }
+    except Exception as e:
+        logger.error("Failed to embed texts: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/memories")

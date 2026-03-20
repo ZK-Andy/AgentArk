@@ -3,10 +3,6 @@ import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useUiStore } from "../store/uiStore";
 
-/* ------------------------------------------------------------------ */
-/*  Step definitions                                                   */
-/* ------------------------------------------------------------------ */
-
 type TourStepDef = {
   id: string;
   view: string;
@@ -23,25 +19,34 @@ const TOUR_STEPS: TourStepDef[] = [
     view: "settings",
     targetSelector: "[data-tour-target='settings-models']",
     title: "Welcome! Let's add your first AI model",
-    body: "AgentArk needs at least one LLM to work. Add an OpenAI, Anthropic, Ollama, or OpenRouter model here. You can configure multiple models for different tasks — primary, fast, code, and more.",
+    body: "AgentArk needs at least one LLM to work. Add an OpenAI, Anthropic, Ollama, or OpenRouter model here. You can configure multiple models for different tasks - primary, fast, code, and more.",
     placement: "left",
     spotlightPadding: 10,
   },
   {
-    id: "goals",
-    view: "goals",
-    targetSelector: "[data-tour-target='nav-goals']",
-    title: "Set goals for your agent",
-    body: "Goals are high-level objectives you want to achieve. AgentArk breaks them into tasks, plans execution steps, and tracks progress autonomously. Think of them as your strategic intent.",
+    id: "chat",
+    view: "chat",
+    targetSelector: "[data-tour-target='nav-chat']",
+    title: "Start in chat",
+    body: "This is the main working surface. Quick questions stay chat-native, while builds, imports, research, and file-changing work can promote into durable tasks without leaving the thread.",
     placement: "right",
     spotlightPadding: 6,
   },
   {
-    id: "skills",
-    view: "skills",
-    targetSelector: "[data-tour-target='nav-skills']",
-    title: "Skills: what your agent can do",
-    body: "Skills are reusable workflows — like a daily briefing, web research, or invoice generation. Install community skills or create your own. Each skill is reviewed for safety before activation.",
+    id: "inbox",
+    view: "inbox",
+    targetSelector: "[data-tour-target='nav-inbox']",
+    title: "Use Inbox for blocked or risky work",
+    body: "Approvals, pauses, failures, and urgent notifications are grouped here so the active workspace can stay clean instead of turning into a dashboard of interruptions.",
+    placement: "right",
+    spotlightPadding: 6,
+  },
+  {
+    id: "tasks",
+    view: "tasks",
+    targetSelector: "[data-tour-target='nav-tasks']",
+    title: "Tasks stay durable",
+    body: "Use Tasks for long-running execution, retries, approvals, and anything that should outlive a single chat turn.",
     placement: "right",
     spotlightPadding: 6,
   },
@@ -49,8 +54,8 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "apps",
     view: "apps",
     targetSelector: "[data-tour-target='nav-apps']",
-    title: "Connect your apps and services",
-    body: "Integrations let AgentArk interact with Gmail, Calendar, GitHub, Notion, and more. Connect your accounts here and the agent can read, write, and automate across all of them.",
+    title: "Apps stay directly accessible",
+    body: "Built apps live here with their links, guard settings, and operations. You do not need to hunt through a separate library surface to manage them.",
     placement: "right",
     spotlightPadding: 6,
   },
@@ -58,25 +63,21 @@ const TOUR_STEPS: TourStepDef[] = [
     id: "overview",
     view: "overview",
     targetSelector: "[data-tour-target='overview-dashboard']",
-    title: "Your Mission Control dashboard",
-    body: "This is home base. You'll see tasks needing approval, smart suggestions, today's highlights, and the activity feed. The status bar shows real-time system health at a glance.",
+    title: "Mission Control stays lightweight",
+    body: "Mission Control is the daily summary surface: attention items, suggestions, highlights, and recent activity. It should support chat, not compete with it.",
     placement: "bottom",
     spotlightPadding: 12,
   },
   {
     id: "done",
-    view: "overview",
-    targetSelector: "[data-tour-target='welcome-hero']",
+    view: "chat",
+    targetSelector: "[data-tour-target='workspace-shell']",
     title: "You're all set!",
-    body: "Start by chatting with your agent or adding an AI model if you haven't yet. You can re-run this tour anytime from Settings \u2192 Advanced. Happy building!",
+    body: "Start in chat, open deeper operational panels only when needed, and use the inbox when the run needs you. You can re-run this tour anytime from Settings > Advanced.",
     placement: "bottom",
     spotlightPadding: 10,
   },
 ];
-
-/* ------------------------------------------------------------------ */
-/*  Geometry helpers                                                   */
-/* ------------------------------------------------------------------ */
 
 type Rect = { top: number; left: number; width: number; height: number };
 
@@ -92,14 +93,17 @@ function tooltipPosition(
   placement: TourStepDef["placement"],
   pad: number,
 ): { top: number; left: number } {
-  const TW = 380;
-  const TH = 220;
-  const GAP = 14;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
+  const tooltipWidth = 380;
+  const tooltipHeight = 220;
+  const gap = 14;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
 
   if (!target) {
-    return { top: vh / 2 - TH / 2, left: vw / 2 - TW / 2 };
+    return {
+      top: viewportHeight / 2 - tooltipHeight / 2,
+      left: viewportWidth / 2 - tooltipWidth / 2,
+    };
   }
 
   let top = 0;
@@ -107,35 +111,30 @@ function tooltipPosition(
 
   switch (placement) {
     case "bottom":
-      top = target.top + target.height + pad + GAP;
-      left = target.left + target.width / 2 - TW / 2;
+      top = target.top + target.height + pad + gap;
+      left = target.left + target.width / 2 - tooltipWidth / 2;
       break;
     case "top":
-      top = target.top - pad - GAP - TH;
-      left = target.left + target.width / 2 - TW / 2;
+      top = target.top - pad - gap - tooltipHeight;
+      left = target.left + target.width / 2 - tooltipWidth / 2;
       break;
     case "right":
-      top = target.top + target.height / 2 - TH / 2;
-      left = target.left + target.width + pad + GAP;
+      top = target.top + target.height / 2 - tooltipHeight / 2;
+      left = target.left + target.width + pad + gap;
       break;
     case "left":
-      top = target.top + target.height / 2 - TH / 2;
-      left = target.left - pad - GAP - TW;
+      top = target.top + target.height / 2 - tooltipHeight / 2;
+      left = target.left - pad - gap - tooltipWidth;
       break;
   }
 
-  // Clamp to viewport
   if (left < 16) left = 16;
-  if (left + TW > vw - 16) left = vw - 16 - TW;
+  if (left + tooltipWidth > viewportWidth - 16) left = viewportWidth - 16 - tooltipWidth;
   if (top < 16) top = 16;
-  if (top + TH > vh - 16) top = vh - 16 - TH;
+  if (top + tooltipHeight > viewportHeight - 16) top = viewportHeight - 16 - tooltipHeight;
 
   return { top, left };
 }
-
-/* ------------------------------------------------------------------ */
-/*  Component                                                          */
-/* ------------------------------------------------------------------ */
 
 type Props = {
   navigateToView: (view: string, replace?: boolean) => void;
@@ -156,15 +155,13 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
 
   const stepDef = TOUR_STEPS[tourStep] as TourStepDef | undefined;
 
-  // Navigate to the correct view when step changes
   useEffect(() => {
     if (!tourActive || !stepDef) return;
     if (currentView !== stepDef.view) {
       navigateToView(stepDef.view);
     }
-  }, [tourActive, tourStep]);
+  }, [tourActive, tourStep, currentView, navigateToView, stepDef]);
 
-  // Measure target element position after view settles
   useLayoutEffect(() => {
     if (!tourActive || !stepDef) return;
     setTargetRect(null);
@@ -173,7 +170,7 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
       const rect = getElementRect(stepDef.targetSelector);
       if (rect) {
         setTargetRect(rect);
-        setRenderKey((k) => k + 1);
+        setRenderKey((key) => key + 1);
       } else if (attempt < 8) {
         retryRef.current = setTimeout(() => measure(attempt + 1), 200);
       }
@@ -183,9 +180,8 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
     return () => {
       if (retryRef.current) clearTimeout(retryRef.current);
     };
-  }, [tourActive, tourStep, currentView]);
+  }, [tourActive, tourStep, currentView, stepDef]);
 
-  // Reposition on resize / scroll
   useEffect(() => {
     if (!tourActive || !stepDef) return;
     const update = () => {
@@ -200,14 +196,13 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
     };
   }, [tourActive, stepDef]);
 
-  // Escape to skip
   useEffect(() => {
     if (!tourActive) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") skipTour();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") skipTour();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, [tourActive, skipTour]);
 
   const handleNext = useCallback(() => {
@@ -227,7 +222,6 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
 
   return (
     <>
-      {/* Backdrop with spotlight cutout */}
       <Box
         className="tour-backdrop"
         onClick={skipTour}
@@ -238,210 +232,117 @@ export function GuidedTour({ navigateToView, currentView }: Props) {
           pointerEvents: "auto",
         }}
       >
-        <svg
-          width="100%"
-          height="100%"
-          style={{ display: "block", position: "absolute", inset: 0 }}
-        >
+        <svg width="100%" height="100%" style={{ position: "absolute", inset: 0 }}>
           <defs>
             <mask id="tour-spotlight-mask">
-              <rect width="100%" height="100%" fill="white" />
-              {targetRect && (
+              <rect x="0" y="0" width="100%" height="100%" fill="white" />
+              {targetRect ? (
                 <rect
-                  x={targetRect.left - pad}
-                  y={targetRect.top - pad}
+                  x={Math.max(0, targetRect.left - pad)}
+                  y={Math.max(0, targetRect.top - pad)}
+                  rx="14"
+                  ry="14"
                   width={targetRect.width + pad * 2}
                   height={targetRect.height + pad * 2}
-                  rx={12}
-                  ry={12}
                   fill="black"
                 />
-              )}
+              ) : null}
             </mask>
           </defs>
           <rect
+            x="0"
+            y="0"
             width="100%"
             height="100%"
-            fill="rgba(3, 7, 17, 0.72)"
+            fill="rgba(3, 8, 17, 0.76)"
             mask="url(#tour-spotlight-mask)"
           />
         </svg>
       </Box>
 
-      {/* Glow ring around spotlight */}
-      {targetRect && (
+      {targetRect ? (
         <Box
+          key={renderKey}
+          className="tour-spotlight-ring"
           sx={{
             position: "fixed",
-            zIndex: 9998,
-            top: targetRect.top - pad,
-            left: targetRect.left - pad,
+            zIndex: 9999,
+            pointerEvents: "none",
+            top: Math.max(0, targetRect.top - pad),
+            left: Math.max(0, targetRect.left - pad),
             width: targetRect.width + pad * 2,
             height: targetRect.height + pad * 2,
-            borderRadius: "12px",
-            border: "1.5px solid rgba(47, 212, 255, 0.45)",
+            borderRadius: 3,
+            border: "2px solid rgba(47, 212, 255, 0.95)",
             boxShadow:
-              "0 0 24px 4px rgba(47, 212, 255, 0.18), inset 0 0 12px rgba(47, 212, 255, 0.08)",
-            pointerEvents: "none",
+              "0 0 0 1px rgba(47, 212, 255, 0.2), 0 0 34px rgba(47, 212, 255, 0.2), inset 0 0 24px rgba(47, 212, 255, 0.06)",
             animation: "tour-ring-pulse 2s ease-in-out infinite",
           }}
         />
-      )}
+      ) : null}
 
-      {/* Tooltip card */}
       <Box
-        key={`step-${tourStep}-${renderKey}`}
+        key={`${stepDef.id}-${renderKey}`}
         className="tour-tooltip"
-        onClick={(e) => e.stopPropagation()}
         sx={{
           position: "fixed",
-          zIndex: 9999,
           top: pos.top,
           left: pos.left,
           width: 380,
           maxWidth: "calc(100vw - 32px)",
-          borderRadius: "16px",
-          border: "1px solid rgba(108, 156, 212, 0.28)",
+          minHeight: 220,
+          zIndex: 10000,
+          borderRadius: 3,
+          border: "1px solid rgba(47, 212, 255, 0.22)",
           background:
-            "linear-gradient(160deg, rgba(9, 21, 39, 0.96), rgba(9, 21, 39, 0.82))",
-          backdropFilter: "blur(24px)",
-          WebkitBackdropFilter: "blur(24px)",
-          boxShadow:
-            "0 20px 60px rgba(0, 0, 0, 0.55), 0 0 40px rgba(47, 212, 255, 0.08)",
-          p: 2.5,
+            "linear-gradient(160deg, rgba(10, 18, 34, 0.97), rgba(7, 14, 28, 0.95))",
+          backdropFilter: "blur(18px)",
+          WebkitBackdropFilter: "blur(18px)",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.4)",
+          p: 2,
+          display: "flex",
+          flexDirection: "column",
+          animation: "tour-tooltip-enter 180ms ease",
         }}
       >
-        {/* Close */}
-        <IconButton
-          size="small"
-          onClick={skipTour}
-          sx={{
-            position: "absolute",
-            top: 8,
-            right: 8,
-            color: "rgba(195, 221, 252, 0.5)",
-            "&:hover": { color: "rgba(195, 221, 252, 0.9)" },
-          }}
-          aria-label="Skip tour"
-        >
-          <CloseRoundedIcon fontSize="small" />
-        </IconButton>
+        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1}>
+          <Box>
+            <Typography
+              variant="overline"
+              sx={{ color: "rgba(47, 212, 255, 0.86)", letterSpacing: "0.1em" }}
+            >
+              Guided Tour
+            </Typography>
+            <Typography variant="h6" sx={{ mt: 0.4, fontWeight: 700 }}>
+              {stepDef.title}
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={skipTour} aria-label="Close tour">
+            <CloseRoundedIcon fontSize="small" />
+          </IconButton>
+        </Stack>
 
-        {/* Step counter */}
-        <Typography
-          variant="caption"
-          sx={{
-            color: "rgba(47, 212, 255, 0.85)",
-            fontWeight: 600,
-            letterSpacing: "0.06em",
-            textTransform: "uppercase",
-            fontSize: "0.68rem",
-          }}
-        >
-          Step {tourStep + 1} of {TOUR_STEPS.length}
-        </Typography>
-
-        {/* Title */}
-        <Typography
-          variant="h6"
-          sx={{
-            mt: 0.75,
-            fontWeight: 700,
-            color: "rgba(236, 245, 255, 0.98)",
-            lineHeight: 1.3,
-            fontSize: "1.05rem",
-          }}
-        >
-          {stepDef.title}
-        </Typography>
-
-        {/* Body */}
-        <Typography
-          variant="body2"
-          sx={{
-            mt: 1,
-            color: "rgba(195, 221, 252, 0.75)",
-            lineHeight: 1.55,
-          }}
-        >
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1.3, lineHeight: 1.6 }}>
           {stepDef.body}
         </Typography>
 
-        {/* Progress dots + navigation */}
-        <Stack
-          direction="row"
-          alignItems="center"
-          justifyContent="space-between"
-          sx={{ mt: 2.5 }}
-        >
-          {/* Dots */}
-          <Stack direction="row" spacing={0.75}>
-            {TOUR_STEPS.map((_, i) => (
-              <Box
-                key={i}
-                sx={{
-                  width: i === tourStep ? 18 : 7,
-                  height: 7,
-                  borderRadius: "4px",
-                  background:
-                    i === tourStep
-                      ? "linear-gradient(90deg, rgba(47, 212, 255, 0.95), rgba(20, 241, 149, 0.85))"
-                      : i < tourStep
-                        ? "rgba(47, 212, 255, 0.4)"
-                        : "rgba(108, 156, 212, 0.2)",
-                  transition: "all 200ms ease",
-                }}
-              />
-            ))}
-          </Stack>
+        <Box sx={{ flex: 1 }} />
 
-          {/* Buttons */}
+        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mt: 2 }}>
+          <Typography variant="caption" color="text.secondary">
+            Step {tourStep + 1} of {TOUR_STEPS.length}
+          </Typography>
           <Stack direction="row" spacing={1}>
             {!isFirst ? (
-              <Button
-                size="small"
-                variant="text"
-                onClick={prevTourStep}
-                sx={{
-                  textTransform: "none",
-                  color: "rgba(195, 221, 252, 0.6)",
-                  "&:hover": { color: "rgba(195, 221, 252, 0.9)" },
-                }}
-              >
+              <Button variant="text" onClick={prevTourStep} sx={{ textTransform: "none" }}>
                 Back
               </Button>
-            ) : (
-              <Button
-                size="small"
-                variant="text"
-                onClick={skipTour}
-                sx={{
-                  textTransform: "none",
-                  color: "rgba(195, 221, 252, 0.45)",
-                  "&:hover": { color: "rgba(195, 221, 252, 0.7)" },
-                }}
-              >
-                Skip
-              </Button>
-            )}
-            <Button
-              size="small"
-              variant="contained"
-              onClick={handleNext}
-              sx={{
-                textTransform: "none",
-                px: 2.5,
-                background:
-                  "linear-gradient(135deg, rgba(47, 212, 255, 0.9), rgba(20, 241, 149, 0.75))",
-                color: "#030711",
-                fontWeight: 700,
-                "&:hover": {
-                  background:
-                    "linear-gradient(135deg, rgba(47, 212, 255, 1), rgba(20, 241, 149, 0.9))",
-                },
-              }}
-            >
-              {isLast ? "Get Started" : "Next"}
+            ) : null}
+            <Button variant="text" onClick={skipTour} sx={{ textTransform: "none" }}>
+              Skip
+            </Button>
+            <Button variant="contained" onClick={handleNext} sx={{ textTransform: "none" }}>
+              {isLast ? "Finish" : "Next"}
             </Button>
           </Stack>
         </Stack>

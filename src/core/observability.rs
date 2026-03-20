@@ -1,4 +1,5 @@
-use super::{agent::ExecutionTrace, config::AgentConfig};
+use super::agent::ExecutionTrace;
+use crate::core::AgentConfig;
 use crate::storage::Storage;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -122,16 +123,24 @@ pub fn load_observability_auth_token(
         .filter(|value| !value.is_empty()))
 }
 
-pub async fn load_delivery_logs(storage: &Storage) -> Vec<ObservabilityDeliveryLog> {
-    let raw = match storage.get_encrypted(OBSERVABILITY_LOG_KEY).await {
-        Ok(Some(bytes)) => bytes,
-        _ => return Vec::new(),
-    };
-    serde_json::from_slice::<Vec<ObservabilityDeliveryLog>>(&raw).unwrap_or_default()
+pub async fn load_delivery_logs(
+    storage: &Storage,
+    config_dir: &Path,
+) -> Vec<ObservabilityDeliveryLog> {
+    crate::storage::legacy_recovery::load_json_vec_with_legacy_key_recovery(
+        storage,
+        config_dir,
+        OBSERVABILITY_LOG_KEY,
+    )
+    .await
 }
 
-pub async fn append_delivery_log(storage: &Storage, entry: ObservabilityDeliveryLog) {
-    let mut logs = load_delivery_logs(storage).await;
+pub async fn append_delivery_log(
+    storage: &Storage,
+    config_dir: &Path,
+    entry: ObservabilityDeliveryLog,
+) {
+    let mut logs = load_delivery_logs(storage, config_dir).await;
     logs.insert(0, entry);
     if logs.len() > OBSERVABILITY_LOG_LIMIT {
         logs.truncate(OBSERVABILITY_LOG_LIMIT);
@@ -139,19 +148,6 @@ pub async fn append_delivery_log(storage: &Storage, entry: ObservabilityDelivery
     if let Ok(bytes) = serde_json::to_vec(&logs) {
         let _ = storage.set_encrypted(OBSERVABILITY_LOG_KEY, &bytes).await;
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn observability_is_ready(config: &AgentConfig, auth_token: Option<&str>) -> bool {
-    config.observability.enabled
-        && !normalize_observability_endpoint(
-            &config.observability.provider,
-            &config.observability.endpoint,
-        )
-        .is_empty()
-        && auth_token
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
 }
 
 fn truncate_text(value: &str, max_chars: usize) -> String {
@@ -162,6 +158,10 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     trimmed.chars().take(max_chars).collect::<String>()
 }
 
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn hash_hex(input: &str, len: usize) -> String {
     let mut hash = blake3::hash(input.as_bytes()).to_hex().to_string();
     hash.truncate(len);
@@ -170,11 +170,6 @@ fn hash_hex(input: &str, len: usize) -> String {
 
 fn otel_attribute_string(key: &str, value: String) -> serde_json::Value {
     json!({ "key": key, "value": { "stringValue": value } })
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn otel_attribute_bool(key: &str, value: bool) -> serde_json::Value {
-    json!({ "key": key, "value": { "boolValue": value } })
 }
 
 fn otel_attribute_int(key: &str, value: i64) -> serde_json::Value {
@@ -199,6 +194,47 @@ fn redact_by_mode(mode: ObservabilityPrivacyMode, value: &str, max_chars: usize)
             max_chars,
         )),
         ObservabilityPrivacyMode::FullContent => Some(truncate_text(trimmed, max_chars)),
+    }
+}
+
+fn display_channel_name(channel: &str) -> &'static str {
+    match channel.trim().to_ascii_lowercase().as_str() {
+        "web" | "chat" | "console" | "ui" => "Chat",
+        "task" | "tasks" => "Task",
+        "telegram" => "Telegram",
+        "whatsapp" => "WhatsApp",
+        "gmail" | "email" => "Email",
+        "moltbook" => "Moltbook",
+        "watcher" | "watchers" => "Watcher",
+        _ => "Run",
+    }
+}
+
+fn build_root_span_name(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode) -> String {
+    let channel = display_channel_name(&trace.channel);
+    let message_preview = redact_by_mode(mode, &collapse_whitespace(&trace.message), 72);
+    match message_preview {
+        Some(preview) if !preview.is_empty() => format!("AgentArk {}: {}", channel, preview),
+        _ => format!("AgentArk {}", channel),
+    }
+}
+
+fn should_export_step(step: &super::agent::ExecutionStep) -> bool {
+    !matches!(
+        step.title.trim(),
+        "Message Received" | "Execution Record Saved" | "Response Complete"
+    )
+}
+
+fn export_step_name(step: &super::agent::ExecutionStep) -> String {
+    match step.title.trim() {
+        "LLM Routing Decision" => "Route Request".to_string(),
+        "Model Selection" => "Select Model".to_string(),
+        "Context Packing" => "Assemble Context".to_string(),
+        "Memory Layer" => "Retrieve Memory".to_string(),
+        "LLM Response Received" => "Receive LLM Output".to_string(),
+        "Clarification Needed" => "Need Clarification".to_string(),
+        other => truncate_text(other, 120),
     }
 }
 
@@ -271,6 +307,7 @@ fn build_step_attributes(
     let mut attributes = vec![
         otel_attribute_string("agentark.trace_id", trace.id.clone()),
         otel_attribute_string("agentark.step_type", step.step_type.clone()),
+        otel_attribute_string("agentark.step_title", step.title.clone()),
         otel_attribute_string("agentark.icon", step.icon.clone()),
     ];
     if let Some(duration_ms) = step.duration_ms {
@@ -314,13 +351,16 @@ fn build_otlp_trace_payload(config: &AgentConfig, trace: &ExecutionTrace) -> ser
     let mut spans = vec![json!({
         "traceId": trace_id,
         "spanId": root_span_id,
-        "name": "AgentArk Run",
+        "name": build_root_span_name(trace, mode),
         "startTimeUnixNano": datetime_to_unix_nanos(start_time),
         "endTimeUnixNano": datetime_to_unix_nanos(end_time),
         "attributes": build_trace_attributes(trace, mode),
     })];
 
     for (index, step) in trace.steps.iter().enumerate() {
+        if !should_export_step(step) {
+            continue;
+        }
         let step_end = if index + 1 < trace.steps.len() {
             trace.steps[index + 1].timestamp
         } else {
@@ -339,7 +379,7 @@ fn build_otlp_trace_payload(config: &AgentConfig, trace: &ExecutionTrace) -> ser
             "traceId": trace_id,
             "spanId": step_span_id,
             "parentSpanId": root_span_id,
-            "name": truncate_text(&step.title, 120),
+            "name": export_step_name(step),
             "startTimeUnixNano": datetime_to_unix_nanos(effective_start),
             "endTimeUnixNano": datetime_to_unix_nanos(effective_end),
             "attributes": build_step_attributes(trace, step, mode),
@@ -459,6 +499,7 @@ pub async fn export_execution_trace(
             if status.is_success() {
                 append_delivery_log(
                     storage,
+                    config_dir,
                     ObservabilityDeliveryLog {
                         id: uuid::Uuid::new_v4().to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -482,6 +523,7 @@ pub async fn export_execution_trace(
                 let message = truncate_text(&body, 280);
                 append_delivery_log(
                     storage,
+                    config_dir,
                     ObservabilityDeliveryLog {
                         id: uuid::Uuid::new_v4().to_string(),
                         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -508,6 +550,7 @@ pub async fn export_execution_trace(
         Err(error) => {
             append_delivery_log(
                 storage,
+                config_dir,
                 ObservabilityDeliveryLog {
                     id: uuid::Uuid::new_v4().to_string(),
                     timestamp: chrono::Utc::now().to_rfc3339(),

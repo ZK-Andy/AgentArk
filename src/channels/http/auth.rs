@@ -129,10 +129,7 @@ async fn consume_local_ui_bootstrap_token(state: &AppState, token: &str) -> bool
     let now = unix_now_ts();
     let mut tokens = state.local_ui_bootstrap_tokens.write().await;
     tokens.retain(|_, expires_at| *expires_at > now);
-    match tokens.remove(trimmed) {
-        Some(expires_at) if expires_at > now => true,
-        _ => false,
-    }
+    matches!(tokens.remove(trimmed), Some(expires_at) if expires_at > now)
 }
 
 pub(super) fn extract_bearer_api_key(headers: &HeaderMap) -> Option<String> {

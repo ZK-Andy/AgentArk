@@ -13,19 +13,6 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum output size before truncation (200KB).
 const MAX_OUTPUT_BYTES: usize = 200_000;
 
-/// Check whether the `lightpanda` binary is available on PATH.
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn is_available() -> bool {
-    Command::new("lightpanda")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Fetch a URL and return its content as markdown.
 ///
 /// Uses `lightpanda fetch --dump markdown <url>`.

@@ -461,7 +461,7 @@ impl Integration for GitHubConnector {
     }
 
     fn description(&self) -> &str {
-        "Access GitHub repositories, issues, pull requests, and search"
+        "GitHub API connector for repositories, issues, pull requests, and search"
     }
 
     fn icon(&self) -> &str {

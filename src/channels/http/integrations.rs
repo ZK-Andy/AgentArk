@@ -580,7 +580,7 @@ pub(super) fn external_integration_config(
                 required: true,
                 options: None,
             }],
-            Some("Create a GitHub personal access token and paste it here. It will be stored encrypted.".to_string()),
+            Some("Create a GitHub personal access token and paste it here. It will be stored encrypted. This is for the GitHub API connector; local git operations in the workspace work separately and do not require this token.".to_string()),
             Some("Save Token".to_string()),
         )),
         "notion" => Some((

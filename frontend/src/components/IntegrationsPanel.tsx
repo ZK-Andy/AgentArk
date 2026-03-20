@@ -107,6 +107,94 @@ function statusColor(status: IntegrationItem["status"]): "success" | "warning" |
   return "default";
 }
 
+type IntegrationCardState = "enabled" | "disabled" | "needs_auth" | "error" | "not_configured";
+
+function integrationCardState(integration: IntegrationItem): IntegrationCardState {
+  if (integration.status === "connected") {
+    return integration.enabled ? "enabled" : "disabled";
+  }
+  if (integration.status === "needs_auth") return "needs_auth";
+  if (integration.status === "error") return "error";
+  return "not_configured";
+}
+
+function integrationCardLabel(state: IntegrationCardState): string {
+  if (state === "enabled") return "Enabled";
+  if (state === "disabled") return "Disabled";
+  if (state === "needs_auth") return "Needs sign-in";
+  if (state === "error") return "Error";
+  return "Not configured";
+}
+
+function integrationCardCopy(integration: IntegrationItem): string {
+  const detail = str(integration.status_detail, "").trim();
+  if (detail) return detail;
+  const state = integrationCardState(integration);
+  if (state === "enabled") return integration.description;
+  if (state === "disabled") return "Configured, but currently disabled for agent use.";
+  if (state === "needs_auth") return "Finish the sign-in flow to activate this integration.";
+  if (state === "error") return "The saved credentials could not be validated.";
+  return "No saved credentials found for this integration yet.";
+}
+
+function integrationCardAccent(state: IntegrationCardState): {
+  border: string;
+  background: string;
+  hoverBorder: string;
+  hoverBackground: string;
+  chipBorder: string;
+  chipColor: string;
+} {
+  if (state === "enabled") {
+    return {
+      border: "rgba(74,210,157,0.35)",
+      background: "rgba(74,210,157,0.06)",
+      hoverBorder: "rgba(74,210,157,0.55)",
+      hoverBackground: "rgba(74,210,157,0.1)",
+      chipBorder: "rgba(74,210,157,0.3)",
+      chipColor: "rgba(74,210,157,0.9)"
+    };
+  }
+  if (state === "disabled") {
+    return {
+      border: "rgba(255,180,50,0.28)",
+      background: "rgba(255,180,50,0.05)",
+      hoverBorder: "rgba(255,180,50,0.44)",
+      hoverBackground: "rgba(255,180,50,0.08)",
+      chipBorder: "rgba(255,180,50,0.24)",
+      chipColor: "rgba(255,196,92,0.92)"
+    };
+  }
+  if (state === "needs_auth") {
+    return {
+      border: "rgba(255,180,50,0.2)",
+      background: "rgba(255,180,50,0.03)",
+      hoverBorder: "rgba(255,180,50,0.38)",
+      hoverBackground: "rgba(255,180,50,0.06)",
+      chipBorder: "rgba(255,180,50,0.24)",
+      chipColor: "rgba(255,196,92,0.9)"
+    };
+  }
+  if (state === "error") {
+    return {
+      border: "rgba(255,88,88,0.28)",
+      background: "rgba(255,88,88,0.05)",
+      hoverBorder: "rgba(255,88,88,0.45)",
+      hoverBackground: "rgba(255,88,88,0.08)",
+      chipBorder: "rgba(255,88,88,0.24)",
+      chipColor: "rgba(255,130,130,0.92)"
+    };
+  }
+  return {
+    border: "rgba(108,156,212,0.18)",
+    background: "rgba(6,15,29,0.5)",
+    hoverBorder: "rgba(47,212,255,0.4)",
+    hoverBackground: "rgba(47,212,255,0.06)",
+    chipBorder: "rgba(255,255,255,0.1)",
+    chipColor: "rgba(180,200,225,0.66)"
+  };
+}
+
 function channelStatusColor(status: string): "success" | "warning" | "error" | "info" | "default" {
   const s = (status || "").toLowerCase();
   if (s === "connected" || s === "ready") return "success";
@@ -537,8 +625,8 @@ export function IntegrationsPanel({
     () => [...integrations].sort((a, b) => a.name.localeCompare(b.name)),
     [integrations]
   );
-  const enabledList = sorted.filter((i) => i.enabled);
-  const disabledList = sorted.filter((i) => !i.enabled);
+  const readyList = sorted.filter((i) => integrationCardState(i) === "enabled");
+  const notReadyList = sorted.filter((i) => integrationCardState(i) !== "enabled");
   const mcpSorted = useMemo(
     () => [...mcpServers].sort((a, b) => str(a.name, "").localeCompare(str(b.name, ""))),
     [mcpServers]
@@ -1322,12 +1410,14 @@ export function IntegrationsPanel({
         <Box className="list-shell">
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
             <Typography variant="subtitle2">
-              Integrations ({enabledList.length} active, {disabledList.length} available)
+              Integrations ({readyList.length} ready, {notReadyList.length} need setup or attention)
             </Typography>
           </Stack>
           <Grid2 container spacing={1}>
-            {[...enabledList, ...disabledList].map((integration) => {
-              const isEnabled = integration.enabled;
+            {[...readyList, ...notReadyList].map((integration) => {
+              const cardState = integrationCardState(integration);
+              const isEnabled = cardState === "enabled";
+              const accent = integrationCardAccent(cardState);
               const sc = statusColor(integration.status);
               const dotColor = sc === "success" ? "#4ad29d" : sc === "error" ? "rgba(255,88,88,0.85)" : sc === "warning" ? "rgba(255,180,50,0.85)" : "rgba(255,255,255,0.25)";
               return (
@@ -1336,12 +1426,12 @@ export function IntegrationsPanel({
                     role="button"
                     tabIndex={0}
                     onClick={() => {
-                      if (isEnabled) {
+                      if (cardState === "enabled") {
                         if (integration.config_fields && integration.config_fields.length > 0) {
                           openConfig(integration);
                         }
                       } else {
-                        if (integration.status === "connected") {
+                        if (cardState === "disabled") {
                           enableMutation.mutate(integration.id);
                         } else {
                           openConfig(integration);
@@ -1351,12 +1441,12 @@ export function IntegrationsPanel({
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        if (isEnabled) {
+                        if (cardState === "enabled") {
                           if (integration.config_fields && integration.config_fields.length > 0) {
                             openConfig(integration);
                           }
                         } else {
-                          if (integration.status === "connected") {
+                          if (cardState === "disabled") {
                             enableMutation.mutate(integration.id);
                           } else {
                             openConfig(integration);
@@ -1368,14 +1458,14 @@ export function IntegrationsPanel({
                       height: "100%",
                       p: 1.2,
                       borderRadius: "10px",
-                      border: isEnabled ? "1px solid rgba(74,210,157,0.35)" : "1px solid rgba(108,156,212,0.18)",
-                      background: isEnabled ? "rgba(74,210,157,0.06)" : "rgba(6,15,29,0.5)",
+                      border: `1px solid ${accent.border}`,
+                      background: accent.background,
                       cursor: "pointer",
                       transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
-                      opacity: isEnabled ? 1 : 0.75,
+                      opacity: cardState === "enabled" ? 1 : 0.86,
                       "&:hover": {
-                        borderColor: isEnabled ? "rgba(74,210,157,0.55)" : "rgba(47,212,255,0.4)",
-                        background: isEnabled ? "rgba(74,210,157,0.1)" : "rgba(47,212,255,0.06)",
+                        borderColor: accent.hoverBorder,
+                        background: accent.hoverBackground,
                         boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
                         opacity: 1
                       }
@@ -1397,19 +1487,19 @@ export function IntegrationsPanel({
                         />
                       </Stack>
                       <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.3, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
-                        {isEnabled ? (integration.status_detail || integration.description) : integration.description}
+                        {integrationCardCopy(integration)}
                       </Typography>
                     </Stack>
                     <Chip
                       size="small"
-                      label={isEnabled ? "Enabled" : "Disabled"}
+                      label={integrationCardLabel(cardState)}
                       sx={{
                         mt: 0.8,
                         height: 20,
                         fontSize: "0.66rem",
                         fontWeight: 600,
-                        borderColor: isEnabled ? "rgba(74,210,157,0.3)" : "rgba(255,255,255,0.1)",
-                        color: isEnabled ? "rgba(74,210,157,0.9)" : "rgba(180,200,225,0.5)"
+                        borderColor: accent.chipBorder,
+                        color: accent.chipColor
                       }}
                       variant="outlined"
                     />
@@ -2022,14 +2112,26 @@ export function IntegrationsPanel({
             </Typography>
             <Typography variant="caption" color="text.secondary">
               {active?.status === "connected"
-                ? "Connected"
+                ? active?.enabled
+                  ? "Connected"
+                  : "Connected but disabled"
                 : active?.status === "needs_auth"
                   ? "Needs sign-in"
+                  : active?.status === "error"
+                    ? "Validation failed"
                   : "Not configured"}
             </Typography>
-            {!active?.enabled ? (
+            {active?.status === "connected" && !active?.enabled ? (
               <Alert severity="info">
-                This integration is disabled. Enter credentials and validate to enable it.
+                This integration has valid credentials but is currently disabled for agent use.
+              </Alert>
+            ) : null}
+            {active?.status === "error" && active?.status_detail ? (
+              <Alert severity="error">{active.status_detail}</Alert>
+            ) : null}
+            {active?.status === "not_configured" ? (
+              <Alert severity="info">
+                No saved credentials were found for this integration in the running AgentArk instance.
               </Alert>
             ) : null}
             {activeNeedsOauth ? (

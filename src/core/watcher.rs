@@ -493,16 +493,6 @@ impl WatcherManager {
         id
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn semantic_signature(watcher: &Watcher) -> String {
-        format!(
-            "{}|{}|{}",
-            watcher.poll_action.trim().to_ascii_lowercase(),
-            watcher.notify_channel.trim().to_ascii_lowercase(),
-            watcher_topic_signature(&watcher.poll_arguments, &watcher.description)
-        )
-    }
-
     pub fn watchers_are_semantically_similar(existing: &Watcher, candidate: &Watcher) -> bool {
         if !existing
             .poll_action

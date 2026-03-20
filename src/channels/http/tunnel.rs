@@ -7,15 +7,15 @@ pub(super) enum TunnelControlCommand {
     Status,
 }
 
-/// Manages the active public tunnel process and discovered URL.
+/// Manages the active remote-access process and discovered URL.
 pub(super) struct TunnelState {
     /// Child process handle
     pub(super) process: Option<tokio::process::Child>,
     /// Active provider for the running tunnel
     pub provider: TunnelProviderKind,
-    /// Public URL assigned by the active tunnel provider
+    /// Access URL assigned by the active provider
     pub url: Option<String>,
-    /// If set, only this deployed app is reachable through the public tunnel.
+    /// If set, only this deployed app is reachable through the active remote-access link.
     pub selected_app_id: Option<String>,
     /// Whether the tunnel is actively running
     pub active: bool,
@@ -46,6 +46,7 @@ trait TunnelProvider {
 
 struct CloudflareTunnelProvider;
 struct NgrokTunnelProvider;
+struct TailscalePrivateTunnelProvider;
 struct TailscaleTunnelProvider;
 struct BoreTunnelProvider;
 
@@ -59,7 +60,7 @@ impl TunnelProvider for CloudflareTunnelProvider {
     }
 
     fn description(&self) -> &'static str {
-        "Free public HTTPS link using Cloudflare Quick Tunnel."
+        "Default public HTTPS link using Cloudflare Quick Tunnel. Easy setup, encrypted in transit, not end-to-end encrypted."
     }
 
     fn config_fields(&self) -> Vec<IntegrationConfigField> {
@@ -75,7 +76,7 @@ impl TunnelProvider for CloudflareTunnelProvider {
 
     fn config_help(&self) -> Option<&'static str> {
         Some(
-            "Click Start Tunnel to get a temporary public HTTPS link. No Cloudflare account or token is required.",
+            "Click Start to get a temporary public HTTPS link. No Cloudflare account or token is required for Quick Tunnel.",
         )
     }
 }
@@ -115,7 +116,38 @@ impl TunnelProvider for NgrokTunnelProvider {
     }
 
     fn config_help(&self) -> Option<&'static str> {
-        Some("Save an ngrok auth token, then AgentArk will start an `ngrok http` tunnel for the local control plane.")
+        Some("Save an ngrok auth token, then AgentArk will start an `ngrok http` tunnel for remote access to the local control plane.")
+    }
+}
+
+impl TunnelProvider for TailscalePrivateTunnelProvider {
+    fn kind(&self) -> TunnelProviderKind {
+        TunnelProviderKind::TailscalePrivate
+    }
+
+    fn label(&self) -> &'static str {
+        "Tailscale Private (WireGuard E2EE)"
+    }
+
+    fn description(&self) -> &'static str {
+        "Private HTTPS access for devices on your tailnet using `tailscale serve`. End-to-end encrypted with WireGuard."
+    }
+
+    fn config_fields(&self) -> Vec<IntegrationConfigField> {
+        vec![IntegrationConfigField {
+            key: "binary_path".to_string(),
+            label: "Binary Path".to_string(),
+            input_type: "text".to_string(),
+            placeholder: Some("tailscale".to_string()),
+            required: true,
+            options: None,
+        }]
+    }
+
+    fn config_help(&self) -> Option<&'static str> {
+        Some(
+            "Use this for private end-to-end encrypted access from your own Tailscale devices. AgentArk will use `tailscale serve` and can auto-connect the Docker runtime when you save an auth key.",
+        )
     }
 }
 
@@ -129,7 +161,7 @@ impl TunnelProvider for TailscaleTunnelProvider {
     }
 
     fn description(&self) -> &'static str {
-        "Public tunnel using `tailscale funnel`."
+        "Public HTTPS URL on your tailnet domain using `tailscale funnel`."
     }
 
     fn config_fields(&self) -> Vec<IntegrationConfigField> {
@@ -162,7 +194,7 @@ impl TunnelProvider for TailscaleTunnelProvider {
     }
 
     fn config_help(&self) -> Option<&'static str> {
-        Some("Requires a working Tailscale client, Funnel enabled for the device, and a reachable local service on port 8990.")
+        Some("Requires a working Tailscale runtime. In Docker, AgentArk starts `tailscaled` automatically and can run `tailscale up` from the saved auth key before opening Funnel.")
     }
 }
 
@@ -208,6 +240,7 @@ impl TunnelProvider for BoreTunnelProvider {
 fn tunnel_provider_defs() -> Vec<Box<dyn TunnelProvider>> {
     vec![
         Box::new(CloudflareTunnelProvider),
+        Box::new(TailscalePrivateTunnelProvider),
         Box::new(NgrokTunnelProvider),
         Box::new(TailscaleTunnelProvider),
         Box::new(BoreTunnelProvider),
@@ -237,6 +270,9 @@ struct TunnelProviderResponse {
     id: String,
     label: String,
     description: String,
+    exposure: String,
+    e2ee: bool,
+    link_label: String,
     available: bool,
     configured: bool,
     config_fields: Vec<IntegrationConfigField>,
@@ -251,6 +287,9 @@ pub(super) struct TunnelProvidersResponse {
     selected_provider: String,
     active: bool,
     active_provider: String,
+    exposure: String,
+    e2ee: bool,
+    link_label: String,
     url: Option<String>,
     selected_app_id: Option<String>,
     error: Option<String>,
@@ -273,6 +312,9 @@ fn parse_tunnel_provider_kind(value: &str) -> Option<TunnelProviderKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "cloudflare" => Some(TunnelProviderKind::Cloudflare),
         "ngrok" => Some(TunnelProviderKind::Ngrok),
+        "tailscale_private" | "tailscale-private" | "tailscale private" => {
+            Some(TunnelProviderKind::TailscalePrivate)
+        }
         "tailscale" | "tailscale_funnel" | "tailscale-funnel" => {
             Some(TunnelProviderKind::TailscaleFunnel)
         }
@@ -285,8 +327,30 @@ fn tunnel_provider_label(kind: TunnelProviderKind) -> &'static str {
     match kind {
         TunnelProviderKind::Cloudflare => "Cloudflare",
         TunnelProviderKind::Ngrok => "ngrok",
+        TunnelProviderKind::TailscalePrivate => "Tailscale Private (WireGuard E2EE)",
         TunnelProviderKind::TailscaleFunnel => "Tailscale Funnel",
         TunnelProviderKind::Bore => "Bore",
+    }
+}
+
+fn tunnel_provider_exposure(kind: TunnelProviderKind) -> &'static str {
+    match kind {
+        TunnelProviderKind::TailscalePrivate => "tailnet_private",
+        TunnelProviderKind::Cloudflare
+        | TunnelProviderKind::Ngrok
+        | TunnelProviderKind::TailscaleFunnel
+        | TunnelProviderKind::Bore => "public",
+    }
+}
+
+fn tunnel_provider_is_e2ee(kind: TunnelProviderKind) -> bool {
+    matches!(kind, TunnelProviderKind::TailscalePrivate)
+}
+
+fn tunnel_provider_link_label(kind: TunnelProviderKind) -> &'static str {
+    match kind {
+        TunnelProviderKind::TailscalePrivate => "Private Tailnet URL",
+        _ => "Public Link",
     }
 }
 
@@ -294,6 +358,7 @@ fn tunnel_provider_binary_path(kind: TunnelProviderKind, config: &TunnelConfig) 
     match kind {
         TunnelProviderKind::Cloudflare => config.cloudflare.binary_path.trim(),
         TunnelProviderKind::Ngrok => config.ngrok.binary_path.trim(),
+        TunnelProviderKind::TailscalePrivate => config.tailscale_funnel.binary_path.trim(),
         TunnelProviderKind::TailscaleFunnel => config.tailscale_funnel.binary_path.trim(),
         TunnelProviderKind::Bore => config.bore.binary_path.trim(),
     }
@@ -367,9 +432,24 @@ fn resolve_cloudflared_binary(config: &TunnelCloudflareConfig) -> Option<String>
         .find(|candidate| binary_path_available(candidate))
 }
 
+fn tailscale_runtime_available(config: &TunnelConfig) -> bool {
+    let cli_available = binary_path_available(config.tailscale_funnel.binary_path.trim());
+    if !cli_available {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        binary_path_available("tailscaled") || std::env::var_os("TS_SOCKET").is_some()
+    } else {
+        true
+    }
+}
+
 fn tunnel_provider_available(kind: TunnelProviderKind, config: &TunnelConfig) -> bool {
     match kind {
         TunnelProviderKind::Cloudflare => resolve_cloudflared_binary(&config.cloudflare).is_some(),
+        TunnelProviderKind::TailscalePrivate | TunnelProviderKind::TailscaleFunnel => {
+            tailscale_runtime_available(config)
+        }
         _ => binary_path_available(tunnel_provider_binary_path(kind, config)),
     }
 }
@@ -378,6 +458,7 @@ fn tunnel_provider_configured(kind: TunnelProviderKind, config: &TunnelConfig) -
     match kind {
         TunnelProviderKind::Cloudflare => true,
         TunnelProviderKind::Ngrok => !config.ngrok.authtoken.trim().is_empty(),
+        TunnelProviderKind::TailscalePrivate => true,
         TunnelProviderKind::TailscaleFunnel => true,
         TunnelProviderKind::Bore => !config.bore.server.trim().is_empty(),
     }
@@ -406,6 +487,12 @@ fn tunnel_provider_config_values(
             if !config.ngrok.authtoken.trim().is_empty() {
                 stored_secrets.push("authtoken".to_string());
             }
+        }
+        TunnelProviderKind::TailscalePrivate => {
+            values.insert(
+                "binary_path".to_string(),
+                config.tailscale_funnel.binary_path.clone(),
+            );
         }
         TunnelProviderKind::TailscaleFunnel => {
             values.insert(
@@ -443,6 +530,9 @@ fn tunnel_provider_summary(
         id: kind.as_str().to_string(),
         label: provider.label().to_string(),
         description: provider.description().to_string(),
+        exposure: tunnel_provider_exposure(kind).to_string(),
+        e2ee: tunnel_provider_is_e2ee(kind),
+        link_label: tunnel_provider_link_label(kind).to_string(),
         available: tunnel_provider_available(kind, config),
         configured: tunnel_provider_configured(kind, config),
         config_fields: provider.config_fields(),
@@ -456,21 +546,26 @@ fn tunnel_providers_response(
     runtime: &TunnelState,
     config: &TunnelConfig,
 ) -> TunnelProvidersResponse {
+    let effective_provider = if runtime.active {
+        runtime.provider
+    } else {
+        config.provider
+    };
     TunnelProvidersResponse {
         selected_provider: config.provider.as_str().to_string(),
         active: runtime.active,
-        active_provider: if runtime.active {
-            runtime.provider.as_str().to_string()
-        } else {
-            config.provider.as_str().to_string()
-        },
+        active_provider: effective_provider.as_str().to_string(),
+        exposure: tunnel_provider_exposure(effective_provider).to_string(),
+        e2ee: tunnel_provider_is_e2ee(effective_provider),
+        link_label: tunnel_provider_link_label(effective_provider).to_string(),
         url: runtime.url.clone(),
         selected_app_id: runtime.selected_app_id.clone(),
         error: runtime.error.clone(),
         providers: [
             TunnelProviderKind::Cloudflare,
-            TunnelProviderKind::Ngrok,
+            TunnelProviderKind::TailscalePrivate,
             TunnelProviderKind::TailscaleFunnel,
+            TunnelProviderKind::Ngrok,
             TunnelProviderKind::Bore,
         ]
         .into_iter()
@@ -505,19 +600,20 @@ pub(super) async fn handle_tunnel_control_command(
             if let Some(found) = url.or(tunnel_url) {
                 persist_public_tunnel_state(state, Some(&found), None).await;
                 Ok(format!(
-                    "{} tunnel started.\nExternal URL: {}",
+                    "{} started.\n{}: {}",
                     tunnel_provider_label(provider),
+                    tunnel_provider_link_label(provider),
                     found
                 ))
             } else if let Some(err) = tunnel_error {
                 Err(format!(
-                    "{} tunnel start failed: {}",
+                    "{} start failed: {}",
                     tunnel_provider_label(provider),
                     err
                 ))
             } else {
                 Ok(format!(
-                    "{} tunnel is starting. URL is pending; try 'tunnel status' in ~10s.",
+                    "{} is starting. URL is pending; try 'tunnel status' in ~10s.",
                     tunnel_provider_label(provider)
                 ))
             }
@@ -543,7 +639,11 @@ pub(super) async fn handle_tunnel_control_command(
                 tunnel_provider_label(provider)
             );
             if let Some(url) = tunnel.url.clone() {
-                out.push_str(&format!("\nExternal URL: {}", url));
+                out.push_str(&format!(
+                    "\n{}: {}",
+                    tunnel_provider_link_label(provider),
+                    url
+                ));
             }
             if let Some(err) = tunnel.error.clone() {
                 out.push_str(&format!("\nLast error: {}", err));
@@ -595,6 +695,7 @@ fn tunnel_https_url_matches_provider(provider: TunnelProviderKind, url: &str) ->
             host.ends_with(".trycloudflare.com") || host.ends_with(".cfargotunnel.com")
         }
         TunnelProviderKind::Ngrok => host.contains("ngrok"),
+        TunnelProviderKind::TailscalePrivate => host.ends_with(".ts.net"),
         TunnelProviderKind::TailscaleFunnel => host.ends_with(".ts.net"),
         TunnelProviderKind::Bore => true,
     }
@@ -622,7 +723,10 @@ fn extract_tunnel_url_from_log(
             return Some(url);
         }
     }
-    if provider == TunnelProviderKind::TailscaleFunnel {
+    if matches!(
+        provider,
+        TunnelProviderKind::TailscalePrivate | TunnelProviderKind::TailscaleFunnel
+    ) {
         for token in line.split_whitespace() {
             let cleaned = clean_logged_url(token);
             if cleaned.ends_with(".ts.net") {
@@ -733,6 +837,275 @@ async fn spawn_ngrok_url_probe(tunnel_arc: Arc<RwLock<TunnelState>>) {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TailscaleStatusSnapshot {
+    backend_state: Option<String>,
+    dns_name: Option<String>,
+}
+
+impl TailscaleStatusSnapshot {
+    fn is_running(&self) -> bool {
+        matches!(self.backend_state.as_deref(), Some("Running"))
+    }
+
+    fn display_name(&self) -> String {
+        self.dns_name
+            .clone()
+            .or_else(|| self.backend_state.clone())
+            .unwrap_or_else(|| "Tailscale runtime".to_string())
+    }
+}
+
+fn parse_tailscale_status_snapshot(raw: &str) -> Result<TailscaleStatusSnapshot, String> {
+    let payload: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid tailscale status output: {}", e))?;
+    let backend_state = payload
+        .get("BackendState")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let dns_name = payload
+        .get("Self")
+        .and_then(|value| value.get("DNSName"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim_end_matches('.').to_string())
+        .filter(|value| !value.trim().is_empty());
+    Ok(TailscaleStatusSnapshot {
+        backend_state,
+        dns_name,
+    })
+}
+
+fn is_tailscale_binary(binary: &str) -> bool {
+    matches!(
+        binary
+            .rsplit(['/', '\\'])
+            .next()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(name) if name == "tailscale" || name == "tailscale.exe"
+    )
+}
+
+fn tailscale_socket_override() -> Option<String> {
+    std::env::var("TS_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn apply_tailscale_socket_arg(command: &mut tokio::process::Command, binary: &str) {
+    if is_tailscale_binary(binary) {
+        if let Some(socket) = tailscale_socket_override() {
+            command.arg("--socket").arg(socket);
+        }
+    }
+}
+
+async fn read_tailscale_status(
+    config: &TunnelTailscaleConfig,
+) -> Result<TailscaleStatusSnapshot, String> {
+    let raw =
+        run_tunnel_test_command(config.binary_path.trim(), &["status", "--json"], &[]).await?;
+    parse_tailscale_status_snapshot(&raw)
+}
+
+async fn tailscale_up(config: &TunnelTailscaleConfig) -> Result<(), String> {
+    let auth_key = config.auth_key.trim();
+    if auth_key.is_empty() {
+        return Err(
+            "Tailscale is installed but not signed in. Save a Tailscale auth key first, then retry."
+                .to_string(),
+        );
+    }
+
+    let mut args = vec![
+        "up".to_string(),
+        format!("--auth-key={}", auth_key),
+        "--accept-dns=false".to_string(),
+        "--reset".to_string(),
+        "--timeout=60s".to_string(),
+    ];
+    if let Some(hostname) = config
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        args.push(format!("--hostname={}", hostname));
+    }
+
+    let mut command = tokio::process::Command::new(config.binary_path.trim());
+    apply_tailscale_socket_arg(&mut command, config.binary_path.trim());
+    command
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = tokio::time::timeout(Duration::from_secs(75), command.output())
+        .await
+        .map_err(|_| "Timed out while connecting Tailscale runtime.".to_string())?
+        .map_err(|e| format!("Failed to run tailscale up: {}", e))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("tailscale up exited with {}", output.status)
+    })
+}
+
+async fn ensure_tailscale_runtime_ready(
+    config: &TunnelTailscaleConfig,
+) -> Result<TailscaleStatusSnapshot, String> {
+    match read_tailscale_status(config).await {
+        Ok(snapshot) if snapshot.is_running() => Ok(snapshot),
+        Err(error) if error.to_ascii_lowercase().contains("binary not found") => Err(error),
+        Ok(_) | Err(_) if config.auth_key.trim().is_empty() => Err(
+            "Tailscale runtime is not connected. Save a Tailscale auth key in Settings, then retry."
+                .to_string(),
+        ),
+        Ok(_) | Err(_) => {
+            tailscale_up(config).await?;
+            let snapshot = read_tailscale_status(config).await?;
+            if snapshot.is_running() {
+                Ok(snapshot)
+            } else {
+                Err(format!(
+                    "Tailscale started but is not ready yet (state: {}).",
+                    snapshot
+                        .backend_state
+                        .as_deref()
+                        .unwrap_or("unknown")
+                ))
+            }
+        }
+    }
+}
+
+fn tailscale_status_args(provider: TunnelProviderKind) -> Option<[&'static str; 2]> {
+    match provider {
+        TunnelProviderKind::TailscalePrivate => Some(["serve", "status"]),
+        TunnelProviderKind::TailscaleFunnel => Some(["funnel", "status"]),
+        _ => None,
+    }
+}
+
+fn tailscale_reset_args(provider: TunnelProviderKind) -> Option<[&'static str; 2]> {
+    match provider {
+        TunnelProviderKind::TailscalePrivate => Some(["serve", "reset"]),
+        TunnelProviderKind::TailscaleFunnel => Some(["funnel", "reset"]),
+        _ => None,
+    }
+}
+
+async fn spawn_tailscale_url_probe(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    provider: TunnelProviderKind,
+    binary: String,
+    auth_key: Option<String>,
+) {
+    let Some(args) = tailscale_status_args(provider) else {
+        return;
+    };
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let should_continue = {
+            let tunnel = tunnel_arc.read().await;
+            tunnel.active && tunnel.provider == provider && tunnel.url.is_none()
+        };
+        if !should_continue {
+            break;
+        }
+
+        let mut command = tokio::process::Command::new(&binary);
+        apply_tailscale_socket_arg(&mut command, &binary);
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(value) = auth_key.as_deref().filter(|value| !value.trim().is_empty()) {
+            command.env("TS_AUTHKEY", value.trim());
+        }
+
+        let Ok(output) = tokio::time::timeout(Duration::from_secs(5), command.output()).await
+        else {
+            continue;
+        };
+        let Ok(output) = output else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let found = stdout
+            .lines()
+            .chain(stderr.lines())
+            .find_map(|line| extract_tunnel_url_from_log(provider, line, None));
+        if let Some(url) = found {
+            let mut tunnel = tunnel_arc.write().await;
+            if tunnel.active && tunnel.provider == provider {
+                tunnel.url = Some(url);
+                tunnel.error = None;
+            }
+            break;
+        }
+    }
+}
+
+async fn reset_tailscale_provider(provider: TunnelProviderKind, config: &TunnelConfig) {
+    let Some(args) = tailscale_reset_args(provider) else {
+        return;
+    };
+    let binary = config.tailscale_funnel.binary_path.trim();
+    if !binary_path_available(binary) {
+        tracing::warn!(
+            "Skipping {} reset because binary is unavailable: {}",
+            tunnel_provider_label(provider),
+            binary
+        );
+        return;
+    }
+    let mut command = tokio::process::Command::new(binary);
+    apply_tailscale_socket_arg(&mut command, binary);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if !config.tailscale_funnel.auth_key.trim().is_empty() {
+        command.env("TS_AUTHKEY", config.tailscale_funnel.auth_key.trim());
+    }
+
+    match tokio::time::timeout(Duration::from_secs(8), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {}
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            tracing::warn!(
+                "Failed to reset {}: {}",
+                tunnel_provider_label(provider),
+                if stderr.is_empty() {
+                    format!("exit {}", output.status)
+                } else {
+                    stderr
+                }
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                "Failed to reset {}: {}",
+                tunnel_provider_label(provider),
+                error
+            );
+        }
+        Err(_) => {
+            tracing::warn!("Timed out resetting {}", tunnel_provider_label(provider));
+        }
+    }
+}
+
 pub(super) async fn persist_public_tunnel_state(
     state: &AppState,
     url: Option<&str>,
@@ -772,6 +1145,7 @@ async fn run_tunnel_test_command(
         return Err(format!("Binary not found: {}", binary));
     }
     let mut cmd = tokio::process::Command::new(binary);
+    apply_tailscale_socket_arg(&mut cmd, binary);
     cmd.args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -826,13 +1200,19 @@ async fn test_tunnel_provider_connection(
             )
             .await
         }
+        TunnelProviderKind::TailscalePrivate => {
+            let snapshot = ensure_tailscale_runtime_ready(&config.tailscale_funnel).await?;
+            Ok(format!(
+                "Tailscale private access is ready on {}.",
+                snapshot.display_name()
+            ))
+        }
         TunnelProviderKind::TailscaleFunnel => {
-            run_tunnel_test_command(
-                config.tailscale_funnel.binary_path.trim(),
-                &["status", "--json"],
-                &[("TS_AUTHKEY", config.tailscale_funnel.auth_key.trim())],
-            )
-            .await
+            let snapshot = ensure_tailscale_runtime_ready(&config.tailscale_funnel).await?;
+            Ok(format!(
+                "Tailscale Funnel is ready on {}.",
+                snapshot.display_name()
+            ))
         }
         TunnelProviderKind::Bore => {
             run_tunnel_test_command(config.bore.binary_path.trim(), &["--help"], &[]).await
@@ -875,6 +1255,9 @@ pub(super) async fn configure_tunnel(
             match next.provider {
                 TunnelProviderKind::Cloudflare => next.cloudflare.binary_path = value.to_string(),
                 TunnelProviderKind::Ngrok => next.ngrok.binary_path = value.to_string(),
+                TunnelProviderKind::TailscalePrivate => {
+                    next.tailscale_funnel.binary_path = value.to_string()
+                }
                 TunnelProviderKind::TailscaleFunnel => {
                     next.tailscale_funnel.binary_path = value.to_string()
                 }
@@ -890,6 +1273,7 @@ pub(super) async fn configure_tunnel(
                     }
                 }
             }
+            TunnelProviderKind::TailscalePrivate => {}
             TunnelProviderKind::TailscaleFunnel => {
                 if let Some(value) = values.get("auth_key") {
                     if !value.trim().is_empty() {
@@ -1003,6 +1387,9 @@ pub(super) async fn get_tunnel_status(State(state): State<AppState>) -> Json<ser
         "error": tunnel.error,
         "provider": provider.as_str(),
         "provider_label": tunnel_provider_label(provider),
+        "exposure": tunnel_provider_exposure(provider),
+        "e2ee": tunnel_provider_is_e2ee(provider),
+        "link_label": tunnel_provider_link_label(provider),
         "available": tunnel_provider_available(provider, &config),
         "configured": tunnel_provider_configured(provider, &config)
     }))
@@ -1135,7 +1522,9 @@ async fn spawn_tailscale_tunnel(
     if !binary_path_available(binary) {
         return Err(format!("Tailscale binary not found: {}", binary));
     }
+    ensure_tailscale_runtime_ready(config).await?;
     let mut command = tokio::process::Command::new(binary);
+    apply_tailscale_socket_arg(&mut command, binary);
     command
         .arg("funnel")
         .arg("8990")
@@ -1171,16 +1560,87 @@ async fn spawn_tailscale_tunnel(
             }
             if let Some(stderr) = stderr {
                 spawn_tunnel_output_reader(
-                    tunnel_arc,
+                    tunnel_arc.clone(),
                     TunnelProviderKind::TailscaleFunnel,
                     stderr,
                     None,
                     "stderr",
                 );
             }
+            tokio::spawn(spawn_tailscale_url_probe(
+                tunnel_arc,
+                TunnelProviderKind::TailscaleFunnel,
+                binary.to_string(),
+                (!config.auth_key.trim().is_empty()).then(|| config.auth_key.trim().to_string()),
+            ));
             Ok(())
         }
         Err(e) => Err(format!("Failed to start Tailscale Funnel: {}", e)),
+    }
+}
+
+async fn spawn_tailscale_private_access(
+    tunnel_arc: Arc<RwLock<TunnelState>>,
+    config: &TunnelTailscaleConfig,
+) -> Result<(), String> {
+    let binary = config.binary_path.trim();
+    if !binary_path_available(binary) {
+        return Err(format!("Tailscale binary not found: {}", binary));
+    }
+    ensure_tailscale_runtime_ready(config).await?;
+    let mut command = tokio::process::Command::new(binary);
+    apply_tailscale_socket_arg(&mut command, binary);
+    command
+        .arg("serve")
+        .arg("8990")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if !config.auth_key.trim().is_empty() {
+        command.env("TS_AUTHKEY", config.auth_key.trim());
+    }
+    if let Some(hostname) = config
+        .hostname
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        command.env("TS_HOSTNAME", hostname.trim());
+    }
+    match command.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut tunnel = tunnel_arc.write().await;
+                set_tunnel_running(&mut tunnel, child, TunnelProviderKind::TailscalePrivate);
+            }
+            if let Some(stdout) = stdout {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::TailscalePrivate,
+                    stdout,
+                    None,
+                    "stdout",
+                );
+            }
+            if let Some(stderr) = stderr {
+                spawn_tunnel_output_reader(
+                    tunnel_arc.clone(),
+                    TunnelProviderKind::TailscalePrivate,
+                    stderr,
+                    None,
+                    "stderr",
+                );
+            }
+            tokio::spawn(spawn_tailscale_url_probe(
+                tunnel_arc,
+                TunnelProviderKind::TailscalePrivate,
+                binary.to_string(),
+                (!config.auth_key.trim().is_empty()).then(|| config.auth_key.trim().to_string()),
+            ));
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to start Tailscale private access: {}", e)),
     }
 }
 
@@ -1258,6 +1718,9 @@ pub(super) async fn spawn_tunnel(
             spawn_cloudflare_tunnel(state.tunnel.clone(), &config.cloudflare).await
         }
         TunnelProviderKind::Ngrok => spawn_ngrok_tunnel(state.tunnel.clone(), &config.ngrok).await,
+        TunnelProviderKind::TailscalePrivate => {
+            spawn_tailscale_private_access(state.tunnel.clone(), &config.tailscale_funnel).await
+        }
         TunnelProviderKind::TailscaleFunnel => {
             spawn_tailscale_tunnel(state.tunnel.clone(), &config.tailscale_funnel).await
         }
@@ -1365,17 +1828,27 @@ pub(super) async fn start_tunnel(
 }
 
 pub(super) async fn stop_tunnel_internal(state: &AppState) {
-    let mut tunnel = state.tunnel.write().await;
-    if let Some(ref mut child) = tunnel.process {
-        let _ = child.kill().await;
+    let provider = {
+        let mut tunnel = state.tunnel.write().await;
+        if let Some(ref mut child) = tunnel.process {
+            let _ = child.kill().await;
+        }
+        let provider = tunnel.provider;
+        tunnel.process = None;
+        tunnel.active = false;
+        tunnel.url = None;
+        tunnel.selected_app_id = None;
+        tunnel.error = None;
+        tracing::info!("Tunnel stopped by user");
+        provider
+    };
+    if matches!(
+        provider,
+        TunnelProviderKind::TailscalePrivate | TunnelProviderKind::TailscaleFunnel
+    ) {
+        let config = load_tunnel_config(state).await;
+        reset_tailscale_provider(provider, &config).await;
     }
-    tunnel.process = None;
-    tunnel.active = false;
-    tunnel.url = None;
-    tunnel.selected_app_id = None;
-    tunnel.error = None;
-    tracing::info!("Tunnel stopped by user");
-    drop(tunnel);
     persist_public_tunnel_state(state, None, None).await;
 }
 

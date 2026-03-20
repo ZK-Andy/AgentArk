@@ -66,12 +66,12 @@ pub(super) async fn get_observability_logs(
     State(state): State<AppState>,
     Query(query): Query<ObservabilityLogQuery>,
 ) -> Response {
-    let storage = {
+    let (storage, config_dir) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (agent.storage.clone(), agent.config_dir.clone())
     };
     let limit = query.limit.unwrap_or(40).clamp(1, 120);
-    let mut logs = crate::core::observability::load_delivery_logs(&storage).await;
+    let mut logs = crate::core::observability::load_delivery_logs(&storage, &config_dir).await;
     if logs.len() > limit {
         logs.truncate(limit);
     }

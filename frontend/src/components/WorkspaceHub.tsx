@@ -1,0 +1,384 @@
+import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
+import {
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  Divider,
+  Drawer,
+  IconButton,
+  Stack,
+  Typography,
+} from "@mui/material";
+import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { api } from "../api/client";
+import type { Task, TraceSummary } from "../types";
+import { NativeWorkspace, type WorkspaceView } from "./NativeWorkspace";
+
+const REFRESH_MS = 8000;
+
+type DrawerView = Extract<
+  WorkspaceView,
+  "tasks" | "apps" | "documents" | "skills" | "swarm" | "trace" | "status" | "goals" | "moltbook"
+>;
+
+type Props = {
+  autoRefresh: boolean;
+  showAdvanced: boolean;
+  unreadCount: number;
+  onNavigateToView: (view: string, replace?: boolean) => void;
+};
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function pickTasks(value: unknown): Task[] {
+  if (Array.isArray(value)) return value as Task[];
+  const record = asRecord(value);
+  return Array.isArray(record.tasks) ? (record.tasks as Task[]) : [];
+}
+
+function pickTraceHistory(value: unknown): TraceSummary[] {
+  const record = asRecord(value);
+  return Array.isArray(record.history) ? (record.history as TraceSummary[]) : [];
+}
+
+function pickRecords(value: unknown, key: string): Record<string, unknown>[] {
+  const record = asRecord(value);
+  return Array.isArray(record[key]) ? (record[key] as Record<string, unknown>[]) : [];
+}
+
+function taskStatusKey(task: Task): string {
+  return String(task?.status || "").toLowerCase();
+}
+
+function formatTaskStatus(task: Task): string {
+  const value = taskStatusKey(task);
+  if (value.includes("awaitingapproval")) return "Awaiting approval";
+  if (value.includes("inprogress")) return "Running";
+  if (value.includes("paused")) return "Paused";
+  if (value.includes("failed")) return "Failed";
+  if (value.includes("completed")) return "Completed";
+  return value || "Pending";
+}
+
+function formatWhen(raw?: string): string {
+  if (!raw) return "-";
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return raw;
+  return dt.toLocaleString();
+}
+
+const DRAWER_VIEWS: Array<{ view: DrawerView; label: string; detail: string }> = [
+  { view: "tasks", label: "Tasks", detail: "Durable execution queue and approvals." },
+  { view: "apps", label: "Apps", detail: "Built artifacts and deployed surfaces." },
+  { view: "documents", label: "Files", detail: "Knowledge, uploads, and project documents." },
+  { view: "skills", label: "Skills", detail: "Reusable capabilities and imports." },
+  { view: "swarm", label: "Agents", detail: "Specialist agents and live roster." },
+  { view: "trace", label: "Trace", detail: "Execution history and tool telemetry." },
+  { view: "status", label: "Watchers", detail: "Background monitors and triggers." },
+  { view: "goals", label: "Goals", detail: "Long-running intent and outcomes." },
+  { view: "moltbook", label: "Moltbook", detail: "Community exposure and publishing." },
+];
+
+export function WorkspaceHub({
+  autoRefresh,
+  showAdvanced,
+  unreadCount,
+  onNavigateToView,
+}: Props) {
+  const interval = autoRefresh ? REFRESH_MS : false;
+  const [drawerView, setDrawerView] = useState<DrawerView | null>(null);
+
+  const tasksQ = useQuery({
+    queryKey: ["tasks"],
+    queryFn: api.getTasks,
+    refetchInterval: interval,
+  });
+  const traceQ = useQuery({
+    queryKey: ["trace"],
+    queryFn: api.getTrace,
+    refetchInterval: interval,
+  });
+  const projectsQ = useQuery({
+    queryKey: ["chat-projects"],
+    queryFn: () => api.rawGet("/projects"),
+    refetchInterval: interval,
+  });
+  const appsQ = useQuery({
+    queryKey: ["apps-manager"],
+    queryFn: () => api.rawGet("/apps"),
+    refetchInterval: interval,
+  });
+
+  const tasks = useMemo(() => pickTasks(tasksQ.data), [tasksQ.data]);
+  const traces = useMemo(() => pickTraceHistory(traceQ.data), [traceQ.data]);
+  const projects = useMemo(() => pickRecords(projectsQ.data, "projects"), [projectsQ.data]);
+  const apps = useMemo(() => pickRecords(appsQ.data, "apps"), [appsQ.data]);
+
+  const runningTasks = useMemo(
+    () => tasks.filter((task) => taskStatusKey(task).includes("inprogress")),
+    [tasks]
+  );
+  const waitingTasks = useMemo(
+    () =>
+      tasks.filter((task) => {
+        const status = taskStatusKey(task);
+        return status.includes("awaitingapproval") || status.includes("paused");
+      }),
+    [tasks]
+  );
+  const failedTasks = useMemo(
+    () => tasks.filter((task) => taskStatusKey(task).includes("failed")),
+    [tasks]
+  );
+  const activeApps = useMemo(
+    () =>
+      apps.filter((app) => {
+        const running = app.running;
+        return running === true || String(running).toLowerCase() === "true";
+      }),
+    [apps]
+  );
+
+  const liveTaskPreview = useMemo(
+    () => [...runningTasks, ...waitingTasks, ...failedTasks].slice(0, 4),
+    [failedTasks, runningTasks, waitingTasks]
+  );
+  const latestTrace = traces[0];
+  const drawerMeta = DRAWER_VIEWS.find((entry) => entry.view === drawerView) || null;
+
+  return (
+    <Box className="workspace-hub-shell" data-tour-target="workspace-shell">
+      <Box className="workspace-launch-bar">
+        <Stack
+          direction={{ xs: "column", lg: "row" }}
+          spacing={1.5}
+          justifyContent="space-between"
+          alignItems={{ xs: "flex-start", lg: "center" }}
+        >
+          <Box sx={{ minWidth: 0 }}>
+            <Typography variant="overline" className="workspace-shell-kicker">
+              Active Workspace
+            </Typography>
+            <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em", mb: 0.35 }}>
+              Chat stays primary. Durable work stays one click away.
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>
+              Ask quick questions directly. When the work needs files, tools, approvals, apps, or repeatability, the run
+              remains visible as a task without sending you to a different product surface.
+            </Typography>
+          </Box>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            {DRAWER_VIEWS.slice(0, 6).map((entry) => (
+              <Button
+                key={entry.view}
+                variant={drawerView === entry.view ? "contained" : "outlined"}
+                size="small"
+                onClick={() => setDrawerView(entry.view)}
+                sx={{ textTransform: "none", borderRadius: 999 }}
+              >
+                {entry.label}
+              </Button>
+            ))}
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => onNavigateToView("projects")}
+              sx={{ textTransform: "none", borderRadius: 999 }}
+            >
+              Projects
+            </Button>
+          </Stack>
+        </Stack>
+      </Box>
+
+      <Box className="workspace-hub-grid">
+        <Box className="workspace-chat-stage">
+          <NativeWorkspace view="chat" autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+        </Box>
+
+        <Stack className="workspace-companion-rail" spacing={1.1}>
+          <Card className="workspace-side-card">
+            <CardContent sx={{ p: 1.5 }}>
+              <Stack spacing={1.1}>
+                <Box>
+                  <Typography variant="overline" className="workspace-side-kicker">
+                    Task Flow
+                  </Typography>
+                  <Typography variant="h6" sx={{ fontWeight: 650 }}>
+                    Live execution stays visible.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                  <Chip size="small" color="info" label={`${runningTasks.length} running`} />
+                  <Chip size="small" color="warning" label={`${waitingTasks.length} waiting`} />
+                  <Chip size="small" color={failedTasks.length > 0 ? "error" : "default"} label={`${failedTasks.length} failed`} />
+                </Stack>
+                {liveTaskPreview.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">
+                    No active or blocked tasks right now. The thread is clear for quick asks.
+                  </Typography>
+                ) : (
+                  <Stack spacing={0.75}>
+                    {liveTaskPreview.map((task) => (
+                      <Box key={task.id} className="action-row">
+                        <Stack spacing={0.45}>
+                          <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                            <Chip size="small" variant="outlined" label={formatTaskStatus(task)} />
+                            <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
+                              {task.description || "Task"}
+                            </Typography>
+                          </Stack>
+                          <Typography variant="caption" color="text.secondary">
+                            Created {formatWhen(task.created_at)}
+                          </Typography>
+                        </Stack>
+                      </Box>
+                    ))}
+                  </Stack>
+                )}
+                <Stack direction="row" spacing={1}>
+                  <Button size="small" variant="outlined" onClick={() => setDrawerView("tasks")} sx={{ textTransform: "none" }}>
+                    Open Task Queue
+                  </Button>
+                  <Button size="small" variant="text" onClick={() => onNavigateToView("inbox")} sx={{ textTransform: "none" }}>
+                    Open Inbox
+                  </Button>
+                </Stack>
+              </Stack>
+            </CardContent>
+          </Card>
+
+          <Card className="workspace-side-card">
+            <CardContent sx={{ p: 1.5 }}>
+              <Stack spacing={1.1}>
+                <Box>
+                  <Typography variant="overline" className="workspace-side-kicker">
+                    Context
+                  </Typography>
+                  <Typography variant="h6" sx={{ fontWeight: 650 }}>
+                    Projects, artifacts, and recent runs.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                  <Chip size="small" label={`${projects.length} projects`} />
+                  <Chip size="small" label={`${activeApps.length} live apps`} />
+                  <Chip size="small" label={`${traces.length} traces`} />
+                  <Chip size="small" color={unreadCount > 0 ? "warning" : "default"} label={`${unreadCount} inbox`} />
+                </Stack>
+                <Divider sx={{ borderColor: "rgba(108, 156, 212, 0.12)" }} />
+                <Stack spacing={0.65}>
+                  <Typography variant="caption" color="text.secondary">
+                    Latest run
+                  </Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={latestTrace?.message_preview || ""}>
+                    {latestTrace?.message_preview || "No recent traces yet."}
+                  </Typography>
+                  {latestTrace ? (
+                    <Typography variant="caption" color="text.secondary">
+                      {latestTrace.status || "unknown"} • {latestTrace.step_count} step{latestTrace.step_count === 1 ? "" : "s"} • {formatWhen(latestTrace.started_at)}
+                    </Typography>
+                  ) : null}
+                </Stack>
+                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                  <Button size="small" variant="outlined" onClick={() => onNavigateToView("projects")} sx={{ textTransform: "none" }}>
+                    Open Projects
+                  </Button>
+                  <Button size="small" variant="outlined" onClick={() => setDrawerView("trace")} sx={{ textTransform: "none" }}>
+                    Open Trace
+                  </Button>
+                  <Button size="small" variant="text" onClick={() => onNavigateToView("overview")} sx={{ textTransform: "none" }}>
+                    Home
+                  </Button>
+                </Stack>
+              </Stack>
+            </CardContent>
+          </Card>
+
+          <Card className="workspace-side-card">
+            <CardContent sx={{ p: 1.5 }}>
+              <Stack spacing={1.1}>
+                <Box>
+                  <Typography variant="overline" className="workspace-side-kicker">
+                    Surfaces
+                  </Typography>
+                  <Typography variant="h6" sx={{ fontWeight: 650 }}>
+                    Open deeper tools only when needed.
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                  {DRAWER_VIEWS.map((entry) => (
+                    <Chip
+                      key={entry.view}
+                      label={entry.label}
+                      clickable
+                      variant={drawerView === entry.view ? "filled" : "outlined"}
+                      color={drawerView === entry.view ? "primary" : "default"}
+                      onClick={() => setDrawerView(entry.view)}
+                    />
+                  ))}
+                </Stack>
+                <Typography variant="body2" color="text.secondary">
+                  This keeps the first screen focused while still exposing the full operator surface behind one action.
+                </Typography>
+                <Stack direction="row" spacing={1}>
+                  <Button size="small" variant="outlined" onClick={() => onNavigateToView("library")} sx={{ textTransform: "none" }}>
+                    Library
+                  </Button>
+                  <Button size="small" variant="text" onClick={() => onNavigateToView("inbox")} sx={{ textTransform: "none" }}>
+                    Inbox
+                  </Button>
+                </Stack>
+              </Stack>
+            </CardContent>
+          </Card>
+        </Stack>
+      </Box>
+
+      <Drawer
+        anchor="right"
+        open={drawerView !== null}
+        onClose={() => setDrawerView(null)}
+        PaperProps={{
+          sx: {
+            width: { xs: "100%", md: 640 },
+            maxWidth: "100vw",
+            borderLeft: "1px solid rgba(108, 156, 212, 0.18)",
+            background: "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(7, 16, 30, 0.9))",
+          },
+        }}
+      >
+        <Box className="workspace-side-drawer">
+          <Stack
+            direction="row"
+            alignItems="center"
+            justifyContent="space-between"
+            spacing={1}
+            sx={{ px: 1.5, py: 1.2, borderBottom: "1px solid rgba(108, 156, 212, 0.14)" }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 650 }} noWrap>
+                {drawerMeta?.label || "Workspace panel"}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                {drawerMeta?.detail || "Operational surface"}
+              </Typography>
+            </Box>
+            <IconButton size="small" onClick={() => setDrawerView(null)} aria-label="Close workspace drawer">
+              <CloseRoundedIcon fontSize="small" />
+            </IconButton>
+          </Stack>
+          <Box sx={{ flex: 1, minHeight: 0 }}>
+            {drawerView ? (
+              <NativeWorkspace view={drawerView} autoRefresh={autoRefresh} showAdvanced={showAdvanced} />
+            ) : null}
+          </Box>
+        </Box>
+      </Drawer>
+    </Box>
+  );
+}

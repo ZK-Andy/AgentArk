@@ -1272,7 +1272,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /reject-task <task_id> - Reject a waiting task\n\
                  /search <query> - Web search\n\
                  /image <prompt> - Generate an image\n\
-                 /tunnel [start|stop|status] - Manage public UI tunnel\n\
+                 /tunnel [start|stop|status] - Manage remote UI access\n\
                  /setsecret KEY=VALUE - Store a secret encrypted (paired/allowlisted only)\n\
                  /approve <number> - Approve a contact\n\
                  /clear - Clear conversation history\n\n\

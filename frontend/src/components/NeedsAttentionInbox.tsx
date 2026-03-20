@@ -145,7 +145,7 @@ export function NeedsAttentionInbox({
   const count = items.length;
 
   return (
-    <Card className="attention-card">
+    <Card className="attention-card" sx={{ alignSelf: "flex-start" }}>
       <CardContent sx={{ p: 1.5 }}>
         <Stack direction="row" alignItems="center" spacing={1} mb={count > 0 ? 1.25 : 0}>
           <WarningAmberRoundedIcon
