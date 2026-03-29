@@ -19,6 +19,7 @@ pub const ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY: &str =
     "routing_complexity_policy_baseline_snapshot_v1";
 pub const SELF_EVOLVE_LAST_RESULT_KEY: &str = "self_evolve_last_result_v1";
 pub const APP_DEPLOY_ACCESS_GUARD_DEFAULT_KEY: &str = "app_deploy_access_guard_default_v1";
+pub const SELF_EVOLVE_ENABLED_KEY: &str = "self_evolve_enabled_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolStrategyProfile {

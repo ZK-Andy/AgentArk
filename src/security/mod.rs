@@ -428,7 +428,14 @@ impl SecurityGuard {
     /// Filter output to prevent sensitive data leakage
     pub fn filter_output(&self, output: &str) -> FilteredOutput {
         let redacted_secret_output = redact_secret_input(output);
-        let filtered = redacted_secret_output.text;
+        let filtered =
+            if redacted_secret_output.primary_kind() == Some(SecretInputType::ApiKeyOrToken) {
+                redacted_secret_output
+                    .text
+                    .replace("[REDACTED_SECRET]", "[REDACTED_API_KEY]")
+            } else {
+                redacted_secret_output.text.clone()
+            };
         let mut redactions = redacted_secret_output.redactions;
 
         // Check for sensitive keywords

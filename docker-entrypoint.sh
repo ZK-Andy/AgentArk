@@ -134,16 +134,27 @@ start_mem0_bridge
 
 # Start Playwright bridge in background (localhost-only)
 start_playwright_bridge() {
+    if ! command -v node >/dev/null 2>&1 || [ ! -f /app/playwright-bridge/index.js ] || [ ! -d /app/playwright-bridge/node_modules ]; then
+        echo -e "${YELLOW}Playwright bridge not available (Node.js or bridge dependencies missing)${NC}"
+        return
+    fi
+
+    if [ -n "${PLAYWRIGHT_EXECUTABLE_PATH:-}" ] && [ ! -x "${PLAYWRIGHT_EXECUTABLE_PATH}" ]; then
+        if [ -z "$(find "${PLAYWRIGHT_BROWSERS_PATH:-/nonexistent}" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]; then
+            echo -e "${YELLOW}Playwright bridge not available (no Chromium binary or bundled Playwright browsers found)${NC}"
+            return
+        fi
+    fi
+
     if command -v node >/dev/null 2>&1 && [ -f /app/playwright-bridge/index.js ]; then
         echo -e "${GREEN}Starting Playwright bridge (localhost:3100)...${NC}"
-        PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/ms-playwright} \
+        PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright-browsers} \
+        PLAYWRIGHT_EXECUTABLE_PATH=${PLAYWRIGHT_EXECUTABLE_PATH:-} \
         PORT=${PLAYWRIGHT_BRIDGE_PORT:-3100} \
         PLAYWRIGHT_BRIDGE_HOST=${PLAYWRIGHT_BRIDGE_HOST:-127.0.0.1} \
         gosu agent node /app/playwright-bridge/index.js &
         PLAYWRIGHT_PID=$!
         echo -e "${GREEN}Playwright bridge started (PID: $PLAYWRIGHT_PID)${NC}"
-    else
-        echo -e "${YELLOW}Playwright bridge not available (Node.js or bridge files missing)${NC}"
     fi
 }
 

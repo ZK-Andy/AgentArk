@@ -30,14 +30,13 @@ fn token_path(config_dir: &Path) -> PathBuf {
 }
 
 fn get_oauth_client_with_config(config_dir: &Path) -> Result<(String, String)> {
-    // Try env vars first
     if let (Ok(id), Ok(secret)) = (
         std::env::var("GMAIL_CLIENT_ID"),
         std::env::var("GMAIL_CLIENT_SECRET"),
     ) {
         return Ok((id, secret));
     }
-    // Fall back to secure config
+
     let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
     if let Some(json_str) = manager.get_custom_secret("gmail_oauth_config")? {
         let v: serde_json::Value = serde_json::from_str(&json_str)?;
@@ -53,8 +52,15 @@ fn get_oauth_client_with_config(config_dir: &Path) -> Result<(String, String)> {
             .ok_or_else(|| anyhow!("Missing client_secret in gmail config"))?;
         return Ok((client_id, client_secret));
     }
+
+    if let Some(config) =
+        crate::actions::google_workspace::load_workspace_client_config(config_dir)?
+    {
+        return Ok((config.client_id, config.client_secret));
+    }
+
     Err(anyhow!(
-        "Gmail OAuth credentials not configured. Go to Settings > Gmail to add them."
+        "Gmail OAuth credentials not configured. Connect Google Workspace or add Gmail credentials."
     ))
 }
 
@@ -65,7 +71,6 @@ async fn load_tokens(config_dir: &Path) -> Result<GmailTokens> {
         return Ok(tokens);
     }
 
-    // Migration from legacy plaintext file if it exists
     let legacy_path = token_path(config_dir);
     if legacy_path.exists() {
         let content = tokio::fs::read_to_string(&legacy_path).await?;
@@ -91,7 +96,16 @@ async fn save_tokens(config_dir: &Path, tokens: &GmailTokens) -> Result<()> {
 }
 
 pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
-    let mut tokens = load_tokens(config_dir).await?;
+    let mut tokens = match load_tokens(config_dir).await {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            return crate::actions::google_workspace::ensure_access_token_for_bundles(
+                config_dir,
+                &["gmail"],
+            )
+            .await;
+        }
+    };
     let now = chrono::Utc::now().timestamp();
 
     if tokens.expires_at > now + 60 {
@@ -148,13 +162,44 @@ pub(crate) async fn gmail_profile_email(config_dir: &Path) -> Result<String> {
     Ok(profile.email_address)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailScanMode {
+    #[default]
+    Auto,
+    Recent,
+    Search,
+    Triage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct GmailScanArgs {
+    #[serde(default)]
+    pub mode: GmailScanMode,
     pub query: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]
     pub max_results: Option<u32>,
+}
+
+pub(crate) fn effective_scan_mode(args: &GmailScanArgs) -> GmailScanMode {
+    match args.mode {
+        GmailScanMode::Auto => {
+            let has_query = args
+                .query
+                .as_deref()
+                .is_some_and(|query| !query.trim().is_empty());
+            if has_query || !args.labels.is_empty() {
+                GmailScanMode::Search
+            } else if args.max_results.is_some() {
+                GmailScanMode::Recent
+            } else {
+                GmailScanMode::Triage
+            }
+        }
+        explicit => explicit,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,9 +224,11 @@ struct GmailMessageRef {
 struct GmailFullMessage {
     id: String,
     #[serde(default, rename = "threadId")]
-    _thread_id: String,
+    thread_id: String,
     #[serde(default, rename = "labelIds")]
     label_ids: Vec<String>,
+    #[serde(default)]
+    snippet: String,
     #[serde(default)]
     payload: GmailPayload,
 }
@@ -206,7 +253,25 @@ fn header_value(headers: &[GmailHeader], name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Fetch message IDs from a single Gmail query
+fn render_message_summary(meta: GmailFullMessage) -> String {
+    let subject = header_value(&meta.payload.headers, "Subject");
+    let from = header_value(&meta.payload.headers, "From");
+    let date = header_value(&meta.payload.headers, "Date");
+    let labels = meta.label_ids.join(", ");
+    let mut lines = vec![
+        format!("- From: {}", from),
+        format!("  Subject: {}", subject),
+        format!("  Date: {}", date),
+        format!("  Labels: {}", labels),
+        format!("  Id: {}", meta.id),
+        format!("  ThreadId: {}", meta.thread_id),
+    ];
+    if !meta.snippet.trim().is_empty() {
+        lines.push(format!("  Snippet: {}", meta.snippet.trim()));
+    }
+    lines.join("\n")
+}
+
 async fn fetch_message_ids(
     client: &reqwest::Client,
     access_token: &str,
@@ -240,7 +305,6 @@ async fn fetch_message_ids(
         .collect())
 }
 
-/// Fetch full metadata for a single message
 async fn fetch_message_metadata(
     client: &reqwest::Client,
     access_token: &str,
@@ -262,86 +326,139 @@ async fn fetch_message_metadata(
     resp.json().await.ok()
 }
 
-pub async fn gmail_scan(config_dir: &Path, args: &serde_json::Value) -> Result<String> {
-    let args: GmailScanArgs = serde_json::from_value(args.clone())
-        .map_err(|e| anyhow!("Invalid Gmail scan args: {}", e))?;
+async fn fetch_message_ids_via_gws(
+    config_dir: &Path,
+    query: Option<&str>,
+    labels: &[String],
+    max_results: u32,
+) -> Result<Vec<String>> {
+    let mut params = serde_json::json!({
+        "userId": "me",
+        "maxResults": max_results
+    });
+    if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
+        params["q"] = serde_json::Value::String(query.to_string());
+    }
+    if !labels.is_empty() {
+        params["labelIds"] = serde_json::Value::Array(
+            labels
+                .iter()
+                .map(|label| serde_json::Value::String(label.clone()))
+                .collect(),
+        );
+    }
+    let argv = vec![
+        "gmail".to_string(),
+        "users".to_string(),
+        "messages".to_string(),
+        "list".to_string(),
+        "--params".to_string(),
+        params.to_string(),
+    ];
+    let data =
+        crate::actions::google_workspace::gws_json_command(config_dir, &argv, &["gmail"]).await?;
+    let parsed: GmailListResponse = serde_json::from_value(data)
+        .map_err(|error| anyhow!("Invalid gws Gmail list response: {}", error))?;
+    Ok(parsed
+        .messages
+        .unwrap_or_default()
+        .into_iter()
+        .map(|message| message.id)
+        .collect())
+}
 
-    let access_token = ensure_access_token(config_dir).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+async fn fetch_message_metadata_via_gws(
+    config_dir: &Path,
+    msg_id: &str,
+) -> Result<Option<GmailFullMessage>> {
+    let argv = vec![
+        "gmail".to_string(),
+        "users".to_string(),
+        "messages".to_string(),
+        "get".to_string(),
+        "--params".to_string(),
+        serde_json::json!({
+            "userId": "me",
+            "id": msg_id,
+            "format": "metadata",
+            "metadataHeaders": ["Subject", "From", "Date"]
+        })
+        .to_string(),
+    ];
+    let data =
+        crate::actions::google_workspace::gws_json_command(config_dir, &argv, &["gmail"]).await?;
+    let parsed: GmailFullMessage = serde_json::from_value(data)
+        .map_err(|error| anyhow!("Invalid gws Gmail metadata response: {}", error))?;
+    Ok(Some(parsed))
+}
 
-    let has_specific_query = args.query.is_some() || !args.labels.is_empty();
-
-    // Collect unique message IDs
+async fn gmail_scan_via_gws(config_dir: &Path, args: &GmailScanArgs) -> Result<String> {
+    let normalized_query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effective_mode = effective_scan_mode(args);
     let mut seen = std::collections::HashSet::new();
     let mut ordered_ids: Vec<String> = Vec::new();
 
-    if has_specific_query {
-        // User/LLM provided a specific query — honour it directly
-        let labels = if args.labels.is_empty() {
-            vec!["INBOX".to_string()]
-        } else {
-            args.labels.clone()
-        };
-        let ids = fetch_message_ids(
-            &client,
-            &access_token,
-            args.query.as_deref(),
-            &labels,
-            args.max_results.unwrap_or(20),
-        )
-        .await?;
-        for id in ids {
-            if seen.insert(id.clone()) {
-                ordered_ids.push(id);
-            }
-        }
-    } else {
-        // No specific query — smart multi-query strategy:
-        // 1. Important + unread (Gmail's own ML importance)
-        // 2. Unread in primary category (real mail, not promos)
-        // 3. Recent unread (catch-all for last 3 days)
-        // 4. Starred (user-flagged)
-        // Run all in parallel, deduplicate.
-        let inbox = vec!["INBOX".to_string()];
-
-        let (important, primary, recent, starred) = tokio::join!(
-            fetch_message_ids(
-                &client,
-                &access_token,
-                Some("is:unread is:important"),
-                &inbox,
-                15
-            ),
-            fetch_message_ids(
-                &client,
-                &access_token,
-                Some("is:unread category:primary"),
-                &inbox,
-                15
-            ),
-            fetch_message_ids(
-                &client,
-                &access_token,
-                Some("is:unread newer_than:3d"),
-                &inbox,
-                20
-            ),
-            fetch_message_ids(
-                &client,
-                &access_token,
-                Some("is:starred newer_than:7d"),
-                &inbox,
-                5
-            ),
-        );
-
-        // Merge in priority order — important first, then primary, then recent, then starred
-        for batch in [important, primary, recent, starred] {
-            for id in batch.unwrap_or_default() {
+    match effective_mode {
+        GmailScanMode::Search => {
+            let labels = if args.labels.is_empty() {
+                vec!["INBOX".to_string()]
+            } else {
+                args.labels.clone()
+            };
+            let ids = fetch_message_ids_via_gws(
+                config_dir,
+                normalized_query,
+                &labels,
+                args.max_results.unwrap_or(20),
+            )
+            .await?;
+            for id in ids {
                 if seen.insert(id.clone()) {
                     ordered_ids.push(id);
+                }
+            }
+        }
+        GmailScanMode::Recent => {
+            let labels = if args.labels.is_empty() {
+                vec!["INBOX".to_string()]
+            } else {
+                args.labels.clone()
+            };
+            let ids = fetch_message_ids_via_gws(
+                config_dir,
+                None,
+                &labels,
+                args.max_results.unwrap_or(10),
+            )
+            .await?;
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    ordered_ids.push(id);
+                }
+            }
+        }
+        GmailScanMode::Triage | GmailScanMode::Auto => {
+            let inbox = vec!["INBOX".to_string()];
+            let (important, primary, recent, starred) = tokio::join!(
+                fetch_message_ids_via_gws(config_dir, Some("is:unread is:important"), &inbox, 15),
+                fetch_message_ids_via_gws(
+                    config_dir,
+                    Some("is:unread category:primary"),
+                    &inbox,
+                    15
+                ),
+                fetch_message_ids_via_gws(config_dir, Some("is:unread newer_than:3d"), &inbox, 20),
+                fetch_message_ids_via_gws(config_dir, Some("is:starred newer_than:7d"), &inbox, 5),
+            );
+            for batch in [important, primary, recent, starred] {
+                for id in batch.unwrap_or_default() {
+                    if seen.insert(id.clone()) {
+                        ordered_ids.push(id);
+                    }
                 }
             }
         }
@@ -351,26 +468,158 @@ pub async fn gmail_scan(config_dir: &Path, args: &serde_json::Value) -> Result<S
         return Ok("No messages found.".to_string());
     }
 
-    // Fetch metadata for all messages in parallel
+    let metadata_futures: Vec<_> = ordered_ids
+        .iter()
+        .map(|id| fetch_message_metadata_via_gws(config_dir, id))
+        .collect();
+    let metadata_results = futures::future::join_all(metadata_futures).await;
+    let summaries = metadata_results
+        .into_iter()
+        .filter_map(Result::ok)
+        .flatten()
+        .map(render_message_summary)
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        Ok("No messages found.".to_string())
+    } else {
+        Ok(summaries.join("\n\n"))
+    }
+}
+
+pub async fn gmail_scan(config_dir: &Path, args: &serde_json::Value) -> Result<String> {
+    let args: GmailScanArgs = serde_json::from_value(args.clone())
+        .map_err(|e| anyhow!("Invalid Gmail scan args: {}", e))?;
+    if crate::actions::google_workspace::gws_backend_available().await {
+        match gmail_scan_via_gws(config_dir, &args).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                tracing::warn!(
+                    "gmail_scan gws path failed, falling back to direct Gmail API: {}",
+                    error
+                );
+            }
+        }
+    }
+    let normalized_query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effective_mode = effective_scan_mode(&args);
+
+    let access_token = ensure_access_token(config_dir).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::new();
+
+    match effective_mode {
+        GmailScanMode::Search => {
+            let labels = if args.labels.is_empty() {
+                vec!["INBOX".to_string()]
+            } else {
+                args.labels.clone()
+            };
+            let ids = fetch_message_ids(
+                &client,
+                &access_token,
+                normalized_query,
+                &labels,
+                args.max_results.unwrap_or(20),
+            )
+            .await?;
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    ordered_ids.push(id);
+                }
+            }
+        }
+        GmailScanMode::Recent => {
+            let labels = if args.labels.is_empty() {
+                vec!["INBOX".to_string()]
+            } else {
+                args.labels.clone()
+            };
+            let ids = fetch_message_ids(
+                &client,
+                &access_token,
+                None,
+                &labels,
+                args.max_results.unwrap_or(10),
+            )
+            .await?;
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    ordered_ids.push(id);
+                }
+            }
+        }
+        GmailScanMode::Triage | GmailScanMode::Auto => {
+            let inbox = vec!["INBOX".to_string()];
+            let (important, primary, recent, starred) = tokio::join!(
+                fetch_message_ids(
+                    &client,
+                    &access_token,
+                    Some("is:unread is:important"),
+                    &inbox,
+                    15
+                ),
+                fetch_message_ids(
+                    &client,
+                    &access_token,
+                    Some("is:unread category:primary"),
+                    &inbox,
+                    15
+                ),
+                fetch_message_ids(
+                    &client,
+                    &access_token,
+                    Some("is:unread newer_than:3d"),
+                    &inbox,
+                    20
+                ),
+                fetch_message_ids(
+                    &client,
+                    &access_token,
+                    Some("is:starred newer_than:7d"),
+                    &inbox,
+                    5
+                ),
+            );
+
+            for batch in [important, primary, recent, starred] {
+                for id in batch.unwrap_or_default() {
+                    if seen.insert(id.clone()) {
+                        ordered_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    if ordered_ids.is_empty() {
+        return Ok("No messages found.".to_string());
+    }
+
     let metadata_futures: Vec<_> = ordered_ids
         .iter()
         .map(|id| fetch_message_metadata(&client, &access_token, id))
         .collect();
     let metadata_results = futures::future::join_all(metadata_futures).await;
 
-    let mut summaries = Vec::new();
-    for meta in metadata_results.into_iter().flatten() {
-        let subject = header_value(&meta.payload.headers, "Subject");
-        let from = header_value(&meta.payload.headers, "From");
-        let date = header_value(&meta.payload.headers, "Date");
-        let labels = meta.label_ids.join(", ");
-        summaries.push(format!(
-            "- From: {}\n  Subject: {}\n  Date: {}\n  Labels: {}\n  Id: {}",
-            from, subject, date, labels, meta.id
-        ));
-    }
+    let summaries = metadata_results
+        .into_iter()
+        .flatten()
+        .map(render_message_summary)
+        .collect::<Vec<_>>();
 
-    Ok(summaries.join("\n\n"))
+    if summaries.is_empty() {
+        Ok("No messages found.".to_string())
+    } else {
+        Ok(summaries.join("\n\n"))
+    }
 }
 
 pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<String> {
@@ -395,6 +644,30 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
         body["threadId"] = serde_json::Value::String(thread_id.clone());
     }
 
+    if crate::actions::google_workspace::gws_backend_available().await {
+        let argv = vec![
+            "gmail".to_string(),
+            "users".to_string(),
+            "messages".to_string(),
+            "send".to_string(),
+            "--params".to_string(),
+            serde_json::json!({ "userId": "me" }).to_string(),
+            "--json".to_string(),
+            body.to_string(),
+        ];
+        match crate::actions::google_workspace::gws_text_command(config_dir, &argv, &["gmail"])
+            .await
+        {
+            Ok(_) => return Ok("Reply sent successfully.".to_string()),
+            Err(error) => {
+                tracing::warn!(
+                    "gmail_reply gws path failed, falling back to direct Gmail API: {}",
+                    error
+                );
+            }
+        }
+    }
+
     let resp = client
         .post(format!("{}/users/me/messages/send", GMAIL_API_BASE))
         .bearer_auth(&access_token)
@@ -407,4 +680,50 @@ pub async fn gmail_reply(config_dir: &Path, args: &serde_json::Value) -> Result<
     }
 
     Ok("Reply sent successfully.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_scan_mode, GmailScanArgs, GmailScanMode};
+
+    #[test]
+    fn gmail_scan_auto_mode_uses_recent_when_only_max_results_is_set() {
+        let args = GmailScanArgs {
+            mode: GmailScanMode::Auto,
+            query: None,
+            labels: Vec::new(),
+            max_results: Some(5),
+        };
+        assert_eq!(effective_scan_mode(&args), GmailScanMode::Recent);
+    }
+
+    #[test]
+    fn gmail_scan_auto_mode_uses_search_when_query_or_labels_are_present() {
+        let with_query = GmailScanArgs {
+            mode: GmailScanMode::Auto,
+            query: Some("from:alice@example.com".to_string()),
+            labels: Vec::new(),
+            max_results: Some(5),
+        };
+        assert_eq!(effective_scan_mode(&with_query), GmailScanMode::Search);
+
+        let with_labels = GmailScanArgs {
+            mode: GmailScanMode::Auto,
+            query: None,
+            labels: vec!["STARRED".to_string()],
+            max_results: None,
+        };
+        assert_eq!(effective_scan_mode(&with_labels), GmailScanMode::Search);
+    }
+
+    #[test]
+    fn gmail_scan_auto_mode_defaults_to_triage_without_filters() {
+        let args = GmailScanArgs {
+            mode: GmailScanMode::Auto,
+            query: None,
+            labels: Vec::new(),
+            max_results: None,
+        };
+        assert_eq!(effective_scan_mode(&args), GmailScanMode::Triage);
+    }
 }

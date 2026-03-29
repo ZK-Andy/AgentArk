@@ -7,6 +7,12 @@ use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
 
+// OpenRouter enforces request affordability against the declared output budget.
+// Cap only that provider by default so other OpenAI-compatible backends remain
+// free to use their own native limits.
+// No artificial output cap — let the model use its full native output limit.
+// Previously set to 1024, which truncated app_deploy payloads mid-JSON.
+
 /// Supported LLM providers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
@@ -24,6 +30,78 @@ pub enum LlmProvider {
         base_url: String,
         model: String,
     },
+}
+
+/// Attempt to repair truncated JSON by closing unclosed braces, brackets, and strings.
+/// Returns `Some(Value)` if repair produces valid JSON, `None` otherwise.
+fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Only attempt repair on object-like or array-like starts.
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+
+    // Walk through the string tracking open delimiters and string state.
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for ch in trimmed.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last() == Some(&ch) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Nothing to close — original should have parsed fine.
+    if stack.is_empty() && !in_string {
+        return None;
+    }
+
+    let mut repaired = trimmed.to_string();
+
+    // Close open string if needed.
+    if in_string {
+        repaired.push('"');
+    }
+
+    // Trim any trailing comma or colon (incomplete key-value).
+    let end = repaired.trim_end();
+    if end.ends_with(',') || end.ends_with(':') {
+        repaired = end.trim_end_matches([',', ':']).to_string();
+    }
+
+    // Close remaining open delimiters in reverse order.
+    for closer in stack.into_iter().rev() {
+        repaired.push(closer);
+    }
+
+    serde_json::from_str(&repaired).ok()
 }
 
 fn is_codex_cli_base_url(base_url: Option<&str>) -> bool {
@@ -929,7 +1007,8 @@ impl LlmClient {
         #[derive(Serialize)]
         struct AnthropicRequest {
             model: String,
-            max_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
             system: String,
             messages: Vec<AnthropicMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1004,7 +1083,7 @@ impl LlmClient {
 
         let request = AnthropicRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: None,
             system: system_prompt.to_string(),
             messages,
             tools,
@@ -1088,6 +1167,8 @@ impl LlmClient {
         #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
             messages: Vec<OpenAIMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
@@ -1204,15 +1285,15 @@ impl LlmClient {
             content: user_message.to_string(),
         });
 
-        let request = OpenAIRequest {
-            model: model.to_string(),
-            messages,
-            tools,
-        };
-
         let url = effective_openai_base_url(base_url);
         let endpoint = format!("{}/chat/completions", url);
         let is_openrouter = url.contains("openrouter");
+        let request = OpenAIRequest {
+            model: model.to_string(),
+            max_tokens: None,
+            messages,
+            tools,
+        };
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..MAX_RETRY_ATTEMPTS {
@@ -1803,6 +1884,8 @@ impl LlmClient {
         #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
             messages: Vec<OpenAIMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
@@ -1929,6 +2012,7 @@ impl LlmClient {
 
         let request = OpenAIRequest {
             model: model.to_string(),
+            max_tokens: None,
             messages,
             tools,
             stream: true,
@@ -2218,8 +2302,21 @@ impl LlmClient {
                 let args = if tb.args.trim().is_empty() {
                     serde_json::Value::Null
                 } else {
-                    serde_json::from_str(&tb.args)
-                        .unwrap_or_else(|_| serde_json::Value::String(tb.args.clone()))
+                    serde_json::from_str(&tb.args).unwrap_or_else(|_| {
+                        // The model may have truncated its JSON output (hit token limit).
+                        // Try to repair by closing open braces/brackets.
+                        if let Some(repaired) = repair_truncated_json(&tb.args) {
+                            tracing::info!(
+                                "Repaired truncated tool arguments for '{}' ({}→{} chars)",
+                                tb.name,
+                                tb.args.len(),
+                                repaired.to_string().len()
+                            );
+                            repaired
+                        } else {
+                            serde_json::Value::String(tb.args.clone())
+                        }
+                    })
                 };
                 (
                     idx,
@@ -2279,7 +2376,8 @@ impl LlmClient {
         #[derive(Serialize)]
         struct AnthropicRequest {
             model: String,
-            max_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
             system: String,
             messages: Vec<AnthropicMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2375,7 +2473,7 @@ impl LlmClient {
 
         let request = AnthropicRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: None,
             system: system_prompt.to_string(),
             messages,
             tools,

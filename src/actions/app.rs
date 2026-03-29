@@ -9,7 +9,7 @@
 //! reverse-proxies /apps/{id}/* to that port.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -28,6 +28,12 @@ const MAX_APP_COMMAND_LEN: usize = 1024;
 const LOCAL_RUNTIME_STDOUT_LOG_FILE: &str = ".agentark_runtime_stdout.log";
 const LOCAL_RUNTIME_STDERR_LOG_FILE: &str = ".agentark_runtime_stderr.log";
 const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
+const MAX_REPO_CLONE_TIMEOUT_SECS: u64 = 240;
+const MAX_REPO_COMMAND_COUNT: usize = 120;
+const MAX_REPO_TEXT_FILE_BYTES: usize = 512 * 1024;
+const MAX_REPO_TOTAL_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REPO_TEXT_FILES: usize = 600;
+const MAX_README_BYTES: usize = 256 * 1024;
 
 fn default_runtime_image() -> String {
     std::env::var("AGENTARK_APP_IMAGE")
@@ -35,6 +41,1326 @@ fn default_runtime_image() -> String {
         .unwrap_or_else(|_| DEFAULT_APP_RUNTIME_IMAGE.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoServiceMode {
+    Auto,
+    Frontend,
+    Backend,
+    Fullstack,
+}
+
+fn repo_service_mode_from_opt(raw: Option<&str>) -> RepoServiceMode {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "frontend" | "front-end" | "ui" | "web" => RepoServiceMode::Frontend,
+        "backend" | "back-end" | "api" | "server" => RepoServiceMode::Backend,
+        "fullstack" | "full-stack" | "all" => RepoServiceMode::Fullstack,
+        _ => RepoServiceMode::Auto,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoServiceKind {
+    Frontend,
+    Backend,
+    Fullstack,
+    Static,
+}
+
+impl RepoServiceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RepoServiceKind::Frontend => "frontend",
+            RepoServiceKind::Backend => "backend",
+            RepoServiceKind::Fullstack => "fullstack",
+            RepoServiceKind::Static => "static",
+        }
+    }
+
+    fn matches_mode(self, mode: RepoServiceMode) -> bool {
+        match mode {
+            RepoServiceMode::Auto | RepoServiceMode::Fullstack => true,
+            RepoServiceMode::Frontend => {
+                matches!(
+                    self,
+                    RepoServiceKind::Frontend
+                        | RepoServiceKind::Fullstack
+                        | RepoServiceKind::Static
+                )
+            }
+            RepoServiceMode::Backend => {
+                matches!(self, RepoServiceKind::Backend | RepoServiceKind::Fullstack)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoCopyScope {
+    RepositoryRoot,
+    ServiceRoot,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RepoReadmeHints {
+    install_command: Option<String>,
+    start_command: Option<String>,
+    mentions_compose: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RepoNodeManifest {
+    name: Option<String>,
+    scripts: HashSet<String>,
+    dependencies: HashSet<String>,
+    has_workspaces: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RepoServicePlan {
+    title: String,
+    relative_dir: String,
+    kind: RepoServiceKind,
+    copy_scope: RepoCopyScope,
+    install_command: Option<String>,
+    entry_command: Option<String>,
+    required_inputs: Vec<AppRequiredInput>,
+    detection_reason: String,
+}
+
+fn normalize_repo_relative_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let trimmed = raw.trim_matches('/');
+    trimmed
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn humanize_repo_label(raw: &str) -> String {
+    let mut parts = Vec::new();
+    for token in raw
+        .split(|ch: char| !(ch.is_ascii_alphanumeric()))
+        .filter(|token| !token.is_empty())
+    {
+        let mut chars = token.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let mut rebuilt = String::new();
+        rebuilt.push(first.to_ascii_uppercase());
+        rebuilt.push_str(&chars.as_str().to_ascii_lowercase());
+        parts.push(rebuilt);
+    }
+    if parts.is_empty() {
+        "Repo".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn repo_title_from_url(repo_url: &str) -> String {
+    let fallback = humanize_repo_label(
+        repo_url
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .trim_end_matches(".git"),
+    );
+    let Ok(parsed) = reqwest::Url::parse(repo_url) else {
+        return fallback;
+    };
+    parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .map(|segment| humanize_repo_label(segment.trim_end_matches(".git")))
+        .unwrap_or(fallback)
+}
+
+fn build_repo_service_title(repo_title: &str, relative_dir: &str, kind: RepoServiceKind) -> String {
+    if relative_dir.trim().is_empty() {
+        return repo_title.to_string();
+    }
+    let segment = relative_dir
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(relative_dir);
+    let label = humanize_repo_label(segment);
+    if label.eq_ignore_ascii_case(kind.as_str()) {
+        format!("{} {}", repo_title, label)
+    } else {
+        format!(
+            "{} {} {}",
+            repo_title,
+            label,
+            humanize_repo_label(kind.as_str())
+        )
+    }
+}
+
+fn repo_dir_name_hint(relative_dir: &str) -> Option<RepoServiceKind> {
+    let lower = relative_dir.to_ascii_lowercase();
+    let segment = lower
+        .rsplit('/')
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(lower.as_str());
+    if [
+        "frontend",
+        "front",
+        "client",
+        "web",
+        "ui",
+        "site",
+        "app",
+        "dashboard",
+    ]
+    .iter()
+    .any(|needle| segment.contains(needle))
+    {
+        return Some(RepoServiceKind::Frontend);
+    }
+    if ["backend", "back", "api", "server", "svc", "service"]
+        .iter()
+        .any(|needle| segment.contains(needle))
+    {
+        return Some(RepoServiceKind::Backend);
+    }
+    None
+}
+
+fn is_allowed_repo_url(repo_url: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(repo_url)
+        .with_context(|| format!("invalid repo_url '{}'", repo_url))?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        other => anyhow::bail!("unsupported repo_url scheme '{}': use http/https", other),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("repo_url must include a host"))?;
+    let lower_host = host.trim().to_ascii_lowercase();
+    if lower_host == "localhost" || lower_host.ends_with(".local") {
+        anyhow::bail!("repo_url must not target localhost or .local hosts");
+    }
+    if let Ok(ip) = lower_host.parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local()
+            }
+        };
+        if blocked {
+            anyhow::bail!("repo_url must not target a private or loopback address");
+        }
+    }
+    Ok(parsed)
+}
+
+fn should_skip_repo_dir(entry: &walkdir::DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        ".git"
+            | "node_modules"
+            | ".next"
+            | ".nuxt"
+            | ".turbo"
+            | "dist"
+            | "build"
+            | "coverage"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | "target"
+            | ".idea"
+            | ".vscode"
+    )
+}
+
+fn read_text_file_limited(path: &Path, max_bytes: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn discover_readme_path(dir: &Path) -> Option<PathBuf> {
+    for candidate in [
+        "README.md",
+        "README.MD",
+        "README.txt",
+        "README",
+        "readme.md",
+        "readme.txt",
+        "readme",
+    ] {
+        let path = dir.join(candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn normalize_readme_command_line(line: &str) -> Option<String> {
+    let mut trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("<!--")
+    {
+        return None;
+    }
+    if let Some(stripped) = trimmed.strip_prefix("$ ") {
+        trimmed = stripped.trim();
+    }
+    if let Some(stripped) = trimmed.strip_prefix("- ") {
+        trimmed = stripped.trim();
+    }
+    if let Some(stripped) = trimmed.strip_prefix("* ") {
+        trimmed = stripped.trim();
+    }
+    let trimmed = trimmed.trim_matches('`').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn extract_readme_hints(readme: &str) -> RepoReadmeHints {
+    let mut hints = RepoReadmeHints::default();
+    for line in readme.lines() {
+        let Some(command) = normalize_readme_command_line(line) else {
+            continue;
+        };
+        let lower = command.to_ascii_lowercase();
+        if lower.contains("docker compose") || lower.contains("docker-compose") {
+            hints.mentions_compose = true;
+        }
+        if hints.install_command.is_none()
+            && [
+                "npm install",
+                "npm ci",
+                "pnpm install",
+                "yarn install",
+                "pip install",
+                "poetry install",
+                "uv sync",
+                "cargo build",
+            ]
+            .iter()
+            .any(|needle| lower.starts_with(needle))
+        {
+            hints.install_command = Some(command.clone());
+        }
+        if hints.start_command.is_none()
+            && [
+                "npm run dev",
+                "npm run start",
+                "pnpm dev",
+                "pnpm start",
+                "yarn dev",
+                "yarn start",
+                "uvicorn ",
+                "python ",
+                "streamlit run",
+                "flask run",
+                "cargo run",
+                "docker compose up",
+                "docker-compose up",
+            ]
+            .iter()
+            .any(|needle| lower.starts_with(needle))
+        {
+            hints.start_command = Some(command);
+        }
+    }
+    hints
+}
+
+fn load_readme_hints(dir: &Path) -> Option<(String, RepoReadmeHints)> {
+    let path = discover_readme_path(dir)?;
+    let content = read_text_file_limited(&path, MAX_README_BYTES)?;
+    let relative = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "README".to_string());
+    Some((relative, extract_readme_hints(&content)))
+}
+
+fn load_node_manifest(dir: &Path) -> Option<RepoNodeManifest> {
+    let raw = read_text_file_limited(&dir.join("package.json"), MAX_REPO_TEXT_FILE_BYTES)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mut manifest = RepoNodeManifest {
+        name: parsed
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ..RepoNodeManifest::default()
+    };
+    if parsed.get("workspaces").is_some() {
+        manifest.has_workspaces = true;
+    }
+    for key in [
+        "scripts",
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(obj) = parsed.get(key).and_then(|value| value.as_object()) {
+            if key == "scripts" {
+                manifest.scripts.extend(obj.keys().cloned());
+            } else {
+                manifest.dependencies.extend(
+                    obj.keys()
+                        .map(|value| value.to_ascii_lowercase())
+                        .collect::<HashSet<_>>(),
+                );
+            }
+        }
+    }
+    Some(manifest)
+}
+
+fn load_python_dependency_text(dir: &Path) -> String {
+    let mut combined = String::new();
+    for candidate in ["requirements.txt", "pyproject.toml"] {
+        let path = dir.join(candidate);
+        if let Some(text) = read_text_file_limited(&path, MAX_REPO_TEXT_FILE_BYTES) {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&text);
+        }
+    }
+    combined
+}
+
+fn first_existing_file(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+}
+
+fn build_relative_file_arg(relative_dir: &str, filename: &str) -> String {
+    if relative_dir.trim().is_empty() {
+        filename.to_string()
+    } else {
+        format!("{}/{}", relative_dir.trim_end_matches('/'), filename)
+    }
+}
+
+fn detect_fastapi_entry(dir: &Path) -> Option<PathBuf> {
+    for candidate in ["main.py", "app.py", "server.py", "api.py"] {
+        let path = dir.join(candidate);
+        let Some(text) = read_text_file_limited(&path, MAX_REPO_TEXT_FILE_BYTES) else {
+            continue;
+        };
+        if text.contains("FastAPI(") || text.contains("from fastapi import") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn detect_flask_entry(dir: &Path) -> Option<PathBuf> {
+    for candidate in ["app.py", "main.py", "server.py", "wsgi.py"] {
+        let path = dir.join(candidate);
+        let Some(text) = read_text_file_limited(&path, MAX_REPO_TEXT_FILE_BYTES) else {
+            continue;
+        };
+        if text.contains("Flask(") || text.contains("from flask import") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn build_python_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    let dependency_text = load_python_dependency_text(dir).to_ascii_lowercase();
+    let requirements_path = dir.join("requirements.txt");
+    let pyproject_path = dir.join("pyproject.toml");
+    let install_command = if requirements_path.exists() {
+        Some(format!(
+            "pip install -r {} -q",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, "requirements.txt"))
+        ))
+    } else if pyproject_path.exists() {
+        Some(if relative_dir.trim().is_empty() {
+            "pip install -e .".to_string()
+        } else {
+            format!("pip install -e {}", shell_quote_arg(relative_dir))
+        })
+    } else {
+        None
+    };
+
+    if dir.join("manage.py").exists() {
+        return Some((
+            RepoServiceKind::Backend,
+            install_command,
+            format!(
+                "python {} runserver 0.0.0.0:{{PORT}}",
+                shell_quote_arg(&build_relative_file_arg(relative_dir, "manage.py"))
+            ),
+        ));
+    }
+
+    if dependency_text.contains("streamlit") {
+        if let Some(entry) = first_existing_file(dir, &["app.py", "main.py", "streamlit_app.py"]) {
+            let rel = normalize_repo_relative_path(entry.strip_prefix(dir).ok().unwrap_or(&entry));
+            return Some((
+                RepoServiceKind::Fullstack,
+                install_command,
+                format!(
+                    "streamlit run {} --server.address 0.0.0.0 --server.port {{PORT}}",
+                    shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+                ),
+            ));
+        }
+    }
+
+    if let Some(entry) = detect_fastapi_entry(dir) {
+        let rel_dir = entry.parent().unwrap_or(dir);
+        let app_dir = if rel_dir == dir {
+            relative_dir.to_string()
+        } else {
+            let nested =
+                normalize_repo_relative_path(rel_dir.strip_prefix(dir).ok().unwrap_or(rel_dir));
+            if relative_dir.trim().is_empty() {
+                nested
+            } else if nested.is_empty() {
+                relative_dir.to_string()
+            } else {
+                format!("{}/{}", relative_dir.trim_end_matches('/'), nested)
+            }
+        };
+        let module = entry
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app");
+        let app_dir_arg = if app_dir.trim().is_empty() {
+            ".".to_string()
+        } else {
+            app_dir
+        };
+        return Some((
+            RepoServiceKind::Backend,
+            install_command,
+            format!(
+                "uvicorn --app-dir {} {}:app --host 0.0.0.0 --port {{PORT}}",
+                shell_quote_arg(&app_dir_arg),
+                module
+            ),
+        ));
+    }
+
+    if let Some(entry) = detect_flask_entry(dir) {
+        let rel = normalize_repo_relative_path(entry.strip_prefix(dir).ok().unwrap_or(&entry));
+        return Some((
+            RepoServiceKind::Backend,
+            install_command,
+            format!(
+                "flask --app {} run --host 0.0.0.0 --port {{PORT}}",
+                shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+            ),
+        ));
+    }
+
+    if dependency_text.contains("gradio") {
+        if let Some(entry) = first_existing_file(dir, &["app.py", "main.py"]) {
+            let rel = normalize_repo_relative_path(entry.strip_prefix(dir).ok().unwrap_or(&entry));
+            return Some((
+                RepoServiceKind::Fullstack,
+                install_command,
+                format!(
+                    "python {}",
+                    shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+                ),
+            ));
+        }
+    }
+
+    if let Some(entry) = first_existing_file(dir, &["server.py", "app.py", "main.py", "run.py"]) {
+        let rel = normalize_repo_relative_path(entry.strip_prefix(dir).ok().unwrap_or(&entry));
+        return Some((
+            repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+            install_command,
+            format!(
+                "python {}",
+                shell_quote_arg(&build_relative_file_arg(relative_dir, &rel))
+            ),
+        ));
+    }
+
+    None
+}
+
+fn classify_node_service_kind(manifest: &RepoNodeManifest, relative_dir: &str) -> RepoServiceKind {
+    let deps = &manifest.dependencies;
+    let has_frontend_framework = deps.iter().any(|dep| {
+        matches!(
+            dep.as_str(),
+            "react"
+                | "react-dom"
+                | "vite"
+                | "next"
+                | "vue"
+                | "nuxt"
+                | "svelte"
+                | "@sveltejs/kit"
+                | "astro"
+                | "gatsby"
+                | "@angular/core"
+                | "remix"
+        )
+    });
+    let has_backend_framework = deps.iter().any(|dep| {
+        matches!(
+            dep.as_str(),
+            "express" | "koa" | "fastify" | "hapi" | "@nestjs/core" | "@nestjs/common" | "restify"
+        )
+    });
+    if deps.contains("next")
+        || deps.contains("nuxt")
+        || deps.contains("@sveltejs/kit")
+        || deps.contains("remix")
+    {
+        return RepoServiceKind::Fullstack;
+    }
+    if has_frontend_framework && has_backend_framework {
+        return RepoServiceKind::Fullstack;
+    }
+    if has_frontend_framework {
+        return RepoServiceKind::Frontend;
+    }
+    if has_backend_framework {
+        return RepoServiceKind::Backend;
+    }
+    repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend)
+}
+
+fn build_node_run_command(
+    manifest: &RepoNodeManifest,
+    relative_dir: &str,
+    script: &str,
+    extra_args: &[&str],
+    root_has_workspaces: bool,
+) -> String {
+    let workspace_name = manifest.name.as_deref().filter(|_| root_has_workspaces);
+    let mut command = if let Some(name) = workspace_name {
+        format!("npm run {} --workspace={}", script, shell_quote_arg(name))
+    } else if relative_dir.trim().is_empty() {
+        format!("npm run {}", script)
+    } else {
+        format!(
+            "npm --prefix {} run {}",
+            shell_quote_arg(relative_dir),
+            script
+        )
+    };
+    if !extra_args.is_empty() {
+        command.push_str(" -- ");
+        command.push_str(&extra_args.join(" "));
+    }
+    command
+}
+
+fn build_node_commands(
+    dir: &Path,
+    relative_dir: &str,
+    manifest: &RepoNodeManifest,
+    root_has_workspaces: bool,
+) -> Option<(RepoServiceKind, String, String)> {
+    let kind = classify_node_service_kind(manifest, relative_dir);
+    let install_command = if relative_dir.trim().is_empty() || root_has_workspaces {
+        "npm install --omit=dev".to_string()
+    } else {
+        format!(
+            "npm --prefix {} install --omit=dev",
+            shell_quote_arg(relative_dir)
+        )
+    };
+
+    let frontend_args = if manifest.dependencies.contains("next") {
+        vec!["--hostname", "0.0.0.0", "--port", "{PORT}"]
+    } else {
+        vec!["--host", "0.0.0.0", "--port", "{PORT}"]
+    };
+
+    let entry_command = if manifest.scripts.contains("preview")
+        && matches!(kind, RepoServiceKind::Frontend | RepoServiceKind::Fullstack)
+    {
+        build_node_run_command(
+            manifest,
+            relative_dir,
+            "preview",
+            &frontend_args,
+            root_has_workspaces,
+        )
+    } else if manifest.scripts.contains("start") {
+        if manifest.dependencies.contains("next") {
+            build_node_run_command(
+                manifest,
+                relative_dir,
+                "start",
+                &["--hostname", "0.0.0.0", "--port", "{PORT}"],
+                root_has_workspaces,
+            )
+        } else {
+            build_node_run_command(manifest, relative_dir, "start", &[], root_has_workspaces)
+        }
+    } else if manifest.scripts.contains("dev") {
+        if matches!(kind, RepoServiceKind::Frontend | RepoServiceKind::Fullstack) {
+            build_node_run_command(
+                manifest,
+                relative_dir,
+                "dev",
+                &frontend_args,
+                root_has_workspaces,
+            )
+        } else {
+            build_node_run_command(manifest, relative_dir, "dev", &[], root_has_workspaces)
+        }
+    } else if dir.join("server.js").exists() {
+        let path = build_relative_file_arg(relative_dir, "server.js");
+        format!("node {}", shell_quote_arg(&path))
+    } else if dir.join("app.js").exists() {
+        let path = build_relative_file_arg(relative_dir, "app.js");
+        format!("node {}", shell_quote_arg(&path))
+    } else if dir.join("index.js").exists() && matches!(kind, RepoServiceKind::Backend) {
+        let path = build_relative_file_arg(relative_dir, "index.js");
+        format!("node {}", shell_quote_arg(&path))
+    } else {
+        return None;
+    };
+
+    Some((kind, install_command, entry_command))
+}
+
+fn collect_env_example_inputs(scope_root: &Path) -> Vec<AppRequiredInput> {
+    let mut out = Vec::new();
+    for candidate in [
+        ".env.example",
+        ".env.sample",
+        ".env.template",
+        ".env.local.example",
+        ".env.development.example",
+    ] {
+        let path = scope_root.join(candidate);
+        let Some(text) = read_text_file_limited(&path, MAX_REPO_TEXT_FILE_BYTES) else {
+            continue;
+        };
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((key, _)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let normalized = key.trim();
+            if normalized.is_empty()
+                || !normalized
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+            {
+                continue;
+            }
+            let sensitive = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASS", "PRIVATE"]
+                .iter()
+                .any(|needle| normalized.contains(needle));
+            push_required_input(&mut out, normalized, sensitive);
+        }
+    }
+    out
+}
+
+fn discover_repo_candidate_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .min_depth(0)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(should_skip_repo_dir);
+    for entry in walker.flatten() {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let is_candidate = dir.join("package.json").exists()
+            || dir.join("requirements.txt").exists()
+            || dir.join("pyproject.toml").exists()
+            || dir.join("manage.py").exists()
+            || dir.join("index.html").exists();
+        if is_candidate {
+            candidates.push(dir.to_path_buf());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn plan_repo_services(
+    repo_root: &Path,
+    repo_title: &str,
+    service_mode: RepoServiceMode,
+) -> Result<Vec<RepoServicePlan>> {
+    let root_manifest = load_node_manifest(repo_root);
+    let root_has_workspaces = root_manifest
+        .as_ref()
+        .map(|manifest| manifest.has_workspaces)
+        .unwrap_or(false);
+    let root_readme_hints = load_readme_hints(repo_root);
+    let candidate_dirs = discover_repo_candidate_dirs(repo_root);
+    let has_child_package = candidate_dirs
+        .iter()
+        .any(|candidate| candidate != repo_root && candidate.join("package.json").exists());
+    let mut plans = Vec::new();
+
+    for dir in candidate_dirs {
+        let relative_dir =
+            normalize_repo_relative_path(dir.strip_prefix(repo_root).unwrap_or(&dir));
+        if root_has_workspaces && relative_dir.is_empty() && has_child_package {
+            continue;
+        }
+
+        let local_readme = load_readme_hints(&dir)
+            .map(|(_, hints)| hints)
+            .unwrap_or_default();
+        let _readme_hints = if local_readme.install_command.is_some()
+            || local_readme.start_command.is_some()
+            || local_readme.mentions_compose
+        {
+            local_readme
+        } else {
+            root_readme_hints
+                .as_ref()
+                .map(|(_, hints)| hints.clone())
+                .unwrap_or_default()
+        };
+
+        let required_inputs = {
+            let mut inputs = collect_env_example_inputs(repo_root);
+            for input in collect_env_example_inputs(&dir) {
+                push_required_input(&mut inputs, &input.key, input.sensitive);
+            }
+            inputs
+        };
+
+        if let Some(manifest) = load_node_manifest(&dir) {
+            let Some((kind, install_command, entry_command)) =
+                build_node_commands(&dir, &relative_dir, &manifest, root_has_workspaces)
+            else {
+                continue;
+            };
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command: Some(install_command),
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "package.json scripts".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_python_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "python app manifest".to_string(),
+            });
+            continue;
+        }
+
+        if dir.join("index.html").exists() {
+            let kind = RepoServiceKind::Static;
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::ServiceRoot,
+                install_command: None,
+                entry_command: None,
+                required_inputs,
+                detection_reason: "static index.html".to_string(),
+            });
+        }
+    }
+
+    if plans.is_empty() {
+        if let Some((_, hints)) = root_readme_hints {
+            if hints.mentions_compose {
+                anyhow::bail!(
+                    "Repo README suggests docker compose, but managed compose lifecycles are not supported yet. Use a repo with a directly runnable app or split the services explicitly."
+                );
+            }
+            if service_mode == RepoServiceMode::Auto {
+                if let Some(start_command) = hints.start_command {
+                    plans.push(RepoServicePlan {
+                        title: repo_title.to_string(),
+                        relative_dir: String::new(),
+                        kind: RepoServiceKind::Fullstack,
+                        copy_scope: RepoCopyScope::RepositoryRoot,
+                        install_command: hints.install_command,
+                        entry_command: Some(start_command),
+                        required_inputs: collect_env_example_inputs(repo_root),
+                        detection_reason: "README install/run instructions".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    if plans.len() > MAX_REPO_COMMAND_COUNT {
+        anyhow::bail!(
+            "Repo analysis detected too many runnable services ({}). Narrow the repo with repo_subdir or service_mode.",
+            plans.len()
+        );
+    }
+    Ok(plans)
+}
+
+fn collect_repo_files(root: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut files = serde_json::Map::new();
+    let mut total_bytes = 0usize;
+    let mut total_files = 0usize;
+    let walker = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(should_skip_repo_dir);
+    for entry in walker.flatten() {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if metadata.len() == 0 || metadata.len() as usize > MAX_REPO_TEXT_FILE_BYTES {
+            continue;
+        }
+        let relative = normalize_repo_relative_path(path.strip_prefix(root).unwrap_or(path));
+        if relative.is_empty() {
+            continue;
+        }
+        let Some(content) = read_text_file_limited(path, MAX_REPO_TEXT_FILE_BYTES) else {
+            continue;
+        };
+        total_files += 1;
+        total_bytes += content.len();
+        if total_files > MAX_REPO_TEXT_FILES {
+            anyhow::bail!(
+                "Repo is too large to deploy safely (>{} text files). Narrow it with repo_subdir.",
+                MAX_REPO_TEXT_FILES
+            );
+        }
+        if total_bytes > MAX_REPO_TOTAL_TEXT_BYTES {
+            anyhow::bail!(
+                "Repo is too large to deploy safely (>{} bytes of text content). Narrow it with repo_subdir.",
+                MAX_REPO_TOTAL_TEXT_BYTES
+            );
+        }
+        files.insert(relative, serde_json::Value::String(content));
+    }
+    if files.is_empty() {
+        anyhow::bail!("Repo did not contain any deployable text files after filtering");
+    }
+    Ok(files)
+}
+
+async fn clone_repo(
+    repo_url: &str,
+    repo_ref: Option<&str>,
+    target_dir: &Path,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Result<()> {
+    let mut clone_args = vec!["git".to_string(), "clone".to_string()];
+    if repo_ref.is_none() {
+        clone_args.push("--depth".to_string());
+        clone_args.push("1".to_string());
+    }
+    clone_args.push(repo_url.to_string());
+    clone_args.push(target_dir.to_string_lossy().to_string());
+
+    emit_progress(stream_tx, &format!("Cloning repository {}", repo_url)).await;
+    let output = run_local_command_with_progress(
+        &join_shell_command(&clone_args),
+        "git clone",
+        std::env::current_dir()?.as_path(),
+        &HashMap::new(),
+        MAX_REPO_CLONE_TIMEOUT_SECS,
+        stream_tx,
+        "repo_clone",
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        anyhow::bail!("git clone failed: {}", detail);
+    }
+
+    if let Some(reference) = repo_ref.filter(|value| !value.trim().is_empty()) {
+        emit_progress(stream_tx, &format!("Checking out repo ref {}", reference)).await;
+        let output = run_local_command_with_progress(
+            &format!("git checkout {}", shell_quote_arg(reference)),
+            "git checkout",
+            target_dir,
+            &HashMap::new(),
+            120,
+            stream_tx,
+            "repo_checkout",
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            anyhow::bail!("git checkout failed: {}", detail);
+        }
+    }
+
+    Ok(())
+}
+
+async fn deploy_repo_bundle(
+    config_dir: &Path,
+    data_dir: &Path,
+    arguments: &serde_json::Value,
+    registry: &AppRegistry,
+    llm_env: &HashMap<String, String>,
+    stream_tx: Option<Sender<StreamEvent>>,
+) -> Result<String> {
+    let repo_url = arguments
+        .get("repo_url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("repo_url cannot be empty"))?;
+    let parsed_url = is_allowed_repo_url(repo_url)?;
+    let repo_ref = arguments
+        .get("repo_ref")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo_subdir = arguments
+        .get("repo_subdir")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim_matches('/').trim_matches('\\'))
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let requested_title = arguments
+        .get("title")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo_title = requested_title
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| repo_title_from_url(parsed_url.as_str()));
+    let service_mode = repo_service_mode_from_opt(
+        arguments
+            .get("service_mode")
+            .and_then(|value| value.as_str()),
+    );
+    let runtime_preference = if arguments
+        .get("runtime_preference")
+        .and_then(|value| value.as_str())
+        .is_some()
+    {
+        runtime_preference_from_opt(
+            arguments
+                .get("runtime_preference")
+                .and_then(|value| value.as_str()),
+        )
+    } else {
+        RuntimePreference::Container
+    };
+    let expose_public = arguments
+        .get("expose_public")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let access_guard_enabled = arguments
+        .get("access_guard")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let runtime_image = arguments.get("runtime_image").cloned();
+
+    let bundle_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let bundle_dir = data_dir.join("repo-deployments").join(&bundle_id);
+    let source_dir = bundle_dir.join("source");
+    tokio::fs::create_dir_all(&bundle_dir).await?;
+    clone_repo(repo_url, repo_ref, &source_dir, &stream_tx).await?;
+
+    let repo_root = if let Some(subdir) = repo_subdir.as_ref() {
+        let candidate = source_dir.join(subdir);
+        if !candidate.exists() || !candidate.is_dir() {
+            anyhow::bail!(
+                "repo_subdir '{}' was not found inside the cloned repo",
+                subdir
+            );
+        }
+        candidate
+    } else {
+        source_dir.clone()
+    };
+
+    let (readme_file, readme_mentions_compose) = load_readme_hints(&repo_root)
+        .map(|(file, hints)| (Some(file), hints.mentions_compose))
+        .unwrap_or((None, false));
+
+    emit_progress(&stream_tx, "Reading repo README and local manifests").await;
+    let service_plans = plan_repo_services(&repo_root, &repo_title, service_mode)?;
+    if service_plans.is_empty() {
+        anyhow::bail!(
+            "I cloned the repo, but I could not detect a runnable frontend/backend service from the README or local manifests."
+        );
+    }
+    emit_progress(
+        &stream_tx,
+        &format!(
+            "Detected {} repo service(s): {}",
+            service_plans.len(),
+            service_plans
+                .iter()
+                .map(|plan| format!(
+                    "{} ({})",
+                    if plan.relative_dir.is_empty() {
+                        ".".to_string()
+                    } else {
+                        plan.relative_dir.clone()
+                    },
+                    plan.kind.as_str()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+
+    let mut deployed_services = Vec::new();
+    let mut success_like_count = 0usize;
+    let mut needs_inputs_count = 0usize;
+    let mut failure_count = 0usize;
+
+    for (idx, plan) in service_plans.iter().enumerate() {
+        emit_progress(
+            &stream_tx,
+            &format!(
+                "Deploying repo service {}/{}: {}",
+                idx + 1,
+                service_plans.len(),
+                plan.title
+            ),
+        )
+        .await;
+        let scope_root = match plan.copy_scope {
+            RepoCopyScope::RepositoryRoot => &repo_root,
+            RepoCopyScope::ServiceRoot => {
+                if plan.relative_dir.is_empty() {
+                    &repo_root
+                } else {
+                    &repo_root.join(&plan.relative_dir)
+                }
+            }
+        };
+        let files = collect_repo_files(scope_root)?;
+        let mut service_args = serde_json::Map::new();
+        service_args.insert("files".to_string(), serde_json::Value::Object(files));
+        service_args.insert("title".to_string(), serde_json::json!(plan.title));
+        service_args.insert(
+            "runtime_preference".to_string(),
+            serde_json::json!(runtime_preference.as_str()),
+        );
+        service_args.insert(
+            "expose_public".to_string(),
+            serde_json::json!(expose_public),
+        );
+        service_args.insert(
+            "access_guard".to_string(),
+            serde_json::json!(access_guard_enabled),
+        );
+        service_args.insert("repo_url".to_string(), serde_json::json!(repo_url));
+        service_args.insert("repo_bundle_id".to_string(), serde_json::json!(bundle_id));
+        service_args.insert(
+            "repo_service_kind".to_string(),
+            serde_json::json!(plan.kind.as_str()),
+        );
+        service_args.insert(
+            "repo_service_dir".to_string(),
+            serde_json::json!(plan.relative_dir),
+        );
+        if let Some(ref value) = repo_ref {
+            service_args.insert("repo_ref".to_string(), serde_json::json!(value));
+        }
+        if let Some(ref value) = repo_subdir {
+            service_args.insert("repo_subdir".to_string(), serde_json::json!(value));
+        }
+        if let Some(ref value) = runtime_image {
+            service_args.insert("runtime_image".to_string(), value.clone());
+        }
+        if !plan.required_inputs.is_empty() {
+            service_args.insert(
+                "required_inputs".to_string(),
+                serde_json::to_value(&plan.required_inputs)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+            );
+        }
+        if let Some(command) = plan.install_command.as_ref() {
+            service_args.insert("install_command".to_string(), serde_json::json!(command));
+        }
+        if let Some(command) = plan.entry_command.as_ref() {
+            service_args.insert("entry_command".to_string(), serde_json::json!(command));
+        }
+
+        match std::pin::Pin::from(Box::new(app_deploy(
+            config_dir,
+            data_dir,
+            &serde_json::Value::Object(service_args),
+            registry,
+            llm_env,
+            stream_tx.clone(),
+        )))
+        .await
+        {
+            Ok(result) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&result)
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "deployed", "raw": result }));
+                let status = parsed
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("deployed");
+                if matches!(status, "deployed" | "needs_secrets") {
+                    success_like_count += 1;
+                }
+                if status == "needs_secrets" {
+                    needs_inputs_count += 1;
+                }
+                deployed_services.push(serde_json::json!({
+                    "title": plan.title,
+                    "relative_dir": plan.relative_dir,
+                    "kind": plan.kind.as_str(),
+                    "status": status,
+                    "detection_reason": plan.detection_reason,
+                    "result": parsed,
+                }));
+            }
+            Err(error) => {
+                failure_count += 1;
+                deployed_services.push(serde_json::json!({
+                    "title": plan.title,
+                    "relative_dir": plan.relative_dir,
+                    "kind": plan.kind.as_str(),
+                    "status": "failed",
+                    "detection_reason": plan.detection_reason,
+                    "error": error.to_string(),
+                }));
+            }
+        }
+    }
+
+    let summary_status = if failure_count == 0 && needs_inputs_count == 0 {
+        "deployed"
+    } else if failure_count == 0 {
+        "needs_inputs"
+    } else if success_like_count > 0 {
+        "deployed_partially"
+    } else {
+        anyhow::bail!(
+            "Repo deploy failed for all detected services: {}",
+            deployed_services
+                .iter()
+                .filter_map(|service| {
+                    let title = service.get("title").and_then(|value| value.as_str())?;
+                    let error = service.get("error").and_then(|value| value.as_str())?;
+                    Some(format!("{}: {}", title, error))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    };
+
+    let manifest = serde_json::json!({
+        "bundle_id": bundle_id,
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "repo_subdir": repo_subdir,
+        "title": repo_title,
+        "service_mode": match service_mode {
+            RepoServiceMode::Auto => "auto",
+            RepoServiceMode::Frontend => "frontend",
+            RepoServiceMode::Backend => "backend",
+            RepoServiceMode::Fullstack => "fullstack",
+        },
+        "status": summary_status,
+        "readme_file": readme_file,
+        "readme_mentions_compose": readme_mentions_compose,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "services": deployed_services,
+    });
+    tokio::fs::write(
+        bundle_dir.join("bundle.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )
+    .await?;
+    let _ = tokio::fs::remove_dir_all(&source_dir).await;
+
+    Ok(serde_json::json!({
+        "status": summary_status,
+        "deployment_kind": "repo_bundle",
+        "bundle_id": bundle_id,
+        "title": repo_title,
+        "repo_url": repo_url,
+        "repo_ref": repo_ref,
+        "repo_subdir": repo_subdir,
+        "readme_file": readme_file,
+        "runtime_preference": runtime_preference.as_str(),
+        "service_count": deployed_services.len(),
+        "deployed_count": success_like_count,
+        "failed_count": failure_count,
+        "services": deployed_services,
+    })
+    .to_string())
+}
 fn app_container_name(app_id: &str) -> String {
     format!("{}{}", APP_CONTAINER_PREFIX, app_id)
 }
@@ -1184,6 +2510,21 @@ pub async fn launch_dynamic_process(
     runtime_env.insert("HOST".to_string(), "0.0.0.0".to_string());
     runtime_env.extend(extra_env.clone());
 
+    // If a per-app venv exists, prepend its bin to PATH so the entry command
+    // picks up the venv's Python and installed packages automatically.
+    let venv_dir = app_dir.join(".venv");
+    if venv_dir.join("bin").exists() {
+        let venv_bin = venv_dir.join("bin").to_string_lossy().to_string();
+        let merged = std::env::var("PATH")
+            .map(|existing| format!("{}:{}", venv_bin, existing))
+            .unwrap_or(venv_bin.clone());
+        runtime_env.insert("PATH".to_string(), merged);
+        runtime_env.insert(
+            "VIRTUAL_ENV".to_string(),
+            venv_dir.to_string_lossy().to_string(),
+        );
+    }
+    // Legacy: support old --target _deps installs for backward compat.
     let deps_dir = app_dir.join("_deps");
     if deps_dir.exists() {
         let deps = deps_dir.to_string_lossy().to_string();
@@ -1467,19 +2808,27 @@ async fn write_file_with_progress(
 
     let segments: Vec<&str> = content.split_inclusive('\n').collect();
     let total_lines = segments.len();
+    // Stream normal-sized files line-by-line so the UI can render the code as it is written.
+    // Fall back to sampled updates for very large files to avoid flooding the event stream.
+    const FILE_WRITE_PROGRESS_LINE_BY_LINE_MAX_LINES: usize = 4_000;
+    let emit_every_line = total_lines <= FILE_WRITE_PROGRESS_LINE_BY_LINE_MAX_LINES;
+    let sampled_step = (total_lines / 200).clamp(10, 50);
     for (idx, segment) in segments.iter().enumerate() {
         file.write_all(segment.as_bytes()).await?;
         let line_no = idx + 1;
-        let line_text = segment.trim_end_matches('\n').trim_end_matches('\r');
-        emit_file_write_progress(
-            stream_tx,
-            filename,
-            line_no,
-            total_lines,
-            line_text,
-            line_no >= total_lines,
-        )
-        .await;
+        let is_last = line_no >= total_lines;
+        if emit_every_line || line_no == 1 || is_last || (line_no % sampled_step == 0) {
+            let line_text = segment.trim_end_matches('\n').trim_end_matches('\r');
+            emit_file_write_progress(
+                stream_tx,
+                filename,
+                line_no,
+                total_lines,
+                line_text,
+                is_last,
+            )
+            .await;
+        }
     }
     file.flush().await?;
     Ok(())
@@ -2212,6 +3561,17 @@ pub async fn app_deploy(
     llm_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
 ) -> Result<String> {
+    if arguments
+        .get("repo_url")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return deploy_repo_bundle(
+            config_dir, data_dir, arguments, registry, llm_env, stream_tx,
+        )
+        .await;
+    }
+
     let files = arguments
         .get("files")
         .and_then(|v| v.as_object())
@@ -2239,7 +3599,7 @@ pub async fn app_deploy(
     let expose_public = arguments
         .get("expose_public")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     let access_guard_enabled = arguments
         .get("access_guard")
         .and_then(|v| v.as_bool())
@@ -2339,6 +3699,12 @@ pub async fn app_deploy(
         "runtime_image": runtime_image.clone(),
         "runtime_preference": runtime_preference.as_str(),
         "expose_public": expose_public,
+        "repo_url": arguments.get("repo_url").cloned(),
+        "repo_ref": arguments.get("repo_ref").cloned(),
+        "repo_subdir": arguments.get("repo_subdir").cloned(),
+        "repo_bundle_id": arguments.get("repo_bundle_id").cloned(),
+        "repo_service_kind": arguments.get("repo_service_kind").cloned(),
+        "repo_service_dir": arguments.get("repo_service_dir").cloned(),
         "required_inputs": required_inputs.clone(),
         "required_secrets": required_secret_keys.clone(),
         "required_env": required_secret_keys.clone(),
@@ -2452,13 +3818,19 @@ pub async fn app_deploy(
         .to_string());
     }
 
-    let has_requirements = app_dir.join("requirements.txt").exists();
+    let requirements_path = app_dir.join("requirements.txt");
+    let has_requirements = requirements_path.exists()
+        && tokio::fs::metadata(&requirements_path)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
     let has_package_json = app_dir.join("package.json").exists();
 
+    // Each Python app gets its own venv for isolation. Node apps use local node_modules.
     let effective_install_cmd = if let Some(cmd) = install_command {
         Some(cmd.to_string())
     } else if has_requirements {
-        Some("pip install --target ./_deps -r requirements.txt -q".to_string())
+        Some("python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q".to_string())
     } else if has_package_json {
         Some("npm install --omit=dev".to_string())
     } else {
@@ -2553,4 +3925,89 @@ pub async fn app_deploy(
         "access_guard_enabled": access_guard_enabled,
     })
     .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_readme_hints_detects_install_and_start_commands() {
+        let readme = r#"
+# Demo
+
+```bash
+$ npm install
+$ npm run dev
+```
+"#;
+
+        let hints = extract_readme_hints(readme);
+        assert_eq!(hints.install_command.as_deref(), Some("npm install"));
+        assert_eq!(hints.start_command.as_deref(), Some("npm run dev"));
+        assert!(!hints.mentions_compose);
+    }
+
+    #[test]
+    fn is_allowed_repo_url_rejects_localhost() {
+        assert!(is_allowed_repo_url("http://127.0.0.1/repo").is_err());
+        assert!(is_allowed_repo_url("http://localhost/repo").is_err());
+        assert!(is_allowed_repo_url("https://github.com/openai/demo").is_ok());
+    }
+
+    #[test]
+    fn plan_repo_services_detects_simple_frontend_and_backend_repo() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        let frontend = repo.path().join("frontend");
+        let backend = repo.path().join("backend");
+        std::fs::create_dir_all(&frontend).expect("frontend dir");
+        std::fs::create_dir_all(&backend).expect("backend dir");
+        std::fs::write(
+            repo.path().join("README.md"),
+            "# Demo\n\nRun `npm install` then `npm run dev`.\n",
+        )
+        .expect("readme");
+        std::fs::write(
+            frontend.join("package.json"),
+            r#"{
+  "name": "demo-frontend",
+  "scripts": { "dev": "vite" },
+  "dependencies": { "vite": "^5.0.0", "react": "^18.0.0" }
+}"#,
+        )
+        .expect("frontend manifest");
+        std::fs::write(
+            frontend.join("index.html"),
+            "<!doctype html><html><body>demo</body></html>",
+        )
+        .expect("frontend html");
+        std::fs::write(backend.join("requirements.txt"), "fastapi\nuvicorn\n")
+            .expect("backend requirements");
+        std::fs::write(
+            backend.join("main.py"),
+            "from fastapi import FastAPI\napp = FastAPI()\n",
+        )
+        .expect("backend main");
+
+        let plans = plan_repo_services(repo.path(), "Demo Repo", RepoServiceMode::Auto)
+            .expect("repo services");
+
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().any(|plan| {
+            plan.relative_dir == "frontend"
+                && plan.kind == RepoServiceKind::Frontend
+                && plan
+                    .entry_command
+                    .as_deref()
+                    .is_some_and(|command| command.contains("npm"))
+        }));
+        assert!(plans.iter().any(|plan| {
+            plan.relative_dir == "backend"
+                && plan.kind == RepoServiceKind::Backend
+                && plan
+                    .entry_command
+                    .as_deref()
+                    .is_some_and(|command| command.contains("uvicorn"))
+        }));
+    }
 }

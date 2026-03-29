@@ -15,8 +15,8 @@ pub struct Model {
     #[sea_orm(nullable)]
     pub completed_at: Option<String>,
     #[sea_orm(nullable)]
-    pub duration_ms: Option<i64>,
-    pub step_count: i64,
+    pub duration_ms: Option<i32>,
+    pub step_count: i32,
     pub steps_json: String,
     #[sea_orm(nullable)]
     pub response: Option<String>,
@@ -24,9 +24,9 @@ pub struct Model {
     pub proof_id: Option<String>,
     #[sea_orm(nullable)]
     pub model: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub total_tokens: i32,
     pub cost_usd: f64,
     #[sea_orm(nullable)]
     pub complexity: Option<String>,

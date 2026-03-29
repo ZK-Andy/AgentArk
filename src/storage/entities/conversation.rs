@@ -14,6 +14,7 @@ pub struct Model {
     pub updated_at: String,
     pub message_count: i32,
     pub archived: bool,
+    pub starred: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

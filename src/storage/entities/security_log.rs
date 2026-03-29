@@ -18,7 +18,7 @@ pub struct Model {
     #[sea_orm(nullable)]
     pub source: Option<String>,
     /// Count of events in this batch (from atomic counters)
-    pub count: i64,
+    pub count: i32,
     pub created_at: String,
 }
 

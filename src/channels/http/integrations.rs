@@ -1,4 +1,7 @@
 use super::*;
+use std::time::Duration;
+
+const INTEGRATION_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Serialize)]
 struct GmailOAuthStartResponse {
@@ -29,6 +32,8 @@ struct IntegrationResponse {
     pub config_help: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configure_button: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_values: Option<serde_json::Value>,
 }
 
 pub(super) async fn gmail_oauth_start(State(state): State<AppState>) -> Response {
@@ -158,6 +163,8 @@ async fn gmail_exchange_code(state: &AppState, code: &str) -> Result<(), String>
     manager
         .set_custom_secret("gmail_tokens", Some(payload))
         .map_err(|e| format!("Failed to save tokens: {}", e))?;
+    set_builtin_integration_enabled(&config_dir, &data_dir, &["gmail"], true)?;
+    set_builtin_integration_user_disabled(&config_dir, &data_dir, &["gmail"], false)?;
 
     // Remove legacy plaintext token file if it exists
     let legacy_path = config_dir.join("gmail.json");
@@ -344,7 +351,63 @@ pub(super) async fn gmail_test(State(state): State<AppState>) -> Response {
 }
 
 pub(super) fn integration_enabled_key(id: &str) -> String {
-    format!("integration_enabled:{}", id)
+    crate::integrations::integration_enabled_key(id)
+}
+
+pub(super) fn integration_user_disabled_key(id: &str) -> String {
+    crate::integrations::integration_user_disabled_key(id)
+}
+
+fn set_builtin_integration_enabled(
+    config_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    integration_ids: &[&str],
+    enabled: bool,
+) -> Result<(), String> {
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))
+            .map_err(|e| format!("Secure storage error: {}", e))?;
+    let value = enabled.to_string();
+    for integration_id in integration_ids {
+        manager
+            .set_custom_secret(
+                &integration_enabled_key(integration_id),
+                Some(value.clone()),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to update integration state for {}: {}",
+                    integration_id, e
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn set_builtin_integration_user_disabled(
+    config_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    integration_ids: &[&str],
+    disabled: bool,
+) -> Result<(), String> {
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))
+            .map_err(|e| format!("Secure storage error: {}", e))?;
+    let value = disabled.to_string();
+    for integration_id in integration_ids {
+        manager
+            .set_custom_secret(
+                &integration_user_disabled_key(integration_id),
+                Some(value.clone()),
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to update manual integration state for {}: {}",
+                    integration_id, e
+                )
+            })?;
+    }
+    Ok(())
 }
 
 pub(super) fn parse_boolish(value: &str) -> Option<bool> {
@@ -475,6 +538,84 @@ pub(super) fn calendar_oauth_pair(
         .or_else(|| gmail_oauth_pair(manager))
 }
 
+fn google_workspace_bundle_text(config_dir: &std::path::Path) -> String {
+    crate::actions::google_workspace::load_saved_bundles(config_dir)
+        .unwrap_or_else(|_| crate::actions::google_workspace::default_bundles())
+        .join(", ")
+}
+
+fn google_workspace_config_values(config_dir: &std::path::Path) -> serde_json::Value {
+    let saved_client =
+        crate::actions::google_workspace::load_saved_workspace_client_config(config_dir)
+            .ok()
+            .flatten();
+    let oauth_client_configured =
+        crate::actions::google_workspace::load_workspace_client_config(config_dir)
+            .ok()
+            .flatten()
+            .is_some();
+    let oauth_client_source =
+        crate::actions::google_workspace::workspace_client_config_source(config_dir)
+            .ok()
+            .flatten()
+            .unwrap_or("none");
+    serde_json::json!({
+        "client_id": saved_client
+            .as_ref()
+            .map(|config| config.client_id.clone())
+            .unwrap_or_default(),
+        "client_secret_configured": saved_client.is_some(),
+        "service_bundles": google_workspace_bundle_text(config_dir),
+        "oauth_client_configured": oauth_client_configured,
+        "oauth_client_source": oauth_client_source
+    })
+}
+
+fn google_workspace_status_detail(
+    granted: &[String],
+    missing: &[String],
+    pending: &[String],
+) -> Option<String> {
+    if !missing.is_empty() {
+        let list = missing
+            .iter()
+            .map(|bundle| crate::actions::google_workspace::bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Reconnect Google Workspace to grant access for {}.",
+            list
+        ));
+    }
+    if !pending.is_empty() {
+        let list = pending
+            .iter()
+            .map(|bundle| crate::actions::google_workspace::bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "AgentArk requested additional Google Workspace access for {}. Reconnect to approve it.",
+            list
+        ));
+    }
+    if !granted.is_empty() {
+        let list = granted
+            .iter()
+            .map(|bundle| crate::actions::google_workspace::bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("Connected bundles: {}.", list));
+    }
+    None
+}
+
+fn google_workspace_configured(config_dir: &std::path::Path) -> bool {
+    crate::actions::google_workspace::load_workspace_client_config(config_dir)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn format_gmail_auth_url(client_id: &str, state_token: &str) -> String {
     let redirect_uri = "http://localhost:8990/oauth/callback";
     let scope =
@@ -521,12 +662,49 @@ async fn build_calendar_auth_url(
     Ok(format_calendar_auth_url(&client_id, &state_token))
 }
 
+async fn build_google_workspace_auth_url(state: &AppState) -> std::result::Result<String, String> {
+    let config_dir = { state.agent.read().await.config_dir.clone() };
+    let state_token = auth::issue_oauth_state(state, "google_workspace").await;
+    crate::actions::google_workspace::build_auth_url(&config_dir, &state_token)
+        .map_err(|e| e.to_string())
+}
+
 pub(super) fn external_integration_config(
     id: &str,
 ) -> Option<(Vec<IntegrationConfigField>, Option<String>, Option<String>)> {
     // This section is "External Integrations" in the Settings UI.
     // Keep these auth fields aligned with how the integration actually loads secrets.
     match id {
+        "google_workspace" => Some((
+            vec![
+                IntegrationConfigField {
+                    key: "client_id".to_string(),
+                    label: "Google OAuth Client ID".to_string(),
+                    input_type: "text".to_string(),
+                    placeholder: Some("1234567890-xxxxx.apps.googleusercontent.com".to_string()),
+                    required: false,
+                    options: None,
+                },
+                IntegrationConfigField {
+                    key: "client_secret".to_string(),
+                    label: "Google OAuth Client Secret".to_string(),
+                    input_type: "password".to_string(),
+                    placeholder: Some("GOCSPX-...".to_string()),
+                    required: false,
+                    options: None,
+                },
+                IntegrationConfigField {
+                    key: "service_bundles".to_string(),
+                    label: "Workspace Bundles".to_string(),
+                    input_type: "textarea".to_string(),
+                    placeholder: Some("gmail, calendar".to_string()),
+                    required: false,
+                    options: None,
+                },
+            ],
+            Some("Enter the Google OAuth client ID and client secret for this AgentArk instance, choose the Workspace bundles you want, then continue with Google in your browser.".to_string()),
+            Some("Save Setup".to_string()),
+        )),
         "gmail" => Some((
             vec![
                 IntegrationConfigField {
@@ -945,6 +1123,18 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
             .await
             .map(|_| serde_json::json!({"status": "connected"}))
             .map_err(|e| anyhow::anyhow!(e)),
+        "google_workspace" => {
+            let config_dir = { state.agent.read().await.config_dir.clone() };
+            crate::actions::google_workspace::exchange_code(&config_dir, &code)
+                .await
+                .map(|tokens| {
+                    serde_json::json!({
+                        "status": "connected",
+                        "granted_bundles": tokens.granted_bundles
+                    })
+                })
+                .map_err(|e| anyhow::anyhow!(e))
+        }
         "google_calendar" | "calendar" => calendar_exchange_code(&state, &code)
             .await
             .map(|_| serde_json::json!({"status": "connected"}))
@@ -963,6 +1153,52 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
 
     match result {
         Ok(_) => {
+            if matches!(
+                service_id.as_str(),
+                "gmail" | "google_calendar" | "calendar" | "google_workspace"
+            ) {
+                let (config_dir, data_dir) = {
+                    let agent = state.agent.read().await;
+                    (agent.config_dir.clone(), agent.data_dir.clone())
+                };
+                let mut integration_ids = match service_id.as_str() {
+                    "gmail" => vec!["gmail"],
+                    "google_calendar" | "calendar" => vec!["google_calendar"],
+                    "google_workspace" => vec!["google_workspace"],
+                    _ => Vec::new(),
+                };
+                if service_id == "google_workspace" {
+                    let granted = crate::actions::google_workspace::granted_bundles(&config_dir)
+                        .unwrap_or_default();
+                    if granted.iter().any(|bundle| bundle == "gmail") {
+                        integration_ids.push("gmail");
+                    }
+                    if granted.iter().any(|bundle| bundle == "calendar") {
+                        integration_ids.push("google_calendar");
+                    }
+                }
+                if let Err(error) =
+                    set_builtin_integration_enabled(&config_dir, &data_dir, &integration_ids, true)
+                {
+                    tracing::warn!(
+                        "oauth_callback: connected '{}' but failed to enable runtime actions: {}",
+                        service_id,
+                        error
+                    );
+                }
+                if let Err(error) = set_builtin_integration_user_disabled(
+                    &config_dir,
+                    &data_dir,
+                    &integration_ids,
+                    false,
+                ) {
+                    tracing::warn!(
+                        "oauth_callback: connected '{}' but failed to clear manual disable markers: {}",
+                        service_id,
+                        error
+                    );
+                }
+            }
             let signal = oauth_callback_signal_script(&service_id, "connected", "");
             let html = format!(
                 r#"<!DOCTYPE html>
@@ -1029,8 +1265,81 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
     .ok();
 
     let mut integrations = Vec::new();
+
+    if let Some((config_fields, config_help, configure_button)) =
+        external_integration_config("google_workspace")
+    {
+        let configured = google_workspace_configured(&config_dir);
+        let granted =
+            crate::actions::google_workspace::granted_bundles(&config_dir).unwrap_or_default();
+        let missing = crate::actions::google_workspace::missing_selected_bundles(&config_dir)
+            .unwrap_or_default();
+        let pending =
+            crate::actions::google_workspace::load_pending_bundles(&config_dir).unwrap_or_default();
+        let (status, status_detail) = if !configured && granted.is_empty() {
+            (
+                "not_configured",
+                Some(
+                    "Enter the Google OAuth client ID and client secret in Google Workspace, then continue with Google."
+                        .to_string(),
+                ),
+            )
+        } else if granted.is_empty() {
+            (
+                "needs_auth",
+                Some(
+                    "Choose the Workspace bundles you want, then continue with Google to finish browser sign-in."
+                        .to_string(),
+                ),
+            )
+        } else if !missing.is_empty() {
+            (
+                "needs_auth",
+                google_workspace_status_detail(&granted, &missing, &pending),
+            )
+        } else {
+            match tokio::time::timeout(
+                INTEGRATION_STATUS_TIMEOUT,
+                google_workspace_test_connection(&config_dir),
+            )
+            .await
+            {
+                Err(_) => (
+                    "error",
+                    Some("Google Workspace status check timed out.".to_string()),
+                ),
+                Ok(Ok(_)) => (
+                    "connected",
+                    google_workspace_status_detail(&granted, &missing, &pending),
+                ),
+                Ok(Err(error)) => ("error", Some(error)),
+            }
+        };
+        let enabled =
+            crate::integrations::effective_integration_enabled(&config_dir, "google_workspace");
+        integrations.push(IntegrationResponse {
+            id: "google_workspace".to_string(),
+            name: "Google Workspace".to_string(),
+            description:
+                "Connect Google Workspace once, then let AgentArk use Gmail, Calendar, Drive, Docs, Sheets, Chat, Admin, and the broader gws CLI surface from the same credential set."
+                    .to_string(),
+            icon: "".to_string(),
+            status: status.to_string(),
+            enabled,
+            status_detail,
+            auth_url: None,
+            config_fields: Some(config_fields),
+            config_help,
+            configure_button,
+            config_values: Some(google_workspace_config_values(&config_dir)),
+        });
+    }
+
     for info in agent.integrations.list().await {
-        if info.id == "moltbook" {
+        if info.id == "moltbook"
+            || info.id == "gmail"
+            || info.id == "google_calendar"
+        {
             continue;
         }
 
@@ -1045,9 +1354,15 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             let has_refresh_token =
                 oauth_has_refresh_token(stored_secret(manager.as_ref(), "calendar_tokens"));
             if has_refresh_token {
-                match validate_calendar_oauth_connection(&config_dir).await {
-                    Ok(()) => ("connected", None),
-                    Err(error) => ("error", Some(error)),
+                match tokio::time::timeout(
+                    INTEGRATION_STATUS_TIMEOUT,
+                    validate_calendar_oauth_connection(&config_dir),
+                )
+                .await
+                {
+                    Err(_) => ("error", Some("Calendar status check timed out.".to_string())),
+                    Ok(Ok(())) => ("connected", None),
+                    Ok(Err(error)) => ("error", Some(error)),
                 }
             } else if configured {
                 (
@@ -1066,16 +1381,7 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             }
         };
 
-        let default_enabled = status_str == "connected";
-        let enabled = manager
-            .as_ref()
-            .and_then(|m| {
-                m.get_custom_secret(&integration_enabled_key(&info.id))
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|v| parse_boolish(&v))
-            .unwrap_or(default_enabled);
+        let enabled = crate::integrations::effective_integration_enabled(&config_dir, &info.id);
 
         let auth_url = None;
 
@@ -1092,48 +1398,7 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             config_fields: Some(config_fields),
             config_help,
             configure_button,
-        });
-    }
-
-    let gmail_meta = external_integration_config("gmail");
-    if let Some((config_fields, config_help, configure_button)) = gmail_meta {
-        let has_refresh_token =
-            oauth_has_refresh_token(stored_secret(manager.as_ref(), "gmail_tokens"));
-        let configured = gmail_oauth_pair(manager.as_ref()).is_some();
-        let (status, status_detail) = if has_refresh_token {
-            match validate_gmail_oauth_connection(&config_dir).await {
-                Ok(()) => ("connected", None),
-                Err(error) => ("error", Some(error)),
-            }
-        } else if configured {
-            (
-                "needs_auth",
-                Some("Google sign-in required to finish connecting Gmail.".to_string()),
-            )
-        } else {
-            ("not_configured", None)
-        };
-        let enabled = manager
-            .as_ref()
-            .and_then(|m| {
-                m.get_custom_secret(&integration_enabled_key("gmail"))
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|v| parse_boolish(&v))
-            .unwrap_or(status == "connected");
-        integrations.push(IntegrationResponse {
-            id: "gmail".to_string(),
-            name: "Gmail".to_string(),
-            description: "Connect Gmail to read, triage, and reply to email".to_string(),
-            icon: "".to_string(),
-            status: status.to_string(),
-            enabled,
-            status_detail,
-            auth_url: None,
-            config_fields: Some(config_fields),
-            config_help,
-            configure_button,
+            config_values: None,
         });
     }
 
@@ -1149,7 +1414,7 @@ pub(super) async fn get_integration_auth_url(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    if id == "gmail" || id == "google_calendar" {
+    if id == "gmail" || id == "google_calendar" || id == "google_workspace" {
         let (config_dir, data_dir) = {
             let agent = state.agent.read().await;
             (agent.config_dir.clone(), agent.data_dir.clone())
@@ -1161,6 +1426,8 @@ pub(super) async fn get_integration_auth_url(
         .ok();
         let auth_url = if id == "gmail" {
             build_gmail_auth_url(&state, manager.as_ref()).await
+        } else if id == "google_workspace" {
+            build_google_workspace_auth_url(&state).await
         } else {
             build_calendar_auth_url(&state, manager.as_ref()).await
         };
@@ -1232,6 +1499,13 @@ pub(super) async fn disconnect_integration(
         };
 
         let keys: &[&str] = match id.as_str() {
+            "google_workspace" => &[
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY,
+                "gmail_tokens",
+                "calendar_tokens",
+            ],
             "gmail" => &["gmail_tokens"],
             "google_calendar" => &["calendar_oauth_config", "calendar_tokens"],
             "github" => &["github_token"],
@@ -1269,6 +1543,10 @@ pub(super) async fn disconnect_integration(
         }
         // Also disable the integration (do not auto-use it after disconnect).
         let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
+        let _ = manager.set_custom_secret(
+            &integration_user_disabled_key(&id),
+            Some("false".to_string()),
+        );
 
         return (
             StatusCode::OK,
@@ -1331,7 +1609,9 @@ pub(super) async fn configure_integration(
     if id == "google_calendar" {
         return configure_calendar(State(state), Json(request)).await;
     }
-
+    if id == "google_workspace" {
+        return configure_google_workspace(State(state), Json(request)).await;
+    }
     let (config_dir, data_dir) = {
         let agent = state.agent.read().await;
         (agent.config_dir.clone(), agent.data_dir.clone())
@@ -1647,6 +1927,10 @@ pub(super) async fn configure_integration(
                                 &integration_enabled_key(&id),
                                 Some("true".to_string()),
                             );
+                            let _ = manager.set_custom_secret(
+                                &integration_user_disabled_key(&id),
+                                Some("false".to_string()),
+                            );
                         }
                         (
                             StatusCode::OK,
@@ -1664,6 +1948,10 @@ pub(super) async fn configure_integration(
                         {
                             let _ = manager.set_custom_secret(
                                 &integration_enabled_key(&id),
+                                Some("false".to_string()),
+                            );
+                            let _ = manager.set_custom_secret(
+                                &integration_user_disabled_key(&id),
                                 Some("false".to_string()),
                             );
                         }
@@ -1685,6 +1973,10 @@ pub(super) async fn configure_integration(
                         {
                             let _ = manager.set_custom_secret(
                                 &integration_enabled_key(&id),
+                                Some("false".to_string()),
+                            );
+                            let _ = manager.set_custom_secret(
+                                &integration_user_disabled_key(&id),
                                 Some("false".to_string()),
                             );
                         }
@@ -1726,7 +2018,7 @@ pub(super) async fn enable_integration(
             .into_response();
     }
 
-    if id == "gmail" || id == "google_calendar" {
+    if id == "gmail" || id == "google_calendar" || id == "google_workspace" {
         let (config_dir, data_dir) = {
             let agent = state.agent.read().await;
             (agent.config_dir.clone(), agent.data_dir.clone())
@@ -1748,6 +2040,12 @@ pub(super) async fn enable_integration(
         };
         let has_refresh_token = if id == "gmail" {
             oauth_has_refresh_token(stored_secret(Some(&manager), "gmail_tokens"))
+        } else if id == "google_workspace" {
+            crate::actions::google_workspace::summarize_connection_status(&config_dir)
+                .map(|(connected, granted, missing)| {
+                    connected && !granted.is_empty() && missing.is_empty()
+                })
+                .unwrap_or(false)
         } else {
             oauth_has_refresh_token(stored_secret(Some(&manager), "calendar_tokens"))
         };
@@ -1755,12 +2053,21 @@ pub(super) async fn enable_integration(
             Err("Complete Google sign-in first.".to_string())
         } else if id == "gmail" {
             validate_gmail_oauth_connection(&config_dir).await
+        } else if id == "google_workspace" {
+            google_workspace_test_connection(&config_dir)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         } else {
             validate_calendar_oauth_connection(&config_dir).await
         };
         if has_refresh_token && validation.is_ok() {
             let _ =
                 manager.set_custom_secret(&integration_enabled_key(&id), Some("true".to_string()));
+            let _ = manager.set_custom_secret(
+                &integration_user_disabled_key(&id),
+                Some("false".to_string()),
+            );
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
@@ -1768,6 +2075,10 @@ pub(super) async fn enable_integration(
                 .into_response();
         }
         let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
+        let _ = manager.set_custom_secret(
+            &integration_user_disabled_key(&id),
+            Some("false".to_string()),
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1802,6 +2113,10 @@ pub(super) async fn enable_integration(
             ) {
                 let _ = manager
                     .set_custom_secret(&integration_enabled_key(&id), Some("true".to_string()));
+                let _ = manager.set_custom_secret(
+                    &integration_user_disabled_key(&id),
+                    Some("false".to_string()),
+                );
             }
             (
                 StatusCode::OK,
@@ -1816,6 +2131,10 @@ pub(super) async fn enable_integration(
             ) {
                 let _ = manager
                     .set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
+                let _ = manager.set_custom_secret(
+                    &integration_user_disabled_key(&id),
+                    Some("false".to_string()),
+                );
             }
             (
                 StatusCode::BAD_REQUEST,
@@ -1832,6 +2151,10 @@ pub(super) async fn enable_integration(
             ) {
                 let _ = manager
                     .set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
+                let _ = manager.set_custom_secret(
+                    &integration_user_disabled_key(&id),
+                    Some("false".to_string()),
+                );
             }
             (
                 StatusCode::BAD_REQUEST,
@@ -1867,6 +2190,10 @@ pub(super) async fn disable_integration(
         crate::core::config::SecureConfigManager::new_with_data_dir(&config_dir, Some(&data_dir))
     {
         let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
+        let _ = manager.set_custom_secret(
+            &integration_user_disabled_key(&id),
+            Some("true".to_string()),
+        );
     }
     (
         StatusCode::OK,
@@ -1895,6 +2222,13 @@ pub(super) async fn test_integration(
     }
     if id == "google_calendar" {
         return calendar_test(State(state)).await;
+    }
+    if id == "google_workspace" {
+        let config_dir = { state.agent.read().await.config_dir.clone() };
+        return match google_workspace_test_connection(&config_dir).await {
+            Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+            Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
+        };
     }
 
     let agent = state.agent.read().await;
@@ -1946,6 +2280,219 @@ pub(super) async fn test_integration(
                 .into_response()
         }
     }
+}
+
+async fn google_workspace_test_connection(
+    config_dir: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    let checks = crate::actions::google_workspace::test_selected_bundles(config_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut ok = true;
+    for message in checks.values() {
+        if message.contains("failed") || message.contains("unavailable") {
+            ok = false;
+            break;
+        }
+    }
+    Ok(serde_json::json!({
+        "status": if ok { "ok" } else { "warning" },
+        "checks": checks
+    }))
+}
+
+pub(super) async fn configure_google_workspace(
+    State(state): State<AppState>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    let manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
+        &config_dir,
+        Some(&data_dir),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Config error: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let credentials_json = request
+        .get("credentials_json")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manual_client_id = request
+        .get("client_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manual_client_secret = request
+        .get("client_secret")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let selected_bundles = request
+        .get("service_bundles")
+        .map(crate::actions::google_workspace::parse_bundle_list)
+        .unwrap_or_else(|| {
+            crate::actions::google_workspace::load_saved_bundles(&config_dir)
+                .unwrap_or_else(|_| crate::actions::google_workspace::default_bundles())
+        });
+
+    let existing_saved =
+        crate::actions::google_workspace::load_saved_workspace_client_config(&config_dir)
+            .ok()
+            .flatten();
+    let next_config = if let Some(raw) = credentials_json {
+        match crate::actions::google_workspace::parse_credentials_json(raw) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    } else if let (Some(client_id), Some(client_secret)) = (manual_client_id, manual_client_secret)
+    {
+        Some(
+            crate::actions::google_workspace::GoogleWorkspaceClientConfig {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+            },
+        )
+    } else {
+        None
+    };
+
+    let credentials_changed = next_config.as_ref().is_some_and(|next| {
+        existing_saved.as_ref().is_none_or(|existing| {
+            existing.client_id != next.client_id || existing.client_secret != next.client_secret
+        })
+    });
+
+    if let Some(next_config) = next_config.as_ref() {
+        if let Err(error) =
+            crate::actions::google_workspace::save_workspace_client_config(&config_dir, next_config)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to save Google OAuth client: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) =
+        crate::actions::google_workspace::save_selected_bundles(&config_dir, &selected_bundles)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to save Google Workspace bundles: {}", error),
+            }),
+        )
+            .into_response();
+    }
+    if let Ok(pending) = crate::actions::google_workspace::load_pending_bundles(&config_dir) {
+        let retained = pending
+            .into_iter()
+            .filter(|bundle| !selected_bundles.iter().any(|selected| selected == bundle))
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            crate::actions::google_workspace::save_pending_bundles(&config_dir, &retained)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Failed to update pending Google Workspace bundle requests: {}",
+                        error
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if credentials_changed {
+        for key in [
+            crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+            crate::actions::google_workspace::GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY,
+            "gmail_tokens",
+            "calendar_tokens",
+        ] {
+            if let Err(error) = manager.set_custom_secret(key, None) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Failed to reset Google OAuth state after client change: {}",
+                            error
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+        for key in [
+            integration_enabled_key("google_workspace"),
+            integration_enabled_key("gmail"),
+            integration_enabled_key("google_calendar"),
+        ] {
+            if let Err(error) = manager.set_custom_secret(&key, Some("false".to_string())) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "Failed to reset Google OAuth state after client change: {}",
+                            error
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let reconnect_required = credentials_changed
+        || !google_workspace_configured(&config_dir)
+        || crate::actions::google_workspace::missing_selected_bundles(&config_dir)
+            .map(|missing| !missing.is_empty())
+            .unwrap_or(true)
+        || crate::actions::google_workspace::granted_bundles(&config_dir)
+            .map(|granted| granted.is_empty())
+            .unwrap_or(true);
+    let _ = manager.set_custom_secret(
+        &integration_enabled_key("google_workspace"),
+        Some((!reconnect_required).to_string()),
+    );
+    let _ = manager.set_custom_secret(
+        &integration_user_disabled_key("google_workspace"),
+        Some("false".to_string()),
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "selected_bundles": selected_bundles,
+            "credentials_saved": next_config.is_some()
+        })),
+    )
+        .into_response()
 }
 
 /// Configure Gmail OAuth credentials
@@ -2249,6 +2796,8 @@ async fn calendar_exchange_code(state: &AppState, code: &str) -> Result<(), Stri
     manager
         .set_custom_secret("calendar_tokens", Some(payload))
         .map_err(|e| format!("Failed to save tokens: {}", e))?;
+    set_builtin_integration_enabled(&config_dir, &data_dir, &["google_calendar"], true)?;
+    set_builtin_integration_user_disabled(&config_dir, &data_dir, &["google_calendar"], false)?;
 
     Ok(())
 }
@@ -2376,4 +2925,45 @@ pub(super) async fn calendar_test(State(state): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_builtin_integration_enabled_persists_enabled_flags() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("config");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+
+        set_builtin_integration_enabled(
+            &config_dir,
+            &data_dir,
+            &["google_workspace", "gmail"],
+            true,
+        )
+        .expect("enable integrations");
+
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &config_dir,
+            Some(&data_dir),
+        )
+        .expect("secure manager");
+        assert_eq!(
+            manager
+                .get_custom_secret(&integration_enabled_key("google_workspace"))
+                .expect("workspace secret read"),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            manager
+                .get_custom_secret(&integration_enabled_key("gmail"))
+                .expect("gmail secret read"),
+            Some("true".to_string())
+        );
+    }
+
 }

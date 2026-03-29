@@ -1,4 +1,5 @@
 const express = require('express');
+const fs = require('fs');
 const { chromium } = require('playwright');
 const { v4: uuidv4 } = require('uuid');
 
@@ -16,10 +17,22 @@ let browser = null;
 
 async function ensureBrowser() {
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({
+    const launchOptions = {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    };
+    const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
+    if (executablePath) {
+      if (!fs.existsSync(executablePath)) {
+        throw new Error(`Configured PLAYWRIGHT_EXECUTABLE_PATH does not exist: ${executablePath}`);
+      }
+      launchOptions.executablePath = executablePath;
+    }
+    const channel = process.env.PLAYWRIGHT_CHANNEL;
+    if (channel) {
+      launchOptions.channel = channel;
+    }
+    browser = await chromium.launch(launchOptions);
   }
   return browser;
 }

@@ -11,13 +11,16 @@
 
 mod actions;
 mod channels;
+mod cli;
 mod core;
 mod crypto;
+mod custom_apis;
 mod hooks;
 mod identity;
 mod integrations;
 mod mcp;
 mod memory;
+mod plugins;
 mod proofs;
 mod runtime;
 mod safety;
@@ -72,6 +75,10 @@ struct Args {
     /// Run one ArkPulse health check and print the latest snapshot
     #[arg(long)]
     pulse: bool,
+
+    /// Gateway and control-plane management commands
+    #[command(subcommand)]
+    command: Option<cli::Command>,
 }
 
 #[tokio::main]
@@ -283,6 +290,10 @@ async fn main() -> Result<()> {
             let agent = core::Agent::init(&config_dir, &data_dir, unified_key.clone()).await?;
             return run_headless(agent).await;
         }
+    }
+
+    if let Some(command) = args.command {
+        return cli::run(agent, command).await;
     }
 
     if args.chat {
@@ -1135,6 +1146,27 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
         })
     };
 
+    // Start Matrix sync runtime if configured
+    let matrix_handle = {
+        let agent = agent.clone();
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = channels::matrix::serve(agent, shutdown).await {
+                tracing::error!("Matrix runtime error: {}", e);
+            }
+        })
+    };
+
+    // Start Discord gateway runtime if configured
+    let discord_handle = {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            if let Err(e) = channels::discord::run_gateway(agent).await {
+                tracing::error!("Discord runtime error: {}", e);
+            }
+        })
+    };
+
     // Start Telegram bot if configured
     #[cfg(feature = "telegram")]
     let telegram_handle = {
@@ -1178,6 +1210,26 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
                 tracing::warn!("Sentinel task did not stop within 10s; aborting task");
                 handle.abort();
             }
+        }
+    }
+
+    let mut matrix_handle = matrix_handle;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut matrix_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("Matrix task join failed during shutdown: {}", e),
+        Err(_) => {
+            tracing::warn!("Matrix task did not stop within 10s; aborting task");
+            matrix_handle.abort();
+        }
+    }
+
+    let mut discord_handle = discord_handle;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut discord_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("Discord task join failed during shutdown: {}", e),
+        Err(_) => {
+            tracing::warn!("Discord task did not stop within 10s; aborting task");
+            discord_handle.abort();
         }
     }
 

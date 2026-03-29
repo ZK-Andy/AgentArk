@@ -93,7 +93,7 @@ pub enum RuleAction {
 
 /// The safety policy engine
 pub struct SafetyEngine {
-    rules: Vec<SafetyRule>,
+    rules: RwLock<Vec<SafetyRule>>,
     rate_limits: RwLock<std::collections::HashMap<String, RateLimitState>>,
     pending_approvals: RwLock<Vec<PendingApproval>>,
 }
@@ -136,7 +136,7 @@ impl SafetyEngine {
         };
 
         Ok(Self {
-            rules,
+            rules: RwLock::new(rules),
             rate_limits: RwLock::new(std::collections::HashMap::new()),
             pending_approvals: RwLock::new(Vec::new()),
         })
@@ -150,7 +150,11 @@ impl SafetyEngine {
         arguments: &serde_json::Value,
     ) -> Result<bool> {
         // Clone rules to avoid borrow issues with rate limiting
-        let rules = self.rules.clone();
+        let rules = self
+            .rules
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+            .clone();
         for rule in &rules {
             if Self::rule_matches_static(&rule.trigger, action_name) {
                 // Check condition if present
@@ -430,13 +434,19 @@ impl SafetyEngine {
     }
 
     /// Add a new safety rule
-    pub fn add_rule(&mut self, rule: SafetyRule) {
-        self.rules.push(rule);
+    pub fn add_rule(&self, rule: SafetyRule) {
+        if let Ok(mut rules) = self.rules.write() {
+            rules.push(rule);
+        }
     }
 
     /// Get all rules
-    pub fn rules(&self) -> &[SafetyRule] {
-        &self.rules
+    #[cfg(feature = "gui")]
+    pub fn rules(&self) -> Vec<SafetyRule> {
+        self.rules
+            .read()
+            .map(|rules| rules.clone())
+            .unwrap_or_default()
     }
 
     /// Clear expired pending approvals (older than 1 hour)

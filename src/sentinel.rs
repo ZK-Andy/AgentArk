@@ -2039,6 +2039,8 @@ pub struct SentinelConfig {
     pub scheduler_interval: u64,
     /// How often to poll watchers (seconds)
     pub watcher_interval: u64,
+    /// How often to poll connected integrations for new activity (seconds)
+    pub integration_sync_interval: u64,
     /// How often to run memory consolidation (seconds)
     pub consolidation_interval: u64,
     /// How often to expire old approvals (seconds)
@@ -2061,6 +2063,7 @@ impl Default for SentinelConfig {
             _process_check_interval: 30,
             scheduler_interval: 30,
             watcher_interval: 15,
+            integration_sync_interval: 120,
             consolidation_interval: 600,
             approval_expiry_interval: 300,
             pulse_interval: 1800,              // 30 minutes
@@ -2138,6 +2141,41 @@ pub fn start(
             }
         })
     });
+
+    if config.integration_sync_interval > 0 {
+        handles.push({
+            let agent = agent.clone();
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if !sleep_or_shutdown(std::time::Duration::from_secs(35), &mut shutdown).await {
+                    return;
+                }
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    config.integration_sync_interval,
+                ));
+                interval.tick().await;
+                loop {
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
+                    if is_agent_autonomy_paused(&agent).await {
+                        continue;
+                    }
+                    run_with_busy_deferral(
+                        &agent,
+                        "integration_sync",
+                        MAINTENANCE_DEFER_MINUTES,
+                        MAINTENANCE_MAX_DEFERS,
+                        || {
+                            let agent = agent.clone();
+                            async move { run_integration_sync(&agent).await }
+                        },
+                    )
+                    .await;
+                }
+            })
+        });
+    }
 
     // ── Memory Consolidation ────────────────────────────────────────────
     handles.push({
@@ -2411,9 +2449,14 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, consolidation={}s, pulse={}s, auto_analysis={}s, mem0_cleanup=monthly",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, pulse={}s, auto_analysis={}s, mem0_cleanup=monthly",
         config.scheduler_interval,
         config.watcher_interval,
+        if config.integration_sync_interval > 0 {
+            config.integration_sync_interval.to_string()
+        } else {
+            "off".to_string()
+        },
         config.consolidation_interval,
         if config.pulse_interval > 0 {
             config.pulse_interval.to_string()
@@ -2669,6 +2712,17 @@ async fn run_watchers(agent: &SharedAgent) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Memory Consolidation
 // ═══════════════════════════════════════════════════════════════════════════
+
+async fn run_integration_sync(agent: &SharedAgent) {
+    let shared_agent = agent.clone();
+    let ctx = {
+        let agent = shared_agent.read().await;
+        crate::core::integration_sync::context_from_agent(&agent, Some(shared_agent.clone()))
+    };
+    if let Err(error) = crate::core::integration_sync::run_due_syncs(&ctx).await {
+        tracing::warn!("ArkSentinel: integration sync failed: {}", error);
+    }
+}
 
 async fn run_consolidation(agent: &SharedAgent) {
     let agent = agent.read().await;
@@ -2994,6 +3048,17 @@ pub async fn run_pulse(agent: &SharedAgent) {
     }
     let _pulse_guard = PulseRunGuard;
 
+    {
+        let shared_agent = agent.clone();
+        let ctx = {
+            let guard = shared_agent.read().await;
+            crate::core::integration_sync::context_from_agent(&guard, Some(shared_agent.clone()))
+        };
+        if let Err(error) = crate::core::integration_sync::run_due_syncs(&ctx).await {
+            tracing::debug!("ArkPulse integration probe skipped: {}", error);
+        }
+    }
+
     // ── Code-only checks first (zero LLM tokens) ────────────────────────
     // Only wake the LLM if there's actually something worth acting on.
 
@@ -3282,7 +3347,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
                         severity: severity.to_string(),
                         message: format!("{}: {} event(s)", desc, count),
                         source: Some("arkpulse".to_string()),
-                        count: *count as i64,
+                        count: (*count).min(i32::MAX as u64) as i32,
                         created_at: now_str.clone(),
                     };
                     if let Err(e) = agent.storage.insert_security_log(&log).await {

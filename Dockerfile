@@ -12,6 +12,51 @@
 # across rebuilds when using docker-compose.
 #
 # =============================================================================
+# BUILD VARIANTS
+# =============================================================================
+#
+# SLIM BUILD (~900MB) — core agent, no heavy optional runtimes:
+#
+#   docker build -t agentark:slim .
+#
+# FULL BUILD (~5-6GB) — everything including Playwright, Ollama, mem0, etc:
+#
+#   docker build -t agentark:full \
+#     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true \
+#     --build-arg INSTALL_MEM0=true \
+#     --build-arg INSTALL_FFMPEG=true \
+#     --build-arg INSTALL_TAILSCALE=true \
+#     --build-arg INSTALL_CLOUDFLARED=true \
+#     --build-arg INSTALL_LIGHTPANDA=true \
+#     --build-arg INSTALL_GWS=true \
+#     --build-arg INSTALL_OLLAMA_CLI=true \
+#     --build-arg INSTALL_REMOTION_TEMPLATE=true \
+#     --build-arg INSTALL_WHATSAPP_BRIDGE=true \
+#     .
+#
+# PowerShell (Windows):
+#
+#   docker build -t agentark:full `
+#     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true `
+#     --build-arg INSTALL_MEM0=true `
+#     --build-arg INSTALL_FFMPEG=true `
+#     --build-arg INSTALL_TAILSCALE=true `
+#     --build-arg INSTALL_CLOUDFLARED=true `
+#     --build-arg INSTALL_LIGHTPANDA=true `
+#     --build-arg INSTALL_GWS=true `
+#     --build-arg INSTALL_OLLAMA_CLI=true `
+#     --build-arg INSTALL_REMOTION_TEMPLATE=true `
+#     --build-arg INSTALL_WHATSAPP_BRIDGE=true `
+#     .
+#
+# CUSTOM BUILD — pick only what you need:
+#
+#   docker build -t agentark:custom \
+#     --build-arg INSTALL_MEM0=true \
+#     --build-arg INSTALL_CLOUDFLARED=true \
+#     .
+#
+# =============================================================================
 # MANUAL DOCKER RUN (must include volumes to preserve data):
 #
 #   docker run -d -p 8990:8990 \
@@ -28,8 +73,9 @@ FROM rust:1.92-bookworm AS builder
 
 WORKDIR /app
 
-# Copy manifests
+# Copy manifests and vendored dependencies
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -39,11 +85,12 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 ENV CARGO_BUILD_JOBS=1
 ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+ARG AGENTARK_DOCKER_FEATURES="telegram,docker,ssh"
 
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release -j 1 && rm -rf src
+    cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j 1 && rm -rf src
 
 # Copy source + assets (logo.svg is included at compile time via include_str!)
 # CACHEBUST invalidates the layer when source changes aren't detected by Docker
@@ -55,7 +102,7 @@ COPY assets ./assets
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     rm -f target/release/agentark target/release/deps/agentark-* && \
-    touch src/main.rs && cargo build --release -j 1 && \
+    touch src/main.rs && cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j 1 && \
     cp target/release/agentark /app/agentark-bin
 
 # ── Stage 2: Frontend build ──────────────────────────────────────────────────
@@ -72,55 +119,84 @@ RUN npm run build
 # Build node_modules here (git available), then copy only the result to runtime
 FROM node:20-slim AS node-builder
 
+ARG INSTALL_WHATSAPP_BRIDGE=true
+ARG INSTALL_PLAYWRIGHT_RUNTIME=false
+ARG INSTALL_REMOTION_TEMPLATE=false
+
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /bridge/whatsapp-bridge
 COPY services/whatsapp-bridge/package.json services/whatsapp-bridge/package-lock.json ./
-RUN printf '[url "https://github.com/"]\n\tinsteadOf = ssh://git@github.com/\n\tinsteadOf = git@github.com:\n' > /root/.gitconfig && \
-    npm ci --omit=dev && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /root/.gitconfig /tmp/*
+RUN if [ "${INSTALL_WHATSAPP_BRIDGE}" = "true" ]; then \
+        printf '[url "https://github.com/"]\n\tinsteadOf = ssh://git@github.com/\n\tinsteadOf = git@github.com:\n' > /root/.gitconfig && \
+        npm ci --omit=dev && \
+        npm cache clean --force && \
+        rm -rf /root/.npm /root/.gitconfig /tmp/*; \
+    fi
 COPY services/whatsapp-bridge/index.js ./
 
 # Playwright bridge (skip browser download; runtime image provides browsers)
 WORKDIR /bridge/playwright-bridge
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 COPY services/playwright-bridge/package.json services/playwright-bridge/package-lock.json ./
-RUN npm ci --omit=dev && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /tmp/*
+RUN if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
+        npm ci --omit=dev && \
+        npm cache clean --force && \
+        rm -rf /root/.npm /tmp/*; \
+    fi
 COPY services/playwright-bridge/index.js ./
 
 # Remotion video template (pre-install node_modules for fast renders)
 WORKDIR /bridge/remotion-template
 COPY services/remotion-template/package.json services/remotion-template/package-lock.json ./
-RUN npm ci --omit=dev 2>/dev/null && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /tmp/*
+RUN if [ "${INSTALL_REMOTION_TEMPLATE}" = "true" ]; then \
+        npm ci --omit=dev 2>/dev/null && \
+        npm cache clean --force && \
+        rm -rf /root/.npm /tmp/*; \
+    fi
 COPY services/remotion-template/src ./src
 COPY services/remotion-template/tsconfig.json services/remotion-template/remotion.config.ts ./
 
 # ── Stage 4: Minimal runtime ────────────────────────────────────────────────
-FROM mcr.microsoft.com/playwright:v1.58.2-noble
+FROM node:20-bookworm-slim
 
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    gosu \
-    ffmpeg \
-    git \
-    python3 \
-    python3-venv \
-    zstd \
-    && mkdir -p --mode=0755 /usr/share/keyrings \
-    && curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
-        -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
-    && curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
-        -o /etc/apt/sources.list.d/tailscale.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends tailscale \
-    && rm -rf /var/lib/apt/lists/*
+ARG INSTALL_PLAYWRIGHT_RUNTIME=false
+ARG INSTALL_MEM0=false
+ARG INSTALL_FFMPEG=false
+ARG INSTALL_TAILSCALE=false
+ARG INSTALL_CLOUDFLARED=false
+ARG INSTALL_LIGHTPANDA=true
+ARG INSTALL_GWS=false
+ARG INSTALL_OLLAMA_CLI=false
+ARG INSTALL_REMOTION_TEMPLATE=false
+
+RUN set -eux; \
+    apt_packages="ca-certificates curl gosu git python3 python3-pip python3-venv"; \
+    if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
+        apt_packages="${apt_packages} chromium"; \
+    fi; \
+    if [ "${INSTALL_FFMPEG}" = "true" ]; then \
+        apt_packages="${apt_packages} ffmpeg"; \
+    fi; \
+    if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
+        apt_packages="${apt_packages} zstd"; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ${apt_packages}; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN if [ "${INSTALL_TAILSCALE}" = "true" ]; then \
+        set -eux; \
+        mkdir -p --mode=0755 /usr/share/keyrings; \
+        curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
+            -o /usr/share/keyrings/tailscale-archive-keyring.gpg; \
+        curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list \
+            -o /etc/apt/sources.list.d/tailscale.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends tailscale; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /app
 
@@ -134,13 +210,16 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MEM0_VENV=/opt/mem0-venv \
-    MEM0_PYTHON=/opt/mem0-venv/bin/python
+    MEM0_PYTHON=/opt/mem0-venv/bin/python \
+    PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install Mem0 Python dependencies in an isolated virtualenv.
 COPY services/mem0-bridge/requirements.txt /app/mem0-bridge/
-RUN python3 -m venv "${MEM0_VENV}" && \
-    "${MEM0_VENV}/bin/pip" install --upgrade pip setuptools wheel && \
-    "${MEM0_VENV}/bin/pip" install -r /app/mem0-bridge/requirements.txt
+RUN if [ "${INSTALL_MEM0}" = "true" ]; then \
+        python3 -m venv "${MEM0_VENV}" && \
+        "${MEM0_VENV}/bin/pip" install --upgrade pip setuptools wheel && \
+        "${MEM0_VENV}/bin/pip" install -r /app/mem0-bridge/requirements.txt; \
+    fi
 
 # Copy Mem0 bridge app
 COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
@@ -149,23 +228,48 @@ COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
 # Download cloudflared for built-in tunnel support (zero-friction remote access)
 # Pinned version for reproducible builds — update deliberately after testing.
 ARG CLOUDFLARED_VERSION=2026.2.0
-RUN curl -fsSL --retry 3 \
-    "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
-    -o /usr/local/bin/cloudflared && \
-    chmod +x /usr/local/bin/cloudflared
+RUN if [ "${INSTALL_CLOUDFLARED}" = "true" ]; then \
+        curl -fsSL --retry 3 \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+            -o /usr/local/bin/cloudflared && \
+        chmod +x /usr/local/bin/cloudflared; \
+    fi
 
 # Download Lightpanda for fast headless content extraction (~6MB vs ~1.5GB Chromium)
 # Used as fast-path for http_get, web search scraping, and research content fetching.
 # Playwright remains for screenshots and complex SPA interaction.
 ARG LIGHTPANDA_RELEASE=nightly
-RUN curl -fsSL --retry 3 \
-    "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/lightpanda-x86_64-linux" \
-    -o /usr/local/bin/lightpanda && \
-    chmod +x /usr/local/bin/lightpanda
+RUN if [ "${INSTALL_LIGHTPANDA}" = "true" ]; then \
+        curl -fsSL --retry 3 \
+            "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/lightpanda-x86_64-linux" \
+            -o /usr/local/bin/lightpanda && \
+        chmod +x /usr/local/bin/lightpanda; \
+    fi
+
+# Install Google Workspace CLI so AgentArk can use gws as a Workspace execution backend.
+ARG GOOGLE_WORKSPACE_CLI_VERSION=latest
+RUN if [ "${INSTALL_GWS}" = "true" ]; then \
+        npm install -g "@googleworkspace/cli@${GOOGLE_WORKSPACE_CLI_VERSION}" && \
+        mkdir -p /app/gws-skills && \
+        cd /app/gws-skills && \
+        (gws generate-skills >/dev/null 2>&1 || true) && \
+        npm cache clean --force; \
+    fi
 
 # Install the Ollama CLI so AgentArk can expose `ollama launch` application registry actions.
 ARG OLLAMA_LINUX_URL=https://ollama.com/download/ollama-linux-amd64.tar.zst
-RUN curl -fsSL --retry 3 "${OLLAMA_LINUX_URL}" | tar --zstd -x -C /usr
+RUN if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
+        curl -fL \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            -o /tmp/ollama-linux-amd64.tar.zst \
+            "${OLLAMA_LINUX_URL}" && \
+        tar --zstd -xf /tmp/ollama-linux-amd64.tar.zst -C /usr && \
+        rm -f /tmp/ollama-linux-amd64.tar.zst; \
+    fi
 
 RUN apt-get purge -y --auto-remove curl && rm -rf /var/lib/apt/lists/*
 
@@ -200,8 +304,9 @@ ENV AGENTARK_DATA=/app/data
 ENV TS_STATE_DIR=/app/data/tailscale
 ENV TS_SOCKET=/app/data/tailscale/tailscaled.sock
 ENV TS_USERSPACE=true
-# Playwright browsers are preinstalled in the base image
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# Playwright automation is optional in the slim image. When enabled, the bridge
+# uses a system Chromium binary instead of the full Playwright browser bundle.
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
 # Default bridge URL for in-container Playwright service
 ENV PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
 # Secure logging: suppress SQLx queries to prevent sensitive data exposure

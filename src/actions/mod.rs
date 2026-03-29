@@ -5,6 +5,7 @@
 pub mod app;
 pub mod calendar;
 pub mod gmail;
+pub mod google_workspace;
 pub mod research;
 pub mod search;
 #[cfg(feature = "ssh")]

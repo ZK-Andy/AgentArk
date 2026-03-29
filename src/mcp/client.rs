@@ -71,6 +71,7 @@ struct StdioTransport {
     command: String,
     args: Vec<String>,
     working_dir: Option<std::path::PathBuf>,
+    env: std::collections::HashMap<String, String>,
     session: Option<StdioSession>,
 }
 
@@ -82,7 +83,11 @@ struct StdioSession {
 }
 
 impl McpClient {
-    pub fn new(config: &McpServerConfig, auth: Option<McpAuth>) -> Result<Self> {
+    pub fn new(
+        config: &McpServerConfig,
+        auth: Option<McpAuth>,
+        env: std::collections::HashMap<String, String>,
+    ) -> Result<Self> {
         let timeout = Duration::from_secs(config.timeout_secs);
         let max_response_bytes = config.max_response_bytes;
         let transport = match &config.transport {
@@ -95,10 +100,12 @@ impl McpClient {
                 command,
                 args,
                 working_dir,
+                ..
             } => McpTransport::Stdio(Box::new(StdioTransport {
                 command: command.clone(),
                 args: args.clone(),
                 working_dir: working_dir.as_ref().map(std::path::PathBuf::from),
+                env,
                 session: None,
             })),
         };
@@ -358,6 +365,9 @@ impl StdioTransport {
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
         }
+        if !self.env.is_empty() {
+            cmd.envs(&self.env);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to start MCP stdio server: {}", e))?;
@@ -387,9 +397,10 @@ impl StdioSession {
         max_response_bytes: usize,
     ) -> Result<RpcResponse> {
         let json = serde_json::to_vec(request)?;
-        let header = format!("Content-Length: {}\r\n\r\n", json.len());
-        self.stdin.write_all(header.as_bytes()).await?;
+        // Use line-delimited JSON (newline-terminated) — compatible with both
+        // LSP-style Content-Length servers and line-delimited servers.
         self.stdin.write_all(&json).await?;
+        self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
 
         let expected_id = request.id.clone();
@@ -403,9 +414,8 @@ impl StdioSession {
 
     async fn send_notification(&mut self, request: &RpcRequest) -> Result<()> {
         let json = serde_json::to_vec(request)?;
-        let header = format!("Content-Length: {}\r\n\r\n", json.len());
-        self.stdin.write_all(header.as_bytes()).await?;
         self.stdin.write_all(&json).await?;
+        self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
         Ok(())
     }

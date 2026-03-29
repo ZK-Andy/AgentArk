@@ -17,7 +17,10 @@ type Props = {
 export function MetricBarCard({ title, value, values, rows, palette }: Props) {
   const option = {
     backgroundColor: "transparent",
-    animationDuration: 320,
+    animation: true,
+    animationDuration: 800,
+    animationEasing: "cubicOut",
+    animationDelay: (idx: number) => idx * 60,
     grid: { left: 0, right: 0, top: 8, bottom: 2, containLabel: false },
     tooltip: {
       trigger: "axis",

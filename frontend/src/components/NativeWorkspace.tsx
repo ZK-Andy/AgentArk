@@ -47,6 +47,8 @@ import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
+import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
+import StarRoundedIcon from "@mui/icons-material/StarRounded";
 import ArrowUpwardRoundedIcon from "@mui/icons-material/ArrowUpwardRounded";
 import StopRoundedIcon from "@mui/icons-material/StopRounded";
 import CloseIcon from "@mui/icons-material/Close";
@@ -55,13 +57,17 @@ import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import SmartToyRoundedIcon from "@mui/icons-material/SmartToyRounded";
 import PersonRoundedIcon from "@mui/icons-material/PersonRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import ReactECharts from "echarts-for-react";
 import { api } from "../api/client";
 import AgentLogo from "../assets/logo.svg";
 import { MetricBarCard } from "./analytics/MetricBarCard";
+import { BrowserProfilesPanel } from "./BrowserProfilesPanel";
+import { ChannelsControlPanel } from "./ChannelsControlPanel";
+import { DevicesControlPanel } from "./DevicesControlPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { ObservabilityPanel } from "./ObservabilityPanel";
+import { RoutingControlPanel } from "./RoutingControlPanel";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { SwarmManager } from "./SwarmManager";
 import {
@@ -96,6 +102,8 @@ const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
 const CHAT_PENDING_STREAM_STEPS_MAX = 48;
 const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
 const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
+const CHAT_CONVERSATIONS_PAGE_SIZE = 20;
+const CHAT_STARRED_LIMIT = 3;
 type ImportRiskBand = "secure" | "review" | "risky";
 
 type ChatPendingRunSnapshot = {
@@ -127,11 +135,9 @@ type ChatRunStatusDetail = {
 
 type ChatExecutionMode = "auto" | "chat" | "task";
 
-type ActiveChatTaskState = {
-  id: string;
-  description: string;
-  status: string;
-  workType: string;
+type WorkspaceFileEntry = {
+  name: string;
+  content: string;
 };
 
 const MODEL_FALLBACKS_BY_PROVIDER: Record<string, string[]> = {
@@ -177,6 +183,12 @@ type LiveFileWriteState = {
   line: number;
   totalLines: number;
   done: boolean;
+};
+
+type ToolProgressPresentation = {
+  title: string;
+  detail: string;
+  streamKey?: string;
 };
 
 type TrustApprovalPreset = {
@@ -258,6 +270,14 @@ type SkillEditorForm = {
 
 export type WorkspaceView =
   | "chat"
+  | "connections"
+  | "channels"
+  | "routing"
+  | "webhooks"
+  | "devices"
+  | "browser"
+  | "gatewayops"
+  | "failover"
   | "tasks"
   | "skills"
   | "apps"
@@ -326,6 +346,137 @@ function toBool(value: unknown): boolean {
     return normalized === "true" || normalized === "1" || normalized === "yes";
   }
   return false;
+}
+
+function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
+  const raw = str(pathOrName, "").trim();
+  if (!raw) return "";
+  let normalized = raw.replace(/\\/g, "/");
+  const normalizedAppDir = appDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (
+    normalizedAppDir &&
+    normalized.toLowerCase().startsWith(`${normalizedAppDir.toLowerCase()}/`)
+  ) {
+    normalized = normalized.slice(normalizedAppDir.length + 1);
+  }
+  normalized = normalized.replace(/^.*\/apps\/[^/]+\//i, "");
+  normalized = normalized.replace(/^\/+/, "");
+  return normalized || raw;
+}
+
+function mergeWorkspaceFiles(
+  current: WorkspaceFileEntry[],
+  incoming: WorkspaceFileEntry[]
+): WorkspaceFileEntry[] {
+  const merged = new Map(current.map((file) => [file.name, file] as const));
+  for (const file of incoming) {
+    if (!file.name) continue;
+    const existing = merged.get(file.name);
+    if (!existing) {
+      merged.set(file.name, file);
+      continue;
+    }
+    if (file.content && file.content !== existing.content) {
+      merged.set(file.name, file);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function extractWorkspaceAppFromStreamPayload(name: string, payload: unknown): JsonRecord | null {
+  const obj = asRecord(payload);
+  const source = name === "app_inspect" ? asRecord(obj.matched_app) : obj;
+  const appId = str(source.app_id, str(source.id, "")).trim();
+  const url = str(source.local_url, str(source.url, "")).trim();
+  const accessUrl = str(
+    source.local_access_url,
+    str(source.access_url, url)
+  ).trim();
+  if (!appId && !url && !accessUrl) return null;
+  return {
+    id: appId,
+    app_id: appId,
+    title: str(source.title, "App"),
+    url: str(source.url, url),
+    access_url: str(source.access_url, accessUrl || url),
+    local_url: url,
+    local_access_url: accessUrl,
+    app_dir: str(source.app_dir, "").trim(),
+    running: source.running ?? true,
+    is_static: source.is_static ?? true,
+    runtime_mode: str(source.runtime_mode, toBool(source.is_static) ? "static" : "unknown")
+  };
+}
+
+function extractWorkspaceFilesFromStreamPayload(
+  name: string,
+  payload: unknown
+): WorkspaceFileEntry[] {
+  const obj = asRecord(payload);
+  const source = name === "app_inspect" ? asRecord(obj.matched_app) : obj;
+  const appDir = str(source.app_dir, str(obj.app_dir, "")).trim();
+  const filesValue = source.files ?? obj.files;
+  if (Array.isArray(filesValue)) {
+    return filesValue
+      .map((row) => {
+        const entry = asRecord(row);
+        return {
+          name: normalizeWorkspaceFileName(entry.path, appDir),
+          content: ""
+        };
+      })
+      .filter((file) => !!file.name);
+  }
+
+  const filesMap = asRecord(filesValue);
+  const mappedFiles = Object.entries(filesMap)
+    .filter(([, value]) => typeof value === "string")
+    .map(([path, value]) => ({
+      name: normalizeWorkspaceFileName(path, appDir),
+      content: value as string
+    }))
+    .filter((file) => !!file.name);
+  if (mappedFiles.length > 0) {
+    return mappedFiles;
+  }
+
+  const fileNames = Array.isArray(source.file_names)
+    ? source.file_names
+    : Array.isArray(obj.file_names)
+      ? obj.file_names
+      : [];
+  return fileNames
+    .map((value) => ({
+      name: normalizeWorkspaceFileName(value, appDir),
+      content: ""
+    }))
+    .filter((file) => !!file.name);
+}
+
+function tunnelCheckAlertSeverity(status: unknown): "success" | "info" | "warning" | "error" {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass" || normalized === "healthy" || normalized === "ok") return "success";
+  if (normalized === "fail" || normalized === "error" || normalized === "down") return "error";
+  if (normalized === "warn" || normalized === "warning" || normalized === "degraded") return "warning";
+  return "info";
+}
+
+function tunnelCheckChipColor(status: unknown): "success" | "info" | "warning" | "error" | "default" {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass" || normalized === "healthy" || normalized === "ok") return "success";
+  if (normalized === "fail" || normalized === "error" || normalized === "down") return "error";
+  if (normalized === "warn" || normalized === "warning" || normalized === "degraded") return "warning";
+  if (normalized === "info") return "info";
+  return "default";
+}
+
+function tunnelCheckLabel(status: unknown): string {
+  const normalized = str(status, "info").trim().toLowerCase();
+  if (normalized === "pass") return "Ready";
+  if (normalized === "fail") return "Needs action";
+  if (normalized === "warn") return "Check";
+  if (!normalized) return "Info";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 function compactUnknown(value: unknown, maxLen = 2200): string {
@@ -447,6 +598,46 @@ function summarizeActivityDetail(detail: string): string {
   }
 
   return trimmed;
+}
+
+function buildToolProgressPresentation(
+  name: string,
+  content: string,
+  payload: unknown,
+  appDir = ""
+): ToolProgressPresentation {
+  const preview = (content || "").trim().slice(0, 1600);
+  const detail = summarizeActivityDetail(preview);
+  const payloadObj = asRecord(payload);
+  const isFileWriteProgress =
+    (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
+    name === "file_write";
+
+  if (isFileWriteProgress) {
+    const fileName = normalizeWorkspaceFileName(
+      payloadObj.file ?? payloadObj.path,
+      appDir
+    );
+    const lineNo = Math.max(0, num(payloadObj.line, 0));
+    const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+    const text = str(payloadObj.text, "").trim();
+    const lineLabel =
+      totalLines > 0
+        ? `Line ${Math.min(lineNo, totalLines)}/${totalLines}`
+        : lineNo > 0
+          ? `Line ${lineNo}`
+          : "Preparing file";
+    return {
+      title: `Writing ${fileName || "file"}`,
+      detail: text ? `${lineLabel}: ${text}` : lineLabel,
+      streamKey: fileName ? `file-write:${fileName}` : "file-write"
+    };
+  }
+
+  return {
+    title: `Tool progress: ${name || "tool"}`,
+    detail: detail || preview
+  };
 }
 
 function isHumanReadableStatus(detail: string): boolean {
@@ -1637,7 +1828,14 @@ function formatTraceStepTime(raw: string): string {
   const durationPart = match[2]?.trim() || "";
   const dt = new Date(isopart);
   if (Number.isNaN(dt.getTime())) return raw;
-  const time = dt.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  const time = dt
+    .toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    })
+    .replace(/\b(am|pm)\b/g, (value) => value.toUpperCase());
   return durationPart ? `${time} ${durationPart}` : time;
 }
 
@@ -3092,7 +3290,8 @@ function QueryTable({
   columns,
   autoRefresh,
   emptyLabel,
-  queryKey
+  queryKey,
+  pageSize
 }: {
   title: string;
   path: string;
@@ -3101,14 +3300,39 @@ function QueryTable({
   autoRefresh: boolean;
   emptyLabel: string;
   queryKey: string;
+  pageSize?: number;
 }) {
+  const [page, setPage] = useState(0);
+  const offset = pageSize ? page * pageSize : 0;
+  const queryPath = useMemo(() => {
+    if (!pageSize) return path;
+    const [pathname, rawSearch = ""] = path.split("?");
+    const params = new URLSearchParams(rawSearch);
+    params.set("limit", String(pageSize));
+    params.set("offset", String(offset));
+    const search = params.toString();
+    return search ? `${pathname}?${search}` : pathname;
+  }, [offset, pageSize, path]);
   const q = useQuery({
-    queryKey: [queryKey],
-    queryFn: () => api.rawGet(path),
+    queryKey: [queryKey, queryPath],
+    queryFn: () => api.rawGet(queryPath),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
 
-  const rows = pickRecords(q.data, arrayKey);
+  const payload = asRecord(q.data);
+  const rows = pickRecords(payload, arrayKey);
+  const totalRows = pageSize ? Math.max(0, num(payload.total, rows.length)) : rows.length;
+  const effectiveLimit = pageSize ? Math.max(1, num(payload.limit, pageSize)) : Math.max(1, rows.length || 1);
+  const pageCount = pageSize ? Math.max(1, Math.ceil(totalRows / effectiveLimit)) : 1;
+  const pageLabel = `${Math.min(page + 1, pageCount)}/${pageCount}`;
+
+  useEffect(() => {
+    if (!pageSize) return;
+    const maxPage = Math.max(0, pageCount - 1);
+    if (page > maxPage) {
+      setPage(maxPage);
+    }
+  }, [page, pageCount, pageSize]);
 
   return (
     <Box className="list-shell">
@@ -3122,7 +3346,37 @@ function QueryTable({
           {emptyLabel}
         </Typography>
       ) : (
-        <DataTable rows={rows} columns={columns} />
+        <>
+          <DataTable rows={rows} columns={columns} />
+          {pageSize ? (
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between" sx={{ mt: 1 }}>
+              <Typography variant="caption" className="conversation-pagination-copy">
+                {totalRows} item{totalRows === 1 ? "" : "s"}
+              </Typography>
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => setPage((prev) => Math.max(0, prev - 1))}
+                  disabled={page <= 0}
+                >
+                  Prev
+                </Button>
+                <Typography variant="caption" className="conversation-page-indicator">
+                  {pageLabel}
+                </Typography>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => setPage((prev) => Math.min(Math.max(0, pageCount - 1), prev + 1))}
+                  disabled={page >= pageCount - 1}
+                >
+                  Next
+                </Button>
+              </Stack>
+            </Stack>
+          ) : null}
+        </>
       )}
     </Box>
   );
@@ -3175,25 +3429,30 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
-  const [activeChatTask, setActiveChatTask] = useState<ActiveChatTaskState | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isStoppingStream, setIsStoppingStream] = useState(false);
   const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(null);
   const [failedUserMessage, setFailedUserMessage] = useState<string | null>(null);
   const [streamingResponse, setStreamingResponse] = useState("");
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
+  const [executionPlan, setExecutionPlan] = useState<Array<{ id: number; title: string; description: string; status: string; tool_hint: string | null }>>([]);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
+  const [completedProgressMessagesByConversation, setCompletedProgressMessagesByConversation] =
+    useState<Record<string, { messages: string[]; beforeMessageId: string }>>({});
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(
     () => typeof window !== "undefined" && window.innerWidth >= 1280
   );
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
   const [secretHelperKey, setSecretHelperKey] = useState("OPENAI_API_KEY");
   const [secretHelperValue, setSecretHelperValue] = useState("");
   const [secretHelperBusy, setSecretHelperBusy] = useState(false);
   const [isDragOverChat, setIsDragOverChat] = useState(false);
-  const [deployedFiles, setDeployedFiles] = useState<Array<{ name: string; content: string }>>([]);
+  const [deployedFiles, setDeployedFiles] = useState<WorkspaceFileEntry[]>([]);
+  const [streamedWorkspaceApp, setStreamedWorkspaceApp] = useState<JsonRecord | null>(null);
   const [liveFileWrites, setLiveFileWrites] = useState<Record<string, LiveFileWriteState>>({});
   const [codeViewerOpen, setCodeViewerOpen] = useState(false);
   const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
@@ -3213,14 +3472,23 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const dragDepthRef = useRef(0);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const streamLockRef = useRef(false);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const activeChatTaskIdRef = useRef<string | null>(null);
+  const stopRequestedRef = useRef(false);
   const recentSendRef = useRef<{ fingerprint: string; at: number } | null>(null);
   const streamingStepsRef = useRef<JsonRecord[]>([]);
   const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
+  const pendingFileReadPathRef = useRef("");
+  const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
+  const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
 
   const convQ = useQuery({
-    queryKey: ["chat-conversations"],
-    queryFn: () => api.rawGet("/conversations?limit=30"),
+    queryKey: ["chat-conversations", conversationPage],
+    queryFn: () =>
+      api.rawGet(
+        `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`
+      ),
     refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
     refetchIntervalInBackground: chatBackgroundRefresh
   });
@@ -3231,11 +3499,41 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     refetchIntervalInBackground: chatBackgroundRefresh
   });
 
-  const conversations = pickRecords(convQ.data, "conversations");
+  const conversationsPayload = asRecord(convQ.data);
+  const conversations = pickRecords(conversationsPayload, "conversations");
+  const starredConversations = pickRecords(conversationsPayload, "starred_conversations").slice(
+    0,
+    CHAT_STARRED_LIMIT
+  );
+  const sidebarConversationIds = useMemo(
+    () => new Set([...starredConversations, ...conversations].map((conv) => str(conv.id, ""))),
+    [starredConversations, conversations]
+  );
+  const conversationListTotal = Math.max(0, num(conversationsPayload.total, conversations.length));
+  const conversationListLimit = Math.max(
+    1,
+    num(conversationsPayload.limit, CHAT_CONVERSATIONS_PAGE_SIZE)
+  );
+  const conversationPageCount = Math.max(
+    1,
+    Math.ceil(conversationListTotal / conversationListLimit)
+  );
+  const conversationPageLabel = `${Math.min(conversationPage + 1, conversationPageCount)}/${conversationPageCount}`;
   const projects = pickRecords(projectsQ.data, "projects");
+  const selectedConversationQ = useQuery({
+    queryKey: ["chat-conversation", conversationId],
+    queryFn: () => api.rawGet(`/conversations/${encodeURIComponent(conversationId || "")}`),
+    enabled: !!conversationId && !sidebarConversationIds.has(conversationId || ""),
+    refetchInterval: chatAutoRefresh ? REFRESH_MS : false
+  });
   const selectedConversation = useMemo(
-    () => conversations.find((conv) => str(conv.id, "") === conversationId) ?? null,
-    [conversations, conversationId]
+    () =>
+      [...starredConversations, ...conversations].find((conv) => str(conv.id, "") === conversationId) ??
+      (() => {
+        const fetched = asRecord(selectedConversationQ.data);
+        return str(fetched.id, "").trim() ? fetched : null;
+      })(),
+    [starredConversations, conversations, conversationId, selectedConversationQ.data]
   );
   const selectedMessageCount = num(selectedConversation?.message_count, 0);
   const selectedConversationUpdatedAtMs = Date.parse(str(selectedConversation?.updated_at, ""));
@@ -3329,14 +3627,22 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   }, [conversationId]);
 
   useEffect(() => {
+    const maxPage = Math.max(0, conversationPageCount - 1);
+    if (conversationPage > maxPage) {
+      setConversationPage(maxPage);
+    }
+  }, [conversationPage, conversationPageCount]);
+
+  useEffect(() => {
     const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
     if (
       pending &&
-      conversations.some((conv) => str(conv.id, "") === pending.conversationId)
+      sidebarConversationIds.has(pending.conversationId)
     ) {
       const shouldSelectPendingConversation = !conversationId;
       const viewingPendingConversation = conversationId === pending.conversationId;
       if (shouldSelectPendingConversation) {
+        setConversationPage(0);
         setConversationId(pending.conversationId);
       }
       if (shouldSelectPendingConversation || viewingPendingConversation) {
@@ -3364,14 +3670,20 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       }
     }
 
-    if (conversationId || conversations.length === 0 || typeof window === "undefined") return;
+    if (
+      conversationId ||
+      (starredConversations.length === 0 && conversations.length === 0) ||
+      typeof window === "undefined"
+    ) {
+      return;
+    }
     try {
       const lastSelected = window.sessionStorage
         .getItem(CHAT_LAST_CONVERSATION_STORAGE_KEY)
         ?.trim();
       if (
         lastSelected &&
-        conversations.some((conv) => str(conv.id, "") === lastSelected)
+        sidebarConversationIds.has(lastSelected)
       ) {
         setConversationId(lastSelected);
       }
@@ -3381,6 +3693,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   }, [
     conversationId,
     conversations,
+    starredConversations,
+    sidebarConversationIds,
     pendingRunSnapshot,
     pendingUserMessage,
     failedUserMessage,
@@ -3407,13 +3721,29 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (preservedSteps.length > 0) {
       setLastRunSteps(preservedSteps);
     }
+    if (streamingProgressMessages.length > 0) {
+      setCompletedProgressMessagesByConversation((prev) => ({
+        ...prev,
+        [pendingRunSnapshot.conversationId]: {
+          messages: streamingProgressMessages.slice(-5),
+          beforeMessageId: str(latestMessage?.id, "")
+        }
+      }));
+    }
     storeChatPendingRunSnapshot(null);
     setPendingRunSnapshot(null);
     setPendingUserMessage(null);
     setStreamingResponse("");
-    setStreamingSteps([]);
+    setStreamingSteps([]); setExecutionPlan([]);
+    setStreamingProgressMessages([]);
     streamingStepsRef.current = [];
-  }, [pendingRunSnapshot, conversationId, messages, streamingSteps]);
+  }, [
+    pendingRunSnapshot,
+    conversationId,
+    messages,
+    streamingSteps,
+    streamingProgressMessages
+  ]);
 
   useEffect(() => {
     if (!latestAssistantTraceId || isStreaming || hasPendingSnapshotForConversation) return;
@@ -3543,7 +3873,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   ): { label: string; detail: string; kind?: string; tone?: string } => {
     const t = title.toLowerCase();
     // Log-style: short typed label + actual detail from the step data
-    if (t === "message received" || t.startsWith("message received")) {
+    if (t === "message received" || t.startsWith("message received") || t === "request received" || t.startsWith("request received")) {
       return { label: "Reading your request", detail: detail || "" };
     }
     if (t === "memory layer" || t.startsWith("memory layer")) {
@@ -3610,6 +3940,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       const rawName = title.split(":").slice(1).join(":").trim();
       return {
         label: `Running ${toHumanToolName(rawName)}`,
+        detail: detail || "Working...",
+        kind: "Running",
+        tone: "tone-action"
+      };
+    }
+    if (stepType.includes("tool_progress") && title.trim()) {
+      return {
+        label: title.trim(),
         detail: detail || "Working...",
         kind: "Running",
         tone: "tone-action"
@@ -3918,6 +4256,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     dragDepthRef.current = 0;
     setIsDragOverChat(false);
     setConversationId(null);
+    setConversationPage(0);
     setDraftProjectId("");
     setPrompt("");
     setDeepResearchEnabled(false);
@@ -3927,12 +4266,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setPendingUserMessage(null);
     setFailedUserMessage(null);
     setStreamingResponse("");
-    setStreamingSteps([]);
+    setStreamingSteps([]); setExecutionPlan([]);
+    setStreamingProgressMessages([]);
     streamingStepsRef.current = [];
     setTraceStepsById({});
     setTraceLoadingById({});
     setTraceErrorById({});
     setLastRunSteps([]);
+    setCompletedProgressMessagesByConversation({});
     setLiveFileWrites({});
     setDeployedFiles([]);
     setCodeViewerFileIdx(0);
@@ -3947,7 +4288,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setPendingUserMessage(null);
     setFailedUserMessage(null);
     setStreamingResponse("");
-    setStreamingSteps([]);
+    setStreamingSteps([]); setExecutionPlan([]);
+    setStreamingProgressMessages([]);
     streamingStepsRef.current = [];
     setTraceStepsById({});
     setTraceLoadingById({});
@@ -4128,7 +4470,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       /missing ['"`]?files['"`]?/i.test(message) ||
       /object mapping filename to content/i.test(message)
     ) {
-      return "Deploy payload was malformed (missing files). Retry the request; AgentArk will regenerate a valid app_deploy payload.";
+      return "Deploy payload was malformed — the LLM did not provide a valid `files` object. The agent has been given details to self-correct on retry.";
     }
     if (
       /error decoding response body/i.test(message) ||
@@ -4286,6 +4628,25 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
   };
 
+  const toggleConversationStarMutation = useMutation({
+    mutationFn: ({ id, starred }: { id: string; starred: boolean }) =>
+      api.rawPatch(`/conversations/${encodeURIComponent(id)}`, { starred }),
+    onSuccess: async (_data, vars) => {
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+      await queryClient.invalidateQueries({ queryKey: ["chat-conversation", vars.id] });
+      setChatNotice(vars.starred ? "Chat starred." : "Chat unstarred.");
+    },
+    onError: (err) => {
+      setChatError(normalizeChatError(errMessage(err)));
+    }
+  });
+
+  const toggleConversationStar = async (id: string, starred: boolean) => {
+    if (!id || toggleConversationStarMutation.isPending) return;
+    setChatError(null);
+    await toggleConversationStarMutation.mutateAsync({ id, starred });
+  };
+
   const deleteConversationMutation = useMutation({
     mutationFn: (id: string) => api.rawDelete(`/conversations/${encodeURIComponent(id)}`),
     onSuccess: async (_data, id) => {
@@ -4316,6 +4677,89 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const closeConversationMenu = () => {
     setConversationMenuAnchor(null);
     setConversationMenuTarget(null);
+  };
+
+  const renderConversationCard = (conv: JsonRecord) => {
+    const id = str(conv.id, "");
+    const active = conversationId === id;
+    const starred = toBool(conv.starred);
+    const title = str(conv.title, "Untitled").replace(/\s+/g, " ").trim() || "Untitled";
+    return (
+      <Box
+        key={id}
+        className={`${active ? "conversation-card active" : "conversation-card"}${starred ? " conversation-card-starred" : ""}`}
+        onClick={() => {
+          openConversationById(id);
+        }}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            openConversationById(id);
+          }
+        }}
+      >
+        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
+          <Box sx={{ minWidth: 0, flex: 1 }}>
+            <div className="conversation-card-title" title={title}>
+              {title}
+            </div>
+            {(() => {
+              const updatedAt = str(conv.updated_at, "");
+              if (!updatedAt) return null;
+              const parsed = formatChatTimestamp(updatedAt);
+              return (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: "block", mt: 0.15, opacity: 0.88 }}
+                  title={parsed.tooltip}
+                >
+                  {parsed.label}
+                </Typography>
+              );
+            })()}
+          </Box>
+          <Stack direction="row" alignItems="center" spacing={0.25}>
+            <Tooltip title={starred ? "Unstar chat" : "Star chat"}>
+              <span>
+                <IconButton
+                  size="small"
+                  className={`conversation-card-star-btn${starred ? " active" : ""}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void toggleConversationStar(id, !starred);
+                  }}
+                  disabled={toggleConversationStarMutation.isPending}
+                >
+                  {starred ? (
+                    <StarRoundedIcon fontSize="small" />
+                  ) : (
+                    <StarBorderRoundedIcon fontSize="small" />
+                  )}
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Chat options">
+              <span>
+                <IconButton
+                  size="small"
+                  className="conversation-card-menu"
+                  onClick={(e) => {
+                    openConversationMenu(e, conv);
+                  }}
+                  disabled={
+                    deleteConversationMutation.isPending || toggleConversationStarMutation.isPending
+                  }
+                >
+                  <MoreVertIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </Stack>
+        </Stack>
+      </Box>
+    );
   };
 
   const normalizeActivityStepTime = (step: JsonRecord): JsonRecord => {
@@ -4419,13 +4863,29 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (normalizedName === "app_deploy") {
       const root = asRecord(payload);
       const nested = asRecord(root.payload);
+      // The backend summary uses file_names (array) + file_count (number);
+      // fall back to counting keys in a files object when present.
       const rootFiles = asRecord(root.files);
       const nestedFiles = asRecord(nested.files);
       const filesObj = Object.keys(rootFiles).length > 0 ? rootFiles : nestedFiles;
-      const fileCount = Object.keys(filesObj).length;
+      const summaryNames: string[] = Array.isArray(root.file_names)
+        ? (root.file_names as string[])
+        : [];
+      const fileCount =
+        typeof root.file_count === "number"
+          ? (root.file_count as number)
+          : summaryNames.length > 0
+            ? summaryNames.length
+            : Object.keys(filesObj).length;
+      const fileNames =
+        summaryNames.length > 0
+          ? summaryNames
+          : Object.keys(filesObj);
       const entryCommand = str(root.entry_command, str(nested.entry_command, "")).trim();
       if (fileCount > 0) {
-        return `Preparing deployment package (${fileCount} file${fileCount === 1 ? "" : "s"}${entryCommand ? ", dynamic runtime" : ", static runtime"}).`;
+        const namePreview = fileNames.slice(0, 6).join(", ");
+        const overflow = fileCount > 6 ? ` +${fileCount - 6} more` : "";
+        return `Deploying ${fileCount} file${fileCount === 1 ? "" : "s"}: ${namePreview}${overflow}${entryCommand ? " (dynamic runtime)" : " (static)"}.`;
       }
       return "Preparing deployment package.";
     }
@@ -4435,9 +4895,31 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   };
 
   const pushStreamingStep = (step: JsonRecord) => {
+    // Handle execution plan events
+    const stepType = str(step.step_type, "");
+    if (stepType === "plan_generated") {
+      const rawSteps = Array.isArray(step.steps) ? step.steps : [];
+      setExecutionPlan(rawSteps.map((s: unknown) => {
+        const r = s && typeof s === "object" ? s as Record<string, unknown> : {};
+        return {
+          id: typeof r.id === "number" ? r.id : 0,
+          title: typeof r.title === "string" ? r.title : "Step",
+          description: typeof r.description === "string" ? r.description : "",
+          status: typeof r.status === "string" ? r.status : "pending",
+          tool_hint: typeof r.tool_hint === "string" ? r.tool_hint : null,
+        };
+      }));
+    }
+    if (stepType === "plan_step_update" && typeof step.step_id === "number") {
+      const sid = step.step_id as number;
+      const newStatus = typeof step.status === "string" ? step.status : "running";
+      setExecutionPlan((prev) => prev.map((s) => s.id === sid ? { ...s, status: newStatus } : s));
+    }
+
     setStreamingSteps((prev) => {
       const normalizedStep = ensureActivityStepTime(normalizeActivityStepForDisplay(step));
       const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
+      const incomingStableKey = getStreamingStepStableKey(normalizedStep);
       let next: JsonRecord[];
       if (incomingHeartbeat) {
         const existingIndex = prev.findIndex((row) => isHeartbeatStreamingStep(row));
@@ -4459,6 +4941,17 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         if (heartbeatIndex >= 0) {
           next.splice(heartbeatIndex, 1);
         }
+        if (incomingStableKey) {
+          const existingIndex = next.findIndex(
+            (row) => getStreamingStepStableKey(row) === incomingStableKey
+          );
+          if (existingIndex >= 0) {
+            next.splice(existingIndex, 1);
+            next.push(attachStreamingStepStableKey(normalizedStep, incomingStableKey));
+            streamingStepsRef.current = next;
+            return next;
+          }
+        }
         const lastIdx = next.length - 1;
         const incomingKey = streamingStepDedupKey(normalizedStep);
         if (lastIdx >= 0 && streamingStepDedupKey(next[lastIdx]) === incomingKey) {
@@ -4473,6 +4966,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       streamingStepsRef.current = next;
       return next;
     });
+  };
+
+  const rememberStreamedWorkspaceApp = (nextApp: JsonRecord | null) => {
+    if (!nextApp) return;
+    const merged = { ...(streamedWorkspaceAppRef.current || {}), ...nextApp };
+    streamedWorkspaceAppRef.current = merged;
+    setStreamedWorkspaceApp(merged);
   };
 
   const runStreamingChat = async (
@@ -4515,6 +5015,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
     recentSendRef.current = { fingerprint, at: now };
     streamLockRef.current = true;
+    stopRequestedRef.current = false;
+    activeChatTaskIdRef.current = null;
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
 
     setChatError(null);
     const sensitiveMessage =
@@ -4524,14 +5028,22 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setPendingUserMessage(sensitiveMessage ? null : activeMessage);
     setFailedUserMessage(null);
     setStreamingResponse("");
-    setStreamingSteps([]);
+    setStreamingSteps([]); setExecutionPlan([]);
     setStreamingProgressMessages([]);
+    setCompletedProgressMessagesByConversation((prev) => {
+      if (!targetConversationId || !prev[targetConversationId]) return prev;
+      const next = { ...prev };
+      delete next[targetConversationId];
+      return next;
+    });
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
-    setActiveChatTask(null);
     setStreamTraceOpen(false);
     setIsStreaming(true);
+    pendingFileReadPathRef.current = "";
 
     if (conversationId !== targetConversationId) {
       setConversationId(targetConversationId);
@@ -4592,6 +5104,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             attachments_present: files.length > 0
           },
           {
+          signal: abortController.signal,
           onEvent: (_eventName, payload) => {
             absorbConversationId(payload);
           },
@@ -4610,63 +5123,67 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
               data: name
             });
-            // Capture deployed app files for code viewer
-            if (name === "app_deploy" && payload && typeof payload === "object") {
-              const rec = payload as Record<string, unknown>;
-              const nested = rec.payload && typeof rec.payload === "object"
-                ? (rec.payload as Record<string, unknown>)
-                : null;
-              const files = (rec.files as Record<string, string> | undefined)
-                || (nested?.files as Record<string, string> | undefined);
-              const fileNames = Array.isArray(rec.file_names)
-                ? rec.file_names
-                : Array.isArray(nested?.file_names)
-                  ? nested?.file_names
-                  : [];
-              const captured = files && typeof files === "object"
-                ? Object.entries(files)
-                    .filter(([, v]) => typeof v === "string")
-                    .map(([k, v]) => ({ name: k, content: v as string }))
-                : fileNames
-                    .map((name) => str(name, "").trim())
-                    .filter(Boolean)
-                    .map((name) => ({ name, content: "" }));
-              if (captured.length > 0) {
-                setDeployedFiles((prev) => {
-                  const merged = new Map(prev.map((file) => [file.name, file] as const));
-                  for (const file of captured) {
-                    const existing = merged.get(file.name);
-                    merged.set(file.name, existing && existing.content ? existing : file);
+            if (name === "file_read") {
+              const readPayload = asRecord(payload);
+              pendingFileReadPathRef.current = normalizeWorkspaceFileName(
+                readPayload.path ?? readPayload.file,
+                str(streamedWorkspaceAppRef.current?.app_dir, "")
+              );
+            }
+            const capturedApp = extractWorkspaceAppFromStreamPayload(name, payload);
+            rememberStreamedWorkspaceApp(capturedApp);
+            const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payload);
+            if (capturedFiles.length > 0) {
+              setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles));
+              setLiveFileWrites((prev) => {
+                const next = { ...prev };
+                for (const file of capturedFiles) {
+                  if (!next[file.name]) {
+                    const totalLines =
+                      file.content.length > 0
+                        ? file.content.split(/\r?\n/).length
+                        : 0;
+                    next[file.name] = {
+                      content: "",
+                      line: 0,
+                      totalLines,
+                      done: false
+                    };
                   }
-                  return Array.from(merged.values());
-                });
-                setLiveFileWrites((prev) => {
-                  const next = { ...prev };
-                  for (const file of captured) {
-                    if (!next[file.name]) {
-                      const totalLines =
-                        file.content.length > 0
-                          ? file.content.split(/\r?\n/).length
-                          : 0;
-                      next[file.name] = {
-                        content: file.content ? `${file.content}${file.content.endsWith("\n") ? "" : "\n"}` : "",
-                        line: 0,
-                        totalLines,
-                        done: false
-                      };
-                    }
-                  }
-                  return next;
-                });
-                setCodeViewerFileIdx(0);
-                setWorkspaceOpen(true);
-              }
+                }
+                return next;
+              });
+              setCodeViewerFileIdx(0);
+              setWorkspaceOpen(true);
             }
           },
           onToolResult: (name, content, payload) => {
             const preview = content.trim().slice(0, 1600);
             const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
-            if (name === "app_deploy") {
+            const payloadObj = asRecord(payload);
+            const capturedApp = extractWorkspaceAppFromStreamPayload(name, payloadObj);
+            rememberStreamedWorkspaceApp(capturedApp);
+            if (capturedApp) setWorkspaceOpen(true);
+            const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payloadObj);
+            if (capturedFiles.length > 0) {
+              setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles));
+              setWorkspaceOpen(true);
+            }
+            if (name === "file_read") {
+              const rawContent = str(payloadObj.raw_content, "").trim();
+              const fileName = normalizeWorkspaceFileName(
+                payloadObj.path ?? payloadObj.file ?? pendingFileReadPathRef.current,
+                str(capturedApp?.app_dir, str(streamedWorkspaceAppRef.current?.app_dir, ""))
+              );
+              if (fileName && rawContent) {
+                setDeployedFiles((prev) =>
+                  mergeWorkspaceFiles(prev, [{ name: fileName, content: rawContent }])
+                );
+                setWorkspaceOpen(true);
+              }
+              pendingFileReadPathRef.current = "";
+            }
+            if (name === "app_deploy" || name === "app_restart") {
               setLiveFileWrites((prev) => {
                 const next: Record<string, LiveFileWriteState> = {};
                 for (const [file, state] of Object.entries(prev)) {
@@ -4683,11 +5200,18 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             });
           },
           onToolProgress: (name, content, payload) => {
-            const preview = content.trim().slice(0, 1600);
-            const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
             const payloadObj = asRecord(payload);
+            const progressPresentation = buildToolProgressPresentation(
+              name,
+              content,
+              payloadObj,
+              str(streamedWorkspaceAppRef.current?.app_dir, "")
+            );
             if (toBool(payloadObj.chat_visible)) {
-              const chatMessage = str(payloadObj.chat_message, detail || preview).trim();
+              const chatMessage = str(
+                payloadObj.chat_message,
+                progressPresentation.detail || content.trim().slice(0, 1600)
+              ).trim();
               if (chatMessage) {
                 setStreamingProgressMessages((prev) => {
                   if (prev.some((entry) => entry === chatMessage)) return prev;
@@ -4699,7 +5223,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
               name === "file_write";
             if (isFileWriteProgress) {
-              const fileName = str(payloadObj.file, "").trim();
+              const fileName = normalizeWorkspaceFileName(
+                payloadObj.file ?? payloadObj.path,
+                str(streamedWorkspaceAppRef.current?.app_dir, "")
+              );
               if (fileName) {
                 const lineNo = Math.max(0, num(payloadObj.line, 0));
                 const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
@@ -4734,22 +5261,17 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             }
             pushStreamingStep({
               step_type: "tool_progress",
-              title: `Tool progress: ${name || "tool"}`,
-              detail: detail || preview,
-              data: Object.keys(payloadObj).length > 0 ? payloadObj : detail || preview
+              title: progressPresentation.title,
+              detail: progressPresentation.detail,
+              data: Object.keys(payloadObj).length > 0 ? payloadObj : progressPresentation.detail,
+              ...(progressPresentation.streamKey ? { __streamKey: progressPresentation.streamKey } : {})
             });
           },
           onTaskStarted: (payload) => {
             const taskId = str(payload.task_id, "");
             const description = str(payload.description, "Task");
-            const workType = str(payload.work_type, "task");
             if (!taskId) return;
-            setActiveChatTask({
-              id: taskId,
-              description,
-              status: "in_progress",
-              workType
-            });
+            activeChatTaskIdRef.current = taskId;
             setChatNotice(`Task started: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
@@ -4758,14 +5280,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             const taskId = str(payload.task_id, "");
             const description = str(payload.description, "Task");
             const status = str(payload.status, "");
-            const workType = str(payload.work_type, "task");
             if (!taskId || !status) return;
-            setActiveChatTask((prev) => ({
-              id: taskId,
-              description: description || prev?.description || "Task",
-              status,
-              workType: workType || prev?.workType || "task"
-            }));
             const statusLabel =
               status === "completed"
                 ? "completed"
@@ -4791,7 +5306,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         }
       );
     } catch (err) {
-      streamError = normalizeChatError(errMessage(err));
+      const aborted =
+        stopRequestedRef.current &&
+        ((err instanceof DOMException && err.name === "AbortError") ||
+          errMessage(err).toLowerCase().includes("abort"));
+      if (!aborted) {
+        streamError = normalizeChatError(errMessage(err));
+      }
     } finally {
       if (streamError) {
         setChatError(streamError);
@@ -4824,6 +5345,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           }
         }
         if (resolvedConversationId) {
+          setConversationPage(0);
           setConversationId(resolvedConversationId);
           await queryClient.invalidateQueries({ queryKey: ["chat-messages", resolvedConversationId] });
         }
@@ -4850,14 +5372,40 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         storeChatPendingRunSnapshot(null);
         setPendingRunSnapshot(null);
         setPendingUserMessage(null);
-        setStreamingSteps([]);
+        setStreamingSteps([]); setExecutionPlan([]);
         streamingStepsRef.current = [];
         setStreamingResponse("");
       }
+      streamAbortRef.current = null;
+      activeChatTaskIdRef.current = null;
+      stopRequestedRef.current = false;
       setIsStreaming(false);
+      setIsStoppingStream(false);
       streamLockRef.current = false;
     }
     return !streamError;
+  };
+
+  const handleStopStreaming = async () => {
+    if (!isStreaming && !streamLockRef.current) return;
+    stopRequestedRef.current = true;
+    setIsStoppingStream(true);
+    setChatError(null);
+    setChatNotice("Stopping...");
+    streamAbortRef.current?.abort();
+    const activeTaskId = activeChatTaskIdRef.current;
+    if (activeTaskId) {
+      try {
+        await api.rawPost(`/tasks/${encodeURIComponent(activeTaskId)}/cancel`, {});
+        setChatNotice("Stopped.");
+      } catch (err) {
+        setChatNotice(`Stop requested, but task cancel failed: ${errMessage(err)}`);
+      }
+    } else {
+      setChatNotice("Stopped.");
+    }
+    void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
   };
 
   useEffect(() => {
@@ -4908,7 +5456,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (stickToBottom.current) {
       thread.scrollTop = thread.scrollHeight;
     }
-  });
+  }, [
+    messages.length,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse.length,
+    streamingProgressMessages.length,
+    isStreaming
+  ]);
   // Track whether user is near bottom to decide if we should auto-stick
   useEffect(() => {
     const thread = threadRef.current;
@@ -4968,9 +5523,50 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const visiblePendingUserMessage = hasPendingSnapshotForConversation ? pendingUserMessage : null;
   const visibleFailedUserMessage = hasPendingSnapshotForConversation ? failedUserMessage : null;
   const visibleStreamingResponse = hasPendingSnapshotForConversation ? streamingResponse : "";
+  const completedProgressSnapshot =
+    !hasPendingSnapshotForConversation && conversationId
+      ? completedProgressMessagesByConversation[conversationId] || null
+      : null;
   const visibleStreamingProgressMessages = hasPendingSnapshotForConversation
     ? streamingProgressMessages
-    : [];
+    : completedProgressSnapshot?.messages || []
+      ;
+  const completedProgressBeforeMessageId = completedProgressSnapshot?.beforeMessageId || "";
+  const pendingSnapshotStartedAt = pendingRunSnapshot?.startedAt ?? 0;
+  const latestPendingUserMessageIndex = useMemo(() => {
+    if (!showStreamingAssistant || !visiblePendingUserMessage) return -1;
+    const pendingNorm = stripAttachmentContextMarker(visiblePendingUserMessage).trim();
+    if (!pendingNorm) return -1;
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "user") continue;
+      const msgNorm = stripAttachmentContextMarker(str(candidate.content, "")).trim();
+      if (msgNorm !== pendingNorm) continue;
+      const tsMs = Date.parse(str(candidate.timestamp, ""));
+      if (
+        Number.isFinite(tsMs) &&
+        pendingSnapshotStartedAt > 0 &&
+        tsMs + 1000 < pendingSnapshotStartedAt
+      ) {
+        continue;
+      }
+      return idx;
+    }
+    return -1;
+  }, [messages, pendingSnapshotStartedAt, showStreamingAssistant, visiblePendingUserMessage]);
+  const latestStreamingAssistantIndex = useMemo(() => {
+    if (!showStreamingAssistant || pendingSnapshotStartedAt <= 0) return -1;
+    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+      const candidate = asRecord(messages[idx]);
+      if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const tsMs = Date.parse(str(candidate.timestamp, ""));
+      if (Number.isFinite(tsMs) && tsMs + 1000 < pendingSnapshotStartedAt) {
+        continue;
+      }
+      return idx;
+    }
+    return -1;
+  }, [messages, pendingSnapshotStartedAt, showStreamingAssistant]);
   const hasLiveThreadActivity = Boolean(
     visiblePendingUserMessage ||
     isStreamingForCurrentConversation ||
@@ -4983,6 +5579,30 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     !showStreamingAssistant &&
     !visiblePendingUserMessage &&
     !visibleFailedUserMessage;
+  const shouldInlineCompletedProgressBeforeAssistant =
+    !showStreamingAssistant &&
+    visibleStreamingProgressMessages.length > 0 &&
+    !!completedProgressBeforeMessageId;
+  const renderProgressRows = (keyPrefix: string) =>
+    visibleStreamingProgressMessages.map((msg, idx) => (
+      <Box className="chat-row" key={`${keyPrefix}-${idx}`}>
+        <Avatar
+          variant="rounded"
+          className="chat-avatar"
+          sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
+        >
+          <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
+        </Avatar>
+        <Box className="chat-bubble chat-bubble-assistant">
+          <Typography variant="caption" color="text.secondary">
+            AgentArk | working...
+          </Typography>
+          <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+            {msg}
+          </Typography>
+        </Box>
+      </Box>
+    ));
   const starterPrompts = [
     {
       label: "Review recent changes",
@@ -5087,9 +5707,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     extractFirstCodeFence(latestAssistantMessageText);
   const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
   const activeLiveWrite = activeCodeFile ? liveFileWrites[activeCodeFile.name] : undefined;
-  const codeViewerContent = activeLiveWrite
-    ? activeLiveWrite.content
-    : (activeCodeFile?.content ?? "");
+  const codeViewerContent = activeCodeFile
+    ? activeLiveWrite && !activeLiveWrite.done
+      ? activeLiveWrite.content ||
+        `Waiting for streamed lines from ${activeCodeFile.name}...`
+      : activeCodeFile.content ||
+        activeLiveWrite?.content ||
+        `File content for ${activeCodeFile.name} was not captured during this run.`
+    : "";
   const codeViewerWriteStatus = activeLiveWrite
     ? activeLiveWrite.totalLines > 0
       ? `${Math.min(activeLiveWrite.line, activeLiveWrite.totalLines)}/${activeLiveWrite.totalLines} lines written${activeLiveWrite.done ? " (done)" : ""}`
@@ -5097,6 +5722,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         ? "File write complete"
         : "Writing file..."
     : "";
+  const panelCodePreview = useMemo(() => {
+    if (!codeViewerContent || (activeLiveWrite && !activeLiveWrite.done)) return "";
+    const lines = codeViewerContent.split(/\r?\n/);
+    return lines.slice(0, 24).join("\n");
+  }, [activeLiveWrite, codeViewerContent]);
+  const canShowInlineFilePreview = Boolean(activeCodeFile && panelCodePreview.trim());
+  const panelCodePreviewLabel = codeViewerWriteStatus || "Preview excerpt";
 
   const appsWorkspaceQ = useQuery({
     queryKey: ["chat-workspace-apps"],
@@ -5116,13 +5748,34 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const workspaceTunnelBaseUrl = str(workspaceTunnel.url, "").trim().replace(/\/+$/, "");
   const workspaceSelectedPublicAppId = str(workspaceTunnel.selected_app_id, "").trim();
   const activeWorkspaceApp = useMemo(() => {
-    if (workspaceApps.length === 0) return null;
-    const running = workspaceApps.find(
-      (app) => toBool(app.running) || str(app.running, "").toLowerCase() === "true"
-    );
-    return running || workspaceApps[0];
-  }, [workspaceApps]);
-  const previewPath = str(activeWorkspaceApp?.access_url, str(activeWorkspaceApp?.url, "")).trim();
+    const hintedAppId = str(streamedWorkspaceApp?.id, str(streamedWorkspaceApp?.app_id, "")).trim();
+    if (hintedAppId) {
+      const matched = workspaceApps.find((app) => str(app.id, "").trim() === hintedAppId);
+      if (matched) {
+        return { ...matched, ...(streamedWorkspaceApp || {}) };
+      }
+    }
+    if (streamedWorkspaceApp) {
+      return streamedWorkspaceApp;
+    }
+    // No app deployed in this conversation — don't show stale preview from previous ones.
+    return null;
+  }, [workspaceApps, streamedWorkspaceApp]);
+  const activeWorkspaceAppId = str(
+    activeWorkspaceApp?.id,
+    str(activeWorkspaceApp?.app_id, "")
+  ).trim();
+  const previewPath = str(
+    activeWorkspaceApp?.local_access_url,
+    str(
+      activeWorkspaceApp?.access_url,
+      str(activeWorkspaceApp?.local_url, str(activeWorkspaceApp?.url, ""))
+    )
+  ).trim();
+  const publicAccessPath = str(
+    activeWorkspaceApp?.access_url,
+    str(activeWorkspaceApp?.url, "")
+  ).trim();
   const previewUrl = toAbsoluteAppUrl(previewPath, origin);
   const previewImagePath = useMemo(() => {
     const streamImage = extractPreviewImageUrl(streamingResponse);
@@ -5131,8 +5784,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   }, [streamingResponse, latestAssistantMessageText]);
   const previewImageUrl = toAbsoluteAppUrl(previewImagePath, origin);
   const publicPreviewUrl =
-    workspaceTunnelBaseUrl && workspaceTunnelBaseUrl !== origin && workspaceSelectedPublicAppId
-      ? toAbsoluteAppUrl(previewPath, workspaceTunnelBaseUrl)
+    workspaceTunnelBaseUrl &&
+    workspaceTunnelBaseUrl !== origin &&
+    workspaceSelectedPublicAppId &&
+    activeWorkspaceAppId &&
+    workspaceSelectedPublicAppId === activeWorkspaceAppId &&
+    publicAccessPath
+      ? toAbsoluteAppUrl(publicAccessPath, workspaceTunnelBaseUrl)
       : "";
   const runtimeMode = str(activeWorkspaceApp?.runtime_mode, "").toLowerCase();
   const runtimeSummary = (() => {
@@ -5176,16 +5834,23 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     () => [...workspaceCards].reverse().find((row) => row.kind === "Running" || row.kind === "Planning") || null,
     [workspaceCards]
   );
-  const latestIssueCard = useMemo(
-    () => [...workspaceCards].reverse().find((row) => row.kind === "Issue") || null,
+  const latestCompletedCard = useMemo(
+    () => [...workspaceCards].reverse().find((row) => row.kind === "Done") || null,
     [workspaceCards]
   );
-  const safetyPolicyBlocked = isSafetyPolicyBlockedText(
-    `${latestIssueCard?.label || ""} ${latestIssueCard?.detail || ""} ${latestIssueCard?.detailFull || ""}`
+  const currentStatusCard = useMemo(
+    () => latestRunningCard || latestWorkspaceCard || null,
+    [latestRunningCard, latestWorkspaceCard]
   );
+  const currentWorkspaceIssue = currentStatusCard?.kind === "Issue";
+  const safetyPolicyBlocked =
+    currentWorkspaceIssue &&
+    isSafetyPolicyBlockedText(
+      `${currentStatusCard?.label || ""} ${currentStatusCard?.detail || ""} ${currentStatusCard?.detailFull || ""}`
+    );
   const hasCompletedWorkspaceRun =
     !showStreamingAssistant &&
-    !latestIssueCard &&
+    !currentWorkspaceIssue &&
     workspaceCards.length > 0 &&
     latestWorkspaceCard?.kind === "Done";
   const progressSummary = !progressRows.length
@@ -5195,18 +5860,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       : hasCompletedWorkspaceRun
         ? `Run completed • ${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
         : `${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`;
-  const runState = apiKeyActionNeeded
-    ? ("waiting_input" as const)
-    : isStreamingForCurrentConversation
-      ? ("running" as const)
-      : ("stopped" as const);
-  const runStateLabel =
-    runState === "running"
-      ? "RUNNING"
-      : runState === "waiting_input"
-        ? "WAITING INPUT"
-        : "STOPPED";
-  const runStateChipColor = runState === "running" ? "info" : runState === "waiting_input" ? "warning" : "default";
   const workspaceStatusCopy = useMemo(() => {
     if (apiKeyActionNeeded) {
       return {
@@ -5233,14 +5886,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (latestWorkspaceCard?.kind === "Done") {
       return {
         line1: "Status: Completed",
-        line2: `Last completed step: ${latestWorkspaceCard.label}`,
+        line2: latestWorkspaceCard.detail || latestWorkspaceCard.label,
         tone: "default"
       };
     }
     if (latestWorkspaceCard) {
       return {
         line1: "Status: Stopped",
-        line2: `Last completed step: ${latestWorkspaceCard.label}`,
+        line2: latestWorkspaceCard.detail || latestWorkspaceCard.label,
         tone: "default"
       };
     }
@@ -5256,6 +5909,142 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     const active = latestRunningCard || latestWorkspaceCard;
     return active?.label || "Waiting for next step";
   }, [apiKeyActionNeeded, latestRunningCard, latestWorkspaceCard, safetyPolicyBlocked]);
+  const liveWriteEntries = useMemo(
+    () =>
+      Object.entries(liveFileWrites).sort((a, b) => {
+        const aDone = a[1].done ? 1 : 0;
+        const bDone = b[1].done ? 1 : 0;
+        return aDone - bDone;
+      }),
+    [liveFileWrites]
+  );
+  const activeLiveWriteEntry = useMemo(
+    () => liveWriteEntries.find(([, state]) => !state.done) || liveWriteEntries[0] || null,
+    [liveWriteEntries]
+  );
+  const activeLiveWriteName = activeLiveWriteEntry?.[0] || "";
+  const activeLiveWriteState = activeLiveWriteEntry?.[1] || null;
+  const liveWriteSummary = activeLiveWriteName
+    ? activeLiveWriteState?.totalLines
+      ? `${activeLiveWriteName} ${Math.min(activeLiveWriteState.line, activeLiveWriteState.totalLines)}/${activeLiveWriteState.totalLines}`
+      : activeLiveWriteState?.done
+        ? `${activeLiveWriteName} ready`
+        : activeLiveWriteName
+    : deployedFiles.length > 0
+      ? `${deployedFiles.length} tracked file${deployedFiles.length === 1 ? "" : "s"}`
+      : "Waiting for file sync";
+  const activeWorkspaceAppTitle = str(
+    activeWorkspaceApp?.title,
+    str(activeWorkspaceApp?.app_id, str(activeWorkspaceApp?.id, ""))
+  ).trim();
+  const signalRows = useMemo(() => {
+    const rows: Array<{
+      label: string;
+      value: string;
+      detail?: string;
+      href?: string;
+      tone?: "default" | "live" | "warning" | "success";
+    }> = [];
+    if (apiKeyActionNeeded || safetyPolicyBlocked) {
+      rows.push({
+        label: "Attention",
+        value: workspaceStatusCopy.line1.replace(/^Status:\s*/i, "").trim() || "Action required",
+        detail: workspaceStatusCopy.line2,
+        tone: "warning"
+      });
+    }
+
+    if (activeLiveWriteName) {
+      const lineDetail = activeLiveWriteState?.totalLines
+        ? `Line ${Math.min(activeLiveWriteState.line, activeLiveWriteState.totalLines)}/${activeLiveWriteState.totalLines}${activeLiveWriteState.done ? " complete" : ""}`
+        : activeLiveWriteState?.done
+          ? "Write complete"
+          : "Writing now";
+      rows.push({
+        label: "Writing file",
+        value: activeLiveWriteName,
+        detail: lineDetail,
+        tone: activeLiveWriteState?.done ? "success" : "live"
+      });
+    } else if (deployedFiles.length > 0) {
+      rows.push({
+        label: "Files written",
+        value: `${deployedFiles.length} file${deployedFiles.length === 1 ? "" : "s"}`,
+        detail: deployedFiles[deployedFiles.length - 1]?.name || "",
+        tone: "success"
+      });
+    }
+
+    if (activeWorkspaceApp) {
+      rows.push({
+        label: "Runtime",
+        value: runtimeSummary.label,
+        detail: activeWorkspaceAppTitle || activeWorkspaceAppId || "",
+        tone: runtimeSummary.tone === "warning"
+          ? "warning"
+          : runtimeSummary.tone === "success"
+            ? "success"
+            : "default"
+      });
+    }
+
+    const previewHref = publicPreviewUrl || previewUrl;
+    if (previewHref) {
+      rows.push({
+        label: "Preview",
+        value: publicPreviewUrl ? "Public preview ready" : "Preview ready",
+        detail: previewHref,
+        href: previewHref,
+        tone: "success"
+      });
+    }
+
+    return rows;
+  }, [
+    activeLiveWriteName,
+    activeLiveWriteState,
+    activeWorkspaceApp,
+    activeWorkspaceAppId,
+    activeWorkspaceAppTitle,
+    apiKeyActionNeeded,
+    deployedFiles,
+    previewUrl,
+    publicPreviewUrl,
+    runtimeSummary.label,
+    runtimeSummary.tone,
+    safetyPolicyBlocked,
+    workspaceStatusCopy.line1,
+    workspaceStatusCopy.line2
+  ]);
+  const termFooterSignals = useMemo(() => {
+    const rows: Array<{ label: string; value: string }> = [];
+    if (activeLiveWriteName) {
+      rows.push({ label: "File", value: liveWriteSummary });
+    } else if (deployedFiles.length > 0) {
+      rows.push({
+        label: "Files",
+        value: `${deployedFiles.length} written`
+      });
+    }
+    if (activeWorkspaceApp) {
+      rows.push({ label: "Runtime", value: runtimeSummary.label });
+    }
+    if (publicPreviewUrl || previewUrl) {
+      rows.push({
+        label: "Preview",
+        value: publicPreviewUrl ? "Public ready" : "Ready"
+      });
+    }
+    return rows;
+  }, [
+    activeLiveWriteName,
+    activeWorkspaceApp,
+    deployedFiles.length,
+    liveWriteSummary,
+    previewUrl,
+    publicPreviewUrl,
+    runtimeSummary.label
+  ]);
 
   const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
     if (secretHelperBusy || isStreaming) return;
@@ -5347,75 +6136,83 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
           <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
             <Stack spacing={0.5} className="conversation-list">
-              {conversations.length === 0 ? (
+              {starredConversations.length === 0 && conversations.length === 0 ? (
                 <Typography variant="body2" color="text.secondary">
                   No conversations yet.
                 </Typography>
               ) : (
-                conversations.map((conv) => {
-                  const id = str(conv.id, "");
-                  const active = conversationId === id;
-                  const title = str(conv.title, "Untitled")
-                    .replace(/\s+/g, " ")
-                    .trim() || "Untitled";
-                  return (
-                    <Box
-                      key={id}
-                      className={active ? "conversation-card active" : "conversation-card"}
-                      onClick={() => {
-                        openConversationById(id);
-                      }}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          openConversationById(id);
-                        }
-                      }}
-                    >
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                        <Box sx={{ minWidth: 0, flex: 1 }}>
-                          <div className="conversation-card-title" title={title}>
-                            {title}
-                          </div>
-                          {(() => {
-                            const updatedAt = str(conv.updated_at, "");
-                            if (!updatedAt) return null;
-                            const parsed = formatChatTimestamp(updatedAt);
-                            return (
-                              <Typography
-                                variant="caption"
-                                color="text.secondary"
-                                sx={{ display: "block", mt: 0.15, opacity: 0.88 }}
-                                title={parsed.tooltip}
-                              >
-                                {parsed.label}
-                              </Typography>
-                            );
-                          })()}
-                        </Box>
-                        <Tooltip title="Chat options">
-                          <span>
-                            <IconButton
-                              size="small"
-                              className="conversation-card-menu"
-                              onClick={(e) => {
-                                openConversationMenu(e, conv);
-                              }}
-                              disabled={deleteConversationMutation.isPending}
-                            >
-                              <MoreVertIcon fontSize="small" />
-                            </IconButton>
-                          </span>
-                        </Tooltip>
+                <>
+                  {starredConversations.length > 0 ? (
+                    <Box className="conversation-group">
+                      <Typography variant="caption" className="conversation-group-label">
+                        Starred
+                      </Typography>
+                      <Stack spacing={0.5}>
+                        {starredConversations.map((conv) => renderConversationCard(conv))}
                       </Stack>
                     </Box>
-                  );
-                })
+                  ) : null}
+                  {conversations.length > 0 ? (
+                    <Box className="conversation-group">
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 0.25 }}>
+                        <Typography variant="caption" className="conversation-group-label">
+                          All Chats
+                        </Typography>
+                        <Typography variant="caption" className="conversation-page-indicator">
+                          Page {conversationPageLabel}
+                        </Typography>
+                      </Stack>
+                      <Stack spacing={0.5}>
+                        {conversations.map((conv) => renderConversationCard(conv))}
+                      </Stack>
+                    </Box>
+                  ) : null}
+                </>
               )}
             </Stack>
           </Box>
+          <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between" sx={{ mt: 1 }}>
+            <Typography variant="caption" className="conversation-pagination-copy">
+              {conversationListTotal} chat{conversationListTotal === 1 ? "" : "s"}
+            </Typography>
+            <Stack direction="row" spacing={0.75} alignItems="center">
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() => setConversationPage((prev) => Math.max(0, prev - 1))}
+                disabled={conversationPage <= 0}
+              >
+                Prev
+              </Button>
+              <Typography variant="caption" className="conversation-page-indicator">
+                {conversationPageLabel}
+              </Typography>
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() =>
+                  setConversationPage((prev) =>
+                    Math.min(Math.max(0, conversationPageCount - 1), prev + 1)
+                  )
+                }
+                disabled={conversationPage >= conversationPageCount - 1}
+              >
+                Next
+              </Button>
+            </Stack>
+          </Stack>
           <Menu anchorEl={conversationMenuAnchor} open={Boolean(conversationMenuAnchor)} onClose={closeConversationMenu}>
+            <MenuItem
+              disabled={toggleConversationStarMutation.isPending}
+              onClick={() => {
+                const id = str(conversationMenuTarget?.id, "");
+                const starred = toBool(conversationMenuTarget?.starred);
+                closeConversationMenu();
+                if (id) void toggleConversationStar(id, !starred);
+              }}
+            >
+              {toBool(conversationMenuTarget?.starred) ? "Unstar chat" : "Star chat"}
+            </MenuItem>
             <MenuItem
               onClick={() => {
                 const id = str(conversationMenuTarget?.id, "");
@@ -5471,12 +6268,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               </Button>
             ) : null}
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
-            <Box sx={{ minWidth: 0 }}>
-              <Typography variant="h6">AgentArk Console</Typography>
-              <Typography variant="caption" color="text.secondary">
-                Open workspace chat with live activity, file writes, and agent output.
-              </Typography>
-            </Box>
+            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>AgentArk Console</Typography>
           </Stack>
           <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
             <Tooltip title={showWorkspacePanel ? "Hide agent activity" : "Show agent activity"}>
@@ -5521,7 +6313,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 onChange={(e) => setDraftProjectId(e.target.value)}
                 sx={{ maxWidth: { xs: "100%", md: 360 } }}
               >
-                <MenuItem value="">Open workspace (no project)</MenuItem>
+                <MenuItem value="">Workspace (no project)</MenuItem>
                 {projects.map((project) => {
                   const id = str(project.id, "");
                   if (!id) return null;
@@ -5533,25 +6325,18 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 })}
               </TextField>
               <Typography variant="caption" color="text.secondary">
-                Leave this blank to chat in the open workspace across all accessible context.
+                Attach a project only if you want this new chat scoped to it.
               </Typography>
             </Stack>
-          ) : (
+          ) : selectedConversationProjectId ? (
             <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 1 }} useFlexGap flexWrap="wrap">
               <Chip
                 size="small"
                 variant="outlined"
-                label={
-                  selectedConversationProjectId
-                    ? `Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`
-                    : "Open workspace"
-                }
+                label={`Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`}
               />
-              <Typography variant="caption" color="text.secondary">
-                This conversation is not restricted to a project unless one is explicitly attached.
-              </Typography>
             </Stack>
-          )}
+          ) : null}
 
           <Box
             ref={threadRef}
@@ -5593,13 +6378,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               {messages.map((message, idx) => {
                 const role = str(message.role, "").toLowerCase();
                 const isUser = role === "user";
+                const isAssistant = role === "assistant";
                 const messageId = str(message.id, String(idx));
-                // Skip the last user message if it duplicates the pending message during streaming
-                if (isUser && isStreamingForCurrentConversation && visiblePendingUserMessage && idx === messages.length - 1) {
-                  const pendingNorm = stripAttachmentContextMarker(visiblePendingUserMessage).trim();
-                  const msgNorm = stripAttachmentContextMarker(str(message.content, "")).trim();
-                  if (pendingNorm === msgNorm) return null;
-                }
+                // Hide the persisted user row for the in-flight run while the pending bubble is active.
+                if (isUser && idx === latestPendingUserMessageIndex) return null;
+                // Hide the persisted assistant row from the current run until the live streaming bubble hands off cleanly.
+                if (isAssistant && idx === latestStreamingAssistantIndex) return null;
                 const tsRaw = str(message.timestamp, "");
                 const ts = tsRaw ? formatChatTimestamp(tsRaw) : null;
                 const content = str(message.content);
@@ -5622,68 +6406,74 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 const traceExpanded = Boolean(messageTraceOpen[messageId]);
                 const traceCards = traceExpanded && hasTrace ? expandedTraceCardsById[traceId] || [] : [];
                 const traceSummary = traceSummaryFromSteps(rawTraceSteps, { loading: traceLoading, error: traceError });
+                const shouldInsertCompletedProgressBeforeMessage =
+                  shouldInlineCompletedProgressBeforeAssistant &&
+                  messageId === completedProgressBeforeMessageId;
                 return (
-                  <Box key={messageId} className={isUser ? "chat-row chat-row-user" : "chat-row"}>
-                    {!isUser ? (
-                      <Avatar
-                        variant="rounded"
-                        className="chat-avatar"
-                        sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-                      >
-                        <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-                      </Avatar>
-                    ) : null}
-                    <Box className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-assistant"}>
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          title={ts?.tooltip || undefined}
+                  <Fragment key={messageId}>
+                    {shouldInsertCompletedProgressBeforeMessage ? renderProgressRows("completed-progress") : null}
+                    <Box className={isUser ? "chat-row chat-row-user" : "chat-row"}>
+                      {!isUser ? (
+                        <Avatar
+                          variant="rounded"
+                          className="chat-avatar"
+                          sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
                         >
-                          {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts.label}` : ""}
-                        </Typography>
-                        <Stack direction="row" spacing={0.25} alignItems="center">
-                          {!isUser ? (
-                            <Tooltip title="Download reply">
+                          <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
+                        </Avatar>
+                      ) : null}
+                      <Box className={isUser ? "chat-bubble chat-bubble-user" : "chat-bubble chat-bubble-assistant"}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={0.5}>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            title={ts?.tooltip || undefined}
+                          >
+                            {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts.label}` : ""}
+                          </Typography>
+                          <Stack direction="row" spacing={0.25} alignItems="center">
+                            {!isUser ? (
+                              <Tooltip title="Download reply">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    void exportAssistantMessage(message, previousUserPrompt);
+                                  }}
+                                  sx={{ color: "rgba(189, 216, 249, 0.9)" }}
+                                >
+                                  <FileDownloadRoundedIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
+                            ) : null}
+                            <Tooltip title="Copy message">
                               <IconButton
                                 size="small"
                                 onClick={() => {
-                                  void exportAssistantMessage(message, previousUserPrompt);
+                                  void copyMessage(message);
                                 }}
                                 sx={{ color: "rgba(189, 216, 249, 0.9)" }}
                               >
-                                <FileDownloadRoundedIcon fontSize="small" />
+                                <ContentCopyRoundedIcon fontSize="small" />
                               </IconButton>
                             </Tooltip>
-                          ) : null}
-                          <Tooltip title="Copy message">
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                void copyMessage(message);
-                              }}
-                              sx={{ color: "rgba(189, 216, 249, 0.9)" }}
-                            >
-                              <ContentCopyRoundedIcon fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
+                          </Stack>
                         </Stack>
-                      </Stack>
-                      {/* Trace steps shown in Activity panel on the right */}
+                        {/* Trace steps shown in Activity panel on the right */}
+                        {isUser ? (
+                          <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                            {renderedContent}
+                          </Typography>
+                        ) : (
+                          renderChatMarkdown(renderedContent)
+                        )}
+                      </Box>
                       {isUser ? (
-                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                          {renderedContent}
-                        </Typography>
-                      ) : (
-                        renderChatMarkdown(renderedContent)
-                      )}
+                        <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
+                          <PersonRoundedIcon sx={{ fontSize: 16 }} />
+                        </Avatar>
+                      ) : null}
                     </Box>
-                    {isUser ? (
-                      <Avatar className="chat-avatar chat-avatar-user" sx={{ width: 30, height: 30, bgcolor: "rgba(47,212,255,0.18)" }}>
-                        <PersonRoundedIcon sx={{ fontSize: 16 }} />
-                      </Avatar>
-                    ) : null}
-                  </Box>
+                  </Fragment>
                 );
               })}
 
@@ -5719,26 +6509,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 </Box>
               ) : null}
 
-              {showStreamingAssistant && visibleStreamingProgressMessages.length > 0
-                ? visibleStreamingProgressMessages.map((msg) => (
-                    <Box className="chat-row" key={`stream-progress-${msg}`}>
-                      <Avatar
-                        variant="rounded"
-                        className="chat-avatar"
-                        sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
-                      >
-                        <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
-                      </Avatar>
-                      <Box className="chat-bubble chat-bubble-assistant">
-                        <Typography variant="caption" color="text.secondary">
-                          AgentArk | working...
-                        </Typography>
-                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                          {msg}
-                        </Typography>
-                      </Box>
-                    </Box>
-                  ))
+              {visibleStreamingProgressMessages.length > 0 &&
+              (showStreamingAssistant || !completedProgressBeforeMessageId)
+                ? renderProgressRows(showStreamingAssistant ? "stream-progress-live" : "stream-progress-fallback")
                 : null}
 
               {showStreamingAssistant ? (
@@ -5755,10 +6528,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                       {visibleStreamingResponse.trim() ? "AgentArk is streaming..." : streamingActivity}
                     </Typography>
                     {visibleStreamingResponse.trim() ? (
-                      <>
-                        {renderChatMarkdown(visibleStreamingResponse)}
+                      <Typography
+                        variant="body2"
+                        sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                      >
+                        {visibleStreamingResponse}
                         <span className="stream-caret" />
-                      </>
+                      </Typography>
                     ) : (
                       <div className="typing-dots" aria-label="typing">
                         <span />
@@ -5882,43 +6658,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             ))}
           </Stack>
         ) : null}
-        {activeChatTask ? (
-          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.5 }}>
-            <Chip
-              size="small"
-              color={
-                activeChatTask.status === "completed"
-                  ? "success"
-                  : activeChatTask.status === "failed"
-                    ? "error"
-                    : activeChatTask.status === "paused" || activeChatTask.status === "awaiting_approval"
-                      ? "warning"
-                      : "info"
-              }
-              label={`Task ${activeChatTask.status === "in_progress" ? "running" : activeChatTask.status.replace(/_/g, " ")}`}
-            />
-            <Chip
-              size="small"
-              variant="outlined"
-              label={
-                activeChatTask.workType === "app"
-                  ? "App"
-                  : activeChatTask.workType === "import"
-                    ? "Import"
-                    : activeChatTask.workType === "automation"
-                      ? "Automation"
-                      : activeChatTask.workType === "workspace"
-                        ? "Workspace"
-                        : activeChatTask.workType === "research"
-                          ? "Research"
-                          : "Task"
-              }
-            />
-            <Typography variant="caption" color="text.secondary" sx={{ minWidth: 0 }}>
-              {activeChatTask.description}
-            </Typography>
-          </Stack>
-        ) : null}
         <Box className="chat-composer-shell">
           <textarea
             className="chat-composer-textarea"
@@ -6017,8 +6756,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               <IconButton
                 size="small"
                 className="chat-composer-stop-btn"
+                disabled={isStoppingStream}
                 onClick={() => {
-                  // abort handled by parent streaming logic
+                  void handleStopStreaming();
                 }}
               >
                 <StopRoundedIcon fontSize="small" />
@@ -6053,21 +6793,35 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           className="list-shell chat-workspace-shell"
           sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1 }}
         >
-          <Box className="activity-status-bar">
-            <span className={`activity-status-dot${safetyPolicyBlocked ? " error" : showStreamingAssistant ? " running" : " idle"}`} />
-            <span className="activity-status-text">
-              {showStreamingAssistant
-                ? workspaceStatusCopy.line1 || (isStreamingForCurrentConversation ? "Processing..." : "Recovered latest progress")
-                : workspaceCards.length > 0
-                  ? workspaceStatusCopy.line1 || runStateLabel
-                  : runStateLabel === "STOPPED"
-                    ? "Waiting for activity"
-                    : workspaceStatusCopy.line1 || runStateLabel}
-            </span>
-            <span className="activity-step-count">{workspaceCards.length} step{workspaceCards.length === 1 ? "" : "s"}</span>
-          </Box>
+          <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }} className="chat-workspace-sections">
+              {signalRows.length > 0 ? (
+                <Box className="activity-signal-list">
+                  {signalRows.map((row) => (
+                    <Box key={`${row.label}-${row.value}`} className={`activity-signal-row tone-${row.tone || "default"}`}>
+                      <span className="activity-signal-label">{row.label}</span>
+                      <Box className="activity-signal-main">
+                        <span className="activity-signal-value">{row.value}</span>
+                        {row.detail ? (
+                          row.href ? (
+                            <Link
+                              href={row.href}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              underline="hover"
+                              className="activity-signal-detail activity-signal-link"
+                            >
+                              {row.detail}
+                            </Link>
+                          ) : (
+                            <span className="activity-signal-detail">{row.detail}</span>
+                          )
+                        ) : null}
+                      </Box>
+                    </Box>
+                  ))}
+                </Box>
+              ) : null}
 
-          <Box sx={{ flex: 1, minHeight: 0, overflow: "auto" }} className="chat-workspace-sections">
               <Box className="term-shell">
                 <Box className="term-titlebar">
                   <span className="term-tl-dot" style={{ background: "#ff5f57" }} />
@@ -6081,6 +6835,42 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                     {progressSummary}
                   </Typography>
                 </Box>
+                  {executionPlan.length > 0 ? (
+                    <Box sx={{ px: 1.5, py: 1, borderBottom: "1px solid rgba(64,196,255,0.12)", bgcolor: "rgba(6,14,28,0.6)" }}>
+                      <Typography variant="caption" sx={{ fontWeight: 600, color: "rgba(214,228,255,0.7)", letterSpacing: "0.04em", mb: 0.75, display: "block" }}>
+                        EXECUTION PLAN
+                      </Typography>
+                      <Stack spacing={0.5}>
+                        {executionPlan.map((step) => (
+                          <Stack key={step.id} direction="row" spacing={0.75} alignItems="flex-start">
+                            <Box sx={{ mt: "2px", flexShrink: 0, width: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                              {step.status === "completed" ? (
+                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", bgcolor: "rgba(74,210,157,0.85)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#0a1220" }}>&#10003;</Box>
+                              ) : step.status === "running" ? (
+                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", border: "2px solid #39d0ff", borderTopColor: "transparent", animation: "spin 0.8s linear infinite" }} />
+                              ) : step.status === "failed" ? (
+                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", bgcolor: "rgba(255,100,100,0.85)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#fff" }}>&#10007;</Box>
+                              ) : (
+                                <Box sx={{ width: 12, height: 12, borderRadius: "50%", border: "1.5px solid rgba(140,170,210,0.25)" }} />
+                              )}
+                            </Box>
+                            <Typography
+                              variant="caption"
+                              sx={{
+                                color: step.status === "running" ? "#e8f4ff" : step.status === "completed" ? "rgba(214,228,255,0.45)" : "rgba(214,228,255,0.65)",
+                                textDecoration: step.status === "completed" ? "line-through" : "none",
+                                fontWeight: step.status === "running" ? 600 : 400,
+                                fontSize: "0.76rem",
+                                lineHeight: 1.4,
+                              }}
+                            >
+                              {step.title}
+                            </Typography>
+                          </Stack>
+                        ))}
+                      </Stack>
+                    </Box>
+                  ) : null}
                   <Box
                     className="term-body"
                     ref={workspaceActivityRef}
@@ -6095,7 +6885,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                     {workspaceCards.length === 0 ? (
                       <Box className="term-line">
                         <span className="term-prompt">&gt;</span>
-                        <span className="term-text term-dim">awaiting_activity<span className="term-block-cursor" /></span>
+                        <span className="term-text term-dim">awaiting_activity</span>
                       </Box>
                     ) : (
                       workspaceCards.map((row, idx) => {
@@ -6115,7 +6905,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                           <Box key={`activity-${row.id}`} className={`term-line${isActive ? " term-line-active" : ""}`}>
                             <span className="term-prompt" style={{ color: lineTone }}>•</span>
                             <Box className="term-content">
-                              <span className={`term-label${isActive ? " term-typewriter" : ""}`} style={{ color: lineTone }}>
+                              <span className="term-label" style={{ color: lineTone }}>
                                 {row.time ? `[${formatTraceStepTime(row.time)}] ` : ""}{row.label}
                               </span>
                               {(row.detailFull || row.detail) ? (
@@ -6127,35 +6917,75 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                       })
                     )}
                   </Box>
+                  {termFooterSignals.length > 0 ? (
+                    <Box className="term-footer">
+                      <Box className="term-footer-meta">
+                        {termFooterSignals.map((item) => (
+                          <span key={`${item.label}-${item.value}`} className="term-footer-meta-item">
+                            <span className="term-footer-meta-label">{item.label}</span>
+                            <span className="term-footer-meta-value">{item.value}</span>
+                          </span>
+                        ))}
+                      </Box>
+                    </Box>
+                  ) : null}
               </Box>
 
+            {canShowInlineFilePreview ? (
+              <Accordion className="chat-workspace-section" disableGutters>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Typography variant="subtitle2">File Preview</Typography>
+                </AccordionSummary>
+                <AccordionDetails sx={{ p: "6px 8px 10px" }}>
+                  <Box className="chat-workspace-code">
+                    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1} sx={{ mb: 0.8 }}>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="caption" className="file-preview-name">
+                          {activeCodeFile.name}
+                        </Typography>
+                        <Typography variant="caption" className="file-preview-meta">
+                          {codeViewerWriteStatus || panelCodePreviewLabel}
+                        </Typography>
+                      </Box>
+                      <Button size="small" variant="outlined" onClick={() => setCodeViewerOpen(true)}>
+                        Open full file
+                      </Button>
+                    </Stack>
+                    <pre className="chat-workspace-pre chat-workspace-pre-compact"><code>{panelCodePreview}</code></pre>
+                  </Box>
+                </AccordionDetails>
+              </Accordion>
+            ) : null}
+
             {deployedFiles.length > 0 ? (
-              <Accordion className="chat-workspace-section" defaultExpanded disableGutters>
+              <Accordion className="chat-workspace-section" disableGutters>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Typography variant="subtitle2">Files ({deployedFiles.length})</Typography>
                 </AccordionSummary>
                 <AccordionDetails sx={{ p: "4px 8px 8px" }}>
                   <Stack spacing={0.5}>
-                    {deployedFiles.map((f, i) => (
-                      <Box
-                        key={f.name}
-                        className="deployed-file-row"
-                        onClick={() => { setCodeViewerFileIdx(i); setCodeViewerOpen(true); }}
-                      >
-                        <span className="deployed-file-icon">&#128196;</span>
-                        <span className="deployed-file-name">{f.name}</span>
-                        <span className="deployed-file-size">
-                          {(() => {
-                            const live = liveFileWrites[f.name];
-                            if (!live) return `${(f.content.length / 1024).toFixed(1)}KB`;
-                            if (live.totalLines > 0) {
-                              return `${Math.min(live.line, live.totalLines)}/${live.totalLines} lines${live.done ? " done" : ""}`;
-                            }
-                            return live.done ? "written" : "writing...";
-                          })()}
-                        </span>
-                      </Box>
-                    ))}
+                    {deployedFiles.map((f, i) => {
+                      const live = liveFileWrites[f.name];
+                      return (
+                        <Box
+                          key={f.name}
+                          className={`deployed-file-row${live && !live.done ? " is-live" : ""}${i === codeViewerFileIdx ? " is-selected" : ""}`}
+                          onClick={() => { setCodeViewerFileIdx(i); setCodeViewerOpen(true); }}
+                        >
+                          <span className="deployed-file-icon">&#128196;</span>
+                          <span className="deployed-file-name">{f.name}</span>
+                          <span className="deployed-file-size">
+                            {(() => {
+                              if (!live) return `${(f.content.length / 1024).toFixed(1)}KB`;
+                              if (live.totalLines > 0) {
+                                return `${Math.min(live.line, live.totalLines)}/${live.totalLines} lines${live.done ? " done" : ""}`;
+                              }
+                              return live.done ? "written" : "writing...";
+                            })()}
+                          </span>
+                        </Box>
+                      );
+                    })}
                   </Stack>
                 </AccordionDetails>
               </Accordion>
@@ -6170,7 +7000,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               </Accordion>
             ) : null}
 
-            {previewUrl && deployedFiles.length > 0 ? (
+            {previewUrl ? (
               <Accordion className="chat-workspace-section chat-workspace-section-preview" disableGutters>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Typography variant="subtitle2">Preview</Typography>
@@ -6247,7 +7077,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Generated Files</Typography>
               {activeCodeFile && codeViewerWriteStatus ? (
                 <Typography variant="caption" color="text.secondary">
-                  {activeCodeFile.name} • {codeViewerWriteStatus}
+                  {`${activeCodeFile.name} - ${codeViewerWriteStatus}`}
                 </Typography>
               ) : null}
             </Box>
@@ -6273,7 +7103,16 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           {activeCodeFile && (
             <>
               <pre className="code-viewer-pre">
-                <code>{codeViewerContent}</code>
+                <code>{(codeViewerContent || "").split(/\r?\n/).map((line, i) => (
+                  <span
+                    key={i}
+                    className={`code-line${activeLiveWrite && !activeLiveWrite.done && i + 1 === activeLiveWrite.line ? " code-line-active" : ""}`}
+                  >
+                    <span className="code-line-number">{i + 1}</span>
+                    <span className="code-line-content">{line}</span>
+                    {"\n"}
+                  </span>
+                ))}</code>
               </pre>
               {activeLiveWrite && !activeLiveWrite.done ? (
                 <Box sx={{ px: 1.5, pb: 1 }}>
@@ -10559,6 +11398,8 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFileName, setSelectedFileName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const docsQ = useQuery({ queryKey: ["documents-manager"], queryFn: () => api.rawGet("/documents?limit=100"), refetchInterval: autoRefresh ? REFRESH_MS : false });
@@ -10620,73 +11461,97 @@ function DocumentsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Button
             variant="contained"
             size="small"
-            disabled={uploadFileMutation.isPending}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => { setUploadDialogOpen(true); setUploadSuccess(null); setError(null); }}
           >
             Upload Document
           </Button>
         </Stack>
 
-        {selectedFile ? (
-          <Box className="metadata-box" sx={{ mb: 1.25 }}>
-            <Grid2 container spacing={1} alignItems="center">
-              <Grid2 size={{ xs: 12, md: projects.length > 0 ? 4 : 8 }}>
-                <Typography variant="body2" sx={{ wordBreak: "break-word" }}>
+        <Dialog open={uploadDialogOpen} onClose={() => { if (!uploadFileMutation.isPending) { setUploadDialogOpen(false); setSelectedFile(null); setSelectedFileName(""); setError(null); } }} maxWidth="sm" fullWidth>
+          <DialogTitle sx={{ pb: 0.5 }}>Upload Document</DialogTitle>
+          <DialogContent>
+            <Stack spacing={2} sx={{ mt: 1 }}>
+              <Typography variant="caption" color="text.secondary">
+                Supports PDF, DOCX, TXT, MD, JSON, CSV and code/text files.
+              </Typography>
+              {selectedFile ? (
+                <Alert severity="info" sx={{ py: 0.5 }}>
                   Selected: {selectedFileName}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  Supports PDF, DOCX, TXT, MD, JSON, CSV and code/text files.
-                </Typography>
-              </Grid2>
-              {projects.length > 0 ? (
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    select
-                    label="Project (optional)"
-                    value={projectId}
-                    onChange={(e) => setProjectId(e.target.value)}
-                    InputLabelProps={{ shrink: true }}
-                    SelectProps={{ displayEmpty: true }}
-                  >
-                    <MenuItem value="">Global</MenuItem>
-                    {projects.map((project) => <MenuItem key={str(project.id, "")} value={str(project.id, "")}>{str(project.name)}</MenuItem>)}
-                  </TextField>
-                </Grid2>
+                </Alert>
               ) : null}
-              <Grid2 size={{ xs: 12, md: projects.length > 0 ? 4 : 4 }}>
-                <Stack direction="row" spacing={1}>
-                  <Button
-                    variant="contained"
-                    disabled={uploadFileMutation.isPending || !selectedFile}
-                    onClick={async () => {
-                      setError(null);
-                      try {
-                        await uploadFileMutation.mutateAsync();
-                        setSelectedFile(null);
-                        setSelectedFileName("");
-                      } catch (e) {
-                        setError(errMessage(e));
-                      }
-                    }}
-                  >
-                    {uploadFileMutation.isPending ? "Uploading..." : "Upload"}
-                  </Button>
+              {uploadSuccess ? (
+                <Alert severity="success" sx={{ py: 0.5 }}>{uploadSuccess}</Alert>
+              ) : null}
+              {error ? (
+                <Alert severity="error" sx={{ py: 0.5 }}>{error}</Alert>
+              ) : null}
+              {projects.length > 0 ? (
+                <TextField
+                  fullWidth
+                  size="small"
+                  select
+                  label="Project (optional)"
+                  value={projectId}
+                  onChange={(e) => setProjectId(e.target.value)}
+                  InputLabelProps={{ shrink: true }}
+                  SelectProps={{ displayEmpty: true }}
+                >
+                  <MenuItem value="">Global</MenuItem>
+                  {projects.map((project) => <MenuItem key={str(project.id, "")} value={str(project.id, "")}>{str(project.name)}</MenuItem>)}
+                </TextField>
+              ) : null}
+              <Stack direction="row" spacing={1}>
+                <Button
+                  variant="outlined"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploadFileMutation.isPending}
+                >
+                  Choose File
+                </Button>
+                <Button
+                  variant="contained"
+                  disabled={uploadFileMutation.isPending || !selectedFile}
+                  onClick={async () => {
+                    setError(null);
+                    setUploadSuccess(null);
+                    try {
+                      await uploadFileMutation.mutateAsync();
+                      setUploadSuccess(`Uploaded ${selectedFileName} successfully.`);
+                      setSelectedFile(null);
+                      setSelectedFileName("");
+                    } catch (e) {
+                      setError(errMessage(e));
+                    }
+                  }}
+                >
+                  {uploadFileMutation.isPending ? "Uploading..." : "Upload"}
+                </Button>
+                {selectedFile && !uploadFileMutation.isPending ? (
                   <Button
                     variant="text"
                     onClick={() => {
                       setSelectedFile(null);
                       setSelectedFileName("");
                       setError(null);
+                      setUploadSuccess(null);
                       if (fileInputRef.current) fileInputRef.current.value = "";
                     }}
                   >
                     Clear
                   </Button>
-                </Stack>
-              </Grid2>
-            </Grid2>
+                ) : null}
+              </Stack>
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => { setUploadDialogOpen(false); setSelectedFile(null); setSelectedFileName(""); setError(null); }} disabled={uploadFileMutation.isPending}>
+              Close
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {false ? (
+          <Box className="metadata-box" sx={{ mb: 1.25 }}>
           </Box>
         ) : null}
 
@@ -11498,7 +12363,7 @@ function ProjectsManager({ autoRefresh }: { autoRefresh: boolean }) {
             </TableContainer>
           </Box>
         </Grid2>
-        <Grid2 size={{ xs: 12, lg: 5 }}><QueryTable title="Project Conversations" path="/conversations?limit=100" arrayKey="conversations" columns={["title", "project_id", "channel", "updated_at"]} autoRefresh={autoRefresh} emptyLabel="No conversations mapped to projects." queryKey="projects-conversation-table" /></Grid2>
+        <Grid2 size={{ xs: 12, lg: 5 }}><QueryTable title="Project Conversations" path="/conversations" arrayKey="conversations" columns={["title", "project_id", "channel", "updated_at"]} autoRefresh={autoRefresh} emptyLabel="No conversations mapped to projects." queryKey="projects-conversation-table" pageSize={20} /></Grid2>
       </Grid2>
 
       {projectsQ.error || conversationsQ.error || error ? <Alert severity="error">{error || errMessage(projectsQ.error || conversationsQ.error)}</Alert> : null}
@@ -11969,11 +12834,94 @@ function evolutionTraceIdHint(payload: unknown): string {
   return traceId ? ` Trace ${traceId.slice(0, 8)} recorded.` : "";
 }
 
-function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
-  const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+function syncRunStatusColor(status: string): "success" | "warning" | "error" | "default" {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "completed") return "success";
+  if (normalized === "failed") return "error";
+  if (normalized === "blocked") return "warning";
+  return "default";
+}
 
-  const traceQ = useQuery({ queryKey: ["trace-manager"], queryFn: () => api.rawGet("/trace?limit=40"), refetchInterval: autoRefresh ? REFRESH_MS : false });
+function syncRunTriggerLabel(trigger: string): string {
+  const normalized = trigger.trim().toLowerCase();
+  if (normalized === "manual") return "Manual";
+  if (normalized === "background") return "Background";
+  return normalized ? normalized.replace(/_/g, " ") : "Unknown";
+}
+
+type TraceRange = "1h" | "6h" | "24h" | "7d" | "14d" | "30d";
+const TRACE_RANGE_PRESETS: { value: TraceRange; label: string; hours: number }[] = [
+  { value: "1h", label: "1 hour", hours: 1 },
+  { value: "6h", label: "6 hours", hours: 6 },
+  { value: "24h", label: "24 hours", hours: 24 },
+  { value: "7d", label: "7 days", hours: 168 },
+  { value: "14d", label: "14 days", hours: 336 },
+  { value: "30d", label: "30 days", hours: 720 },
+];
+
+function traceRangeHours(range: TraceRange): number {
+  return TRACE_RANGE_PRESETS.find((p) => p.value === range)?.hours || 168;
+}
+
+function traceRangeSinceISO(range: TraceRange): string {
+  const ms = traceRangeHours(range) * 3600 * 1000;
+  return new Date(Date.now() - ms).toISOString();
+}
+
+type TraceBucket = { label: string; ts: number };
+
+function buildTraceTrendBuckets(range: TraceRange): TraceBucket[] {
+  const hours = traceRangeHours(range);
+  const bucketCount = Math.min(hours <= 6 ? hours : hours <= 24 ? 12 : hours <= 168 ? 7 : 14, 14);
+  const spanMs = hours * 3600 * 1000;
+  const bucketMs = spanMs / bucketCount;
+  const now = Date.now();
+  const buckets: TraceBucket[] = [];
+  for (let i = 0; i < bucketCount; i++) {
+    const ts = now - spanMs + (i + 1) * bucketMs;
+    const d = new Date(ts);
+    const label = hours <= 24
+      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString([], { month: "short", day: "numeric" });
+    buckets.push({ label, ts });
+  }
+  return buckets;
+}
+
+function bucketizeTraceItems<T>(items: T[], getTs: (item: T) => string, buckets: TraceBucket[]): number[] {
+  const counts = new Array(buckets.length).fill(0) as number[];
+  for (const item of items) {
+    const ts = new Date(getTs(item)).getTime();
+    if (!ts || isNaN(ts)) continue;
+    for (let i = buckets.length - 1; i >= 0; i--) {
+      const lo = i === 0 ? 0 : buckets[i - 1].ts;
+      if (ts > lo && ts <= buckets[i].ts) {
+        counts[i]++;
+        break;
+      }
+    }
+  }
+  return counts;
+}
+
+function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
+  const [traceSection, setTraceSection] = useState<"history" | "sync" | "exports">("history");
+  const [traceRange, setTraceRange] = useState<TraceRange>("7d");
+  const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [selectedSyncRunId, setSelectedSyncRunId] = useState<string | null>(null);
+  const [syncRunPage, setSyncRunPage] = useState(0);
+  const syncRunPageSize = 12;
+
+  const traceSince = traceRangeSinceISO(traceRange);
+  const traceBuckets = useMemo(() => buildTraceTrendBuckets(traceRange), [traceRange]);
+
+  const traceQ = useQuery({ queryKey: ["trace-manager", traceRange], queryFn: () => api.rawGet(`/trace?limit=200&since=${encodeURIComponent(traceSince)}`), refetchInterval: autoRefresh ? REFRESH_MS : false });
   const traceDetailQ = useQuery({ queryKey: ["trace-detail", selectedTraceId], queryFn: () => api.rawGet(`/trace/${encodeURIComponent(selectedTraceId || "")}`), enabled: !!selectedTraceId });
+  const syncRunsQ = useQuery({
+    queryKey: ["integration-sync-runs", syncRunPage],
+    queryFn: () => api.rawGet(`/integrations/sync/runs?limit=${syncRunPageSize}&offset=${syncRunPage * syncRunPageSize}`),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
   const exportLogsQ = useQuery({ queryKey: ["settings-observability-logs"], queryFn: () => api.rawGet("/settings/observability/logs"), refetchInterval: autoRefresh ? 30000 : false });
   const exportLogs = pickRecords(asRecord(exportLogsQ.data), "logs");
 
@@ -11989,6 +12937,29 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const traceEvidence = buildTraceEvidenceItems(steps);
   const traceArtifacts = extractTraceArtifacts(selectedTrace, steps);
   const evolutionReviewCards = useMemo(() => buildEvolutionReviewCards(steps), [steps]);
+  const syncRunData = asRecord(syncRunsQ.data);
+  const syncRuns = pickRecords(syncRunData, "items");
+  const syncRunTotal = num(syncRunData.total, syncRuns.length);
+  const syncRunStats = asRecord(syncRunData.stats);
+  const syncRunBuckets = pickRecords(syncRunStats, "buckets");
+  const syncRunPages = Math.max(1, Math.ceil(syncRunTotal / syncRunPageSize));
+  const selectedSyncRun = useMemo(
+    () => syncRuns.find((item) => str(item.id, "") === selectedSyncRunId) || null,
+    [syncRuns, selectedSyncRunId]
+  );
+  const selectedSyncRunStatus = str(selectedSyncRun?.status, "");
+  const selectedSyncRunStarted = humanTs(str(selectedSyncRun?.started_at, ""));
+  const selectedSyncRunCompleted = humanTs(str(selectedSyncRun?.completed_at, ""));
+  const syncRunTrendRows: Array<{ label: string; value: string }> = syncRunBuckets.map((bucket) => ({
+    label: str(bucket.label, "-"),
+    value: `${num(bucket.runs, 0)} runs`,
+  }));
+  const syncRunTrendValues = syncRunBuckets.map((bucket) => num(bucket.runs, 0));
+  const syncAttentionRows: Array<{ label: string; value: string }> = syncRunBuckets.map((bucket) => ({
+    label: str(bucket.label, "-"),
+    value: `${num(bucket.failures, 0) + num(bucket.blocked, 0)} attention`,
+  }));
+  const syncAttentionValues = syncRunBuckets.map((bucket) => num(bucket.failures, 0) + num(bucket.blocked, 0));
   const traceOutcomeSummary =
     selectedTraceStatus === "completed"
       ? `Completed successfully in ${formatTraceDuration(selectedTrace.duration_ms)}`
@@ -11998,16 +12969,122 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <Stack spacing={2}>
+      <Box className="list-shell" sx={{ p: "4px 8px" }}>
+        <Stack direction="row" alignItems="center" justifyContent="space-between">
+          <Tabs
+            value={traceSection}
+            onChange={(_, value) => setTraceSection(value)}
+            variant="scrollable"
+            allowScrollButtonsMobile
+            sx={{
+              minHeight: 36,
+              flex: 1,
+              "& .MuiTabs-indicator": { backgroundColor: "#39d0ff", height: 2, borderRadius: 1 },
+              "& .MuiTab-root": {
+                minHeight: 36,
+                px: 2,
+                py: 0.75,
+                textTransform: "none",
+                fontSize: "0.82rem",
+                fontWeight: 500,
+                letterSpacing: "0.01em",
+                color: "rgba(214, 228, 255, 0.55)",
+                "&:hover": { color: "rgba(214, 228, 255, 0.85)" },
+              },
+              "& .Mui-selected": { color: "#e8f4ff !important", fontWeight: 600 }
+            }}
+          >
+            <Tab value="history" label={`Execution History (${historyTotal})`} />
+            <Tab value="sync" label={`Sync Runs (${syncRunTotal})`} />
+            <Tab value="exports" label={`Export Delivery (${exportLogs.length})`} />
+          </Tabs>
+          <Stack direction="row" spacing={0.5} sx={{ flexShrink: 0, pl: 1 }}>
+            {TRACE_RANGE_PRESETS.map((preset) => (
+              <Chip
+                key={preset.value}
+                size="small"
+                label={preset.label}
+                variant={traceRange === preset.value ? "filled" : "outlined"}
+                color={traceRange === preset.value ? "primary" : "default"}
+                onClick={() => setTraceRange(preset.value)}
+                sx={{ fontSize: "0.72rem", height: 24, cursor: "pointer" }}
+              />
+            ))}
+          </Stack>
+        </Stack>
+      </Box>
+
+      {traceSection === "history" ? (
       <Box className="list-shell">
-        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
+        <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
           <Typography variant="h6">Trace History</Typography>
           <Typography variant="caption" color="text.secondary">
             Showing {history.length} of {historyTotal} runs
           </Typography>
         </Stack>
+        {(() => {
+          const completed = history.filter((h) => str(h.status, "").toLowerCase() === "completed");
+          const failed = history.filter((h) => str(h.status, "").toLowerCase() === "failed");
+          const histTrendValues = bucketizeTraceItems(history, (h) => str(h.started_at || h.created_at, ""), traceBuckets);
+          const histTrendRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(histTrendValues[i] || 0) }));
+          const histFailValues = bucketizeTraceItems(failed, (h) => str(h.started_at || h.created_at, ""), traceBuckets);
+          const histFailRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(histFailValues[i] || 0) }));
+          return (
+          <>
+          <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
+            <Grid2 size={{ xs: 6, sm: 3 }}>
+              <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" color="text.secondary">Total</Typography>
+                <Typography variant="h5">{history.length}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, sm: 3 }}>
+              <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" color="text.secondary">Completed</Typography>
+                <Typography variant="h5" sx={{ color: "rgba(74,210,157,0.9)" }}>{completed.length}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, sm: 3 }}>
+              <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" color="text.secondary">Failed</Typography>
+                <Typography variant="h5" sx={{ color: "rgba(255,100,100,0.9)" }}>{failed.length}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, sm: 3 }}>
+              <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                <Typography variant="caption" color="text.secondary">Avg steps</Typography>
+                <Typography variant="h5">{history.length > 0 ? Math.round(history.reduce((sum, h) => sum + num(h.step_count, 0), 0) / history.length) : 0}</Typography>
+              </Box>
+            </Grid2>
+          </Grid2>
+          {history.length > 0 ? (
+            <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <MetricBarCard
+                  title="Execution Volume"
+                  value={`${history.length} runs`}
+                  values={histTrendValues}
+                  rows={histTrendRows}
+                  palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <MetricBarCard
+                  title="Failures"
+                  value={`${failed.length} failed`}
+                  values={histFailValues}
+                  rows={histFailRows}
+                  palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
+                />
+              </Grid2>
+            </Grid2>
+          ) : null}
+          </>
+          );
+        })()}
         {history.length === 0 ? (
           <Alert severity="info">
-            No trace history is available yet. New chat runs will appear here with detailed execution steps. Older runs from before trace persistence was enabled may not be listed.
+            No trace history is available yet. New chat runs will appear here with detailed execution steps.
           </Alert>
         ) : (
           <TableContainer className="table-shell">
@@ -12072,9 +13149,156 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
           </TableContainer>
         )}
       </Box>
+      ) : null}
 
       {traceQ.error || traceDetailQ.error ? (
         <Alert severity="error">{errMessage(traceQ.error || traceDetailQ.error)}</Alert>
+      ) : null}
+
+      {traceSection === "sync" ? (
+      <Box className="list-shell">
+        <Stack spacing={1.25}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" flexWrap="wrap" useFlexGap>
+            <Box>
+              <Typography variant="h6">Integration Sync Runs</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Background and manual sync executions across all connected integrations.
+              </Typography>
+            </Box>
+            <Typography variant="caption" color="text.secondary">
+              Showing {syncRuns.length} of {syncRunTotal} runs
+            </Typography>
+          </Stack>
+
+          {syncRunBuckets.length > 0 ? (
+            <Grid2 container spacing={1.25}>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <MetricBarCard
+                  title="Sync Run Volume"
+                  value={`${num(syncRunStats.total_runs, 0)} total`}
+                  values={syncRunTrendValues}
+                  rows={syncRunTrendRows}
+                  palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12, lg: 6 }}>
+                <MetricBarCard
+                  title="Attention Load"
+                  value={`${num(syncRunStats.important_hits, 0)} important`}
+                  values={syncAttentionValues}
+                  rows={syncAttentionRows}
+                  palette={["#ffb347", "#ff7a7a", "#ff9966", "#ffd166", "#ff857d", "#ffb86c", "#ff9e64"]}
+                />
+              </Grid2>
+            </Grid2>
+          ) : null}
+
+          <Grid2 container spacing={1}>
+            <Grid2 size={{ xs: 6, md: 3 }}>
+              <Box className="metadata-box">
+                <Typography variant="caption" color="text.secondary">Completed</Typography>
+                <Typography variant="h6">{num(syncRunStats.completed_runs, 0)}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, md: 3 }}>
+              <Box className="metadata-box">
+                <Typography variant="caption" color="text.secondary">Failed</Typography>
+                <Typography variant="h6">{num(syncRunStats.failed_runs, 0)}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, md: 3 }}>
+              <Box className="metadata-box">
+                <Typography variant="caption" color="text.secondary">Blocked</Typography>
+                <Typography variant="h6">{num(syncRunStats.blocked_runs, 0)}</Typography>
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 6, md: 3 }}>
+              <Box className="metadata-box">
+                <Typography variant="caption" color="text.secondary">Avg duration</Typography>
+                <Typography variant="h6">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          {syncRunsQ.error ? (
+            <Alert severity="warning">{errMessage(syncRunsQ.error)}</Alert>
+          ) : syncRuns.length === 0 ? (
+            <Alert severity="info">
+              No integration sync runs have been recorded yet. Once background sync or manual sync runs execute, they will appear here.
+            </Alert>
+          ) : (
+            <>
+              <TableContainer className="table-shell">
+                <Table size="small" sx={{ tableLayout: "fixed" }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell width="14%">Started</TableCell>
+                      <TableCell width="14%">Integration</TableCell>
+                      <TableCell width="10%">Trigger</TableCell>
+                      <TableCell width="12%">Status</TableCell>
+                      <TableCell width="28%">Summary</TableCell>
+                      <TableCell width="12%">Items</TableCell>
+                      <TableCell width="10%">Duration</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {syncRuns.map((item, idx) => {
+                      const id = str(item.id, `sync-run-${idx}`);
+                      const status = str(item.status, "completed");
+                      return (
+                        <TableRow key={id} hover onClick={() => setSelectedSyncRunId(id)} sx={{ cursor: "pointer" }}>
+                          <TableCell>
+                            <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
+                              {humanTs(str(item.started_at)).label}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" noWrap title={str(item.integration_name)}>
+                              {str(item.integration_name)}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" noWrap>{syncRunTriggerLabel(str(item.trigger))}</Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Chip size="small" color={syncRunStatusColor(status)} label={status} />
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" noWrap title={str(item.summary)}>
+                              {str(item.summary)}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" noWrap>
+                              {num(item.new_item_count, 0)} new / {num(item.important_item_count, 0)} imp
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" noWrap>{formatTraceDuration(item.duration_ms)}</Typography>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" useFlexGap>
+                <Typography variant="caption" color="text.secondary">
+                  Page {Math.min(syncRunPage + 1, syncRunPages)} of {syncRunPages}
+                </Typography>
+                <Stack direction="row" spacing={1}>
+                  <Button size="small" variant="outlined" disabled={syncRunPage === 0} onClick={() => setSyncRunPage((prev) => Math.max(0, prev - 1))}>
+                    Prev
+                  </Button>
+                  <Button size="small" variant="outlined" disabled={syncRunPage >= syncRunPages - 1} onClick={() => setSyncRunPage((prev) => Math.min(syncRunPages - 1, prev + 1))}>
+                    Next
+                  </Button>
+                </Stack>
+              </Stack>
+            </>
+          )}
+        </Stack>
+      </Box>
       ) : null}
 
       <Dialog open={selectedTraceId != null} onClose={() => setSelectedTraceId(null)} maxWidth="lg" fullWidth>
@@ -12239,62 +13463,244 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
         </DialogActions>
       </Dialog>
 
+      <Dialog open={selectedSyncRunId != null} onClose={() => setSelectedSyncRunId(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 2 }}>
+          <Box>
+            <Typography variant="h6">Integration Sync Run</Typography>
+            <Typography variant="caption" color="text.secondary">
+              <span title={selectedSyncRunStarted.tip}>{selectedSyncRunStarted.label}</span>
+              {selectedSyncRun ? ` | ${str(selectedSyncRun.integration_name, "-")} | ${syncRunTriggerLabel(str(selectedSyncRun.trigger, ""))}` : ""}
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={() => setSelectedSyncRunId(null)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {!selectedSyncRun ? (
+            <Typography variant="body2" color="text.secondary">Run details are not available on this page.</Typography>
+          ) : (
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                <Chip size="small" color={syncRunStatusColor(selectedSyncRunStatus)} label={selectedSyncRunStatus || "unknown"} />
+                <Chip size="small" variant="outlined" label={syncRunTriggerLabel(str(selectedSyncRun.trigger, ""))} />
+                <Typography variant="body2" color="text.secondary">
+                  {formatTraceDuration(selectedSyncRun.duration_ms)} | {str(selectedSyncRun.sync_kind, "activity")}
+                </Typography>
+              </Stack>
+
+              <Alert severity={selectedSyncRunStatus === "failed" ? "error" : selectedSyncRunStatus === "blocked" ? "warning" : "info"}>
+                {str(selectedSyncRun.summary, "No summary available.")}
+              </Alert>
+
+              <Grid2 container spacing={1}>
+                <Grid2 size={{ xs: 6, sm: 3 }}>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">Fetched</Typography>
+                    <Typography variant="h6">{num(selectedSyncRun.fetched_item_count, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3 }}>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">New</Typography>
+                    <Typography variant="h6">{num(selectedSyncRun.new_item_count, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3 }}>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">Recorded</Typography>
+                    <Typography variant="h6">{num(selectedSyncRun.recorded_item_count, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3 }}>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">Important</Typography>
+                    <Typography variant="h6">{num(selectedSyncRun.important_item_count, 0)}</Typography>
+                  </Box>
+                </Grid2>
+              </Grid2>
+
+              <Grid2 container spacing={1}>
+                <Grid2 size={{ xs: 12, sm: 6 }}>
+                  <Box className="metadata-box" sx={{ minHeight: 86 }}>
+                    <Typography variant="caption" color="text.secondary">Runtime state</Typography>
+                    <Typography variant="body2">
+                      {toBool(selectedSyncRun.connected) ? "Connected" : "Not connected"}
+                      {" | "}
+                      {toBool(selectedSyncRun.integration_enabled) ? "Integration enabled" : "Integration disabled"}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                      Completed: <span title={selectedSyncRunCompleted.tip}>{selectedSyncRunCompleted.label}</span>
+                    </Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 12, sm: 6 }}>
+                  <Box className="metadata-box" sx={{ minHeight: 86 }}>
+                    <Typography variant="caption" color="text.secondary">Last detected item</Typography>
+                    <Typography variant="body2">
+                      {str(selectedSyncRun.last_item_at) ? humanTs(str(selectedSyncRun.last_item_at)).label : "None"}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+                      {toBool(selectedSyncRun.baseline_mode) ? "This run seeded baseline history." : "Normal incremental sync run."}
+                    </Typography>
+                  </Box>
+                </Grid2>
+              </Grid2>
+
+              {str(selectedSyncRun.error, "").trim() ? (
+                <Alert severity="error">{str(selectedSyncRun.error)}</Alert>
+              ) : null}
+
+              {Array.isArray(selectedSyncRun.sample_titles) && selectedSyncRun.sample_titles.length > 0 ? (
+                <Box className="metadata-box">
+                  <Typography variant="subtitle2">Captured items</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Top items seen in this run.
+                  </Typography>
+                  <Stack spacing={0.5} sx={{ mt: 1 }}>
+                    {selectedSyncRun.sample_titles.map((title, index) => (
+                      <Typography key={`${selectedSyncRunId}-${index}`} variant="body2">
+                        {index + 1}. {str(title)}
+                      </Typography>
+                    ))}
+                  </Stack>
+                </Box>
+              ) : null}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSelectedSyncRunId(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Observability Export Delivery Logs */}
-      {exportLogs.length > 0 ? (
+      {traceSection === "exports" ? (
         <Box className="list-shell">
-          <Stack spacing={0.5} mb={1}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
             <Typography variant="h6">Export Delivery</Typography>
             <Typography variant="caption" color="text.secondary">
-              Recent pushes to the observability platform.
+              {exportLogs.length} deliveries
             </Typography>
           </Stack>
-          <TableContainer className="table-shell">
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Time</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell>Event</TableCell>
-                  <TableCell>Message</TableCell>
-                  <TableCell>Trace</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {exportLogs.slice(0, 20).map((entry, idx) => {
-                  const level = str(entry.level, "").toLowerCase();
-                  const ts = humanTs(str(entry.timestamp, ""));
-                  const traceId = str(entry.trace_id, "").trim();
-                  return (
-                    <TableRow
-                      key={`exp-${str(entry.id, "log")}-${idx}`}
-                      hover
-                      onClick={() => { if (traceId) setSelectedTraceId(traceId); }}
-                      sx={{ cursor: traceId ? "pointer" : "default" }}
-                    >
-                      <TableCell sx={{ whiteSpace: "nowrap" }}>
-                        <Typography variant="body2" noWrap title={ts.tip}>{ts.label}</Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: level === "error" ? "rgba(255,100,100,0.85)" : level === "success" ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
-                          <Typography variant="body2" color="text.secondary" noWrap>{level || "info"}</Typography>
-                        </Box>
-                      </TableCell>
-                      <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
-                      <TableCell sx={{ maxWidth: 520 }}>
-                        <Typography variant="body2" color={level === "error" ? "error" : "text.secondary"} noWrap title={str(entry.message, "-")}>
-                          {str(entry.message, "-")}
-                        </Typography>
-                      </TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>
-                        {traceId ? traceId.slice(0, 8) : "-"}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </TableContainer>
+          {(() => {
+            const successLogs = exportLogs.filter((e) => str(e.level, "").toLowerCase() === "success");
+            const errorLogs = exportLogs.filter((e) => str(e.level, "").toLowerCase() === "error");
+            const expTrendValues = bucketizeTraceItems(exportLogs, (e) => str(e.timestamp, ""), traceBuckets);
+            const expTrendRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(expTrendValues[i] || 0) }));
+            const expErrorValues = bucketizeTraceItems(errorLogs, (e) => str(e.timestamp, ""), traceBuckets);
+            const expErrorRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(expErrorValues[i] || 0) }));
+            return (
+            <>
+            <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
+              <Grid2 size={{ xs: 6, sm: 3 }}>
+                <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" color="text.secondary">Total</Typography>
+                  <Typography variant="h5">{exportLogs.length}</Typography>
+                </Box>
+              </Grid2>
+              <Grid2 size={{ xs: 6, sm: 3 }}>
+                <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" color="text.secondary">Success</Typography>
+                  <Typography variant="h5" sx={{ color: "rgba(74,210,157,0.9)" }}>{successLogs.length}</Typography>
+                </Box>
+              </Grid2>
+              <Grid2 size={{ xs: 6, sm: 3 }}>
+                <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" color="text.secondary">Errors</Typography>
+                  <Typography variant="h5" sx={{ color: "rgba(255,100,100,0.9)" }}>{errorLogs.length}</Typography>
+                </Box>
+              </Grid2>
+              <Grid2 size={{ xs: 6, sm: 3 }}>
+                <Box className="metadata-box" sx={{ textAlign: "center" }}>
+                  <Typography variant="caption" color="text.secondary">Events</Typography>
+                  <Typography variant="h5">{new Set(exportLogs.map((e) => str(e.event, ""))).size}</Typography>
+                </Box>
+              </Grid2>
+            </Grid2>
+            {exportLogs.length > 0 ? (
+              <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
+                <Grid2 size={{ xs: 12, lg: 6 }}>
+                  <MetricBarCard
+                    title="Delivery Volume"
+                    value={`${exportLogs.length} exports`}
+                    values={expTrendValues}
+                    rows={expTrendRows}
+                    palette={["#6cf2ff", "#33d8ff", "#0bd8b8", "#7de2ff", "#63a6ff", "#00c7ff", "#8df7ff"]}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, lg: 6 }}>
+                  <MetricBarCard
+                    title="Export Errors"
+                    value={`${errorLogs.length} errors`}
+                    values={expErrorValues}
+                    rows={expErrorRows}
+                    palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
+                  />
+                </Grid2>
+              </Grid2>
+            ) : null}
+            </>
+            );
+          })()}
+          {exportLogs.length === 0 ? (
+            <Alert severity="info">
+              No observability export delivery logs are available yet.
+            </Alert>
+          ) : (
+            <TableContainer className="table-shell">
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Time</TableCell>
+                    <TableCell>Status</TableCell>
+                    <TableCell>Event</TableCell>
+                    <TableCell>Message</TableCell>
+                    <TableCell>Trace</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {exportLogs.slice(0, 20).map((entry, idx) => {
+                    const level = str(entry.level, "").toLowerCase();
+                    const ts = humanTs(str(entry.timestamp, ""));
+                    const traceId = str(entry.trace_id, "").trim();
+                    return (
+                      <TableRow
+                        key={`exp-${str(entry.id, "log")}-${idx}`}
+                        hover
+                        onClick={() => {
+                          if (traceId) {
+                            setTraceSection("history");
+                            setSelectedTraceId(traceId);
+                          }
+                        }}
+                        sx={{ cursor: traceId ? "pointer" : "default" }}
+                      >
+                        <TableCell sx={{ whiteSpace: "nowrap" }}>
+                          <Typography variant="body2" noWrap title={ts.tip}>{ts.label}</Typography>
+                        </TableCell>
+                        <TableCell>
+                          <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                            <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: level === "error" ? "rgba(255,100,100,0.85)" : level === "success" ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                            <Typography variant="body2" color="text.secondary" noWrap>{level || "info"}</Typography>
+                          </Box>
+                        </TableCell>
+                        <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
+                        <TableCell sx={{ maxWidth: 520 }}>
+                          <Typography variant="body2" color={level === "error" ? "error" : "text.secondary"} noWrap title={str(entry.message, "-")}>
+                            {str(entry.message, "-")}
+                          </Typography>
+                        </TableCell>
+                        <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>
+                          {traceId ? traceId.slice(0, 8) : "-"}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
         </Box>
       ) : null}
     </Stack>
@@ -12591,6 +13997,31 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
       await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
     }
   });
+  const runNowMutation = useMutation({
+    mutationFn: (id: string) => api.rawPost(`/watchers/${encodeURIComponent(id)}/run-now`, {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    }
+  });
+  const extendMutation = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: JsonRecord }) =>
+      api.rawPost(`/watchers/${encodeURIComponent(id)}/extend`, body),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    }
+  });
+  const pauseAllMutation = useMutation({
+    mutationFn: () => api.rawPost("/watchers/pause-all", {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    }
+  });
+  const resumeAllMutation = useMutation({
+    mutationFn: () => api.rawPost("/watchers/resume-all", {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    }
+  });
 
   const watchers = pickRecords(watchersQ.data, "watchers");
   const selectedWatcher = useMemo(
@@ -12607,34 +14038,68 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <Stack spacing={2}>
-      {watchers.length > 0 ? (
-        <Grid2 container spacing={2} alignItems="stretch">
-          <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
-              <Typography variant="caption" color="text.secondary">Active</Typography>
-              <Typography variant="h5">{activeCount}</Typography>
-            </Box>
-          </Grid2>
-          <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
-              <Typography variant="caption" color="text.secondary">Paused</Typography>
-              <Typography variant="h5">{pausedCount}</Typography>
-            </Box>
-          </Grid2>
-          <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
-              <Typography variant="caption" color="text.secondary">Triggered</Typography>
-              <Typography variant="h5">{triggeredCount}</Typography>
-            </Box>
-          </Grid2>
-          <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
-            <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
-              <Typography variant="caption" color="text.secondary">Stopped / Failed</Typography>
-              <Typography variant="h5">{failedCount}</Typography>
-            </Box>
-          </Grid2>
+      <Grid2 container spacing={2} alignItems="stretch">
+        <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
+          <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
+            <Typography variant="caption" color="text.secondary">Active</Typography>
+            <Typography variant="h5">{activeCount}</Typography>
+          </Box>
         </Grid2>
-      ) : null}
+        <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
+          <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
+            <Typography variant="caption" color="text.secondary">Paused</Typography>
+            <Typography variant="h5">{pausedCount}</Typography>
+          </Box>
+        </Grid2>
+        <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
+          <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
+            <Typography variant="caption" color="text.secondary">Triggered</Typography>
+            <Typography variant="h5">{triggeredCount}</Typography>
+          </Box>
+        </Grid2>
+        <Grid2 size={{ xs: 6, md: 3 }} sx={{ display: "flex" }}>
+          <Box className="list-shell" sx={{ minHeight: 80, height: "100%", width: "100%" }}>
+            <Typography variant="caption" color="text.secondary">Stopped / Failed</Typography>
+            <Typography variant="h5">{failedCount}</Typography>
+          </Box>
+        </Grid2>
+      </Grid2>
+
+      <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+        <Typography variant="caption" color="text.secondary" sx={{ mr: 0.5 }}>
+          Default watcher lifetime is 24h. You can pause, resume, extend, or queue a watcher to run on the next Sentinel tick.
+        </Typography>
+        <Button
+          size="small"
+          variant="outlined"
+          disabled={activeCount === 0 || pauseAllMutation.isPending}
+          onClick={async () => {
+            setError(null);
+            try {
+              await pauseAllMutation.mutateAsync();
+            } catch (e) {
+              setError(errMessage(e));
+            }
+          }}
+        >
+          Pause all active
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          disabled={pausedCount === 0 || resumeAllMutation.isPending}
+          onClick={async () => {
+            setError(null);
+            try {
+              await resumeAllMutation.mutateAsync();
+            } catch (e) {
+              setError(errMessage(e));
+            }
+          }}
+        >
+          Resume all paused
+        </Button>
+      </Stack>
 
       {watchers.length === 0 ? (
         <Box sx={{ py: 8, textAlign: "center" }}>
@@ -12737,6 +14202,11 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                               onClick: () => { setError(null); setSelectedWatcherId(id); },
                             },
                             {
+                              label: "Run now",
+                              disabled: isHistoryOnly || !isActive || runNowMutation.isPending,
+                              onClick: async () => { setError(null); try { await runNowMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
+                            },
+                            {
                               label: "Pause",
                               disabled: isHistoryOnly || !isActive || pauseMutation.isPending,
                               onClick: async () => { setError(null); try { await pauseMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
@@ -12751,6 +14221,22 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                               tone: "warning",
                               disabled: isHistoryOnly || (!isActive && !isPaused) || cancelMutation.isPending,
                               onClick: async () => { setError(null); try { await cancelMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); } },
+                            },
+                            {
+                              label: "Extend +24h",
+                              disabled: isHistoryOnly || (!isActive && !isPaused) || extendMutation.isPending,
+                              onClick: async () => {
+                                setError(null);
+                                try { await extendMutation.mutateAsync({ id, body: { extra_hours: 24 } }); } catch (e) { setError(errMessage(e)); }
+                              },
+                            },
+                            {
+                              label: "Until stopped",
+                              disabled: isHistoryOnly || (!isActive && !isPaused) || extendMutation.isPending,
+                              onClick: async () => {
+                                setError(null);
+                                try { await extendMutation.mutateAsync({ id, body: { until_stopped: true } }); } catch (e) { setError(errMessage(e)); }
+                              },
                             },
                             {
                               label: "Delete",
@@ -12979,6 +14465,49 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Stack>
         </DialogContent>
         <DialogActions>
+          {!toBool(selectedWatcher?.history_only) ? (
+            <Stack direction="row" spacing={1} sx={{ mr: "auto" }}>
+              <Button
+                size="small"
+                variant="outlined"
+                disabled={!str(selectedWatcher?.status, "").toLowerCase().includes("active") || runNowMutation.isPending}
+                onClick={async () => {
+                  const id = str(selectedWatcher?.id, "").trim();
+                  if (!id) return;
+                  setError(null);
+                  try { await runNowMutation.mutateAsync(id); } catch (e) { setError(errMessage(e)); }
+                }}
+              >
+                Run now
+              </Button>
+              <Button
+                size="small"
+                variant="outlined"
+                disabled={!["active", "paused"].some((token) => str(selectedWatcher?.status, "").toLowerCase().includes(token)) || extendMutation.isPending}
+                onClick={async () => {
+                  const id = str(selectedWatcher?.id, "").trim();
+                  if (!id) return;
+                  setError(null);
+                  try { await extendMutation.mutateAsync({ id, body: { extra_hours: 24 } }); } catch (e) { setError(errMessage(e)); }
+                }}
+              >
+                Extend 24h
+              </Button>
+              <Button
+                size="small"
+                variant="outlined"
+                disabled={!["active", "paused"].some((token) => str(selectedWatcher?.status, "").toLowerCase().includes(token)) || extendMutation.isPending}
+                onClick={async () => {
+                  const id = str(selectedWatcher?.id, "").trim();
+                  if (!id) return;
+                  setError(null);
+                  try { await extendMutation.mutateAsync({ id, body: { until_stopped: true } }); } catch (e) { setError(errMessage(e)); }
+                }}
+              >
+                Until stopped
+              </Button>
+            </Stack>
+          ) : null}
           <Button onClick={() => setSelectedWatcherId(null)}>Close</Button>
         </DialogActions>
       </Dialog>
@@ -13011,12 +14540,36 @@ function SettingsManager({
       setup: 0,
       models: 1,
       channels: 2,
+      connections: 2,
       integrations: 2,
       media: 3,
       security: 4,
+      observability: 6,
+      telemetry: 6,
+      webhooks: 2,
+      verification: 16,
+      trust: 16,
+      "sender-verification": 16,
+      senderverification: 16,
+      plugins: 2,
+      plugin: 2,
+      sdk: 2,
+      ingress: 2,
+      events: 2,
       advanced: 5,
       moltbook: 7,
       mcp: 8,
+      routing: 2,
+      // Browser profile UI is intentionally hidden for now.
+      // Keep the underlying code path so the surface can be re-enabled later.
+      browser: 2,
+      // Companion-device UI is intentionally hidden for now.
+      // Keep the underlying code path so the surface can be re-enabled later.
+      devices: 2,
+      failover: 1,
+      reliability: 1,
+      gateway: 9,
+      gatewayops: 9,
       memory: 12,
       system: 9,
       trace: 11,
@@ -13024,6 +14577,9 @@ function SettingsManager({
     };
     if (normalized in byName) return byName[normalized];
     const asNumber = Number(normalized);
+    if (Number.isFinite(asNumber) && Math.trunc(asNumber) === 14) return 14;
+    if (Number.isFinite(asNumber) && Math.trunc(asNumber) === 15) return 15;
+    if (Number.isFinite(asNumber) && Math.trunc(asNumber) === 16) return 16;
     if (Number.isFinite(asNumber) && Math.trunc(asNumber) === 10) return 2;
     return Number.isFinite(asNumber) ? Math.max(0, Math.trunc(asNumber)) : 0;
   });
@@ -13061,8 +14617,9 @@ function SettingsManager({
   const [tunnelSelectedProviderId, setTunnelSelectedProviderId] = useState("");
   const [tunnelDraftValues, setTunnelDraftValues] = useState<Record<string, string>>({});
   const [showTunnelAdvanced, setShowTunnelAdvanced] = useState(false);
+  const [tunnelSetupChecks, setTunnelSetupChecks] = useState<JsonRecord[]>([]);
   const [tunnelPanelNotice, setTunnelPanelNotice] = useState<{
-    severity: "success" | "info";
+    severity: "success" | "info" | "warning";
     text: string;
   } | null>(null);
   const [resumeTunnelStartAfterPassword, setResumeTunnelStartAfterPassword] = useState(false);
@@ -13139,8 +14696,8 @@ function SettingsManager({
   const observabilityLogsQ = useQuery({
     queryKey: ["settings-observability-logs"],
     queryFn: () => api.rawGet("/settings/observability/logs?limit=40"),
-    enabled: tab === 5,
-    refetchInterval: tab === 5 && autoRefresh ? REFRESH_MS : false
+    enabled: tab === 6,
+    refetchInterval: tab === 6 && autoRefresh ? REFRESH_MS : false
   });
   const vaultSecretsQ = useQuery({
     queryKey: ["settings-secrets"],
@@ -13205,7 +14762,6 @@ function SettingsManager({
     daily_brief_time: "09:00",
     daily_brief_channel: "telegram",
     smart_routing: true,
-    app_deploy_model_id: "",
 
     llm_provider: "ollama",
     llm_model: "",
@@ -13220,6 +14776,49 @@ function SettingsManager({
     telegram_enabled: false,
     telegram_bot_token: "",
     telegram_allowed_users_csv: "",
+
+    slack_enabled: false,
+    slack_bot_token: "",
+    slack_signing_secret: "",
+    slack_api_base_url: "https://slack.com/api",
+    slack_default_channel_id: "",
+    slack_default_thread_ts: "",
+    slack_workspace_id: "",
+    slack_workspace_name: "",
+
+    discord_enabled: false,
+    discord_bot_token: "",
+    discord_api_base_url: "https://discord.com/api/v10",
+    discord_default_channel_id: "",
+    discord_default_thread_id: "",
+    discord_guild_id: "",
+    discord_application_id: "",
+    discord_webhook_url: "",
+
+    matrix_enabled: false,
+    matrix_homeserver_url: "",
+    matrix_access_token: "",
+    matrix_user_id: "",
+    matrix_device_id: "",
+    matrix_account_id: "",
+    matrix_default_room_id: "",
+    matrix_sync_timeout_ms: "30000",
+    matrix_limit: "100",
+    matrix_user_agent: "",
+
+    teams_enabled: false,
+    teams_service_url: "",
+    teams_access_token: "",
+    teams_bot_app_id: "",
+    teams_bot_name: "",
+    teams_tenant_id: "",
+    teams_team_id: "",
+    teams_channel_id: "",
+    teams_chat_id: "",
+    teams_graph_base_url: "https://graph.microsoft.com/v1.0",
+    teams_delivery_mode: "auto",
+    teams_timeout_secs: "15",
+    teams_user_agent: "",
 
     whatsapp_enabled: false,
     whatsapp_mode: "baileys",
@@ -13397,13 +14996,6 @@ function SettingsManager({
     const tgUsers = Array.isArray(settings.telegram_allowed_users) ? (settings.telegram_allowed_users as unknown[]) : [];
     const waNums = Array.isArray(settings.whatsapp_allowed_numbers) ? (settings.whatsapp_allowed_numbers as unknown[]) : [];
     const autoApprove = Array.isArray(settings.auto_approve) ? (settings.auto_approve as unknown[]) : [];
-    const modelPool = Array.isArray(settings.model_pool) ? (settings.model_pool as unknown[]) : [];
-    const modelPoolIds = modelPool
-      .map((slot) => str(asRecord(slot).id, "").trim())
-      .filter((id) => id.length > 0);
-    const appDeployModelIdRaw = str(settings.app_deploy_model_id, "").trim();
-    const appDeployModelId = modelPoolIds.includes(appDeployModelIdRaw) ? appDeployModelIdRaw : "";
-
     const nextForm = ({
       ...form,
       bot_name: str(settings.bot_name, form.bot_name),
@@ -13416,7 +15008,6 @@ function SettingsManager({
       daily_brief_time: str(settings.daily_brief_time, "09:00"),
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
       smart_routing: toBool(settings.smart_routing),
-      app_deploy_model_id: appDeployModelId,
 
       llm_provider: str(settings.llm_provider, "ollama"),
       llm_model: str(settings.llm_model, ""),
@@ -13434,6 +15025,49 @@ function SettingsManager({
         .map((v) => (typeof v === "number" ? String(v) : typeof v === "string" ? v : ""))
         .filter((v) => v.trim().length > 0)
         .join(", "),
+
+      slack_enabled: toBool(settings.slack_enabled),
+      slack_bot_token: "",
+      slack_signing_secret: "",
+      slack_api_base_url: str(settings.slack_api_base_url, "https://slack.com/api"),
+      slack_default_channel_id: str(settings.slack_default_channel_id, ""),
+      slack_default_thread_ts: str(settings.slack_default_thread_ts, ""),
+      slack_workspace_id: str(settings.slack_workspace_id, ""),
+      slack_workspace_name: str(settings.slack_workspace_name, ""),
+
+      discord_enabled: toBool(settings.discord_enabled),
+      discord_bot_token: "",
+      discord_api_base_url: str(settings.discord_api_base_url, "https://discord.com/api/v10"),
+      discord_default_channel_id: str(settings.discord_default_channel_id, ""),
+      discord_default_thread_id: str(settings.discord_default_thread_id, ""),
+      discord_guild_id: str(settings.discord_guild_id, ""),
+      discord_application_id: str(settings.discord_application_id, ""),
+      discord_webhook_url: str(settings.discord_webhook_url, ""),
+
+      matrix_enabled: toBool(settings.matrix_enabled),
+      matrix_homeserver_url: str(settings.matrix_homeserver_url, ""),
+      matrix_access_token: "",
+      matrix_user_id: str(settings.matrix_user_id, ""),
+      matrix_device_id: str(settings.matrix_device_id, ""),
+      matrix_account_id: str(settings.matrix_account_id, ""),
+      matrix_default_room_id: str(settings.matrix_default_room_id, ""),
+      matrix_sync_timeout_ms: str(settings.matrix_sync_timeout_ms, "30000"),
+      matrix_limit: str(settings.matrix_limit, "100"),
+      matrix_user_agent: str(settings.matrix_user_agent, ""),
+
+      teams_enabled: toBool(settings.teams_enabled),
+      teams_service_url: str(settings.teams_service_url, ""),
+      teams_access_token: "",
+      teams_bot_app_id: str(settings.teams_bot_app_id, ""),
+      teams_bot_name: str(settings.teams_bot_name, ""),
+      teams_tenant_id: str(settings.teams_tenant_id, ""),
+      teams_team_id: str(settings.teams_team_id, ""),
+      teams_channel_id: str(settings.teams_channel_id, ""),
+      teams_chat_id: str(settings.teams_chat_id, ""),
+      teams_graph_base_url: str(settings.teams_graph_base_url, "https://graph.microsoft.com/v1.0"),
+      teams_delivery_mode: str(settings.teams_delivery_mode, "auto"),
+      teams_timeout_secs: str(settings.teams_timeout_secs, "15"),
+      teams_user_agent: str(settings.teams_user_agent, ""),
 
       whatsapp_enabled: toBool(settings.whatsapp_enabled),
       whatsapp_mode: str(settings.whatsapp_mode, "baileys"),
@@ -13536,6 +15170,49 @@ function SettingsManager({
         form.telegram_bot_token.trim().length > 0 ||
         fieldChanged("telegram_enabled") ||
         fieldChanged("telegram_allowed_users_csv");
+      const includeSlackSettings =
+        form.slack_bot_token.trim().length > 0 ||
+        form.slack_signing_secret.trim().length > 0 ||
+        fieldChanged("slack_enabled") ||
+        fieldChanged("slack_api_base_url") ||
+        fieldChanged("slack_default_channel_id") ||
+        fieldChanged("slack_default_thread_ts") ||
+        fieldChanged("slack_workspace_id") ||
+        fieldChanged("slack_workspace_name");
+      const includeDiscordSettings =
+        form.discord_bot_token.trim().length > 0 ||
+        fieldChanged("discord_enabled") ||
+        fieldChanged("discord_api_base_url") ||
+        fieldChanged("discord_default_channel_id") ||
+        fieldChanged("discord_default_thread_id") ||
+        fieldChanged("discord_guild_id") ||
+        fieldChanged("discord_application_id") ||
+        fieldChanged("discord_webhook_url");
+      const includeMatrixSettings =
+        form.matrix_access_token.trim().length > 0 ||
+        fieldChanged("matrix_enabled") ||
+        fieldChanged("matrix_homeserver_url") ||
+        fieldChanged("matrix_user_id") ||
+        fieldChanged("matrix_device_id") ||
+        fieldChanged("matrix_account_id") ||
+        fieldChanged("matrix_default_room_id") ||
+        fieldChanged("matrix_sync_timeout_ms") ||
+        fieldChanged("matrix_limit") ||
+        fieldChanged("matrix_user_agent");
+      const includeTeamsSettings =
+        form.teams_access_token.trim().length > 0 ||
+        fieldChanged("teams_enabled") ||
+        fieldChanged("teams_service_url") ||
+        fieldChanged("teams_bot_app_id") ||
+        fieldChanged("teams_bot_name") ||
+        fieldChanged("teams_tenant_id") ||
+        fieldChanged("teams_team_id") ||
+        fieldChanged("teams_channel_id") ||
+        fieldChanged("teams_chat_id") ||
+        fieldChanged("teams_graph_base_url") ||
+        fieldChanged("teams_delivery_mode") ||
+        fieldChanged("teams_timeout_secs") ||
+        fieldChanged("teams_user_agent");
       const includeWhatsappSettings =
         form.whatsapp_access_token.trim().length > 0 ||
         fieldChanged("whatsapp_enabled") ||
@@ -13575,7 +15252,6 @@ function SettingsManager({
         daily_brief_time: form.daily_brief_time || "09:00",
         daily_brief_channel: form.daily_brief_channel || "telegram",
         smart_routing: form.smart_routing,
-        app_deploy_model_id: form.app_deploy_model_id,
 
         llm_provider: form.llm_provider,
         llm_model: form.llm_model,
@@ -13626,6 +15302,57 @@ function SettingsManager({
         payload.telegram_enabled = !!form.telegram_enabled;
         payload.telegram_bot_token = form.telegram_bot_token || null;
         payload.telegram_allowed_users = parseTelegramUsers(form.telegram_allowed_users_csv);
+      }
+
+      if (includeSlackSettings) {
+        payload.slack_enabled = !!form.slack_enabled;
+        payload.slack_bot_token = form.slack_bot_token || null;
+        payload.slack_signing_secret = form.slack_signing_secret || null;
+        payload.slack_api_base_url = form.slack_api_base_url || null;
+        payload.slack_default_channel_id = form.slack_default_channel_id || null;
+        payload.slack_default_thread_ts = form.slack_default_thread_ts || null;
+        payload.slack_workspace_id = form.slack_workspace_id || null;
+        payload.slack_workspace_name = form.slack_workspace_name || null;
+      }
+
+      if (includeDiscordSettings) {
+        payload.discord_enabled = !!form.discord_enabled;
+        payload.discord_bot_token = form.discord_bot_token || null;
+        payload.discord_api_base_url = form.discord_api_base_url || null;
+        payload.discord_default_channel_id = form.discord_default_channel_id || null;
+        payload.discord_default_thread_id = form.discord_default_thread_id || null;
+        payload.discord_guild_id = form.discord_guild_id || null;
+        payload.discord_application_id = form.discord_application_id || null;
+        payload.discord_webhook_url = form.discord_webhook_url || null;
+      }
+
+      if (includeMatrixSettings) {
+        payload.matrix_enabled = !!form.matrix_enabled;
+        payload.matrix_homeserver_url = form.matrix_homeserver_url || null;
+        payload.matrix_access_token = form.matrix_access_token || null;
+        payload.matrix_user_id = form.matrix_user_id || null;
+        payload.matrix_device_id = form.matrix_device_id || null;
+        payload.matrix_account_id = form.matrix_account_id || null;
+        payload.matrix_default_room_id = form.matrix_default_room_id || null;
+        payload.matrix_sync_timeout_ms = Number.parseInt(form.matrix_sync_timeout_ms || "0", 10) || 0;
+        payload.matrix_limit = Number.parseInt(form.matrix_limit || "0", 10) || 100;
+        payload.matrix_user_agent = form.matrix_user_agent || null;
+      }
+
+      if (includeTeamsSettings) {
+        payload.teams_enabled = !!form.teams_enabled;
+        payload.teams_service_url = form.teams_service_url || null;
+        payload.teams_access_token = form.teams_access_token || null;
+        payload.teams_bot_app_id = form.teams_bot_app_id || null;
+        payload.teams_bot_name = form.teams_bot_name || null;
+        payload.teams_tenant_id = form.teams_tenant_id || null;
+        payload.teams_team_id = form.teams_team_id || null;
+        payload.teams_channel_id = form.teams_channel_id || null;
+        payload.teams_chat_id = form.teams_chat_id || null;
+        payload.teams_graph_base_url = form.teams_graph_base_url || null;
+        payload.teams_delivery_mode = form.teams_delivery_mode || null;
+        payload.teams_timeout_secs = Number.parseInt(form.teams_timeout_secs || "0", 10) || 15;
+        payload.teams_user_agent = form.teams_user_agent || null;
       }
 
       if (includeWhatsappSettings) {
@@ -14072,6 +15799,15 @@ function SettingsManager({
 
   const hasTelegramToken = toBool(settings.has_telegram_token);
   const telegramDeliveryReady = toBool(settings.telegram_delivery_ready);
+  const hasSlackBotToken = toBool(settings.has_slack_bot_token);
+  const hasSlackSigningSecret = toBool(settings.has_slack_signing_secret);
+  const slackDeliveryReady = toBool(settings.slack_delivery_ready);
+  const hasDiscordBotToken = toBool(settings.has_discord_bot_token);
+  const discordDeliveryReady = toBool(settings.discord_delivery_ready);
+  const hasMatrixAccessToken = toBool(settings.has_matrix_access_token);
+  const matrixDeliveryReady = toBool(settings.matrix_delivery_ready);
+  const hasTeamsAccessToken = toBool(settings.has_teams_access_token);
+  const teamsDeliveryReady = toBool(settings.teams_delivery_ready);
   const hasWhatsAppToken = toBool(settings.has_whatsapp_token);
   const whatsappDeliveryReady = toBool(settings.whatsapp_delivery_ready);
   const hasPrimaryApiKey = toBool(settings.has_api_key);
@@ -14090,6 +15826,30 @@ function SettingsManager({
           : !whatsappDeliveryReady
             ? "WhatsApp is configured, but there is no delivery target yet. Send the agent a WhatsApp message first."
             : ""
+        : form.daily_brief_channel === "slack"
+          ? !hasSlackBotToken || !hasSlackSigningSecret
+            ? "Slack is not configured yet."
+            : !slackDeliveryReady
+              ? "Slack is configured, but it still needs a signed webhook and delivery target."
+              : ""
+          : form.daily_brief_channel === "discord"
+            ? !hasDiscordBotToken && !str(form.discord_webhook_url, "").trim()
+              ? "Discord is not configured yet."
+              : !discordDeliveryReady
+                ? "Discord is configured, but it still needs a live bot or webhook destination."
+                : ""
+            : form.daily_brief_channel === "matrix"
+              ? !hasMatrixAccessToken
+                ? "Matrix is not configured yet."
+                : !matrixDeliveryReady
+                  ? "Matrix is configured, but it still needs a room binding."
+                  : ""
+              : form.daily_brief_channel === "teams"
+                ? !hasTeamsAccessToken
+                  ? "Teams is not configured yet."
+                  : !teamsDeliveryReady
+                    ? "Teams is configured, but it still needs a reply destination."
+                    : ""
         : "";
   const settingsComplete = stableSettingsComplete || toBool(settings.settings_complete) || modelSlots.length > 0;
   const showSetupRequired =
@@ -14182,13 +15942,22 @@ function SettingsManager({
     const advancedTunnelConfigFields = selectedTunnelConfigFields.filter(
       (field) => str(field.key, "").trim() === "binary_path"
     );
+    const selectedTunnelId = str(selectedTunnelProviderRecord?.id, "").trim();
+    const selectedTunnelHasAuthKey =
+      selectedTunnelStoredSecretFields.includes("auth_key") ||
+      Boolean(str(tunnelDraftValues.auth_key, "").trim());
+    const selectedTunnelNeedsAuthKeyHint =
+      (selectedTunnelId === "tailscale_private" || selectedTunnelId === "tailscale_funnel") &&
+      !selectedTunnelHasAuthKey;
     const selectedTunnelLabel = str(selectedTunnelProviderRecord?.label, str(tunnel.provider_label, "Tunnel"));
     const tunnelSummaryTone: "success" | "warning" | "info" =
       toBool(tunnel.active) ? "success" : !selectedTunnelAvailable || !selectedTunnelConfigured ? "warning" : "info";
     const tunnelGuidanceText = !selectedTunnelAvailable
       ? selectedTunnelMeta.isPrivate
-        ? "Private tailnet access needs the Tailscale CLI on the same runtime as AgentArk. In Docker, that means the container itself must have Tailscale available."
-        : "This provider's tunnel binary is not available on this runtime. Use an installed provider or open advanced options to set a custom binary path."
+        ? "Private tailnet access needs Tailscale on the same runtime as AgentArk. In Docker, the container needs the Tailscale CLI plus a running tailscaled or TS_SOCKET mount."
+        : selectedTunnelId === "tailscale_funnel"
+          ? "Tailscale Funnel needs Tailscale on the same runtime as AgentArk. In Docker, the container needs the Tailscale CLI plus a running tailscaled or TS_SOCKET mount."
+          : "This tunnel provider is not available on this runtime yet."
       : selectedTunnelMeta.isPrivate
         ? "Private access only works from devices already connected to your tailnet. It does not create a public internet URL."
         : str(selectedTunnelProviderRecord?.id, "") === "bore"
@@ -14208,6 +15977,7 @@ function SettingsManager({
 
   useEffect(() => {
     setShowTunnelAdvanced(false);
+    setTunnelSetupChecks([]);
     setTunnelPanelNotice(null);
   }, [tunnelSelectedProviderId, serverSelectedTunnelProviderId]);
 
@@ -14240,7 +16010,7 @@ function SettingsManager({
       : !selectedTunnelConfigured
         ? `${selectedTunnelLabel} needs setup before it can start.`
         : tunnelNeedsPassword
-          ? `Set a custom password first, then start ${selectedTunnelLabel}.`
+          ? "Set a custom password first to enable remote access."
           : `${selectedTunnelLabel} is ready to start.`;
   const tunnelPrimaryDetail = !selectedTunnelAvailable
     ? tunnelGuidanceText
@@ -14248,13 +16018,15 @@ function SettingsManager({
       ? selectedTunnelHelp
       : toBool(tunnel.active)
         ? selectedTunnelMeta.isPrivate
-          ? "Only devices already connected to your tailnet can reach this sign-in page."
-          : "Visitors reach the sign-in page through this link and still need your AgentArk password."
+          ? "Only your connected devices can access this link."
+          : "Anyone with the link can see the sign-in page. They still need your password to log in."
         : tunnelNeedsPassword
-          ? "Remote access stays locked until you set your own password."
+          ? ""
+          : selectedTunnelNeedsAuthKeyHint
+            ? "Save a Tailscale auth key first if this runtime isn't signed in yet."
           : selectedTunnelMeta.isPrivate
-            ? "Only devices already connected to your tailnet will be able to reach it."
-            : "This will expose the sign-in page with password protection.";
+            ? "Only your connected devices will be able to reach it."
+            : "Password-protected sign-in page will be available at the public link.";
   const tunnelHasDetails =
     advancedTunnelConfigFields.length > 0 ||
     selectedTunnelDescription.length > 0 ||
@@ -14301,10 +16073,30 @@ function SettingsManager({
   const moltbookRunBusy = runMoltbookMutation.isPending || moltbookRunning || Boolean(moltbookPollState);
   const moltbookLastStatus = str(moltbookStatus.last_status, "").toLowerCase();
   const moltbookLastRunStats = asRecord(moltbookStatus.last_run_stats);
-  const moltbookNeedsConnection =
-    moltbookLastStatus === "not_connected" ||
-    moltbookLastStatus === "not_configured" ||
-    moltbookLastStatus === "error";
+  const moltbookHasStoredApiKey =
+    toBool(settings.moltbook_has_api_key) || toBool(moltbookStatus.has_api_key);
+  const moltbookNeedsConnection = !moltbookHasStoredApiKey;
+  const moltbookHasConnectionIssue =
+    moltbookHasStoredApiKey &&
+    (moltbookLastStatus === "not_connected" || moltbookLastStatus === "error");
+  const moltbookConnectionState = !form.moltbook_enabled
+    ? { label: "Disabled", color: "#555" }
+    : moltbookNeedsConnection
+      ? { label: "Not connected", color: "#f59e0b" }
+      : moltbookHasConnectionIssue
+        ? { label: "Check connection", color: "#f59e0b" }
+        : moltbookLastStatus === "ok"
+          ? { label: "Connected", color: "#22c55e" }
+          : { label: "Configured", color: "#22c55e" };
+  const moltbookConnectorChip = !form.moltbook_enabled
+    ? null
+    : moltbookNeedsConnection
+      ? { label: "API key missing", color: "warning" as const }
+      : moltbookHasConnectionIssue
+        ? { label: "Connection issue", color: "warning" as const }
+        : moltbookLastStatus === "ok"
+          ? { label: "Connected", color: "success" as const }
+          : { label: "Configured", color: "success" as const };
   const moltbookSchedulePresets = [
     { value: "every_minute", label: "Every 1 minute" },
     { value: "every_5_minutes", label: "Every 5 minutes" },
@@ -14419,7 +16211,7 @@ function SettingsManager({
       : pulseEvents.length === 0
       ? pulseHistoryUnavailable
         ? pulseHistoryUnavailableReason || "A previous ArkPulse payload exists, but this runtime could not decrypt it. New runs will appear normally."
-        : "Click Run now to generate your first ArkPulse report."
+        : "Click Run now to generate your first diagnostics report."
       : latestPulseFindingsCount > 0
       ? "Open the latest report and start with Fix #1."
       : "No urgent action needed right now.";
@@ -15111,6 +16903,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     ]);
   }
 
+  function scheduleTunnelRefreshBurst() {
+    for (const delayMs of [1500, 4000, 8000]) {
+      window.setTimeout(() => {
+        void refreshTunnelQueries();
+      }, delayMs);
+    }
+  }
+
   const tunnelSaveMutation = useMutation({
     mutationFn: (payload: { provider: string; values: Record<string, string> }) =>
       api.rawPost("/tunnel/configure", payload),
@@ -15170,6 +16970,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       severity: startedUrl ? "success" : "info",
       text: startMessage
     });
+    if (!startedUrl) {
+      scheduleTunnelRefreshBurst();
+    }
     setSuccess(str(response.message, "Tunnel start requested."));
   }
 
@@ -15207,19 +17010,27 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       await saveSelectedTunnelProviderSettings();
       const response = asRecord(
         await tunnelTestMutation.mutateAsync({
-          provider: tunnelSelectedProviderId.trim() || serverSelectedTunnelProviderId
-        })
-      );
-      const message = str(response.message, "Tunnel provider test passed.").trim();
-      const detail = str(response.detail, "").trim();
-      setTunnelPanelNotice({
-        severity: "success",
-        text: detail ? `${message} ${detail}` : message
-      });
-      setSuccess(detail ? `${message} ${detail}` : message);
-    } catch (e) {
-      setError(errMessage(e));
-    }
+            provider: tunnelSelectedProviderId.trim() || serverSelectedTunnelProviderId
+          })
+        );
+        const ok = toBool(response.ok);
+        const checks = pickRecords(response, "checks");
+        setTunnelSetupChecks(checks);
+        const message = str(
+          response.message,
+          ok ? "Tunnel provider test passed." : "Tunnel provider still needs setup."
+        ).trim();
+        const detail = str(response.detail, "").trim();
+        setTunnelPanelNotice({
+          severity: ok ? "success" : "warning",
+          text: detail ? `${message} ${detail}` : message
+        });
+        if (ok) {
+          setSuccess(detail ? `${message} ${detail}` : message);
+        }
+      } catch (e) {
+        setError(errMessage(e));
+      }
   }
 
   async function handleTunnelStart() {
@@ -15550,9 +17361,20 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       ]
     },
     {
-      id: "operations",
-      label: "Operations",
-      items: [{ value: 13, label: "Evolution" }]
+      id: "connected-systems",
+      label: "Connected Systems",
+      items: [
+        // Browser profiles stay implemented in code, but are hidden from novice-facing settings.
+        // Companion devices stay implemented in code, but are hidden until real device pairing exists.
+      ]
+    },
+      {
+        id: "admin",
+        label: "Admin",
+        items: [
+          { value: 6, label: "Observability" },
+          { value: 13, label: "Evolution" }
+        ]
     },
     {
       id: "security",
@@ -15582,7 +17404,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               label: "Trace"
             }
           : settingsNavActual[0]);
-  const tabSupportsSave = ![9, 11].includes(tab);
+  useEffect(() => {
+    if (tab === 10 || tab === 14 || tab === 15) {
+      setTab(2);
+    }
+  }, [tab]);
+
+  const tabSupportsSave = ![9, 11, 16, 17].includes(tab);
 
   return (
     <Stack spacing={2}>
@@ -15690,6 +17518,36 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   label: "Telegram",
                   tone: !hasTelegramToken ? "muted" : telegramDeliveryReady ? "success" : "warning",
                   status: !hasTelegramToken ? "Not configured" : telegramDeliveryReady ? "Ready to deliver" : "No recipient"
+                },
+                {
+                  label: "Slack",
+                  tone: !hasSlackBotToken || !hasSlackSigningSecret ? "muted" : slackDeliveryReady ? "success" : "warning",
+                  status:
+                    !hasSlackBotToken || !hasSlackSigningSecret
+                      ? "Not configured"
+                      : slackDeliveryReady
+                        ? "Ready to deliver"
+                        : "Needs target"
+                },
+                {
+                  label: "Discord",
+                  tone: !hasDiscordBotToken && !str(settings.discord_webhook_url, "").trim() ? "muted" : discordDeliveryReady ? "success" : "warning",
+                  status:
+                    !hasDiscordBotToken && !str(settings.discord_webhook_url, "").trim()
+                      ? "Not configured"
+                      : discordDeliveryReady
+                        ? "Ready to deliver"
+                        : "Needs target"
+                },
+                {
+                  label: "Matrix",
+                  tone: !hasMatrixAccessToken ? "muted" : matrixDeliveryReady ? "success" : "warning",
+                  status: !hasMatrixAccessToken ? "Not configured" : matrixDeliveryReady ? "Ready to deliver" : "Needs room"
+                },
+                {
+                  label: "Teams",
+                  tone: !hasTeamsAccessToken ? "muted" : teamsDeliveryReady ? "success" : "warning",
+                  status: !hasTeamsAccessToken ? "Not configured" : teamsDeliveryReady ? "Ready to deliver" : "Needs target"
                 },
                 {
                   label: "WhatsApp",
@@ -15923,6 +17781,10 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   InputLabelProps={{ shrink: true }}
                 >
                   <MenuItem value="telegram">Telegram</MenuItem>
+                  <MenuItem value="slack">Slack</MenuItem>
+                  <MenuItem value="discord">Discord</MenuItem>
+                  <MenuItem value="matrix">Matrix</MenuItem>
+                  <MenuItem value="teams">Teams</MenuItem>
                   <MenuItem value="whatsapp">WhatsApp</MenuItem>
                   <MenuItem value="email">Email</MenuItem>
                 </TextField>
@@ -15935,6 +17797,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               ) : null}
             </Stack>
           </Box>
+
         </Stack>
       ) : null}
 
@@ -15967,30 +17830,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 When off, the agent uses the primary model for everything.
               </Typography>
             </Stack>
-            <TextField
-              label="App Deploy Model (optional)"
-              select
-              fullWidth
-              size="small"
-              sx={{ mb: 1.25, maxWidth: 560 }}
-              value={form.app_deploy_model_id}
-              onChange={(e) => setField("app_deploy_model_id", e.target.value)}
-              helperText="If not set, app deploy uses the default primary model."
-            >
-              <MenuItem value="">Default (Primary model)</MenuItem>
-              {modelSlots.map((slot) => {
-                const id = str(slot.id, "");
-                const label = str(slot.label, "Model");
-                const role = str(slot.role, "primary");
-                const model = str(slot.model, "");
-                const enabled = toBool(slot.enabled);
-                return (
-                  <MenuItem key={id || `${label}:${model}`} value={id} disabled={!enabled}>
-                    {enabled ? `${label} [${role}] - ${model}` : `${label} [${role}] - ${model} (disabled)`}
-                  </MenuItem>
-                );
-              })}
-            </TextField>
 
             {modelsQ.isLoading && modelSlots.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
@@ -16555,6 +18394,61 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         <Alert severity={tunnelPanelNotice.severity}>{tunnelPanelNotice.text}</Alert>
                       ) : null}
                       {str(tunnel.error, "").trim() ? <Alert severity="error">{str(tunnel.error)}</Alert> : null}
+                      {tunnelSetupChecks.length > 0 ? (
+                        <Box
+                          sx={{
+                            border: "1px solid rgba(62,143,214,0.18)",
+                            borderRadius: 1,
+                            px: 1.25,
+                            py: 1
+                          }}
+                        >
+                          <Stack spacing={1}>
+                            <Stack spacing={0.35}>
+                              <Typography variant="subtitle2">Setup checklist</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                Check setup explains exactly what is missing before remote access can start.
+                              </Typography>
+                            </Stack>
+                            {tunnelSetupChecks.map((rawCheck, index) => {
+                              const check = asRecord(rawCheck);
+                              const status = str(check.status, "info");
+                              const detail = str(check.detail, "");
+                              const remediation = str(check.remediation, "").trim();
+                              return (
+                                <Alert
+                                  key={`${str(check.id, `check-${index}`)}-${index}`}
+                                  severity={tunnelCheckAlertSeverity(status)}
+                                  sx={{ py: 0.25, "& .MuiAlert-message": { width: "100%" } }}
+                                >
+                                  <Stack spacing={0.45}>
+                                    <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                                      <Chip
+                                        size="small"
+                                        color={tunnelCheckChipColor(status)}
+                                        label={tunnelCheckLabel(status)}
+                                      />
+                                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                                        {str(check.label, "Setup step")}
+                                      </Typography>
+                                    </Stack>
+                                    {detail ? (
+                                      <Typography variant="body2" color="inherit">
+                                        {detail}
+                                      </Typography>
+                                    ) : null}
+                                    {remediation ? (
+                                      <Typography variant="caption" color="inherit" sx={{ opacity: 0.85 }}>
+                                        {remediation}
+                                      </Typography>
+                                    ) : null}
+                                  </Stack>
+                                </Alert>
+                              );
+                            })}
+                          </Stack>
+                        </Box>
+                      ) : null}
                       {str(tunnel.url, "").trim() ? (
                         <TextField
                           label={getTunnelUrlFieldLabel(selectedTunnelMeta)}
@@ -16615,8 +18509,20 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         >
                           Copy link
                         </Button>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => {
+                            const url = str(tunnel.url, "").trim();
+                            if (!url) return;
+                            window.open(url, "_blank", "noopener,noreferrer");
+                          }}
+                          disabled={!str(tunnel.url, "").trim()}
+                        >
+                          Open link
+                        </Button>
                       </Stack>
-                      {tunnelHasDetails ? (
+                      {advancedTunnelConfigFields.length > 0 ? (
                         <Accordion
                           expanded={showTunnelAdvanced}
                           onChange={(_, expanded) => setShowTunnelAdvanced(expanded)}
@@ -16630,37 +18536,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         >
                           <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                             <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                              Setup details
+                              Advanced configuration
                             </Typography>
                           </AccordionSummary>
                           <AccordionDetails sx={{ pt: 0 }}>
                             <Stack spacing={1}>
-                              {selectedTunnelDescription ? (
-                                <Typography variant="body2" color="text.secondary">
-                                  {selectedTunnelDescription}
-                                </Typography>
-                              ) : null}
-                              {tunnelGuidanceText ? (
-                                <Alert
-                                  severity={!selectedTunnelAvailable || str(selectedTunnelProviderRecord?.id, "") === "bore" ? "warning" : "info"}
-                                  sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                                  action={
-                                    !selectedTunnelAvailable &&
-                                    recommendedPublicTunnelProvider &&
-                                    str(recommendedPublicTunnelProvider.id, "").trim() !== str(selectedTunnelProviderRecord?.id, "").trim() ? (
-                                      <Button
-                                        color="inherit"
-                                        size="small"
-                                        onClick={() => syncTunnelDraftFromPayload(tunnelProvidersPayload, str(recommendedPublicTunnelProvider.id, "").trim())}
-                                      >
-                                        Use {str(recommendedPublicTunnelProvider.label, "Cloudflare")}
-                                      </Button>
-                                    ) : undefined
-                                  }
-                                >
-                                  {tunnelGuidanceText}
-                                </Alert>
-                              ) : null}
                               {advancedTunnelConfigFields.map((field) => {
                                 const key = str(field.key, "");
                                 const inputType = str(field.input_type, "text");
@@ -16688,18 +18568,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           </AccordionDetails>
                         </Accordion>
                       ) : null}
-                      {!hasCustomMasterPassword ? (
-                        <Alert
-                          severity="info"
-                          sx={{ py: 0.25, "& .MuiAlert-message": { fontSize: "0.75rem", lineHeight: 1.35 } }}
-                        >
-                          Set a custom password first. AgentArk will keep remote sign-in blocked until then.
-                        </Alert>
-                      ) : (
+                      {hasCustomMasterPassword && getTunnelPanelWarning(selectedTunnelMeta) ? (
                         <Typography variant="caption" color="text.secondary">
                           {getTunnelPanelWarning(selectedTunnelMeta)}
                         </Typography>
-                      )}
+                      ) : null}
                     </Stack>
                   )}
                 </Stack>
@@ -16767,13 +18640,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     </Typography>
                   ) : (
                     <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
-                      <Table size="small" sx={{ minWidth: 760 }}>
+                      <Table size="small" sx={{ tableLayout: "fixed", width: "100%" }}>
                         <TableHead>
                           <TableRow>
-                            <TableCell>Key</TableCell>
-                            <TableCell>Source</TableCell>
-                            <TableCell>Value</TableCell>
-                            <TableCell align="right">Ops</TableCell>
+                            <TableCell sx={{ width: "35%" }}>Key</TableCell>
+                            <TableCell sx={{ width: "20%" }}>Source</TableCell>
+                            <TableCell sx={{ width: "25%" }}>Value</TableCell>
+                            <TableCell sx={{ width: "20%" }} align="right">Ops</TableCell>
                           </TableRow>
                         </TableHead>
                         <TableBody>
@@ -16786,10 +18659,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               <TableRow key={`${key}-${idx}`}>
                                 <TableCell
                                   sx={{
-                                    maxWidth: 260,
                                     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                                    wordBreak: "break-all"
+                                    fontSize: "0.8rem",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap"
                                   }}
+                                  title={key}
                                 >
                                   {key}
                                 </TableCell>
@@ -16798,7 +18674,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                                     {source.replace(/[-_]+/g, " ")}
                                   </Typography>
                                 </TableCell>
-                                <TableCell sx={{ minWidth: 180, maxWidth: 360 }}>
+                                <TableCell sx={{ overflow: "hidden" }}>
                                   <Typography
                                     variant="body2"
                                     title={shownValue}
@@ -16811,7 +18687,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                                     {shownValue || "-"}
                                   </Typography>
                                 </TableCell>
-                                <TableCell align="right" sx={{ whiteSpace: "nowrap", width: "1%" }}>
+                                <TableCell align="right" sx={{ whiteSpace: "nowrap" }}>
                                   <Stack direction="row" spacing={0.5} justifyContent="flex-end">
                                     {deletable ? (
                                       <Button
@@ -16888,67 +18764,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <Box className="adv-banner">
             <span className="adv-banner-icon">&#9888;</span>
             Advanced settings can impact stability or security. Change only if you understand the effect.
-          </Box>
-
-          <Box className="adv-group">
-            <div className="adv-group-header">
-              <div className="adv-group-header-icon" style={{ background: "rgba(74, 222, 128, 0.10)", border: "1px solid rgba(74, 222, 128, 0.22)" }}>
-                <SmartToyRoundedIcon sx={{ fontSize: 16, color: "#4ade80" }} />
-              </div>
-              <div>
-                <div className="adv-group-header-title">Observability</div>
-                <div className="adv-group-header-sub">Optional export of AgentArk traces to Langtrace, LangSmith, or OTLP collectors</div>
-              </div>
-            </div>
-            <ObservabilityPanel
-              values={{
-                enabled: form.observability_enabled,
-                provider: form.observability_provider,
-                endpoint: form.observability_endpoint,
-                serviceName: form.observability_service_name,
-                headerName: form.observability_header_name,
-                privacyMode: form.observability_privacy_mode,
-                authToken: form.observability_auth_token,
-                authTokenConfigured: toBool(observabilitySettings.auth_token_configured)
-              }}
-              logs={observabilityLogs}
-              issues={observabilityIssues}
-              logsLoading={observabilityLogsQ.isLoading}
-              logsError={observabilityLogsQ.error ? errMessage(observabilityLogsQ.error) : null}
-              testing={testObservabilityMutation.isPending}
-              onValueChange={(next) => {
-                if (Object.prototype.hasOwnProperty.call(next, "enabled")) {
-                  setField("observability_enabled", !!next.enabled);
-                }
-                if (typeof next.provider === "string") {
-                  setField("observability_provider", next.provider);
-                }
-                if (typeof next.endpoint === "string") {
-                  setField("observability_endpoint", next.endpoint);
-                }
-                if (typeof next.serviceName === "string") {
-                  setField("observability_service_name", next.serviceName);
-                }
-                if (typeof next.headerName === "string") {
-                  setField("observability_header_name", next.headerName);
-                }
-                if (typeof next.privacyMode === "string") {
-                  setField("observability_privacy_mode", next.privacyMode);
-                }
-                if (typeof next.authToken === "string") {
-                  setField("observability_auth_token", next.authToken);
-                }
-              }}
-              onTest={async () => {
-                setError(null);
-                setSuccess(null);
-                try {
-                  await testObservabilityMutation.mutateAsync();
-                } catch {
-                  // handled by mutation onError
-                }
-              }}
-            />
           </Box>
 
           {/* ── System Controls group ── */}
@@ -17224,6 +19039,60 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Stack>
       ) : null}
 
+      {tab === 6 ? (
+        <Stack spacing={2.5}>
+          <ObservabilityPanel
+            values={{
+              enabled: form.observability_enabled,
+              provider: form.observability_provider,
+              endpoint: form.observability_endpoint,
+              serviceName: form.observability_service_name,
+              headerName: form.observability_header_name,
+              privacyMode: form.observability_privacy_mode,
+              authToken: form.observability_auth_token,
+              authTokenConfigured: toBool(observabilitySettings.auth_token_configured)
+            }}
+            logs={observabilityLogs}
+            issues={observabilityIssues}
+            logsLoading={observabilityLogsQ.isLoading}
+            logsError={observabilityLogsQ.error ? errMessage(observabilityLogsQ.error) : null}
+            testing={testObservabilityMutation.isPending}
+            onValueChange={(next) => {
+              if (Object.prototype.hasOwnProperty.call(next, "enabled")) {
+                setField("observability_enabled", !!next.enabled);
+              }
+              if (typeof next.provider === "string") {
+                setField("observability_provider", next.provider);
+              }
+              if (typeof next.endpoint === "string") {
+                setField("observability_endpoint", next.endpoint);
+              }
+              if (typeof next.serviceName === "string") {
+                setField("observability_service_name", next.serviceName);
+              }
+              if (typeof next.headerName === "string") {
+                setField("observability_header_name", next.headerName);
+              }
+              if (typeof next.privacyMode === "string") {
+                setField("observability_privacy_mode", next.privacyMode);
+              }
+              if (typeof next.authToken === "string") {
+                setField("observability_auth_token", next.authToken);
+              }
+            }}
+            onTest={async () => {
+              setError(null);
+              setSuccess(null);
+              try {
+                await testObservabilityMutation.mutateAsync();
+              } catch {
+                // handled by mutation onError
+              }
+            }}
+          />
+        </Stack>
+      ) : null}
+
       {tab === 7 ? (
         <Stack spacing={2}>
           {/* ── Header + Enable + API Key ── */}
@@ -17234,10 +19103,10 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   <Typography variant="h6">Moltbook</Typography>
                   <Box sx={{
                     width: 8, height: 8, borderRadius: "50%",
-                    bgcolor: form.moltbook_enabled ? (moltbookNeedsConnection ? "#f59e0b" : "#22c55e") : "#555",
+                    bgcolor: moltbookConnectionState.color,
                   }} />
                   <Typography variant="caption" color="text.secondary">
-                    {form.moltbook_enabled ? (moltbookNeedsConnection ? "Not connected" : "Connected") : "Disabled"}
+                    {moltbookConnectionState.label}
                   </Typography>
                 </Stack>
                 <FormControlLabel
@@ -17271,7 +19140,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     }}
                   />
                   <Typography variant="caption" color="text.secondary">
-                    Required to connect. Get your key at moltbook.com
+                    {moltbookHasStoredApiKey
+                      ? "Stored securely on the server. Leave this blank to keep the existing key."
+                      : "Required to connect. Get your key at moltbook.com"}
                   </Typography>
                 </Stack>
               ) : null}
@@ -17366,11 +19237,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
               <Stack direction="row" spacing={1.5} alignItems="center">
                 <Typography variant="subtitle2">Connector</Typography>
-                {form.moltbook_enabled ? (
+                {moltbookConnectorChip ? (
                   <Chip
                     size="small"
-                    label={str(moltbookStatus.last_status, "unknown")}
-                    color={str(moltbookStatus.last_status, "").toLowerCase() === "ok" ? "success" : "default"}
+                    label={moltbookConnectorChip.label}
+                    color={moltbookConnectorChip.color}
                     variant="outlined"
                   />
                 ) : null}
@@ -17408,7 +19279,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       });
                       setSuccess(str(out.message, "Moltbook run is already in progress."));
                     } else if (status === "not_connected") {
-                      setError("Not connected. Save your API key first, then run.");
+                      const statusDetail = str(out.status_detail, "").toLowerCase();
+                      const reason = str(out.reason, "").trim();
+                      if (statusDetail === "not_configured" || !moltbookHasStoredApiKey) {
+                        setError(reason || "No Moltbook API key configured. Save your key first, then run.");
+                      } else {
+                        setError(
+                          reason ||
+                            "Stored Moltbook key could not connect. Check the key or claim status, then run again."
+                        );
+                      }
                     } else if (status === "disabled") {
                       setError("Moltbook is disabled.");
                     } else if (status === "off_mode") {
@@ -17432,7 +19312,15 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
             {moltbookStatusQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(moltbookStatusQ.error)}</Alert> : null}
             {form.moltbook_enabled && moltbookNeedsConnection ? (
-              <Alert severity="warning" variant="outlined" sx={{ mb: 1, py: 0.3 }}>Not connected. Add API key, save, then run.</Alert>
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1, py: 0.3 }}>
+                No Moltbook API key is configured. Add the key, save, then run.
+              </Alert>
+            ) : null}
+            {form.moltbook_enabled && moltbookHasConnectionIssue ? (
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1, py: 0.3 }}>
+                Stored Moltbook API key found, but the last connection attempt failed. Try <strong>Run now</strong>
+                {" "}again or replace the key if it has expired or the agent is not yet claimed.
+              </Alert>
             ) : null}
             <Stack direction="row" spacing={3} useFlexGap flexWrap="wrap" sx={{ fontSize: "0.82rem" }}>
               <Typography variant="caption" color="text.secondary">
@@ -17561,11 +19449,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Stack>
       ) : null}
 
-      {tab === 2 ? (
-        <Box className="list-shell">
-          <IntegrationsPanel autoRefresh={autoRefresh} embedded mode="integrations" />
-        </Box>
-      ) : null}
+        {tab === 2 ? (
+          <Box className="list-shell">
+            <IntegrationsPanel autoRefresh={autoRefresh} embedded mode="integrations" />
+          </Box>
+        ) : null}
 
       {tab === 11 ? <TraceManager autoRefresh={autoRefresh} /> : null}
 
@@ -17583,7 +19471,12 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             <Grid2 size={{ xs: 12 }}>
               <Box className="list-shell" sx={{ minHeight: 0, height: "100%", display: "flex", flexDirection: "column" }}>
                 <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-                  <Typography variant="h6">ArkPulse</Typography>
+                  <Box>
+                    <Typography variant="h6">ArkPulse</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Diagnostics, onboarding readiness, and runtime health in one place.
+                    </Typography>
+                  </Box>
                   <Button
                     size="small"
                     onClick={async () => {
@@ -17631,13 +19524,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       </Typography>
                       <Stack spacing={0.6} sx={{ mt: 0.75 }}>
                         <Typography variant="body2" color="text.secondary">
-                          Periodic system check that summarizes operational health, safety posture, and execution drift.
+                          AgentArk's built-in diagnostics run for operational health, safety posture, onboarding readiness, and execution drift.
                         </Typography>
                         <Typography variant="body2" color="text.secondary">
-                          Run it after changing models, channels, or adding a new integration.
+                          Run it after changing models, adding integrations, or when something stops working.
                         </Typography>
                         <Typography variant="body2" color="text.secondary">
-                          Results show up here as an event stream with findings and a score.
+                          Every run appears here with findings, fixes, and a health score.
                         </Typography>
                       </Stack>
                     </Box>
@@ -17650,8 +19543,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         <TableRow>
                           <TableCell>Captured</TableCell>
                           <TableCell>Result</TableCell>
-                          <TableCell>Health</TableCell>
-                          <TableCell>Issues</TableCell>
+                          <TableCell>Score</TableCell>
+                          <TableCell>Diagnostics</TableCell>
                           <TableCell>Next step</TableCell>
                           <TableCell align="right">Ops</TableCell>
                         </TableRow>
@@ -17709,6 +19602,12 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Stack>
       ) : null}
 
+      {/* BrowserProfilesManager is intentionally not rendered in the current UI.
+          Keep tab 16 reserved so future re-enable work can restore the surface without rebuilding the backend. */}
+
+      {/* DevicesManager is intentionally not rendered in the current UI.
+          Keep tab 17 reserved so future re-enable work can restore the surface without rebuilding the backend. */}
+
       {tab === 13 ? (
         <Stack spacing={2}>
           <Alert severity="info" sx={{ borderRadius: 2 }}>
@@ -17731,7 +19630,21 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       <Tooltip title="When On, AgentArk periodically generates improved routing policies and tests them automatically." arrow>
                         <Typography variant="body2" sx={{ cursor: "help", textDecoration: "underline dotted", textDecorationColor: "rgba(140,170,210,0.35)", textUnderlineOffset: 3 }}>Self-evolve:</Typography>
                       </Tooltip>
-                      <Chip size="small" color={toBool(evolution.self_evolve_enabled) ? "success" : "default"} label={toBool(evolution.self_evolve_enabled) ? "On" : "Off"} />
+                      <Chip
+                        size="small"
+                        color={toBool(evolution.self_evolve_enabled) ? "success" : "default"}
+                        label={toBool(evolution.self_evolve_enabled) ? "On" : "Off"}
+                        onClick={async () => {
+                          try {
+                            await updateEvolutionSettingsMutation.mutateAsync({
+                              self_evolve_enabled: !toBool(evolution.self_evolve_enabled),
+                            });
+                          } catch (_) {
+                            // best-effort toggle
+                          }
+                        }}
+                        sx={{ cursor: "pointer" }}
+                      />
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
                       <Tooltip title="Canary deploys route a percentage of traffic to a new candidate policy to compare its performance against the current baseline before fully promoting it." arrow>
@@ -19368,6 +21281,630 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   );
 }
 
+function ChannelsManager({
+  autoRefresh,
+  onOpenSetup
+}: {
+  autoRefresh: boolean;
+  onOpenSetup?: (channelId: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const interval = autoRefresh ? REFRESH_MS : false;
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+
+  const channelsQ = useQuery({
+    queryKey: ["gateway-channels"],
+    queryFn: api.getChannels,
+    refetchInterval: interval,
+  });
+
+  const payload = asRecord(channelsQ.data);
+  const channelRows = pickRecords(payload, "channels");
+  const accountRows = pickRecords(payload, "accounts");
+
+  useEffect(() => {
+    if (channelRows.length === 0) {
+      if (selectedChannelId !== null) setSelectedChannelId(null);
+      return;
+    }
+    if (!selectedChannelId || !channelRows.some((row) => str(row.id, "") === selectedChannelId)) {
+      setSelectedChannelId(str(channelRows[0]?.id, ""));
+    }
+  }, [channelRows, selectedChannelId]);
+
+  const selectedDescriptor = useMemo(
+    () => channelRows.find((row) => str(row.id, "") === selectedChannelId) ?? channelRows[0] ?? null,
+    [channelRows, selectedChannelId]
+  );
+
+  const channels = useMemo(
+    () =>
+      channelRows.map((row) => {
+        const account = accountRows.find((item) => str(item.channel_id, "") === str(row.id, ""));
+        return {
+          id: str(row.id, ""),
+          name: str(row.name, str(row.display_name, "Channel")),
+          kind: str(row.kind, str(row.id, "channel")),
+          description: str(row.description, ""),
+          status: str(row.status, "missing_config"),
+          enabled: toBool(row.enabled),
+          route_scope: str(account?.peer_scope, ""),
+          last_activity_at: str(account?.last_seen_at, ""),
+          unread_count: num(asRecord(row.metadata).unread_count, 0),
+          paired_with: str(asRecord(row.metadata).paired_with, ""),
+          detail: str(row.last_error, "") || str(row.description, ""),
+        };
+      }),
+    [accountRows, channelRows]
+  );
+
+  const capabilities = useMemo(() => {
+    const caps = Array.isArray(selectedDescriptor?.capabilities)
+      ? (selectedDescriptor?.capabilities as unknown[])
+      : [];
+    return caps.map((value) => {
+      const id = str(value, "");
+      return {
+        id,
+        label: id
+          .split("_")
+          .filter(Boolean)
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(" "),
+        detail: `Gateway capability: ${id}`,
+      };
+    });
+  }, [selectedDescriptor]);
+
+  const refresh = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["gateway-channels"] });
+  };
+
+  const upsertAccount = async (
+    mode: "connect" | "disconnect" | "note",
+    channelId: string,
+    overrides?: Record<string, unknown>
+  ) => {
+    const channel = channelRows.find((row) => str(row.id, "") === channelId);
+    const existing = accountRows.find((row) => str(row.channel_id, "") === channelId);
+    if (!channel) return;
+    const metadata = { ...asRecord(existing?.metadata), ...overrides };
+    const payloadForSave = {
+      channel_id: channelId,
+      label: str(existing?.label, `${str(channel.name, "Channel")} Account`),
+      enabled: mode !== "disconnect",
+      status: mode === "disconnect" ? "disabled" : "connected",
+      peer_scope: str(existing?.peer_scope, "per_channel"),
+      default_agent_id: str(existing?.default_agent_id, ""),
+      metadata,
+    };
+    try {
+      if (existing) {
+        await api.updateChannelAccount(str(existing.id, ""), payloadForSave);
+      } else if (mode !== "disconnect") {
+        await api.createChannelAccount(payloadForSave);
+      }
+      setNotice({
+        kind: "success",
+        text:
+          mode === "connect"
+            ? `${str(channel.name, "Channel")} connected in the gateway inventory.`
+            : mode === "disconnect"
+              ? `${str(channel.name, "Channel")} disabled for agent dispatch.`
+              : `Saved note for ${str(channel.name, "Channel")}.`,
+      });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: errMessage(error) });
+    }
+  };
+
+  return (
+    <Stack spacing={1.25}>
+      {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
+      {channelsQ.error ? <Alert severity="error">{errMessage(channelsQ.error)}</Alert> : null}
+      <ChannelsControlPanel
+        channels={channels}
+        selectedChannelId={selectedChannelId}
+        capabilities={capabilities}
+        onSelectChannel={setSelectedChannelId}
+        onConnectChannel={(channelId) => upsertAccount("connect", channelId, { connected_via: "channels_panel" })}
+        onDisconnectChannel={(channelId) => upsertAccount("disconnect", channelId)}
+        onOpenWizard={(channelId) => {
+          if (onOpenSetup) {
+            onOpenSetup(channelId);
+            return;
+          }
+          setNotice({
+            kind: "info",
+            text: `Open Settings -> Integrations to configure ${channelId || "the channel"}, then return here if you need live delivery diagnostics.`,
+          });
+        }}
+        onSubmitQuickNote={(channelId, note) => upsertAccount("note", channelId, { quick_note: note })}
+      />
+    </Stack>
+  );
+}
+
+function RoutingManager({ autoRefresh }: { autoRefresh: boolean }) {
+  const queryClient = useQueryClient();
+  const interval = autoRefresh ? REFRESH_MS : false;
+  const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+
+  const routingQ = useQuery({
+    queryKey: ["gateway-routing"],
+    queryFn: api.getRouting,
+    refetchInterval: interval,
+  });
+  const channelsQ = useQuery({
+    queryKey: ["gateway-channels"],
+    queryFn: api.getChannels,
+    refetchInterval: interval,
+  });
+  const swarmQ = useQuery({
+    queryKey: ["swarm-agents"],
+    queryFn: () => api.rawGet("/swarm/agents"),
+    refetchInterval: interval,
+  });
+
+  const routingPayload = asRecord(routingQ.data);
+  const routeRows = pickRecords(routingPayload, "rules");
+  const groupRows = pickRecords(routingPayload, "broadcast_groups");
+  const channelRows = pickRecords(channelsQ.data, "channels");
+  const swarmRows = pickRecords(asRecord(swarmQ.data), "agents");
+
+  useEffect(() => {
+    if (routeRows.length === 0) {
+      if (selectedRouteId !== null) setSelectedRouteId(null);
+      return;
+    }
+    if (!selectedRouteId || !routeRows.some((row) => str(row.id, "") === selectedRouteId)) {
+      setSelectedRouteId(str(routeRows[0]?.id, ""));
+    }
+  }, [routeRows, selectedRouteId]);
+
+  const routes = useMemo(
+    () =>
+      routeRows.map((row) => {
+        const matchKind = str(row.match_kind, "all");
+        const matchValue = str(row.match_value, "");
+        return {
+          id: str(row.id, ""),
+          name: str(row.name, "Route"),
+          match: matchValue ? `${matchKind}:${matchValue}` : matchKind,
+          scope: str(row.conversation_scope, "per_channel"),
+          route_to:
+            str(row.target_kind, "") && str(row.target_value, "")
+              ? `${str(row.target_kind, "")}:${str(row.target_value, "")}`
+              : str(row.target_value, ""),
+          channel: str(row.channel_id, ""),
+          agent: str(row.agent_id, ""),
+          broadcast_group: str(row.broadcast_group_id, ""),
+          enabled: toBool(row.enabled),
+          priority: num(row.priority, 0),
+          last_matched_at: str(row.updated_at, ""),
+          description: str(row.notes, ""),
+        };
+      }),
+    [routeRows]
+  );
+
+  const targets = useMemo(() => {
+    const channelTargets = channelRows.map((row) => ({
+      id: `channel:${str(row.id, "")}`,
+      label: `${str(row.name, "Channel")} channel`,
+      kind: "channel",
+      detail: str(row.description, ""),
+    }));
+    const agentTargets = swarmRows.map((row) => ({
+      id: `agent:${str(row.id, "")}`,
+      label: `${str(row.name, "Agent")} agent`,
+      kind: "agent",
+      detail: str(row.agent_type, ""),
+    }));
+    return [...channelTargets, ...agentTargets];
+  }, [channelRows, swarmRows]);
+
+  const broadcastGroups = useMemo(
+    () =>
+      groupRows.map((row) => ({
+        id: str(row.id, ""),
+        name: str(row.name, "Broadcast group"),
+        members: Array.isArray(row.targets)
+          ? (row.targets as unknown[]).map((value) => str(value, "")).filter(Boolean)
+          : [],
+        description: str(row.description, ""),
+      })),
+    [groupRows]
+  );
+
+  const refresh = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["gateway-routing"] }),
+      queryClient.invalidateQueries({ queryKey: ["gateway-channels"] }),
+    ]);
+  };
+
+  const parseMatch = (input: string) => {
+    const trimmed = input.trim();
+    if (!trimmed) return { match_kind: "all", match_value: "" };
+    const idx = trimmed.indexOf(":");
+    if (idx < 0) return { match_kind: "contains", match_value: trimmed };
+    return {
+      match_kind: trimmed.slice(0, idx).trim() || "all",
+      match_value: trimmed.slice(idx + 1).trim(),
+    };
+  };
+
+  const parseTarget = (input: string) => {
+    const trimmed = input.trim();
+    if (!trimmed) return { target_kind: "agent", target_value: "" };
+    const idx = trimmed.indexOf(":");
+    if (idx < 0) return { target_kind: "agent", target_value: trimmed };
+    return {
+      target_kind: trimmed.slice(0, idx).trim() || "agent",
+      target_value: trimmed.slice(idx + 1).trim(),
+    };
+  };
+
+  const saveRoute = async (partial: Record<string, unknown>) => {
+    const routeId = str(partial.id, "");
+    const existing = routeRows.find((row) => str(row.id, "") === routeId);
+    const merged = { ...asRecord(existing), ...partial };
+    const match = parseMatch(str(merged.match, ""));
+    const target = parseTarget(str(merged.route_to, str(merged.target_value, "")));
+    const payloadForSave = {
+      name: str(merged.name, "Route"),
+      enabled: toBool(merged.enabled ?? true),
+      priority: num(merged.priority, 0),
+      channel_id: str(merged.channel, str(merged.channel_id, "")) || undefined,
+      account_id: str(merged.account_id, "") || undefined,
+      match_kind: match.match_kind,
+      match_value: match.match_value,
+      target_kind: target.target_kind,
+      target_value: target.target_value,
+      agent_id: str(merged.agent, str(merged.agent_id, "")) || undefined,
+      conversation_scope: str(merged.scope, str(merged.conversation_scope, "per_channel")),
+      broadcast_group_id: str(merged.broadcast_group, str(merged.broadcast_group_id, "")) || undefined,
+      notes: str(merged.description, str(merged.notes, "")) || undefined,
+    };
+    try {
+      if (routeId) {
+        await api.updateRoutingRule(routeId, payloadForSave);
+      } else {
+        await api.createRoutingRule(payloadForSave);
+      }
+      await refresh();
+      setNotice({ kind: "success", text: routeId ? "Route updated." : "Route created." });
+    } catch (error) {
+      setNotice({ kind: "error", text: errMessage(error) });
+    }
+  };
+
+  const toggleRoute = async (routeId: string, enabled: boolean) => {
+    const existing = routeRows.find((row) => str(row.id, "") === routeId);
+    if (!existing) return;
+    await saveRoute({ ...existing, id: routeId, enabled });
+  };
+
+  return (
+    <Stack spacing={1.25}>
+      {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
+      {routingQ.error ? <Alert severity="error">{errMessage(routingQ.error)}</Alert> : null}
+      <RoutingControlPanel
+        routes={routes}
+        targets={targets}
+        broadcastGroups={broadcastGroups}
+        selectedRouteId={selectedRouteId}
+        onSelectRoute={setSelectedRouteId}
+        onToggleRoute={toggleRoute}
+        onSaveRoute={(route) => saveRoute(route as Record<string, unknown>)}
+        onDeleteRoute={async (routeId) => {
+          try {
+            await api.deleteRoutingRule(routeId);
+            setNotice({ kind: "success", text: "Route deleted." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onCreateGroup={async (name) => {
+          try {
+            await api.createBroadcastGroup({ name, targets: [] });
+            setNotice({ kind: "success", text: "Broadcast group created." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+      />
+    </Stack>
+  );
+}
+
+// Intentionally hidden from the current UI.
+// Keep this manager and its supporting panel code for a future re-enable once
+// AgentArk has a real companion-device transport, pairing handshake, and command channel.
+function DevicesManager({ autoRefresh }: { autoRefresh: boolean }) {
+  const queryClient = useQueryClient();
+  const interval = autoRefresh ? REFRESH_MS : false;
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+
+  const nodesQ = useQuery({
+    queryKey: ["nodes"],
+    queryFn: api.getNodes,
+    refetchInterval: interval,
+  });
+
+  const nodeRows = pickRecords(asRecord(nodesQ.data), "nodes");
+
+  useEffect(() => {
+    if (nodeRows.length === 0) {
+      if (selectedNodeId !== null) setSelectedNodeId(null);
+      return;
+    }
+    if (!selectedNodeId || !nodeRows.some((row) => str(row.id, "") === selectedNodeId)) {
+      setSelectedNodeId(str(nodeRows[0]?.id, ""));
+    }
+  }, [nodeRows, selectedNodeId]);
+
+  const nodes = useMemo(
+    () =>
+      nodeRows.map((row) => ({
+        id: str(row.id, ""),
+        name: str(row.display_name, str(row.id, "Node")),
+        platform: str(row.platform, str(row.transport, "node")),
+        status: str(row.state, "paired").toLowerCase(),
+        capabilities: Array.isArray(row.capabilities)
+          ? (row.capabilities as unknown[]).map((value) => str(value, "")).filter(Boolean)
+          : [],
+        last_seen_at: str(row.last_heartbeat_at, ""),
+        paired_at: str(row.last_heartbeat_at, ""),
+        owner: str(row.owner, ""),
+        detail: str(row.last_error, "") || `Transport: ${str(row.transport, "node")}`,
+      })),
+    [nodeRows]
+  );
+
+  const refresh = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["nodes"] });
+  };
+
+  const refreshNode = async (nodeId: string) => {
+    const existing = nodeRows.find((row) => str(row.id, "") === nodeId);
+    if (!existing) return;
+    try {
+      await api.refreshNodeHeartbeat(nodeId, {
+        state: "online",
+        transport: str(existing.transport, "node"),
+        capabilities: Array.isArray(existing.capabilities)
+          ? (existing.capabilities as unknown[]).map((value) => str(value, "")).filter(Boolean)
+          : [],
+      });
+      setNotice({ kind: "success", text: "Node heartbeat refreshed." });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: errMessage(error) });
+    }
+  };
+
+  return (
+    <Stack spacing={1.25}>
+      {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
+      {nodesQ.error ? <Alert severity="error">{errMessage(nodesQ.error)}</Alert> : null}
+      <DevicesControlPanel
+        nodes={nodes}
+        selectedNodeId={selectedNodeId}
+        onSelectNode={setSelectedNodeId}
+        onPairNode={async ({ name, platform, capabilities }) => {
+          try {
+            await api.createNode({ name, platform, capabilities });
+            setNotice({ kind: "success", text: "Node paired in the control plane." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onUnpairNode={async (nodeId) => {
+          try {
+            await api.deleteNode(nodeId);
+            setNotice({ kind: "success", text: "Node revoked." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onSendCommand={async (nodeId, command) => {
+          try {
+            await api.logNodeCommand(nodeId, { command, actor: "devices-panel", success: true });
+            setNotice({ kind: "success", text: "Command logged for the node." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onRefreshNode={refreshNode}
+      />
+    </Stack>
+  );
+}
+
+// Intentionally hidden from the current UI.
+// Keep this manager and its supporting panel code for a future re-enable if
+// session-persistent browser automation becomes a first-class user workflow.
+function BrowserProfilesManager({ autoRefresh }: { autoRefresh: boolean }) {
+  const queryClient = useQueryClient();
+  const interval = autoRefresh ? REFRESH_MS : false;
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+
+  const profilesQ = useQuery({
+    queryKey: ["browser-profiles"],
+    queryFn: api.getBrowserProfiles,
+    refetchInterval: interval,
+  });
+
+  const profileRows = pickRecords(asRecord(profilesQ.data), "profiles");
+
+  useEffect(() => {
+    if (profileRows.length === 0) {
+      if (selectedProfileId !== null) setSelectedProfileId(null);
+      return;
+    }
+    if (!selectedProfileId || !profileRows.some((row) => str(row.id, "") === selectedProfileId)) {
+      setSelectedProfileId(str(profileRows[0]?.id, ""));
+    }
+  }, [profileRows, selectedProfileId]);
+
+  const selectedProfile = useMemo(
+    () => profileRows.find((row) => str(row.id, "") === selectedProfileId) ?? profileRows[0] ?? null,
+    [profileRows, selectedProfileId]
+  );
+
+  const profiles = useMemo(
+    () =>
+      profileRows.map((row) => {
+        const metadata = asRecord(row.metadata);
+        const lock = asRecord(row.lock);
+        const loginState = str(row.login_state, "unknown").toLowerCase();
+        return {
+          id: str(row.id, ""),
+          name: str(row.name, "Browser profile"),
+          browser: str(metadata.browser, str(row.target_kind, "browser")),
+          status: lock.owner
+            ? "locked"
+            : loginState === "needs_mfa" || loginState === "expired"
+              ? "manual_login"
+              : toBool(row.enabled)
+                ? "available"
+                : "error",
+          default: toBool(metadata.is_default),
+          target: str(row.target_kind, "sandbox"),
+          managed: toBool(metadata.managed) || str(row.target_kind, "").toLowerCase() === "sandbox",
+          session_count: Array.isArray(row.recent_sessions) ? row.recent_sessions.length : 0,
+          last_launch_at: str(row.last_used_at, ""),
+          detail: str(row.last_error, "") || str(row.login_note, ""),
+        };
+      }),
+    [profileRows]
+  );
+
+  const sessions = useMemo(() => {
+    const rows = Array.isArray(selectedProfile?.recent_sessions)
+      ? (selectedProfile?.recent_sessions as unknown[])
+      : [];
+    return rows.map((value) => {
+      const row = asRecord(value);
+      return {
+        id: str(row.id, ""),
+        status: str(row.outcome, "completed"),
+        title: str(row.title, ""),
+        url: str(row.url, ""),
+        updated_at: str(row.ended_at, str(row.started_at, "")),
+      };
+    });
+  }, [selectedProfile]);
+
+  const refresh = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["browser-profiles"] });
+  };
+
+  const saveProfile = async (profileId: string, patch: Record<string, unknown>) => {
+    const existing = profileRows.find((row) => str(row.id, "") === profileId);
+    if (!existing) return;
+    const metadata = { ...asRecord(existing.metadata), ...asRecord(patch.metadata) };
+    try {
+      await api.updateBrowserProfile(profileId, {
+        name: str(patch.name, str(existing.name, "Browser profile")),
+        description: str(patch.description, str(existing.description, "")) || undefined,
+        browser: str(metadata.browser, str(asRecord(existing.metadata).browser, "chrome")),
+        managed:
+          patch.managed == null
+            ? toBool(metadata.managed) || str(existing.target_kind, "").toLowerCase() === "sandbox"
+            : toBool(patch.managed),
+        login_state: str(patch.login_state, str(existing.login_state, "")) || undefined,
+        target_kind: str(patch.target_kind, str(existing.target_kind, "")) || undefined,
+        target_endpoint: str(patch.target_endpoint, str(existing.target_endpoint, "")) || undefined,
+        target_profile_path: str(patch.target_profile_path, str(existing.target_profile_path, "")) || undefined,
+        metadata,
+      });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: errMessage(error) });
+    }
+  };
+
+  return (
+    <Stack spacing={1.25}>
+      {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
+      {profilesQ.error ? <Alert severity="error">{errMessage(profilesQ.error)}</Alert> : null}
+      <BrowserProfilesPanel
+        profiles={profiles}
+        sessions={sessions}
+        selectedProfileId={selectedProfileId}
+        onSelectProfile={setSelectedProfileId}
+        onLaunchProfile={async (profileId) => {
+          try {
+            await api.lockBrowserProfile(profileId, { owner: "browser-panel", reason: "Launch requested" });
+            await api.recordBrowserSession(profileId, {
+              outcome: "active",
+              title: "Launch requested",
+            });
+            setNotice({ kind: "success", text: "Browser profile locked for launch." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onStopProfile={async (profileId) => {
+          try {
+            await api.unlockBrowserProfile(profileId, { owner: "browser-panel" });
+            await api.recordBrowserSession(profileId, {
+              outcome: "completed",
+              title: "Session closed",
+              ended_at: new Date().toISOString(),
+            });
+            setNotice({ kind: "success", text: "Browser profile unlocked." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onOpenManualLogin={async (profileId) => {
+          await saveProfile(profileId, { login_state: "needs_mfa" });
+          setNotice({ kind: "info", text: "Profile marked for manual login handoff." });
+        }}
+        onCreateProfile={async ({ name, browser, managed }) => {
+          try {
+            await api.createBrowserProfile({ name, browser, managed });
+            setNotice({ kind: "success", text: "Browser profile created." });
+            await refresh();
+          } catch (error) {
+            setNotice({ kind: "error", text: errMessage(error) });
+          }
+        }}
+        onSetDefaultProfile={async (profileId) => {
+          for (const row of profileRows) {
+            const id = str(row.id, "");
+            if (!id) continue;
+            await saveProfile(id, {
+              metadata: {
+                ...asRecord(row.metadata),
+                is_default: id === profileId,
+              },
+            });
+          }
+          setNotice({ kind: "success", text: "Default browser profile updated." });
+          await refresh();
+        }}
+      />
+    </Stack>
+  );
+}
+
 export function NativeWorkspace({
   view,
   autoRefresh,
@@ -19396,6 +21933,16 @@ export function NativeWorkspace({
       <Box sx={{ display: view === "chat" ? "flex" : "none", flex: 1, minHeight: 0, minWidth: 0, width: "100%" }}>
         <ChatManager autoRefresh={autoRefresh} isActive={view === "chat"} />
       </Box>
+      {view === "connections" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {view === "channels" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {view === "routing" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {view === "webhooks" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {/* Keep the legacy devices route alive, but redirect it to Integrations while the companion-device UI is hidden. */}
+      {view === "devices" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {/* Keep the legacy browser route alive, but redirect it to Integrations while the browser-profile UI is hidden. */}
+      {view === "browser" ? <SettingsManager autoRefresh={autoRefresh} initialTab={2} /> : null}
+      {view === "gatewayops" ? <SettingsManager autoRefresh={autoRefresh} initialTab={9} hideSettingsNav /> : null}
+      {view === "failover" ? <SettingsManager autoRefresh={autoRefresh} initialTab={1} /> : null}
       {view === "tasks" ? <TasksManager autoRefresh={autoRefresh} /> : null}
       {view === "skills" ? <SkillsManager autoRefresh={autoRefresh} /> : null}
       {view === "apps" ? <AppsManager autoRefresh={autoRefresh} /> : null}
@@ -19420,5 +21967,6 @@ export function NativeWorkspace({
     </Box>
   );
 }
+
 
 

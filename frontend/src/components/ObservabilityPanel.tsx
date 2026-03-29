@@ -114,10 +114,18 @@ export function ObservabilityPanel({
           value={values.provider}
           onChange={(e) => {
             const nextProvider = e.target.value;
-            onValueChange({
+            const updates: Record<string, unknown> = {
               provider: nextProvider,
-              headerName: nextProvider === "langtrace" ? "x-api-key" : nextProvider === "langsmith" ? "x-api-key" : values.headerName
-            });
+              headerName: nextProvider === "langtrace" ? "x-api-key" : nextProvider === "langsmith" ? "x-api-key" : values.headerName,
+            };
+            // Prefill endpoint when switching to a known provider and the field is empty or default.
+            const currentEndpoint = (values.endpoint || "").trim();
+            if (nextProvider === "langsmith" && (!currentEndpoint || currentEndpoint.includes("langtrace"))) {
+              updates.endpoint = "https://api.smith.langchain.com";
+            } else if (nextProvider === "langtrace" && (!currentEndpoint || currentEndpoint.includes("smith.langchain"))) {
+              updates.endpoint = "";
+            }
+            onValueChange(updates);
           }}
         >
           <MenuItem value="langtrace">Langtrace</MenuItem>

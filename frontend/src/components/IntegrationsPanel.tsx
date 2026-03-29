@@ -1,7 +1,11 @@
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   Dialog,
   DialogActions,
@@ -24,14 +28,34 @@ import {
   Typography
 } from "@mui/material";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
+import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { IntegrationConfigField, IntegrationItem } from "../types";
+import type {
+  GatewayChannelDescriptor,
+  IntegrationConfigField,
+  IntegrationItem,
+  IntegrationSyncFeedItem,
+  IntegrationSyncStatus
+} from "../types";
+import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
+import { IntegrationRoutingPanel } from "./IntegrationRoutingPanel";
+import { PluginSdkPanel } from "./PluginSdkPanel";
 
 const REFRESH_MS = 8000;
 const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
 const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
+const GOOGLE_WORKSPACE_BUNDLES = [
+  { id: "gmail", label: "Gmail" },
+  { id: "calendar", label: "Calendar" },
+  { id: "drive", label: "Drive" },
+  { id: "docs", label: "Docs" },
+  { id: "sheets", label: "Sheets" },
+  { id: "chat", label: "Chat" },
+  { id: "admin", label: "Admin" }
+] as const;
 
 type JsonRecord = Record<string, unknown>;
 type OAuthSignalPayload = {
@@ -79,6 +103,49 @@ type ChannelSettingsForm = {
   telegram_enabled: boolean;
   telegram_bot_token: string;
   telegram_allowed_users_csv: string;
+  slack_enabled: boolean;
+  slack_bot_token: string;
+  slack_signing_secret: string;
+  slack_api_base_url: string;
+  slack_default_channel_id: string;
+  slack_default_thread_ts: string;
+  slack_workspace_id: string;
+  slack_workspace_name: string;
+  slack_trust_policy: string;
+  slack_allowed_senders_csv: string;
+  discord_enabled: boolean;
+  discord_bot_token: string;
+  discord_webhook_url: string;
+  discord_api_base_url: string;
+  discord_default_channel_id: string;
+  discord_default_thread_id: string;
+  discord_guild_id: string;
+  discord_application_id: string;
+  matrix_enabled: boolean;
+  matrix_homeserver_url: string;
+  matrix_access_token: string;
+  matrix_user_id: string;
+  matrix_device_id: string;
+  matrix_account_id: string;
+  matrix_default_room_id: string;
+  matrix_sync_timeout_ms: string;
+  matrix_limit: string;
+  matrix_user_agent: string;
+  teams_enabled: boolean;
+  teams_service_url: string;
+  teams_access_token: string;
+  teams_bot_app_id: string;
+  teams_bot_name: string;
+  teams_tenant_id: string;
+  teams_team_id: string;
+  teams_channel_id: string;
+  teams_chat_id: string;
+  teams_graph_base_url: string;
+  teams_delivery_mode: "auto" | "bot_framework" | "graph";
+  teams_timeout_secs: string;
+  teams_user_agent: string;
+  teams_trust_policy: string;
+  teams_allowed_senders_csv: string;
   whatsapp_enabled: boolean;
   whatsapp_mode: "baileys" | "cloud_api";
   whatsapp_access_token: string;
@@ -88,6 +155,41 @@ type ChannelSettingsForm = {
   whatsapp_dm_policy: string;
   whatsapp_allowed_numbers_csv: string;
 };
+
+type IntegrationSyncFormState = {
+  enabled: boolean;
+  poll_interval_minutes: string;
+  importance_threshold_percent: string;
+  notify_on_important: boolean;
+  push_to_preferred_channel: boolean;
+};
+
+function defaultIntegrationSyncForm(): IntegrationSyncFormState {
+  return {
+    enabled: false,
+    poll_interval_minutes: "5",
+    importance_threshold_percent: "70",
+    notify_on_important: true,
+    push_to_preferred_channel: false
+  };
+}
+
+function integrationSyncFormFromStatus(status?: IntegrationSyncStatus | null): IntegrationSyncFormState {
+  if (!status) return defaultIntegrationSyncForm();
+  return {
+    enabled: !!status.enabled,
+    poll_interval_minutes: String(Math.max(1, Math.round((status.poll_interval_secs || 300) / 60))),
+    importance_threshold_percent: String(Math.round((status.importance_threshold || 0.7) * 100)),
+    notify_on_important: !!status.notify_on_important,
+    push_to_preferred_channel: !!status.push_to_preferred_channel
+  };
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) return "Never";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
 
 function asErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return "Request failed";
@@ -102,6 +204,8 @@ function asErrorMessage(err: unknown): string {
 
 function statusColor(status: IntegrationItem["status"]): "success" | "warning" | "error" | "default" {
   if (status === "connected") return "success";
+  if (status === "starting") return "warning";
+  if (status === "disabled") return "warning";
   if (status === "needs_auth") return "warning";
   if (status === "error") return "error";
   return "default";
@@ -113,6 +217,8 @@ function integrationCardState(integration: IntegrationItem): IntegrationCardStat
   if (integration.status === "connected") {
     return integration.enabled ? "enabled" : "disabled";
   }
+  if (integration.status === "starting") return "needs_auth";
+  if (integration.status === "disabled") return "disabled";
   if (integration.status === "needs_auth") return "needs_auth";
   if (integration.status === "error") return "error";
   return "not_configured";
@@ -195,28 +301,73 @@ function integrationCardAccent(state: IntegrationCardState): {
   };
 }
 
-function channelStatusColor(status: string): "success" | "warning" | "error" | "info" | "default" {
+type MessagingDisplayState = "off" | "checking" | "needs_setup" | "ready" | "error";
+
+function messagingDisplayState(status: string, enabled: boolean): MessagingDisplayState {
+  if (!enabled) return "off";
   const s = (status || "").toLowerCase();
-  if (s === "connected" || s === "ready") return "success";
-  if (s === "qr" || s === "connecting" || s === "syncing" || s === "checking") return "info";
-  if (s === "missing_token" || s === "missing_config" || s === "disabled") return "warning";
-  if (s === "error" || s === "failed") return "error";
+  if (s === "checking" || s === "refreshing") return "checking";
+  if (s === "connected" || s === "ready" || s === "configured") return "ready";
+  if (s === "error" || s === "failed" || s === "invalid_token") return "error";
+  return "needs_setup";
+}
+
+function channelStatusColor(
+  status: string,
+  enabled: boolean
+): "success" | "warning" | "error" | "info" | "default" {
+  const display = messagingDisplayState(status, enabled);
+  if (display === "ready") return "success";
+  if (display === "error") return "error";
+  if (display === "checking") return "info";
+  if (display === "needs_setup") return "warning";
   return "default";
 }
 
-function channelStatusLabel(status: string): string {
-  const s = (status || "").toLowerCase();
-  if (s === "qr") return "Waiting for QR scan";
-  if (s === "connecting") return "Connecting";
-  if (s === "syncing") return "Syncing";
-  if (s === "connected") return "Connected";
-  if (s === "ready") return "Ready";
-  if (s === "disabled") return "Disabled";
-  if (s === "missing_token") return "Missing token";
-  if (s === "missing_config") return "Missing config";
-  if (s === "checking") return "Checking";
-  if (s === "error") return "Error";
-  return status || "Unknown";
+function channelStatusLabel(status: string, enabled: boolean): string {
+  const display = messagingDisplayState(status, enabled);
+  if (display === "ready") return "Ready";
+  if (display === "error") return "Error";
+  if (display === "checking") return "Checking";
+  if (display === "needs_setup") return "Needs setup";
+  return "Off";
+}
+
+function messagingWizardHint(status: string, enabled: boolean): string {
+  const display = messagingDisplayState(status, enabled);
+  if (display === "ready") return "Configured already. Open the wizard to update credentials, defaults, or targets.";
+  if (display === "error") return "Open the wizard to fix the saved settings and reconnect.";
+  if (display === "checking") return "A live connectivity check is in progress.";
+  if (display === "needs_setup") return "Open the wizard to finish setup and save the required connection details.";
+  return "Turn it on and complete the wizard to connect this channel.";
+}
+
+function gatewayChannelById(
+  channels: GatewayChannelDescriptor[],
+  id: string
+): GatewayChannelDescriptor | null {
+  return channels.find((channel) => channel.id === id) || null;
+}
+
+function gatewayChannelDetail(channel: GatewayChannelDescriptor | null, fallback: string): string {
+  if (!channel) return fallback;
+  if (str(channel.last_error, "").trim()) return str(channel.last_error, "");
+  if (!channel.configured) return fallback;
+  const parts: string[] = [];
+  if ((channel.connected_account_count || 0) > 0) {
+    parts.push(`${channel.connected_account_count} live account${channel.connected_account_count === 1 ? "" : "s"}`);
+  } else if ((channel.account_count || 0) > 0) {
+    parts.push(`${channel.account_count} account${channel.account_count === 1 ? "" : "s"} configured`);
+  } else {
+    parts.push("Configuration saved");
+  }
+  if ((channel.route_count || 0) > 0) {
+    parts.push(`${channel.route_count} route${channel.route_count === 1 ? "" : "s"}`);
+  }
+  if (str(channel.delivery_mode, "").trim()) {
+    parts.push(str(channel.delivery_mode, "").replace(/_/g, " "));
+  }
+  return parts.join(" • ");
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -289,6 +440,28 @@ function normalizeIntegrationId(value: string): string {
 function integrationDisplayName(id: string, integrations: IntegrationItem[]): string {
   const normalized = normalizeIntegrationId(id);
   return integrations.find((item) => item.id === normalized)?.name || normalized || "Integration";
+}
+
+function summarizeInlineNames(names: string[], emptyText: string): string {
+  const cleaned = names.map((value) => value.trim()).filter(Boolean);
+  if (cleaned.length === 0) return emptyText;
+  const preview = cleaned.slice(0, 3).join(", ");
+  return cleaned.length > 3 ? `${preview} +${cleaned.length - 3} more` : preview;
+}
+
+function parseWorkspaceBundleCsv(input: string): string[] {
+  const seen = new Set<string>();
+  for (const raw of (input || "").split(/[,\n\r;]+/g)) {
+    const normalized = raw.trim().toLowerCase();
+    if (!normalized) continue;
+    const match = GOOGLE_WORKSPACE_BUNDLES.find((bundle) => bundle.id === normalized);
+    if (match) seen.add(match.id);
+  }
+  return Array.from(seen.values());
+}
+
+function workspaceBundleCsv(input: string[]): string {
+  return input.join(", ");
 }
 
 function parseCsvList(input: string): string[] {
@@ -417,14 +590,21 @@ export function IntegrationsPanel({
 }: {
   autoRefresh: boolean;
   embedded?: boolean;
-  mode?: "all" | "integrations" | "mcp";
+  mode?: "all" | "integrations" | "messaging" | "mcp";
 }) {
   const queryClient = useQueryClient();
   const showIntegrations = mode !== "mcp";
-  const showMcp = mode !== "integrations";
+  const showCatalog = mode === "all" || mode === "integrations";
+  const showMessagingOnly = mode === "messaging";
+  const showMcp = mode === "all" || mode === "mcp";
   const [active, setActive] = useState<IntegrationItem | null>(null);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
+  const [googleWorkspaceHelpOpen, setGoogleWorkspaceHelpOpen] = useState(false);
+  const [editingConnected, setEditingConnected] = useState(false);
+  const [syncForm, setSyncForm] = useState<IntegrationSyncFormState>(defaultIntegrationSyncForm());
+  const [syncDirty, setSyncDirty] = useState(false);
+  const [syncNotice, setSyncNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const [configSuccess, setConfigSuccess] = useState(false);
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
@@ -447,6 +627,7 @@ export function IntegrationsPanel({
   const [sshConnKeyName, setSshConnKeyName] = useState("");
   const [sshTestConnName, setSshTestConnName] = useState("");
   const [sshTestOutput, setSshTestOutput] = useState("");
+  const [expandedSection, setExpandedSection] = useState<string | false>("connected");
   const [sshKeyError, setSshKeyError] = useState<string | null>(null);
   const [sshConnError, setSshConnError] = useState<string | null>(null);
   const [showDisabledIntegrations, setShowDisabledIntegrations] = useState(false);
@@ -455,6 +636,10 @@ export function IntegrationsPanel({
   const [channelsDirty, setChannelsDirty] = useState(false);
   const [searchSetupOpen, setSearchSetupOpen] = useState(false);
   const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
+  const [slackSetupOpen, setSlackSetupOpen] = useState(false);
+  const [discordSetupOpen, setDiscordSetupOpen] = useState(false);
+  const [matrixSetupOpen, setMatrixSetupOpen] = useState(false);
+  const [teamsSetupOpen, setTeamsSetupOpen] = useState(false);
   const [whatsAppSetupOpen, setWhatsAppSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
     search_primary: "lightpanda",
@@ -466,6 +651,49 @@ export function IntegrationsPanel({
     telegram_enabled: false,
     telegram_bot_token: "",
     telegram_allowed_users_csv: "",
+    slack_enabled: false,
+    slack_bot_token: "",
+    slack_signing_secret: "",
+    slack_api_base_url: "https://slack.com/api",
+    slack_default_channel_id: "",
+    slack_default_thread_ts: "",
+    slack_workspace_id: "",
+    slack_workspace_name: "",
+    slack_trust_policy: "open",
+    slack_allowed_senders_csv: "",
+    discord_enabled: false,
+    discord_bot_token: "",
+    discord_webhook_url: "",
+    discord_api_base_url: "https://discord.com/api/v10",
+    discord_default_channel_id: "",
+    discord_default_thread_id: "",
+    discord_guild_id: "",
+    discord_application_id: "",
+    matrix_enabled: false,
+    matrix_homeserver_url: "",
+    matrix_access_token: "",
+    matrix_user_id: "",
+    matrix_device_id: "",
+    matrix_account_id: "",
+    matrix_default_room_id: "",
+    matrix_sync_timeout_ms: "30000",
+    matrix_limit: "100",
+    matrix_user_agent: "",
+    teams_enabled: false,
+    teams_service_url: "",
+    teams_access_token: "",
+    teams_bot_app_id: "",
+    teams_bot_name: "",
+    teams_tenant_id: "",
+    teams_team_id: "",
+    teams_channel_id: "",
+    teams_chat_id: "",
+    teams_graph_base_url: "https://graph.microsoft.com/v1.0",
+    teams_delivery_mode: "auto",
+    teams_timeout_secs: "15",
+    teams_user_agent: "",
+    teams_trust_policy: "open",
+    teams_allowed_senders_csv: "",
     whatsapp_enabled: false,
     whatsapp_mode: "baileys",
     whatsapp_access_token: "",
@@ -480,12 +708,55 @@ export function IntegrationsPanel({
   const integrationsQ = useQuery({
     queryKey: ["integrations"],
     queryFn: api.getIntegrations,
+    refetchInterval: REFRESH_MS,
+    enabled: showCatalog,
+    placeholderData: (previous) => previous
+  });
+  const integrationSyncStatusQ = useQuery({
+    queryKey: ["integration-sync-status"],
+    queryFn: api.getIntegrationSyncStatus,
     refetchInterval: autoRefresh ? REFRESH_MS : false,
-    enabled: showIntegrations
+    enabled: showCatalog
+  });
+  const integrationSyncFeedQ = useQuery({
+    queryKey: ["integration-sync-feed"],
+    queryFn: () => api.getIntegrationSyncFeed({ limit: 18 }),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showCatalog
+  });
+  const webhookSourcesQ = useQuery({
+    queryKey: ["integrations-quickstart-webhooks"],
+    queryFn: () => api.rawGet("/webhooks/sources"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showCatalog
+  });
+  const customApisQ = useQuery({
+    queryKey: ["integrations-quickstart-custom-apis"],
+    queryFn: () => api.rawGet("/custom-apis"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showCatalog
+  });
+  const pluginsSummaryQ = useQuery({
+    queryKey: ["settings-plugins"],
+    queryFn: () => api.rawGet("/plugins"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showCatalog
   });
   const settingsQ = useQuery({
     queryKey: ["settings"],
     queryFn: () => api.rawGet("/settings"),
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showIntegrations
+  });
+  const channelsQ = useQuery({
+    queryKey: ["gateway-channels-integrations"],
+    queryFn: api.getChannels,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    enabled: showIntegrations
+  });
+  const senderVerificationQ = useQuery({
+    queryKey: ["settings-sender-verification-inline"],
+    queryFn: () => api.rawGet("/sender-verification"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
     enabled: showIntegrations
   });
@@ -532,14 +803,22 @@ export function IntegrationsPanel({
     mutationFn: ({ id, payload }: { id: string; payload: Record<string, unknown> }) =>
       api.configureIntegration(id, payload),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-feed"] })
+      ]);
     }
   });
 
   const disconnectMutation = useMutation({
     mutationFn: (id: string) => api.disconnectIntegration(id),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-feed"] })
+      ]);
     }
   });
 
@@ -547,7 +826,10 @@ export function IntegrationsPanel({
     mutationFn: (id: string) => api.enableIntegration(id),
     onSuccess: async () => {
       setNotice({ kind: "success", text: "Integration enabled." });
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] })
+      ]);
     },
     onError: (err) => {
       setNotice({ kind: "error", text: asErrorMessage(err) });
@@ -558,7 +840,10 @@ export function IntegrationsPanel({
     mutationFn: (id: string) => api.disableIntegration(id),
     onSuccess: async () => {
       setNotice({ kind: "success", text: "Integration disabled." });
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] })
+      ]);
     },
     onError: (err) => {
       setNotice({ kind: "error", text: asErrorMessage(err) });
@@ -569,12 +854,39 @@ export function IntegrationsPanel({
     mutationFn: (id: string) => api.testIntegration(id),
     onSuccess: async () => {
       setNotice({ kind: "success", text: "Connection test passed." });
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] })
+      ]);
     },
     onError: async (err) => {
       // Backend may auto-disable on failed test.
       setNotice({ kind: "error", text: asErrorMessage(err) });
-      await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integrations"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] })
+      ]);
+    }
+  });
+  const saveSyncMutation = useMutation({
+    mutationFn: ({ id, payload }: { id: string; payload: Record<string, unknown> }) =>
+      api.updateIntegrationSync(id, payload),
+    onSuccess: async () => {
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-feed"] })
+      ]);
+    }
+  });
+  const syncNowMutation = useMutation({
+    mutationFn: (id: string) => api.runIntegrationSyncNow(id),
+    onSuccess: async () => {
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-status"] }),
+        queryClient.invalidateQueries({ queryKey: ["integration-sync-feed"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications-count"] })
+      ]);
     }
   });
 
@@ -588,23 +900,102 @@ export function IntegrationsPanel({
       setNotice({ kind: "error", text: asErrorMessage(err) });
     }
   });
+  const approveSenderMutation = useMutation({
+    mutationFn: (payload: Record<string, unknown>) => api.rawPost("/sender-verification/approve", payload),
+    onSuccess: async () => {
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["settings-sender-verification-inline"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications-count"] })
+      ]);
+    }
+  });
+  const revokeSenderMutation = useMutation({
+    mutationFn: (payload: Record<string, unknown>) => api.rawPost("/sender-verification/revoke", payload),
+    onSuccess: async () => {
+      await Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ["settings-sender-verification-inline"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+        queryClient.invalidateQueries({ queryKey: ["notifications-count"] })
+      ]);
+    }
+  });
 
-  const integrations = showIntegrations
+  const integrations = showCatalog
     ? (integrationsQ.data?.integrations || []).filter((item) => normalizeIntegrationId(item.id) !== "moltbook")
     : [];
+  const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
+  const integrationSyncStatusById = useMemo(
+    () =>
+      Object.fromEntries(
+        integrationSyncStatuses.map((status) => [status.integration_id, status] as const)
+      ) as Record<string, IntegrationSyncStatus>,
+    [integrationSyncStatuses]
+  );
+  const integrationSyncFeed = showCatalog ? integrationSyncFeedQ.data?.items || [] : [];
   const settings = asRecord(settingsQ.data);
+  const senderVerification = asRecord(senderVerificationQ.data);
+  const senderVerificationSettings = asRecord(senderVerification.settings);
+  const slackTrustSettings = asRecord(senderVerificationSettings.slack);
+  const teamsTrustSettings = asRecord(senderVerificationSettings.teams);
+  const whatsappTrustSettings = asRecord(senderVerificationSettings.whatsapp);
+  const pendingSenderRows = asRecords(senderVerification.pending);
+  const approvedSenderRows = asRecords(senderVerification.approved);
+  const gatewayChannels = showIntegrations ? channelsQ.data?.channels || [] : [];
   const waBridge = asRecord(waBridgeQ.data);
   const telegramStatus = asRecord(telegramStatusQ.data);
+  const telegramEnabledSaved = toBool(settings.telegram_enabled);
   const hasTelegramToken = toBool(settings.has_telegram_token);
+  const telegramDeliveryReady = toBool(settings.telegram_delivery_ready);
+  const hasSlackBotToken = toBool(settings.has_slack_bot_token);
+  const hasSlackSigningSecret = toBool(settings.has_slack_signing_secret);
+  const hasDiscordBotToken = toBool(settings.has_discord_bot_token);
+  const hasMatrixAccessToken = toBool(settings.has_matrix_access_token);
+  const hasTeamsAccessToken = toBool(settings.has_teams_access_token);
   const hasWhatsAppToken = toBool(settings.has_whatsapp_token);
   const searchSerperConfigured = toBool(settings.search_serper_configured);
   const searchBraveConfigured = toBool(settings.search_brave_configured);
-  const telegramTokenConfigured = hasTelegramToken || channelForm.telegram_bot_token.trim().length > 0;
+  const telegramDraftTokenConfigured = channelForm.telegram_bot_token.trim().length > 0;
+  const telegramTokenConfigured = hasTelegramToken || telegramDraftTokenConfigured;
   const whatsappTokenConfigured = hasWhatsAppToken || channelForm.whatsapp_access_token.trim().length > 0;
-  const telegramConnectionStatusRaw = telegramStatusQ.isFetching
-    ? "checking"
-    : str(telegramStatus.status, channelForm.telegram_enabled ? "ready" : "disabled");
-  const telegramConnectionDetail = str(telegramStatus.detail, "");
+  const telegramProbeStatus = str(telegramStatus.status, "").trim().toLowerCase();
+  const telegramProbeDetail = str(telegramStatus.detail, "").trim();
+  const telegramConnectionStatusRaw = (() => {
+    if (!telegramEnabledSaved) return "disabled";
+    if (!hasTelegramToken) return "missing_token";
+    if (!telegramProbeStatus) return "configured";
+    if (telegramProbeStatus === "error") {
+      const detail = telegramProbeDetail.toLowerCase();
+      const likelyCredentialError =
+        detail.includes("unauthorized") ||
+        detail.includes("forbidden") ||
+        detail.includes("invalid") ||
+        detail.includes("not found") ||
+        detail.includes("bot token");
+      return likelyCredentialError ? "error" : "configured";
+    }
+    return telegramProbeStatus;
+  })();
+  const telegramConnectionDetail = (() => {
+    if (!telegramEnabledSaved) return "Telegram is disabled.";
+    if (!hasTelegramToken) {
+      return telegramDraftTokenConfigured
+        ? "Bot token entered locally. Save changes to apply it."
+        : "Telegram bot token is not configured.";
+    }
+    if (telegramConnectionStatusRaw === "connected" && telegramProbeDetail) {
+      return telegramProbeDetail;
+    }
+    if (telegramProbeStatus === "error" && telegramConnectionStatusRaw === "configured") {
+      return telegramProbeDetail
+        ? `Saved bot token is configured. Last live check failed: ${telegramProbeDetail}`
+        : "Saved bot token is configured.";
+    }
+    if (telegramProbeDetail) return telegramProbeDetail;
+    return telegramDeliveryReady
+      ? "Saved bot token and delivery routing are configured."
+      : "Saved bot token is configured.";
+  })();
   const whatsappConnectionStatusRaw = (() => {
     if (!channelForm.whatsapp_enabled) return "disabled";
     if (channelForm.whatsapp_mode === "cloud_api") {
@@ -620,13 +1011,149 @@ export function IntegrationsPanel({
         ? "Cloud API credentials are configured."
         : "Cloud API token and phone number ID are required."
       : str(waBridge.error, "");
+  const slackGateway = gatewayChannelById(gatewayChannels, "slack");
+  const discordGateway = gatewayChannelById(gatewayChannels, "discord");
+  const matrixGateway = gatewayChannelById(gatewayChannels, "matrix");
+  const teamsGateway = gatewayChannelById(gatewayChannels, "teams");
+  const slackConnectionStatusRaw = slackGateway?.status || (channelForm.slack_enabled ? "missing_config" : "disabled");
+  const discordConnectionStatusRaw =
+    discordGateway?.status || (channelForm.discord_enabled ? "missing_config" : "disabled");
+  const matrixConnectionStatusRaw =
+    matrixGateway?.status || (channelForm.matrix_enabled ? "missing_config" : "disabled");
+  const teamsConnectionStatusRaw =
+    teamsGateway?.status || (channelForm.teams_enabled ? "missing_config" : "disabled");
+  const slackConnectionDetail = gatewayChannelDetail(
+    slackGateway,
+    channelForm.slack_enabled ? "Bot token and signing secret are required." : "Not configured"
+  );
+  const discordConnectionDetail = gatewayChannelDetail(
+    discordGateway,
+    channelForm.discord_enabled ? "Bot token or webhook URL is required." : "Not configured"
+  );
+  const matrixConnectionDetail = gatewayChannelDetail(
+    matrixGateway,
+    channelForm.matrix_enabled ? "Homeserver URL, access token, and user ID are required." : "Not configured"
+  );
+  const teamsConnectionDetail = gatewayChannelDetail(
+    teamsGateway,
+    channelForm.teams_enabled ? "Service URL, access token, and bot app ID are required." : "Not configured"
+  );
   const mcpServers = showMcp ? asRecords(asRecord(mcpQ.data).servers) : [];
   const sorted = useMemo(
-    () => [...integrations].sort((a, b) => a.name.localeCompare(b.name)),
+    () =>
+      [...integrations].sort((a, b) => {
+        if (a.id === "google_workspace" && b.id !== "google_workspace") return -1;
+        if (b.id === "google_workspace" && a.id !== "google_workspace") return 1;
+        return a.name.localeCompare(b.name);
+      }),
     [integrations]
   );
+  const activeSyncStatus = active ? integrationSyncStatusById[active.id] || null : null;
   const readyList = sorted.filter((i) => integrationCardState(i) === "enabled");
   const notReadyList = sorted.filter((i) => integrationCardState(i) !== "enabled");
+  const webhookSources = useMemo(
+    () => asRecords(asRecord(webhookSourcesQ.data).sources),
+    [webhookSourcesQ.data]
+  );
+  const customApis = useMemo(
+    () => asRecords(asRecord(customApisQ.data).custom_apis),
+    [customApisQ.data]
+  );
+  const pluginSummaries = useMemo(
+    () => asRecords(asRecord(pluginsSummaryQ.data).plugins),
+    [pluginsSummaryQ.data]
+  );
+  const enabledWebhookSources = webhookSources.filter((source) => source.enabled !== false);
+  const enabledCustomApis = customApis.filter((item) => item.enabled !== false);
+  const enabledPluginSummaries = pluginSummaries.filter((plugin) => plugin.enabled !== false);
+  const liveConnectionSummary = [
+    readyList.length > 0
+      ? {
+          key: "apps",
+          label: "Connected Apps",
+          detail: summarizeInlineNames(
+            readyList.map((item) => item.name),
+            "No connected apps yet."
+          ),
+          badge: `${readyList.length} live`
+        }
+      : null,
+    enabledWebhookSources.length > 0
+      ? {
+          key: "webhooks",
+          label: "Webhooks",
+          detail: summarizeInlineNames(
+            enabledWebhookSources.map((item) => str(item.name, str(item.id))),
+            "No webhooks enabled."
+          ),
+          badge: `${enabledWebhookSources.length} active`
+        }
+      : null,
+    enabledCustomApis.length > 0
+      ? {
+          key: "custom-apis",
+          label: "Custom APIs",
+          detail: summarizeInlineNames(
+            enabledCustomApis.map((item) => str(item.name, str(item.id))),
+            "No custom APIs active."
+          ),
+          badge: `${enabledCustomApis.length} imported`
+        }
+      : null,
+    enabledPluginSummaries.length > 0
+      ? {
+          key: "plugins",
+          label: "Plugins",
+          detail: summarizeInlineNames(
+            enabledPluginSummaries.map((item) => str(item.name, str(item.id))),
+            "No plugins enabled."
+          ),
+          badge: `${enabledPluginSummaries.length} active`
+        }
+      : null
+  ].filter((item): item is { key: string; label: string; detail: string; badge: string } => Boolean(item));
+  const sectionAccordionSx = {
+    border: "1px solid rgba(112,153,201,0.14)",
+    borderRadius: "14px",
+    background: "rgba(8,18,34,0.7)",
+    boxShadow: "none",
+    "&:before": { display: "none" },
+    "&.Mui-expanded": { mt: 0, mb: 0 },
+    "& .MuiAccordionSummary-root": {
+      minHeight: 56,
+      px: 1.5
+    },
+    "& .MuiAccordionSummary-content": {
+      my: 1
+    },
+    "& .MuiAccordionDetails-root": {
+      pt: 0,
+      px: 1.5,
+      pb: 1.5
+    }
+  } as const;
+  const sectionCountChipSx = {
+    height: 22,
+    borderRadius: 1,
+    background: "rgba(14, 25, 43, 0.92)",
+    border: "1px solid rgba(112,153,201,0.16)",
+    color: "rgba(173,192,214,0.9)",
+    "& .MuiChip-label": {
+      px: 1,
+      fontSize: "0.64rem",
+      fontWeight: 700,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase"
+    }
+  } as const;
+  const dialogActionButtonSx = {
+    minHeight: 32,
+    px: 1.5,
+    borderRadius: 1.5,
+    textTransform: "none",
+    fontWeight: 700,
+    boxShadow: "none"
+  } as const;
   const mcpSorted = useMemo(
     () => [...mcpServers].sort((a, b) => str(a.name, "").localeCompare(str(b.name, ""))),
     [mcpServers]
@@ -640,7 +1167,10 @@ export function IntegrationsPanel({
     const refreshedIntegrations = showIntegrations ? await integrationsQ.refetch() : null;
     if (showIntegrations) {
       await Promise.allSettled([
+        integrationSyncStatusQ.refetch(),
+        integrationSyncFeedQ.refetch(),
         settingsQ.refetch(),
+        channelsQ.refetch(),
         telegramStatusQ.refetch(),
         channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "baileys"
           ? waBridgeQ.refetch()
@@ -674,9 +1204,9 @@ export function IntegrationsPanel({
 
   const needsPendingConnectionRefresh =
     !!oauthPendingId ||
-    (channelForm.telegram_enabled &&
-      telegramTokenConfigured &&
-      !["connected", "ready", "disabled"].includes(telegramConnectionStatusRaw)) ||
+    (telegramEnabledSaved &&
+      hasTelegramToken &&
+      ["checking", "missing_token"].includes(telegramConnectionStatusRaw)) ||
     (channelForm.whatsapp_enabled &&
       channelForm.whatsapp_mode === "baileys" &&
       !["connected", "ready", "disabled"].includes(whatsappConnectionStatusRaw));
@@ -692,9 +1222,7 @@ export function IntegrationsPanel({
       const targetName = integrationDisplayName(targetId, integrations);
       const status = str(payload.status, "").trim().toLowerCase();
       const detail = str(payload.detail, "").trim();
-      if (status === "connected") {
-        setNotice({ kind: "success", text: `${targetName} connected.` });
-      } else if (status === "error") {
+      if (status === "error") {
         setNotice({
           kind: "error",
           text: detail ? `${targetName} connection failed: ${detail}` : `${targetName} connection failed.`
@@ -750,7 +1278,13 @@ export function IntegrationsPanel({
       document.removeEventListener("visibilitychange", handleVisibility);
       oauthChannel?.close();
     };
-  }, [showIntegrations, integrations, oauthPendingId, active?.id]);
+  }, [showIntegrations, integrations, oauthPendingId, active?.id, channelsQ, channelForm.whatsapp_enabled, channelForm.whatsapp_mode]);
+
+  useEffect(() => {
+    if (!notice || notice.kind !== "success") return;
+    const timer = window.setTimeout(() => setNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   useEffect(() => {
     if (!showIntegrations || !needsPendingConnectionRefresh) return;
@@ -773,16 +1307,77 @@ export function IntegrationsPanel({
       telegram_enabled: toBool(next.telegram_enabled),
       telegram_bot_token: "",
       telegram_allowed_users_csv: asStringList(next.telegram_allowed_users).join(", "),
+      slack_enabled: toBool(next.slack_enabled),
+      slack_bot_token: "",
+      slack_signing_secret: "",
+      slack_api_base_url: str(next.slack_api_base_url, "https://slack.com/api"),
+      slack_default_channel_id: str(next.slack_default_channel_id, ""),
+      slack_default_thread_ts: str(next.slack_default_thread_ts, ""),
+      slack_workspace_id: str(next.slack_workspace_id, ""),
+      slack_workspace_name: str(next.slack_workspace_name, ""),
+      slack_trust_policy: str(slackTrustSettings.policy, "open"),
+      slack_allowed_senders_csv: asStringList(slackTrustSettings.allowed_senders).join(", "),
+      discord_enabled: toBool(next.discord_enabled),
+      discord_bot_token: "",
+      discord_webhook_url: str(next.discord_webhook_url, ""),
+      discord_api_base_url: str(next.discord_api_base_url, "https://discord.com/api/v10"),
+      discord_default_channel_id: str(next.discord_default_channel_id, ""),
+      discord_default_thread_id: str(next.discord_default_thread_id, ""),
+      discord_guild_id: str(next.discord_guild_id, ""),
+      discord_application_id: str(next.discord_application_id, ""),
+      matrix_enabled: toBool(next.matrix_enabled),
+      matrix_homeserver_url: str(next.matrix_homeserver_url, ""),
+      matrix_access_token: "",
+      matrix_user_id: str(next.matrix_user_id, ""),
+      matrix_device_id: str(next.matrix_device_id, ""),
+      matrix_account_id: str(next.matrix_account_id, ""),
+      matrix_default_room_id: str(next.matrix_default_room_id, ""),
+      matrix_sync_timeout_ms: str(next.matrix_sync_timeout_ms, "30000"),
+      matrix_limit: str(next.matrix_limit, "100"),
+      matrix_user_agent: str(next.matrix_user_agent, ""),
+      teams_enabled: toBool(next.teams_enabled),
+      teams_service_url: str(next.teams_service_url, ""),
+      teams_access_token: "",
+      teams_bot_app_id: str(next.teams_bot_app_id, ""),
+      teams_bot_name: str(next.teams_bot_name, ""),
+      teams_tenant_id: str(next.teams_tenant_id, ""),
+      teams_team_id: str(next.teams_team_id, ""),
+      teams_channel_id: str(next.teams_channel_id, ""),
+      teams_chat_id: str(next.teams_chat_id, ""),
+      teams_graph_base_url: str(next.teams_graph_base_url, "https://graph.microsoft.com/v1.0"),
+      teams_delivery_mode: str(next.teams_delivery_mode, "auto") === "graph"
+        ? "graph"
+        : str(next.teams_delivery_mode, "auto") === "bot_framework"
+          ? "bot_framework"
+          : "auto",
+      teams_timeout_secs: str(next.teams_timeout_secs, "15"),
+      teams_user_agent: str(next.teams_user_agent, ""),
+      teams_trust_policy: str(teamsTrustSettings.policy, "open"),
+      teams_allowed_senders_csv: asStringList(teamsTrustSettings.allowed_senders).join(", "),
       whatsapp_enabled: toBool(next.whatsapp_enabled),
       whatsapp_mode: str(next.whatsapp_mode, "baileys") === "cloud_api" ? "cloud_api" : "baileys",
       whatsapp_access_token: "",
       whatsapp_phone_number_id: str(next.whatsapp_phone_number_id, ""),
       whatsapp_verify_token: "",
       whatsapp_bridge_url: str(next.whatsapp_bridge_url, ""),
-      whatsapp_dm_policy: str(next.whatsapp_dm_policy, "all") || "all",
-      whatsapp_allowed_numbers_csv: asStringList(next.whatsapp_allowed_numbers).join(", ")
+      whatsapp_dm_policy: str(whatsappTrustSettings.policy, str(next.whatsapp_dm_policy, "pairing")) || "pairing",
+      whatsapp_allowed_numbers_csv: asStringList(whatsappTrustSettings.allowed_senders).join(", ")
     });
-  }, [showIntegrations, settingsQ.data, settingsQ.dataUpdatedAt, channelsDirty]);
+  }, [
+    showIntegrations,
+    settingsQ.data,
+    settingsQ.dataUpdatedAt,
+    channelsDirty,
+    senderVerificationQ.data,
+    slackTrustSettings,
+    teamsTrustSettings,
+    whatsappTrustSettings
+  ]);
+
+  useEffect(() => {
+    if (!active || syncDirty) return;
+    setSyncForm(integrationSyncFormFromStatus(activeSyncStatus));
+  }, [active?.id, activeSyncStatus, syncDirty]);
 
   const setChannelField = <K extends keyof ChannelSettingsForm>(
     key: K,
@@ -799,6 +1394,34 @@ export function IntegrationsPanel({
     setTelegramSetupOpen(true);
   };
 
+  const openSlackSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.slack_enabled) {
+      setChannelField("slack_enabled", true);
+    }
+    setSlackSetupOpen(true);
+  };
+
+  const openDiscordSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.discord_enabled) {
+      setChannelField("discord_enabled", true);
+    }
+    setDiscordSetupOpen(true);
+  };
+
+  const openMatrixSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.matrix_enabled) {
+      setChannelField("matrix_enabled", true);
+    }
+    setMatrixSetupOpen(true);
+  };
+
+  const openTeamsSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.teams_enabled) {
+      setChannelField("teams_enabled", true);
+    }
+    setTeamsSetupOpen(true);
+  };
+
   const openWhatsAppSetup = (enableIfDisabled = false) => {
     if (enableIfDisabled && !channelForm.whatsapp_enabled) {
       setChannelField("whatsapp_enabled", true);
@@ -809,6 +1432,82 @@ export function IntegrationsPanel({
   const openSearchSetup = () => {
     setSearchSetupOpen(true);
   };
+
+  const messagingSetups = [
+    {
+      id: "telegram",
+      name: "Telegram",
+      enabled: telegramEnabledSaved,
+      status: telegramConnectionStatusRaw,
+      detail: !telegramEnabledSaved
+        ? "Turn Telegram on in the wizard, then add a bot token."
+        : telegramConnectionDetail || (telegramTokenConfigured ? "Bot token saved. Finish setup to make delivery available." : "Add a bot token to finish setup."),
+      actionLabel: channelForm.telegram_enabled ? "Open wizard" : "Turn on",
+      open: () => openTelegramSetup(!channelForm.telegram_enabled)
+    },
+    {
+      id: "whatsapp",
+      name: "WhatsApp",
+      enabled: channelForm.whatsapp_enabled,
+      status: whatsappConnectionStatusRaw,
+      detail: !channelForm.whatsapp_enabled
+        ? "Turn WhatsApp on in the wizard, then choose QR pairing or Cloud API."
+        : whatsappConnectionDetail ||
+          (channelForm.whatsapp_mode === "cloud_api"
+            ? "Add the Cloud API token and phone number ID to finish setup."
+            : "Open the wizard and scan the QR code to finish pairing."),
+      actionLabel: channelForm.whatsapp_enabled ? "Open wizard" : "Turn on",
+      open: () => openWhatsAppSetup(!channelForm.whatsapp_enabled)
+    },
+    {
+      id: "slack",
+      name: "Slack",
+      enabled: channelForm.slack_enabled,
+      status: slackConnectionStatusRaw,
+      detail: !channelForm.slack_enabled
+        ? "Turn Slack on in the wizard, then add the bot token and signing secret."
+        : slackConnectionDetail,
+      actionLabel: channelForm.slack_enabled ? "Open wizard" : "Turn on",
+      open: () => openSlackSetup(!channelForm.slack_enabled)
+    },
+    {
+      id: "discord",
+      name: "Discord",
+      enabled: channelForm.discord_enabled,
+      status: discordConnectionStatusRaw,
+      detail: !channelForm.discord_enabled
+        ? "Turn Discord on in the wizard, then add a bot token or webhook URL."
+        : discordConnectionDetail,
+      actionLabel: channelForm.discord_enabled ? "Open wizard" : "Turn on",
+      open: () => openDiscordSetup(!channelForm.discord_enabled)
+    },
+    {
+      id: "matrix",
+      name: "Matrix",
+      enabled: channelForm.matrix_enabled,
+      status: matrixConnectionStatusRaw,
+      detail: !channelForm.matrix_enabled
+        ? "Turn Matrix on in the wizard, then add the homeserver URL, access token, and user ID."
+        : matrixConnectionDetail,
+      actionLabel: channelForm.matrix_enabled ? "Open wizard" : "Turn on",
+      open: () => openMatrixSetup(!channelForm.matrix_enabled)
+    },
+    {
+      id: "teams",
+      name: "Teams",
+      enabled: channelForm.teams_enabled,
+      status: teamsConnectionStatusRaw,
+      detail: !channelForm.teams_enabled
+        ? "Turn Teams on in the wizard, then add the service URL, access token, and bot app ID."
+        : teamsConnectionDetail,
+      actionLabel: channelForm.teams_enabled ? "Open wizard" : "Turn on",
+      open: () => openTeamsSetup(!channelForm.teams_enabled)
+    }
+  ];
+  const messagingReadyCount = messagingSetups.filter(
+    (setup) => messagingDisplayState(setup.status, setup.enabled) === "ready"
+  ).length;
+  const messagingAttentionCount = messagingSetups.length - messagingReadyCount;
 
   const saveChannelsMutation = useMutation({
     mutationFn: async () => {
@@ -830,6 +1529,45 @@ export function IntegrationsPanel({
         telegram_enabled: !!channelForm.telegram_enabled,
         telegram_bot_token: channelForm.telegram_bot_token.trim() || null,
         telegram_allowed_users: parseTelegramUsers(channelForm.telegram_allowed_users_csv),
+        slack_enabled: !!channelForm.slack_enabled,
+        slack_bot_token: channelForm.slack_bot_token.trim() || null,
+        slack_signing_secret: channelForm.slack_signing_secret.trim() || null,
+        slack_api_base_url: channelForm.slack_api_base_url.trim() || null,
+        slack_default_channel_id: channelForm.slack_default_channel_id.trim() || null,
+        slack_default_thread_ts: channelForm.slack_default_thread_ts.trim() || null,
+        slack_workspace_id: channelForm.slack_workspace_id.trim() || null,
+        slack_workspace_name: channelForm.slack_workspace_name.trim() || null,
+        discord_enabled: !!channelForm.discord_enabled,
+        discord_bot_token: channelForm.discord_bot_token.trim() || null,
+        discord_webhook_url: channelForm.discord_webhook_url.trim() || null,
+        discord_api_base_url: channelForm.discord_api_base_url.trim() || null,
+        discord_default_channel_id: channelForm.discord_default_channel_id.trim() || null,
+        discord_default_thread_id: channelForm.discord_default_thread_id.trim() || null,
+        discord_guild_id: channelForm.discord_guild_id.trim() || null,
+        discord_application_id: channelForm.discord_application_id.trim() || null,
+        matrix_enabled: !!channelForm.matrix_enabled,
+        matrix_homeserver_url: channelForm.matrix_homeserver_url.trim() || null,
+        matrix_access_token: channelForm.matrix_access_token.trim() || null,
+        matrix_user_id: channelForm.matrix_user_id.trim() || null,
+        matrix_device_id: channelForm.matrix_device_id.trim() || null,
+        matrix_account_id: channelForm.matrix_account_id.trim() || null,
+        matrix_default_room_id: channelForm.matrix_default_room_id.trim() || null,
+        matrix_sync_timeout_ms: Number(channelForm.matrix_sync_timeout_ms) || null,
+        matrix_limit: Number(channelForm.matrix_limit) || null,
+        matrix_user_agent: channelForm.matrix_user_agent.trim() || null,
+        teams_enabled: !!channelForm.teams_enabled,
+        teams_service_url: channelForm.teams_service_url.trim() || null,
+        teams_access_token: channelForm.teams_access_token.trim() || null,
+        teams_bot_app_id: channelForm.teams_bot_app_id.trim() || null,
+        teams_bot_name: channelForm.teams_bot_name.trim() || null,
+        teams_tenant_id: channelForm.teams_tenant_id.trim() || null,
+        teams_team_id: channelForm.teams_team_id.trim() || null,
+        teams_channel_id: channelForm.teams_channel_id.trim() || null,
+        teams_chat_id: channelForm.teams_chat_id.trim() || null,
+        teams_graph_base_url: channelForm.teams_graph_base_url.trim() || null,
+        teams_delivery_mode: channelForm.teams_delivery_mode,
+        teams_timeout_secs: Number(channelForm.teams_timeout_secs) || null,
+        teams_user_agent: channelForm.teams_user_agent.trim() || null,
         whatsapp_enabled: !!channelForm.whatsapp_enabled,
         whatsapp_mode: channelForm.whatsapp_mode,
         whatsapp_access_token: channelForm.whatsapp_access_token.trim() || null,
@@ -839,31 +1577,296 @@ export function IntegrationsPanel({
         whatsapp_dm_policy: channelForm.whatsapp_dm_policy.trim() || null,
         whatsapp_allowed_numbers: parseCsvList(channelForm.whatsapp_allowed_numbers_csv)
       };
-      return api.rawPost("/settings", payload);
+      await api.rawPost("/settings", payload);
+      return api.rawPost("/sender-verification/settings", {
+        slack_policy: channelForm.slack_trust_policy.trim() || "open",
+        slack_allowed_senders: parseCsvList(channelForm.slack_allowed_senders_csv),
+        teams_policy: channelForm.teams_trust_policy.trim() || "open",
+        teams_allowed_senders: parseCsvList(channelForm.teams_allowed_senders_csv)
+      });
     },
     onSuccess: async () => {
       setNotice({ kind: "success", text: "Channel settings saved." });
+      await Promise.allSettled([
+        settingsQ.refetch(),
+        channelsQ.refetch(),
+        senderVerificationQ.refetch(),
+        telegramStatusQ.refetch(),
+        channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "baileys"
+          ? waBridgeQ.refetch()
+          : Promise.resolve(null),
+        queryClient.invalidateQueries({ queryKey: ["gateway-channels"] })
+      ]);
       setChannelsDirty(false);
-      setChannelForm((prev) => ({
-        ...prev,
-        search_serper_key: "",
-        search_brave_key: "",
-        telegram_bot_token: "",
-        whatsapp_access_token: "",
-        whatsapp_verify_token: ""
-      }));
-      await queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
     onError: (err) => {
       setNotice({ kind: "error", text: asErrorMessage(err) });
     }
   });
 
+  const senderTrustBusy =
+    approveSenderMutation.isPending ||
+    revokeSenderMutation.isPending ||
+    senderVerificationQ.isFetching;
+
+  const renderSenderTrustSection = ({
+    channel,
+    configured,
+    policyValue,
+    onPolicyChange,
+    allowedValue,
+    onAllowedChange,
+    allowedLabel,
+    allowedHelper
+  }: {
+    channel: "slack" | "teams" | "whatsapp";
+    configured: boolean;
+    policyValue: string;
+    onPolicyChange: (value: string) => void;
+    allowedValue: string;
+    onAllowedChange: (value: string) => void;
+    allowedLabel: string;
+    allowedHelper: string;
+  }) => {
+    const pending = pendingSenderRows.filter((row) => str(row.channel) === channel);
+    const approved = approvedSenderRows.filter((row) => str(row.channel) === channel);
+    const channelName = channel === "slack" ? "Slack" : channel === "teams" ? "Teams" : "WhatsApp";
+    const formatSeen = (value: string) => {
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? value || "-" : parsed.toLocaleString();
+    };
+    const senderLabel = (row: JsonRecord) => str(row.sender_label, str(row.sender_id, "-"));
+    const scopeLabel = (row: JsonRecord) => str(row.scope_label, str(row.scope_id, "-"));
+
+    return (
+      <Box
+        sx={{
+          border: "1px solid rgba(110, 160, 255, 0.18)",
+          borderRadius: 2,
+          p: 1.25,
+          background: "rgba(10, 18, 32, 0.5)"
+        }}
+      >
+        <Stack spacing={1.25}>
+          <Box>
+            <Typography variant="subtitle2">Sender Trust</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Use pairing when unknown {channelName} senders should wait for operator approval before AgentArk acts.
+            </Typography>
+          </Box>
+          <TextField
+            select
+            fullWidth
+            size="small"
+            label="Policy"
+            value={policyValue}
+            onChange={(e) => onPolicyChange(e.target.value)}
+            disabled={!configured}
+          >
+            <MenuItem value="open">Open</MenuItem>
+            <MenuItem value="pairing">Pairing</MenuItem>
+          </TextField>
+          <TextField
+            fullWidth
+            size="small"
+            label={allowedLabel}
+            value={allowedValue}
+            onChange={(e) => onAllowedChange(e.target.value)}
+            disabled={!configured}
+            multiline
+            minRows={2}
+            helperText={configured ? allowedHelper : `${channelName} must be configured first.`}
+          />
+          {senderVerificationQ.error ? (
+            <Alert severity="warning">
+              Could not load sender approval state right now: {asErrorMessage(senderVerificationQ.error)}
+            </Alert>
+          ) : null}
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            <Chip size="small" variant="outlined" label={`${pending.length} pending`} />
+            <Chip size="small" variant="outlined" label={`${approved.length} approved`} />
+          </Stack>
+          <Box>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
+              Pending approvals
+            </Typography>
+            {pending.length === 0 ? (
+              <Typography variant="caption" color="text.secondary">
+                No pending {channelName} senders.
+              </Typography>
+            ) : (
+              <Stack spacing={0.9}>
+                {pending.map((row) => (
+                  <Box
+                    key={str(row.key, `${channel}-${str(row.sender_id)}`)}
+                    sx={{
+                      border: "1px solid rgba(255,255,255,0.08)",
+                      borderRadius: 1.5,
+                      px: 1,
+                      py: 0.9
+                    }}
+                  >
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="body2">{senderLabel(row)}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {str(row.sender_id, "-")}
+                          {str(row.scope_id) ? ` • ${scopeLabel(row)}` : ""}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                          Last seen {formatSeen(str(row.last_seen_at))}
+                        </Typography>
+                      </Box>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        disabled={senderTrustBusy}
+                        onClick={async () => {
+                          try {
+                            setNotice(null);
+                            await approveSenderMutation.mutateAsync({
+                              channel,
+                              sender_id: str(row.sender_id),
+                              sender_label: str(row.sender_label) || undefined,
+                              scope_id: str(row.scope_id) || undefined,
+                              scope_label: str(row.scope_label) || undefined,
+                              conversation_id: str(row.conversation_id) || undefined,
+                              approved_by: "integrations_panel"
+                            });
+                            setNotice({ kind: "success", text: `${channelName} sender approved.` });
+                          } catch (err) {
+                            setNotice({ kind: "error", text: asErrorMessage(err) });
+                          }
+                        }}
+                      >
+                        Approve
+                      </Button>
+                    </Stack>
+                  </Box>
+                ))}
+              </Stack>
+            )}
+          </Box>
+          <Box>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
+              Approved senders
+            </Typography>
+            {approved.length === 0 ? (
+              <Typography variant="caption" color="text.secondary">
+                No approved {channelName} senders yet.
+              </Typography>
+            ) : (
+              <Stack spacing={0.9}>
+                {approved.map((row) => (
+                  <Box
+                    key={str(row.key, `${channel}-${str(row.sender_id)}`)}
+                    sx={{
+                      border: "1px solid rgba(255,255,255,0.08)",
+                      borderRadius: 1.5,
+                      px: 1,
+                      py: 0.9
+                    }}
+                  >
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} justifyContent="space-between">
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="body2">{senderLabel(row)}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {str(row.sender_id, "-")}
+                          {str(row.scope_id) ? ` • ${scopeLabel(row)}` : ""}
+                        </Typography>
+                      </Box>
+                      <Button
+                        size="small"
+                        color="warning"
+                        variant="outlined"
+                        disabled={senderTrustBusy}
+                        onClick={async () => {
+                          try {
+                            setNotice(null);
+                            await revokeSenderMutation.mutateAsync({
+                              channel,
+                              sender_id: str(row.sender_id),
+                              scope_id: str(row.scope_id) || undefined
+                            });
+                            setNotice({ kind: "success", text: `${channelName} sender revoked.` });
+                          } catch (err) {
+                            setNotice({ kind: "error", text: asErrorMessage(err) });
+                          }
+                        }}
+                      >
+                        Revoke
+                      </Button>
+                    </Stack>
+                  </Box>
+                ))}
+              </Stack>
+            )}
+          </Box>
+        </Stack>
+      </Box>
+    );
+  };
+
+  const setSyncField = <K extends keyof IntegrationSyncFormState>(
+    key: K,
+    value: IntegrationSyncFormState[K]
+  ) => {
+    setSyncDirty(true);
+    setSyncForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const saveActiveSyncSettings = async () => {
+    if (!active) return;
+    const pollIntervalMinutes = Math.max(1, Number(syncForm.poll_interval_minutes) || 5);
+    const thresholdPercent = Math.min(100, Math.max(10, Number(syncForm.importance_threshold_percent) || 70));
+    try {
+      setSyncNotice(null);
+      await saveSyncMutation.mutateAsync({
+        id: active.id,
+        payload: {
+          enabled: syncForm.enabled,
+          poll_interval_secs: pollIntervalMinutes * 60,
+          importance_threshold: thresholdPercent / 100,
+          notify_on_important: syncForm.notify_on_important,
+          push_to_preferred_channel: syncForm.push_to_preferred_channel
+        }
+      });
+      setSyncDirty(false);
+      setSyncNotice({ kind: "success", text: "Background sync settings saved." });
+    } catch (err) {
+      setSyncNotice({ kind: "error", text: asErrorMessage(err) });
+    }
+  };
+
+  const runActiveSyncNow = async () => {
+    if (!active) return;
+    try {
+      setSyncNotice(null);
+      await syncNowMutation.mutateAsync(active.id);
+      setSyncNotice({ kind: "success", text: "Sync run queued." });
+    } catch (err) {
+      setSyncNotice({ kind: "error", text: asErrorMessage(err) });
+    }
+  };
+
   const openConfig = (integration: IntegrationItem) => {
     setActive(integration);
     setFormError(null);
-    setFormValues({});
+    const nextValues: Record<string, string> = {};
+    const configValues = asRecord(integration.config_values);
+    for (const [key, value] of Object.entries(configValues)) {
+      if (typeof value === "string") {
+        nextValues[key] = value;
+      } else if (typeof value === "number" || typeof value === "boolean") {
+        nextValues[key] = String(value);
+      }
+    }
+    setFormValues(nextValues);
     setConfigSuccess(false);
+    setSyncForm(integrationSyncFormFromStatus(integrationSyncStatusById[integration.id] || null));
+    setSyncDirty(false);
+    setSyncNotice(null);
+    setGoogleWorkspaceHelpOpen(false);
   };
 
   const closeConfig = () => {
@@ -872,6 +1875,11 @@ export function IntegrationsPanel({
     setFormError(null);
     setSaving(false);
     setConfigSuccess(false);
+    setEditingConnected(false);
+    setSyncForm(defaultIntegrationSyncForm());
+    setSyncDirty(false);
+    setSyncNotice(null);
+    setGoogleWorkspaceHelpOpen(false);
   };
 
   const openCreateMcp = () => {
@@ -1146,14 +2154,14 @@ export function IntegrationsPanel({
     }
   });
 
-  const submitConfig = async () => {
-    if (!active) return;
+  const saveActiveConfig = async (closeIfDone = true): Promise<IntegrationItem | null> => {
+    if (!active) return null;
     const current = active;
     const fields = current.config_fields || [];
     for (const field of fields) {
       if (field.required && !(formValues[field.key] || "").trim()) {
         setFormError(`Missing required field: ${field.label}`);
-        return;
+        return null;
       }
     }
 
@@ -1168,28 +2176,39 @@ export function IntegrationsPanel({
         }
       }
       await configureMutation.mutateAsync({ id: current.id, payload });
-      const refreshed = await integrationsQ.refetch();
+      const [refreshed] = await Promise.all([
+        integrationsQ.refetch(),
+        integrationSyncStatusQ.refetch(),
+        integrationSyncFeedQ.refetch()
+      ]);
       const refreshedItems = refreshed.data?.integrations || [];
       const updated = refreshedItems.find((item) => item.id === current.id) || current;
       setActive(updated);
       setConfigSuccess(true);
       setSaving(false);
       const needsOauthFollowup =
+        updated.id === "google_workspace" ||
         updated.id === "gmail" ||
         updated.id === "google_calendar" ||
         updated.status === "needs_auth" ||
         !!str(updated.auth_url, "").trim();
-      if (!needsOauthFollowup) {
+      if (closeIfDone && !needsOauthFollowup) {
         setTimeout(() => {
           closeConfig();
         }, 850);
       }
+      return updated;
     } catch (err) {
       setFormError(asErrorMessage(err));
       // Backend disables integration on failed validation; refresh to reflect it.
-      await integrationsQ.refetch();
+      await Promise.allSettled([integrationsQ.refetch(), integrationSyncStatusQ.refetch()]);
       setSaving(false);
+      return null;
     }
+  };
+
+  const submitConfig = async () => {
+    await saveActiveConfig(true);
   };
 
   const disconnectActive = async () => {
@@ -1206,7 +2225,10 @@ export function IntegrationsPanel({
     }
   };
 
-  const startIntegrationAuth = async (integration: IntegrationItem) => {
+  const startIntegrationAuth = async (
+    integration: IntegrationItem,
+    authWindow?: Window | null
+  ) => {
     setNotice(null);
     setOauthBusyId(integration.id);
     try {
@@ -1217,9 +2239,23 @@ export function IntegrationsPanel({
       }
       if (!authUrl) throw new Error("No OAuth URL is available yet. Configure this integration first.");
       setOauthPendingId(normalizeIntegrationId(integration.id));
-      window.open(authUrl, "_blank", "noopener,noreferrer");
+      if (authWindow && !authWindow.closed) {
+        authWindow.location.replace(authUrl);
+        authWindow.focus();
+      } else {
+        window.open(authUrl, "_blank", "noopener,noreferrer");
+      }
       setNotice({ kind: "success", text: "OAuth window opened. Finish sign-in and AgentArk will update this automatically." });
     } catch (err) {
+      if (authWindow && !authWindow.closed) {
+        authWindow.document.write(
+          `<!doctype html><title>Sign-in failed</title><body style="font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;"><div style="max-width:420px;background:#102236;border:1px solid rgba(112,153,201,0.18);border-radius:16px;padding:20px;"><h2 style="margin:0 0 12px;font-size:18px;">Sign-in could not start</h2><p style="margin:0;color:#a9bdd6;line-height:1.5;">${String(asErrorMessage(err))
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")}</p></div></body>`
+        );
+        authWindow.document.close();
+      }
       setOauthPendingId(null);
       setNotice({ kind: "error", text: asErrorMessage(err) });
     } finally {
@@ -1228,15 +2264,116 @@ export function IntegrationsPanel({
     }
   };
 
+  const continueWithOauth = async () => {
+    if (!active) return;
+    if (active.id === "google_workspace") {
+      const configValues = asRecord(active.config_values);
+      const configured = toBool(configValues.oauth_client_configured);
+      const savedClientId = str(configValues.client_id, "").trim();
+      const nextClientId = str(formValues.client_id, "").trim();
+      const nextClientSecret = str(formValues.client_secret, "").trim();
+      if (!configured && (!nextClientId || !nextClientSecret)) {
+        setFormError("Enter the Google OAuth client ID and client secret first.");
+        return;
+      }
+      if ((nextClientId && !nextClientSecret && nextClientId !== savedClientId) || (!nextClientId && nextClientSecret)) {
+        setFormError("Enter both the Google OAuth client ID and client secret, or leave both unchanged.");
+        return;
+      }
+    }
+    const authWindow =
+      typeof window !== "undefined"
+        ? window.open("", "_blank", "width=540,height=760")
+        : null;
+    if (authWindow) {
+      authWindow.document.write(
+        "<!doctype html><title>Opening sign-in...</title><body style=\"font-family:system-ui;background:#0b1320;color:#dce7f7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;\">Opening sign-in...</body>"
+      );
+      authWindow.document.close();
+    }
+    const integration =
+      active.config_fields && active.config_fields.length > 0
+        ? await saveActiveConfig(false)
+        : active;
+    if (!integration) {
+      if (authWindow && !authWindow.closed) {
+        authWindow.close();
+      }
+      return;
+    }
+    await startIntegrationAuth(integration, authWindow);
+  };
+
   const activeNeedsOauth =
     !!active &&
-    (active.id === "gmail" ||
+    (active.id === "google_workspace" ||
+      active.id === "gmail" ||
       active.id === "google_calendar" ||
       active.status === "needs_auth" ||
       !!str(active.auth_url, "").trim());
+  const activeWorkspaceSecretConfigured =
+    !!active &&
+    active.id === "google_workspace" &&
+    toBool(asRecord(active.config_values).client_secret_configured);
 
   const renderField = (field: IntegrationConfigField) => {
     const value = formValues[field.key] || "";
+    if (active?.id === "google_workspace" && field.key === "service_bundles") {
+      const selected = parseWorkspaceBundleCsv(value);
+      return (
+        <Stack key={field.key} spacing={1}>
+          <Typography variant="subtitle2">{field.label}</Typography>
+          <Typography variant="caption" color="text.secondary">
+            Choose the Workspace services AgentArk should be allowed to use from this single Google consent flow.
+          </Typography>
+          <Grid2 container spacing={0.75}>
+            {GOOGLE_WORKSPACE_BUNDLES.map((bundle) => {
+              const checked = selected.includes(bundle.id);
+              return (
+                <Grid2 key={bundle.id} size={{ xs: 12, sm: 6 }}>
+                  <Box
+                    sx={{
+                      border: "1px solid rgba(112,153,201,0.14)",
+                      borderRadius: 1.5,
+                      background: checked ? "rgba(15, 68, 110, 0.18)" : "rgba(7,17,32,0.28)"
+                    }}
+                  >
+                    <FormControlLabel
+                      sx={{ m: 0, px: 1.1, py: 0.35, width: "100%" }}
+                      control={
+                        <Checkbox
+                          size="small"
+                          checked={checked}
+                          onChange={() => {
+                            const next = checked
+                              ? selected.filter((item) => item !== bundle.id)
+                              : [...selected, bundle.id];
+                            setFormValues((prev) => ({
+                              ...prev,
+                              [field.key]: workspaceBundleCsv(next)
+                            }));
+                          }}
+                        />
+                      }
+                      label={
+                        <Stack spacing={0.15}>
+                          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                            {bundle.label}
+                          </Typography>
+                        </Stack>
+                      }
+                    />
+                  </Box>
+                </Grid2>
+              );
+            })}
+          </Grid2>
+          <Typography variant="caption" color="text.secondary">
+            Checked bundles will be requested during Google consent. You can reconnect later to grant more.
+          </Typography>
+        </Stack>
+      );
+    }
     if (field.input_type === "select") {
       return (
         <TextField
@@ -1281,6 +2418,15 @@ export function IntegrationsPanel({
         }
         required={field.required}
         size="small"
+        helperText={
+          active?.id === "google_workspace" && field.key === "client_id"
+            ? "Copy this from your Google OAuth client in Google Cloud."
+            : active?.id === "google_workspace" && field.key === "client_secret"
+              ? activeWorkspaceSecretConfigured
+                ? "Leave blank to keep the saved secret. Paste a new one only when changing the client."
+                : "Copy this from your Google OAuth client in Google Cloud."
+              : undefined
+        }
       />
     );
   };
@@ -1289,11 +2435,30 @@ export function IntegrationsPanel({
     <Stack spacing={2} sx={embedded ? undefined : { p: 1, height: "100%", overflow: "auto" }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h6">
-          {mode === "mcp" ? "MCP Servers" : mode === "integrations" ? "Integrations" : "Integrations"}
+          {mode === "mcp"
+            ? "MCP Servers"
+            : mode === "messaging"
+              ? "Messaging Setup"
+              : "Integrations"}
         </Typography>
         <Stack direction="row" spacing={1} />
       </Stack>
-      {mode !== "mcp" ? (
+      {mode === "messaging" ? (
+        <>
+          <Typography
+            variant="body2"
+            sx={{
+              fontWeight: 700,
+              color: "#69e2ff"
+            }}
+          >
+            Finish channel onboarding here. If you need a health check later, run ArkPulse.
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            This page is intentionally focused on messaging only: Telegram, WhatsApp, Slack, Discord, Matrix, and Teams.
+          </Typography>
+        </>
+      ) : mode !== "mcp" ? (
         <>
           <Typography
             variant="body2"
@@ -1314,18 +2479,388 @@ export function IntegrationsPanel({
         </Typography>
       )}
 
-      {showIntegrations && notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
+      {showIntegrations && notice?.kind === "error" ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {showMcp && mcpNotice ? <Alert severity={mcpNotice.kind}>{mcpNotice.text}</Alert> : null}
       {showMcp && sshNotice ? <Alert severity={sshNotice.kind}>{sshNotice.text}</Alert> : null}
 
-      {showIntegrations && integrationsQ.error ? (
+      {showCatalog && integrationsQ.error ? (
         <Alert severity="error">
           Failed to load integrations:{" "}
           {integrationsQ.error instanceof Error ? integrationsQ.error.message : "Unknown error"}
         </Alert>
       ) : null}
 
-      {showIntegrations ? (
+      {showCatalog ? (
+        <Box className="list-shell">
+          <Stack spacing={1.1}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Live Summary</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Current connected apps and active integration surfaces.
+                </Typography>
+              </Box>
+              <Chip
+                size="small"
+                label={`${liveConnectionSummary.length} active groups`}
+                sx={sectionCountChipSx}
+              />
+            </Stack>
+            {liveConnectionSummary.length > 0 ? (
+              <Grid2 container spacing={1}>
+                {liveConnectionSummary.map((item) => (
+                  <Grid2 key={item.key} size={{ xs: 12, sm: 6, lg: 3 }}>
+                    <Box
+                      sx={{
+                        p: 1.15,
+                        borderRadius: 1.5,
+                        border: "1px solid rgba(74,210,157,0.18)",
+                        background: "rgba(10, 28, 20, 0.26)",
+                        minHeight: 84
+                      }}
+                    >
+                      <Stack spacing={0.65} sx={{ height: "100%" }}>
+                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+                          <Stack direction="row" alignItems="center" spacing={0.8}>
+                            <Box
+                              sx={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background: "rgba(74,210,157,0.92)",
+                                flexShrink: 0
+                              }}
+                            />
+                            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+                              {item.label}
+                            </Typography>
+                          </Stack>
+                          <Chip size="small" label={item.badge} sx={sectionCountChipSx} />
+                        </Stack>
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.45,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden"
+                          }}
+                        >
+                          {item.detail}
+                        </Typography>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                ))}
+              </Grid2>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                No live integrations or automations are active yet.
+              </Typography>
+            )}
+          </Stack>
+        </Box>
+      ) : null}
+
+      {false && showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "connected"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "connected" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Active Connections</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Live integrations are shown here first. Expand this to manage every connected service.
+                </Typography>
+              </Box>
+              <Chip size="small" label={`${readyList.length} connected`} sx={sectionCountChipSx} />
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+        <Box className="list-shell">
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1}
+            justifyContent="space-between"
+            alignItems={{ xs: "flex-start", sm: "center" }}
+            sx={{ mb: 1.25 }}
+          >
+            <Box>
+              <Typography variant="subtitle2">Connected Apps</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Live integrations are shown here first. Setup-heavy sections stay collapsed until you need them.
+              </Typography>
+            </Box>
+            <Chip size="small" variant="outlined" label={`${readyList.length} connected`} />
+          </Stack>
+          {readyList.length > 0 ? (
+            <Grid2 container spacing={1}>
+              {readyList.map((integration) => {
+                const cardState = integrationCardState(integration);
+                const accent = integrationCardAccent(cardState);
+                const sc = statusColor(integration.status);
+                const dotColor =
+                  sc === "success"
+                    ? "#4ad29d"
+                    : sc === "error"
+                      ? "rgba(255,88,88,0.85)"
+                      : sc === "warning"
+                        ? "rgba(255,180,50,0.85)"
+                        : "rgba(255,255,255,0.25)";
+                return (
+                  <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
+                    <Box
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        if (integration.config_fields && integration.config_fields.length > 0) {
+                          openConfig(integration);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if ((e.key === "Enter" || e.key === " ") && integration.config_fields && integration.config_fields.length > 0) {
+                          e.preventDefault();
+                          openConfig(integration);
+                        }
+                      }}
+                      sx={{
+                        height: "100%",
+                        p: 1.35,
+                        borderRadius: "12px",
+                        border: `1px solid ${accent.border}`,
+                        background: accent.background,
+                        cursor: "pointer",
+                        transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                        "&:hover": {
+                          borderColor: accent.hoverBorder,
+                          background: accent.hoverBackground,
+                          boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                        }
+                      }}
+                    >
+                      <Stack spacing={0.75}>
+                        <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+                          <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                            {integration.name}
+                          </Typography>
+                          <Box
+                            sx={{
+                              width: 8,
+                              height: 8,
+                              borderRadius: "50%",
+                              background: dotColor,
+                              flex: "0 0 auto"
+                            }}
+                          />
+                        </Stack>
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{
+                            lineHeight: 1.45,
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden"
+                          }}
+                        >
+                          {integrationCardCopy(integration)}
+                        </Typography>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Chip
+                            size="small"
+                            label="Connected"
+                            sx={{
+                              height: 20,
+                              fontSize: "0.68rem",
+                              fontWeight: 700,
+                              borderColor: accent.chipBorder,
+                              color: accent.chipColor
+                            }}
+                            variant="outlined"
+                          />
+                          <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => {
+                            e.stopPropagation();
+                            openConfig(integration);
+                          }}>
+                            Manage
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                );
+              })}
+            </Grid2>
+          ) : (
+            <Typography variant="body2" color="text.secondary">
+              No integrations are connected yet.
+            </Typography>
+          )}
+        </Box>
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {false && showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "plugins"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "plugins" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Plugin SDK</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Manage installed external plugins and their event subscriptions here.
+                </Typography>
+              </Box>
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <PluginSdkPanel autoRefresh={autoRefresh} embedded />
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {false && showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "activity"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "activity" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Recent Activity</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Background sync highlights important changes here when attention is needed.
+                </Typography>
+              </Box>
+              <Chip size="small" variant="outlined" label={`${integrationSyncFeed.length} recent`} />
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            {integrationSyncFeedQ.error ? (
+              <Alert severity="warning">
+                Could not load recent integration activity:{" "}
+                {((integrationSyncFeedQ.error as Error | null)?.message) || "Unknown error"}
+              </Alert>
+            ) : integrationSyncFeed.length > 0 ? (
+              <Table
+                size="small"
+                sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}
+              >
+                <TableHead>
+                  <TableRow>
+                    <TableCell sx={{ fontWeight: 600, width: "18%" }}>Source</TableCell>
+                    <TableCell sx={{ fontWeight: 600 }}>Update</TableCell>
+                    <TableCell sx={{ fontWeight: 600, width: "12%" }}>Importance</TableCell>
+                    <TableCell sx={{ fontWeight: 600, width: "16%" }}>Detected</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {integrationSyncFeed.map((item: IntegrationSyncFeedItem) => (
+                    <TableRow key={item.id}>
+                      <TableCell>
+                        <Typography variant="body2">{item.integration_name}</Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: "capitalize" }}>
+                          {item.kind.replace(/_/g, " ")}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{item.title}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {item.summary}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          color={item.important ? "warning" : "default"}
+                          variant={item.important ? "filled" : "outlined"}
+                          label={`${Math.round(item.importance * 100)}%`}
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{formatDateTime(item.detected_at)}</Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ textTransform: "capitalize" }}>
+                          {item.outcome.replace(/_/g, " ")}
+                        </Typography>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                No recent integration activity yet.
+              </Typography>
+            )}
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {showIntegrations && !showMessagingOnly ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "messaging"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "messaging" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Messaging Channels</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Configure delivery transports and review live channel health here.
+                </Typography>
+              </Box>
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Chip size="small" label={`${messagingReadyCount} ready`} sx={sectionCountChipSx} />
+                <Chip size="small" label={`${messagingAttentionCount} need setup`} sx={sectionCountChipSx} />
+              </Stack>
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
         <Box className="list-shell">
           <Typography variant="subtitle2" sx={{ mb: 1 }}>
             Channels
@@ -1366,8 +2901,8 @@ export function IntegrationsPanel({
                   <TableCell>Telegram</TableCell>
                   <TableCell>
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: channelForm.telegram_enabled ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
-                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(telegramConnectionStatusRaw)}</Typography>
+                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: telegramEnabledSaved ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}</Typography>
                     </Box>
                   </TableCell>
                   <TableCell>
@@ -1386,7 +2921,7 @@ export function IntegrationsPanel({
                   <TableCell>
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
                       <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: channelForm.whatsapp_enabled ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
-                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(whatsappConnectionStatusRaw)}</Typography>
+                      <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}</Typography>
                     </Box>
                   </TableCell>
                   <TableCell>
@@ -1403,14 +2938,275 @@ export function IntegrationsPanel({
               </TableBody>
             </Table>
           )}
+          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Stack spacing={1.25}>
+            <Box>
+              <Typography variant="subtitle2">Setup Wizards</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run ArkPulse for diagnostics.
+              </Typography>
+            </Box>
+            {channelsQ.error ? (
+              <Alert severity="error">
+                Failed to load gateway channel health: {channelsQ.error instanceof Error ? channelsQ.error.message : "Unknown error"}
+              </Alert>
+            ) : null}
+            <Grid2 container spacing={1}>
+              {messagingSetups.map((setup) => {
+                const displayState = messagingDisplayState(setup.status, setup.enabled);
+                const accent = integrationCardAccent(
+                  displayState === "ready"
+                    ? "enabled"
+                    : displayState === "error"
+                      ? "error"
+                      : displayState === "needs_setup"
+                        ? "needs_auth"
+                        : "not_configured"
+                );
+                return (
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }}>
+                    <Box
+                      sx={{
+                        border: `1px solid ${accent.border}`,
+                        background: accent.background,
+                        borderRadius: 1.5,
+                        p: 1.5,
+                        minHeight: 172,
+                        display: "flex",
+                        flexDirection: "column",
+                        justifyContent: "space-between"
+                      }}
+                    >
+                      <Stack spacing={1}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Typography variant="subtitle2">{setup.name}</Typography>
+                          <Chip
+                            size="small"
+                            label={channelStatusLabel(setup.status, setup.enabled)}
+                            color={channelStatusColor(setup.status, setup.enabled)}
+                            variant="outlined"
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary">
+                          {setup.detail}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {messagingWizardHint(setup.status, setup.enabled)}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
+                        <Button size="small" variant="contained" onClick={setup.open}>
+                          {setup.actionLabel}
+                        </Button>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                );
+              })}
+            </Grid2>
+          </Stack>
+        </Box>
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "sources"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "sources" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Webhooks, APIs & Connectors</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Add new event sources, API tools, and prebuilt integrations here.
+                </Typography>
+              </Box>
+              <Chip size="small" label={`${integrations.length} available`} sx={sectionCountChipSx} />
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <IntegrationQuickstartPanel
+              integrations={integrations}
+              loading={integrationsQ.isLoading || integrationsQ.isFetching}
+              autoRefresh={autoRefresh}
+              embedded
+              onConfigureIntegration={openConfig}
+            />
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "plugins"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "plugins" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Plugin SDK</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Manage installed external plugins and their event subscriptions here.
+                </Typography>
+              </Box>
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <PluginSdkPanel autoRefresh={autoRefresh} embedded />
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "routing"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "routing" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Conversation Routing</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Keep channel-specific traffic pinned to the right agent only when you explicitly need it.
+                </Typography>
+              </Box>
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
+            <IntegrationRoutingPanel autoRefresh={autoRefresh} />
+          </AccordionDetails>
+        </Accordion>
+      ) : null}
+
+      {showIntegrations && showMessagingOnly ? (
+        <Box className="list-shell">
+          <Stack spacing={1.25}>
+            <Box>
+              <Typography variant="subtitle2">Messaging onboarding</Typography>
+              <Typography variant="caption" color="text.secondary">
+                 Connect each transport here using the same shared setup wizards used by Integrations. After saving, use ArkPulse if you need a diagnostics pass.
+              </Typography>
+            </Box>
+            {channelsQ.error ? (
+              <Alert severity="error">
+                Failed to load gateway channel health: {channelsQ.error instanceof Error ? channelsQ.error.message : "Unknown error"}
+              </Alert>
+            ) : null}
+            <Grid2 container spacing={1}>
+              {messagingSetups.map((setup) => {
+                const displayState = messagingDisplayState(setup.status, setup.enabled);
+                const accent = integrationCardAccent(
+                  displayState === "ready"
+                    ? "enabled"
+                    : displayState === "error"
+                      ? "error"
+                      : displayState === "needs_setup"
+                        ? "needs_auth"
+                        : "not_configured"
+                );
+                return (
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 4 }}>
+                    <Box
+                      sx={{
+                        border: `1px solid ${accent.border}`,
+                        background: accent.background,
+                        borderRadius: 1.5,
+                        p: 1.5,
+                        minHeight: 184,
+                        display: "flex",
+                        flexDirection: "column",
+                        justifyContent: "space-between"
+                      }}
+                    >
+                      <Stack spacing={1}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Typography variant="subtitle2">{setup.name}</Typography>
+                          <Chip
+                            size="small"
+                            label={channelStatusLabel(setup.status, setup.enabled)}
+                            color={channelStatusColor(setup.status, setup.enabled)}
+                            variant="outlined"
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary">
+                          {setup.detail}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {messagingWizardHint(setup.status, setup.enabled)}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
+                        <Button size="small" variant="contained" onClick={setup.open}>
+                          {setup.actionLabel}
+                        </Button>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                );
+              })}
+            </Grid2>
+          </Stack>
         </Box>
       ) : null}
 
-      {showIntegrations ? (
+      {false && showCatalog ? (
+        <Accordion
+          disableGutters
+          expanded={expandedSection === "catalog"}
+          onChange={(_, expanded) => setExpandedSection(expanded ? "catalog" : false)}
+          sx={sectionAccordionSx}
+        >
+          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              sx={{ width: "100%" }}
+            >
+              <Box>
+                <Typography variant="subtitle2">Integration Catalog</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Review everything available, including connectors that still need setup or attention.
+                </Typography>
+              </Box>
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Chip size="small" variant="outlined" label={`${readyList.length} ready`} />
+                <Chip size="small" variant="outlined" label={`${notReadyList.length} need attention`} />
+              </Stack>
+            </Stack>
+          </AccordionSummary>
+          <AccordionDetails>
         <Box className="list-shell">
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
             <Typography variant="subtitle2">
-              Integrations ({readyList.length} ready, {notReadyList.length} need setup or attention)
+              Available Integrations
             </Typography>
           </Stack>
           <Grid2 container spacing={1}>
@@ -1509,6 +3305,8 @@ export function IntegrationsPanel({
             })}
           </Grid2>
         </Box>
+          </AccordionDetails>
+        </Accordion>
       ) : null}
 
       {showMcp ? (
@@ -1841,8 +3639,8 @@ export function IntegrationsPanel({
             <Stack direction="row" spacing={1} alignItems="center">
               <Chip
                 size="small"
-                label={channelStatusLabel(telegramConnectionStatusRaw)}
-                color={channelStatusColor(telegramConnectionStatusRaw)}
+                label={channelStatusLabel(telegramConnectionStatusRaw, telegramEnabledSaved)}
+                color={channelStatusColor(telegramConnectionStatusRaw, telegramEnabledSaved)}
                 variant="outlined"
               />
               <Button size="small" onClick={() => telegramStatusQ.refetch()} disabled={telegramStatusQ.isFetching}>
@@ -1911,6 +3709,310 @@ export function IntegrationsPanel({
       ) : null}
 
       {showIntegrations ? (
+      <Dialog open={slackSetupOpen} onClose={() => setSlackSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Slack Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Save the bot token and signing secret, then point Slack Events API at `/webhook/slack`. Reply routing and channel runtime health will show up in Channels after the first live event.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(slackConnectionStatusRaw, channelForm.slack_enabled)}
+                color={channelStatusColor(slackConnectionStatusRaw, channelForm.slack_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {slackConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.slack_enabled} onChange={(e) => setChannelField("slack_enabled", e.target.checked)} />}
+              label={channelForm.slack_enabled ? "Slack enabled" : "Slack disabled"}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bot Token"
+              value={channelForm.slack_bot_token}
+              onChange={(e) => setChannelField("slack_bot_token", e.target.value)}
+              placeholder={hasSlackBotToken ? "Configured (leave blank to keep)" : "xoxb-..."}
+              helperText={hasSlackBotToken ? "Leave blank to keep the saved bot token." : "Required for outbound delivery."}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Signing Secret"
+              value={channelForm.slack_signing_secret}
+              onChange={(e) => setChannelField("slack_signing_secret", e.target.value)}
+              placeholder={hasSlackSigningSecret ? "Configured (leave blank to keep)" : "Enter signing secret"}
+              helperText={hasSlackSigningSecret ? "Leave blank to keep the saved signing secret." : "Required for signed webhook verification."}
+            />
+            <TextField fullWidth size="small" label="Default Channel ID" value={channelForm.slack_default_channel_id} onChange={(e) => setChannelField("slack_default_channel_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Default Thread TS" value={channelForm.slack_default_thread_ts} onChange={(e) => setChannelField("slack_default_thread_ts", e.target.value)} />
+            <TextField fullWidth size="small" label="Workspace ID" value={channelForm.slack_workspace_id} onChange={(e) => setChannelField("slack_workspace_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Workspace Name" value={channelForm.slack_workspace_name} onChange={(e) => setChannelField("slack_workspace_name", e.target.value)} />
+            <TextField fullWidth size="small" label="API Base URL" value={channelForm.slack_api_base_url} onChange={(e) => setChannelField("slack_api_base_url", e.target.value)} helperText="Leave the default unless you are targeting a proxy or test environment." />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "slack",
+              configured: channelForm.slack_enabled,
+              policyValue: channelForm.slack_trust_policy,
+              onPolicyChange: (value) => setChannelField("slack_trust_policy", value),
+              allowedValue: channelForm.slack_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("slack_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted Sender IDs",
+              allowedHelper: "Comma-separated Slack user IDs that should bypass pairing, for example U123ABC."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSlackSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setSlackSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={discordSetupOpen} onClose={() => setDiscordSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Discord Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Choose either a live bot token for gateway delivery or a webhook URL for scoped channel posting. Use the wizard to save defaults that the runtime can fall back to before route rules exist.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(discordConnectionStatusRaw, channelForm.discord_enabled)}
+                color={channelStatusColor(discordConnectionStatusRaw, channelForm.discord_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {discordConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.discord_enabled} onChange={(e) => setChannelField("discord_enabled", e.target.checked)} />}
+              label={channelForm.discord_enabled ? "Discord enabled" : "Discord disabled"}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bot Token"
+              value={channelForm.discord_bot_token}
+              onChange={(e) => setChannelField("discord_bot_token", e.target.value)}
+              placeholder={hasDiscordBotToken ? "Configured (leave blank to keep)" : "Enter bot token"}
+              helperText={hasDiscordBotToken ? "Leave blank to keep the saved bot token." : "Required for gateway runtime and REST delivery."}
+            />
+            <TextField fullWidth size="small" label="Webhook URL" value={channelForm.discord_webhook_url} onChange={(e) => setChannelField("discord_webhook_url", e.target.value)} helperText="Optional. Useful for scoped thread delivery without the full bot runtime." />
+            <TextField fullWidth size="small" label="Default Channel ID" value={channelForm.discord_default_channel_id} onChange={(e) => setChannelField("discord_default_channel_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Default Thread ID" value={channelForm.discord_default_thread_id} onChange={(e) => setChannelField("discord_default_thread_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Guild ID" value={channelForm.discord_guild_id} onChange={(e) => setChannelField("discord_guild_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Application ID" value={channelForm.discord_application_id} onChange={(e) => setChannelField("discord_application_id", e.target.value)} />
+            <TextField fullWidth size="small" label="API Base URL" value={channelForm.discord_api_base_url} onChange={(e) => setChannelField("discord_api_base_url", e.target.value)} />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDiscordSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setDiscordSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={matrixSetupOpen} onClose={() => setMatrixSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Matrix Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Configure a Matrix homeserver identity that the sync loop can poll continuously. After the first room event, AgentArk will remember the active reply destination automatically.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(matrixConnectionStatusRaw, channelForm.matrix_enabled)}
+                color={channelStatusColor(matrixConnectionStatusRaw, channelForm.matrix_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {matrixConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.matrix_enabled} onChange={(e) => setChannelField("matrix_enabled", e.target.checked)} />}
+              label={channelForm.matrix_enabled ? "Matrix enabled" : "Matrix disabled"}
+            />
+            <TextField fullWidth size="small" label="Homeserver URL" value={channelForm.matrix_homeserver_url} onChange={(e) => setChannelField("matrix_homeserver_url", e.target.value)} />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Access Token"
+              value={channelForm.matrix_access_token}
+              onChange={(e) => setChannelField("matrix_access_token", e.target.value)}
+              placeholder={hasMatrixAccessToken ? "Configured (leave blank to keep)" : "Enter access token"}
+              helperText={hasMatrixAccessToken ? "Leave blank to keep the saved access token." : "Required for sync and outbound delivery."}
+            />
+            <TextField fullWidth size="small" label="User ID" value={channelForm.matrix_user_id} onChange={(e) => setChannelField("matrix_user_id", e.target.value)} />
+            <TextField fullWidth size="small" label="Default Room ID" value={channelForm.matrix_default_room_id} onChange={(e) => setChannelField("matrix_default_room_id", e.target.value)} />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="Device ID" value={channelForm.matrix_device_id} onChange={(e) => setChannelField("matrix_device_id", e.target.value)} />
+              <TextField fullWidth size="small" label="Account ID" value={channelForm.matrix_account_id} onChange={(e) => setChannelField("matrix_account_id", e.target.value)} />
+              <TextField fullWidth size="small" label="Sync Timeout (ms)" value={channelForm.matrix_sync_timeout_ms} onChange={(e) => setChannelField("matrix_sync_timeout_ms", e.target.value)} />
+              <TextField fullWidth size="small" label="Batch Limit" value={channelForm.matrix_limit} onChange={(e) => setChannelField("matrix_limit", e.target.value)} />
+            </Box>
+            <TextField fullWidth size="small" label="User Agent" value={channelForm.matrix_user_agent} onChange={(e) => setChannelField("matrix_user_agent", e.target.value)} />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setMatrixSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setMatrixSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={teamsSetupOpen} onClose={() => setTeamsSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Teams Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Configure the Bot Framework endpoint and credentials, including the bot app ID used for JWT verification. The runtime will only accept signed inbound activities and only reply to trusted service URLs.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(teamsConnectionStatusRaw, channelForm.teams_enabled)}
+                color={channelStatusColor(teamsConnectionStatusRaw, channelForm.teams_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {teamsConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.teams_enabled} onChange={(e) => setChannelField("teams_enabled", e.target.checked)} />}
+              label={channelForm.teams_enabled ? "Teams enabled" : "Teams disabled"}
+            />
+            <TextField fullWidth size="small" label="Service URL" value={channelForm.teams_service_url} onChange={(e) => setChannelField("teams_service_url", e.target.value)} helperText="Must match the Bot Framework service URL used by inbound activities." />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Access Token"
+              value={channelForm.teams_access_token}
+              onChange={(e) => setChannelField("teams_access_token", e.target.value)}
+              placeholder={hasTeamsAccessToken ? "Configured (leave blank to keep)" : "Enter access token"}
+              helperText={hasTeamsAccessToken ? "Leave blank to keep the saved access token." : "Required for outbound Bot Framework or Graph delivery."}
+            />
+            <TextField fullWidth size="small" label="Bot App ID" value={channelForm.teams_bot_app_id} onChange={(e) => setChannelField("teams_bot_app_id", e.target.value)} helperText="Required for Bot Framework JWT validation." />
+            <TextField fullWidth size="small" label="Bot Name" value={channelForm.teams_bot_name} onChange={(e) => setChannelField("teams_bot_name", e.target.value)} />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="Tenant ID" value={channelForm.teams_tenant_id} onChange={(e) => setChannelField("teams_tenant_id", e.target.value)} />
+              <TextField fullWidth size="small" label="Chat ID" value={channelForm.teams_chat_id} onChange={(e) => setChannelField("teams_chat_id", e.target.value)} />
+              <TextField fullWidth size="small" label="Team ID" value={channelForm.teams_team_id} onChange={(e) => setChannelField("teams_team_id", e.target.value)} />
+              <TextField fullWidth size="small" label="Channel ID" value={channelForm.teams_channel_id} onChange={(e) => setChannelField("teams_channel_id", e.target.value)} />
+            </Box>
+            <TextField select fullWidth size="small" label="Delivery Mode" value={channelForm.teams_delivery_mode} onChange={(e) => setChannelField("teams_delivery_mode", e.target.value as ChannelSettingsForm["teams_delivery_mode"])}>
+              <MenuItem value="auto">Auto</MenuItem>
+              <MenuItem value="bot_framework">Bot Framework</MenuItem>
+              <MenuItem value="graph">Graph</MenuItem>
+            </TextField>
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="Graph Base URL" value={channelForm.teams_graph_base_url} onChange={(e) => setChannelField("teams_graph_base_url", e.target.value)} />
+              <TextField fullWidth size="small" label="Timeout (s)" value={channelForm.teams_timeout_secs} onChange={(e) => setChannelField("teams_timeout_secs", e.target.value)} />
+            </Box>
+            <TextField fullWidth size="small" label="User Agent" value={channelForm.teams_user_agent} onChange={(e) => setChannelField("teams_user_agent", e.target.value)} />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "teams",
+              configured: channelForm.teams_enabled,
+              policyValue: channelForm.teams_trust_policy,
+              onPolicyChange: (value) => setChannelField("teams_trust_policy", value),
+              allowedValue: channelForm.teams_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("teams_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted Sender IDs",
+              allowedHelper: "Comma-separated Teams user IDs or AAD object IDs that should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTeamsSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setTeamsSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
       <Dialog open={whatsAppSetupOpen} onClose={() => setWhatsAppSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>WhatsApp Setup</DialogTitle>
         <DialogContent dividers>
@@ -1952,8 +4054,8 @@ export function IntegrationsPanel({
                     </Typography>
                     <Chip
                       size="small"
-                      label={channelStatusLabel(whatsappConnectionStatusRaw)}
-                      color={channelStatusColor(whatsappConnectionStatusRaw)}
+                      label={channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
+                      color={channelStatusColor(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
                       variant="outlined"
                     />
                   </Stack>
@@ -2023,8 +4125,8 @@ export function IntegrationsPanel({
                 <Stack direction="row" spacing={1} alignItems="center">
                   <Chip
                     size="small"
-                    label={channelStatusLabel(whatsappConnectionStatusRaw)}
-                    color={channelStatusColor(whatsappConnectionStatusRaw)}
+                    label={channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
+                    color={channelStatusColor(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
                     variant="outlined"
                   />
                   <Typography variant="caption" color="text.secondary">
@@ -2057,27 +4159,17 @@ export function IntegrationsPanel({
               </>
             ) : null}
 
-            <TextField
-              fullWidth
-              size="small"
-              select
-              label="DM Policy"
-              value={channelForm.whatsapp_dm_policy}
-              onChange={(e) => setChannelField("whatsapp_dm_policy", e.target.value)}
-              disabled={!channelForm.whatsapp_enabled}
-            >
-              <MenuItem value="pairing">pairing (recommended)</MenuItem>
-              <MenuItem value="open">open</MenuItem>
-            </TextField>
-            <TextField
-              fullWidth
-              size="small"
-              label="Allowed Numbers (comma separated, optional)"
-              value={channelForm.whatsapp_allowed_numbers_csv}
-              onChange={(e) => setChannelField("whatsapp_allowed_numbers_csv", e.target.value)}
-              placeholder="+15551234567, +15557654321"
-              disabled={!channelForm.whatsapp_enabled}
-            />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "whatsapp",
+              configured: channelForm.whatsapp_enabled,
+              policyValue: channelForm.whatsapp_dm_policy,
+              onPolicyChange: (value) => setChannelField("whatsapp_dm_policy", value),
+              allowedValue: channelForm.whatsapp_allowed_numbers_csv,
+              onAllowedChange: (value) => setChannelField("whatsapp_allowed_numbers_csv", value),
+              allowedLabel: "Always-Trusted Numbers",
+              allowedHelper: "Comma-separated phone numbers that should always bypass pairing. Dynamic approvals appear below."
+            })}
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -2115,13 +4207,46 @@ export function IntegrationsPanel({
                 ? active?.enabled
                   ? "Connected"
                   : "Connected but disabled"
+                : active?.status === "starting"
+                  ? "Starting"
                 : active?.status === "needs_auth"
                   ? "Needs sign-in"
                   : active?.status === "error"
                     ? "Validation failed"
                   : "Not configured"}
             </Typography>
-            {active?.status === "connected" && !active?.enabled ? (
+            {active?.status === "connected" && !editingConnected ? (
+              <Stack spacing={1.5}>
+                <Alert severity={active?.enabled ? "success" : "info"}>
+                  {active?.enabled
+                    ? "This integration is connected and active."
+                    : "This integration has valid credentials but is currently disabled for agent use."}
+                </Alert>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={!!active?.enabled}
+                        onChange={async () => {
+                          try {
+                            await api.rawPost(`/integrations/${active!.id}/${active!.enabled ? "disable" : "enable"}`, {});
+                            await queryClient.invalidateQueries({ queryKey: ["integrations"] });
+                            setActive((prev) => prev ? { ...prev, enabled: !prev.enabled } : prev);
+                          } catch (e) {
+                            setFormError(asErrorMessage(e));
+                          }
+                        }}
+                      />
+                    }
+                    label={active?.enabled ? "Enabled" : "Disabled"}
+                  />
+                  <Button variant="outlined" size="small" onClick={() => setEditingConnected(true)}>
+                    Edit Configuration
+                  </Button>
+                </Stack>
+              </Stack>
+            ) : null}
+            {active?.status === "connected" && !active?.enabled && editingConnected ? (
               <Alert severity="info">
                 This integration has valid credentials but is currently disabled for agent use.
               </Alert>
@@ -2129,27 +4254,248 @@ export function IntegrationsPanel({
             {active?.status === "error" && active?.status_detail ? (
               <Alert severity="error">{active.status_detail}</Alert>
             ) : null}
+            {active?.status === "starting" && active?.status_detail ? (
+              <Alert severity="info">{active.status_detail}</Alert>
+            ) : null}
             {active?.status === "not_configured" ? (
               <Alert severity="info">
-                No saved credentials were found for this integration in the running AgentArk instance.
+                {active?.id === "google_workspace"
+                  ? "Google Workspace is not connected yet."
+                  : "No saved credentials were found for this integration in the running AgentArk instance."}
               </Alert>
             ) : null}
-            {activeNeedsOauth ? (
+            {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
               <Alert severity="info">
-                Save your Google OAuth client credentials here, then click Connect to finish sign-in.
+                {active?.id === "google_workspace"
+                  ? "Enter the Google OAuth client ID and client secret, choose the Workspace bundles, then continue with Google."
+                  : "Save your Google OAuth client credentials here, then click Connect to finish sign-in."}
               </Alert>
             ) : null}
-            {(active?.config_fields || []).map(renderField)}
+            {(active?.status !== "connected" || editingConnected) && active?.id === "google_workspace" ? (
+              <Box
+                sx={{
+                  border: "1px solid rgba(112,153,201,0.12)",
+                  borderRadius: 2,
+                  p: 1.25,
+                  background: "rgba(8, 18, 32, 0.46)"
+                }}
+              >
+                <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                  <Box>
+                    <Typography variant="subtitle2">Google OAuth setup</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Add the Google OAuth client here, then AgentArk will open the Google consent screen in your browser.
+                    </Typography>
+                  </Box>
+                  <IconButton
+                    size="small"
+                    onClick={() => setGoogleWorkspaceHelpOpen((open) => !open)}
+                    aria-label="How to get Google OAuth client credentials"
+                  >
+                    <InfoOutlinedIcon fontSize="small" />
+                  </IconButton>
+                </Stack>
+                {googleWorkspaceHelpOpen ? (
+                  <Alert severity="info" sx={{ mt: 1.25 }}>
+                    Create or open a Google Cloud project, configure the OAuth consent screen, add yourself as a test user if the app is still in testing, then create an OAuth client and copy its client ID and client secret. Add the redirect URI <strong>http://localhost:8990/oauth/callback</strong>, and enable the Google APIs you want AgentArk to use such as Gmail API, Google Calendar API, Drive API, Docs API, Sheets API, Google Chat API, and Admin SDK. Google’s official setup guide is at <strong>developers.google.com/accounts/docs/OAuth2Login</strong>.
+                  </Alert>
+                ) : null}
+              </Box>
+            ) : null}
+            {(active?.status !== "connected" || editingConnected)
+              ? (active?.config_fields || []).map(renderField)
+              : null}
             {active?.config_help ? (
               <Typography variant="caption" color="text.secondary">
                 {active.config_help}
               </Typography>
             ) : null}
+            {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
+              <Box
+                sx={{
+                  border: "1px solid rgba(64, 196, 255, 0.24)",
+                  borderRadius: 2,
+                  p: 1.5,
+                  background: "rgba(8, 24, 42, 0.56)"
+                }}
+              >
+                <Box>
+                  <Typography variant="subtitle2">
+                    {active?.id === "google_workspace"
+                      ? "Browser Sign-In"
+                      : "Finish Browser Sign-In"}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {active?.id === "google_workspace"
+                      ? "AgentArk will save the client ID, optional secret update, and selected bundles first, then open the Google consent screen."
+                      : "AgentArk will save these credentials first, then open the provider sign-in flow."}
+                  </Typography>
+                </Box>
+              </Box>
+            ) : null}
+            {active?.id !== "google_workspace" ? (
+              <>
+                <Divider sx={{ borderColor: "rgba(112,153,201,0.12)" }} />
+                <Box
+                  sx={{
+                    border: "1px solid rgba(110, 160, 255, 0.18)",
+                    borderRadius: 2,
+                    p: 1.5,
+                    background: "rgba(10, 18, 32, 0.5)"
+                  }}
+                >
+                  <Stack spacing={1.25}>
+                    <Box>
+                      <Typography variant="subtitle2">Background Sync</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Poll this integration in the background so AgentArk can spot important updates without waiting for chat.
+                      </Typography>
+                    </Box>
+                    {integrationSyncStatusQ.error ? (
+                      <Alert severity="warning">
+                        Could not load background sync state right now: {asErrorMessage(integrationSyncStatusQ.error)}
+                      </Alert>
+                    ) : null}
+                    {activeSyncStatus && !activeSyncStatus.supported ? (
+                      <Alert severity="info">
+                        This connector does not expose a reliable background feed yet. Use webhooks or watchers for proactive behavior.
+                      </Alert>
+                    ) : (
+                      <>
+                        {activeSyncStatus && !activeSyncStatus.integration_enabled ? (
+                          <Alert severity="info">
+                            This integration is disabled. Background sync will stay paused until the connector is enabled again.
+                          </Alert>
+                        ) : null}
+                        {activeSyncStatus && !activeSyncStatus.connected ? (
+                          <Alert severity="info">
+                            Connect this integration first. AgentArk can save sync preferences now, but it cannot poll until credentials work.
+                          </Alert>
+                        ) : null}
+                        <FormControlLabel
+                          control={
+                            <Switch
+                              checked={syncForm.enabled}
+                              onChange={(e) => setSyncField("enabled", e.target.checked)}
+                            />
+                          }
+                          label="Enable background sync"
+                        />
+                        <Grid2 container spacing={1.25}>
+                          <Grid2 size={{ xs: 12, sm: 6 }}>
+                            <TextField
+                              fullWidth
+                              size="small"
+                              label="Poll every (minutes)"
+                              type="number"
+                              value={syncForm.poll_interval_minutes}
+                              onChange={(e) => setSyncField("poll_interval_minutes", e.target.value)}
+                              inputProps={{ min: 1, max: 1440 }}
+                            />
+                          </Grid2>
+                          <Grid2 size={{ xs: 12, sm: 6 }}>
+                            <TextField
+                              fullWidth
+                              size="small"
+                              label="Important threshold (0-100)"
+                              type="number"
+                              value={syncForm.importance_threshold_percent}
+                              onChange={(e) =>
+                                setSyncField("importance_threshold_percent", e.target.value)
+                              }
+                              inputProps={{ min: 10, max: 100 }}
+                            />
+                          </Grid2>
+                        </Grid2>
+                        <FormControlLabel
+                          control={
+                            <Switch
+                              checked={syncForm.notify_on_important}
+                              onChange={(e) =>
+                                setSyncField("notify_on_important", e.target.checked)
+                              }
+                            />
+                          }
+                          label="Notify when something important is detected"
+                        />
+                        <FormControlLabel
+                          control={
+                            <Switch
+                              checked={syncForm.push_to_preferred_channel}
+                              onChange={(e) =>
+                                setSyncField("push_to_preferred_channel", e.target.checked)
+                              }
+                            />
+                          }
+                          label="Also push important updates to the preferred channel"
+                        />
+                        {activeSyncStatus ? (
+                          <Grid2 container spacing={1}>
+                            <Grid2 size={{ xs: 12, sm: 6 }}>
+                              <Typography variant="caption" color="text.secondary">
+                                Last sync
+                              </Typography>
+                              <Typography variant="body2">
+                                {formatDateTime(activeSyncStatus.last_sync_at)}
+                              </Typography>
+                            </Grid2>
+                            <Grid2 size={{ xs: 12, sm: 6 }}>
+                              <Typography variant="caption" color="text.secondary">
+                                Last detected item
+                              </Typography>
+                              <Typography variant="body2">
+                                {formatDateTime(activeSyncStatus.last_item_at)}
+                              </Typography>
+                            </Grid2>
+                            <Grid2 size={{ xs: 12, sm: 6 }}>
+                              <Typography variant="caption" color="text.secondary">
+                                Recent captured items
+                              </Typography>
+                              <Typography variant="body2">{activeSyncStatus.recent_item_count}</Typography>
+                            </Grid2>
+                            <Grid2 size={{ xs: 12, sm: 6 }}>
+                              <Typography variant="caption" color="text.secondary">
+                                Feed type
+                              </Typography>
+                              <Typography variant="body2" sx={{ textTransform: "capitalize" }}>
+                                {activeSyncStatus.sync_kind.replace(/_/g, " ")}
+                              </Typography>
+                            </Grid2>
+                          </Grid2>
+                        ) : null}
+                        {activeSyncStatus?.last_error ? (
+                          <Alert severity="warning">{activeSyncStatus.last_error}</Alert>
+                        ) : null}
+                        {syncNotice ? <Alert severity={syncNotice.kind}>{syncNotice.text}</Alert> : null}
+                        <Stack direction="row" spacing={1}>
+                          <Button
+                            variant="outlined"
+                            onClick={() => void runActiveSyncNow()}
+                            disabled={!active || syncNowMutation.isPending || !activeSyncStatus?.supported}
+                          >
+                            {syncNowMutation.isPending ? "Syncing..." : "Sync now"}
+                          </Button>
+                          <Button
+                            variant="contained"
+                            onClick={() => void saveActiveSyncSettings()}
+                            disabled={!active || saveSyncMutation.isPending || !activeSyncStatus?.supported}
+                          >
+                            {saveSyncMutation.isPending ? "Saving..." : "Save sync settings"}
+                          </Button>
+                        </Stack>
+                      </>
+                    )}
+                  </Stack>
+                </Box>
+              </>
+            ) : null}
             {formError ? <Alert severity="error">{formError}</Alert> : null}
             {configSuccess ? (
               <Alert severity="success">
                 {activeNeedsOauth
-                  ? "Credentials saved. Click Connect to finish authorization."
+                  ? active?.id === "google_workspace"
+                    ? "Workspace setup saved. Continue with Google to finish authorization."
+                    : "Credentials saved. Click Connect to finish authorization."
                   : "API keys validated and saved."}
               </Alert>
             ) : null}
@@ -2166,21 +4512,47 @@ export function IntegrationsPanel({
               Disconnect
             </Button>
           ) : null}
-          <Button onClick={closeConfig} disabled={saving}>
+          <Button onClick={closeConfig} disabled={saving} size="small" sx={dialogActionButtonSx}>
             Close
           </Button>
-          {activeNeedsOauth ? (
+          {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
             <Button
-              variant="outlined"
-              onClick={() => active && startIntegrationAuth(active)}
+              variant="contained"
+              onClick={() => {
+                void continueWithOauth();
+              }}
               disabled={saving || oauthBusyId === active?.id}
+              size="small"
+              sx={dialogActionButtonSx}
             >
-              {oauthBusyId === active?.id ? "Opening..." : "Connect"}
+              {oauthBusyId === active?.id
+                ? "Opening..."
+                : active?.id === "google_workspace"
+                  ? "Continue with Google"
+                  : "Save & Connect"}
             </Button>
           ) : null}
-          <Button variant="contained" onClick={submitConfig} disabled={saving || !(active?.config_fields?.length)}>
-            {saving ? "Saving..." : activeNeedsOauth ? "Save Credentials" : "Validate & Enable"}
-          </Button>
+          {(active?.status !== "connected" || editingConnected) && !(active?.id === "google_workspace" && activeNeedsOauth) ? (
+            <Button
+              variant={activeNeedsOauth ? "outlined" : "contained"}
+              onClick={submitConfig}
+              disabled={
+                saving ||
+                active?.status === "starting" ||
+                !(active?.config_fields?.length)
+              }
+              size="small"
+              sx={dialogActionButtonSx}
+            >
+              {saving
+                ? "Saving..."
+                : activeNeedsOauth
+                  ? "Save Only"
+                  : active?.id === "google_workspace"
+                    ? "Save Workspace Bundles"
+                    : "Validate & Enable"}
+              </Button>
+          ) : null}
         </DialogActions>
       </Dialog>
       ) : null}

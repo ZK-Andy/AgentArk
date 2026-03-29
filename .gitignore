@@ -35,7 +35,8 @@ tests/e2e/test-results/
 .vscode/
 *.swp
 *.swo
-/remotion*
+*.db
+/remotion_video*
 nul
 asda
 

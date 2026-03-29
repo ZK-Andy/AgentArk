@@ -254,7 +254,7 @@ fn format_trace_summary_from_persisted(
         started_at: parse_rfc3339_to_time_display(&t.started_at),
         duration_ms: t.duration_ms.map(|value| value.max(0) as u64),
         model: t.model.clone(),
-        total_tokens: t.total_tokens,
+        total_tokens: t.total_tokens as i64,
         cost_usd: t.cost_usd,
         complexity: t.complexity.clone(),
     }
@@ -312,9 +312,9 @@ fn format_trace_detail_from_persisted(
         response: t.response.clone(),
         proof_id: t.proof_id.clone(),
         model: t.model.clone(),
-        input_tokens: t.input_tokens,
-        output_tokens: t.output_tokens,
-        total_tokens: t.total_tokens,
+        input_tokens: t.input_tokens as i64,
+        output_tokens: t.output_tokens as i64,
+        total_tokens: t.total_tokens as i64,
         cost_usd: t.cost_usd,
         complexity: t.complexity.clone(),
     }
@@ -324,6 +324,8 @@ pub(super) async fn get_trace(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<TraceResponse> {
+    const TRACE_HISTORY_BUFFER: u64 = 100;
+    const SQLITE_MAX_INTEGER: u64 = i64::MAX as u64;
     let history_limit = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -334,9 +336,13 @@ pub(super) async fn get_trace(
         .unwrap_or(0usize);
 
     let agent = state.agent.read().await;
+    let persisted_fetch_limit = (history_limit as u64)
+        .saturating_add(history_offset as u64)
+        .saturating_add(TRACE_HISTORY_BUFFER)
+        .min(SQLITE_MAX_INTEGER);
     let persisted_history = agent
         .encrypted_storage
-        .list_execution_traces_decrypted(history_limit as u64 + history_offset as u64 + 100, 0)
+        .list_execution_traces_decrypted(persisted_fetch_limit, 0)
         .await
         .unwrap_or_default();
 

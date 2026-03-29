@@ -335,12 +335,14 @@ impl ProofEngine {
     }
 
     /// Get a clone of the current execution trace
+    #[cfg(feature = "gui")]
     pub fn trace(&self) -> ExecutionTrace {
         self.trace.lock().map(|t| t.clone()).unwrap_or_default()
     }
 }
 
 /// Compact proof receipt for sharing
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofReceipt {
     pub proof_id: Uuid,
@@ -351,6 +353,7 @@ pub struct ProofReceipt {
     pub signature: String,
 }
 
+#[cfg(feature = "gui")]
 impl From<&ExecutionProof> for ProofReceipt {
     fn from(proof: &ExecutionProof) -> Self {
         Self {

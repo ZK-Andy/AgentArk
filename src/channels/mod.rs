@@ -1,6 +1,11 @@
 //! Communication channels - HTTP, Telegram, WhatsApp, etc.
 
+pub mod discord;
+pub mod gateway;
 pub mod http;
+pub mod matrix;
+pub mod slack;
+pub mod teams;
 pub mod web;
 pub mod whatsapp;
 

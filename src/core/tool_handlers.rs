@@ -37,6 +37,8 @@ pub struct IntegrationToolHandler;
 pub struct SelfEvolveToolHandler;
 pub struct AppInspectToolHandler;
 pub struct AppRestartToolHandler;
+pub struct AppStopToolHandler;
+pub struct AppDeleteToolHandler;
 pub struct AppDeployToolHandler;
 pub struct MemoryLookupToolHandler;
 pub struct GoalManageToolHandler;
@@ -178,6 +180,8 @@ impl ToolHandler for IntegrationToolHandler {
             || call.name == "compose_report"
             || call.name == "self_evolve"
             || call.name == "app_restart"
+            || call.name == "app_stop"
+            || call.name == "app_delete"
             || call.name == "app_deploy"
         {
             return false;
@@ -303,6 +307,52 @@ impl ToolHandler for AppRestartToolHandler {
                 ctx.request_channel,
                 ctx.conversation_id,
             )
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for AppStopToolHandler {
+    fn id(&self) -> &'static str {
+        "app_stop"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "app_stop"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_app_stop_tool_call(call, ctx.stream_tx, ctx.request_channel)
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for AppDeleteToolHandler {
+    fn id(&self) -> &'static str {
+        "app_delete"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "app_delete"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_app_delete_tool_call(call, ctx.stream_tx, ctx.request_channel)
             .await?;
         Ok(Some(out))
     }
@@ -476,6 +526,8 @@ pub fn default_tool_handlers() -> Vec<Box<dyn ToolHandler>> {
         Box::new(SelfEvolveToolHandler),
         Box::new(AppInspectToolHandler),
         Box::new(AppRestartToolHandler),
+        Box::new(AppStopToolHandler),
+        Box::new(AppDeleteToolHandler),
         Box::new(AppDeployToolHandler),
         Box::new(MemoryLookupToolHandler),
         Box::new(GoalManageToolHandler),

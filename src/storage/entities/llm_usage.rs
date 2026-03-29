@@ -12,9 +12,9 @@ pub struct Model {
     pub model: String,
     pub channel: String,
     pub purpose: String,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+    pub total_tokens: i32,
     pub estimated: bool,
 }
 

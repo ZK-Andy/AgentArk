@@ -35,17 +35,31 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 mod actions;
 mod applications;
 mod auth;
+mod browser_profiles_control;
+mod custom_apis;
+mod gateway_control;
+mod gateway_ops_control;
+mod integration_sync;
 mod integrations;
+mod model_failover_control;
 mod moltbook;
+mod nodes_control;
 mod observability;
+mod plugins;
+mod sender_verification;
 mod suggestions;
 mod trace;
 mod tunnel;
 mod tunnel_auth;
+mod webhooks;
 
 pub(crate) use self::actions::import_action_from_url_shared;
 use self::moltbook::MoltbookSettings;
 
+use crate::channels::{
+    discord::DiscordChannelConfig, matrix::MatrixTransportConfig, slack::SlackChannelConfig,
+    teams::TeamsTransportConfig,
+};
 use crate::core::config::{
     DeploymentMode, TelegramConfig, TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig,
     TunnelProviderKind, TunnelTailscaleConfig,
@@ -115,6 +129,8 @@ enum McpTransportRequest {
         args: Vec<String>,
         #[serde(default)]
         working_dir: Option<String>,
+        #[serde(default)]
+        env: Option<std::collections::HashMap<String, String>>,
     },
 }
 
@@ -405,6 +421,9 @@ pub struct AppState {
     pub last_trace: Arc<RwLock<ExecutionTrace>>,
     /// Task queue - can be read without locking agent
     pub tasks: Arc<RwLock<TaskQueue>>,
+    /// Cancellation signals for actively streamed chat tasks.
+    pub chat_task_cancellations:
+        Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     /// User profile - can be read without locking agent
     pub user_profile: Arc<RwLock<UserProfile>>,
     /// Tiered rate limiter for all endpoints
@@ -470,6 +489,37 @@ pub struct ChatRequest {
 
 fn default_channel() -> String {
     "http".to_string()
+}
+
+async fn register_chat_task_cancellation(
+    state: &AppState,
+    task_id: &str,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    state
+        .chat_task_cancellations
+        .write()
+        .await
+        .insert(task_id.to_string(), tx);
+    rx
+}
+
+async fn signal_chat_task_cancellation(state: &AppState, task_id: &str) {
+    let sender = {
+        state
+            .chat_task_cancellations
+            .read()
+            .await
+            .get(task_id)
+            .cloned()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(true);
+    }
+}
+
+async fn unregister_chat_task_cancellation(state: &AppState, task_id: &str) {
+    state.chat_task_cancellations.write().await.remove(task_id);
 }
 
 fn is_openrouter_base_url(url: &str) -> bool {
@@ -857,7 +907,7 @@ fn provider_from_model_slot_request(
 
     let provider = match request.provider.as_str() {
         "ollama" => LlmProvider::Ollama {
-            base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+            base_url: base_url.unwrap_or("http://localhost:11434".to_string()),
             model: request.model.clone(),
         },
         "anthropic" => LlmProvider::Anthropic {
@@ -1308,7 +1358,7 @@ async fn handle_autonomy_quick_command(
                                 "Delegate"
                             };
                             serde_json::json!({
-                                "message_id": m.get("id").cloned().unwrap_or_else(|| serde_json::json!("")),
+                                "message_id": m.get("id").cloned().unwrap_or(serde_json::json!("")),
                                 "label": label,
                                 "reason": "Heuristic fallback classification",
                                 "draft_reply": if label == "Act now" { "Acknowledged. I will handle this today." } else { "Received. Delegating to the right owner and will track status." },
@@ -1335,7 +1385,7 @@ async fn handle_autonomy_quick_command(
                     .unwrap_or_else(|| {
                         row.get("message_id")
                             .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string())
+                            .unwrap_or("-".to_string())
                     });
                 let label = row.get("label").and_then(|v| v.as_str()).unwrap_or("-");
                 let reason = row.get("reason").and_then(|v| v.as_str()).unwrap_or("-");
@@ -1407,7 +1457,7 @@ async fn handle_autonomy_quick_command(
                         result: Some(result.final_result.clone()),
                         success: 1,
                         confidence: Some(0.82),
-                        execution_time_ms: Some(result.total_time_ms as i32),
+                        execution_time_ms: Some(result.total_time_ms.min(i32::MAX as u64) as i32),
                         created_at: chrono::Utc::now().to_rfc3339(),
                         completed_at: Some(chrono::Utc::now().to_rfc3339()),
                     };
@@ -1449,8 +1499,8 @@ async fn handle_autonomy_quick_command(
                     return Err("Task cannot be cancelled from its current state.".to_string());
                 }
                 task.status = TaskStatus::Cancelled;
-                let status_json = serde_json::to_string(&task.status)
-                    .unwrap_or_else(|_| "\"Cancelled\"".to_string());
+                let status_json =
+                    serde_json::to_string(&task.status).unwrap_or("\"Cancelled\"".to_string());
                 let _ = agent
                     .storage
                     .update_task_status(task_id, &status_json)
@@ -1667,14 +1717,58 @@ pub struct SettingsResponse {
     // Model pool
     pub model_pool: Vec<ModelSlotSummary>,
     pub smart_routing: bool,
-    /// Optional pinned model slot for app_deploy.
-    /// If unset, app_deploy uses the default primary model.
-    pub app_deploy_model_id: Option<String>,
     // Telegram
     pub telegram_enabled: bool,
     pub has_telegram_token: bool,
     pub telegram_delivery_ready: bool,
     pub telegram_allowed_users: Vec<i64>,
+    // Slack
+    pub slack_enabled: bool,
+    pub has_slack_bot_token: bool,
+    pub has_slack_signing_secret: bool,
+    pub slack_api_base_url: String,
+    pub slack_default_channel_id: String,
+    pub slack_default_thread_ts: Option<String>,
+    pub slack_workspace_id: Option<String>,
+    pub slack_workspace_name: Option<String>,
+    pub slack_delivery_ready: bool,
+    // Discord
+    pub discord_enabled: bool,
+    pub has_discord_bot_token: bool,
+    pub discord_api_base_url: String,
+    pub discord_default_channel_id: String,
+    pub discord_default_thread_id: Option<String>,
+    pub discord_guild_id: Option<String>,
+    pub discord_application_id: Option<String>,
+    pub discord_webhook_url: String,
+    pub discord_delivery_ready: bool,
+    // Matrix
+    pub matrix_enabled: bool,
+    pub has_matrix_access_token: bool,
+    pub matrix_homeserver_url: String,
+    pub matrix_user_id: String,
+    pub matrix_device_id: Option<String>,
+    pub matrix_account_id: Option<String>,
+    pub matrix_default_room_id: Option<String>,
+    pub matrix_sync_timeout_ms: u64,
+    pub matrix_limit: usize,
+    pub matrix_user_agent: Option<String>,
+    pub matrix_delivery_ready: bool,
+    // Teams
+    pub teams_enabled: bool,
+    pub has_teams_access_token: bool,
+    pub teams_service_url: String,
+    pub teams_bot_app_id: Option<String>,
+    pub teams_bot_name: Option<String>,
+    pub teams_tenant_id: Option<String>,
+    pub teams_team_id: Option<String>,
+    pub teams_channel_id: Option<String>,
+    pub teams_chat_id: Option<String>,
+    pub teams_graph_base_url: Option<String>,
+    pub teams_delivery_mode: String,
+    pub teams_timeout_secs: u64,
+    pub teams_user_agent: Option<String>,
+    pub teams_delivery_ready: bool,
     // WhatsApp
     pub whatsapp_enabled: bool,
     pub whatsapp_mode: String,
@@ -1699,6 +1793,7 @@ pub struct SettingsResponse {
     pub moltbook_sync_frequency: String,
     pub moltbook_write_enabled: bool,
     pub moltbook_defer_when_busy: bool,
+    pub moltbook_has_api_key: bool,
     pub moltbook_last_run_at: Option<String>,
     pub moltbook_last_status: Option<String>,
     pub tunnel_active: bool,
@@ -1761,10 +1856,6 @@ pub struct SettingsUpdate {
     /// Model pool routing behavior (if false, always use primary)
     #[serde(default)]
     pub smart_routing: Option<bool>,
-    /// Optional model slot id to always use for app_deploy.
-    /// Empty string clears the override.
-    #[serde(default)]
-    pub app_deploy_model_id: Option<String>,
     // Primary LLM
     pub llm_provider: String,
     pub llm_model: String,
@@ -1780,6 +1871,53 @@ pub struct SettingsUpdate {
     pub telegram_enabled: Option<bool>,
     pub telegram_bot_token: Option<String>,
     pub telegram_allowed_users: Option<Vec<i64>>,
+    // Slack
+    #[serde(default)]
+    pub slack_enabled: Option<bool>,
+    pub slack_bot_token: Option<String>,
+    pub slack_signing_secret: Option<String>,
+    pub slack_api_base_url: Option<String>,
+    pub slack_default_channel_id: Option<String>,
+    pub slack_default_thread_ts: Option<String>,
+    pub slack_workspace_id: Option<String>,
+    pub slack_workspace_name: Option<String>,
+    // Discord
+    #[serde(default)]
+    pub discord_enabled: Option<bool>,
+    pub discord_bot_token: Option<String>,
+    pub discord_api_base_url: Option<String>,
+    pub discord_default_channel_id: Option<String>,
+    pub discord_default_thread_id: Option<String>,
+    pub discord_guild_id: Option<String>,
+    pub discord_application_id: Option<String>,
+    pub discord_webhook_url: Option<String>,
+    // Matrix
+    #[serde(default)]
+    pub matrix_enabled: Option<bool>,
+    pub matrix_homeserver_url: Option<String>,
+    pub matrix_access_token: Option<String>,
+    pub matrix_user_id: Option<String>,
+    pub matrix_device_id: Option<String>,
+    pub matrix_account_id: Option<String>,
+    pub matrix_default_room_id: Option<String>,
+    pub matrix_sync_timeout_ms: Option<u64>,
+    pub matrix_limit: Option<usize>,
+    pub matrix_user_agent: Option<String>,
+    // Teams
+    #[serde(default)]
+    pub teams_enabled: Option<bool>,
+    pub teams_service_url: Option<String>,
+    pub teams_access_token: Option<String>,
+    pub teams_bot_app_id: Option<String>,
+    pub teams_bot_name: Option<String>,
+    pub teams_tenant_id: Option<String>,
+    pub teams_team_id: Option<String>,
+    pub teams_channel_id: Option<String>,
+    pub teams_chat_id: Option<String>,
+    pub teams_graph_base_url: Option<String>,
+    pub teams_delivery_mode: Option<String>,
+    pub teams_timeout_secs: Option<u64>,
+    pub teams_user_agent: Option<String>,
     // WhatsApp
     #[serde(default)]
     pub whatsapp_enabled: Option<bool>,
@@ -1869,6 +2007,29 @@ pub struct SettingsUpdate {
     pub memory_retention_protect_fact_sources: Option<bool>,
     #[serde(default)]
     pub observability: Option<observability::ObservabilitySettingsUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleWorkspaceOAuthClientSettingsResponse {
+    configured: bool,
+    source: String,
+    source_label: String,
+    managed_externally: bool,
+    client_id_hint: Option<String>,
+    secret_configured: bool,
+    redirect_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleWorkspaceOAuthClientSettingsUpdate {
+    #[serde(default)]
+    credentials_json: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    clear: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1999,6 +2160,7 @@ struct EvolutionSettingsResponse {
 #[derive(Debug, Deserialize)]
 struct EvolutionSettingsUpdateRequest {
     deploy_guard_default: Option<bool>,
+    self_evolve_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2903,7 +3065,7 @@ pub async fn serve(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let tiered_rate_limiter = TieredRateLimiter::new();
-    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
+    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or("127.0.0.1:8990".to_string());
 
     // Spawn a background task to periodically clean up expired rate-limit entries
     {
@@ -2981,6 +3143,7 @@ pub async fn serve(
             trace_history: agent_guard.trace_history.clone(),
             last_trace: agent_guard.last_trace.clone(),
             tasks: agent_guard.tasks.clone(),
+            chat_task_cancellations: Arc::new(RwLock::new(HashMap::new())),
             user_profile: agent_guard.user_profile.clone(),
             tiered_rate_limiter,
             api_key: Arc::new(RwLock::new(initial_api_key)),
@@ -3030,6 +3193,14 @@ pub async fn serve(
         // WhatsApp webhook (public - Meta calls without auth)
         .route("/webhook/whatsapp", get(whatsapp_webhook_verify))
         .route("/webhook/whatsapp", post(whatsapp_webhook_handler))
+        .route(
+            "/webhook/inbound/{source_id}",
+            post(webhooks::handle_inbound_webhook),
+        )
+        // Slack webhook (public endpoint, authenticated by Slack request signatures)
+        .route("/webhook/slack", post(slack_webhook_handler))
+        // Teams webhook (public endpoint, authenticated by Bot Framework JWTs)
+        .route("/webhook/teams", post(teams_webhook_handler))
         // OAuth callback (public - browser redirect from Google/Meta with no auth headers)
         .route("/oauth/callback", get(integrations::oauth_callback))
         // Deployed apps (public - these are user-facing apps, no auth required)
@@ -3043,6 +3214,114 @@ pub async fn serve(
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
         .route("/chat/clear", post(clear_chat))
+        .route("/gateway/channels", get(gateway_control::get_channels))
+        .route("/gateway/ops", get(gateway_ops_control::get_overview))
+        .route(
+            "/gateway/channels/accounts",
+            post(gateway_control::create_channel_account),
+        )
+        .route(
+            "/gateway/channels/accounts/{id}",
+            post(gateway_control::update_channel_account)
+                .delete(gateway_control::delete_channel_account),
+        )
+        .route("/gateway/routing", get(gateway_control::get_routing))
+        .route(
+            "/gateway/routing/rules",
+            post(gateway_control::create_route_rule),
+        )
+        .route(
+            "/gateway/routing/rules/{id}",
+            post(gateway_control::update_route_rule).delete(gateway_control::delete_route_rule),
+        )
+        .route(
+            "/gateway/routing/groups",
+            post(gateway_control::create_broadcast_group),
+        )
+        .route(
+            "/gateway/routing/simulate",
+            post(gateway_control::simulate_routing),
+        )
+        .route("/nodes", get(nodes_control::list_nodes))
+        .route("/nodes", post(nodes_control::create_node))
+        .route(
+            "/nodes/{id}",
+            post(nodes_control::update_node).delete(nodes_control::revoke_node),
+        )
+        .route("/nodes/{id}/heartbeat", post(nodes_control::heartbeat_node))
+        .route(
+            "/nodes/{id}/commands",
+            get(nodes_control::list_node_commands).post(nodes_control::log_node_command),
+        )
+        .route(
+            "/browser/profiles",
+            get(browser_profiles_control::list_profiles),
+        )
+        .route(
+            "/browser/profiles",
+            post(browser_profiles_control::create_profile),
+        )
+        .route(
+            "/browser/profiles/{id}",
+            post(browser_profiles_control::update_profile)
+                .delete(browser_profiles_control::delete_profile),
+        )
+        .route(
+            "/browser/profiles/{id}/lock",
+            post(browser_profiles_control::lock_profile),
+        )
+        .route(
+            "/browser/profiles/{id}/unlock",
+            post(browser_profiles_control::unlock_profile),
+        )
+        .route(
+            "/browser/profiles/{id}/sessions",
+            post(browser_profiles_control::record_session),
+        )
+        .route(
+            "/models/failover",
+            get(model_failover_control::list_failover),
+        )
+        .route(
+            "/models/failover/profiles",
+            post(model_failover_control::upsert_profile),
+        )
+        .route(
+            "/models/failover/profiles/{id}/default",
+            post(model_failover_control::set_default_profile),
+        )
+        .route(
+            "/models/failover/profiles/{id}/disable",
+            post(model_failover_control::disable_profile),
+        )
+        .route(
+            "/models/failover/profiles/{id}/clear-cooldown",
+            post(model_failover_control::clear_profile_cooldown),
+        )
+        .route(
+            "/models/failover/profiles/{id}/rotate",
+            post(model_failover_control::rotate_profile),
+        )
+        .route(
+            "/models/failover/providers",
+            post(model_failover_control::upsert_provider),
+        )
+        .route(
+            "/models/failover/providers/{id}/disable",
+            post(model_failover_control::disable_provider),
+        )
+        .route(
+            "/models/failover/providers/{id}/clear-cooldown",
+            post(model_failover_control::clear_provider_cooldown),
+        )
+        .route(
+            "/models/failover/chains",
+            post(model_failover_control::upsert_chain),
+        )
+        .route(
+            "/models/failover/select",
+            post(model_failover_control::select_candidate),
+        )
         .route("/skills", get(actions::list_actions))
         .route("/skills", post(actions::create_action))
         .route("/skills/{name}", get(actions::get_action_content))
@@ -3142,6 +3421,14 @@ pub async fn serve(
         .route("/settings", get(get_settings))
         .route("/settings", post(update_settings))
         .route(
+            "/settings/google-workspace/oauth-client",
+            get(get_google_workspace_oauth_client_settings),
+        )
+        .route(
+            "/settings/google-workspace/oauth-client",
+            post(update_google_workspace_oauth_client_settings),
+        )
+        .route(
             "/settings/evolution",
             get(get_evolution_settings).post(update_evolution_settings),
         )
@@ -3195,8 +3482,28 @@ pub async fn serve(
         // Integrations routes
         .route("/integrations", get(integrations::list_integrations))
         .route(
+            "/integrations/sync/status",
+            get(integration_sync::list_integration_sync_statuses),
+        )
+        .route(
+            "/integrations/sync/feed",
+            get(integration_sync::list_integration_sync_feed),
+        )
+        .route(
+            "/integrations/sync/runs",
+            get(integration_sync::list_integration_sync_runs),
+        )
+        .route(
             "/integrations/{id}/auth",
             get(integrations::get_integration_auth_url),
+        )
+        .route(
+            "/integrations/{id}/sync",
+            post(integration_sync::update_integration_sync_config),
+        )
+        .route(
+            "/integrations/{id}/sync-now",
+            post(integration_sync::run_integration_sync_now),
         )
         .route(
             "/integrations/{id}/disconnect",
@@ -3230,6 +3537,47 @@ pub async fn serve(
         )
         .route("/calendar/status", get(integrations::calendar_status))
         .route("/calendar/test", get(integrations::calendar_test))
+        .route(
+            "/plugins",
+            get(plugins::list_plugins).post(plugins::create_plugin),
+        )
+        .route("/plugins/logs", get(plugins::list_plugin_logs))
+        .route(
+            "/plugins/{id}",
+            axum::routing::put(plugins::update_plugin).delete(plugins::delete_plugin),
+        )
+        .route("/plugins/{id}/refresh", post(plugins::refresh_plugin))
+        .route("/plugins/{id}/test", post(plugins::test_plugin))
+        .route(
+            "/custom-apis",
+            get(custom_apis::list_custom_apis).post(custom_apis::create_custom_api),
+        )
+        .route(
+            "/custom-apis/preview",
+            post(custom_apis::preview_custom_api),
+        )
+        .route(
+            "/custom-apis/{id}",
+            axum::routing::put(custom_apis::update_custom_api)
+                .delete(custom_apis::delete_custom_api),
+        )
+        .route("/custom-apis/{id}/test", post(custom_apis::test_custom_api))
+        .route(
+            "/sender-verification",
+            get(sender_verification::get_sender_verification),
+        )
+        .route(
+            "/sender-verification/settings",
+            post(sender_verification::update_sender_verification_settings),
+        )
+        .route(
+            "/sender-verification/approve",
+            post(sender_verification::approve_sender),
+        )
+        .route(
+            "/sender-verification/revoke",
+            post(sender_verification::revoke_sender),
+        )
         // SSH routes
         .route("/ssh/connections", get(ssh_list_connections))
         .route("/ssh/connections", post(ssh_add_connection))
@@ -3330,6 +3678,20 @@ pub async fn serve(
         .route("/hooks/runs", get(list_hook_runs))
         .route("/hooks", post(add_hook))
         .route("/hooks/{id}", axum::routing::delete(remove_hook))
+        .route(
+            "/webhooks/sources",
+            get(webhooks::list_webhook_sources).post(webhooks::create_webhook_source),
+        )
+        .route(
+            "/webhooks/sources/{id}",
+            axum::routing::put(webhooks::update_webhook_source)
+                .delete(webhooks::delete_webhook_source),
+        )
+        .route("/webhooks/events", get(webhooks::list_webhook_events))
+        .route(
+            "/webhooks/sources/{id}/test",
+            post(webhooks::test_webhook_source),
+        )
         // MCP (Model Context Protocol) routes
         .route("/mcp", post(mcp_handler))
         .route("/mcp/tools", get(mcp_list_tools))
@@ -3389,10 +3751,14 @@ pub async fn serve(
         .route("/tunnel/stop", post(tunnel::stop_tunnel))
         // Watchers
         .route("/watchers", get(get_watchers))
+        .route("/watchers/pause-all", post(pause_all_watchers))
+        .route("/watchers/resume-all", post(resume_all_watchers))
         .route("/watchers/{id}", axum::routing::delete(delete_watcher))
         .route("/watchers/{id}/cancel", post(cancel_watcher))
         .route("/watchers/{id}/pause", post(pause_watcher))
         .route("/watchers/{id}/resume", post(resume_watcher))
+        .route("/watchers/{id}/run-now", post(run_watcher_now))
+        .route("/watchers/{id}/extend", post(extend_watcher))
         // Greetings (LLM-generated, cached in DB)
         // ArkPulse log
         .route("/arkpulse", get(get_pulse_log))
@@ -3512,7 +3878,7 @@ pub async fn serve(
         let public_app_bind_addr = state
             .public_app_bind_addr
             .clone()
-            .unwrap_or_else(|| "127.0.0.1:8992".to_string());
+            .unwrap_or("127.0.0.1:8992".to_string());
         let public_app_listener = tokio::net::TcpListener::bind(&public_app_bind_addr).await?;
         let mut app_shutdown = shutdown_rx.clone();
         public_app_server = Some(tokio::spawn(async move {
@@ -3577,6 +3943,8 @@ pub async fn serve(
             }
         });
     }
+
+    schedule_enabled_mcp_server_resumes(state.agent.clone());
 
     // ArkSentinel: monitor tunnel + WhatsApp bridge processes, auto-restart if they die
     {
@@ -3936,7 +4304,7 @@ fn redirect_to_selected_tunnel_app(app_id: &str) -> Response {
         .status(StatusCode::FOUND)
         .header(header::LOCATION, location)
         .body(axum::body::Body::empty())
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn is_public_app_tunnel_path(path: &str) -> bool {
@@ -4212,6 +4580,18 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     add("/settings", "GET", "Get settings", "Settings");
     add("/settings", "POST", "Update settings", "Settings");
     add(
+        "/settings/google-workspace/oauth-client",
+        "GET",
+        "Get global Google OAuth client settings",
+        "Settings",
+    );
+    add(
+        "/settings/google-workspace/oauth-client",
+        "POST",
+        "Update global Google OAuth client settings",
+        "Settings",
+    );
+    add(
         "/settings/observability/logs",
         "GET",
         "List observability export delivery logs",
@@ -4331,6 +4711,64 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "POST",
         "Disconnect integration",
         "Integrations",
+    );
+
+    // --- Plugin SDK ---
+    add("/plugins", "GET", "List plugin SDK integrations", "Plugins");
+    add(
+        "/plugins",
+        "POST",
+        "Install plugin SDK integration",
+        "Plugins",
+    );
+    add(
+        "/plugins/logs",
+        "GET",
+        "List plugin SDK delivery logs",
+        "Plugins",
+    );
+    add(
+        "/plugins/{id}",
+        "PUT",
+        "Update plugin SDK integration",
+        "Plugins",
+    );
+    add(
+        "/plugins/{id}",
+        "DELETE",
+        "Delete plugin SDK integration",
+        "Plugins",
+    );
+    add(
+        "/plugins/{id}/refresh",
+        "POST",
+        "Refresh plugin manifest",
+        "Plugins",
+    );
+    add("/plugins/{id}/test", "POST", "Ping plugin", "Plugins");
+    add(
+        "/sender-verification",
+        "GET",
+        "List sender verification policies and approval state",
+        "Security",
+    );
+    add(
+        "/sender-verification/settings",
+        "POST",
+        "Update sender verification policies",
+        "Security",
+    );
+    add(
+        "/sender-verification/approve",
+        "POST",
+        "Approve a pending sender",
+        "Security",
+    );
+    add(
+        "/sender-verification/revoke",
+        "POST",
+        "Revoke an approved sender",
+        "Security",
     );
 
     // --- Documents ---
@@ -5570,9 +6008,7 @@ async fn app_scoped_llm_chat_proxy(
         system_lines.join("\n")
     };
 
-    let (last_role, last_text) = convo
-        .pop()
-        .unwrap_or_else(|| ("user".to_string(), String::new()));
+    let (last_role, last_text) = convo.pop().unwrap_or(("user".to_string(), String::new()));
     let user_message = if last_text.trim().is_empty() {
         "Please help with this request.".to_string()
     } else if last_role == "assistant" {
@@ -6180,7 +6616,7 @@ async fn serve_app_file_inner(
                 .status(StatusCode::TEMPORARY_REDIRECT)
                 .header(header::LOCATION, target)
                 .body(axum::body::Body::empty())
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6260,7 +6696,7 @@ async fn serve_app_file_inner(
                     .header(header::SET_COOKIE, cookie)
                     .header(header::LOCATION, clean_url)
                     .body(axum::body::Body::empty())
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
         }
     }
@@ -6429,7 +6865,7 @@ async fn serve_app_file_inner(
                         };
                         builder
                             .body(response_body)
-                            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+                            .unwrap_or(StatusCode::BAD_GATEWAY.into_response())
                     }
                     Err(_) => StatusCode::BAD_GATEWAY.into_response(),
                 }
@@ -6684,7 +7120,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
 
     let meta_path = app_dir.join(".app_meta.json");
     let mut meta: serde_json::Value = match tokio::fs::read(&meta_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     };
     if !meta.is_object() {
@@ -7257,7 +7693,7 @@ async fn health(State(state): State<AppState>) -> Response {
             "deployment_mode": state.deployment_mode.as_str(),
             "checks": {
                 "storage": storage_ok,
-                "sqlite_quick_check": sqlite_quick_check.unwrap_or_else(|| "unavailable".to_string()),
+                "sqlite_quick_check": sqlite_quick_check.unwrap_or("unavailable".to_string()),
                 "sqlite_ok": sqlite_ok,
                 "mem0_bridge": mem0_ok,
                 "playwright_bridge": playwright_ok,
@@ -7316,6 +7752,139 @@ async fn whatsapp_webhook_handler(
     StatusCode::OK.into_response()
 }
 
+/// POST /webhook/slack - Slack Events API ingress
+async fn slack_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let timestamp = parts
+        .headers
+        .get("x-slack-request-timestamp")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let signature = parts
+        .headers
+        .get("x-slack-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+
+    let is_url_verification = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|event_type| event_type == "url_verification");
+
+    if is_url_verification {
+        let agent = state.agent.clone();
+        return match crate::channels::slack::handle_webhook(
+            agent,
+            &body_bytes,
+            timestamp.as_deref(),
+            signature.as_deref(),
+        )
+        .await
+        {
+            Ok(response) => (StatusCode::OK, response).into_response(),
+            Err(error) => {
+                tracing::warn!("Slack webhook processing failed: {}", error);
+                (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+            }
+        };
+    }
+
+    let agent = state.agent.clone();
+    let timestamp_owned = timestamp.clone();
+    let signature_owned = signature.clone();
+    let body_owned = body_bytes.to_vec();
+    tokio::spawn(async move {
+        if let Err(error) = crate::channels::slack::handle_webhook(
+            agent,
+            &body_owned,
+            timestamp_owned.as_deref(),
+            signature_owned.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!("Slack webhook processing failed: {}", error);
+        }
+    });
+
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// POST /webhook/teams - Teams/Bot Framework ingress
+async fn teams_webhook_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(activity): Json<crate::channels::teams::TeamsActivity>,
+) -> Response {
+    let agent = state.agent.clone();
+    let config = {
+        let guard = state.agent.read().await;
+        guard
+            .config
+            .teams
+            .clone()
+            .or(
+                crate::channels::teams::load_config_from_storage(&guard.storage)
+                    .await
+                    .ok()
+                    .flatten(),
+            )
+    };
+
+    let Some(config) = config else {
+        return (StatusCode::FORBIDDEN, "Teams not configured").into_response();
+    };
+
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let verified = match crate::channels::teams::verify_inbound_activity_request(
+        &config,
+        authorization.as_deref(),
+        &activity,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(error) => {
+            tracing::warn!("Teams webhook authorization failed: {}", error);
+            return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(error) =
+            crate::channels::teams::handle_activity(&agent, &config, activity, verified).await
+        {
+            tracing::warn!("Teams webhook processing failed: {}", error);
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "accepted" })),
+    )
+        .into_response()
+}
+
 // - WhatsApp Bridge Proxy -
 
 /// GET /api/whatsapp-bridge/status - proxy to Baileys bridge sidecar
@@ -7327,7 +7896,7 @@ async fn whatsapp_bridge_status(State(state): State<AppState>) -> Response {
             .whatsapp
             .as_ref()
             .map(|w| w.bridge_url.clone())
-            .unwrap_or_else(|| "http://127.0.0.1:8999".to_string())
+            .unwrap_or("http://127.0.0.1:8999".to_string())
     };
 
     let client = reqwest::Client::builder()
@@ -7363,7 +7932,7 @@ async fn whatsapp_bridge_logout(State(state): State<AppState>) -> Response {
             .whatsapp
             .as_ref()
             .map(|w| w.bridge_url.clone())
-            .unwrap_or_else(|| "http://127.0.0.1:8999".to_string())
+            .unwrap_or("http://127.0.0.1:8999".to_string())
     };
 
     let client = reqwest::Client::builder()
@@ -7406,7 +7975,10 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "disabled",
-                "detail": "Telegram is disabled."
+                "detail": "Telegram is disabled.",
+                "enabled": false,
+                "configured": false,
+                "probe_status": "disabled"
             })),
         )
             .into_response();
@@ -7417,7 +7989,10 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "missing_token",
-                "detail": "Telegram bot token is not configured."
+                "detail": "Telegram bot token is not configured.",
+                "enabled": true,
+                "configured": false,
+                "probe_status": "missing_token"
             })),
         )
             .into_response();
@@ -7436,7 +8011,7 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
             let payload = resp
                 .json::<serde_json::Value>()
                 .await
-                .unwrap_or_else(|_| serde_json::json!({}));
+                .unwrap_or(serde_json::json!({}));
             if status.is_success() && payload.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                 let result = payload
                     .get("result")
@@ -7456,6 +8031,9 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
                     Json(serde_json::json!({
                         "status": "connected",
                         "detail": format!("Connected as @{} ({})", username, bot_id),
+                        "enabled": true,
+                        "configured": true,
+                        "probe_status": "connected",
                         "username": username,
                         "bot_id": bot_id
                     })),
@@ -7466,11 +8044,26 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Telegram API returned an error.");
+                let detail = desc.trim();
+                let detail_lower = detail.to_ascii_lowercase();
+                let invalid_token =
+                    status == StatusCode::UNAUTHORIZED
+                        || detail_lower.contains("unauthorized")
+                        || detail_lower.contains("invalid")
+                        || detail_lower.contains("not found")
+                        || detail_lower.contains("bot token");
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({
-                        "status": "error",
-                        "detail": desc
+                        "status": if invalid_token { "error" } else { "configured" },
+                        "detail": if invalid_token {
+                            detail.to_string()
+                        } else {
+                            format!("Bot token is saved. Last live check failed: {}", detail)
+                        },
+                        "enabled": true,
+                        "configured": true,
+                        "probe_status": if invalid_token { "invalid_token" } else { "api_error" }
                     })),
                 )
                     .into_response()
@@ -7479,8 +8072,11 @@ async fn telegram_channel_status(State(state): State<AppState>) -> Response {
         Err(e) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "status": "error",
-                "detail": format!("Telegram API unreachable: {}", e)
+                "status": "configured",
+                "detail": format!("Bot token is saved. Last live check failed: Telegram API unreachable: {}", e),
+                "enabled": true,
+                "configured": true,
+                "probe_status": "unreachable"
             })),
         )
             .into_response(),
@@ -7789,6 +8385,67 @@ async fn resume_watcher(
             }
         }
         Json(serde_json::json!({ "resumed": resumed }))
+    } else {
+        Json(serde_json::json!({ "error": "Invalid watcher ID" }))
+    }
+}
+
+async fn pause_all_watchers(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let agent = state.agent.read().await;
+    let paused = agent.watcher_manager.pause_all().await;
+    Json(serde_json::json!({ "paused": paused }))
+}
+
+async fn resume_all_watchers(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let agent = state.agent.read().await;
+    let resumed = agent.watcher_manager.resume_all().await;
+    Json(serde_json::json!({ "resumed": resumed }))
+}
+
+async fn run_watcher_now(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let agent = state.agent.read().await;
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let queued = agent.watcher_manager.run_now(uuid).await;
+        Json(serde_json::json!({ "queued": queued }))
+    } else {
+        Json(serde_json::json!({ "error": "Invalid watcher ID" }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WatcherExtendRequest {
+    #[serde(default)]
+    extra_hours: Option<u64>,
+    #[serde(default)]
+    extra_days: Option<u64>,
+    #[serde(default)]
+    extra_secs: Option<u64>,
+    #[serde(default)]
+    until_stopped: Option<bool>,
+}
+
+async fn extend_watcher(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<WatcherExtendRequest>,
+) -> Json<serde_json::Value> {
+    let agent = state.agent.read().await;
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let timeout_secs = if request.until_stopped.unwrap_or(false) {
+            agent.watcher_manager.extend_until_stopped(uuid).await
+        } else {
+            let extra_secs = request.extra_secs.unwrap_or(0)
+                + request.extra_hours.unwrap_or(0).saturating_mul(60 * 60)
+                + request.extra_days.unwrap_or(0).saturating_mul(24 * 60 * 60);
+            agent.watcher_manager.extend_timeout(uuid, extra_secs).await
+        };
+        Json(serde_json::json!({
+            "updated": timeout_secs.is_some(),
+            "timeout_secs": timeout_secs
+        }))
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
     }
@@ -8910,6 +9567,22 @@ fn summarize_stream_tool_activity_content(content: &str) -> String {
     trimmed.chars().take(240).collect::<String>()
 }
 
+fn truncate_stream_tool_raw_content(content: &str, max_chars: usize) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in trimmed.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("\n...[truncated]");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn normalize_stream_heartbeat_status(status: &str) -> String {
     let trimmed = status.trim();
     if trimmed.is_empty() {
@@ -8978,12 +9651,32 @@ fn normalize_stream_event_for_sse(
             (Some(("tool_start", payload_json)), String::new())
         }
         crate::core::StreamEvent::ToolResult { name, content } => {
-            let content = summarize_stream_tool_activity_content(&content);
+            let summarized = summarize_stream_tool_activity_content(&content);
+            let trimmed = content.trim();
+            let mut payload = serde_json::Map::new();
+            payload.insert("name".to_string(), serde_json::json!(name));
+            payload.insert("content".to_string(), serde_json::json!(summarized));
+            if !trimmed.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Some(obj) = value.as_object() {
+                        for (k, v) in obj {
+                            if matches!(k.as_str(), "name" | "content" | "raw_content" | "result") {
+                                continue;
+                            }
+                            payload.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        payload.insert("result".to_string(), value);
+                    }
+                } else {
+                    payload.insert(
+                        "raw_content".to_string(),
+                        serde_json::json!(truncate_stream_tool_raw_content(trimmed, 65536)),
+                    );
+                }
+            }
             (
-                Some((
-                    "tool_result",
-                    serde_json::json!({ "name": name, "content": content }),
-                )),
+                Some(("tool_result", serde_json::Value::Object(payload))),
                 String::new(),
             )
         }
@@ -9010,6 +9703,34 @@ fn normalize_stream_event_for_sse(
             };
             (Some(("tool_progress", payload_json)), String::new())
         }
+        crate::core::StreamEvent::PlanGenerated { steps } => (
+            Some((
+                "plan_generated",
+                serde_json::json!({
+                    "step_type": "plan_generated",
+                    "title": "Execution Plan",
+                    "detail": format!("{} steps planned", steps.len()),
+                    "steps": steps,
+                }),
+            )),
+            String::new(),
+        ),
+        crate::core::StreamEvent::PlanStepUpdate {
+            step_id,
+            status,
+            detail,
+        } => (
+            Some((
+                "plan_step_update",
+                serde_json::json!({
+                    "step_type": "plan_step_update",
+                    "step_id": step_id,
+                    "status": status,
+                    "detail": detail.unwrap_or_default(),
+                }),
+            )),
+            String::new(),
+        ),
     }
 }
 
@@ -9545,6 +10266,7 @@ async fn chat_stream(
     let project_id = request.project_id.clone();
     let deep_research = request.deep_research;
     let execution_mode = request.execution_mode.clone();
+    let app_state = state.clone();
 
     tokio::spawn(async move {
         let tracked_task = if chat_request_should_create_task(
@@ -9602,6 +10324,12 @@ async fn chat_stream(
                     None
                 }
             }
+        } else {
+            None
+        };
+
+        let mut cancel_rx = if let Some((task, _)) = tracked_task.as_ref() {
+            Some(register_chat_task_cancellation(&app_state, &task.id.to_string()).await)
         } else {
             None
         };
@@ -9746,19 +10474,68 @@ async fn chat_stream(
         );
         let _ = tx.send(Ok(initial_status)).await;
 
-        let result = {
-            let agent_guard = agent_ref.read().await;
-            agent_guard
-                .process_message_stream_with_meta_and_hints(
-                    &message,
-                    &channel,
-                    conversation_id.as_deref(),
-                    project_id.as_deref(),
-                    trace_ref.clone(),
-                    stream_tx,
-                    crate::core::RequestExecutionHints { deep_research },
-                )
-                .await
+        let mut process_handle = {
+            let agent_ref = agent_ref.clone();
+            let message = message.clone();
+            let channel = channel.clone();
+            let conversation_id = conversation_id.clone();
+            let project_id = project_id.clone();
+            let trace_ref = trace_ref.clone();
+            tokio::spawn(async move {
+                let agent_guard = agent_ref.read().await;
+                agent_guard
+                    .process_message_stream_with_meta_and_hints(
+                        &message,
+                        &channel,
+                        conversation_id.as_deref(),
+                        project_id.as_deref(),
+                        trace_ref,
+                        stream_tx,
+                        crate::core::RequestExecutionHints { deep_research },
+                    )
+                    .await
+            })
+        };
+        let mut was_cancelled = false;
+        let result = if let Some(ref mut cancel_rx) = cancel_rx {
+            tokio::select! {
+                worker = &mut process_handle => {
+                    match worker {
+                        Ok(result) => result,
+                        Err(error) if error.is_cancelled() => {
+                            was_cancelled = true;
+                            Err(anyhow::anyhow!("Chat run cancelled"))
+                        }
+                        Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+                    }
+                }
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        was_cancelled = true;
+                        process_handle.abort();
+                        let _ = process_handle.await;
+                        Err(anyhow::anyhow!("Chat run cancelled"))
+                    } else {
+                        match process_handle.await {
+                            Ok(result) => result,
+                            Err(error) if error.is_cancelled() => {
+                                was_cancelled = true;
+                                Err(anyhow::anyhow!("Chat run cancelled"))
+                            }
+                            Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+                        }
+                    }
+                }
+            }
+        } else {
+            match process_handle.await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => {
+                    was_cancelled = true;
+                    Err(anyhow::anyhow!("Chat run cancelled"))
+                }
+                Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+            }
         };
 
         // Ensure the trace is marked complete even on early errors, so the poller can't hang.
@@ -9772,6 +10549,10 @@ async fn chat_stream(
         // Wait for poller to catch up
         let _ = trace_poller.await;
         let _ = stream_forwarder.await;
+
+        if let Some((task, _)) = tracked_task.as_ref() {
+            unregister_chat_task_cancellation(&app_state, &task.id.to_string()).await;
+        }
 
         // Emit final response
         match result {
@@ -9829,6 +10610,41 @@ async fn chat_stream(
                     .event("content")
                     .data(serde_json::to_string(&content).unwrap_or_default());
                 let _ = tx.send(Ok(event)).await;
+            }
+            Err(e) if was_cancelled => {
+                if let Some((task, work_type)) = tracked_task.as_ref() {
+                    let result_preview = "Cancelled by user.";
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(finalize_error) = agent_guard
+                            .finalize_task(
+                                task.id,
+                                crate::core::TaskStatus::Cancelled,
+                                Some(result_preview.to_string()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize cancelled streamed chat task '{}': {}",
+                                task.id,
+                                finalize_error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.id.to_string(),
+                            "description": task.description,
+                            "status": "cancelled",
+                            "work_type": work_type,
+                            "result_preview": result_preview,
+                            "conversation_id": conversation_id.clone(),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
             }
             Err(e) => {
                 if let Some((task, work_type)) = tracked_task.as_ref() {
@@ -10833,8 +11649,7 @@ async fn update_task(
 
     if let Some(arguments) = request.arguments {
         task.arguments = arguments;
-        args_to_save =
-            Some(serde_json::to_string(&task.arguments).unwrap_or_else(|_| "{}".to_string()));
+        args_to_save = Some(serde_json::to_string(&task.arguments).unwrap_or("{}".to_string()));
     }
 
     if let Some(cron_value) = request.cron {
@@ -11053,7 +11868,7 @@ async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>) -> R
             .storage
             .update_task_status(
                 &id,
-                &serde_json::to_string(&task.status).unwrap_or_else(|_| "Cancelled".to_string()),
+                &serde_json::to_string(&task.status).unwrap_or("Cancelled".to_string()),
             )
             .await
     };
@@ -11067,6 +11882,8 @@ async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>) -> R
         )
             .into_response();
     }
+
+    signal_chat_task_cancellation(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -11112,7 +11929,7 @@ async fn pause_task(State(state): State<AppState>, Path(id): Path<String>) -> Re
         }
 
         task.status = TaskStatus::Paused;
-        serde_json::to_string(&task.status).unwrap_or_else(|_| "\"Paused\"".to_string())
+        serde_json::to_string(&task.status).unwrap_or("\"Paused\"".to_string())
     };
 
     let save_result = {
@@ -11187,7 +12004,7 @@ async fn resume_task(State(state): State<AppState>, Path(id): Path<String>) -> R
         }
 
         (
-            serde_json::to_string(&task.status).unwrap_or_else(|_| "\"Pending\"".to_string()),
+            serde_json::to_string(&task.status).unwrap_or("\"Pending\"".to_string()),
             task.scheduled_for.as_ref().map(|dt| dt.to_rfc3339()),
         )
     };
@@ -11274,7 +12091,7 @@ async fn retry_task(State(state): State<AppState>, Path(id): Path<String>) -> Re
         };
 
         (
-            serde_json::to_string(&task.status).unwrap_or_else(|_| "Pending".to_string()),
+            serde_json::to_string(&task.status).unwrap_or("Pending".to_string()),
             task.scheduled_for.as_ref().map(|dt| dt.to_rfc3339()),
         )
     };
@@ -12175,13 +12992,20 @@ async fn build_autonomy_briefing(
             &settings.trust_policy,
         ));
     }
-    recommended_actions.push(recommendation(
-        "Send Daily Command Brief",
-        "Generate today's executive brief and push it to your preferred channel.",
-        "daily_brief_now",
-        serde_json::json!({}),
-        &settings.trust_policy,
-    ));
+    // Only suggest daily brief when the agent has a notification channel configured.
+    let has_notification_channel = agent.config.telegram.is_some()
+        || agent.config.slack.is_some()
+        || agent.config.discord.is_some();
+    if has_notification_channel {
+        recommended_actions.push(recommendation(
+            "Send Daily Command Brief",
+            "Generate today's executive brief and push it to your preferred channel.",
+            "daily_brief_now",
+            serde_json::json!({}),
+            &settings.trust_policy,
+        ));
+    }
+    // Only suggest delegation when swarm is ready and has specialists.
     let swarm_ready = agent.swarm.is_some() && !agent.config.swarm.specialists.is_empty();
     if recommended_actions.len() < 3 && swarm_ready {
         recommended_actions.push(recommendation(
@@ -12438,6 +13262,10 @@ fn settings_secret_source_for_custom_key(key: &str) -> &'static str {
     }
 }
 
+fn is_configured_secret(value: &str) -> bool {
+    !value.trim().is_empty() && value != "[ENCRYPTED]"
+}
+
 fn custom_settings_secret_is_deletable(_key: &str) -> bool {
     true
 }
@@ -12490,6 +13318,51 @@ fn collect_settings_secret_entries(
             "telegram_bot_token".to_string(),
             value,
             "telegram",
+            false,
+        );
+    }
+    if let Some(value) = secrets.slack_bot_token.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "slack_bot_token".to_string(),
+            value,
+            "slack",
+            false,
+        );
+    }
+    if let Some(value) = secrets.slack_signing_secret.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "slack_signing_secret".to_string(),
+            value,
+            "slack",
+            false,
+        );
+    }
+    if let Some(value) = secrets.discord_bot_token.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "discord_bot_token".to_string(),
+            value,
+            "discord",
+            false,
+        );
+    }
+    if let Some(value) = secrets.matrix_access_token.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "matrix_access_token".to_string(),
+            value,
+            "matrix",
+            false,
+        );
+    }
+    if let Some(value) = secrets.teams_access_token.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "teams_access_token".to_string(),
+            value,
+            "teams",
             false,
         );
     }
@@ -13054,8 +13927,17 @@ async fn build_evolution_settings_response(
         "No evolution runs yet".to_string()
     };
 
+    let self_evolve_enabled = storage
+        .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+
     EvolutionSettingsResponse {
-        self_evolve_enabled: true,
+        self_evolve_enabled,
         canary,
         last_promotion_result,
         replay_gate_result,
@@ -13161,6 +14043,28 @@ async fn update_evolution_settings(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
+    if let Some(enabled) = request.self_evolve_enabled {
+        let raw = if enabled {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        };
+        if let Err(e) = storage
+            .set(
+                crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY,
+                raw,
+            )
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update self_evolve_enabled: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
     if let Some(enabled) = request.deploy_guard_default {
         let raw = if enabled {
             b"true".as_slice()
@@ -13248,6 +14152,7 @@ async fn persist_evolution_action_trace(
         total_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("evolution".to_string()),
+        plan: None,
     }));
 
     let agent = state.agent.read().await;
@@ -13460,8 +14365,9 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             .cloned()
     };
     let moltbook_settings = moltbook::load_moltbook_settings(&storage).await;
+    let moltbook_has_api_key = moltbook::has_moltbook_api_key(&config_dir, Some(&data_dir));
     let daily_brief_channel = match storage.get(DAILY_BRIEF_CHANNEL_KEY).await {
-        Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_else(|_| "telegram".to_string()),
+        Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or("telegram".to_string()),
         _ => "telegram".to_string(),
     };
     let stored_daily_brief_enabled =
@@ -13480,7 +14386,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                 .and_then(|task| task.cron.as_deref())
                 .and_then(daily_brief_time_from_cron)
         })
-        .unwrap_or_else(|| DEFAULT_DAILY_BRIEF_TIME.to_string());
+        .unwrap_or(DEFAULT_DAILY_BRIEF_TIME.to_string());
     let daily_brief_enabled = stored_daily_brief_enabled || daily_brief_task.is_some();
     let moltbook_last_run_at = storage
         .get(moltbook::MOLTBOOK_LAST_RUN_KEY)
@@ -13583,6 +14489,182 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+
+    let (
+        slack_enabled,
+        has_slack_bot_token,
+        has_slack_signing_secret,
+        slack_api_base_url,
+        slack_default_channel_id,
+        slack_default_thread_ts,
+        slack_workspace_id,
+        slack_workspace_name,
+        slack_delivery_ready,
+    ) = match &config.slack {
+        Some(slack) => (
+            true,
+            is_configured_secret(&slack.bot_token),
+            is_configured_secret(&slack.signing_secret),
+            slack.api_base_url.clone(),
+            slack.default_channel_id.clone(),
+            slack.default_thread_ts.clone(),
+            slack.workspace_id.clone(),
+            slack.workspace_name.clone(),
+            is_configured_secret(&slack.bot_token) && is_configured_secret(&slack.signing_secret),
+        ),
+        None => (
+            false,
+            false,
+            false,
+            "https://slack.com/api".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            false,
+        ),
+    };
+
+    let (
+        discord_enabled,
+        has_discord_bot_token,
+        discord_api_base_url,
+        discord_default_channel_id,
+        discord_default_thread_id,
+        discord_guild_id,
+        discord_application_id,
+        discord_webhook_url,
+        discord_delivery_ready,
+    ) = match &config.discord {
+        Some(discord) => {
+            let has_bot_token = is_configured_secret(&discord.bot_token);
+            (
+                true,
+                has_bot_token,
+                discord.api_base_url.clone(),
+                discord.default_channel_id.clone(),
+                discord.default_thread_id.clone(),
+                discord.guild_id.clone(),
+                discord.application_id.clone(),
+                discord.webhook_url.clone(),
+                has_bot_token || !discord.webhook_url.trim().is_empty(),
+            )
+        }
+        None => (
+            false,
+            false,
+            "https://discord.com/api".to_string(),
+            String::new(),
+            None,
+            None,
+            None,
+            String::new(),
+            false,
+        ),
+    };
+
+    let (
+        matrix_enabled,
+        has_matrix_access_token,
+        matrix_homeserver_url,
+        matrix_user_id,
+        matrix_device_id,
+        matrix_account_id,
+        matrix_default_room_id,
+        matrix_sync_timeout_ms,
+        matrix_limit,
+        matrix_user_agent,
+        matrix_delivery_ready,
+    ) = match &config.matrix {
+        Some(matrix) => (
+            true,
+            is_configured_secret(&matrix.access_token),
+            matrix.homeserver_url.clone(),
+            matrix.user_id.clone(),
+            matrix.device_id.clone(),
+            matrix.account_id.clone(),
+            matrix.default_room_id.clone(),
+            matrix.sync_timeout_ms,
+            matrix.limit,
+            matrix.user_agent.clone(),
+            is_configured_secret(&matrix.access_token)
+                && !matrix.homeserver_url.trim().is_empty()
+                && !matrix.user_id.trim().is_empty(),
+        ),
+        None => (
+            false,
+            false,
+            String::new(),
+            String::new(),
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            false,
+        ),
+    };
+
+    let (
+        teams_enabled,
+        has_teams_access_token,
+        teams_service_url,
+        teams_bot_app_id,
+        teams_bot_name,
+        teams_tenant_id,
+        teams_team_id,
+        teams_channel_id,
+        teams_chat_id,
+        teams_graph_base_url,
+        teams_delivery_mode,
+        teams_timeout_secs,
+        teams_user_agent,
+        teams_delivery_ready,
+    ) = match &config.teams {
+        Some(teams) => (
+            true,
+            is_configured_secret(&teams.access_token),
+            teams.service_url.clone(),
+            teams.bot_app_id.clone(),
+            teams.bot_name.clone(),
+            teams.tenant_id.clone(),
+            teams.team_id.clone(),
+            teams.channel_id.clone(),
+            teams.chat_id.clone(),
+            teams.graph_base_url.clone(),
+            match teams.delivery_mode {
+                crate::channels::teams::TeamsDeliveryMode::Auto => "auto",
+                crate::channels::teams::TeamsDeliveryMode::BotFramework => "bot_framework",
+                crate::channels::teams::TeamsDeliveryMode::Graph => "graph",
+            }
+            .to_string(),
+            teams.timeout_secs,
+            teams.user_agent.clone(),
+            is_configured_secret(&teams.access_token)
+                && !teams.service_url.trim().is_empty()
+                && teams
+                    .bot_app_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        ),
+        None => (
+            false,
+            false,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("https://graph.microsoft.com/v1.0".to_string()),
+            "auto".to_string(),
+            15,
+            None,
+            false,
+        ),
+    };
 
     let (telegram_enabled, telegram_users, has_telegram_token, telegram_delivery_ready) =
         match &config.telegram {
@@ -13723,11 +14805,53 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         has_fallback_api_key: has_fallback_key,
         model_pool: model_pool_summary,
         smart_routing: config.model_pool.smart_routing,
-        app_deploy_model_id: config.app_deploy_model_id.clone(),
         telegram_enabled,
         has_telegram_token,
         telegram_delivery_ready,
         telegram_allowed_users: telegram_users,
+        slack_enabled,
+        has_slack_bot_token,
+        has_slack_signing_secret,
+        slack_api_base_url,
+        slack_default_channel_id,
+        slack_default_thread_ts,
+        slack_workspace_id,
+        slack_workspace_name,
+        slack_delivery_ready,
+        discord_enabled,
+        has_discord_bot_token,
+        discord_api_base_url,
+        discord_default_channel_id,
+        discord_default_thread_id,
+        discord_guild_id,
+        discord_application_id,
+        discord_webhook_url,
+        discord_delivery_ready,
+        matrix_enabled,
+        has_matrix_access_token,
+        matrix_homeserver_url,
+        matrix_user_id,
+        matrix_device_id,
+        matrix_account_id,
+        matrix_default_room_id,
+        matrix_sync_timeout_ms,
+        matrix_limit,
+        matrix_user_agent,
+        matrix_delivery_ready,
+        teams_enabled,
+        has_teams_access_token,
+        teams_service_url,
+        teams_bot_app_id,
+        teams_bot_name,
+        teams_tenant_id,
+        teams_team_id,
+        teams_channel_id,
+        teams_chat_id,
+        teams_graph_base_url,
+        teams_delivery_mode,
+        teams_timeout_secs,
+        teams_user_agent,
+        teams_delivery_ready,
         whatsapp_enabled,
         whatsapp_mode: whatsapp_mode_str,
         has_whatsapp_token,
@@ -13740,15 +14864,15 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         search_primary: search_cfg
             .as_ref()
             .and_then(|c| c.primary.clone())
-            .unwrap_or_else(|| "playwright".to_string()),
+            .unwrap_or("playwright".to_string()),
         search_fallback1: search_cfg
             .as_ref()
             .and_then(|c| c.fallback1.clone())
-            .unwrap_or_else(|| "duckduckgo".to_string()),
+            .unwrap_or("duckduckgo".to_string()),
         search_fallback2: search_cfg
             .as_ref()
             .and_then(|c| c.fallback2.clone())
-            .unwrap_or_else(|| "none".to_string()),
+            .unwrap_or("none".to_string()),
         search_serper_configured: search_cfg
             .as_ref()
             .map(|cfg| cfg.serper.is_some())
@@ -13770,6 +14894,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         moltbook_sync_frequency: moltbook_settings.sync_frequency,
         moltbook_write_enabled: moltbook_settings.write_enabled,
         moltbook_defer_when_busy: moltbook_settings.defer_when_busy,
+        moltbook_has_api_key,
         moltbook_last_run_at,
         moltbook_last_status,
         tunnel_active: state.tunnel.read().await.active,
@@ -13792,6 +14917,199 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             &data_dir,
         ),
     })
+}
+
+fn google_workspace_client_source_label(source: &str) -> &'static str {
+    match source {
+        "environment_google_workspace" => "Environment override",
+        "settings" => "Saved in AgentArk",
+        "environment_legacy_google" => "Legacy environment override",
+        "legacy_integration" => "Legacy integration config",
+        _ => "Not configured",
+    }
+}
+
+fn google_workspace_client_id_hint(client_id: &str) -> String {
+    let trimmed = client_id.trim();
+    if trimmed.len() <= 12 {
+        return trimmed.to_string();
+    }
+    let prefix = &trimmed[..6];
+    let suffix = &trimmed[trimmed.len().saturating_sub(4)..];
+    format!("{}...{}", prefix, suffix)
+}
+
+fn build_google_workspace_oauth_client_settings_response(
+    config_dir: &std::path::Path,
+) -> GoogleWorkspaceOAuthClientSettingsResponse {
+    let source = crate::actions::google_workspace::workspace_client_config_source(config_dir)
+        .ok()
+        .flatten()
+        .unwrap_or("none")
+        .to_string();
+    let config = crate::actions::google_workspace::load_workspace_client_config(config_dir)
+        .ok()
+        .flatten();
+    GoogleWorkspaceOAuthClientSettingsResponse {
+        configured: config.is_some(),
+        source_label: google_workspace_client_source_label(&source).to_string(),
+        managed_externally: source == "environment_google_workspace"
+            || source == "environment_legacy_google",
+        source,
+        client_id_hint: config
+            .as_ref()
+            .map(|value| google_workspace_client_id_hint(&value.client_id)),
+        secret_configured: config.is_some(),
+        redirect_uri: crate::actions::google_workspace::oauth_redirect_uri().to_string(),
+    }
+}
+
+async fn get_google_workspace_oauth_client_settings(
+    State(state): State<AppState>,
+) -> Json<GoogleWorkspaceOAuthClientSettingsResponse> {
+    let config_dir = { state.agent.read().await.config_dir.clone() };
+    Json(build_google_workspace_oauth_client_settings_response(
+        &config_dir,
+    ))
+}
+
+async fn update_google_workspace_oauth_client_settings(
+    State(state): State<AppState>,
+    Json(request): Json<GoogleWorkspaceOAuthClientSettingsUpdate>,
+) -> Response {
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    let manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
+        &config_dir,
+        Some(&data_dir),
+    ) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Config error: {}", error),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if request.clear {
+        if let Err(error) =
+            crate::actions::google_workspace::clear_saved_workspace_client_config(&config_dir)
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to clear saved Google OAuth client: {}", error),
+                }),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            Json(build_google_workspace_oauth_client_settings_response(
+                &config_dir,
+            )),
+        )
+            .into_response();
+    }
+
+    let credentials_json = request
+        .credentials_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manual_client_id = request
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manual_client_secret = request
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let next_config = if let Some(raw) = credentials_json {
+        match crate::actions::google_workspace::parse_credentials_json(raw) {
+            Ok(config) => config,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else if let (Some(client_id), Some(client_secret)) = (manual_client_id, manual_client_secret)
+    {
+        crate::actions::google_workspace::GoogleWorkspaceClientConfig {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Provide a Google OAuth client JSON file, or enter both client ID and client secret."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let previous_saved =
+        crate::actions::google_workspace::load_saved_workspace_client_config(&config_dir)
+            .ok()
+            .flatten();
+    let credentials_changed = previous_saved.as_ref().is_none_or(|existing| {
+        existing.client_id != next_config.client_id
+            || existing.client_secret != next_config.client_secret
+    });
+
+    if let Err(error) =
+        crate::actions::google_workspace::save_workspace_client_config(&config_dir, &next_config)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to save Google OAuth client: {}", error),
+            }),
+        )
+            .into_response();
+    }
+
+    if credentials_changed {
+        for key in [
+            crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+            crate::actions::google_workspace::GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY,
+            "gmail_tokens",
+            "calendar_tokens",
+        ] {
+            let _ = manager.set_custom_secret(key, None);
+        }
+        for key in [
+            integrations::integration_enabled_key("google_workspace"),
+            integrations::integration_enabled_key("gmail"),
+            integrations::integration_enabled_key("google_calendar"),
+        ] {
+            let _ = manager.set_custom_secret(&key, Some("false".to_string()));
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(build_google_workspace_oauth_client_settings_response(
+            &config_dir,
+        )),
+    )
+        .into_response()
 }
 
 /// Get media generation settings (which providers are configured)
@@ -13907,14 +15225,14 @@ async fn update_settings(
                 .and_then(|task| task.cron.as_deref())
                 .and_then(daily_brief_time_from_cron)
         })
-        .unwrap_or_else(|| DEFAULT_DAILY_BRIEF_TIME.to_string());
+        .unwrap_or(DEFAULT_DAILY_BRIEF_TIME.to_string());
     let stored_daily_brief_channel = deferred_storage
         .get(DAILY_BRIEF_CHANNEL_KEY)
         .await
         .ok()
         .flatten()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_else(|| "telegram".to_string());
+        .unwrap_or("telegram".to_string());
     let requested_daily_brief_time = if let Some(value) = settings.daily_brief_time.as_ref() {
         let Some(normalized) = normalize_daily_brief_time(value) else {
             return (
@@ -13987,11 +15305,14 @@ async fn update_settings(
     let requested_daily_brief_channel = if let Some(channel) = settings.daily_brief_channel.as_ref()
     {
         let normalized = channel.trim().to_lowercase();
-        if normalized != "telegram" && normalized != "whatsapp" && normalized != "email" {
+        if !matches!(
+            normalized.as_str(),
+            "telegram" | "whatsapp" | "slack" | "discord" | "matrix" | "teams" | "email"
+        ) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Daily brief channel must be 'telegram', 'whatsapp', or 'email'"
+                    error: "Daily brief channel must be 'telegram', 'whatsapp', 'slack', 'discord', 'matrix', 'teams', or 'email'"
                         .to_string(),
                 }),
             )
@@ -14163,6 +15484,32 @@ async fn update_settings(
             .as_ref()
             .map(|t| t.bot_token.clone());
 
+        let mut existing_slack_bot_token = agent_guard
+            .config
+            .slack
+            .as_ref()
+            .map(|s| s.bot_token.clone());
+        let mut existing_slack_signing_secret = agent_guard
+            .config
+            .slack
+            .as_ref()
+            .map(|s| s.signing_secret.clone());
+        let mut existing_discord_bot_token = agent_guard
+            .config
+            .discord
+            .as_ref()
+            .map(|d| d.bot_token.clone());
+        let mut existing_matrix_access_token = agent_guard
+            .config
+            .matrix
+            .as_ref()
+            .map(|m| m.access_token.clone());
+        let mut existing_teams_access_token = agent_guard
+            .config
+            .teams
+            .as_ref()
+            .map(|t| t.access_token.clone());
+
         let mut existing_whatsapp_token = agent_guard
             .config
             .whatsapp
@@ -14171,6 +15518,21 @@ async fn update_settings(
 
         if matches!(
             existing_telegram_token.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_slack_bot_token.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_slack_signing_secret.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_discord_bot_token.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_matrix_access_token.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_teams_access_token.as_deref(),
             None | Some("") | Some("[ENCRYPTED]")
         ) || matches!(
             existing_whatsapp_token.as_deref(),
@@ -14186,6 +15548,36 @@ async fn update_settings(
                         None | Some("") | Some("[ENCRYPTED]")
                     ) {
                         existing_telegram_token = secrets.telegram_bot_token.clone();
+                    }
+                    if matches!(
+                        existing_slack_bot_token.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_slack_bot_token = secrets.slack_bot_token.clone();
+                    }
+                    if matches!(
+                        existing_slack_signing_secret.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_slack_signing_secret = secrets.slack_signing_secret.clone();
+                    }
+                    if matches!(
+                        existing_discord_bot_token.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_discord_bot_token = secrets.discord_bot_token.clone();
+                    }
+                    if matches!(
+                        existing_matrix_access_token.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_matrix_access_token = secrets.matrix_access_token.clone();
+                    }
+                    if matches!(
+                        existing_teams_access_token.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_teams_access_token = secrets.teams_access_token.clone();
                     }
                     if matches!(
                         existing_whatsapp_token.as_deref(),
@@ -14279,7 +15671,7 @@ async fn update_settings(
             if settings.llm_provider.as_str() == "ollama" {
                 let url = base_url
                     .clone()
-                    .unwrap_or_else(|| "http://localhost:11434".to_string());
+                    .unwrap_or("http://localhost:11434".to_string());
                 if url.trim().is_empty() {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -14313,7 +15705,7 @@ async fn update_settings(
             // Build new LLM provider
             match settings.llm_provider.as_str() {
                 "ollama" => LlmProvider::Ollama {
-                    base_url: base_url.unwrap_or_else(|| "http://localhost:11434".to_string()),
+                    base_url: base_url.unwrap_or("http://localhost:11434".to_string()),
                     model: settings.llm_model,
                 },
                 "anthropic" => LlmProvider::Anthropic {
@@ -14379,8 +15771,7 @@ async fn update_settings(
                 };
                 match fb_provider.as_str() {
                     "ollama" => Some(LlmProvider::Ollama {
-                        base_url: fallback_base_url
-                            .unwrap_or_else(|| "http://localhost:11434".to_string()),
+                        base_url: fallback_base_url.unwrap_or("http://localhost:11434".to_string()),
                         model: fb_model,
                     }),
                     "anthropic" => Some(LlmProvider::Anthropic {
@@ -14438,22 +15829,433 @@ async fn update_settings(
 
                 Some(TelegramConfig {
                     bot_token: token.unwrap(),
-                    allowed_users: settings.telegram_allowed_users.clone().unwrap_or_else(|| {
+                    allowed_users: settings.telegram_allowed_users.clone().unwrap_or(
                         current_telegram
                             .as_ref()
                             .map(|t| t.allowed_users.clone())
-                            .unwrap_or_default()
-                    }),
+                            .unwrap_or_default(),
+                    ),
                     dm_policy: current_telegram
                         .as_ref()
                         .map(|t| t.dm_policy.clone())
-                        .unwrap_or_else(|| "pairing".to_string()),
+                        .unwrap_or("pairing".to_string()),
                 })
             } else {
                 None
             }
         } else {
             current_telegram
+        };
+
+        let slack_update_requested = settings.slack_enabled.is_some()
+            || settings.slack_bot_token.is_some()
+            || settings.slack_signing_secret.is_some()
+            || settings.slack_api_base_url.is_some()
+            || settings.slack_default_channel_id.is_some()
+            || settings.slack_default_thread_ts.is_some()
+            || settings.slack_workspace_id.is_some()
+            || settings.slack_workspace_name.is_some();
+        let current_slack = agent_guard.config.slack.clone();
+        let new_slack = if slack_update_requested {
+            let slack_enabled = settings.slack_enabled.unwrap_or(
+                current_slack.is_some()
+                    || settings.slack_bot_token.is_some()
+                    || settings.slack_signing_secret.is_some()
+                    || settings.slack_api_base_url.is_some()
+                    || settings.slack_default_channel_id.is_some()
+                    || settings.slack_default_thread_ts.is_some()
+                    || settings.slack_workspace_id.is_some()
+                    || settings.slack_workspace_name.is_some(),
+            );
+            if slack_enabled {
+                let bot_token = settings
+                    .slack_bot_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_slack_bot_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                let signing_secret = settings
+                    .slack_signing_secret
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_slack_signing_secret.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                if bot_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Slack bot token is required when Slack is enabled".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if signing_secret.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Slack signing secret is required when Slack is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                Some(SlackChannelConfig {
+                    bot_token,
+                    signing_secret,
+                    api_base_url: settings
+                        .slack_api_base_url
+                        .clone()
+                        .or_else(|| current_slack.as_ref().map(|c| c.api_base_url.clone()))
+                        .unwrap_or("https://slack.com/api".to_string()),
+                    default_channel_id: settings
+                        .slack_default_channel_id
+                        .clone()
+                        .or_else(|| current_slack.as_ref().map(|c| c.default_channel_id.clone()))
+                        .unwrap_or_default(),
+                    default_thread_ts: settings.slack_default_thread_ts.clone().or_else(|| {
+                        current_slack
+                            .as_ref()
+                            .and_then(|c| c.default_thread_ts.clone())
+                    }),
+                    workspace_id: settings
+                        .slack_workspace_id
+                        .clone()
+                        .or_else(|| current_slack.as_ref().and_then(|c| c.workspace_id.clone())),
+                    workspace_name: settings.slack_workspace_name.clone().or_else(|| {
+                        current_slack
+                            .as_ref()
+                            .and_then(|c| c.workspace_name.clone())
+                    }),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_slack
+        };
+
+        let discord_update_requested = settings.discord_enabled.is_some()
+            || settings.discord_bot_token.is_some()
+            || settings.discord_api_base_url.is_some()
+            || settings.discord_default_channel_id.is_some()
+            || settings.discord_default_thread_id.is_some()
+            || settings.discord_guild_id.is_some()
+            || settings.discord_application_id.is_some()
+            || settings.discord_webhook_url.is_some();
+        let current_discord = agent_guard.config.discord.clone();
+        let new_discord = if discord_update_requested {
+            let discord_enabled = settings.discord_enabled.unwrap_or(
+                current_discord.is_some()
+                    || settings.discord_bot_token.is_some()
+                    || settings.discord_api_base_url.is_some()
+                    || settings.discord_default_channel_id.is_some()
+                    || settings.discord_default_thread_id.is_some()
+                    || settings.discord_guild_id.is_some()
+                    || settings.discord_application_id.is_some()
+                    || settings.discord_webhook_url.is_some(),
+            );
+            if discord_enabled {
+                let bot_token = settings
+                    .discord_bot_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_discord_bot_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                let webhook_url = settings
+                    .discord_webhook_url
+                    .clone()
+                    .or_else(|| current_discord.as_ref().map(|c| c.webhook_url.clone()))
+                    .unwrap_or_default();
+                if bot_token.trim().is_empty() && webhook_url.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "Discord bot token or webhook URL is required when Discord is enabled"
+                                    .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                Some(DiscordChannelConfig {
+                    bot_token,
+                    webhook_url,
+                    api_base_url: settings
+                        .discord_api_base_url
+                        .clone()
+                        .or_else(|| current_discord.as_ref().map(|c| c.api_base_url.clone()))
+                        .unwrap_or("https://discord.com/api".to_string()),
+                    default_channel_id: settings
+                        .discord_default_channel_id
+                        .clone()
+                        .or_else(|| {
+                            current_discord
+                                .as_ref()
+                                .map(|c| c.default_channel_id.clone())
+                        })
+                        .unwrap_or_default(),
+                    default_thread_id: settings.discord_default_thread_id.clone().or_else(|| {
+                        current_discord
+                            .as_ref()
+                            .and_then(|c| c.default_thread_id.clone())
+                    }),
+                    guild_id: settings
+                        .discord_guild_id
+                        .clone()
+                        .or_else(|| current_discord.as_ref().and_then(|c| c.guild_id.clone())),
+                    application_id: settings.discord_application_id.clone().or_else(|| {
+                        current_discord
+                            .as_ref()
+                            .and_then(|c| c.application_id.clone())
+                    }),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_discord
+        };
+
+        let matrix_update_requested = settings.matrix_enabled.is_some()
+            || settings.matrix_homeserver_url.is_some()
+            || settings.matrix_access_token.is_some()
+            || settings.matrix_user_id.is_some()
+            || settings.matrix_device_id.is_some()
+            || settings.matrix_account_id.is_some()
+            || settings.matrix_default_room_id.is_some()
+            || settings.matrix_sync_timeout_ms.is_some()
+            || settings.matrix_limit.is_some()
+            || settings.matrix_user_agent.is_some();
+        let current_matrix = agent_guard.config.matrix.clone();
+        let new_matrix = if matrix_update_requested {
+            let matrix_enabled = settings.matrix_enabled.unwrap_or(
+                current_matrix.is_some()
+                    || settings.matrix_homeserver_url.is_some()
+                    || settings.matrix_access_token.is_some()
+                    || settings.matrix_user_id.is_some()
+                    || settings.matrix_device_id.is_some()
+                    || settings.matrix_account_id.is_some()
+                    || settings.matrix_default_room_id.is_some()
+                    || settings.matrix_sync_timeout_ms.is_some()
+                    || settings.matrix_limit.is_some()
+                    || settings.matrix_user_agent.is_some(),
+            );
+            if matrix_enabled {
+                let access_token = settings
+                    .matrix_access_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_matrix_access_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                let homeserver_url = settings
+                    .matrix_homeserver_url
+                    .clone()
+                    .or_else(|| current_matrix.as_ref().map(|c| c.homeserver_url.clone()))
+                    .unwrap_or_default();
+                let user_id = settings
+                    .matrix_user_id
+                    .clone()
+                    .or_else(|| current_matrix.as_ref().map(|c| c.user_id.clone()))
+                    .unwrap_or_default();
+                if access_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Matrix access token is required when Matrix is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if homeserver_url.trim().is_empty() || user_id.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Matrix homeserver URL and user ID are required when Matrix is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                Some(MatrixTransportConfig {
+                    homeserver_url,
+                    access_token,
+                    user_id,
+                    device_id: settings
+                        .matrix_device_id
+                        .clone()
+                        .or_else(|| current_matrix.as_ref().and_then(|c| c.device_id.clone())),
+                    account_id: settings
+                        .matrix_account_id
+                        .clone()
+                        .or_else(|| current_matrix.as_ref().and_then(|c| c.account_id.clone())),
+                    default_room_id: settings.matrix_default_room_id.clone().or_else(|| {
+                        current_matrix
+                            .as_ref()
+                            .and_then(|c| c.default_room_id.clone())
+                    }),
+                    sync_timeout_ms: settings
+                        .matrix_sync_timeout_ms
+                        .or_else(|| current_matrix.as_ref().map(|c| c.sync_timeout_ms))
+                        .unwrap_or(0),
+                    limit: settings
+                        .matrix_limit
+                        .or_else(|| current_matrix.as_ref().map(|c| c.limit))
+                        .unwrap_or(100),
+                    user_agent: settings
+                        .matrix_user_agent
+                        .clone()
+                        .or_else(|| current_matrix.as_ref().and_then(|c| c.user_agent.clone())),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_matrix
+        };
+
+        let teams_update_requested = settings.teams_enabled.is_some()
+            || settings.teams_service_url.is_some()
+            || settings.teams_access_token.is_some()
+            || settings.teams_bot_app_id.is_some()
+            || settings.teams_bot_name.is_some()
+            || settings.teams_tenant_id.is_some()
+            || settings.teams_team_id.is_some()
+            || settings.teams_channel_id.is_some()
+            || settings.teams_chat_id.is_some()
+            || settings.teams_graph_base_url.is_some()
+            || settings.teams_delivery_mode.is_some()
+            || settings.teams_timeout_secs.is_some()
+            || settings.teams_user_agent.is_some();
+        let current_teams = agent_guard.config.teams.clone();
+        let new_teams = if teams_update_requested {
+            let teams_enabled = settings.teams_enabled.unwrap_or(
+                current_teams.is_some()
+                    || settings.teams_service_url.is_some()
+                    || settings.teams_access_token.is_some()
+                    || settings.teams_bot_app_id.is_some()
+                    || settings.teams_bot_name.is_some()
+                    || settings.teams_tenant_id.is_some()
+                    || settings.teams_team_id.is_some()
+                    || settings.teams_channel_id.is_some()
+                    || settings.teams_chat_id.is_some()
+                    || settings.teams_graph_base_url.is_some()
+                    || settings.teams_delivery_mode.is_some()
+                    || settings.teams_timeout_secs.is_some()
+                    || settings.teams_user_agent.is_some(),
+            );
+            if teams_enabled {
+                let access_token = settings
+                    .teams_access_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_teams_access_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                let service_url = settings
+                    .teams_service_url
+                    .clone()
+                    .or_else(|| current_teams.as_ref().map(|c| c.service_url.clone()))
+                    .unwrap_or_default();
+                if access_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Teams access token is required when Teams is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if service_url.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Teams service URL is required when Teams is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                let bot_app_id = settings
+                    .teams_bot_app_id
+                    .clone()
+                    .or_else(|| current_teams.as_ref().and_then(|c| c.bot_app_id.clone()))
+                    .unwrap_or_default();
+                if bot_app_id.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Teams bot app ID is required when Teams is enabled".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                let current_delivery_mode = current_teams.as_ref().map(|c| match c.delivery_mode {
+                    crate::channels::teams::TeamsDeliveryMode::Auto => "auto",
+                    crate::channels::teams::TeamsDeliveryMode::BotFramework => "bot_framework",
+                    crate::channels::teams::TeamsDeliveryMode::Graph => "graph",
+                });
+                let delivery_mode = match settings
+                    .teams_delivery_mode
+                    .as_deref()
+                    .or(current_delivery_mode)
+                    .unwrap_or("auto")
+                {
+                    "bot_framework" | "botframework" => {
+                        crate::channels::teams::TeamsDeliveryMode::BotFramework
+                    }
+                    "graph" => crate::channels::teams::TeamsDeliveryMode::Graph,
+                    _ => crate::channels::teams::TeamsDeliveryMode::Auto,
+                };
+
+                Some(TeamsTransportConfig {
+                    service_url,
+                    access_token,
+                    bot_app_id: Some(bot_app_id),
+                    bot_name: settings
+                        .teams_bot_name
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.bot_name.clone())),
+                    tenant_id: settings
+                        .teams_tenant_id
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.tenant_id.clone())),
+                    team_id: settings
+                        .teams_team_id
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.team_id.clone())),
+                    channel_id: settings
+                        .teams_channel_id
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.channel_id.clone())),
+                    chat_id: settings
+                        .teams_chat_id
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.chat_id.clone())),
+                    graph_base_url: settings.teams_graph_base_url.clone().or_else(|| {
+                        current_teams
+                            .as_ref()
+                            .and_then(|c| c.graph_base_url.clone())
+                    }),
+                    delivery_mode,
+                    timeout_secs: settings
+                        .teams_timeout_secs
+                        .or_else(|| current_teams.as_ref().map(|c| c.timeout_secs))
+                        .unwrap_or(15),
+                    user_agent: settings
+                        .teams_user_agent
+                        .clone()
+                        .or_else(|| current_teams.as_ref().and_then(|c| c.user_agent.clone())),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_teams
         };
 
         let whatsapp_update_requested = settings.whatsapp_enabled.is_some()
@@ -14504,19 +16306,19 @@ async fn update_settings(
                     .whatsapp_verify_token
                     .clone()
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.verify_token.clone()))
-                    .unwrap_or_else(|| "agentark_verify".to_string());
+                    .unwrap_or("agentark_verify".to_string());
 
                 let bridge_url = settings
                     .whatsapp_bridge_url
                     .clone()
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.bridge_url.clone()))
-                    .unwrap_or_else(|| "http://127.0.0.1:8999".to_string());
+                    .unwrap_or("http://127.0.0.1:8999".to_string());
 
                 let dm_policy = settings
                     .whatsapp_dm_policy
                     .clone()
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.dm_policy.clone()))
-                    .unwrap_or_else(|| "pairing".to_string());
+                    .unwrap_or("pairing".to_string());
 
                 // Cloud API mode requires access token and phone number ID
                 if mode == crate::channels::whatsapp::WhatsAppMode::CloudApi {
@@ -14575,14 +16377,6 @@ async fn update_settings(
         if let Some(v) = settings.smart_routing {
             agent_guard.config.model_pool.smart_routing = v;
         }
-        if let Some(v) = settings.app_deploy_model_id.as_ref() {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                agent_guard.config.app_deploy_model_id = None;
-            } else {
-                agent_guard.config.app_deploy_model_id = Some(trimmed.to_string());
-            }
-        }
         if let Some(mode) = settings.deployment_mode.as_ref() {
             let normalized = mode.trim().to_ascii_lowercase();
             let parsed_mode = match normalized.as_str() {
@@ -14634,6 +16428,10 @@ async fn update_settings(
         agent_guard.config.llm = new_llm.clone();
         agent_guard.config.llm_fallback = new_llm_fallback;
         agent_guard.config.telegram = new_telegram.clone();
+        agent_guard.config.slack = new_slack.clone();
+        agent_guard.config.discord = new_discord.clone();
+        agent_guard.config.matrix = new_matrix.clone();
+        agent_guard.config.teams = new_teams.clone();
         agent_guard.config.whatsapp = new_whatsapp.clone();
 
         // Detect if Telegram config changed (needs process restart)
@@ -14893,7 +16691,7 @@ async fn update_settings(
             && search_config.playwright.is_none()
         {
             let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:3100".to_string());
+                .unwrap_or("http://127.0.0.1:3100".to_string());
             search_config.playwright =
                 Some(crate::actions::SearchBackend::Playwright { bridge_url });
         }
@@ -16024,14 +17822,6 @@ async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> 
 
         agent.config.model_pool.slots.remove(idx);
         agent.model_pool.remove(&id);
-        if agent
-            .config
-            .app_deploy_model_id
-            .as_ref()
-            .is_some_and(|slot_id| slot_id == &id)
-        {
-            agent.config.app_deploy_model_id = None;
-        }
 
         // If we removed the primary, promote the next one
         if agent.primary_model_id == id {
@@ -16163,7 +17953,7 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                         "enabled": a.enabled == 1,
                         "status": live
                             .map(|info| format!("{:?}", info.status))
-                            .unwrap_or_else(|| "Idle".to_string()),
+                .unwrap_or("Idle".to_string()),
                         "created_at": a.created_at,
                     })
                 })
@@ -16240,7 +18030,7 @@ fn build_swarm_agent_spec(
             base_url: request
                 .llm_base_url
                 .clone()
-                .unwrap_or_else(|| "http://localhost:11434".to_string()),
+                .unwrap_or("http://localhost:11434".to_string()),
             model: request.llm_model.clone(),
         },
     };
@@ -16289,7 +18079,7 @@ async fn swarm_add_agent(
                 &specialist_config.capabilities,
             ),
         )
-        .unwrap_or_else(|_| "[]".to_string()),
+        .unwrap_or("[]".to_string()),
         system_prompt: request.system_prompt.clone(),
         enabled: 1,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -16405,7 +18195,7 @@ async fn swarm_update_agent(
                 &specialist_config.capabilities,
             ),
         )
-        .unwrap_or_else(|_| "[]".to_string()),
+        .unwrap_or("[]".to_string()),
         system_prompt: request.system_prompt.clone(),
         enabled: 1,
         created_at: existing.created_at.clone(),
@@ -16628,42 +18418,104 @@ async fn list_conversations(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    const SIDEBAR_CONVERSATION_PAGE_SIZE: u64 = 20;
+    const STARRED_CONVERSATION_LIMIT: u64 = 3;
     let agent = state.agent.read().await;
     let project_id = params.get("project_id").map(|s| s.as_str());
-    let limit = params
+    let sidebar_mode = params
+        .get("sidebar")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false);
+    let requested_limit = params
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(20u64);
+    let limit = if sidebar_mode {
+        requested_limit.min(SIDEBAR_CONVERSATION_PAGE_SIZE)
+    } else {
+        requested_limit
+    };
     let offset = params
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
+    let internal_channels = ["arkpulse", "sentinel", "system"];
     let total = agent
         .storage
-        .count_conversations(project_id)
+        .count_conversations(
+            project_id,
+            &internal_channels,
+            if sidebar_mode { Some(false) } else { None },
+        )
         .await
         .unwrap_or(0);
     match agent
         .storage
-        .list_conversations(limit, offset, project_id)
+        .list_conversations(
+            limit,
+            offset,
+            project_id,
+            &internal_channels,
+            if sidebar_mode { Some(false) } else { None },
+        )
         .await
     {
         Ok(convs) => {
-            // Filter out internal/system conversations (arkpulse, sentinel, etc.)
-            let internal_channels = ["arkpulse", "sentinel", "system"];
             let list: Vec<serde_json::Value> = convs
                 .iter()
-                .filter(|c| !internal_channels.contains(&c.channel.as_str()))
                 .map(|c| {
                     serde_json::json!({
                         "id": c.id, "title": c.title, "channel": c.channel,
                         "project_id": c.project_id, "created_at": c.created_at,
                         "updated_at": c.updated_at, "message_count": c.message_count,
-                        "archived": c.archived,
+                        "archived": c.archived, "starred": c.starred,
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!({"conversations": list, "total": total, "limit": limit, "offset": offset}))).into_response()
+            let starred_conversations = if sidebar_mode {
+                match agent
+                    .storage
+                    .list_conversations(
+                        STARRED_CONVERSATION_LIMIT,
+                        0,
+                        project_id,
+                        &internal_channels,
+                        Some(true),
+                    )
+                    .await
+                {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "id": c.id, "title": c.title, "channel": c.channel,
+                                "project_id": c.project_id, "created_at": c.created_at,
+                                "updated_at": c.updated_at, "message_count": c.message_count,
+                                "archived": c.archived, "starred": c.starred,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "conversations": list,
+                    "starred_conversations": starred_conversations,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                })),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -16705,6 +18557,7 @@ async fn create_conversation_endpoint(
         updated_at: now,
         message_count: 0,
         archived: false,
+        starred: false,
     };
 
     let agent = state.agent.read().await;
@@ -16736,6 +18589,7 @@ async fn get_conversation_endpoint(
                 "id": conv.id, "title": conv.title, "channel": conv.channel,
                 "project_id": conv.project_id, "created_at": conv.created_at,
                 "updated_at": conv.updated_at, "message_count": conv.message_count,
+                "archived": conv.archived, "starred": conv.starred,
             })),
         )
             .into_response(),
@@ -16762,29 +18616,45 @@ async fn update_conversation_endpoint(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let title = body.get("title").and_then(|v| v.as_str());
-    if title.is_none() {
+    let starred = body.get("starred").and_then(|v| v.as_bool());
+    if title.is_none() && starred.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "Missing title".to_string(),
+                error: "Missing title or starred".to_string(),
             }),
         )
             .into_response();
     }
     let agent = state.agent.read().await;
-    match agent.storage.update_conversation(&id, title, None).await {
-        Ok(_) => (
+    match agent
+        .storage
+        .update_conversation(&id, title, None, starred)
+        .await
+    {
+        Ok(updated) => (
             StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "title": title})),
+            Json(serde_json::json!({
+                "status": "ok",
+                "title": updated.title,
+                "starred": updated.starred
+            })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            let message = e.to_string();
+            let status = if message.eq_ignore_ascii_case("Conversation not found") {
+                StatusCode::NOT_FOUND
+            } else if message
+                .to_ascii_lowercase()
+                .contains("max 3 starred chats allowed")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(ErrorResponse { error: message })).into_response()
+        }
     }
 }
 
@@ -17408,7 +19278,7 @@ Goal: {}\n\
 Constraints: {}",
         action_names.join(", "),
         goal,
-        request.constraints.clone().unwrap_or_else(|| "none".to_string())
+        request.constraints.clone().unwrap_or("none".to_string())
     );
 
     let llm_plan = agent
@@ -17437,7 +19307,7 @@ Constraints: {}",
                             action_names
                                 .first()
                                 .cloned()
-                                .unwrap_or_else(|| "daily_brief".to_string())
+                                .unwrap_or("daily_brief".to_string())
                         },
                         "arguments": { "query": goal }
                     }
@@ -17454,7 +19324,7 @@ Constraints: {}",
     let report_cron = request
         .report_cron
         .clone()
-        .unwrap_or_else(|| "0 0 9 * * *".to_string());
+        .unwrap_or("0 0 9 * * *".to_string());
 
     if request.preview_only {
         return (
@@ -17544,7 +19414,7 @@ Constraints: {}",
             let mut args = step
                 .get("arguments")
                 .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
+                .unwrap_or(serde_json::json!({}));
             args["goal_id"] = serde_json::json!(goal_id.clone());
             args["goal"] = serde_json::json!(goal);
             serde_json::json!({
@@ -17561,7 +19431,7 @@ Constraints: {}",
         serde_json::json!({
             "goal_id": goal_id,
             "steps": normalized_steps,
-            "summary": parsed.get("summary").cloned().unwrap_or_else(|| serde_json::json!("")),
+            "summary": parsed.get("summary").cloned().unwrap_or(serde_json::json!("")),
         }),
     );
     plan_task.status = TaskStatus::Pending;
@@ -17623,7 +19493,7 @@ async fn goal_progress_endpoint(
         .filter(|t| {
             goal_id
                 .map(|g| t.arguments.get("goal_id").and_then(|v| v.as_str()) == Some(g))
-                .unwrap_or_else(|| t.arguments.get("goal_id").is_some())
+                .unwrap_or(t.arguments.get("goal_id").is_some())
         })
         .collect();
     let completed = related
@@ -17709,7 +19579,7 @@ async fn run_goal_report_now(
                 .get("goal")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| t.description.trim_start_matches("Goal: ").to_string());
+                .unwrap_or(t.description.trim_start_matches("Goal: ").to_string());
             let pid = t
                 .arguments
                 .get("project_id")
@@ -17884,13 +19754,11 @@ async fn triage_inbox(
         .labels
         .clone()
         .filter(|l| !l.is_empty())
-        .unwrap_or_else(|| {
-            vec![
-                "Act now".to_string(),
-                "Delegate".to_string(),
-                "Ignore".to_string(),
-            ]
-        });
+        .unwrap_or(vec![
+            "Act now".to_string(),
+            "Delegate".to_string(),
+            "Ignore".to_string(),
+        ]);
     let agent = state.agent.read().await;
 
     let mut messages = request.messages.clone();
@@ -17946,7 +19814,7 @@ async fn triage_inbox(
                     let snippet = m.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
                     let label = if snippet.contains("urgent") || snippet.contains("asap") { "Act now" } else { "Delegate" };
                     serde_json::json!({
-                        "message_id": m.get("id").cloned().unwrap_or_else(|| serde_json::json!("")),
+                                "message_id": m.get("id").cloned().unwrap_or(serde_json::json!("")),
                         "label": label,
                         "reason": "Heuristic fallback classification",
                         "draft_reply": if label == "Act now" { "Acknowledged. I will handle this today." } else { "Received. Delegating to the right owner and will track status." },
@@ -17959,7 +19827,7 @@ async fn triage_inbox(
     let triage = parsed
         .get("triage")
         .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
+        .unwrap_or(serde_json::json!([]));
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -18128,7 +19996,7 @@ async fn rollback_timeline_event(
         }
         task.status = TaskStatus::Cancelled;
         let status_json =
-            serde_json::to_string(&task.status).unwrap_or_else(|_| "\"Cancelled\"".to_string());
+            serde_json::to_string(&task.status).unwrap_or("\"Cancelled\"".to_string());
         let _ = agent
             .storage
             .update_task_status(task_id, &status_json)
@@ -19587,6 +21455,21 @@ fn openrouter_pricing_cache() -> &'static RwLock<Option<OpenRouterPricingCacheEn
     OPENROUTER_PRICING_CACHE.get_or_init(|| RwLock::new(None))
 }
 
+/// Look up cost from the OpenRouter pricing cache. Used by agent.rs for trace cost estimation.
+pub fn estimate_cost_from_pricing_cache(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<f64> {
+    let cache = openrouter_pricing_cache().try_read().ok()?;
+    let entry = cache.as_ref()?;
+    let pricing = find_openrouter_pricing(model, &entry.prices)?;
+    Some(
+        input_tokens as f64 * pricing.prompt_per_token
+            + output_tokens as f64 * pricing.completion_per_token,
+    )
+}
+
 fn parse_openrouter_price_value(value: &serde_json::Value) -> Option<f64> {
     if let Some(v) = value.as_f64() {
         return Some(v);
@@ -19875,32 +21758,8 @@ fn estimate_cost_usd(
             );
         }
     }
-    // Default pricing map (USD per 1M tokens). This is a heuristic and may be overridden later.
-    // Unknown models return None.
-    let m = model.trim().to_ascii_lowercase();
-    let (in_per_1m, out_per_1m) = if p == "openai" {
-        if m.starts_with("gpt-4o-mini") {
-            (0.15, 0.60)
-        } else if m.starts_with("gpt-4o") {
-            (5.0, 15.0)
-        } else {
-            return None;
-        }
-    } else if p == "anthropic" {
-        if m.contains("sonnet") {
-            (3.0, 15.0)
-        } else if m.contains("haiku") {
-            (0.25, 1.25)
-        } else {
-            return None;
-        }
-    } else {
-        return None;
-    };
-
-    let cost =
-        (prompt as f64 / 1_000_000.0) * in_per_1m + (completion as f64 / 1_000_000.0) * out_per_1m;
-    Some(cost)
+    // No hardcoded fallback — if pricing isn't in the cache, return None.
+    None
 }
 
 fn analytics_purpose_kind(channel: &str, purpose: &str) -> &'static str {
@@ -19954,7 +21813,7 @@ async fn llm_analytics_endpoint(
     let bucket = params
         .get("bucket")
         .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "hour".to_string());
+        .unwrap_or("hour".to_string());
     let bucket = match bucket.as_str() {
         "hour" | "day" | "week" => bucket,
         _ => "hour".to_string(),
@@ -20020,17 +21879,14 @@ async fn llm_analytics_endpoint(
         let bstart = bucket_start(dt, &bucket);
         let key = bstart.to_rfc3339();
         let provider = normalize_analytics_provider(&r.provider, &r.model, &openrouter_models);
-        let cost = estimate_cost_usd(
-            &provider,
-            &r.model,
-            r.prompt_tokens,
-            r.completion_tokens,
-            &openrouter_prices,
-        );
+        let pt = r.prompt_tokens as i64;
+        let ct = r.completion_tokens as i64;
+        let tt = r.total_tokens as i64;
+        let cost = estimate_cost_usd(&provider, &r.model, pt, ct, &openrouter_prices);
 
-        totals.prompt_tokens += r.prompt_tokens;
-        totals.completion_tokens += r.completion_tokens;
-        totals.total_tokens += r.total_tokens;
+        totals.prompt_tokens += pt;
+        totals.completion_tokens += ct;
+        totals.total_tokens += tt;
         totals.request_count += 1;
         if r.estimated {
             totals.estimated_count += 1;
@@ -20059,21 +21915,21 @@ async fn llm_analytics_endpoint(
                 helper_request_count: 0,
                 cost_usd: Some(0.0),
             });
-        entry.prompt_tokens += r.prompt_tokens;
-        entry.completion_tokens += r.completion_tokens;
-        entry.total_tokens += r.total_tokens;
+        entry.prompt_tokens += pt;
+        entry.completion_tokens += ct;
+        entry.total_tokens += tt;
         entry.request_count += 1;
         match analytics_purpose_kind(&r.channel, &r.purpose) {
             "helper" => {
-                entry.helper_prompt_tokens += r.prompt_tokens;
-                entry.helper_completion_tokens += r.completion_tokens;
-                entry.helper_total_tokens += r.total_tokens;
+                entry.helper_prompt_tokens += pt;
+                entry.helper_completion_tokens += ct;
+                entry.helper_total_tokens += tt;
                 entry.helper_request_count += 1;
             }
             _ => {
-                entry.primary_prompt_tokens += r.prompt_tokens;
-                entry.primary_completion_tokens += r.completion_tokens;
-                entry.primary_total_tokens += r.total_tokens;
+                entry.primary_prompt_tokens += pt;
+                entry.primary_completion_tokens += ct;
+                entry.primary_total_tokens += tt;
                 entry.primary_request_count += 1;
             }
         }
@@ -20097,9 +21953,9 @@ async fn llm_analytics_endpoint(
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
-        model_row.prompt_tokens += r.prompt_tokens;
-        model_row.completion_tokens += r.completion_tokens;
-        model_row.total_tokens += r.total_tokens;
+        model_row.prompt_tokens += pt;
+        model_row.completion_tokens += ct;
+        model_row.total_tokens += tt;
         model_row.request_count += 1;
         match (&mut model_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
@@ -20121,9 +21977,9 @@ async fn llm_analytics_endpoint(
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
-        ch_row.prompt_tokens += r.prompt_tokens;
-        ch_row.completion_tokens += r.completion_tokens;
-        ch_row.total_tokens += r.total_tokens;
+        ch_row.prompt_tokens += pt;
+        ch_row.completion_tokens += ct;
+        ch_row.total_tokens += tt;
         ch_row.request_count += 1;
         match (&mut ch_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
@@ -20145,9 +22001,9 @@ async fn llm_analytics_endpoint(
                 request_count: 0,
                 cost_usd: Some(0.0),
             });
-        pur_row.prompt_tokens += r.prompt_tokens;
-        pur_row.completion_tokens += r.completion_tokens;
-        pur_row.total_tokens += r.total_tokens;
+        pur_row.prompt_tokens += pt;
+        pur_row.completion_tokens += ct;
+        pur_row.total_tokens += tt;
         pur_row.request_count += 1;
         match (&mut pur_row.cost_usd, cost) {
             (Some(sum), Some(c)) => *sum += c,
@@ -20366,7 +22222,7 @@ async fn insert_document_from_text(
         content_type,
         project_id,
         chunk_count: chunks.len() as i32,
-        file_size: content.len() as i64,
+        file_size: content.len().min(i32::MAX as usize) as i32,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -20613,7 +22469,7 @@ async fn upload_document_file_endpoint(
 
     let raw_filename = filename_override
         .or(uploaded_filename)
-        .unwrap_or_else(|| "document.txt".to_string());
+        .unwrap_or("document.txt".to_string());
     let filename = sanitize_document_filename(&raw_filename);
     let content_type = content_type_override.unwrap_or(uploaded_content_type);
     let extracted = match extract_document_text(&filename, &content_type, &bytes) {
@@ -21763,7 +23619,10 @@ fn build_mcp_config(
     request: &McpServerRequest,
     server_id: &str,
     existing: Option<&crate::core::config::McpServerConfig>,
-) -> Result<(crate::core::config::McpServerConfig, Option<McpAuthUpdate>)> {
+) -> Result<(
+    crate::core::config::McpServerConfig,
+    Option<McpSecretUpdate>,
+)> {
     if request.name.trim().is_empty() {
         return Err(anyhow::anyhow!("MCP server name is required"));
     }
@@ -21780,14 +23639,34 @@ fn build_mcp_config(
             command,
             args,
             working_dir,
+            env,
         } => {
             if command.trim().is_empty() {
                 return Err(anyhow::anyhow!("MCP stdio command is required"));
             }
+            let env_keys = env
+                .as_ref()
+                .map(|map| {
+                    let mut keys = map
+                        .keys()
+                        .map(|key| key.trim().to_string())
+                        .filter(|key| !key.is_empty())
+                        .collect::<Vec<_>>();
+                    keys.sort();
+                    keys.dedup();
+                    keys
+                })
+                .unwrap_or_else(|| match existing.map(|cfg| &cfg.transport) {
+                    Some(crate::core::config::McpTransportConfig::Stdio { env_keys, .. }) => {
+                        env_keys.clone()
+                    }
+                    _ => Vec::new(),
+                });
             crate::core::config::McpTransportConfig::Stdio {
                 command: command.clone(),
                 args: args.clone(),
                 working_dir: working_dir.clone(),
+                env_keys,
             }
         }
     };
@@ -21819,7 +23698,16 @@ fn build_mcp_config(
         max_response_bytes,
     };
 
-    Ok((config, auth_update))
+    Ok((
+        config,
+        Some(McpSecretUpdate {
+            auth: auth_update,
+            env: match &request.transport {
+                McpTransportRequest::Stdio { env, .. } => env.clone(),
+                McpTransportRequest::Http { .. } => Some(std::collections::HashMap::new()),
+            },
+        }),
+    ))
 }
 
 fn clean_allowlist(list: &[String]) -> Vec<String> {
@@ -21835,6 +23723,12 @@ struct McpAuthUpdate {
     token: Option<String>,
     username: Option<String>,
     password: Option<String>,
+}
+
+#[derive(Debug)]
+struct McpSecretUpdate {
+    auth: Option<McpAuthUpdate>,
+    env: Option<std::collections::HashMap<String, String>>,
 }
 
 fn parse_mcp_auth(
@@ -21863,9 +23757,7 @@ fn parse_mcp_auth(
             token,
             clear,
         } => {
-            let header = header
-                .clone()
-                .unwrap_or_else(|| "Authorization".to_string());
+            let header = header.clone().unwrap_or("Authorization".to_string());
             (
                 Some(crate::core::config::McpAuthConfig::Bearer { header }),
                 Some(McpAuthUpdate {
@@ -21950,7 +23842,7 @@ fn apply_auth_update(
 fn save_mcp_secrets(
     agent: &mut Agent,
     server_id: &str,
-    update: Option<McpAuthUpdate>,
+    update: Option<McpSecretUpdate>,
 ) -> Result<()> {
     if update.is_none() {
         return Ok(());
@@ -21961,7 +23853,21 @@ fn save_mcp_secrets(
     )?;
     if let Some(update) = update.as_ref() {
         manager.update_secrets(|secrets| {
-            apply_auth_update(secrets, server_id, update);
+            if let Some(auth) = update.auth.as_ref() {
+                apply_auth_update(secrets, server_id, auth);
+            }
+            if let Some(env) = update.env.as_ref() {
+                let cleaned = env
+                    .iter()
+                    .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+                    .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+                    .collect::<std::collections::HashMap<_, _>>();
+                if cleaned.is_empty() {
+                    secrets.mcp_env.remove(server_id);
+                } else {
+                    secrets.mcp_env.insert(server_id.to_string(), cleaned);
+                }
+            }
             Ok(())
         })?;
     }
@@ -21983,30 +23889,43 @@ fn clear_mcp_secrets(agent: &mut Agent, server_id: &str) -> Result<()> {
     )?;
     manager.update_secrets(|secrets| {
         secrets.mcp_auth.remove(server_id);
+        secrets.mcp_env.remove(server_id);
         Ok(())
     })?;
     Ok(())
 }
 
-async fn sync_mcp_registry(agent: &mut Agent, secrets: &crate::core::config::Secrets) {
+async fn sync_mcp_registry(agent: &Agent, secrets: &crate::core::config::Secrets) {
     let Agent {
         mcp,
         safety,
         runtime,
         config,
         ..
-    } = &mut *agent;
-    let config_ref = &*config;
-    let runtime_ref = &*runtime;
+    } = agent;
     let mut registry = mcp.write().await;
     let _ = registry
-        .sync_from_config(config_ref, secrets, runtime_ref, safety)
+        .sync_from_config(config, secrets, runtime, safety)
         .await;
+}
+
+fn mcp_sync_timeout_for_config(config: &crate::core::config::AgentConfig) -> std::time::Duration {
+    let timeout_secs = config
+        .mcp
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .map(|server| server.timeout_secs.max(5))
+        .max()
+        .unwrap_or(20)
+        .saturating_add(15)
+        .max(20);
+    std::time::Duration::from_secs(timeout_secs)
 }
 
 fn schedule_mcp_registry_sync(agent_ref: SharedAgent) {
     tokio::spawn(async move {
-        let mut agent = agent_ref.write().await;
+        let agent = agent_ref.read().await;
         let secrets = match load_mcp_secrets(&agent) {
             Ok(s) => s,
             Err(e) => {
@@ -22014,38 +23933,85 @@ fn schedule_mcp_registry_sync(agent_ref: SharedAgent) {
                 return;
             }
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            sync_mcp_registry(&mut agent, &secrets),
-        )
-        .await
-        {
+        let timeout = mcp_sync_timeout_for_config(&agent.config);
+        match tokio::time::timeout(timeout, sync_mcp_registry(&agent, &secrets)).await {
             Ok(_) => {}
-            Err(_) => tracing::warn!("MCP registry sync timed out after 20s"),
+            Err(_) => tracing::warn!("MCP registry sync timed out after {:?}", timeout),
         }
     });
 }
 
 fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
     tokio::spawn(async move {
-        let mut agent = agent_ref.write().await;
+        let agent = agent_ref.read().await;
         if agent.config.mcp.servers.iter().all(|s| s.id != id) {
             return;
         }
+        let secrets = match load_mcp_secrets(&agent) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "MCP server refresh skipped for {}: failed to load secrets: {}",
+                    id,
+                    e
+                );
+                return;
+            }
+        };
         let Agent {
             mcp,
             runtime,
             safety,
+            config,
             ..
-        } = &mut *agent;
+        } = &*agent;
         let refresh_future = async {
             let mut registry = mcp.write().await;
-            registry.refresh_server(&id, runtime, safety).await
+            registry
+                .refresh_server(&id, config, &secrets, runtime, safety)
+                .await
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(20), refresh_future).await {
-            Ok(Ok(())) => {}
+        let timeout = mcp_sync_timeout_for_config(config);
+        match tokio::time::timeout(timeout, refresh_future).await {
+            Ok(Ok(())) => tracing::info!("MCP server refresh succeeded for {}", id),
             Ok(Err(e)) => tracing::warn!("MCP server refresh failed for {}: {}", id, e),
-            Err(_) => tracing::warn!("MCP server refresh timed out after 20s for {}", id),
+            Err(_) => tracing::warn!(
+                "MCP server refresh timed out after {:?} for {}",
+                timeout,
+                id
+            ),
+        }
+    });
+}
+
+fn schedule_enabled_mcp_server_resumes(agent_ref: SharedAgent) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let enabled_ids = {
+            let agent = agent_ref.read().await;
+            agent
+                .config
+                .mcp
+                .servers
+                .iter()
+                .filter(|server| server.enabled)
+                .map(|server| server.id.clone())
+                .collect::<Vec<_>>()
+        };
+        if enabled_ids.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Resuming {} enabled MCP server(s) in the background",
+            enabled_ids.len()
+        );
+        let total = enabled_ids.len();
+        for (index, id) in enabled_ids.into_iter().enumerate() {
+            tracing::info!("Scheduling background MCP resume for {}", id);
+            schedule_mcp_server_refresh(agent_ref.clone(), id);
+            if index + 1 < total {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            }
         }
     });
 }
@@ -22207,7 +24173,7 @@ pub async fn serve_locked(
         .route("/logo.svg", get(serve_logo_svg_locked))
         .with_state(locked_state);
 
-    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or_else(|_| "127.0.0.1:8990".to_string());
+    let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or("127.0.0.1:8990".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     let display_addr = bind_addr
         .strip_prefix("0.0.0.0:")
@@ -22217,7 +24183,7 @@ pub async fn serve_locked(
                 .strip_prefix("[::]:")
                 .map(|port| format!("localhost:{}", port))
         })
-        .unwrap_or_else(|| bind_addr.clone());
+        .unwrap_or(bind_addr.clone());
 
     println!();
     println!(" -");
@@ -22829,6 +24795,65 @@ async fn remove_master_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request};
+    use axum::routing::{get, post};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    async fn build_test_state() -> (AppState, TempDir, TempDir) {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(RwLock::new(
+            Agent::init(config_dir.path(), data_dir.path(), None)
+                .await
+                .unwrap(),
+        ));
+        let (trace_history, last_trace, tasks, user_profile, security_events, app_registry) = {
+            let guard = shared.read().await;
+            (
+                guard.trace_history.clone(),
+                guard.last_trace.clone(),
+                guard.tasks.clone(),
+                guard.user_profile.clone(),
+                guard.security_events.clone(),
+                guard.app_registry.clone(),
+            )
+        };
+        let state = AppState {
+            agent: shared,
+            trace_history,
+            last_trace,
+            tasks,
+            chat_task_cancellations: Arc::new(RwLock::new(HashMap::new())),
+            user_profile,
+            tiered_rate_limiter: TieredRateLimiter::new(),
+            api_key: Arc::new(RwLock::new(None)),
+            api_key_expires_at: Arc::new(RwLock::new(None)),
+            allow_insecure_no_auth: true,
+            session_token: Arc::new(RwLock::new(None)),
+            local_ui_bootstrap_enabled: true,
+            local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
+            cookie_secure_default: false,
+            oauth_states: Arc::new(RwLock::new(HashMap::new())),
+            remote_login_attempts: Arc::new(RwLock::new(HashMap::new())),
+            tunnel: Arc::new(RwLock::new(tunnel::TunnelState::new())),
+            whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
+            security_events,
+            app_registry,
+            application_registry: applications::ApplicationLauncherRegistry::default(),
+            deployment_mode: DeploymentMode::TrustedLocal,
+            server_role: HttpServerRole::ControlPlane,
+            public_app_bind_addr: None,
+            public_app_base_url: None,
+        };
+        (state, config_dir, data_dir)
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn summarize_stream_tool_activity_content_hides_html_payloads() {
@@ -22915,6 +24940,41 @@ mod tests {
     }
 
     #[test]
+    fn normalize_stream_event_for_sse_preserves_structured_tool_result_fields() {
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ToolResult {
+                name: "app_inspect".to_string(),
+                content: serde_json::json!({
+                    "matched_app": {
+                        "id": "demo",
+                        "title": "Demo App",
+                        "local_access_url": "http://localhost:8990/apps/demo/"
+                    },
+                    "message": "Matched deployed app."
+                })
+                .to_string(),
+            },
+            "",
+        );
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected tool_result event");
+        };
+        assert_eq!(event_name, "tool_result");
+        assert_eq!(
+            payload
+                .get("matched_app")
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("Demo App")
+        );
+        assert_eq!(
+            payload.get("content").and_then(|v| v.as_str()),
+            Some("Matched app and loaded metadata for Demo App.")
+        );
+    }
+
+    #[test]
     fn chat_task_classifier_promotes_plain_english_app_requests() {
         let message = "Spin up an admin console for lead triage and deploy it";
         assert!(chat_message_requests_app_work(
@@ -22961,5 +25021,184 @@ mod tests {
             ),
             "workspace"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_accepts_discord_webhook_without_bot_token() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let state_for_assert = state.clone();
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "llm_provider": "ollama",
+                    "llm_model": "llama3.2",
+                    "discord_enabled": true,
+                    "discord_webhook_url": "https://discord.com/api/webhooks/123/token"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guard = state_for_assert.agent.read().await;
+        let discord = guard
+            .config
+            .discord
+            .as_ref()
+            .expect("discord config should be saved");
+        assert_eq!(
+            discord.webhook_url,
+            "https://discord.com/api/webhooks/123/token"
+        );
+        assert!(discord.bot_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_rejects_incomplete_matrix_config() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "llm_provider": "ollama",
+                    "llm_model": "llama3.2",
+                    "matrix_enabled": true,
+                    "matrix_access_token": "matrix-secret"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("Matrix homeserver URL and user ID are required"));
+    }
+
+    #[tokio::test]
+    async fn gateway_channels_endpoint_returns_transport_inventory() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.slack = Some(crate::channels::slack::SlackChannelConfig {
+                bot_token: "xoxb-test-token".to_string(),
+                signing_secret: "topsecret".to_string(),
+                ..Default::default()
+            });
+            guard.config.teams = Some(crate::channels::teams::TeamsTransportConfig {
+                service_url: "https://smba.trafficmanager.net/teams".to_string(),
+                access_token: "teams-token".to_string(),
+                bot_app_id: Some("teams-app-id".to_string()),
+                ..Default::default()
+            });
+        }
+        let router = Router::new()
+            .route("/gateway/channels", get(gateway_control::get_channels))
+            .with_state(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/gateway/channels")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let channels = body
+            .get("channels")
+            .and_then(|value| value.as_array())
+            .expect("channels array");
+        assert!(channels.iter().any(|channel| {
+            channel.get("id").and_then(|value| value.as_str()) == Some("slack")
+        }));
+        assert!(channels.iter().any(|channel| {
+            channel.get("id").and_then(|value| value.as_str()) == Some("teams")
+        }));
+    }
+
+    #[tokio::test]
+    async fn slack_webhook_endpoint_rejects_unsigned_url_verification_when_secret_is_configured() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.slack = Some(crate::channels::slack::SlackChannelConfig {
+                bot_token: "xoxb-test-token".to_string(),
+                signing_secret: "topsecret".to_string(),
+                ..Default::default()
+            });
+        }
+        let router = Router::new()
+            .route("/webhook/slack", post(slack_webhook_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/slack")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "type": "url_verification",
+                    "challenge": "abc"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.to_ascii_lowercase().contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn teams_webhook_endpoint_rejects_requests_without_authorization() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.teams = Some(crate::channels::teams::TeamsTransportConfig {
+                service_url: "https://smba.trafficmanager.net/teams".to_string(),
+                access_token: "teams-token".to_string(),
+                bot_app_id: Some("teams-app-id".to_string()),
+                ..Default::default()
+            });
+        }
+        let router = Router::new()
+            .route("/webhook/teams", post(teams_webhook_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/teams")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "type": "message",
+                    "id": "activity-1",
+                    "serviceUrl": "https://smba.trafficmanager.net/teams",
+                    "conversation": { "id": "conv-1" },
+                    "text": "hello"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

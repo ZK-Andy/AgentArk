@@ -197,6 +197,10 @@ impl EncryptedStorage {
         Ok(self.decrypt_fact_content(facts))
     }
 
+    pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
+        self.storage.count_facts(project_id).await
+    }
+
     // ==================== Encrypted KV Store ====================
 
     /// Set an encrypted value in the KV store

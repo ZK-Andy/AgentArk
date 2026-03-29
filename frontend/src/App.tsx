@@ -34,7 +34,6 @@ import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
 import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import AutoStoriesRoundedIcon from "@mui/icons-material/AutoStoriesRounded";
 import AnalyticsRoundedIcon from "@mui/icons-material/AnalyticsRounded";
-import PsychologyRoundedIcon from "@mui/icons-material/PsychologyRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import NotificationsNoneRoundedIcon from "@mui/icons-material/NotificationsNoneRounded";
@@ -56,12 +55,18 @@ import type { Task } from "./types";
 const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
-const SIDEBAR_COLLAPSED_KEY = "agentark.sidebar.collapsed";
 type ViewKey =
   | "overview"
   | "inbox"
   | "chat"
   | "library"
+  | "connections"
+  | "channels"
+  | "routing"
+  | "devices"
+  | "browser"
+  | "gatewayops"
+  | "failover"
   | "skills"
   | "tasks"
   | "apps"
@@ -95,6 +100,13 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   project: "projects",
   projects: "projects",
   library: "library",
+  connections: "connections",
+  channels: "channels",
+  routing: "routing",
+  devices: "devices",
+  browser: "browser",
+  gatewayops: "arkpulse",
+  failover: "settings",
   watchers: "status",
   watcher: "status",
   status: "status",
@@ -108,6 +120,13 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "inbox",
   "chat",
   "library",
+  "connections",
+  "channels",
+  "routing",
+  "devices",
+  "browser",
+  "gatewayops",
+  "failover",
   "skills",
   "tasks",
   "apps",
@@ -171,6 +190,13 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   inbox: "inbox",
   chat: "chat",
   library: "library",
+  connections: "connections",
+  channels: "channels",
+  routing: "routing",
+  devices: "devices",
+  browser: "browser",
+  gatewayops: "gateway-ops",
+  failover: "failover",
   skills: "skills",
   tasks: "tasks",
   apps: "apps",
@@ -196,8 +222,13 @@ const PATH_SEGMENT_TO_VIEW: Record<string, ViewKey> = (() => {
   base.overview = "overview";
   base.chat = "chat";
   base.workspace = "chat";
+  base.connections = "connections";
   return base;
 })();
+
+function isNavItemActive(itemKey: ViewKey, activeView: ViewKey): boolean {
+  return activeView === itemKey;
+}
 
 function viewPath(view: ViewKey): string {
   return `/ui/${VIEW_PATH_SEGMENTS[view]}`;
@@ -227,6 +258,8 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
       if (segment === "actions") return { view: "skills", matched: true };
       if (segment === "integrations") return { view: "settings", matched: true };
       if (segment === "memory") return { view: "settings", matched: true };
+      if (segment === "gateway-ops" || segment === "gatewayops") return { view: "arkpulse", matched: true };
+      if (segment === "failover") return { view: "settings", matched: true };
       if (segment === "status") return { view: "status", matched: true };
       const view = PATH_SEGMENT_TO_VIEW[segment];
       if (view) {
@@ -328,15 +361,8 @@ function shouldSurfaceNotification(notification: {
   const source = (notification.source || "").toLowerCase();
   const title = (notification.title || "").toLowerCase();
   if (source.includes("watcher") || title.includes("watcher triggered")) return false;
-  if (!source.includes("arkpulse")) return true;
-  const body = (notification.body || "").toLowerCase();
-  const level = (notification.level || "").toLowerCase();
-  return (
-    level === "critical" ||
-    title.includes("critical") ||
-    body.includes("critical") ||
-    body.includes("immediate action")
-  );
+  if (source.includes("arkpulse")) return false;
+  return true;
 }
 
 function notificationEventAffectsApprovals(payload: NotificationStreamPayload): boolean {
@@ -360,13 +386,6 @@ export default function App() {
   const [view, setViewState] = useState<ViewKey>(() => resolveViewFromPath(window.location.pathname).view);
   const [lastNonSettingsView, setLastNonSettingsView] = useState<ViewKey>("overview");
   const [settingsInitialTab, setSettingsInitialTab] = useState<number | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
-    try {
-      return window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
   const showAdvanced = useUiStore((s) => s.showAdvancedByView[view] ?? false);
   const tourActive = useUiStore((s) => s.tourActive);
   const tourCompleted = useUiStore((s) => s.tourCompleted);
@@ -379,11 +398,6 @@ export default function App() {
       return () => clearTimeout(timer);
     }
   }, []);
-
-  // Expand sidebar when tour is active
-  useEffect(() => {
-    if (tourActive) setSidebarCollapsed(false);
-  }, [tourActive]);
 
   const [notifAnchorEl, setNotifAnchorEl] = useState<HTMLElement | null>(null);
   const notifListOpen = Boolean(notifAnchorEl);
@@ -439,14 +453,6 @@ export default function App() {
       setLastNonSettingsView(view);
     }
   }, [view]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? "1" : "0");
-    } catch {
-      // ignore storage failures
-    }
-  }, [sidebarCollapsed]);
 
   const serverQ = useQuery({
     queryKey: ["server-ping"],
@@ -758,49 +764,37 @@ export default function App() {
           </Toolbar>
         </AppBar>
 
-        <Box className={`main-grid${sidebarCollapsed ? " nav-collapsed" : ""}`}>
-          <Box className={`side-nav${sidebarCollapsed ? " collapsed" : ""}`}>
-            <Stack direction="row" alignItems="center" justifyContent={sidebarCollapsed ? "center" : "space-between"} sx={{ px: 0.5, mb: 1 }}>
-              {!sidebarCollapsed ? (
-                <Typography variant="caption" className="nav-label">
-                  Navigate
-                </Typography>
-              ) : null}
-              <Tooltip title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
-                <IconButton
-                  size="small"
-                  className="nav-collapse-btn"
-                  onClick={() => setSidebarCollapsed((prev) => !prev)}
-                  aria-label={sidebarCollapsed ? "Expand navigation sidebar" : "Collapse navigation sidebar"}
-                >
-                  {sidebarCollapsed ? <ChevronRightRoundedIcon fontSize="small" /> : <ChevronLeftRoundedIcon fontSize="small" />}
-                </IconButton>
-              </Tooltip>
+        <Box className="main-grid">
+          <Box className="side-nav">
+            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ px: 0.5, mb: 1 }}>
+              <Typography variant="caption" className="nav-label">
+                Navigate
+              </Typography>
             </Stack>
             <List dense>
               {NAV_GROUPS.map((group, groupIdx) => (
                 <Box key={group.id} className="nav-group">
-                  {!sidebarCollapsed ? (
+                  <Stack direction="row" alignItems="center" justifyContent="space-between">
                     <Typography variant="overline" className="nav-group-label">
                       {group.label}
                     </Typography>
-                  ) : null}
+                  </Stack>
                   {group.items.map((item) => (
                     <Tooltip
                       key={item.key}
                       title={item.label}
                       placement="right"
-                      disableHoverListener={!sidebarCollapsed}
+                      disableHoverListener
                     >
                       <ListItemButton
-                        selected={activeView === item.key}
+                        selected={isNavItemActive(item.key, activeView)}
                         onClick={() => navigateToView(item.key)}
-                        className={`nav-item${sidebarCollapsed ? " collapsed" : ""}`}
+                        className="nav-item"
                         data-tour-target={`nav-${item.key}`}
                       >
                         <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
                         <ListItemText
-                          className={`nav-item-text${sidebarCollapsed ? " collapsed" : ""}`}
+                          className="nav-item-text"
                           primary={item.label}
                           primaryTypographyProps={{ noWrap: true }}
                         />

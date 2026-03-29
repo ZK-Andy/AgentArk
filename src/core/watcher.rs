@@ -748,6 +748,102 @@ impl WatcherManager {
         resumed
     }
 
+    /// Pause all active watchers and return how many changed state.
+    pub async fn pause_all(&self) -> usize {
+        let mut changed = 0usize;
+        {
+            let mut watchers = self.watchers.write().await;
+            for watcher in watchers.values_mut() {
+                if watcher.status == WatcherStatus::Active {
+                    watcher.status = WatcherStatus::Paused;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.persist().await;
+        }
+        changed
+    }
+
+    /// Resume all paused watchers and return how many changed state.
+    pub async fn resume_all(&self) -> usize {
+        let mut changed = 0usize;
+        {
+            let mut watchers = self.watchers.write().await;
+            for watcher in watchers.values_mut() {
+                if watcher.status == WatcherStatus::Paused {
+                    watcher.status = WatcherStatus::Active;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.persist().await;
+        }
+        changed
+    }
+
+    /// Mark a watcher due for the next Sentinel watcher tick.
+    pub async fn run_now(&self, id: Uuid) -> bool {
+        let ran = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if w.status == WatcherStatus::Active {
+                w.last_poll_at = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if ran {
+            self.persist().await;
+        }
+        ran
+    }
+
+    /// Extend a watcher lifetime by extra seconds, clamped to the global max.
+    pub async fn extend_timeout(&self, id: Uuid, extra_secs: u64) -> Option<u64> {
+        if extra_secs == 0 {
+            return self.get(id).await.map(|watcher| watcher.timeout_secs);
+        }
+        let updated = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused) {
+                w.timeout_secs = w
+                    .timeout_secs
+                    .saturating_add(extra_secs)
+                    .min(MAX_TIMEOUT_SECS);
+                Some(w.timeout_secs)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if updated.is_some() {
+            self.persist().await;
+        }
+        updated
+    }
+
+    /// Set a watcher lifetime to effectively indefinite by pinning it to the max timeout.
+    pub async fn extend_until_stopped(&self, id: Uuid) -> Option<u64> {
+        let updated = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused) {
+                w.timeout_secs = MAX_TIMEOUT_SECS;
+                Some(w.timeout_secs)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if updated.is_some() {
+            self.persist().await;
+        }
+        updated
+    }
+
     /// Delete a watcher by ID
     pub async fn delete(&self, id: Uuid) -> bool {
         let deleted = self.watchers.write().await.remove(&id).is_some();

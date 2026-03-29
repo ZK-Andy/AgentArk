@@ -25,8 +25,8 @@ pub struct MemoryDecayConfig {
     pub recency_weight: f32,
     /// Weight for importance score (γ)
     pub importance_weight: f32,
-    /// Decay rate (λ) - higher = faster decay
-    /// recency = exp(-λ * hours_since_creation)
+    /// Daily decay rate (λ) - higher = faster day-scale decay
+    /// recency = exp(-λ * hours_since_creation / 24)
     pub decay_rate: f32,
     /// Bonus for recently accessed memories
     pub access_recency_bonus: f32,
@@ -38,7 +38,7 @@ impl Default for MemoryDecayConfig {
             relevance_weight: 1.0,
             recency_weight: 1.0,
             importance_weight: 1.0,
-            decay_rate: 0.995, // ~50% decay per day (24 hours)
+            decay_rate: 0.099, // 50% decay per week (ln(2)/7), memories useful for ~30 days
             access_recency_bonus: 0.1,
         }
     }
@@ -101,7 +101,7 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
-        format!("{}...", truncated)
+        format!("{}...", truncated.trim_end())
     } else {
         truncated
     }
@@ -142,7 +142,7 @@ impl CognitiveMemory {
     }
 
     /// Calculate recency score using exponential decay
-    /// recency = exp(-λ * hours_since_creation)
+    /// recency = exp(-λ * hours_since_creation / 24)
     fn calculate_recency_score(
         &self,
         timestamp: DateTime<Utc>,
@@ -363,9 +363,13 @@ impl CognitiveMemory {
     /// Check if a new fact is too similar to any existing fact (deduplication)
     /// Returns true if a duplicate/near-duplicate exists
     async fn is_duplicate_fact(&self, new_fact: &str, project_id: Option<&str>) -> bool {
+        let fact_count = match self.encrypted_storage.count_facts(project_id).await {
+            Ok(count) => count,
+            Err(_) => return false,
+        };
         let existing = match self
             .encrypted_storage
-            .get_facts_by_project_decrypted(u64::MAX, 0, project_id)
+            .get_facts_by_project_decrypted(fact_count, 0, project_id)
             .await
         {
             Ok(facts) => facts,

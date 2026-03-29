@@ -1,0 +1,1928 @@
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+use std::process::Stdio;
+use tempfile::TempDir;
+
+pub const GOOGLE_WORKSPACE_OAUTH_CONFIG_KEY: &str = "google_workspace_oauth_config";
+pub const GOOGLE_WORKSPACE_TOKENS_KEY: &str = "google_workspace_tokens";
+pub const GOOGLE_WORKSPACE_BUNDLES_KEY: &str = "google_workspace_bundles";
+pub const GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY: &str = "google_workspace_pending_bundles";
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const OAUTH_REDIRECT_URI: &str = "http://localhost:8990/oauth/callback";
+const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+const DOCS_API_BASE: &str = "https://docs.googleapis.com/v1";
+const SHEETS_API_BASE: &str = "https://sheets.googleapis.com/v4";
+const CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
+const ADMIN_API_BASE: &str = "https://admin.googleapis.com/admin/directory/v1";
+const GWS_BINARY_ENV: &str = "AGENTARK_GWS_BINARY";
+const GWS_SKILLS_CACHE_DIR: &str = "gws_skills_cache";
+const GWS_BUNDLED_SKILLS_DIR: &str = "/app/gws-skills/skills";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GwsHelpArgs {
+    #[serde(default)]
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GwsSchemaArgs {
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GwsCommandArgs {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub required_bundles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GwsSkillsArgs {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct GwsSkillMetadata {
+    name: String,
+    description: String,
+    cli_help: Option<String>,
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleWorkspaceClientConfig {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleWorkspaceTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub granted_scopes: Vec<String>,
+    #[serde(default)]
+    pub granted_bundles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyGoogleTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveSearchArgs {
+    pub query: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocsReadArgs {
+    pub document_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetsReadArgs {
+    pub spreadsheet_id: String,
+    pub range: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatListSpacesArgs {
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminListUsersArgs {
+    pub customer: Option<String>,
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    expires_in: i64,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+pub fn supported_bundles() -> &'static [&'static str] {
+    &[
+        "gmail", "calendar", "drive", "docs", "sheets", "chat", "admin",
+    ]
+}
+
+pub fn default_bundles() -> Vec<String> {
+    vec!["gmail".to_string(), "calendar".to_string()]
+}
+
+pub fn bundle_label(bundle: &str) -> &'static str {
+    match bundle {
+        "gmail" => "Gmail",
+        "calendar" => "Calendar",
+        "drive" => "Drive",
+        "docs" => "Docs",
+        "sheets" => "Sheets",
+        "chat" => "Chat",
+        "admin" => "Admin",
+        _ => "Unknown",
+    }
+}
+
+pub fn normalize_bundle_id(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    let mapped = match normalized.as_str() {
+        "google_calendar" | "calendar" => "calendar",
+        "gmail" | "mail" => "gmail",
+        "drive" | "google_drive" => "drive",
+        "docs" | "google_docs" | "documents" => "docs",
+        "sheets" | "google_sheets" | "spreadsheets" => "sheets",
+        "chat" | "google_chat" => "chat",
+        "admin" | "directory" | "google_admin" => "admin",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
+pub fn parse_bundle_list_from_str(value: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    for raw in value
+        .split([',', '\n', '\r', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if let Some(bundle) = normalize_bundle_id(raw) {
+            seen.insert(bundle);
+        }
+    }
+    if seen.is_empty() {
+        default_bundles()
+    } else {
+        seen.into_iter().collect()
+    }
+}
+
+pub fn parse_bundle_list(value: &serde_json::Value) -> Vec<String> {
+    if let Some(list) = value.as_array() {
+        let mut seen = BTreeSet::new();
+        for item in list {
+            if let Some(bundle) = item.as_str().and_then(normalize_bundle_id) {
+                seen.insert(bundle);
+            }
+        }
+        if !seen.is_empty() {
+            return seen.into_iter().collect();
+        }
+    }
+    if let Some(raw) = value.as_str() {
+        return parse_bundle_list_from_str(raw);
+    }
+    default_bundles()
+}
+
+pub fn bundle_scopes(bundle: &str) -> &'static [&'static str] {
+    match bundle {
+        "gmail" => &[
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
+        "calendar" => &["https://www.googleapis.com/auth/calendar"],
+        "drive" => &["https://www.googleapis.com/auth/drive.readonly"],
+        "docs" => &["https://www.googleapis.com/auth/documents.readonly"],
+        "sheets" => &["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        "chat" => &["https://www.googleapis.com/auth/chat.spaces.readonly"],
+        "admin" => &["https://www.googleapis.com/auth/admin.directory.user.readonly"],
+        _ => &[],
+    }
+}
+
+pub fn scopes_for_bundles(bundles: &[String]) -> Vec<String> {
+    let mut scopes = BTreeSet::new();
+    for bundle in bundles {
+        for scope in bundle_scopes(bundle) {
+            scopes.insert((*scope).to_string());
+        }
+    }
+    scopes.into_iter().collect()
+}
+
+pub fn parse_credentials_json(raw: &str) -> Result<GoogleWorkspaceClientConfig> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| anyhow!("Invalid credentials JSON: {}", e))?;
+    parse_credentials_value(&parsed)
+}
+
+pub fn parse_credentials_value(value: &serde_json::Value) -> Result<GoogleWorkspaceClientConfig> {
+    fn from_record(record: &serde_json::Value) -> Option<GoogleWorkspaceClientConfig> {
+        let client_id = record.get("client_id")?.as_str()?.trim();
+        let client_secret = record.get("client_secret")?.as_str()?.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return None;
+        }
+        Some(GoogleWorkspaceClientConfig {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+        })
+    }
+
+    if let Some(config) = from_record(value) {
+        return Ok(config);
+    }
+    if let Some(record) = value.get("installed").and_then(from_record) {
+        return Ok(record);
+    }
+    if let Some(record) = value.get("web").and_then(from_record) {
+        return Ok(record);
+    }
+    Err(anyhow!(
+        "Credentials JSON must contain client_id and client_secret in either the root, 'installed', or 'web' object."
+    ))
+}
+
+fn manager(config_dir: &Path) -> Result<crate::core::config::SecureConfigManager> {
+    crate::core::config::SecureConfigManager::new(config_dir).map_err(Into::into)
+}
+
+fn env_primary_workspace_client_config() -> Option<GoogleWorkspaceClientConfig> {
+    let (Ok(client_id), Ok(client_secret)) = (
+        std::env::var("GOOGLE_WORKSPACE_CLIENT_ID"),
+        std::env::var("GOOGLE_WORKSPACE_CLIENT_SECRET"),
+    ) else {
+        return None;
+    };
+    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+        return None;
+    }
+    Some(GoogleWorkspaceClientConfig {
+        client_id,
+        client_secret,
+    })
+}
+
+fn env_legacy_workspace_client_config() -> Option<GoogleWorkspaceClientConfig> {
+    for (id_key, secret_key) in [
+        ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET"),
+        ("CALENDAR_CLIENT_ID", "CALENDAR_CLIENT_SECRET"),
+    ] {
+        if let (Ok(client_id), Ok(client_secret)) =
+            (std::env::var(id_key), std::env::var(secret_key))
+        {
+            if !client_id.trim().is_empty() && !client_secret.trim().is_empty() {
+                return Some(GoogleWorkspaceClientConfig {
+                    client_id,
+                    client_secret,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn read_secret_json<T>(config_dir: &Path, key: &str) -> Result<Option<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let manager = manager(config_dir)?;
+    let Some(raw) = manager.get_custom_secret(key)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+fn write_secret_json<T>(config_dir: &Path, key: &str, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let manager = manager(config_dir)?;
+    manager.set_custom_secret(key, Some(serde_json::to_string(value)?))?;
+    Ok(())
+}
+
+fn remove_secret(config_dir: &Path, key: &str) -> Result<()> {
+    let manager = manager(config_dir)?;
+    manager.set_custom_secret(key, None)?;
+    Ok(())
+}
+
+pub fn load_saved_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    match read_secret_json::<Vec<String>>(config_dir, GOOGLE_WORKSPACE_BUNDLES_KEY)? {
+        Some(bundles) if !bundles.is_empty() => Ok(bundles
+            .into_iter()
+            .filter_map(|bundle| normalize_bundle_id(&bundle))
+            .collect()),
+        _ => {
+            if let Some(tokens) = load_workspace_tokens(config_dir)? {
+                if !tokens.granted_bundles.is_empty() {
+                    return Ok(tokens.granted_bundles);
+                }
+            }
+            let manager = manager(config_dir)?;
+            let mut inferred = BTreeSet::new();
+            for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
+                if let Some(raw) = manager.get_custom_secret(key)? {
+                    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+                    if parsed
+                        .get("refresh_token")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        inferred.insert(bundle.to_string());
+                    }
+                }
+            }
+            if inferred.is_empty() {
+                Ok(default_bundles())
+            } else {
+                Ok(inferred.into_iter().collect())
+            }
+        }
+    }
+}
+
+pub fn save_selected_bundles(config_dir: &Path, bundles: &[String]) -> Result<()> {
+    let normalized = if bundles.is_empty() {
+        default_bundles()
+    } else {
+        bundles.to_vec()
+    };
+    write_secret_json(config_dir, GOOGLE_WORKSPACE_BUNDLES_KEY, &normalized)
+}
+
+pub fn load_pending_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    match read_secret_json::<Vec<String>>(config_dir, GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY)? {
+        Some(bundles) => Ok(bundles
+            .into_iter()
+            .filter_map(|bundle| normalize_bundle_id(&bundle))
+            .collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub fn save_pending_bundles(config_dir: &Path, bundles: &[String]) -> Result<()> {
+    if bundles.is_empty() {
+        remove_secret(config_dir, GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY)
+    } else {
+        write_secret_json(config_dir, GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY, &bundles)
+    }
+}
+
+pub fn request_additional_bundles(config_dir: &Path, bundles: &[String]) -> Result<Vec<String>> {
+    let mut pending = BTreeSet::new();
+    for bundle in load_pending_bundles(config_dir)? {
+        pending.insert(bundle);
+    }
+    for bundle in bundles {
+        if let Some(normalized) = normalize_bundle_id(bundle) {
+            pending.insert(normalized);
+        }
+    }
+    let merged = pending.into_iter().collect::<Vec<_>>();
+    save_pending_bundles(config_dir, &merged)?;
+    Ok(merged)
+}
+
+pub fn oauth_redirect_uri() -> &'static str {
+    OAUTH_REDIRECT_URI
+}
+
+pub fn load_saved_workspace_client_config(
+    config_dir: &Path,
+) -> Result<Option<GoogleWorkspaceClientConfig>> {
+    read_secret_json::<GoogleWorkspaceClientConfig>(config_dir, GOOGLE_WORKSPACE_OAUTH_CONFIG_KEY)
+}
+
+pub fn clear_saved_workspace_client_config(config_dir: &Path) -> Result<()> {
+    remove_secret(config_dir, GOOGLE_WORKSPACE_OAUTH_CONFIG_KEY)
+}
+
+pub fn workspace_client_config_source(config_dir: &Path) -> Result<Option<&'static str>> {
+    if env_primary_workspace_client_config().is_some() {
+        return Ok(Some("environment_google_workspace"));
+    }
+    if load_saved_workspace_client_config(config_dir)?.is_some() {
+        return Ok(Some("settings"));
+    }
+    if env_legacy_workspace_client_config().is_some() {
+        return Ok(Some("environment_legacy_google"));
+    }
+
+    let manager = manager(config_dir)?;
+    for key in ["gmail_oauth_config", "calendar_oauth_config"] {
+        if let Some(raw) = manager.get_custom_secret(key)? {
+            let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+            if parse_credentials_value(&parsed).is_ok() {
+                return Ok(Some("legacy_integration"));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn load_workspace_client_config(
+    config_dir: &Path,
+) -> Result<Option<GoogleWorkspaceClientConfig>> {
+    if let Some(config) = env_primary_workspace_client_config() {
+        return Ok(Some(config));
+    }
+
+    if let Some(config) = load_saved_workspace_client_config(config_dir)? {
+        return Ok(Some(config));
+    }
+
+    if let Some(config) = env_legacy_workspace_client_config() {
+        return Ok(Some(config));
+    }
+
+    let manager = manager(config_dir)?;
+    for key in ["gmail_oauth_config", "calendar_oauth_config"] {
+        if let Some(raw) = manager.get_custom_secret(key)? {
+            let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+            if let Ok(config) = parse_credentials_value(&parsed) {
+                return Ok(Some(config));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn save_workspace_client_config(
+    config_dir: &Path,
+    config: &GoogleWorkspaceClientConfig,
+) -> Result<()> {
+    write_secret_json(config_dir, GOOGLE_WORKSPACE_OAUTH_CONFIG_KEY, config)
+}
+
+fn gws_binary() -> String {
+    std::env::var(GWS_BINARY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "gws".to_string())
+}
+
+fn format_gws_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
+    if !stdout_text.is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout_text) {
+            return serde_json::to_string_pretty(&parsed).unwrap_or(stdout_text);
+        }
+        return stdout_text;
+    }
+    String::from_utf8_lossy(stderr).trim().to_string()
+}
+
+async fn current_workspace_access_token(config_dir: &Path) -> Result<String> {
+    let mut tokens = load_workspace_tokens(config_dir)?.ok_or_else(|| {
+        anyhow!("Google Workspace is not connected yet. Complete the sign-in flow first.")
+    })?;
+    if tokens.expires_at <= Utc::now().timestamp() + 60 {
+        refresh_workspace_token(config_dir, &mut tokens).await?;
+    }
+    Ok(tokens.access_token)
+}
+
+struct GwsRuntimeContext {
+    _temp_dir: TempDir,
+    config_dir: std::path::PathBuf,
+    access_token: Option<String>,
+    client: Option<GoogleWorkspaceClientConfig>,
+}
+
+async fn prepare_gws_runtime(
+    config_dir: &Path,
+    required_bundles: &[String],
+    require_auth: bool,
+) -> Result<GwsRuntimeContext> {
+    let temp_dir = tempfile::tempdir()?;
+    let gws_config_dir = temp_dir.path().join("gws");
+    std::fs::create_dir_all(&gws_config_dir)?;
+    if !require_auth {
+        return Ok(GwsRuntimeContext {
+            _temp_dir: temp_dir,
+            config_dir: gws_config_dir,
+            access_token: None,
+            client: None,
+        });
+    }
+
+    let normalized_bundles = required_bundles
+        .iter()
+        .filter_map(|bundle| normalize_bundle_id(bundle))
+        .collect::<Vec<_>>();
+    let access_token = if normalized_bundles.is_empty() {
+        current_workspace_access_token(config_dir).await?
+    } else {
+        let refs = normalized_bundles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        ensure_access_token_for_bundles(config_dir, &refs).await?
+    };
+    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
+        anyhow!(
+            "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
+        )
+    })?;
+    Ok(GwsRuntimeContext {
+        _temp_dir: temp_dir,
+        config_dir: gws_config_dir,
+        access_token: Some(access_token),
+        client: Some(client),
+    })
+}
+
+async fn run_gws_command_with_options(
+    config_dir: Option<&Path>,
+    argv: &[String],
+    required_bundles: &[String],
+    require_auth: bool,
+    current_dir: Option<&Path>,
+) -> Result<String> {
+    let binary = gws_binary();
+    let mut command = tokio::process::Command::new(&binary);
+    command.kill_on_drop(true);
+    command.args(argv);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env("NO_COLOR", "1");
+    command.env_remove("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE");
+    command.env_remove("GOOGLE_WORKSPACE_CLI_TOKEN");
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+
+    let runtime = if let Some(config_dir) = config_dir {
+        Some(prepare_gws_runtime(config_dir, required_bundles, require_auth).await?)
+    } else {
+        None
+    };
+    if let Some(runtime) = runtime.as_ref() {
+        command.env("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", &runtime.config_dir);
+        if let Some(access_token) = runtime.access_token.as_deref() {
+            command.env("GOOGLE_WORKSPACE_CLI_TOKEN", access_token);
+        }
+        if let Some(client) = runtime.client.as_ref() {
+            command.env("GOOGLE_WORKSPACE_CLI_CLIENT_ID", &client.client_id);
+            command.env("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET", &client.client_secret);
+        }
+    }
+
+    let output = command.output().await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "gws CLI is not installed in this AgentArk runtime. Rebuild the runtime image with Google Workspace CLI support."
+            )
+        } else {
+            anyhow!("Failed to launch gws CLI: {}", error)
+        }
+    })?;
+    let rendered = format_gws_output(&output.stdout, &output.stderr);
+    if output.status.success() {
+        if rendered.is_empty() {
+            Ok("gws command completed.".to_string())
+        } else {
+            Ok(rendered)
+        }
+    } else {
+        Err(anyhow!(
+            "gws command failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            if rendered.is_empty() {
+                "no output returned".to_string()
+            } else {
+                rendered
+            }
+        ))
+    }
+}
+
+async fn run_gws_command(
+    config_dir: Option<&Path>,
+    argv: &[String],
+    required_bundles: &[String],
+    require_auth: bool,
+) -> Result<String> {
+    run_gws_command_with_options(config_dir, argv, required_bundles, require_auth, None).await
+}
+
+pub async fn gws_version() -> Result<String> {
+    run_gws_command(None, &["--version".to_string()], &[], false).await
+}
+
+pub async fn gws_backend_available() -> bool {
+    gws_version().await.is_ok()
+}
+
+pub async fn gws_text_command(
+    config_dir: &Path,
+    argv: &[String],
+    required_bundles: &[&str],
+) -> Result<String> {
+    run_gws_command(
+        Some(config_dir),
+        argv,
+        &required_bundles
+            .iter()
+            .map(|bundle| (*bundle).to_string())
+            .collect::<Vec<_>>(),
+        true,
+    )
+    .await
+}
+
+pub async fn gws_json_command(
+    config_dir: &Path,
+    argv: &[String],
+    required_bundles: &[&str],
+) -> Result<serde_json::Value> {
+    let raw = gws_text_command(config_dir, argv, required_bundles).await?;
+    serde_json::from_str(&raw)
+        .map_err(|error| anyhow!("gws returned non-JSON output: {} | output: {}", error, raw))
+}
+
+fn gws_skills_cache_root(config_dir: &Path) -> std::path::PathBuf {
+    config_dir.join(GWS_SKILLS_CACHE_DIR)
+}
+
+fn trim_frontmatter_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+fn parse_gws_skill_metadata(path: &Path, raw: &str) -> Option<GwsSkillMetadata> {
+    let frontmatter = if let Some(stripped) = raw.strip_prefix("---") {
+        stripped.splitn(2, "---").next().unwrap_or("")
+    } else {
+        ""
+    };
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut cli_help = None;
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            name = trim_frontmatter_value(value);
+        } else if let Some(value) = trimmed.strip_prefix("description:") {
+            description = trim_frontmatter_value(value);
+        } else if let Some(value) = trimmed.strip_prefix("cliHelp:") {
+            let cleaned = trim_frontmatter_value(value);
+            if !cleaned.is_empty() {
+                cli_help = Some(cleaned);
+            }
+        }
+    }
+    if name.is_empty() {
+        name = path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+    }
+    if description.is_empty() {
+        description = format!("Generated Google Workspace CLI skill '{}'.", name);
+    }
+    Some(GwsSkillMetadata {
+        name,
+        description,
+        cli_help,
+        path: path.to_path_buf(),
+    })
+}
+
+async fn ensure_gws_skills_generated(config_dir: &Path) -> Result<std::path::PathBuf> {
+    let bundled_skills_dir = std::path::PathBuf::from(GWS_BUNDLED_SKILLS_DIR);
+    let bundled_marker = bundled_skills_dir.join("gws-shared").join("SKILL.md");
+    if bundled_marker.exists() {
+        return Ok(bundled_skills_dir);
+    }
+
+    let cache_root = gws_skills_cache_root(config_dir);
+    let skills_dir = cache_root.join("skills");
+    let marker = skills_dir.join("gws-shared").join("SKILL.md");
+    if marker.exists() {
+        return Ok(skills_dir);
+    }
+    std::fs::create_dir_all(&cache_root)?;
+    run_gws_command_with_options(
+        None,
+        &["generate-skills".to_string()],
+        &[],
+        false,
+        Some(&cache_root),
+    )
+    .await?;
+    if !marker.exists() {
+        return Err(anyhow!(
+            "gws generate-skills completed but the expected skill catalog was not created."
+        ));
+    }
+    Ok(skills_dir)
+}
+
+async fn load_gws_skills(config_dir: &Path) -> Result<Vec<GwsSkillMetadata>> {
+    let skills_dir = ensure_gws_skills_generated(config_dir).await?;
+    let mut skills = Vec::new();
+    for entry in std::fs::read_dir(&skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_path = path.join("SKILL.md");
+        if !skill_path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&skill_path)?;
+        if let Some(parsed) = parse_gws_skill_metadata(&skill_path, &raw) {
+            skills.push(parsed);
+        }
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(skills)
+}
+
+pub fn load_workspace_tokens(config_dir: &Path) -> Result<Option<GoogleWorkspaceTokens>> {
+    read_secret_json::<GoogleWorkspaceTokens>(config_dir, GOOGLE_WORKSPACE_TOKENS_KEY)
+}
+
+pub fn save_workspace_tokens(config_dir: &Path, tokens: &GoogleWorkspaceTokens) -> Result<()> {
+    write_secret_json(config_dir, GOOGLE_WORKSPACE_TOKENS_KEY, tokens)
+}
+
+fn legacy_token_secret_key(bundle: &str) -> Option<&'static str> {
+    match bundle {
+        "gmail" => Some("gmail_tokens"),
+        "calendar" => Some("calendar_tokens"),
+        _ => None,
+    }
+}
+
+fn load_legacy_tokens(config_dir: &Path, bundle: &str) -> Result<Option<LegacyGoogleTokens>> {
+    let Some(secret_key) = legacy_token_secret_key(bundle) else {
+        return Ok(None);
+    };
+    read_secret_json::<LegacyGoogleTokens>(config_dir, secret_key)
+}
+
+async fn legacy_access_token_for_bundle(config_dir: &Path, bundle: &str) -> Result<Option<String>> {
+    let Some(mut tokens) = load_legacy_tokens(config_dir, bundle)? else {
+        return Ok(None);
+    };
+    if tokens.refresh_token.trim().is_empty() {
+        return Ok(None);
+    }
+    if tokens.expires_at > Utc::now().timestamp() + 60 {
+        return Ok(Some(tokens.access_token));
+    }
+    refresh_legacy_bundle_token(config_dir, bundle, &mut tokens).await?;
+    Ok(Some(tokens.access_token))
+}
+
+async fn refresh_legacy_bundle_token(
+    config_dir: &Path,
+    bundle: &str,
+    tokens: &mut LegacyGoogleTokens,
+) -> Result<()> {
+    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
+        anyhow!(
+            "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
+        )
+    })?;
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let params = [
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
+        ("refresh_token", tokens.refresh_token.as_str()),
+        ("grant_type", "refresh_token"),
+    ];
+    let response = http_client.post(TOKEN_URL).form(&params).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Failed to refresh legacy Google token for {} ({}): {}",
+            bundle,
+            status,
+            body
+        ));
+    }
+    let token: TokenResponse = response.json().await?;
+    tokens.access_token = token.access_token;
+    tokens.expires_at = Utc::now().timestamp() + token.expires_in;
+    if let Some(refresh_token) = token.refresh_token {
+        if !refresh_token.trim().is_empty() {
+            tokens.refresh_token = refresh_token;
+        }
+    }
+    let secret_key = legacy_token_secret_key(bundle)
+        .ok_or_else(|| anyhow!("Unsupported Google bundle '{}'", bundle))?;
+    write_secret_json(config_dir, secret_key, tokens)
+}
+
+pub fn selected_and_pending_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    let mut bundles = BTreeSet::new();
+    for bundle in load_saved_bundles(config_dir)? {
+        bundles.insert(bundle);
+    }
+    for bundle in load_pending_bundles(config_dir)? {
+        bundles.insert(bundle);
+    }
+    if bundles.is_empty() {
+        Ok(default_bundles())
+    } else {
+        Ok(bundles.into_iter().collect())
+    }
+}
+
+pub fn build_auth_url(config_dir: &Path, state_token: &str) -> Result<String> {
+    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
+        anyhow!("Google OAuth client is not configured yet. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google.")
+    })?;
+    let bundles = selected_and_pending_bundles(config_dir)?;
+    let scopes = scopes_for_bundles(&bundles).join(" ");
+    Ok(format!(
+        "{base}?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scope}&state={state}&access_type=offline&prompt=consent&include_granted_scopes=true",
+        base = OAUTH_AUTH_URL,
+        client_id = urlencoding::encode(&client.client_id),
+        redirect = urlencoding::encode(OAUTH_REDIRECT_URI),
+        scope = urlencoding::encode(&scopes),
+        state = urlencoding::encode(state_token),
+    ))
+}
+
+pub async fn exchange_code(config_dir: &Path, code: &str) -> Result<GoogleWorkspaceTokens> {
+    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
+        anyhow!(
+            "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
+        )
+    })?;
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let params = [
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
+        ("code", code),
+        ("redirect_uri", OAUTH_REDIRECT_URI),
+        ("grant_type", "authorization_code"),
+    ];
+    let response = http_client.post(TOKEN_URL).form(&params).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Token exchange failed ({}): {}", status, body));
+    }
+
+    let token: TokenResponse = response.json().await?;
+    let existing = load_workspace_tokens(config_dir)?.unwrap_or(GoogleWorkspaceTokens {
+        access_token: String::new(),
+        refresh_token: String::new(),
+        expires_at: 0,
+        granted_scopes: Vec::new(),
+        granted_bundles: Vec::new(),
+    });
+    let granted_scopes = if let Some(scope) = token.scope.as_deref() {
+        scope
+            .split_whitespace()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        scopes_for_bundles(&selected_and_pending_bundles(config_dir)?)
+    };
+    let granted_bundles = supported_bundles()
+        .iter()
+        .filter_map(|bundle| {
+            let needed = bundle_scopes(bundle);
+            if !needed.is_empty()
+                && needed
+                    .iter()
+                    .all(|scope| granted_scopes.iter().any(|value| value == scope))
+            {
+                Some((*bundle).to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let tokens = GoogleWorkspaceTokens {
+        access_token: token.access_token,
+        refresh_token: token
+            .refresh_token
+            .unwrap_or_else(|| existing.refresh_token.clone()),
+        expires_at: Utc::now().timestamp() + token.expires_in,
+        granted_scopes,
+        granted_bundles: granted_bundles.clone(),
+    };
+    save_workspace_tokens(config_dir, &tokens)?;
+
+    let pending = load_pending_bundles(config_dir)?
+        .into_iter()
+        .filter(|bundle| !granted_bundles.iter().any(|granted| granted == bundle))
+        .collect::<Vec<_>>();
+    save_pending_bundles(config_dir, &pending)?;
+    Ok(tokens)
+}
+
+async fn refresh_workspace_token(
+    config_dir: &Path,
+    tokens: &mut GoogleWorkspaceTokens,
+) -> Result<()> {
+    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
+        anyhow!(
+            "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
+        )
+    })?;
+    if tokens.refresh_token.trim().is_empty() {
+        return Err(anyhow!(
+            "Google Workspace refresh token is missing. Reconnect the integration."
+        ));
+    }
+
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let params = [
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
+        ("refresh_token", tokens.refresh_token.as_str()),
+        ("grant_type", "refresh_token"),
+    ];
+    let response = http_client.post(TOKEN_URL).form(&params).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Failed to refresh Google Workspace token ({}): {}",
+            status,
+            body
+        ));
+    }
+    let token: TokenResponse = response.json().await?;
+    tokens.access_token = token.access_token;
+    tokens.expires_at = Utc::now().timestamp() + token.expires_in;
+    if let Some(refresh_token) = token.refresh_token {
+        if !refresh_token.trim().is_empty() {
+            tokens.refresh_token = refresh_token;
+        }
+    }
+    save_workspace_tokens(config_dir, tokens)
+}
+
+pub fn granted_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    if let Some(tokens) = load_workspace_tokens(config_dir)? {
+        return Ok(tokens.granted_bundles);
+    }
+
+    let manager = manager(config_dir)?;
+    let mut granted = BTreeSet::new();
+    for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
+        let Some(raw) = manager.get_custom_secret(key)? else {
+            continue;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        if parsed
+            .get("refresh_token")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            granted.insert(bundle.to_string());
+        }
+    }
+    Ok(granted.into_iter().collect())
+}
+
+pub fn missing_selected_bundles(config_dir: &Path) -> Result<Vec<String>> {
+    let requested = load_saved_bundles(config_dir)?;
+    let granted = granted_bundles(config_dir)?;
+    Ok(requested
+        .into_iter()
+        .filter(|bundle| {
+            !granted
+                .iter()
+                .any(|granted_bundle| granted_bundle == bundle)
+        })
+        .collect())
+}
+
+pub async fn ensure_access_token_for_bundles(
+    config_dir: &Path,
+    bundles: &[&str],
+) -> Result<String> {
+    let normalized = bundles
+        .iter()
+        .filter_map(|bundle| normalize_bundle_id(bundle))
+        .collect::<Vec<_>>();
+    let granted = granted_bundles(config_dir)?;
+    if normalized.len() == 1
+        && granted
+            .iter()
+            .any(|granted_bundle| granted_bundle == &normalized[0])
+    {
+        if let Some(legacy_access_token) =
+            legacy_access_token_for_bundle(config_dir, &normalized[0]).await?
+        {
+            return Ok(legacy_access_token);
+        }
+    }
+    let missing = normalized
+        .iter()
+        .filter(|bundle| {
+            !granted
+                .iter()
+                .any(|granted_bundle| granted_bundle == *bundle)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let _ = request_additional_bundles(config_dir, &missing);
+        let requested = missing
+            .iter()
+            .map(|bundle| bundle_label(bundle))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "Google Workspace needs additional access for {}. Reconnect the integration to grant those bundles.",
+            requested
+        ));
+    }
+
+    current_workspace_access_token(config_dir).await
+}
+
+pub fn summarize_connection_status(config_dir: &Path) -> Result<(bool, Vec<String>, Vec<String>)> {
+    let granted = granted_bundles(config_dir)?;
+    let missing = missing_selected_bundles(config_dir)?;
+    Ok((!granted.is_empty(), granted, missing))
+}
+
+pub async fn gws_help(arguments: &serde_json::Value) -> Result<String> {
+    let args: GwsHelpArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid gws help args: {}", e))?;
+    let argv = if args.argv.is_empty() {
+        vec!["--help".to_string()]
+    } else {
+        args.argv
+    };
+    if argv
+        .first()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("auth"))
+    {
+        return Err(anyhow!(
+            "gws auth commands are not exposed through AgentArk. Use the Google Workspace integration popup for sign-in."
+        ));
+    }
+    run_gws_command(None, &argv, &[], false).await
+}
+
+pub async fn gws_schema(arguments: &serde_json::Value) -> Result<String> {
+    let args: GwsSchemaArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid gws schema args: {}", e))?;
+    let target = args.target.trim();
+    if target.is_empty() {
+        return Err(anyhow!("Missing gws schema target."));
+    }
+    run_gws_command(
+        None,
+        &["schema".to_string(), target.to_string()],
+        &[],
+        false,
+    )
+    .await
+}
+
+pub async fn gws_command(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: GwsCommandArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid gws command args: {}", e))?;
+    if args.argv.is_empty() {
+        return Err(anyhow!(
+            "{}",
+            "Missing gws argv. Provide the arguments after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"]"
+        ));
+    }
+    if args
+        .argv
+        .first()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("auth"))
+    {
+        return Err(anyhow!(
+            "gws auth commands are not exposed through AgentArk. Use the Google Workspace integration popup for sign-in."
+        ));
+    }
+    run_gws_command(Some(config_dir), &args.argv, &args.required_bundles, true).await
+}
+
+pub async fn gws_skills(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: GwsSkillsArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid gws skills args: {}", e))?;
+    let mut skills = load_gws_skills(config_dir).await?;
+    if let Some(filter) = args
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let needle = filter.to_ascii_lowercase();
+        skills.retain(|skill| {
+            skill.name.to_ascii_lowercase().contains(&needle)
+                || skill.description.to_ascii_lowercase().contains(&needle)
+                || skill
+                    .cli_help
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+        });
+    }
+    if let Some(name) = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let needle = name.to_ascii_lowercase();
+        let skill = skills
+            .into_iter()
+            .find(|skill| {
+                skill.name.eq_ignore_ascii_case(name)
+                    || skill.name.to_ascii_lowercase().contains(&needle)
+            })
+            .ok_or_else(|| anyhow!("No generated gws skill matched '{}'.", name))?;
+        return Ok(std::fs::read_to_string(&skill.path)?);
+    }
+    let limit = args.limit.unwrap_or(80).clamp(1, 200);
+    if skills.is_empty() {
+        return Ok("No generated gws skills found.".to_string());
+    }
+    let mut lines = vec![format!(
+        "Generated Google Workspace CLI skills available: {}",
+        skills.len()
+    )];
+    for skill in skills.into_iter().take(limit) {
+        let cli_help = skill.cli_help.unwrap_or_else(|| "gws --help".to_string());
+        lines.push(format!(
+            "- {} — {} | {}",
+            skill.name, skill.description, cli_help
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub async fn drive_search(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: DriveSearchArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid Drive search args: {}", e))?;
+    let page_size = args.page_size.unwrap_or(10).clamp(1, 50);
+    let data: serde_json::Value = if gws_backend_available().await {
+        let mut params = serde_json::json!({
+            "pageSize": page_size,
+            "fields": "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress))",
+            "orderBy": "modifiedTime desc"
+        });
+        if let Some(q) = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params["q"] = serde_json::Value::String(q.to_string());
+        }
+        let argv = vec![
+            "drive".to_string(),
+            "files".to_string(),
+            "list".to_string(),
+            "--params".to_string(),
+            params.to_string(),
+        ];
+        match gws_json_command(config_dir, &argv, &["drive"]).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "Drive search gws path failed, falling back to REST: {}",
+                    error
+                );
+                let access_token = ensure_access_token_for_bundles(config_dir, &["drive"]).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let mut url = reqwest::Url::parse(&format!("{}/files", DRIVE_API_BASE))?;
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("pageSize", &page_size.to_string());
+                    query.append_pair(
+                        "fields",
+                        "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress))",
+                    );
+                    query.append_pair("orderBy", "modifiedTime desc");
+                    if let Some(q) = args
+                        .query
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        query.append_pair("q", q);
+                    }
+                }
+                let response = client.get(url).bearer_auth(access_token).send().await?;
+                if !response.status().is_success() {
+                    return Err(anyhow!("Google Drive search failed: {}", response.status()));
+                }
+                response.json().await?
+            }
+        }
+    } else {
+        let access_token = ensure_access_token_for_bundles(config_dir, &["drive"]).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let mut url = reqwest::Url::parse(&format!("{}/files", DRIVE_API_BASE))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("pageSize", &page_size.to_string());
+            query.append_pair(
+                "fields",
+                "files(id,name,mimeType,modifiedTime,webViewLink,owners(displayName,emailAddress))",
+            );
+            query.append_pair("orderBy", "modifiedTime desc");
+            if let Some(q) = args
+                .query
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                query.append_pair("q", q);
+            }
+        }
+        let response = client.get(url).bearer_auth(access_token).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Google Drive search failed: {}", response.status()));
+        }
+        response.json().await?
+    };
+    let files = data
+        .get("files")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if files.is_empty() {
+        return Ok("No matching Google Drive files found.".to_string());
+    }
+
+    let mut lines = Vec::new();
+    for file in files {
+        let name = file
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Untitled");
+        let mime = file
+            .get("mimeType")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let modified = file
+            .get("modifiedTime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let owner = file
+            .get("owners")
+            .and_then(|value| value.as_array())
+            .and_then(|owners| owners.first())
+            .and_then(|value| {
+                value
+                    .get("displayName")
+                    .and_then(|name| name.as_str())
+                    .or_else(|| value.get("emailAddress").and_then(|email| email.as_str()))
+            })
+            .unwrap_or("-");
+        let link = file
+            .get("webViewLink")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        lines.push(format!(
+            "- {} | {} | modified {} | owner {} | {}",
+            name, mime, modified, owner, link
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: DocsReadArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid Docs args: {}", e))?;
+    let data: serde_json::Value = if gws_backend_available().await {
+        let argv = vec![
+            "docs".to_string(),
+            "documents".to_string(),
+            "get".to_string(),
+            "--params".to_string(),
+            serde_json::json!({ "documentId": args.document_id }).to_string(),
+        ];
+        match gws_json_command(config_dir, &argv, &["docs"]).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!("Docs read gws path failed, falling back to REST: {}", error);
+                let access_token = ensure_access_token_for_bundles(config_dir, &["docs"]).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let response = client
+                    .get(format!("{}/documents/{}", DOCS_API_BASE, args.document_id))
+                    .bearer_auth(access_token)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(anyhow!("Google Docs read failed: {}", response.status()));
+                }
+                response.json().await?
+            }
+        }
+    } else {
+        let access_token = ensure_access_token_for_bundles(config_dir, &["docs"]).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let response = client
+            .get(format!("{}/documents/{}", DOCS_API_BASE, args.document_id))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Google Docs read failed: {}", response.status()));
+        }
+        response.json().await?
+    };
+    let title = data
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Untitled doc");
+    let mut text_parts = Vec::new();
+    if let Some(content) = data
+        .get("body")
+        .and_then(|value| value.get("content"))
+        .and_then(|value| value.as_array())
+    {
+        for block in content {
+            let Some(elements) = block
+                .get("paragraph")
+                .and_then(|value| value.get("elements"))
+                .and_then(|value| value.as_array())
+            else {
+                continue;
+            };
+            for element in elements {
+                if let Some(text) = element
+                    .get("textRun")
+                    .and_then(|value| value.get("content"))
+                    .and_then(|value| value.as_str())
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        text_parts.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let joined = text_parts.join(" ");
+    if joined.is_empty() {
+        Ok(format!("{} has no readable text content.", title))
+    } else {
+        Ok(format!("{}\n\n{}", title, joined))
+    }
+}
+
+pub async fn sheets_read(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: SheetsReadArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid Sheets args: {}", e))?;
+    let data: serde_json::Value = if gws_backend_available().await {
+        let argv = vec![
+            "sheets".to_string(),
+            "spreadsheets".to_string(),
+            "values".to_string(),
+            "get".to_string(),
+            "--params".to_string(),
+            serde_json::json!({
+                "spreadsheetId": args.spreadsheet_id,
+                "range": args.range
+            })
+            .to_string(),
+        ];
+        match gws_json_command(config_dir, &argv, &["sheets"]).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "Sheets read gws path failed, falling back to REST: {}",
+                    error
+                );
+                let access_token = ensure_access_token_for_bundles(config_dir, &["sheets"]).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let response = client
+                    .get(format!(
+                        "{}/spreadsheets/{}/values/{}",
+                        SHEETS_API_BASE,
+                        args.spreadsheet_id,
+                        urlencoding::encode(&args.range)
+                    ))
+                    .bearer_auth(access_token)
+                    .send()
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(anyhow!("Google Sheets read failed: {}", response.status()));
+                }
+                response.json().await?
+            }
+        }
+    } else {
+        let access_token = ensure_access_token_for_bundles(config_dir, &["sheets"]).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let response = client
+            .get(format!(
+                "{}/spreadsheets/{}/values/{}",
+                SHEETS_API_BASE,
+                args.spreadsheet_id,
+                urlencoding::encode(&args.range)
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Google Sheets read failed: {}", response.status()));
+        }
+        response.json().await?
+    };
+    let values = data
+        .get("values")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if values.is_empty() {
+        return Ok(format!("No values found for range {}.", args.range));
+    }
+    let lines = values
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| {
+                            cell.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| cell.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_else(|| row.to_string())
+        })
+        .collect::<Vec<_>>();
+    Ok(lines.join("\n"))
+}
+
+pub async fn chat_list_spaces(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: ChatListSpacesArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid Chat args: {}", e))?;
+    let page_size = args.page_size.unwrap_or(20).clamp(1, 50);
+    let data: serde_json::Value = if gws_backend_available().await {
+        let argv = vec![
+            "chat".to_string(),
+            "spaces".to_string(),
+            "list".to_string(),
+            "--params".to_string(),
+            serde_json::json!({ "pageSize": page_size }).to_string(),
+        ];
+        match gws_json_command(config_dir, &argv, &["chat"]).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "Google Chat spaces gws path failed, falling back to REST: {}",
+                    error
+                );
+                let access_token = ensure_access_token_for_bundles(config_dir, &["chat"]).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let mut url = reqwest::Url::parse(&format!("{}/spaces", CHAT_API_BASE))?;
+                url.query_pairs_mut()
+                    .append_pair("pageSize", &page_size.to_string());
+                let response = client.get(url).bearer_auth(access_token).send().await?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "Google Chat spaces request failed: {}",
+                        response.status()
+                    ));
+                }
+                response.json().await?
+            }
+        }
+    } else {
+        let access_token = ensure_access_token_for_bundles(config_dir, &["chat"]).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let mut url = reqwest::Url::parse(&format!("{}/spaces", CHAT_API_BASE))?;
+        url.query_pairs_mut()
+            .append_pair("pageSize", &page_size.to_string());
+        let response = client.get(url).bearer_auth(access_token).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Google Chat spaces request failed: {}",
+                response.status()
+            ));
+        }
+        response.json().await?
+    };
+    let spaces = data
+        .get("spaces")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if spaces.is_empty() {
+        return Ok("No Google Chat spaces found.".to_string());
+    }
+    let mut lines = Vec::new();
+    for space in spaces {
+        let name = space
+            .get("displayName")
+            .and_then(|value| value.as_str())
+            .unwrap_or("(unnamed)");
+        let kind = space
+            .get("spaceType")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let id = space
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        lines.push(format!("- {} | {} | {}", name, kind, id));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub async fn admin_list_users(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
+    let args: AdminListUsersArgs = serde_json::from_value(arguments.clone())
+        .map_err(|e| anyhow!("Invalid Admin args: {}", e))?;
+    let max_results = args.max_results.unwrap_or(20).clamp(1, 50);
+    let data: serde_json::Value = if gws_backend_available().await {
+        let mut params = serde_json::json!({
+            "maxResults": max_results,
+            "orderBy": "email"
+        });
+        if let Some(customer) = args
+            .customer
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params["customer"] = serde_json::Value::String(customer.to_string());
+        } else if let Some(domain) = args
+            .domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params["domain"] = serde_json::Value::String(domain.to_string());
+        } else {
+            params["customer"] = serde_json::Value::String("my_customer".to_string());
+        }
+        let argv = vec![
+            "admin".to_string(),
+            "users".to_string(),
+            "list".to_string(),
+            "--params".to_string(),
+            params.to_string(),
+        ];
+        match gws_json_command(config_dir, &argv, &["admin"]).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "Google Admin gws path failed, falling back to REST: {}",
+                    error
+                );
+                let access_token = ensure_access_token_for_bundles(config_dir, &["admin"]).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let mut url = reqwest::Url::parse(&format!("{}/users", ADMIN_API_BASE))?;
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("maxResults", &max_results.to_string());
+                    query.append_pair("orderBy", "email");
+                    if let Some(customer) = args
+                        .customer
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        query.append_pair("customer", customer);
+                    } else if let Some(domain) = args
+                        .domain
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        query.append_pair("domain", domain);
+                    } else {
+                        query.append_pair("customer", "my_customer");
+                    }
+                }
+                let response = client.get(url).bearer_auth(access_token).send().await?;
+                if !response.status().is_success() {
+                    return Err(anyhow!(
+                        "Google Admin users request failed: {}",
+                        response.status()
+                    ));
+                }
+                response.json().await?
+            }
+        }
+    } else {
+        let access_token = ensure_access_token_for_bundles(config_dir, &["admin"]).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let mut url = reqwest::Url::parse(&format!("{}/users", ADMIN_API_BASE))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("maxResults", &max_results.to_string());
+            query.append_pair("orderBy", "email");
+            if let Some(customer) = args
+                .customer
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                query.append_pair("customer", customer);
+            } else if let Some(domain) = args
+                .domain
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                query.append_pair("domain", domain);
+            } else {
+                query.append_pair("customer", "my_customer");
+            }
+        }
+        let response = client.get(url).bearer_auth(access_token).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Google Admin users request failed: {}",
+                response.status()
+            ));
+        }
+        response.json().await?
+    };
+    let users = data
+        .get("users")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if users.is_empty() {
+        return Ok("No Google Workspace users found.".to_string());
+    }
+    let mut lines = Vec::new();
+    for user in users {
+        let primary_email = user
+            .get("primaryEmail")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let name = user
+            .get("name")
+            .and_then(|value| value.get("fullName"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let suspended = user
+            .get("suspended")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        lines.push(format!(
+            "- {} | {}{}",
+            primary_email,
+            name,
+            if suspended { " | suspended" } else { "" }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, String>> {
+    let bundles = load_saved_bundles(config_dir)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let mut results = HashMap::new();
+    match gws_version().await {
+        Ok(version) => {
+            let version = version.trim();
+            results.insert(
+                "gws_backend".to_string(),
+                if version.is_empty() {
+                    "gws CLI ready".to_string()
+                } else {
+                    format!("gws CLI ready ({})", version)
+                },
+            );
+        }
+        Err(error) => {
+            results.insert(
+                "gws_backend".to_string(),
+                format!("gws unavailable: {}", error),
+            );
+        }
+    }
+
+    for bundle in bundles {
+        let access_token = ensure_access_token_for_bundles(config_dir, &[bundle.as_str()]).await?;
+        let (url, label) = match bundle.as_str() {
+            "gmail" => (
+                "https://gmail.googleapis.com/gmail/v1/users/me/profile".to_string(),
+                "Gmail".to_string(),
+            ),
+            "calendar" => (
+                "https://www.googleapis.com/calendar/v3/calendars/primary".to_string(),
+                "Calendar".to_string(),
+            ),
+            "drive" => (
+                format!("{}/files?pageSize=1&fields=files(id,name)", DRIVE_API_BASE),
+                "Drive".to_string(),
+            ),
+            "docs" => {
+                results.insert(bundle, "Docs access granted".to_string());
+                continue;
+            }
+            "sheets" => {
+                results.insert(bundle, "Sheets access granted".to_string());
+                continue;
+            }
+            "chat" => (
+                format!("{}/spaces?pageSize=1", CHAT_API_BASE),
+                "Chat".to_string(),
+            ),
+            "admin" => (
+                format!("{}/users?customer=my_customer&maxResults=1", ADMIN_API_BASE),
+                "Admin".to_string(),
+            ),
+            _ => continue,
+        };
+        let response = client.get(url).bearer_auth(access_token).send().await?;
+        if response.status().is_success() {
+            results.insert(bundle, format!("{} connected", label));
+        } else {
+            results.insert(bundle, format!("{} failed ({})", label, response.status()));
+        }
+    }
+
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_google_client_json_shapes() {
+        let web = r#"{"web":{"client_id":"abc","client_secret":"def"}}"#;
+        let installed = r#"{"installed":{"client_id":"ghi","client_secret":"jkl"}}"#;
+        assert_eq!(parse_credentials_json(web).unwrap().client_id, "abc");
+        assert_eq!(
+            parse_credentials_json(installed).unwrap().client_secret,
+            "jkl"
+        );
+    }
+
+    #[test]
+    fn bundle_list_normalizes_and_defaults() {
+        assert_eq!(
+            parse_bundle_list_from_str("Gmail, google_calendar, drive, invalid"),
+            vec![
+                "calendar".to_string(),
+                "drive".to_string(),
+                "gmail".to_string()
+            ]
+        );
+        assert_eq!(parse_bundle_list_from_str(""), default_bundles());
+    }
+
+    #[test]
+    fn scopes_cover_each_selected_bundle_once() {
+        let scopes = scopes_for_bundles(&[
+            "gmail".to_string(),
+            "calendar".to_string(),
+            "gmail".to_string(),
+        ]);
+        assert!(scopes.iter().any(|scope| scope.contains("gmail.readonly")));
+        assert!(scopes.iter().any(|scope| scope.contains("calendar")));
+    }
+
+    #[test]
+    fn parses_generated_gws_skill_frontmatter() {
+        let raw = r#"---
+name: gws-docs
+description: "Read and write Google Docs."
+metadata:
+  version: 0.22.3
+  openclaw:
+    cliHelp: "gws docs --help"
+---
+
+# docs
+"#;
+        let parsed =
+            parse_gws_skill_metadata(std::path::Path::new("skills/gws-docs/SKILL.md"), raw)
+                .unwrap();
+        assert_eq!(parsed.name, "gws-docs");
+        assert_eq!(parsed.description, "Read and write Google Docs.");
+        assert_eq!(parsed.cli_help.as_deref(), Some("gws docs --help"));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_legacy_gmail_tokens_for_workspace_bundle() {
+        let dir = tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(dir.path()).unwrap();
+        manager
+            .set_custom_secret(
+                "gmail_tokens",
+                Some(
+                    serde_json::json!({
+                        "access_token": "legacy-gmail-token",
+                        "refresh_token": "legacy-refresh-token",
+                        "expires_at": Utc::now().timestamp() + 3600
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+
+        let token = ensure_access_token_for_bundles(dir.path(), &["gmail"])
+            .await
+            .unwrap();
+        assert_eq!(token, "legacy-gmail-token");
+    }
+
+    #[tokio::test]
+    async fn test_selected_bundles_reports_docs_and_sheets_access() {
+        let dir = tempdir().unwrap();
+        save_workspace_client_config(
+            dir.path(),
+            &GoogleWorkspaceClientConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+            },
+        )
+        .unwrap();
+        save_selected_bundles(dir.path(), &["docs".to_string(), "sheets".to_string()]).unwrap();
+        save_workspace_tokens(
+            dir.path(),
+            &GoogleWorkspaceTokens {
+                access_token: "workspace-token".to_string(),
+                refresh_token: "workspace-refresh".to_string(),
+                expires_at: Utc::now().timestamp() + 3600,
+                granted_scopes: scopes_for_bundles(&["docs".to_string(), "sheets".to_string()]),
+                granted_bundles: vec!["docs".to_string(), "sheets".to_string()],
+            },
+        )
+        .unwrap();
+
+        let checks = test_selected_bundles(dir.path()).await.unwrap();
+        assert_eq!(
+            checks.get("docs").map(String::as_str),
+            Some("Docs access granted")
+        );
+        assert_eq!(
+            checks.get("sheets").map(String::as_str),
+            Some("Sheets access granted")
+        );
+    }
+}

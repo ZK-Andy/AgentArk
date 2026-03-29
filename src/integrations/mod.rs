@@ -26,8 +26,13 @@ pub mod whoop;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
+
+const INTEGRATION_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn parse_boolish(value: &str) -> Option<bool> {
     let v = value.trim().to_ascii_lowercase();
@@ -39,6 +44,97 @@ fn parse_boolish(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "n" | "off" => Some(false),
         _ => None,
     }
+}
+
+pub fn integration_enabled_key(id: &str) -> String {
+    format!("integration_enabled:{}", id)
+}
+
+pub fn integration_user_disabled_key(id: &str) -> String {
+    format!("integration_user_disabled:{}", id)
+}
+
+fn stored_bool_secret(
+    manager: &crate::core::config::SecureConfigManager,
+    key: &str,
+) -> Option<bool> {
+    manager
+        .get_custom_secret(key)
+        .ok()
+        .flatten()
+        .and_then(|value| parse_boolish(&value))
+}
+
+fn legacy_google_refresh_token_present(
+    manager: &crate::core::config::SecureConfigManager,
+    key: &str,
+) -> bool {
+    manager
+        .get_custom_secret(key)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|parsed| {
+            parsed
+                .get("refresh_token")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .is_some()
+}
+
+fn builtin_integration_is_connected(
+    config_dir: &Path,
+    manager: &crate::core::config::SecureConfigManager,
+    integration_id: &str,
+) -> bool {
+    match integration_id {
+        "gmail" => legacy_google_refresh_token_present(manager, "gmail_tokens"),
+        "google_calendar" => legacy_google_refresh_token_present(manager, "calendar_tokens"),
+        "google_workspace" => {
+            crate::actions::google_workspace::summarize_connection_status(config_dir)
+                .map(|(connected, granted, missing)| {
+                    connected && !granted.is_empty() && missing.is_empty()
+                })
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+pub fn effective_integration_enabled(config_dir: &Path, integration_id: &str) -> bool {
+    let Ok(manager) = crate::core::config::SecureConfigManager::new(config_dir) else {
+        return true;
+    };
+
+    if stored_bool_secret(&manager, &integration_user_disabled_key(integration_id)).unwrap_or(false)
+    {
+        return false;
+    }
+
+    let explicit = stored_bool_secret(&manager, &integration_enabled_key(integration_id));
+    if !matches!(
+        integration_id,
+        "gmail" | "google_calendar" | "google_workspace"
+    ) {
+        return explicit.unwrap_or(true);
+    }
+
+    if explicit == Some(true) {
+        return true;
+    }
+
+    if builtin_integration_is_connected(config_dir, &manager, integration_id) {
+        let _ = manager.set_custom_secret(
+            &integration_enabled_key(integration_id),
+            Some("true".to_string()),
+        );
+        return true;
+    }
+
+    explicit.unwrap_or(true)
 }
 
 /// Capabilities an integration can provide
@@ -220,58 +316,38 @@ impl IntegrationManager {
         self.integrations.keys().cloned().collect()
     }
 
-    fn enabled_overrides(&self) -> HashMap<String, bool> {
-        let mut enabled = HashMap::new();
-        let Ok(manager) = crate::core::config::SecureConfigManager::new(&self._config_dir) else {
-            return enabled;
-        };
-        let Ok(secrets) = manager.load_secrets() else {
-            return enabled;
-        };
-        for (key, value) in secrets.custom {
-            let Some(id) = key.strip_prefix("integration_enabled:") else {
-                continue;
-            };
-            if let Some(parsed) = parse_boolish(&value) {
-                enabled.insert(id.to_string(), parsed);
-            }
-        }
-        enabled
-    }
-
     /// Returns true when an integration is enabled for agent dispatch.
     /// Missing/invalid flags default to enabled (matching execute-time behavior).
     pub fn is_enabled(&self, integration_id: &str) -> bool {
-        self.enabled_overrides()
-            .get(integration_id)
-            .copied()
-            .unwrap_or(true)
+        effective_integration_enabled(&self._config_dir, integration_id)
     }
 
     /// List integration IDs that are currently enabled for agent dispatch.
     pub fn enabled_ids(&self) -> Vec<String> {
-        let overrides = self.enabled_overrides();
         self.integrations
             .keys()
-            .filter(|id| overrides.get(id.as_str()).copied().unwrap_or(true))
+            .filter(|id| effective_integration_enabled(&self._config_dir, id.as_str()))
             .cloned()
             .collect()
     }
 
     /// List all integrations with their status
     pub async fn list(&self) -> Vec<IntegrationInfo> {
-        let mut result = Vec::new();
-        for (id, integration) in &self.integrations {
-            result.push(IntegrationInfo {
+        join_all(self.integrations.iter().map(|(id, integration)| async move {
+            let status = match tokio::time::timeout(INTEGRATION_STATUS_TIMEOUT, integration.status()).await {
+                Ok(status) => status,
+                Err(_) => IntegrationStatus::Error("Status check timed out".to_string()),
+            };
+            IntegrationInfo {
                 id: id.clone(),
                 name: integration.name().to_string(),
                 description: integration.description().to_string(),
                 icon: integration.icon().to_string(),
                 capabilities: integration.capabilities(),
-                status: integration.status().await,
-            });
-        }
-        result
+                status,
+            }
+        }))
+        .await
     }
 
     /// Return all connected integrations that support notifications
@@ -321,4 +397,108 @@ pub struct IntegrationInfo {
     pub icon: String,
     pub capabilities: Vec<Capability>,
     pub status: IntegrationStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_integration_enabled_autoheals_connected_google_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send",
+                            "https://www.googleapis.com/auth/calendar"
+                        ],
+                        "granted_bundles": ["gmail", "calendar"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .expect("workspace tokens saved");
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail", "calendar"]).to_string()),
+            )
+            .expect("workspace bundles saved");
+        manager
+            .set_custom_secret(
+                &integration_enabled_key("google_workspace"),
+                Some("false".to_string()),
+            )
+            .expect("stale disabled flag saved");
+
+        assert!(effective_integration_enabled(
+            dir.path(),
+            "google_workspace"
+        ));
+        assert_eq!(
+            manager
+                .get_custom_secret(&integration_enabled_key("google_workspace"))
+                .expect("load enabled flag")
+                .as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn effective_integration_enabled_respects_manual_disable_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager =
+            crate::core::config::SecureConfigManager::new(dir.path()).expect("secure manager");
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send"
+                        ],
+                        "granted_bundles": ["gmail"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .expect("workspace tokens saved");
+        manager
+            .set_custom_secret(
+                &integration_user_disabled_key("google_workspace"),
+                Some("true".to_string()),
+            )
+            .expect("manual disable marker saved");
+        manager
+            .set_custom_secret(
+                &integration_enabled_key("google_workspace"),
+                Some("false".to_string()),
+            )
+            .expect("disabled flag saved");
+
+        assert!(!effective_integration_enabled(
+            dir.path(),
+            "google_workspace"
+        ));
+        assert_eq!(
+            manager
+                .get_custom_secret(&integration_enabled_key("google_workspace"))
+                .expect("load enabled flag")
+                .as_deref(),
+            Some("false")
+        );
+    }
 }

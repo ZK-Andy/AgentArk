@@ -6,7 +6,18 @@ import type {
   SkillTestResponse,
   BriefingResponse,
   IntegrationItem,
+  IntegrationSyncFeedItem,
+  IntegrationSyncStatus,
+  BrowserProfilesResponse,
+  GatewayChannelsResponse,
+  GatewayOpsOverview,
+  GatewayRoutingResponse,
+  GatewayRoutingSimulation,
+  GoogleWorkspaceOAuthClientSettings,
   LlmAnalyticsResponse,
+  ModelFailoverResponse,
+  NodeCommandsResponse,
+  NodesResponse,
   Notification,
   PredictiveNudgesResponse,
   StatusResponse,
@@ -304,6 +315,7 @@ type ChatStreamPayload = {
 };
 
 type ChatStreamHandlers = {
+  signal?: AbortSignal;
   onEvent?: (event: string, payload: unknown) => void;
   onToken?: (token: string) => void;
   onThinking?: (step: Record<string, unknown>) => void;
@@ -356,6 +368,7 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
     fetch("/chat/stream", {
       method: "POST",
       credentials: "include",
+      signal: handlers.signal,
       headers: buildHeaders({
         Accept: "text/event-stream"
       }),
@@ -490,6 +503,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload ?? {})
     }),
+  rawPatch: (path: string, payload?: unknown) =>
+    request<unknown>(path, {
+      method: "PATCH",
+      body: JSON.stringify(payload ?? {})
+    }),
   rawDelete: (path: string) =>
     request<unknown>(path, {
       method: "DELETE"
@@ -541,6 +559,228 @@ export const api = {
       body: JSON.stringify(payload)
     }),
   getIntegrations: () => request<{ integrations: IntegrationItem[] }>("/integrations"),
+  getIntegrationSyncStatus: () => request<{ statuses: IntegrationSyncStatus[] }>("/integrations/sync/status"),
+  getIntegrationSyncFeed: (params?: { integration_id?: string; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.integration_id) query.set("integration_id", params.integration_id);
+    if (typeof params?.limit === "number") query.set("limit", String(params.limit));
+    const suffix = query.toString();
+    return request<{ items: IntegrationSyncFeedItem[] }>(
+      `/integrations/sync/feed${suffix ? `?${suffix}` : ""}`
+    );
+  },
+  updateIntegrationSync: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; sync: IntegrationSyncStatus }>(`/integrations/${encodeURIComponent(id)}/sync`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  runIntegrationSyncNow: (id: string) =>
+    request<{ status: string; sync: IntegrationSyncStatus }>(`/integrations/${encodeURIComponent(id)}/sync-now`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  getChannels: () => request<GatewayChannelsResponse>("/gateway/channels"),
+  getGatewayOpsOverview: () => request<GatewayOpsOverview>("/gateway/ops"),
+  createChannelAccount: (payload: Record<string, unknown>) =>
+    request<{ status: string; account?: Record<string, unknown>; message?: string }>("/gateway/channels/accounts", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateChannelAccount: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; account?: Record<string, unknown>; message?: string }>(
+      `/gateway/channels/accounts/${encodeURIComponent(id)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  deleteChannelAccount: (id: string) =>
+    request<{ status: string; message?: string }>(`/gateway/channels/accounts/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
+  getRouting: () => request<GatewayRoutingResponse>("/gateway/routing"),
+  createRoutingRule: (payload: Record<string, unknown>) =>
+    request<{ status: string; rule?: Record<string, unknown>; message?: string }>("/gateway/routing/rules", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  createBroadcastGroup: (payload: Record<string, unknown>) =>
+    request<{ status: string; group?: Record<string, unknown>; message?: string }>("/gateway/routing/groups", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateRoutingRule: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; rule?: Record<string, unknown>; message?: string }>(
+      `/gateway/routing/rules/${encodeURIComponent(id)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  deleteRoutingRule: (id: string) =>
+    request<{ status: string; message?: string }>(`/gateway/routing/rules/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
+  simulateRouting: (payload: Record<string, unknown>) =>
+    request<{ status: string; simulation: GatewayRoutingSimulation }>("/gateway/routing/simulate", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  getNodes: () => request<NodesResponse>("/nodes"),
+  createNode: (payload: Record<string, unknown>) =>
+    request<{ status: string; node?: Record<string, unknown>; message?: string }>("/nodes", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateNode: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; node?: Record<string, unknown>; message?: string }>(`/nodes/${encodeURIComponent(id)}`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  deleteNode: (id: string) =>
+    request<{ status: string; node?: Record<string, unknown>; message?: string }>(`/nodes/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
+  refreshNodeHeartbeat: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; heartbeat?: Record<string, unknown>; message?: string }>(
+      `/nodes/${encodeURIComponent(id)}/heartbeat`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getNodeCommands: (id: string) => request<NodeCommandsResponse>(`/nodes/${encodeURIComponent(id)}/commands`),
+  logNodeCommand: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; command?: Record<string, unknown>; message?: string }>(
+      `/nodes/${encodeURIComponent(id)}/commands`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getBrowserProfiles: () => request<BrowserProfilesResponse>("/browser/profiles"),
+  createBrowserProfile: (payload: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>("/browser/profiles", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  updateBrowserProfile: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  deleteBrowserProfile: (id: string) =>
+    request<{ status: string; message?: string }>(`/browser/profiles/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    }),
+  lockBrowserProfile: (id: string, payload?: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}/lock`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload ?? {})
+      }
+    ),
+  unlockBrowserProfile: (id: string, payload?: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}/unlock`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload ?? {})
+      }
+    ),
+  recordBrowserSession: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}/sessions`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  getModelFailover: () => request<ModelFailoverResponse>("/models/failover"),
+  upsertAuthProfile: (payload: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      "/models/failover/profiles",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  setDefaultAuthProfile: (id: string) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/models/failover/profiles/${encodeURIComponent(id)}/default`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  disableAuthProfile: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; profile?: Record<string, unknown>; message?: string }>(
+      `/models/failover/profiles/${encodeURIComponent(id)}/disable`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  clearAuthProfileCooldown: (id: string) =>
+    request<{ status: string; result?: Record<string, unknown>; message?: string }>(
+      `/models/failover/profiles/${encodeURIComponent(id)}/clear-cooldown`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  rotateAuthProfile: (id: string) =>
+    request<{ status: string; result?: Record<string, unknown>; message?: string }>(
+      `/models/failover/profiles/${encodeURIComponent(id)}/rotate`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  upsertProviderHealth: (payload: Record<string, unknown>) =>
+    request<{ status: string; provider?: Record<string, unknown>; message?: string }>(
+      "/models/failover/providers",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  disableProviderHealth: (id: string, payload: Record<string, unknown>) =>
+    request<{ status: string; provider?: Record<string, unknown>; message?: string }>(
+      `/models/failover/providers/${encodeURIComponent(id)}/disable`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  clearProviderCooldown: (id: string) =>
+    request<{ status: string; result?: Record<string, unknown>; message?: string }>(
+      `/models/failover/providers/${encodeURIComponent(id)}/clear-cooldown`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  upsertFallbackChain: (payload: Record<string, unknown>) =>
+    request<{ status: string; chain?: Record<string, unknown>; message?: string }>(
+      "/models/failover/chains",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
+  selectModelFailoverCandidate: (payload: Record<string, unknown>) =>
+    request<{ status: string; result?: Record<string, unknown>; message?: string }>(
+      "/models/failover/select",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      }
+    ),
   importSkill: (payload: SkillImportRequest) =>
     request<SkillImportResponse>("/skills/import", {
       method: "POST",
@@ -629,6 +869,13 @@ export const api = {
       `/security/logs?limit=${limit}`
     ),
   getSettings: () => request<Record<string, unknown>>("/settings"),
+  getGoogleWorkspaceOAuthClientSettings: () =>
+    request<GoogleWorkspaceOAuthClientSettings>("/settings/google-workspace/oauth-client"),
+  updateGoogleWorkspaceOAuthClientSettings: (payload: Record<string, unknown>) =>
+    request<GoogleWorkspaceOAuthClientSettings>("/settings/google-workspace/oauth-client", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
   deleteSkill: (name: string) =>
     request<{ status: string }>(`/skills/${encodeURIComponent(name)}`, { method: "DELETE" })
 };

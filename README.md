@@ -180,6 +180,48 @@ docker compose --profile with-search up -d --build   # bundle SearXNG private se
 scripts\start.bat
 ```
 
+### Container variants
+
+AgentArk publishes two GHCR variants for deployments: a lean `base` image and a heavier `full` image.
+
+| Variant | What it includes | Approx. size (linux/amd64) |
+|:--|:--|:--|
+| `ghcr.io/agentark-ai/agentark:base` | Core AgentArk server, web UI, Git, Python app runtime | ~900 MB |
+| `ghcr.io/agentark-ai/agentark:full` | Base image plus Playwright/Chromium, Mem0 bridge, ffmpeg, cloudflared, tailscale, Lightpanda, Google Workspace CLI, Remotion template, WhatsApp bridge, Ollama CLI | ~12.8 GB |
+
+Pull whichever image matches your deployment:
+
+```bash
+docker pull ghcr.io/agentark-ai/agentark:base
+docker pull ghcr.io/agentark-ai/agentark:full
+```
+
+Release publishes also create versioned tags in the same shape, for example:
+
+```bash
+docker pull ghcr.io/agentark-ai/agentark:1.2.3-base
+docker pull ghcr.io/agentark-ai/agentark:1.2.3-full
+```
+
+Tag behavior:
+- pushes to `main` refresh moving tags like `:base`, `:full`, `:latest-base`, and `:latest-full`
+- `v*` releases publish those moving tags and the matching versioned tags like `:1.2.3-base` and `:1.2.3-full`
+
+### Local builds
+
+Local `docker compose build` always produces the **full** image (~12.5 GB) with all runtimes included:
+
+```bash
+docker compose up -d --build
+```
+
+The slim base image (~900 MB) is only available via GHCR pulls. If you want a lighter local build, use build args to disable specific components:
+
+```bash
+docker compose build --build-arg INSTALL_OLLAMA_CLI=false --build-arg INSTALL_MEM0=false
+docker compose up -d --force-recreate
+```
+
 ### Build from source
 
 ```bash

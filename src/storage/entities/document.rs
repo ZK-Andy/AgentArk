@@ -11,7 +11,7 @@ pub struct Model {
     pub content_type: String,
     pub project_id: Option<String>,
     pub chunk_count: i32,
-    pub file_size: i64,
+    pub file_size: i32,
     pub created_at: String,
 }
 

@@ -120,6 +120,13 @@ fn decrypt_storage_string(value: &str) -> String {
     }
 }
 
+fn is_foreign_key_constraint_error(error: &sea_orm::DbErr) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("foreign key constraint failed")
+}
+
 fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>> {
     value.map(encrypt_storage_string).transpose()
 }
@@ -165,6 +172,7 @@ pub struct NewUserDataItem<'a> {
 }
 
 impl Storage {
+    const SQLITE_MAX_INTEGER: u64 = i64::MAX as u64;
     const EXECUTION_TRACE_RETENTION_DAYS: i64 = 30;
     const EXECUTION_PROOF_RETENTION_DAYS: i64 = 30;
     const OPERATIONAL_LOG_RETENTION_DAYS: i64 = 30;
@@ -181,6 +189,16 @@ impl Storage {
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
     const SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY: &'static str =
         "storage_sensitive_payload_backfill_v4";
+
+    #[inline]
+    fn sqlite_limit(limit: u64) -> u64 {
+        limit.min(Self::SQLITE_MAX_INTEGER)
+    }
+
+    #[inline]
+    fn sqlite_offset(offset: u64) -> u64 {
+        offset.min(Self::SQLITE_MAX_INTEGER)
+    }
 
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
         let normalized_key = key.trim().to_ascii_lowercase();
@@ -387,8 +405,10 @@ PRAGMA busy_timeout = 5000;\n",
                 updated_at TEXT NOT NULL,
                 message_count INTEGER DEFAULT 0,
                 archived INTEGER DEFAULT 0,
+                starred INTEGER DEFAULT 0,
                 CHECK(message_count >= 0),
-                CHECK(archived IN (0, 1))
+                CHECK(archived IN (0, 1)),
+                CHECK(starred IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -656,10 +676,16 @@ PRAGMA busy_timeout = 5000;\n",
             "ALTER TABLE execution_traces ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE execution_traces ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0.0",
             "ALTER TABLE execution_traces ADD COLUMN complexity TEXT",
+            "ALTER TABLE conversations ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
         ];
         for stmt in alter_stmts {
             Self::apply_sqlite_add_column_migration(db, stmt).await?;
         }
+
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_conversations_starred_updated ON conversations(starred, updated_at);",
+        )
+        .await?;
 
         Ok(())
     }
@@ -1313,7 +1339,7 @@ PRAGMA busy_timeout = 5000;\n",
             .select_only()
             .column(episode::Column::Id)
             .order_by_desc(episode::Column::Timestamp)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .into_tuple::<String>()
             .all(&self.db)
             .await?;
@@ -1339,7 +1365,7 @@ PRAGMA busy_timeout = 5000;\n",
             .filter(episode::Column::Importance.lte(max_importance))
             .filter(episode::Column::AccessCount.lte(max_access_count))
             .order_by_asc(episode::Column::Timestamp)
-            .limit(limit);
+            .limit(Self::sqlite_limit(limit));
         if require_consolidated {
             query = query.filter(episode::Column::Consolidated.eq(true));
         }
@@ -1416,7 +1442,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(episode::Column::ProjectId.eq(pid));
         }
-        let episodes = query.limit(limit).offset(offset).all(&self.db).await?;
+        let episodes = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         Ok(episodes)
     }
 
@@ -1441,7 +1471,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(semantic_fact::Column::ProjectId.eq(pid));
         }
-        let facts = query.limit(limit).offset(offset).all(&self.db).await?;
+        let facts = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         Ok(facts)
     }
 
@@ -1545,7 +1579,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
-        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for row in &mut rows {
             row.value = decrypt_storage_string(&row.value);
         }
@@ -1676,7 +1714,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(kind_value) = kind.map(|v| v.trim()).filter(|v| !v.is_empty()) {
             query = query.filter(user_data_item::Column::Kind.eq(kind_value));
         }
-        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for row in &mut rows {
             row.title = decrypt_storage_string(&row.title);
             row.content = decrypt_storage_string(&row.content);
@@ -1754,7 +1796,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
-        let mut rows = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut rows = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for row in &mut rows {
             row.title = decrypt_storage_string(&row.title);
             row.content = decrypt_storage_string(&row.content);
@@ -2301,7 +2347,7 @@ PRAGMA busy_timeout = 5000;\n",
     pub async fn get_recent_delegations(&self, limit: u64) -> Result<Vec<swarm_delegation::Model>> {
         let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         for delegation in &mut delegations {
@@ -2367,6 +2413,7 @@ PRAGMA busy_timeout = 5000;\n",
             updated_at: Set(conv.updated_at.clone()),
             message_count: Set(conv.message_count),
             archived: Set(conv.archived),
+            starred: Set(conv.starred),
         }
         .insert(&self.db)
         .await?;
@@ -2379,14 +2426,27 @@ PRAGMA busy_timeout = 5000;\n",
         limit: u64,
         offset: u64,
         project_id: Option<&str>,
+        excluded_channels: &[&str],
+        starred: Option<bool>,
     ) -> Result<Vec<conversation::Model>> {
         let mut query = conversation::Entity::find().order_by_desc(conversation::Column::UpdatedAt);
 
         if let Some(pid) = project_id {
             query = query.filter(conversation::Column::ProjectId.eq(pid));
         }
+        if !excluded_channels.is_empty() {
+            query = query
+                .filter(conversation::Column::Channel.is_not_in(excluded_channels.iter().copied()));
+        }
+        if let Some(is_starred) = starred {
+            query = query.filter(conversation::Column::Starred.eq(is_starred));
+        }
 
-        let convs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let convs = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         Ok(convs)
     }
 
@@ -2421,15 +2481,27 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(cursor_filter);
         }
 
-        let convs = query.limit(limit).all(&self.db).await?;
+        let convs = query.limit(Self::sqlite_limit(limit)).all(&self.db).await?;
         Ok(convs)
     }
 
     /// Count conversations
-    pub async fn count_conversations(&self, project_id: Option<&str>) -> Result<u64> {
+    pub async fn count_conversations(
+        &self,
+        project_id: Option<&str>,
+        excluded_channels: &[&str],
+        starred: Option<bool>,
+    ) -> Result<u64> {
         let mut query = conversation::Entity::find();
         if let Some(pid) = project_id {
             query = query.filter(conversation::Column::ProjectId.eq(pid));
+        }
+        if !excluded_channels.is_empty() {
+            query = query
+                .filter(conversation::Column::Channel.is_not_in(excluded_channels.iter().copied()));
+        }
+        if let Some(is_starred) = starred {
+            query = query.filter(conversation::Column::Starred.eq(is_starred));
         }
         Ok(query.count(&self.db).await?)
     }
@@ -2448,21 +2520,42 @@ PRAGMA busy_timeout = 5000;\n",
         id: &str,
         title: Option<&str>,
         message_count: Option<i32>,
-    ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut model = conversation::ActiveModel {
-            id: Set(id.to_string()),
-            updated_at: Set(now),
-            ..Default::default()
+        starred: Option<bool>,
+    ) -> Result<conversation::Model> {
+        let Some(existing) = self.get_conversation(id).await? else {
+            anyhow::bail!("Conversation not found");
         };
+        if title.is_none() && message_count.is_none() && starred.is_none() {
+            return Ok(existing);
+        }
+        if matches!(starred, Some(true)) && !existing.starred {
+            let starred_count = conversation::Entity::find()
+                .filter(conversation::Column::Starred.eq(true))
+                .count(&self.db)
+                .await?;
+            if starred_count >= 3 {
+                anyhow::bail!("Unstar any other chat. Max 3 starred chats allowed.");
+            }
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut model: conversation::ActiveModel = existing.into();
+        let mut touch_updated_at = false;
         if let Some(t) = title {
             model.title = Set(t.to_string());
+            touch_updated_at = true;
         }
         if let Some(mc) = message_count {
             model.message_count = Set(mc);
+            touch_updated_at = true;
         }
-        model.update(&self.db).await?;
-        Ok(())
+        if let Some(is_starred) = starred {
+            model.starred = Set(is_starred);
+        }
+        if touch_updated_at {
+            model.updated_at = Set(now);
+        }
+        let updated = model.update(&self.db).await?;
+        Ok(updated)
     }
 
     /// Delete a conversation and its messages
@@ -2484,17 +2577,39 @@ PRAGMA busy_timeout = 5000;\n",
     /// Insert a message
     pub async fn insert_message(&self, msg: &message::Model) -> Result<()> {
         let content = encrypt_storage_string(&msg.content)?;
-        message::ActiveModel {
+        let insert_result = message::ActiveModel {
             id: Set(msg.id.clone()),
             conversation_id: Set(msg.conversation_id.clone()),
             role: Set(msg.role.clone()),
-            content: Set(content),
+            content: Set(content.clone()),
             timestamp: Set(msg.timestamp.clone()),
             model_used: Set(msg.model_used.clone()),
             trace_id: Set(msg.trace_id.clone()),
         }
         .insert(&self.db)
-        .await?;
+        .await;
+        if let Err(error) = insert_result {
+            if msg.trace_id.is_some() && is_foreign_key_constraint_error(&error) {
+                tracing::warn!(
+                    "Retrying message insert '{}' without trace_id after FK failure: {}",
+                    msg.id,
+                    error
+                );
+                message::ActiveModel {
+                    id: Set(msg.id.clone()),
+                    conversation_id: Set(msg.conversation_id.clone()),
+                    role: Set(msg.role.clone()),
+                    content: Set(content),
+                    timestamp: Set(msg.timestamp.clone()),
+                    model_used: Set(msg.model_used.clone()),
+                    trace_id: Set(None),
+                }
+                .insert(&self.db)
+                .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
 
         // Update conversation message count and updated_at
         let now = chrono::Utc::now().to_rfc3339();
@@ -2528,8 +2643,8 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::ConversationId.eq(conversation_id))
             .order_by_asc(message::Column::Timestamp)
-            .limit(limit)
-            .offset(offset)
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
@@ -2547,7 +2662,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::ConversationId.eq(conversation_id))
             .order_by_desc(message::Column::Timestamp)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         msgs.reverse();
@@ -2562,7 +2677,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::Role.eq("user"))
             .order_by_desc(message::Column::Timestamp)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
@@ -2759,7 +2874,11 @@ PRAGMA busy_timeout = 5000;\n",
         if let Some(pid) = project_id {
             query = query.filter(document::Column::ProjectId.eq(pid));
         }
-        let mut docs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut docs = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for doc in &mut docs {
             doc.filename = decrypt_storage_string(&doc.filename);
         }
@@ -2928,48 +3047,6 @@ PRAGMA busy_timeout = 5000;\n",
             .to_rfc3339()
     }
 
-    fn collapse_recent_arkpulse_notifications(
-        notifications: Vec<notification::Model>,
-    ) -> Vec<notification::Model> {
-        let cutoff =
-            chrono::Utc::now() - chrono::Duration::hours(Self::ARKPULSE_NOTIFICATION_WINDOW_HOURS);
-        let mut kept_recent_arkpulse = false;
-        let mut filtered = Vec::with_capacity(notifications.len());
-
-        for notif in notifications {
-            if !Self::is_arkpulse_notification(&notif.source) {
-                filtered.push(notif);
-                continue;
-            }
-
-            let is_recent = chrono::DateTime::parse_from_rfc3339(&notif.created_at)
-                .map(|dt| dt.with_timezone(&chrono::Utc) >= cutoff)
-                .unwrap_or(true);
-            if !is_recent {
-                filtered.push(notif);
-                continue;
-            }
-
-            if kept_recent_arkpulse {
-                continue;
-            }
-            kept_recent_arkpulse = true;
-            filtered.push(notif);
-        }
-
-        filtered
-    }
-
-    async fn count_recent_arkpulse_notifications(&self, unread_only: bool) -> Result<u64> {
-        let mut query = notification::Entity::find()
-            .filter(notification::Column::Source.eq("arkpulse"))
-            .filter(notification::Column::CreatedAt.gte(Self::arkpulse_recent_cutoff_rfc3339()));
-        if unread_only {
-            query = query.filter(notification::Column::Read.eq(false));
-        }
-        Ok(query.count(&self.db).await?)
-    }
-
     async fn maybe_purge_old_notifications(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let last_run = self
@@ -3094,16 +3171,22 @@ PRAGMA busy_timeout = 5000;\n",
         if let Err(e) = self.maybe_purge_old_notifications().await {
             tracing::warn!("Notification retention purge failed: {}", e);
         }
-        let mut query = notification::Entity::find().order_by_desc(notification::Column::CreatedAt);
+        let mut query = notification::Entity::find()
+            .filter(notification::Column::Source.ne("arkpulse"))
+            .order_by_desc(notification::Column::CreatedAt);
         if unread_only {
             query = query.filter(notification::Column::Read.eq(false));
         }
-        let mut notifs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut notifs = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for notif in &mut notifs {
             notif.title = decrypt_storage_string(&notif.title);
             notif.body = decrypt_storage_string(&notif.body);
         }
-        Ok(Self::collapse_recent_arkpulse_notifications(notifs))
+        Ok(notifs)
     }
 
     /// Count notifications
@@ -3111,20 +3194,12 @@ PRAGMA busy_timeout = 5000;\n",
         if let Err(e) = self.maybe_purge_old_notifications().await {
             tracing::warn!("Notification retention purge failed: {}", e);
         }
-        let mut query = notification::Entity::find();
+        let mut query =
+            notification::Entity::find().filter(notification::Column::Source.ne("arkpulse"));
         if unread_only {
             query = query.filter(notification::Column::Read.eq(false));
         }
-        let count = query.count(&self.db).await?;
-        let arkpulse_recent = self
-            .count_recent_arkpulse_notifications(unread_only)
-            .await
-            .unwrap_or(0);
-        if arkpulse_recent > 1 {
-            Ok(count.saturating_sub(arkpulse_recent - 1))
-        } else {
-            Ok(count)
-        }
+        query.count(&self.db).await.map_err(Into::into)
     }
 
     /// Mark notification as read
@@ -3241,19 +3316,12 @@ PRAGMA busy_timeout = 5000;\n",
         if let Err(e) = self.maybe_purge_old_notifications().await {
             tracing::warn!("Notification retention purge failed: {}", e);
         }
-        let count = notification::Entity::find()
+        notification::Entity::find()
+            .filter(notification::Column::Source.ne("arkpulse"))
             .filter(notification::Column::Read.eq(false))
             .count(&self.db)
-            .await?;
-        let arkpulse_recent_unread = self
-            .count_recent_arkpulse_notifications(true)
             .await
-            .unwrap_or(0);
-        if arkpulse_recent_unread > 1 {
-            Ok(count.saturating_sub(arkpulse_recent_unread - 1))
-        } else {
-            Ok(count)
-        }
+            .map_err(Into::into)
     }
 
     /// Mark episodes as consolidated
@@ -3274,7 +3342,7 @@ PRAGMA busy_timeout = 5000;\n",
         let episodes = episode::Entity::find()
             .filter(episode::Column::Consolidated.eq(false))
             .order_by_asc(episode::Column::Timestamp)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         Ok(episodes)
@@ -3290,8 +3358,8 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<Vec<approval_log::Model>> {
         let mut log = approval_log::Entity::find()
             .order_by_desc(approval_log::Column::RequestedAt)
-            .limit(limit)
-            .offset(offset)
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
             .all(&self.db)
             .await?;
         for row in &mut log {
@@ -3370,6 +3438,30 @@ PRAGMA busy_timeout = 5000;\n",
 
     // ==================== Execution Traces ====================
 
+    pub async fn insert_execution_proof(
+        &self,
+        proof: &crate::proofs::ExecutionProof,
+    ) -> Result<()> {
+        crate::storage::entities::execution_proof::ActiveModel {
+            id: Set(proof.id.to_string()),
+            action_hash: Set(proof.action_hash.clone()),
+            input_hash: Set(proof.input_hash.clone()),
+            output_hash: Set(proof.output_hash.clone()),
+            prev_hash: Set(proof.prev_hash.clone()),
+            timestamp: Set(proof.timestamp.to_rfc3339()),
+            signature: Set(proof.signature.clone()),
+        }
+        .insert(&self.db)
+        .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after proof insert: {}",
+                e
+            );
+        }
+        Ok(())
+    }
+
     /// Persist a completed execution trace for Trace history/detail views.
     pub async fn insert_execution_trace(&self, trace: &crate::core::ExecutionTrace) -> Result<()> {
         let duration_ms = trace.started_at.and_then(|start| {
@@ -3387,28 +3479,59 @@ PRAGMA busy_timeout = 5000;\n",
         let message = encrypt_storage_string(&trace.message)?;
         let steps_json = encrypt_storage_string(&serde_json::to_string(&trace.steps)?)?;
         let response = encrypt_optional_storage_string(trace.response.as_deref())?;
-
-        crate::storage::entities::execution_trace::ActiveModel {
+        let insert_result = crate::storage::entities::execution_trace::ActiveModel {
             id: Set(trace.id.clone()),
-            message: Set(message),
+            message: Set(message.clone()),
             channel: Set(trace.channel.clone()),
-            started_at: Set(started_at),
-            completed_at: Set(completed_at),
-            duration_ms: Set(duration_ms),
-            step_count: Set(trace.steps.len() as i64),
-            steps_json: Set(steps_json),
-            response: Set(response),
+            started_at: Set(started_at.clone()),
+            completed_at: Set(completed_at.clone()),
+            duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
+            step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
+            steps_json: Set(steps_json.clone()),
+            response: Set(response.clone()),
             proof_id: Set(trace.proof_id.clone()),
             model: Set(trace.model.clone()),
-            input_tokens: Set(trace.input_tokens),
-            output_tokens: Set(trace.output_tokens),
-            total_tokens: Set(trace.total_tokens),
+            input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
+            output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
+            total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
             cost_usd: Set(trace.cost_usd),
             complexity: Set(trace.complexity.clone()),
-            created_at: Set(created_at),
+            created_at: Set(created_at.clone()),
         }
         .insert(&self.db)
-        .await?;
+        .await;
+        if let Err(error) = insert_result {
+            if trace.proof_id.is_some() && is_foreign_key_constraint_error(&error) {
+                tracing::warn!(
+                    "Retrying trace insert '{}' without proof_id after FK failure: {}",
+                    trace.id,
+                    error
+                );
+                crate::storage::entities::execution_trace::ActiveModel {
+                    id: Set(trace.id.clone()),
+                    message: Set(message),
+                    channel: Set(trace.channel.clone()),
+                    started_at: Set(started_at),
+                    completed_at: Set(completed_at),
+                    duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
+                    step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
+                    steps_json: Set(steps_json),
+                    response: Set(response),
+                    proof_id: Set(None),
+                    model: Set(trace.model.clone()),
+                    input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
+                    output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
+                    total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
+                    cost_usd: Set(trace.cost_usd),
+                    complexity: Set(trace.complexity.clone()),
+                    created_at: Set(created_at),
+                }
+                .insert(&self.db)
+                .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
         if let Err(e) = self.maybe_purge_housekeeping_tables().await {
             tracing::warn!(
                 "Storage housekeeping purge failed after trace insert: {}",
@@ -3426,8 +3549,8 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<Vec<crate::storage::entities::execution_trace::Model>> {
         let mut traces = crate::storage::entities::execution_trace::Entity::find()
             .order_by_desc(crate::storage::entities::execution_trace::Column::CreatedAt)
-            .limit(limit)
-            .offset(offset)
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
             .all(&self.db)
             .await?;
         for trace in &mut traces {
@@ -3483,7 +3606,7 @@ PRAGMA busy_timeout = 5000;\n",
     pub async fn list_security_logs(&self, limit: u64) -> Result<Vec<security_log::Model>> {
         let mut logs = security_log::Entity::find()
             .order_by_desc(security_log::Column::CreatedAt)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         for log in &mut logs {
@@ -3506,7 +3629,11 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(security_log::Column::EventType.eq(et.trim().to_string()));
         }
 
-        let mut logs = query.limit(limit).offset(offset).all(&self.db).await?;
+        let mut logs = query
+            .limit(Self::sqlite_limit(limit))
+            .offset(Self::sqlite_offset(offset))
+            .all(&self.db)
+            .await?;
         for log in &mut logs {
             log.message = decrypt_storage_string(&log.message);
             log.source = decrypt_optional_storage_string(log.source.clone());
@@ -3575,7 +3702,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut rows = operational_log::Entity::find()
             .filter(operational_log::Column::EventType.eq(event_type.to_string()))
             .order_by_desc(operational_log::Column::CreatedAt)
-            .limit(limit)
+            .limit(Self::sqlite_limit(limit))
             .all(&self.db)
             .await?;
         for row in &mut rows {

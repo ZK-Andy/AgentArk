@@ -58,6 +58,22 @@ impl Default for MoltbookSettings {
     }
 }
 
+pub(super) fn has_moltbook_api_key(
+    config_dir: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> bool {
+    if std::env::var("MOLTBOOK_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, data_dir)
+        .ok()
+        .and_then(|manager| manager.get_custom_secret("moltbook_api_key").ok().flatten())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MoltbookActivityEvent {
     id: String,
@@ -1875,14 +1891,17 @@ Rules:
 
 /// Get Moltbook scheduler status/settings.
 pub(super) async fn get_moltbook_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let (storage, has_connector) = {
+    let (storage, config_dir, data_dir, has_connector) = {
         let agent = state.agent.read().await;
         (
             agent.storage.clone(),
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
             agent.integrations.get("moltbook").is_some(),
         )
     };
     let settings = load_moltbook_settings(&storage).await;
+    let has_api_key = has_moltbook_api_key(&config_dir, Some(&data_dir));
     let last_run_at = storage
         .get(MOLTBOOK_LAST_RUN_KEY)
         .await
@@ -1944,6 +1963,7 @@ pub(super) async fn get_moltbook_status(State(state): State<AppState>) -> Json<s
         "write_enabled": settings.write_enabled,
         "defer_when_busy": settings.defer_when_busy,
         "running": is_moltbook_running(),
+        "has_api_key": has_api_key,
         "last_run_at": last_run_at,
         "next_run_at": next_run_at,
         "last_status": last_status,

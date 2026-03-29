@@ -188,6 +188,353 @@ export type IntegrationItem = {
   config_fields?: IntegrationConfigField[] | null;
   config_help?: string | null;
   configure_button?: string | null;
+  config_values?: Record<string, unknown> | null;
+};
+
+export type GoogleWorkspaceOAuthClientSettings = {
+  configured: boolean;
+  source: string;
+  source_label: string;
+  managed_externally: boolean;
+  client_id_hint?: string | null;
+  secret_configured: boolean;
+  redirect_uri: string;
+};
+
+export type IntegrationSyncStatus = {
+  integration_id: string;
+  integration_name: string;
+  supported: boolean;
+  enabled: boolean;
+  connected: boolean;
+  integration_enabled: boolean;
+  sync_kind: string;
+  poll_interval_secs: number;
+  importance_threshold: number;
+  notify_on_important: boolean;
+  push_to_preferred_channel: boolean;
+  last_sync_at?: string | null;
+  last_success_at?: string | null;
+  last_error?: string | null;
+  last_item_at?: string | null;
+  recent_item_count: number;
+};
+
+export type IntegrationSyncFeedItem = {
+  id: string;
+  integration_id: string;
+  integration_name: string;
+  kind: string;
+  title: string;
+  summary: string;
+  url?: string | null;
+  occurred_at?: string | null;
+  detected_at: string;
+  importance: number;
+  important: boolean;
+  outcome: string;
+};
+
+export type GatewayChannelDescriptor = {
+  id: string;
+  kind: string;
+  name: string;
+  description: string;
+  status: string;
+  enabled: boolean;
+  configured: boolean;
+  supports_pairing: boolean;
+  supports_threads: boolean;
+  supports_groups: boolean;
+  supports_broadcast: boolean;
+  delivery_mode?: string | null;
+  account_count?: number;
+  route_count?: number;
+  connected_account_count?: number;
+  last_error?: string | null;
+  docs_url?: string | null;
+  capabilities?: string[];
+  metadata?: Record<string, unknown> | null;
+};
+
+export type GatewayChannelAccount = {
+  id: string;
+  channel_id: string;
+  label: string;
+  enabled: boolean;
+  status: string;
+  peer_scope?: string | null;
+  default_agent_id?: string | null;
+  last_seen_at?: string | null;
+  last_error?: string | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type GatewayChannelsResponse = {
+  summary: {
+    supported: number;
+    configured: number;
+    connected: number;
+    attention_needed: number;
+  };
+  channels: GatewayChannelDescriptor[];
+  accounts: GatewayChannelAccount[];
+};
+
+export type GatewayBroadcastGroup = {
+  id: string;
+  name: string;
+  description?: string | null;
+  enabled: boolean;
+  member_count: number;
+  channels?: string[];
+  targets?: string[];
+};
+
+export type GatewayRouteRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  channel_id?: string | null;
+  account_id?: string | null;
+  match_kind: string;
+  match_value: string;
+  target_kind: string;
+  target_value: string;
+  agent_id?: string | null;
+  conversation_scope?: string | null;
+  broadcast_group_id?: string | null;
+  notes?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type GatewayRoutingSimulation = {
+  matched: boolean;
+  rule_id?: string | null;
+  rule_name?: string | null;
+  target_kind?: string | null;
+  target_value?: string | null;
+  conversation_scope?: string | null;
+  broadcast_group_id?: string | null;
+  reason?: string | null;
+};
+
+export type GatewayRoutingResponse = {
+  summary: {
+    rules: number;
+    enabled_rules: number;
+    broadcast_groups: number;
+  };
+  rules: GatewayRouteRule[];
+  broadcast_groups: GatewayBroadcastGroup[];
+};
+
+export type GatewayOpsOverview = {
+  generated_at: string;
+  service_summaries: Array<{
+    id: string;
+    title: string;
+    status: string;
+    summary?: string | null;
+    details?: string | null;
+    total_count?: number | null;
+    attention_count: number;
+  }>;
+  operator_checks: Array<{
+    id: string;
+    title: string;
+    passed: boolean;
+    severity: string;
+    message: string;
+    details?: string | null;
+  }>;
+  pulse_highlights: Array<{
+    source: string;
+    severity: string;
+    title: string;
+    message: string;
+    target?: string | null;
+    note?: string | null;
+  }>;
+  doctor_highlights: Array<{
+    source: string;
+    severity: string;
+    title: string;
+    message: string;
+    target?: string | null;
+    note?: string | null;
+  }>;
+};
+
+export type DeviceNodeRecord = {
+  id: string;
+  display_name: string;
+  transport: string;
+  state: string;
+  capabilities?: string[];
+  labels?: string[];
+  platform?: string | null;
+  owner?: string | null;
+  last_heartbeat_at?: string | null;
+  last_error?: string | null;
+  permissions_granted?: number;
+  command_count?: number;
+  metadata?: Record<string, string>;
+};
+
+export type NodesResponse = {
+  status?: string;
+  generated_at?: string;
+  summary?: {
+    total: number;
+    paired: number;
+    online: number;
+    degraded: number;
+    offline: number;
+    revoked: number;
+    capabilities?: Record<string, number>;
+  };
+  nodes: DeviceNodeRecord[];
+};
+
+export type NodeCommandsResponse = {
+  status?: string;
+  commands: Array<{
+    id: string;
+    node_id: string;
+    command: string;
+    requested_at: string;
+    completed_at?: string | null;
+    success: boolean;
+    exit_code?: number | null;
+    output_preview?: string | null;
+    actor?: string | null;
+    context?: Record<string, string>;
+  }>;
+};
+
+export type BrowserProfileRecord = {
+  id: string;
+  name: string;
+  description?: string | null;
+  target_kind: string;
+  target_endpoint?: string | null;
+  target_profile_path?: string | null;
+  target_workspace?: string | null;
+  login_state: string;
+  login_checked_at?: string | null;
+  login_note?: string | null;
+  lock?: {
+    owner: string;
+    reason?: string | null;
+    locked_at: string;
+    expires_at?: string | null;
+  } | null;
+  recent_sessions?: Array<{
+    id: string;
+    started_at: string;
+    ended_at?: string | null;
+    duration_secs?: number | null;
+    outcome: string;
+    title?: string | null;
+    url?: string | null;
+    channel?: string | null;
+    note?: string | null;
+  }>;
+  tags?: string[];
+  enabled?: boolean;
+  last_used_at?: string | null;
+  last_error?: string | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+export type BrowserProfilesResponse = {
+  summary?: {
+    total: number;
+    sandbox: number;
+    host: number;
+    remote_cdp: number;
+    locked: number;
+    logged_in: number;
+    needs_attention: number;
+  };
+  profiles: BrowserProfileRecord[];
+};
+
+export type ModelFailoverResponse = {
+  summary?: {
+    auth_profiles: number;
+    providers: number;
+    disabled_providers: number;
+    cooling_providers: number;
+    chains: number;
+    session_pins: number;
+  };
+  auth_profiles: Array<{
+    id: string;
+    name: string;
+    provider_id: string;
+    provider_kind?: string | null;
+    base_url?: string | null;
+    model_id?: string | null;
+    credential_ref?: string | null;
+    enabled: boolean;
+    priority: number;
+    last_used_at?: string | null;
+    last_error?: string | null;
+    session_pin?: {
+      session_id: string;
+      model_id?: string | null;
+      chain_id?: string | null;
+      provider_id?: string | null;
+      auth_profile_id?: string | null;
+      reason?: string | null;
+      pinned_at?: string | null;
+      expires_at?: string | null;
+    } | null;
+    tags?: string[];
+    metadata?: Record<string, unknown> | null;
+  }>;
+  provider_health: Array<{
+    provider_id: string;
+    provider_kind?: string | null;
+    enabled: boolean;
+    disabled: boolean;
+    cooldown_until?: string | null;
+    last_success_at?: string | null;
+    last_failure_at?: string | null;
+    success_count: number;
+    failure_count: number;
+    last_error?: string | null;
+    health_note?: string | null;
+    session_pin_count?: number;
+    metadata?: Record<string, unknown> | null;
+  }>;
+  fallback_chains: Array<{
+    id: string;
+    name: string;
+    enabled: boolean;
+    ordered_candidates: Array<{
+      provider_id: string;
+      auth_profile_id?: string | null;
+      priority: number;
+      reason?: string | null;
+    }>;
+    session_pin?: {
+      session_id: string;
+      model_id?: string | null;
+      chain_id?: string | null;
+      provider_id?: string | null;
+      auth_profile_id?: string | null;
+      reason?: string | null;
+      pinned_at?: string | null;
+      expires_at?: string | null;
+    } | null;
+    notes?: string | null;
+    metadata?: Record<string, unknown> | null;
+  }>;
 };
 
 export type SkillImportRequest = {

@@ -372,7 +372,7 @@ impl AgentArkApp {
 
         let rules = self.runtime.block_on(async {
             let agent = self.agent.read().await;
-            agent.safety.rules().to_vec()
+            agent.safety.rules()
         });
 
         egui::ScrollArea::vertical().show(ui, |ui| {

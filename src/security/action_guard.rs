@@ -4,7 +4,7 @@
 //! 1. **Integrity Verification** — SHA-256 bundle hashing + Ed25519 signing
 //! 2. **Static Analysis** — Pattern-based threat detection in action content
 //! 3. **Permission Model** — Capability declarations with risk-based enforcement
-//! 4. **Injection Detection** — Prompt manipulation scanning in ACTION.md files
+//! 4. **Injection Detection** — Prompt manipulation scanning in skill markdown files
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 // Types
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Manifest stored as `action.manifest.json` alongside ACTION.md
+/// Manifest stored as `action.manifest.json` alongside SKILL.md (or legacy ACTION.md)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionManifest {
     pub action_name: String,
@@ -540,7 +540,7 @@ impl ActionGuard {
 
         let total_severity: u32 = findings.iter().map(|f| f.severity).sum();
         let mut total_severity = if has_network && has_real_secret {
-            total_severity + 5
+            total_severity + if has_shell { 5 } else { 2 }
         } else {
             total_severity
         };
@@ -758,7 +758,7 @@ impl ActionGuard {
             (r"(?i)<\s*system\s*>", "delimiter_injection"),
             (r"<\|im_start\|>", "delimiter_injection"),
             (r"\[INST\]", "delimiter_injection"),
-            // ACTION.md-specific patterns
+            // Skill-markdown-specific patterns
             (
                 r"(?i)ignore\s+(the\s+)?(safety|security)\s+(rules?|checks?|constraints?)",
                 "safety_bypass",

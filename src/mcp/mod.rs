@@ -10,7 +10,9 @@ pub mod registry;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(alias = "inputSchema", default)]
     pub input_schema: serde_json::Value,
 }
 
@@ -19,7 +21,9 @@ pub struct McpTool {
 pub struct McpResource {
     pub uri: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(alias = "mimeType", default)]
     pub mime_type: String,
 }
 

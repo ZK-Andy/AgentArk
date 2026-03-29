@@ -13,7 +13,7 @@ mod transaction;
 pub use sandbox::{ActionSandbox, SandboxMode};
 pub use transaction::TransactionManager;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "docker")]
 use futures::TryStreamExt;
 use regex::Regex;
@@ -68,6 +68,9 @@ pub struct ActionRuntime {
     storage: Option<crate::storage::Storage>,
     /// MCP registry for external tools/resources
     mcp_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::registry::McpRegistry>>>,
+    /// Plugin registry for third-party HTTP extensions
+    plugin_registry:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::plugins::registry::PluginRegistry>>>,
 }
 
 const LOCAL_APP_HTTP_PORT: u16 = 8990;
@@ -79,10 +82,14 @@ const MAX_NATIVE_ENV_OVERRIDES: usize = 32;
 struct LoadedAction {
     info: ActionDef,
     wasm_module: Option<Vec<u8>>,
-    /// Workflow content from ACTION.md (for LLM-driven actions)
+    /// Workflow content from SKILL.md (legacy ACTION.md still supported)
     workflow_content: Option<String>,
     /// Optional MCP binding (external tool/resource)
     mcp_binding: Option<McpBinding>,
+    /// Optional plugin binding (third-party HTTP extension)
+    plugin_binding: Option<PluginBinding>,
+    /// Optional imported custom API binding
+    custom_api_binding: Option<CustomApiBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +102,40 @@ pub struct McpBinding {
 pub enum McpBindingKind {
     Tool { name: String },
     Resource { uri: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginBinding {
+    pub plugin_id: String,
+    pub action_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomApiBinding {
+    pub api_id: String,
+    pub api_name: String,
+    pub operation_id: String,
+    pub operation_name: String,
+    pub method: String,
+    pub base_url: String,
+    pub path: String,
+    pub read_only: bool,
+    pub secret_key: String,
+    pub auth_mode: crate::custom_apis::CustomApiAuthMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_username: Option<String>,
+    #[serde(default)]
+    pub default_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub default_query: BTreeMap<String, String>,
+    #[serde(default)]
+    pub parameters: Vec<crate::custom_apis::CustomApiParameter>,
+    #[serde(default)]
+    pub body_required: bool,
 }
 
 pub const WORKFLOW_ACTION_MARKER: &str = "__WORKFLOW_ACTION__:";
@@ -502,6 +543,7 @@ impl ActionRuntime {
             action_guard: None,
             storage: None,
             mcp_registry: None,
+            plugin_registry: None,
         };
 
         Ok(runtime)
@@ -531,6 +573,14 @@ impl ActionRuntime {
         registry: std::sync::Arc<tokio::sync::RwLock<crate::mcp::registry::McpRegistry>>,
     ) {
         self.mcp_registry = Some(registry);
+    }
+
+    /// Set plugin registry (called from Agent::init)
+    pub fn set_plugin_registry(
+        &mut self,
+        registry: std::sync::Arc<tokio::sync::RwLock<crate::plugins::registry::PluginRegistry>>,
+    ) {
+        self.plugin_registry = Some(registry);
     }
 
     /// Load all actions (builtin + bundled + user). Call AFTER set_action_guard.
@@ -654,7 +704,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "app_restart".to_string(),
-            description: "Restart an existing deployed app from its saved metadata. Use after file_write edits to /app/data/apps/<id>/..., when a deployed app needs reload, or when the user asks to restart or re-run an existing app. Prefer app_id from app_inspect when available.".to_string(),
+            description: "Restart an existing deployed app from its saved metadata. Use after file_write edits to /app/data/apps/<id>/..., when a deployed app needs reload, or when the user asks to restart or re-run an existing app. Prefer app_id from app_inspect when available; otherwise use query to match an app.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -663,15 +713,71 @@ impl ActionRuntime {
                         "type": "string",
                         "description": "Exact deployed app ID to restart. Preferred when already known."
                     },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional new app title to persist before restarting. Use when a repurposed app should show a new name in the Apps list."
+                    },
                     "query": {
                         "type": "string",
                         "description": "Optional app title or app ID to match when app_id is not known."
                     }
-                },
-                "anyOf": [
-                    { "required": ["app_id"] },
-                    { "required": ["query"] }
-                ]
+                }
+            }),
+            capabilities: vec!["app_hosting".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "app_stop".to_string(),
+            description: "Stop the runtime for an existing deployed app without deleting its files. Use when the user asks to stop, pause, or shut down a deployed app. For repo-based multi-service deployments, `bundle_id` stops all dynamic services in that bundle and skips static ones.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_id": {
+                        "type": "string",
+                        "description": "Exact deployed app ID to stop."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional app title or app ID to match when app_id is not known."
+                    },
+                    "bundle_id": {
+                        "type": "string",
+                        "description": "Optional repo deployment bundle ID to stop all matching dynamic services together."
+                    }
+                }
+            }),
+            capabilities: vec!["app_hosting".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "app_delete".to_string(),
+            description: "Stop and delete an existing deployed app, including its stored files. Use when the user asks to remove, delete, or tear down a deployed app. For repo-based multi-service deployments, `bundle_id` deletes every app in that repo bundle and cleans up the bundle metadata once the last service is gone.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "app_id": {
+                        "type": "string",
+                        "description": "Exact deployed app ID to delete."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional app title or app ID to match when app_id is not known."
+                    },
+                    "bundle_id": {
+                        "type": "string",
+                        "description": "Optional repo deployment bundle ID to delete all matching services together."
+                    }
+                }
             }),
             capabilities: vec!["app_hosting".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
@@ -858,7 +964,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "capability_acquire".to_string(),
-            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom ACTION.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements.".to_string(),
+            description: "Scaffold a reusable integration/action when the needed capability does not already exist. Generates a reviewable custom SKILL.md backed by connector_request and/or browser_auto, registers it immediately, and returns the new action plus any remaining auth/config requirements.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1022,17 +1128,18 @@ impl ActionRuntime {
         // Gmail scan
         self.register_builtin_action(ActionDef {
             name: "gmail_scan".to_string(),
-            description: "Read and scan the user's Gmail inbox. Use when asked to check email, find emails, look for meetings/invites/receipts, or anything email-related. Returns sender, subject, date, and labels for each message. When called with no query, automatically runs smart multi-query (important, primary, recent, starred) to surface all relevant emails. Only set query/labels when the user asks for something specific.".to_string(),
+            description: "Read and scan the user's Gmail inbox. Use when asked to check email, find emails, look for meetings/invites/receipts, or anything email-related. Supports three patterns: `recent` for the literal newest inbox emails in chronological order, `search` for exact Gmail query/filter matches, and `triage` for a smart importance scan across important, primary, recent, and starred messages. Leave mode as `auto` unless you know which behavior is needed.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Gmail search query (e.g., 'from:sarah', 'subject:meeting', 'newer_than:2d'). Leave empty to use smart auto-scan which covers important, primary, recent, and starred emails automatically." },
-                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Label IDs to filter: INBOX (default), SPAM, IMPORTANT, UNREAD, STARRED, SENT, DRAFT, TRASH. Leave empty for smart auto-scan." },
-                    "max_results": { "type": "integer", "description": "Max messages per query when using a specific query (default 20). Ignored for smart auto-scan." }
+                    "mode": { "type": "string", "enum": ["auto", "recent", "search", "triage"], "description": "How to interpret the request. `recent` returns the latest inbox emails exactly as they arrived. `search` returns exact matches for query/labels. `triage` runs the smart importance scan. `auto` picks search when query/labels are present, recent when only max_results is set, otherwise triage." },
+                    "query": { "type": "string", "description": "Optional Gmail search query, for example 'from:sarah', 'subject:meeting', 'newer_than:2d', or 'label:promotions'. Best used with mode `search` or left with mode `auto` so the tool can infer search mode." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Optional Gmail label IDs such as INBOX, IMPORTANT, UNREAD, STARRED, SENT, DRAFT, SPAM, or TRASH. Supplying labels pushes auto mode into exact search/filter behavior." },
+                    "max_results": { "type": "integer", "description": "Number of emails to return. In auto mode, setting only max_results requests the literal newest inbox emails. In search mode, it limits exact matches. In triage mode, it is ignored." }
                 }
             }),
-            capabilities: vec!["gmail".to_string()],
+            capabilities: vec!["gmail".to_string(), "google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1052,7 +1159,7 @@ impl ActionRuntime {
                 },
                 "required": ["to", "subject", "body"]
             }),
-            capabilities: vec!["gmail".to_string()],
+            capabilities: vec!["gmail".to_string(), "google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1264,7 +1371,7 @@ impl ActionRuntime {
                     },
                     "content": {
                         "type": "string",
-                        "description": "ACTION.md content with YAML frontmatter. Required for create/update. Format:\n---\nname: action-name\ndescription: What this action does\nversion: \"1.0.0\"\n---\n\n# Action Title\n\n## Steps\n..."
+                        "description": "SKILL.md content with YAML frontmatter. Required for create/update. Format:\n---\nname: action-name\ndescription: What this action does\nversion: \"1.0.0\"\n---\n\n# Action Title\n\n## Steps\n..."
                     },
                     "allow_duplicate": {
                         "type": "boolean",
@@ -1767,7 +1874,7 @@ impl ActionRuntime {
                 "type": "object",
                 "properties": {}
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1784,7 +1891,7 @@ impl ActionRuntime {
                     "end": { "type": "string", "description": "End datetime (ISO 8601). Defaults to 7 days from now." }
                 }
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1806,7 +1913,7 @@ impl ActionRuntime {
                 },
                 "required": ["summary", "start", "end"]
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1824,7 +1931,186 @@ impl ActionRuntime {
                     "min_duration_minutes": { "type": "integer", "description": "Minimum free slot duration in minutes (default: 30)" }
                 }
             }),
-            capabilities: vec!["network".to_string()],
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_drive_search".to_string(),
+            description: "Search Google Drive files using the connected Google Workspace account. Use when the user asks to find a file, document, folder, spreadsheet, or deck in Drive.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Optional Google Drive query, such as name contains 'roadmap' or mimeType='application/vnd.google-apps.spreadsheet'." },
+                    "page_size": { "type": "integer", "description": "Max number of files to return (default 10)." }
+                }
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_docs_read".to_string(),
+            description: "Read the text content of a Google Doc by document ID. Use when the user provides a Google Doc link or ID and wants the content summarized or inspected.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "document_id": { "type": "string", "description": "Google Doc document ID." }
+                },
+                "required": ["document_id"]
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_sheets_read".to_string(),
+            description: "Read a range from Google Sheets. Use when the user provides a spreadsheet ID and range or asks for values from a connected Google Sheet.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "spreadsheet_id": { "type": "string", "description": "Google Sheets spreadsheet ID." },
+                    "range": { "type": "string", "description": "A1 range notation, such as Sheet1!A1:D20." }
+                },
+                "required": ["spreadsheet_id", "range"]
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_chat_list_spaces".to_string(),
+            description: "List the Google Chat spaces visible to the connected Google Workspace account.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "page_size": { "type": "integer", "description": "Max number of spaces to return (default 20)." }
+                }
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_admin_list_users".to_string(),
+            description: "List Google Workspace users from the Admin Directory. Use when the user asks about Workspace users, seats, or directory accounts.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "customer": { "type": "string", "description": "Optional Google customer ID. Defaults to my_customer." },
+                    "domain": { "type": "string", "description": "Optional domain filter if customer is not provided." },
+                    "max_results": { "type": "integer", "description": "Max number of users to return (default 20)." }
+                }
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_workspace_gws_help".to_string(),
+            description: "Show Google Workspace CLI help output. Use when you need to discover available gws commands or inspect help for a specific Google Workspace service. Pass argv as the command parts after `gws`, for example [\"drive\",\"--help\"] or [\"gmail\",\"users\",\"messages\",\"list\",\"--help\"].".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional arguments after `gws`. Leave empty for top-level help."
+                    }
+                }
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_workspace_gws_schema".to_string(),
+            description: "Inspect the request and response schema for any Google Workspace CLI method. Use when you need the exact shape for a gws command before executing it. Example target: drive.files.list or gmail.users.messages.list.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "The gws schema target, such as drive.files.list or sheets.spreadsheets.values.get."
+                    }
+                },
+                "required": ["target"]
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_workspace_gws_skills".to_string(),
+            description: "List or read the generated Google Workspace CLI skill docs that ship with gws, including service skills, helper skills, recipes, and personas. Use this when you want exact gws examples for Docs, Drive, Sheets, Gmail, Calendar, Chat, Admin, or other Workspace services before calling google_workspace_gws_schema or google_workspace_gws_command. If name is provided, returns the full SKILL.md content for that skill.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Optional generated gws skill name to open, for example gws-docs, gws-gmail-triage, recipe-label-and-archive-emails, or persona-team-lead."
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional text filter to narrow the catalog by skill name, description, or cli help."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of catalog entries to list when name is omitted. Default: 80."
+                    }
+                }
+            }),
+            capabilities: vec!["google_workspace".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        }).await;
+
+        self.register_builtin_action(ActionDef {
+            name: "google_workspace_gws_command".to_string(),
+            description: "Execute any non-auth Google Workspace CLI command against the connected Google Workspace account. Use this when you need broader Workspace API coverage than the built-in Gmail/Calendar/Drive helpers provide. Prefer google_workspace_gws_skills for examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] , [\"calendar\",\"+agenda\"], or [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Arguments after `gws`. Do not include the `gws` binary itself."
+                    },
+                    "required_bundles": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional Workspace bundles needed by the command, such as [\"drive\"] or [\"gmail\",\"calendar\"]."
+                    }
+                },
+                "required": ["argv"]
+            }),
+            capabilities: vec!["google_workspace".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
@@ -1868,7 +2154,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "app_inspect".to_string(),
-            description: "Inspect existing deployed apps. Use when the user asks which apps are deployed, refers to a deployed app by name/ID, or wants to debug, diagnose, fix, or update an existing app. Returns matched app metadata, its /app/data/apps/<id> directory, key files, runtime state, and recent logs so you can use file_read/file_write/app_restart/http_get on the live app.".to_string(),
+            description: "Inspect existing deployed apps. Use when the user asks which apps are deployed, refers to a deployed app by name/ID, wants to inspect a repo deployment bundle, or wants to debug, diagnose, fix, or update an existing app. Returns matched app metadata, its /app/data/apps/<id> directory, repo bundle metadata when present, runtime state, and recent logs so you can use file_read/file_write/app_restart/app_stop/app_delete/http_get on the live app.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1876,6 +2162,10 @@ impl ActionRuntime {
                     "query": {
                         "type": "string",
                         "description": "Optional app title or app ID to match. Leave empty to list deployed apps."
+                    },
+                    "bundle_id": {
+                        "type": "string",
+                        "description": "Optional repo deployment bundle ID to inspect all services from a repo-based deployment together."
                     },
                     "include_files": {
                         "type": "boolean",
@@ -1900,7 +2190,7 @@ impl ActionRuntime {
         // App deployment — write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
-            description: "Deploy a web app or server and return a live URL. Supports ANY type of app: static HTML/JS/CSS, Python (FastAPI, Flask, Streamlit), Node.js (Express), or any language. Use when asked to build a dashboard, create a tool, make a website, build an app, or anything that should be accessible via a browser. For static apps, provide HTML/JS/CSS files. For dynamic apps (Python/Node servers), also provide entry_command to start the server. Dynamic apps default to local runtime with container fallback (runtime_preference=local). Public exposure defaults to enabled (expose_public=true) so the agent can return a tunnel-ready link. Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.".to_string(),
+            description: "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so AgentArk can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For dynamic apps (Python/Node servers), include or infer entry_command. Repo-based deploys default to container runtime unless overridden. Public exposure defaults to enabled (expose_public=true) so the agent can return a tunnel-ready link. Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1909,14 +2199,31 @@ impl ActionRuntime {
                         "type": "object",
                         "description": "Object mapping filename to file content. e.g. {\"index.html\": \"<html>...\", \"style.css\": \"body{...}\", \"app.py\": \"from fastapi import...\"}"
                     },
+                    "repo_url": {
+                        "type": "string",
+                        "description": "Public Git repository URL to clone and deploy, e.g. https://github.com/org/repo. Use this instead of `files` when the user wants AgentArk to run an existing repo locally."
+                    },
+                    "repo_ref": {
+                        "type": "string",
+                        "description": "Optional branch, tag, or commit-ish to check out after cloning the repo."
+                    },
+                    "repo_subdir": {
+                        "type": "string",
+                        "description": "Optional subdirectory inside the cloned repo to treat as the deployment root."
+                    },
+                    "service_mode": {
+                        "type": "string",
+                        "enum": ["auto", "frontend", "backend", "fullstack"],
+                        "description": "For repo deploys, choose which service(s) to stand up. auto deploys the detected default services."
+                    },
                     "title": { "type": "string", "description": "App name/title (default: App)" },
                     "entry_command": {
                         "type": "string",
-                        "description": "Command to start the server process (omit for static HTML apps). Use {PORT} placeholder or PORT env var for the port. Examples: 'python3 app.py', 'node server.js', 'uvicorn app:app --host 0.0.0.0 --port {PORT}'"
+                        "description": "Command to start the server process (omit for static HTML apps). Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'uvicorn app:app --host 0.0.0.0 --port {PORT}'"
                     },
                     "install_command": {
                         "type": "string",
-                        "description": "Command to install dependencies before starting (optional). Examples: 'pip install -r requirements.txt', 'npm install'"
+                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt — a venv is auto-created. Each app runs in its own isolated environment (Python venv or local node_modules). Examples: 'pip install -r requirements.txt', 'npm install'"
                     },
                     "required_inputs": {
                         "type": "array",
@@ -1966,7 +2273,7 @@ impl ActionRuntime {
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: true."
+                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: false."
                     },
                     "access_guard": {
                         "type": "boolean",
@@ -1980,8 +2287,7 @@ impl ActionRuntime {
                         "type": "boolean",
                         "description": "Create another matching app deployment instead of reusing/updating a matching existing app. Default false."
                     }
-                },
-                "required": ["files"]
+                }
             }),
             capabilities: vec!["app_hosting".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
@@ -2110,11 +2416,13 @@ impl ActionRuntime {
                 wasm_module: None,
                 workflow_content: None,
                 mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: None,
             },
         );
     }
 
-    /// Register an action with workflow content (from ACTION.md)
+    /// Register an action with workflow content (from SKILL.md or legacy ACTION.md)
     async fn register_workflow_action(&self, info: ActionDef, workflow: String) {
         self.actions.write().await.insert(
             info.name.clone(),
@@ -2123,6 +2431,8 @@ impl ActionRuntime {
                 wasm_module: None,
                 workflow_content: Some(workflow),
                 mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: None,
             },
         );
     }
@@ -2136,6 +2446,38 @@ impl ActionRuntime {
                 wasm_module: None,
                 workflow_content: None,
                 mcp_binding: Some(binding),
+                plugin_binding: None,
+                custom_api_binding: None,
+            },
+        );
+    }
+
+    /// Register a plugin-backed action
+    pub async fn register_plugin_action(&self, info: ActionDef, binding: PluginBinding) {
+        self.actions.write().await.insert(
+            info.name.clone(),
+            LoadedAction {
+                info,
+                wasm_module: None,
+                workflow_content: None,
+                mcp_binding: None,
+                plugin_binding: Some(binding),
+                custom_api_binding: None,
+            },
+        );
+    }
+
+    /// Register an imported custom API action.
+    pub async fn register_custom_api_action(&self, info: ActionDef, binding: CustomApiBinding) {
+        self.actions.write().await.insert(
+            info.name.clone(),
+            LoadedAction {
+                info,
+                wasm_module: None,
+                workflow_content: None,
+                mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: Some(binding),
             },
         );
     }
@@ -2162,13 +2504,43 @@ impl ActionRuntime {
         before.saturating_sub(actions.len())
     }
 
+    /// Remove all plugin-backed actions
+    pub async fn unregister_plugin_actions(&self) -> usize {
+        let mut actions = self.actions.write().await;
+        let before = actions.len();
+        actions.retain(|_, a| a.plugin_binding.is_none());
+        before.saturating_sub(actions.len())
+    }
+
+    /// Remove plugin-backed actions for a specific plugin
+    pub async fn unregister_plugin_actions_for_plugin(&self, plugin_id: &str) -> usize {
+        let mut actions = self.actions.write().await;
+        let before = actions.len();
+        actions.retain(|_, a| {
+            if let Some(binding) = &a.plugin_binding {
+                binding.plugin_id != plugin_id
+            } else {
+                true
+            }
+        });
+        before.saturating_sub(actions.len())
+    }
+
+    /// Remove all imported custom API actions.
+    pub async fn unregister_custom_api_actions(&self) -> usize {
+        let mut actions = self.actions.write().await;
+        let before = actions.len();
+        actions.retain(|_, a| a.custom_api_binding.is_none());
+        before.saturating_sub(actions.len())
+    }
+
     /// Execute an action with given arguments
     pub async fn execute_action(
         &self,
         action_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String> {
-        let (sandbox_mode, mcp_binding, source) = {
+        let (sandbox_mode, mcp_binding, plugin_binding, custom_api_binding, source) = {
             let actions = self.actions.read().await;
             let action = actions
                 .get(action_name)
@@ -2180,6 +2552,8 @@ impl ActionRuntime {
                     .clone()
                     .unwrap_or(self.config.default_sandbox.clone()),
                 action.mcp_binding.clone(),
+                action.plugin_binding.clone(),
+                action.custom_api_binding.clone(),
                 action.info.source.clone(),
             )
         };
@@ -2193,8 +2567,10 @@ impl ActionRuntime {
                 ));
             }
         } else if !self.is_builtin_integration_action_enabled(action_name) {
-            let integration_id =
-                Self::builtin_integration_for_action(action_name).unwrap_or("required");
+            let integration_id = Self::builtin_integrations_for_action(action_name)
+                .first()
+                .copied()
+                .unwrap_or("required");
             return Err(anyhow::anyhow!(
                 "Action '{}' is unavailable because integration '{}' is disabled.",
                 action_name,
@@ -2208,6 +2584,16 @@ impl ActionRuntime {
 
         if let Some(binding) = mcp_binding {
             return self.execute_mcp_action(binding, &resolved_args).await;
+        }
+
+        if let Some(binding) = plugin_binding {
+            return self.execute_plugin_action(binding, &resolved_args).await;
+        }
+
+        if let Some(binding) = custom_api_binding {
+            return self
+                .execute_custom_api_action(binding, &resolved_args)
+                .await;
         }
 
         // Start transaction if rollback is enabled
@@ -2473,6 +2859,254 @@ impl ActionRuntime {
         }
     }
 
+    async fn execute_plugin_action(
+        &self,
+        binding: PluginBinding,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let registry = self
+            .plugin_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Plugin registry not initialized"))?;
+        registry
+            .write()
+            .await
+            .invoke_action(&binding.plugin_id, &binding.action_name, arguments)
+            .await
+    }
+
+    async fn execute_custom_api_action(
+        &self,
+        binding: CustomApiBinding,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let mut path = binding.path.clone();
+        let mut query_pairs = binding.default_query.clone();
+        let mut dynamic_headers = reqwest::header::HeaderMap::new();
+
+        for parameter in &binding.parameters {
+            let maybe_value = arguments.get(&parameter.name);
+            match parameter.location {
+                crate::custom_apis::CustomApiParameterLocation::Path => {
+                    let value = maybe_value
+                        .and_then(Self::value_to_http_string)
+                        .filter(|value| !value.is_empty());
+                    let value = match value {
+                        Some(value) => value,
+                        None if parameter.required => {
+                            return Err(anyhow::anyhow!(
+                                "Missing required path parameter '{}'",
+                                parameter.name
+                            ));
+                        }
+                        None => continue,
+                    };
+                    let encoded = urlencoding::encode(&value).to_string();
+                    path = path.replace(&format!("{{{}}}", parameter.name), encoded.as_str());
+                    path = path.replace(&format!(":{}", parameter.name), encoded.as_str());
+                }
+                crate::custom_apis::CustomApiParameterLocation::Query => {
+                    if let Some(value) = maybe_value
+                        .and_then(Self::value_to_http_string)
+                        .filter(|v| !v.is_empty())
+                    {
+                        query_pairs.insert(parameter.name.clone(), value);
+                    } else if parameter.required && !query_pairs.contains_key(&parameter.name) {
+                        return Err(anyhow::anyhow!(
+                            "Missing required query parameter '{}'",
+                            parameter.name
+                        ));
+                    }
+                }
+                crate::custom_apis::CustomApiParameterLocation::Header => {
+                    if let Some(value) = maybe_value
+                        .and_then(Self::value_to_http_string)
+                        .filter(|v| !v.is_empty())
+                    {
+                        let header_name =
+                            reqwest::header::HeaderName::from_bytes(parameter.name.as_bytes())
+                                .map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "Invalid header parameter name '{}'",
+                                        parameter.name
+                                    )
+                                })?;
+                        let header_value =
+                            reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                                anyhow::anyhow!("Invalid header value for '{}'", parameter.name)
+                            })?;
+                        dynamic_headers.insert(header_name, header_value);
+                    } else if parameter.required {
+                        return Err(anyhow::anyhow!(
+                            "Missing required header parameter '{}'",
+                            parameter.name
+                        ));
+                    }
+                }
+                crate::custom_apis::CustomApiParameterLocation::Body => {}
+            }
+        }
+
+        let base = binding.base_url.trim_end_matches('/');
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            format!("/{}", path)
+        };
+        let mut url = reqwest::Url::parse(&format!("{}{}", base, path))
+            .map_err(|e| anyhow::anyhow!("Invalid custom API URL: {}", e))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in &query_pairs {
+                pairs.append_pair(key, value);
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
+        let method = reqwest::Method::from_bytes(binding.method.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Invalid HTTP method '{}': {}", binding.method, e))?;
+        let manager =
+            SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))?;
+        let secret = manager.get_custom_secret(&binding.secret_key)?;
+        let secret = secret.as_deref().filter(|value| !value.trim().is_empty());
+
+        if matches!(
+            binding.auth_mode,
+            crate::custom_apis::CustomApiAuthMode::ApiKeyQuery
+        ) {
+            let token = secret.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Auth secret '{}' is not configured for '{}'",
+                    binding.secret_key,
+                    binding.api_name
+                )
+            })?;
+            let query_name = binding.auth_name.as_deref().unwrap_or("api_key");
+            url.query_pairs_mut().append_pair(query_name, token.trim());
+        }
+
+        let mut request = client.request(method, url.clone());
+        for (key, value) in &binding.default_headers {
+            let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                .map_err(|_| anyhow::anyhow!("Invalid default header name '{}'", key))?;
+            let header_value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| anyhow::anyhow!("Invalid default header value for '{}'", key))?;
+            request = request.header(header_name, header_value);
+        }
+        for (key, value) in dynamic_headers.iter() {
+            request = request.header(key, value);
+        }
+
+        request = match binding.auth_mode {
+            crate::custom_apis::CustomApiAuthMode::None
+            | crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => request,
+            crate::custom_apis::CustomApiAuthMode::Bearer
+            | crate::custom_apis::CustomApiAuthMode::OAuth2 => {
+                let token = secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Auth secret '{}' is not configured for '{}'",
+                        binding.secret_key,
+                        binding.api_name
+                    )
+                })?;
+                let header_name = binding.auth_header.as_deref().unwrap_or("Authorization");
+                if header_name.eq_ignore_ascii_case("authorization") {
+                    request.bearer_auth(token.trim())
+                } else {
+                    request.header(header_name, format!("Bearer {}", token.trim()))
+                }
+            }
+            crate::custom_apis::CustomApiAuthMode::ApiKeyHeader => {
+                let token = secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Auth secret '{}' is not configured for '{}'",
+                        binding.secret_key,
+                        binding.api_name
+                    )
+                })?;
+                let header_name = binding
+                    .auth_name
+                    .as_deref()
+                    .or(binding.auth_header.as_deref())
+                    .unwrap_or("X-API-Key");
+                request.header(header_name, token.trim())
+            }
+            crate::custom_apis::CustomApiAuthMode::Basic => {
+                let password = secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Auth secret '{}' is not configured for '{}'",
+                        binding.secret_key,
+                        binding.api_name
+                    )
+                })?;
+                request.basic_auth(
+                    binding.auth_username.clone().unwrap_or_default(),
+                    Some(password.trim().to_string()),
+                )
+            }
+        };
+
+        if binding.body_required || arguments.get("body").is_some() {
+            let body = arguments.get("body").cloned().ok_or_else(|| {
+                anyhow::anyhow!("This endpoint requires a JSON body under the 'body' field")
+            })?;
+            request = request.json(&body);
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("custom API call '{}' failed", binding.operation_name))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = response.text().await.unwrap_or_default();
+        let rendered = if content_type.contains("json") {
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .unwrap_or_else(|| body.clone())
+        } else {
+            body.clone()
+        };
+        let rendered = if rendered.chars().count() > 6_000 {
+            format!("{}...", rendered.chars().take(6_000).collect::<String>())
+        } else {
+            rendered
+        };
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Custom API '{}' returned HTTP {}:\n{}",
+                binding.operation_name,
+                status,
+                rendered
+            ));
+        }
+        Ok(format!(
+            "{} {} succeeded.\n{}",
+            binding.method.to_ascii_uppercase(),
+            binding.operation_name,
+            rendered
+        ))
+    }
+
+    fn value_to_http_string(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(v) => Some(v.to_string()),
+            serde_json::Value::Number(v) => Some(v.to_string()),
+            other => serde_json::to_string(other).ok(),
+        }
+    }
+
     /// Execute an action natively (no sandbox)
     async fn execute_native(
         &self,
@@ -2619,12 +3253,43 @@ impl ActionRuntime {
                     .unwrap_or("watcher");
                 Ok(format!("Watch created: {}", desc))
             }
+            "manage_actions" => self.execute_manage_actions(arguments).await,
+            "capability_acquire" => self.execute_capability_acquire(arguments).await,
             "connector_request" => self.execute_connector_request(arguments).await,
             "pipeline_compile" => self.execute_pipeline_compile(arguments).await,
             "pipeline_run" => self.execute_pipeline_run(arguments).await,
             "signal_consensus" => self.execute_signal_consensus(arguments).await,
             "gmail_scan" => crate::actions::gmail::gmail_scan(&self.config_dir, arguments).await,
             "gmail_reply" => crate::actions::gmail::gmail_reply(&self.config_dir, arguments).await,
+            "google_drive_search" => {
+                crate::actions::google_workspace::drive_search(&self.config_dir, arguments).await
+            }
+            "google_docs_read" => {
+                crate::actions::google_workspace::docs_read(&self.config_dir, arguments).await
+            }
+            "google_sheets_read" => {
+                crate::actions::google_workspace::sheets_read(&self.config_dir, arguments).await
+            }
+            "google_chat_list_spaces" => {
+                crate::actions::google_workspace::chat_list_spaces(&self.config_dir, arguments)
+                    .await
+            }
+            "google_admin_list_users" => {
+                crate::actions::google_workspace::admin_list_users(&self.config_dir, arguments)
+                    .await
+            }
+            "google_workspace_gws_help" => {
+                crate::actions::google_workspace::gws_help(arguments).await
+            }
+            "google_workspace_gws_schema" => {
+                crate::actions::google_workspace::gws_schema(arguments).await
+            }
+            "google_workspace_gws_skills" => {
+                crate::actions::google_workspace::gws_skills(&self.config_dir, arguments).await
+            }
+            "google_workspace_gws_command" => {
+                crate::actions::google_workspace::gws_command(&self.config_dir, arguments).await
+            }
             "web_search" => {
                 let args: crate::actions::search::SearchArgs =
                     serde_json::from_value(arguments.clone())
@@ -3280,6 +3945,179 @@ print(result["text"])
         }
     }
 
+    async fn execute_manage_actions(&self, arguments: &serde_json::Value) -> Result<String> {
+        let operation = arguments
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'operation' parameter"))?;
+
+        match operation {
+            "create" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'name' for create"))?;
+                let content = arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'content' for create"))?;
+                if !name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow::anyhow!(
+                        "Invalid action name. Use kebab-case (e.g., 'check-weather')"
+                    ));
+                }
+                if self.actions.read().await.contains_key(name) {
+                    return Err(anyhow::anyhow!(
+                        "Action '{}' already exists. Use 'update' instead.",
+                        name
+                    ));
+                }
+                let verdict = self.create_action(name, content, false).await?;
+                let mut msg = format!("Action '{}' created and is immediately available.", name);
+                if let Some(ref v) = verdict {
+                    if !v.warnings.is_empty() {
+                        msg.push_str(&format!("\nSecurity warnings: {}", v.warnings.join(", ")));
+                    }
+                    if !v.allow_load {
+                        msg = format!(
+                            "Action '{}' was blocked by security verification: {}",
+                            name,
+                            v.warnings.join(", ")
+                        );
+                    }
+                }
+                Ok(msg)
+            }
+            "update" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'name' for update"))?;
+                let content = arguments
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'content' for update"))?;
+                match self.update_action_content(name, content).await? {
+                    true => Ok(format!("Action '{}' updated.", name)),
+                    false => Err(anyhow::anyhow!(
+                        "Cannot update '{}'. System actions are read-only.",
+                        name
+                    )),
+                }
+            }
+            "delete" => {
+                let name = arguments
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'name' for delete"))?;
+                match self.delete_action(name).await? {
+                    true => Ok(format!("Action '{}' deleted.", name)),
+                    false => Err(anyhow::anyhow!(
+                        "Cannot delete '{}'. Only custom actions can be deleted.",
+                        name
+                    )),
+                }
+            }
+            "list" => {
+                let actions = self.list_actions().await?;
+                let list: Vec<String> = actions
+                    .iter()
+                    .map(|a| {
+                        let source = match a.source {
+                            ActionSource::System => "system",
+                            ActionSource::Bundled => "bundled",
+                            ActionSource::Custom => "custom",
+                        };
+                        format!("- **{}** ({}): {}", a.name, source, a.description)
+                    })
+                    .collect();
+                Ok(format!(
+                    "Available actions ({}):\n{}",
+                    actions.len(),
+                    list.join("\n")
+                ))
+            }
+            _ => Err(anyhow::anyhow!(
+                "Unknown operation '{}'. Use create, update, delete, or list.",
+                operation
+            )),
+        }
+    }
+
+    async fn execute_capability_acquire(&self, arguments: &serde_json::Value) -> Result<String> {
+        let arguments = Self::enrich_capability_acquisition_arguments(arguments).await;
+        let raw_name = arguments
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'name' for capability acquisition"))?;
+        let description = arguments
+            .get("description")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'description' for capability acquisition"))?;
+        let name = Self::normalize_generated_action_name(raw_name);
+        if name.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Generated action name is empty after normalization"
+            ));
+        }
+        let content = self.render_capability_action_markdown(&arguments, &name, description);
+        let force = arguments
+            .get("force")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let verdict = self.create_action(&name, &content, force).await?;
+        let mut lines = vec![
+            format!("Capability scaffolded as action `{}`.", name),
+            "It is now available immediately in the action catalog.".to_string(),
+        ];
+        if let Some(kind) = arguments.get("kind").and_then(|value| value.as_str()) {
+            lines.push(format!("Mode: {}", kind));
+        }
+        if let Some(base_url) = arguments.get("base_url").and_then(|value| value.as_str()) {
+            lines.push(format!("Base URL: {}", base_url));
+        }
+        if let Some(path) = arguments.get("path").and_then(|value| value.as_str()) {
+            lines.push(format!("Primary endpoint: {}", path));
+        }
+        if let Some(method) = arguments.get("method").and_then(|value| value.as_str()) {
+            lines.push(format!("Method: {}", method.to_ascii_uppercase()));
+        }
+        if let Some(secret_name) = arguments
+            .get("auth_secret_name")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!(
+                "Expected secret/config key for auth: `{}`.",
+                secret_name
+            ));
+        }
+        if let Some(source_notes) = arguments
+            .get("source_notes")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Derived from: {}", source_notes));
+        }
+        if let Some(verdict) = verdict {
+            if !verdict.warnings.is_empty() {
+                lines.push(format!(
+                    "Security review notes: {}",
+                    verdict.warnings.join(", ")
+                ));
+            }
+            if !verdict.allow_load {
+                lines.push(
+                    "The scaffold was blocked by security policy and was not loaded.".to_string(),
+                );
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
     async fn execute_pipeline_compile(&self, arguments: &serde_json::Value) -> Result<String> {
         let spec_value = arguments
             .get("spec")
@@ -3907,6 +4745,7 @@ print(result["text"])
                     | "file_write"
                     | "clipboard_write"
                     | "gmail"
+                    | "google_workspace"
                     | "code_execute"
                     | "app_hosting"
                     | "orchestration"
@@ -3917,37 +4756,33 @@ print(result["text"])
         has_dangerous_cap || (source != ActionSource::System && capabilities.is_empty())
     }
 
-    fn builtin_integration_for_action(action_name: &str) -> Option<&'static str> {
+    fn builtin_integrations_for_action(action_name: &str) -> &'static [&'static str] {
         match action_name {
-            "gmail_scan" | "gmail_reply" => Some("gmail"),
+            "gmail_scan" | "gmail_reply" => &["gmail", "google_workspace"],
             "calendar_today" | "calendar_list" | "calendar_create" | "calendar_free" => {
-                Some("google_calendar")
+                &["google_calendar", "google_workspace"]
             }
-            _ => None,
-        }
-    }
-
-    fn parse_boolish_flag(value: &str) -> Option<bool> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" | "enabled" => Some(true),
-            "0" | "false" | "no" | "off" | "disabled" => Some(false),
-            _ => None,
+            "google_drive_search"
+            | "google_docs_read"
+            | "google_sheets_read"
+            | "google_chat_list_spaces"
+            | "google_admin_list_users"
+            | "google_workspace_gws_help"
+            | "google_workspace_gws_schema"
+            | "google_workspace_gws_skills"
+            | "google_workspace_gws_command" => &["google_workspace"],
+            _ => &[],
         }
     }
 
     fn is_builtin_integration_action_enabled(&self, action_name: &str) -> bool {
-        let Some(integration_id) = Self::builtin_integration_for_action(action_name) else {
+        let integration_ids = Self::builtin_integrations_for_action(action_name);
+        if integration_ids.is_empty() {
             return true;
-        };
-        let Ok(manager) = SecureConfigManager::new(&self.config_dir) else {
-            return true;
-        };
-        manager
-            .get_custom_secret(&format!("integration_enabled:{}", integration_id))
-            .ok()
-            .flatten()
-            .and_then(|value| Self::parse_boolish_flag(&value))
-            .unwrap_or(true)
+        }
+        integration_ids.iter().any(|integration_id| {
+            crate::integrations::effective_integration_enabled(&self.config_dir, integration_id)
+        })
     }
 
     fn pipeline_key_slug(input: &str) -> String {
@@ -5613,6 +6448,22 @@ print(result["text"])
         Ok(None)
     }
 
+    fn preferred_skill_markdown_path(dir: &Path) -> std::path::PathBuf {
+        dir.join("SKILL.md")
+    }
+
+    fn resolve_skill_markdown_path(dir: &Path) -> Option<std::path::PathBuf> {
+        let skill_md = dir.join("SKILL.md");
+        if skill_md.exists() {
+            return Some(skill_md);
+        }
+        let legacy_action_md = dir.join("ACTION.md");
+        if legacy_action_md.exists() {
+            return Some(legacy_action_md);
+        }
+        None
+    }
+
     /// Update action content - for bundled actions, creates a custom copy first
     pub async fn update_action_content(&self, name: &str, content: &str) -> Result<bool> {
         let actions = self.actions.read().await;
@@ -5631,7 +6482,7 @@ print(result["text"])
                 tokio::fs::create_dir_all(&custom_action_dir).await?;
 
                 // Write content to custom location
-                let custom_action_file = custom_action_dir.join("ACTION.md");
+                let custom_action_file = Self::preferred_skill_markdown_path(&custom_action_dir);
                 tokio::fs::write(&custom_action_file, content).await?;
 
                 // Re-sign the action manifest after edit
@@ -5704,7 +6555,7 @@ print(result["text"])
         let action_dir = self.actions_dir.join(name);
         tokio::fs::create_dir_all(&action_dir).await?;
 
-        let action_file = action_dir.join("ACTION.md");
+        let action_file = Self::preferred_skill_markdown_path(&action_dir);
         tokio::fs::write(&action_file, content).await?;
 
         // Sign the new action manifest
@@ -6700,7 +7551,7 @@ required:{required_block}
             uuid::Uuid::new_v4().simple()
         ));
         tokio::fs::create_dir_all(&preview_dir).await?;
-        let action_file = preview_dir.join("ACTION.md");
+        let action_file = Self::preferred_skill_markdown_path(&preview_dir);
         tokio::fs::write(&action_file, content).await?;
 
         let parsed = self
@@ -7187,7 +8038,7 @@ required:{required_block}
     }
 
     /// Load markdown-defined actions from a directory
-    /// Looks for ACTION.md files in subdirectories
+    /// Looks for SKILL.md files in subdirectories, with ACTION.md as a legacy fallback.
     /// These are registered as workflow actions for LLM-driven execution
     pub async fn load_markdown_actions(&self, dir: &Path, source: ActionSource) -> Result<()> {
         if !dir.exists() {
@@ -7209,11 +8060,9 @@ required:{required_block}
                 continue;
             }
 
-            let action_md = path.join("ACTION.md");
-            if !action_md.exists() {
+            let Some(md_file) = Self::resolve_skill_markdown_path(&path) else {
                 continue;
-            }
-            let md_file = action_md;
+            };
 
             match self.parse_action_md(&md_file, source.clone()).await {
                 Ok((info, workflow_content, frontmatter)) => {
@@ -7269,7 +8118,8 @@ required:{required_block}
         Ok(())
     }
 
-    /// Parse an ACTION.md file to extract action information and full content
+    /// Parse a SKILL.md file to extract action information and full content
+    /// Legacy ACTION.md files are also accepted.
     /// Returns (ActionDef, full_workflow_content, frontmatter_text)
     async fn parse_action_md(
         &self,
@@ -7485,6 +8335,93 @@ async fn build_search_config(config_dir: &Path) -> crate::actions::SearchConfig 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::integration_enabled_key;
+
+    #[tokio::test]
+    async fn app_management_schemas_avoid_top_level_combinators() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let actions = runtime.list_actions().await.unwrap();
+
+        for action_name in ["app_deploy", "app_restart", "app_stop", "app_delete"] {
+            let action = actions
+                .iter()
+                .find(|action| action.name == action_name)
+                .unwrap_or_else(|| panic!("missing builtin action {}", action_name));
+            let schema = &action.input_schema;
+            assert_eq!(
+                schema.get("type").and_then(|value| value.as_str()),
+                Some("object"),
+                "{} schema should stay a top-level object",
+                action_name
+            );
+            for combinator in ["anyOf", "oneOf", "allOf", "not"] {
+                assert!(
+                    schema.get(combinator).is_none(),
+                    "{} schema should not use top-level {}",
+                    action_name,
+                    combinator
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_enabled_actions_autoheals_connected_google_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = crate::core::config::SecureConfigManager::new(temp.path()).unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_TOKENS_KEY,
+                Some(
+                    serde_json::json!({
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        "granted_scopes": [
+                            "https://www.googleapis.com/auth/gmail.readonly",
+                            "https://www.googleapis.com/auth/gmail.send",
+                            "https://www.googleapis.com/auth/calendar"
+                        ],
+                        "granted_bundles": ["gmail", "calendar"]
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        manager
+            .set_custom_secret(
+                crate::actions::google_workspace::GOOGLE_WORKSPACE_BUNDLES_KEY,
+                Some(serde_json::json!(["gmail", "calendar"]).to_string()),
+            )
+            .unwrap();
+        manager
+            .set_custom_secret(
+                &integration_enabled_key("google_workspace"),
+                Some("false".to_string()),
+            )
+            .unwrap();
+
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        runtime.load_builtin_actions().await.unwrap();
+        let enabled = runtime.list_enabled_actions().await.unwrap();
+
+        assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_skills"));
+        assert_eq!(
+            manager
+                .get_custom_secret(&integration_enabled_key("google_workspace"))
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+    }
 
     #[test]
     fn loopback_http_get_rejects_non_app_paths() {
@@ -7527,6 +8464,7 @@ mod tests {
             action_guard: None,
             storage: None,
             mcp_registry: None,
+            plugin_registry: None,
         };
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(

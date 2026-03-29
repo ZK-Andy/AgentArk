@@ -24,8 +24,22 @@
 
 services:
   agentark:
-    build: .
-    image: agentark:local
+    build:
+      context: .
+      args:
+        AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
+        INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
+        INSTALL_MEM0: ${AGENTARK_INSTALL_MEM0:-true}
+        INSTALL_FFMPEG: ${AGENTARK_INSTALL_FFMPEG:-true}
+        INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
+        INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}
+        INSTALL_LIGHTPANDA: ${AGENTARK_INSTALL_LIGHTPANDA:-true}
+        INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
+        INSTALL_OPENSPACE: ${AGENTARK_INSTALL_OPENSPACE:-true}
+        INSTALL_OLLAMA_CLI: ${AGENTARK_INSTALL_OLLAMA_CLI:-true}
+        INSTALL_REMOTION_TEMPLATE: ${AGENTARK_INSTALL_REMOTION_TEMPLATE:-true}
+        INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
+    image: agentark:local-full
     container_name: agentark
     restart: unless-stopped
     security_opt:

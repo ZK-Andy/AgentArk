@@ -8,28 +8,48 @@ fn action_source_label(source: &crate::actions::ActionSource) -> &'static str {
     }
 }
 
-fn summarize_schema_fields(schema: &serde_json::Value, key: &str, limit: usize) -> Vec<String> {
-    let mut fields: Vec<String> = match schema.get(key).and_then(|v| v.as_object()) {
-        Some(map) => map.keys().take(limit).cloned().collect(),
-        None => Vec::new(),
+/// Build a compact field reference from the schema properties, including type and
+/// description so the model understands the expected shape of each field.
+fn describe_schema_fields(schema: &serde_json::Value, limit: usize) -> Vec<String> {
+    let props = match schema.get("properties").and_then(|v| v.as_object()) {
+        Some(map) => map,
+        None => return Vec::new(),
     };
-    fields.sort();
-    fields
-}
-
-fn summarize_required_fields(schema: &serde_json::Value, limit: usize) -> Vec<String> {
-    schema
+    let required: std::collections::HashSet<&str> = schema
         .get("required")
         .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .take(limit)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut keys: Vec<&String> = props.keys().collect();
+    // Show required fields first, then alphabetical.
+    keys.sort_by(|a, b| {
+        let a_req = required.contains(a.as_str());
+        let b_req = required.contains(b.as_str());
+        b_req.cmp(&a_req).then_with(|| a.cmp(b))
+    });
+
+    keys.into_iter()
+        .take(limit)
+        .filter_map(|key| {
+            let prop = props.get(key)?;
+            let typ = prop.get("type").and_then(|v| v.as_str()).unwrap_or("any");
+            let desc = prop
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let req_marker = if required.contains(key.as_str()) {
+                " (REQUIRED)"
+            } else {
+                ""
+            };
+            let desc_truncated = safe_truncate(desc, 180);
+            Some(format!(
+                "    `{}` ({}{}): {}",
+                key, typ, req_marker, desc_truncated
+            ))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 impl Agent {
@@ -84,6 +104,8 @@ impl Agent {
 - For community/social posting actions, write original agent-authored content based on the current situation and your own grounded reasoning. Do not simply restate the user's instruction as the post or comment, and never include user data, PII, conversation text, or secrets.
 - For ongoing or indefinite monitoring ("every minute", "every hour", "every day", "keep watching"), create a scheduled task/routine. Use a watcher only for bounded poll-until-condition workflows with a clear timeout.
 - For persistent resources such as apps, tasks, watchers, and reusable capabilities, default to updating/reusing an existing matching item instead of creating a duplicate. Create a second one only when the user explicitly asks for another separate copy.
+- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so AgentArk can clone, inspect the README/manifests, and stand it up as a managed app. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
+- Use `browser_auto` only to interact with an existing website or web UI. Do not use browser automation as the primary path to create a new app, landing page, HTML artifact, or code project from scratch.
 - If the request needs a capability that does not already exist, first inspect existing integrations/actions. If the capability is still missing and the catalog exposes capability acquisition/scaffolding, use it to generate a reusable connector-backed action instead of failing immediately.
 
 ## Action Selection
@@ -235,10 +257,16 @@ impl Agent {
             ));
         }
 
-        let app_tools = ["app_inspect", "app_restart", "app_deploy"]
-            .into_iter()
-            .filter(|name| actions.iter().any(|action| action.name == *name))
-            .collect::<Vec<_>>();
+        let app_tools = [
+            "app_inspect",
+            "app_restart",
+            "app_stop",
+            "app_delete",
+            "app_deploy",
+        ]
+        .into_iter()
+        .filter(|name| actions.iter().any(|action| action.name == *name))
+        .collect::<Vec<_>>();
         if !app_tools.is_empty() {
             lines.push(format!(
                 "- App/deployment tools available now: {}.",
@@ -248,6 +276,12 @@ impl Agent {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        if !actions.is_empty() {
+            lines.push(
+                "- If an action is listed in this runtime summary or catalog, it is available in this request. If a call gets blocked or needs approval, report that concrete restriction instead of claiming the capability does not exist."
+                    .to_string(),
+            );
         }
 
         let dynamic_integration_tool_count = actions
@@ -259,6 +293,20 @@ impl Agent {
                 "- Integration-backed tools already present in this scoped catalog: {}.",
                 dynamic_integration_tool_count
             ));
+        }
+
+        let has_gws_chain = [
+            "google_workspace_gws_skills",
+            "google_workspace_gws_schema",
+            "google_workspace_gws_command",
+        ]
+        .iter()
+        .all(|name| actions.iter().any(|action| action.name == *name));
+        if has_gws_chain {
+            lines.push(
+                "- For unfamiliar Google Workspace asks, prefer this chain: `google_workspace_gws_skills` -> `google_workspace_gws_schema` -> `google_workspace_gws_command`. Use the narrower Gmail/Calendar helpers only when the request is straightforward."
+                    .to_string(),
+            );
         }
 
         if actions
@@ -320,13 +368,6 @@ impl Agent {
         );
 
         for action in actions.iter().take(12) {
-            let required = summarize_required_fields(&action.input_schema, 6);
-            let optional = summarize_schema_fields(&action.input_schema, "properties", 8)
-                .into_iter()
-                .filter(|field| !required.iter().any(|req| req == field))
-                .take(6)
-                .collect::<Vec<_>>();
-
             prompt.push_str(&format!(
                 "- `{}` [{}]: {}\n",
                 action.name,
@@ -340,15 +381,55 @@ impl Agent {
                     safe_truncate(&action.capabilities.join(", "), 160)
                 ));
             }
-            if !required.is_empty() {
-                prompt.push_str(&format!("  Required inputs: {}.\n", required.join(", ")));
-            }
-            if !optional.is_empty() {
-                prompt.push_str(&format!("  Common inputs: {}.\n", optional.join(", ")));
+
+            // Include typed field descriptions so the model knows the exact shape
+            // and format expected for each parameter.
+            let field_descriptions = describe_schema_fields(&action.input_schema, 10);
+            if !field_descriptions.is_empty() {
+                prompt.push_str("  Parameters:\n");
+                for desc in &field_descriptions {
+                    prompt.push_str(desc);
+                    prompt.push('\n');
+                }
             }
         }
 
         prompt
+    }
+
+    /// Build a prompt that asks the LLM to produce a structured execution plan.
+    pub(crate) fn build_planning_prompt(
+        user_message: &str,
+        available_actions: &[crate::actions::ActionDef],
+    ) -> (String, String) {
+        let action_names: Vec<&str> = available_actions
+            .iter()
+            .take(12)
+            .map(|a| a.name.as_str())
+            .collect();
+
+        let system = format!(
+            "You are a task planner. Break the user's request into a concrete execution plan.\n\
+            Return ONLY a JSON array of steps. Each step is an object with:\n\
+            - \"title\": short action label (5-10 words)\n\
+            - \"description\": what this step does (1 sentence)\n\
+            - \"tool_hint\": which tool/action to use (from the list below, or null if no tool needed)\n\n\
+            Available actions: {}\n\n\
+            Rules:\n\
+            - 2-8 steps maximum. Be concise.\n\
+            - Each step should be one logical action, not a sub-plan.\n\
+            - Order matters — steps execute sequentially.\n\
+            - The last step should present/summarize the result to the user.\n\
+            - Return ONLY the JSON array. No markdown fences, no explanation.",
+            action_names.join(", ")
+        );
+
+        let user = format!(
+            "Break this request into an execution plan:\n\n{}",
+            user_message
+        );
+
+        (system, user)
     }
 
     pub(crate) async fn persist_app_preview_screenshot(

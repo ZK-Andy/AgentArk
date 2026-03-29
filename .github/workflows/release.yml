@@ -1,4 +1,4 @@
-name: Build & Publish Docker Image
+name: Build & Publish Docker Images
 
 on:
   push:
@@ -44,6 +44,38 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+            build_args: |
+              AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
+              INSTALL_PLAYWRIGHT_RUNTIME=false
+              INSTALL_MEM0=false
+              INSTALL_FFMPEG=false
+              INSTALL_TAILSCALE=false
+              INSTALL_CLOUDFLARED=false
+              INSTALL_LIGHTPANDA=true
+              INSTALL_GWS=false
+              INSTALL_OPENSPACE=false
+              INSTALL_OLLAMA_CLI=false
+              INSTALL_REMOTION_TEMPLATE=false
+              INSTALL_WHATSAPP_BRIDGE=true
+          - variant: full
+            build_args: |
+              AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
+              INSTALL_PLAYWRIGHT_RUNTIME=true
+              INSTALL_MEM0=true
+              INSTALL_FFMPEG=true
+              INSTALL_TAILSCALE=true
+              INSTALL_CLOUDFLARED=true
+              INSTALL_LIGHTPANDA=true
+              INSTALL_GWS=true
+              INSTALL_OPENSPACE=true
+              INSTALL_OLLAMA_CLI=true
+              INSTALL_REMOTION_TEMPLATE=true
+              INSTALL_WHATSAPP_BRIDGE=true
     permissions:
       contents: read
       packages: write
@@ -68,18 +100,22 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=,format=short
+            type=raw,value=${{ matrix.variant }},enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest-${{ matrix.variant }},enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}}-${{ matrix.variant }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{major}}.{{minor}}-${{ matrix.variant }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=AgentArk (${{ matrix.variant }})
+            org.opencontainers.image.description=AgentArk container variant: ${{ matrix.variant }}
 
-      - name: Build and push
+      - name: Build and push (${{ matrix.variant }})
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
           platforms: linux/amd64

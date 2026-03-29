@@ -61,7 +61,14 @@ fn get_oauth_client(config_dir: &Path) -> Result<(String, String)> {
             .ok_or_else(|| anyhow!("Missing client_secret"))?;
         return Ok((client_id, client_secret));
     }
-    Err(anyhow!("Calendar OAuth credentials not configured. Go to Settings > Integrations > Calendar to add them."))
+    if let Some(config) =
+        crate::actions::google_workspace::load_workspace_client_config(config_dir)?
+    {
+        return Ok((config.client_id, config.client_secret));
+    }
+    Err(anyhow!(
+        "Calendar OAuth credentials not configured. Connect Google Workspace or add Calendar credentials."
+    ))
 }
 
 async fn load_tokens(config_dir: &Path) -> Result<CalendarTokens> {
@@ -81,7 +88,16 @@ async fn save_tokens(config_dir: &Path, tokens: &CalendarTokens) -> Result<()> {
 }
 
 pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
-    let mut tokens = load_tokens(config_dir).await?;
+    let mut tokens = match load_tokens(config_dir).await {
+        Ok(tokens) => tokens,
+        Err(_) => {
+            return crate::actions::google_workspace::ensure_access_token_for_bundles(
+                config_dir,
+                &["calendar"],
+            )
+            .await;
+        }
+    };
     let now = chrono::Utc::now().timestamp();
 
     if tokens.expires_at > now + 60 {
@@ -119,19 +135,70 @@ pub(crate) async fn ensure_access_token(config_dir: &Path) -> Result<String> {
     Ok(tokens.access_token)
 }
 
+async fn list_events_json(
+    config_dir: &Path,
+    start: &str,
+    end: &str,
+    max_results: u32,
+) -> Result<serde_json::Value> {
+    if crate::actions::google_workspace::gws_backend_available().await {
+        let argv = vec![
+            "calendar".to_string(),
+            "events".to_string(),
+            "list".to_string(),
+            "--params".to_string(),
+            serde_json::json!({
+                "calendarId": "primary",
+                "timeMin": start,
+                "timeMax": end,
+                "singleEvents": true,
+                "orderBy": "startTime",
+                "maxResults": max_results
+            })
+            .to_string(),
+        ];
+        match crate::actions::google_workspace::gws_json_command(config_dir, &argv, &["calendar"])
+            .await
+        {
+            Ok(data) => return Ok(data),
+            Err(error) => {
+                tracing::warn!(
+                    "calendar events gws path failed, falling back to direct Calendar API: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    let token = ensure_access_token(config_dir).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let url = format!(
+        "{}/calendars/primary/events?timeMin={}&timeMax={}&singleEvents=true&orderBy=startTime&maxResults={}",
+        CALENDAR_API_BASE,
+        urlencoding::encode(start),
+        urlencoding::encode(end),
+        max_results,
+    );
+    let resp = client.get(&url).bearer_auth(token).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("Calendar API error: {}", resp.status()));
+    }
+    Ok(resp.json().await?)
+}
+
 /// List today's calendar events
 pub async fn calendar_today(config_dir: &Path, _arguments: &serde_json::Value) -> Result<String> {
-    let token = ensure_access_token(config_dir).await?;
     let now = chrono::Utc::now();
     let start = now.format("%Y-%m-%dT00:00:00Z").to_string();
     let end = now.format("%Y-%m-%dT23:59:59Z").to_string();
 
-    fetch_events(config_dir, &token, &start, &end).await
+    fetch_events(config_dir, &start, &end).await
 }
 
 /// List events in a date range
 pub async fn calendar_list(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
-    let token = ensure_access_token(config_dir).await?;
     let now = chrono::Utc::now();
 
     let start_default = now.to_rfc3339();
@@ -145,27 +212,11 @@ pub async fn calendar_list(config_dir: &Path, arguments: &serde_json::Value) -> 
         .and_then(|v| v.as_str())
         .unwrap_or(&end_default);
 
-    fetch_events(config_dir, &token, start, end).await
+    fetch_events(config_dir, start, end).await
 }
 
-async fn fetch_events(_config_dir: &Path, token: &str, start: &str, end: &str) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let url = format!(
-        "{}/calendars/primary/events?timeMin={}&timeMax={}&singleEvents=true&orderBy=startTime&maxResults=50",
-        CALENDAR_API_BASE,
-        urlencoding::encode(start),
-        urlencoding::encode(end),
-    );
-
-    let resp = client.get(&url).bearer_auth(token).send().await?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("Calendar API error: {}", resp.status()));
-    }
-
-    let data: serde_json::Value = resp.json().await?;
+async fn fetch_events(config_dir: &Path, start: &str, end: &str) -> Result<String> {
+    let data = list_events_json(config_dir, start, end, 50).await?;
     let items = data.get("items").and_then(|v| v.as_array());
 
     let Some(events) = items else {
@@ -206,8 +257,6 @@ async fn fetch_events(_config_dir: &Path, token: &str, start: &str, end: &str) -
 
 /// Create a calendar event
 pub async fn calendar_create(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
-    let token = ensure_access_token(config_dir).await?;
-
     let summary = arguments
         .get("summary")
         .and_then(|v| v.as_str())
@@ -243,24 +292,63 @@ pub async fn calendar_create(config_dir: &Path, arguments: &serde_json::Value) -
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let url = format!("{}/calendars/primary/events", CALENDAR_API_BASE);
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let err = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Failed to create event: {}", err));
-    }
-
-    let created: serde_json::Value = resp.json().await?;
+    let created: serde_json::Value = if crate::actions::google_workspace::gws_backend_available()
+        .await
+    {
+        let argv = vec![
+            "calendar".to_string(),
+            "events".to_string(),
+            "insert".to_string(),
+            "--params".to_string(),
+            serde_json::json!({ "calendarId": "primary" }).to_string(),
+            "--json".to_string(),
+            body.to_string(),
+        ];
+        match crate::actions::google_workspace::gws_json_command(config_dir, &argv, &["calendar"])
+            .await
+        {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "calendar create gws path failed, falling back to direct Calendar API: {}",
+                    error
+                );
+                let token = ensure_access_token(config_dir).await?;
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                let url = format!("{}/calendars/primary/events", CALENDAR_API_BASE);
+                let resp = client
+                    .post(&url)
+                    .bearer_auth(token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    let err = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("Failed to create event: {}", err));
+                }
+                resp.json().await?
+            }
+        }
+    } else {
+        let token = ensure_access_token(config_dir).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        let url = format!("{}/calendars/primary/events", CALENDAR_API_BASE);
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to create event: {}", err));
+        }
+        resp.json().await?
+    };
     let link = created
         .get("htmlLink")
         .and_then(|v| v.as_str())
@@ -274,7 +362,6 @@ pub async fn calendar_create(config_dir: &Path, arguments: &serde_json::Value) -
 
 /// Find free time slots
 pub async fn calendar_free(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
-    let token = ensure_access_token(config_dir).await?;
     let now = chrono::Utc::now();
 
     let start_default = now.to_rfc3339();
@@ -292,24 +379,7 @@ pub async fn calendar_free(config_dir: &Path, arguments: &serde_json::Value) -> 
         .and_then(|v| v.as_i64())
         .unwrap_or(30);
 
-    // Fetch events to find gaps
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-
-    let url = format!(
-        "{}/calendars/primary/events?timeMin={}&timeMax={}&singleEvents=true&orderBy=startTime&maxResults=100",
-        CALENDAR_API_BASE,
-        urlencoding::encode(start),
-        urlencoding::encode(end),
-    );
-
-    let resp = client.get(&url).bearer_auth(token).send().await?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("Calendar API error: {}", resp.status()));
-    }
-
-    let data: serde_json::Value = resp.json().await?;
+    let data = list_events_json(config_dir, start, end, 100).await?;
     let items = data.get("items").and_then(|v| v.as_array());
 
     // Parse event times

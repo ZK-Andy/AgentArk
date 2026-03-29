@@ -10,6 +10,8 @@ use std::path::Path;
 pub const OBSERVABILITY_AUTH_TOKEN_SECRET_KEY: &str = "observability_auth_token";
 pub const OBSERVABILITY_LOG_KEY: &str = "observability_delivery_log_v1";
 const OBSERVABILITY_LOG_LIMIT: usize = 120;
+const LANGSMITH_PROJECT_HEADER: &str = "Langsmith-Project";
+const LEGACY_LANGSMITH_PROJECT_HEADER: &str = "X-LangSmith-Project";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityDeliveryLog {
@@ -418,6 +420,7 @@ fn build_otlp_trace_payload(config: &AgentConfig, trace: &ExecutionTrace) -> ser
 }
 
 async fn post_export_payload(
+    provider: &str,
     endpoint: &str,
     header_name: &str,
     auth_token: &str,
@@ -434,8 +437,9 @@ async fn post_export_payload(
     if !header_name.trim().is_empty() && !auth_token.trim().is_empty() {
         request = request.header(header_name.trim(), auth_token.trim());
     }
-    // LangSmith requires project name header for OTLP ingestion
-    if endpoint.contains("smith.langchain") || endpoint.contains("langsmith") {
+    // LangSmith OTLP ingestion uses the Langsmith-Project header. Keep the legacy
+    // X-LangSmith-Project header alongside it for compatibility with older setups.
+    if normalize_observability_provider(provider) == "langsmith" {
         let project = if service_name.trim().is_empty() {
             "default"
         } else {
@@ -446,7 +450,9 @@ async fn post_export_payload(
             project,
             endpoint
         );
-        request = request.header("X-LangSmith-Project", project);
+        request = request
+            .header(LANGSMITH_PROJECT_HEADER, project)
+            .header(LEGACY_LANGSMITH_PROJECT_HEADER, project);
     }
     Ok(request.send().await?)
 }
@@ -486,6 +492,7 @@ pub async fn export_execution_trace(
         config.observability.service_name.trim()
     };
     match post_export_payload(
+        &provider,
         &endpoint,
         &normalize_observability_header_name(&config.observability.header_name),
         &auth_token,
@@ -613,6 +620,7 @@ pub async fn export_test_trace(
         total_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("simple".to_string()),
+        plan: None,
     };
 
     export_execution_trace(config, config_dir, data_dir, storage, &trace, "test_export").await
@@ -638,4 +646,23 @@ pub fn summarize_log_issues(logs: &[ObservabilityDeliveryLog]) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_langsmith_provider_accepts_aliases() {
+        assert_eq!(normalize_observability_provider("langsmith"), "langsmith");
+        assert_eq!(normalize_observability_provider("langchain"), "langsmith");
+    }
+
+    #[test]
+    fn normalize_langsmith_endpoint_appends_otel_trace_path() {
+        assert_eq!(
+            normalize_observability_endpoint("langsmith", "https://api.smith.langchain.com"),
+            "https://api.smith.langchain.com/otel/v1/traces"
+        );
+    }
 }

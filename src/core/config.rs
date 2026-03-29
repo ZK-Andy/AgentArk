@@ -5,6 +5,10 @@
 
 use super::llm::LlmProvider;
 use super::swarm::SwarmConfig;
+use crate::channels::{
+    discord::DiscordChannelConfig, matrix::MatrixTransportConfig, slack::SlackChannelConfig,
+    teams::TeamsTransportConfig, whatsapp::WhatsAppChannelConfig,
+};
 use crate::crypto::KeyManager;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -275,14 +279,18 @@ pub struct AgentConfig {
     /// Multi-model pool
     #[serde(default)]
     pub model_pool: ModelPoolConfig,
-    /// Optional model slot ID dedicated for app_deploy planning/generation.
-    /// When unset, app deploy uses the default primary model.
-    #[serde(default)]
-    pub app_deploy_model_id: Option<String>,
     #[serde(default)]
     pub telegram: Option<TelegramConfig>,
     #[serde(default)]
-    pub whatsapp: Option<crate::channels::whatsapp::WhatsAppChannelConfig>,
+    pub slack: Option<SlackChannelConfig>,
+    #[serde(default)]
+    pub discord: Option<DiscordChannelConfig>,
+    #[serde(default)]
+    pub matrix: Option<MatrixTransportConfig>,
+    #[serde(default)]
+    pub teams: Option<TeamsTransportConfig>,
+    #[serde(default)]
+    pub whatsapp: Option<WhatsAppChannelConfig>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
     #[serde(default)]
@@ -336,8 +344,11 @@ impl Default for AgentConfig {
             llm: LlmProvider::default(),
             llm_fallback: None,
             model_pool: ModelPoolConfig::default(),
-            app_deploy_model_id: None,
             telegram: None,
+            slack: None,
+            discord: None,
+            matrix: None,
+            teams: None,
             whatsapp: None,
             sandbox: SandboxConfig::default(),
             memory: MemoryConfig::default(),
@@ -553,6 +564,9 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         working_dir: Option<String>,
+        /// Names of env vars whose values are stored encrypted in secrets.enc.
+        #[serde(default)]
+        env_keys: Vec<String>,
     },
 }
 
@@ -601,6 +615,16 @@ pub struct Secrets {
     pub llm_fallback_api_key: Option<String>,
     /// Telegram bot token
     pub telegram_bot_token: Option<String>,
+    /// Slack bot token
+    pub slack_bot_token: Option<String>,
+    /// Slack signing secret
+    pub slack_signing_secret: Option<String>,
+    /// Discord bot token
+    pub discord_bot_token: Option<String>,
+    /// Matrix access token
+    pub matrix_access_token: Option<String>,
+    /// Teams access token
+    pub teams_access_token: Option<String>,
     /// WhatsApp access token
     #[serde(default)]
     pub whatsapp_access_token: Option<String>,
@@ -627,6 +651,9 @@ pub struct Secrets {
     /// MCP server auth secrets (per server ID)
     #[serde(default)]
     pub mcp_auth: std::collections::HashMap<String, McpAuthSecret>,
+    /// MCP stdio env vars (per server ID, encrypted at rest)
+    #[serde(default)]
+    pub mcp_env: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// Custom secrets (for future extensibility)
     #[serde(default)]
     pub custom: std::collections::HashMap<String, String>,
@@ -818,6 +845,7 @@ impl SecureConfigManager {
             || !secrets.media_provider_keys.is_empty()
             || !secrets.model_pool_keys.is_empty()
             || !secrets.mcp_auth.is_empty()
+            || !secrets.mcp_env.is_empty()
             || !secrets.custom.is_empty()
     }
 
@@ -1077,6 +1105,37 @@ impl SecureConfigManager {
             }
         }
 
+        // Extract Slack secrets
+        if let Some(slack) = &config.slack {
+            if !slack.bot_token.is_empty() && slack.bot_token != "[ENCRYPTED]" {
+                secrets.slack_bot_token = Some(slack.bot_token.clone());
+            }
+            if !slack.signing_secret.is_empty() && slack.signing_secret != "[ENCRYPTED]" {
+                secrets.slack_signing_secret = Some(slack.signing_secret.clone());
+            }
+        }
+
+        // Extract Discord secrets
+        if let Some(discord) = &config.discord {
+            if !discord.bot_token.is_empty() && discord.bot_token != "[ENCRYPTED]" {
+                secrets.discord_bot_token = Some(discord.bot_token.clone());
+            }
+        }
+
+        // Extract Matrix access token
+        if let Some(matrix) = &config.matrix {
+            if !matrix.access_token.is_empty() && matrix.access_token != "[ENCRYPTED]" {
+                secrets.matrix_access_token = Some(matrix.access_token.clone());
+            }
+        }
+
+        // Extract Teams access token
+        if let Some(teams) = &config.teams {
+            if !teams.access_token.is_empty() && teams.access_token != "[ENCRYPTED]" {
+                secrets.teams_access_token = Some(teams.access_token.clone());
+            }
+        }
+
         // Extract WhatsApp access token
         if let Some(wa) = &config.whatsapp {
             if !wa.access_token.is_empty() && wa.access_token != "[ENCRYPTED]" {
@@ -1172,6 +1231,37 @@ impl SecureConfigManager {
             }
         }
 
+        // Replace Slack secrets with placeholders
+        if let Some(slack) = &mut sanitized.slack {
+            if !slack.bot_token.is_empty() {
+                slack.bot_token = "[ENCRYPTED]".to_string();
+            }
+            if !slack.signing_secret.is_empty() {
+                slack.signing_secret = "[ENCRYPTED]".to_string();
+            }
+        }
+
+        // Replace Discord secrets with placeholders
+        if let Some(discord) = &mut sanitized.discord {
+            if !discord.bot_token.is_empty() {
+                discord.bot_token = "[ENCRYPTED]".to_string();
+            }
+        }
+
+        // Replace Matrix access token with placeholder
+        if let Some(matrix) = &mut sanitized.matrix {
+            if !matrix.access_token.is_empty() {
+                matrix.access_token = "[ENCRYPTED]".to_string();
+            }
+        }
+
+        // Replace Teams access token with placeholder
+        if let Some(teams) = &mut sanitized.teams {
+            if !teams.access_token.is_empty() {
+                teams.access_token = "[ENCRYPTED]".to_string();
+            }
+        }
+
         // Replace WhatsApp access token with placeholder
         if let Some(wa) = &mut sanitized.whatsapp {
             if !wa.access_token.is_empty() {
@@ -1259,6 +1349,91 @@ impl SecureConfigManager {
                         bot_token: token.clone(),
                         allowed_users: vec![],
                         dm_policy: "pairing".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Inject Slack secrets
+        if let Some(token) = &secrets.slack_bot_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(slack) = &mut config.slack {
+                    slack.bot_token = token.clone();
+                } else {
+                    tracing::info!(
+                        "Recovered Slack config from encrypted secrets (config.toml was missing [slack] section)"
+                    );
+                    config.slack = Some(SlackChannelConfig {
+                        bot_token: token.clone(),
+                        signing_secret: secrets.slack_signing_secret.clone().unwrap_or_default(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(secret) = &secrets.slack_signing_secret {
+            if !secret.is_empty() && secret != "[ENCRYPTED]" {
+                if let Some(slack) = &mut config.slack {
+                    slack.signing_secret = secret.clone();
+                } else {
+                    tracing::info!(
+                        "Recovered Slack config from encrypted secrets (config.toml was missing [slack] section)"
+                    );
+                    config.slack = Some(SlackChannelConfig {
+                        bot_token: secrets.slack_bot_token.clone().unwrap_or_default(),
+                        signing_secret: secret.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Inject Discord secrets
+        if let Some(token) = &secrets.discord_bot_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(discord) = &mut config.discord {
+                    discord.bot_token = token.clone();
+                } else {
+                    tracing::info!(
+                        "Recovered Discord config from encrypted secrets (config.toml was missing [discord] section)"
+                    );
+                    config.discord = Some(DiscordChannelConfig {
+                        bot_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Inject Matrix access token
+        if let Some(token) = &secrets.matrix_access_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(matrix) = &mut config.matrix {
+                    matrix.access_token = token.clone();
+                } else {
+                    tracing::info!(
+                        "Recovered Matrix config from encrypted secrets (config.toml was missing [matrix] section)"
+                    );
+                    config.matrix = Some(MatrixTransportConfig {
+                        access_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Inject Teams access token
+        if let Some(token) = &secrets.teams_access_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(teams) = &mut config.teams {
+                    teams.access_token = token.clone();
+                } else {
+                    tracing::info!(
+                        "Recovered Teams config from encrypted secrets (config.toml was missing [teams] section)"
+                    );
+                    config.teams = Some(TeamsTransportConfig {
+                        access_token: token.clone(),
+                        ..Default::default()
                     });
                 }
             }

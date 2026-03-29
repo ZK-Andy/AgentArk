@@ -26,6 +26,16 @@ fn app_deploy_chat_progress_message(
     let lower = content.to_ascii_lowercase();
     let mut message = if lower.starts_with("deploying '") {
         Some(format!("I'm deploying the app now. {}", content))
+    } else if lower.starts_with("cloning repository ") {
+        Some("I'm cloning the repository now.".to_string())
+    } else if lower == "reading repo readme and local manifests" {
+        Some("I cloned the repo and I'm reading the README plus local manifests now.".to_string())
+    } else if lower.starts_with("detected ") && lower.contains("repo service") {
+        Some(
+            "I identified the repo services and I'm preparing the managed deploy plan.".to_string(),
+        )
+    } else if lower.starts_with("deploying repo service ") {
+        Some("I'm standing up one of the detected repo services now.".to_string())
     } else if lower.starts_with("writing ") || lower.contains(" line ") {
         if state.announced_file_writes {
             None
@@ -261,6 +271,124 @@ fn blocked_by_saved_rule_message(constraints: &super::UserExecutionConstraints) 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GmailScanRenderedMessage {
+    from: String,
+    subject: String,
+    date: String,
+    snippet: String,
+}
+
+fn gmail_sender_display_name(from: &str) -> String {
+    let trimmed = from.trim();
+    if let Some((name, _rest)) = trimmed.split_once('<') {
+        let cleaned = name.trim().trim_matches('"').trim();
+        if !cleaned.is_empty() {
+            return cleaned.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_gmail_scan_messages(raw: &str) -> Vec<GmailScanRenderedMessage> {
+    raw.split("\n\n")
+        .filter_map(|block| {
+            let mut from = String::new();
+            let mut subject = String::new();
+            let mut date = String::new();
+            let mut snippet = String::new();
+
+            for line in block.lines() {
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("- From: ") {
+                    from = value.trim().to_string();
+                } else if let Some(value) = trimmed.strip_prefix("Subject: ") {
+                    subject = value.trim().to_string();
+                } else if let Some(value) = trimmed.strip_prefix("Date: ") {
+                    date = value.trim().to_string();
+                } else if let Some(value) = trimmed.strip_prefix("Snippet: ") {
+                    snippet = value.trim().to_string();
+                }
+            }
+
+            if from.is_empty() && subject.is_empty() && date.is_empty() && snippet.is_empty() {
+                None
+            } else {
+                Some(GmailScanRenderedMessage {
+                    from,
+                    subject,
+                    date,
+                    snippet,
+                })
+            }
+        })
+        .collect()
+}
+
+fn format_gmail_scan_exact_results(
+    mode: crate::actions::gmail::GmailScanMode,
+    args: Option<&crate::actions::gmail::GmailScanArgs>,
+    messages: &[GmailScanRenderedMessage],
+) -> String {
+    let count = messages.len();
+    let heading = match mode {
+        crate::actions::gmail::GmailScanMode::Recent => {
+            format!(
+                "Here are your latest {} email{}:",
+                count,
+                if count == 1 { "" } else { "s" }
+            )
+        }
+        crate::actions::gmail::GmailScanMode::Search => {
+            let query = args
+                .and_then(|value| value.query.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(query) = query {
+                format!(
+                    "Here are the matching emails for `{}`:",
+                    query.replace('`', "'")
+                )
+            } else {
+                format!(
+                    "Here are the matching {} email{}:",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                )
+            }
+        }
+        _ => format!(
+            "Here are the {} email{}:",
+            count,
+            if count == 1 { "" } else { "s" }
+        ),
+    };
+
+    let items = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let sender = gmail_sender_display_name(&message.from);
+            let subject = if message.subject.trim().is_empty() {
+                "(No subject)"
+            } else {
+                message.subject.trim()
+            };
+            let mut lines = vec![format!("{}. **{}** — {}", index + 1, sender, subject)];
+            if !message.date.trim().is_empty() {
+                lines.push(format!("   Date: {}", message.date.trim()));
+            }
+            if !message.snippet.trim().is_empty() {
+                lines.push(format!("   {}", message.snippet.trim()));
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{}\n\n{}", heading, items)
+}
+
 impl ToolExecutionBatch {
     pub(crate) fn combined_output(&self) -> String {
         self.outputs
@@ -326,6 +454,27 @@ impl Agent {
             || tool_call_has_structural_side_effect_markers(call)
         {
             return true;
+        }
+
+        // Fast-path: tools whose capabilities are purely read-only don't need an LLM call.
+        if let Some(action) = action_def {
+            let all_read_only = !action.capabilities.is_empty()
+                && action.capabilities.iter().all(|cap| {
+                    matches!(
+                        cap.as_str(),
+                        "network"
+                            | "file_read"
+                            | "search"
+                            | "web_search"
+                            | "inspection"
+                            | "read"
+                            | "list"
+                            | "query"
+                    )
+                });
+            if all_read_only {
+                return false;
+            }
         }
 
         let Some(action) = action_def else {
@@ -678,6 +827,12 @@ impl Agent {
         };
 
         let Some(mut normalized) = nested.take() else {
+            // Last resort: try to recover files from the top-level object itself.
+            if let Some(obj) = arguments.as_object() {
+                if let Some(recovered) = Self::recover_files_from_flat_args(obj) {
+                    return recovered;
+                }
+            }
             return arguments.clone();
         };
 
@@ -687,13 +842,37 @@ impl Agent {
                     nested_obj.insert("files".to_string(), serde_json::Value::Object(files_obj));
                 }
             } else {
-                for alias in ["file_map", "source_files", "project_files", "artifacts"] {
+                // Try known aliases for the files field.
+                let mut recovered = false;
+                for alias in [
+                    "file_map",
+                    "source_files",
+                    "project_files",
+                    "artifacts",
+                    "code",
+                    "sources",
+                    "data",
+                ] {
                     if let Some(alias_value) = nested_obj.get(alias).cloned() {
                         if let Some(files_obj) = Self::extract_files_object(&alias_value) {
                             nested_obj
                                 .insert("files".to_string(), serde_json::Value::Object(files_obj));
+                            recovered = true;
                             break;
                         }
+                    }
+                }
+                // If still no files, try single-content keys that models commonly use.
+                if !recovered {
+                    if let Some(files_obj) = Self::recover_files_from_single_content_key(nested_obj)
+                    {
+                        nested_obj
+                            .insert("files".to_string(), serde_json::Value::Object(files_obj));
+                    } else if let Some(files_obj) =
+                        Self::recover_files_from_flat_string_values(nested_obj)
+                    {
+                        nested_obj
+                            .insert("files".to_string(), serde_json::Value::Object(files_obj));
                     }
                 }
             }
@@ -701,20 +880,7 @@ impl Agent {
 
         if let (Some(root), Some(nested_obj)) = (arguments.as_object(), normalized.as_object_mut())
         {
-            for key in [
-                "title",
-                "entry_command",
-                "install_command",
-                "runtime_image",
-                "runtime_preference",
-                "expose_public",
-                "access_guard",
-                "required_inputs",
-                "required_secrets",
-                "required_env",
-                "required_config",
-                "config",
-            ] {
+            for &key in Self::KNOWN_METADATA_KEYS {
                 if nested_obj.get(key).is_none() {
                     if let Some(v) = root.get(key) {
                         nested_obj.insert(key.to_string(), v.clone());
@@ -726,6 +892,145 @@ impl Agent {
         normalized
     }
 
+    /// Known app_deploy metadata keys — these are NOT file content.
+    const KNOWN_METADATA_KEYS: &'static [&'static str] = &[
+        "title",
+        "repo_url",
+        "repo_ref",
+        "repo_subdir",
+        "service_mode",
+        "entry_command",
+        "install_command",
+        "runtime_image",
+        "runtime_preference",
+        "expose_public",
+        "access_guard",
+        "required_inputs",
+        "required_secrets",
+        "required_env",
+        "required_config",
+        "config",
+        "replace_existing",
+        "allow_duplicate",
+        "name",
+    ];
+
+    /// Recover files from a single content key like `content`, `code`, `html`, `source`.
+    /// Models sometimes send `{"content": "<html>...</html>", "title": "My App"}` instead
+    /// of wrapping it in a `files` object.
+    fn recover_files_from_single_content_key(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        for key in ["content", "code", "html", "source", "body", "text", "page"] {
+            if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
+                if value.len() > 20 {
+                    let filename = Self::infer_filename_from_content(value);
+                    let mut files = serde_json::Map::new();
+                    files.insert(filename, serde_json::Value::String(value.to_string()));
+                    return Some(files);
+                }
+            }
+        }
+        None
+    }
+
+    /// Recover files when the model placed string values at the top level that look like
+    /// file content (not known metadata keys). E.g. `{"index.html": "<html>...", "title": "App"}`.
+    fn recover_files_from_flat_string_values(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut files = serde_json::Map::new();
+        for (key, value) in obj {
+            if Self::KNOWN_METADATA_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // Skip known wrapper/alias keys already handled elsewhere.
+            if matches!(
+                key.as_str(),
+                "files"
+                    | "file_map"
+                    | "source_files"
+                    | "project_files"
+                    | "artifacts"
+                    | "payload"
+                    | "arguments"
+                    | "args"
+                    | "input"
+                    | "params"
+                    | "tool_input"
+                    | "tool_arguments"
+            ) {
+                continue;
+            }
+            if let Some(s) = value.as_str() {
+                if s.len() > 20 {
+                    files.insert(key.clone(), serde_json::Value::String(s.to_string()));
+                }
+            }
+        }
+        if files.is_empty() {
+            None
+        } else {
+            Some(files)
+        }
+    }
+
+    /// Recover files from a top-level object that has no `files` key and no nested wrapper.
+    fn recover_files_from_flat_args(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        // First try single-content recovery.
+        if let Some(files_obj) = Self::recover_files_from_single_content_key(obj) {
+            let mut result = obj.clone();
+            result.insert("files".to_string(), serde_json::Value::Object(files_obj));
+            return Some(serde_json::Value::Object(result));
+        }
+        // Then try flat string values.
+        if let Some(files_obj) = Self::recover_files_from_flat_string_values(obj) {
+            let mut result = serde_json::Map::new();
+            result.insert("files".to_string(), serde_json::Value::Object(files_obj));
+            // Carry over metadata keys.
+            for key in Self::KNOWN_METADATA_KEYS {
+                if let Some(v) = obj.get(*key) {
+                    result.insert(key.to_string(), v.clone());
+                }
+            }
+            return Some(serde_json::Value::Object(result));
+        }
+        None
+    }
+
+    /// Infer a reasonable filename from content when the model didn't provide one.
+    fn infer_filename_from_content(content: &str) -> String {
+        let lower = content.trim_start().to_ascii_lowercase();
+        if lower.starts_with("<!doctype html")
+            || lower.starts_with("<html")
+            || lower.starts_with("<head")
+            || lower.starts_with("<body")
+        {
+            "index.html".to_string()
+        } else if lower.starts_with("import ") || lower.starts_with("from ") {
+            if lower.contains("fastapi") || lower.contains("flask") || lower.contains("django") {
+                "app.py".to_string()
+            } else {
+                "app.js".to_string()
+            }
+        } else if lower.starts_with("const ")
+            || lower.starts_with("function ")
+            || lower.starts_with("var ")
+        {
+            "app.js".to_string()
+        } else if lower.starts_with("body")
+            || lower.starts_with("*")
+            || lower.starts_with(".")
+            || lower.starts_with("#")
+        {
+            "style.css".to_string()
+        } else {
+            "index.html".to_string()
+        }
+    }
+
     fn summarize_app_deploy_stream_payload(arguments: &serde_json::Value) -> serde_json::Value {
         let normalized = Self::normalize_app_deploy_arguments(arguments);
         let Some(obj) = normalized.as_object() else {
@@ -735,6 +1040,10 @@ impl Agent {
         let mut summary = serde_json::Map::new();
         for key in [
             "title",
+            "repo_url",
+            "repo_ref",
+            "repo_subdir",
+            "service_mode",
             "entry_command",
             "install_command",
             "runtime_image",
@@ -1320,6 +1629,30 @@ impl Agent {
         })
     }
 
+    fn summarize_ranked_apps_for_user(
+        ranked_apps: &[(f32, String, serde_json::Value, String)],
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let local_base = Self::user_facing_local_base_url();
+        ranked_apps
+            .iter()
+            .take(limit)
+            .map(|(score, _, app, reason)| {
+                let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
+                let local_url =
+                    Self::absolutize_public_url(Some(local_base.as_str()), relative_url);
+                serde_json::json!({
+                    "id": app.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "title": app.get("title").and_then(|v| v.as_str()).unwrap_or("App"),
+                    "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "local_url": local_url,
+                    "match_score": score,
+                    "match_reason": reason,
+                })
+            })
+            .collect()
+    }
+
     async fn collect_app_file_inventory(
         &self,
         app_dir: &std::path::Path,
@@ -1395,18 +1728,29 @@ impl Agent {
             .to_string();
         let app_dir = self.app_registry.get_dir(app_id).await?;
         let meta_path = app_dir.join(".app_meta.json");
-        let meta: Option<serde_json::Value> = tokio::fs::read(&meta_path)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let meta = self.load_app_metadata(app_id).await;
 
         let local_base = Self::user_facing_local_base_url();
         let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
         let local_url = Self::absolutize_public_url(Some(local_base.as_str()), relative_url);
+        let relative_access_url = app
+            .get("access_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or(relative_url);
+        let local_access_url =
+            Self::absolutize_public_url(Some(local_base.as_str()), relative_access_url);
         let access_guard_enabled = app
             .get("access_guard_enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let access_key = if access_guard_enabled {
+            app.get("access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
         let required_inputs = meta
             .as_ref()
             .map(crate::actions::app::parse_required_inputs)
@@ -1457,23 +1801,32 @@ impl Agent {
             "title": title,
             "app_dir": app_dir.to_string_lossy().to_string(),
             "metadata_path": meta_path.to_string_lossy().to_string(),
+          "url": relative_url,
           "local_url": local_url,
+          "access_url": relative_access_url,
+          "local_access_url": local_access_url,
           "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
           "is_static": app.get("is_static").and_then(|v| v.as_bool()).unwrap_or(true),
           "runtime_mode": app.get("runtime_mode").and_then(|v| v.as_str()).unwrap_or("unknown"),
           "created_at": app.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
           "port": app.get("port").and_then(|v| v.as_u64()),
           "access_guard_enabled": access_guard_enabled,
+          "access_key": access_key,
           "entry_command": meta.as_ref().and_then(|m| m.get("entry_command").and_then(|v| v.as_str())),
           "install_command": meta.as_ref().and_then(|m| m.get("install_command").and_then(|v| v.as_str())),
           "runtime_preference": meta.as_ref().and_then(|m| m.get("runtime_preference").and_then(|v| v.as_str())),
             "runtime_image": meta.as_ref().and_then(|m| m.get("runtime_image").and_then(|v| v.as_str())),
+            "repo_url": meta.as_ref().and_then(|m| m.get("repo_url").and_then(|v| v.as_str())),
+            "repo_ref": meta.as_ref().and_then(|m| m.get("repo_ref").and_then(|v| v.as_str())),
+            "repo_bundle_id": meta.as_ref().and_then(|m| m.get("repo_bundle_id").and_then(|v| v.as_str())),
+            "repo_service_kind": meta.as_ref().and_then(|m| m.get("repo_service_kind").and_then(|v| v.as_str())),
+            "repo_service_dir": meta.as_ref().and_then(|m| m.get("repo_service_dir").and_then(|v| v.as_str())),
             "required_inputs": required_inputs,
             "config_keys": config_keys,
             "file_count": file_count,
             "file_bytes": file_bytes,
             "suggested_read_files": suggested_read_files,
-            "suggested_actions": ["file_read", "file_write", "app_restart", "http_get"],
+            "suggested_actions": ["file_read", "file_write", "app_restart", "app_stop", "app_delete", "http_get"],
         });
         if let Some(obj) = out.as_object_mut() {
             if include_files {
@@ -1491,6 +1844,61 @@ impl Agent {
             }
         }
         Some(out)
+    }
+
+    async fn load_app_metadata(&self, app_id: &str) -> Option<serde_json::Value> {
+        let app_dir = self.app_registry.get_dir(app_id).await?;
+        let meta_path = app_dir.join(".app_meta.json");
+        tokio::fs::read(&meta_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .filter(|value: &serde_json::Value| value.is_object())
+    }
+
+    async fn find_repo_bundle_apps(
+        &self,
+        bundle_id: &str,
+    ) -> Vec<(serde_json::Value, serde_json::Value)> {
+        let needle = bundle_id.trim();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let apps = self.app_registry.list().await;
+        let mut matched = Vec::new();
+        for app in apps {
+            let Some(app_id) = app.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(meta) = self.load_app_metadata(app_id).await else {
+                continue;
+            };
+            if meta
+                .get("repo_bundle_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value == needle)
+            {
+                matched.push((app, meta));
+            }
+        }
+        matched
+    }
+
+    async fn cleanup_repo_bundle_artifacts(&self, bundle_id: &str) -> Result<()> {
+        let cleaned = bundle_id.trim();
+        if cleaned.is_empty() {
+            return Ok(());
+        }
+        let bundle_dir = self.data_dir.join("repo-deployments").join(cleaned);
+        match tokio::fs::remove_dir_all(&bundle_dir).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "Failed to remove repo deployment bundle '{}': {}",
+                cleaned,
+                error
+            )),
+        }
     }
 
     fn sample_overlap_tokens(
@@ -2907,6 +3315,7 @@ Do not include any extra prose.",
     pub(crate) async fn restart_deployed_app_from_metadata(
         &self,
         app_id: &str,
+        title_override: Option<&str>,
     ) -> Result<serde_json::Value> {
         let app_id = app_id.trim();
         if app_id.is_empty() {
@@ -2932,11 +3341,23 @@ Do not include any extra prose.",
             meta = serde_json::json!({});
         }
 
-        let title = meta
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or(app_id)
-            .to_string();
+        let override_title = title_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let mut meta_changed = false;
+        if let Some(title) = override_title.as_ref() {
+            if meta.get("title").and_then(|v| v.as_str()) != Some(title.as_str()) {
+                meta["title"] = serde_json::Value::String(title.clone());
+                meta_changed = true;
+            }
+        }
+        let title = override_title.clone().unwrap_or_else(|| {
+            meta.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(app_id)
+                .to_string()
+        });
         let entry_command = meta
             .get("entry_command")
             .and_then(|v| v.as_str())
@@ -2989,6 +3410,9 @@ Do not include any extra prose.",
         {
             meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
             meta["access_key"] = serde_json::Value::String(access_key.clone());
+            meta_changed = true;
+        }
+        if meta_changed {
             let _ = tokio::fs::write(
                 &meta_path,
                 serde_json::to_vec_pretty(&meta).unwrap_or_default(),
@@ -3164,6 +3588,13 @@ Do not include any extra prose.",
             .unwrap_or("")
             .trim()
             .to_string();
+        let title_override = call
+            .arguments
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let query = call
             .arguments
             .get("query")
@@ -3197,25 +3628,7 @@ Do not include any extra prose.",
             if let Some((_, app_id, _, _)) = best_match {
                 resolved_app_id = app_id.clone();
             } else {
-                let app_summaries = ranked_apps
-                    .iter()
-                    .take(10)
-                    .map(|(score, _, app, reason)| {
-                        let relative_url = app.get("url").and_then(|v| v.as_str()).unwrap_or("/apps/");
-                        let local_url = Self::absolutize_public_url(
-                            Some(Self::user_facing_local_base_url().as_str()),
-                            relative_url,
-                        );
-                        serde_json::json!({
-                            "id": app.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                            "title": app.get("title").and_then(|v| v.as_str()).unwrap_or("App"),
-                            "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
-                            "local_url": local_url,
-                            "match_score": score,
-                            "match_reason": reason,
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let app_summaries = Self::summarize_ranked_apps_for_user(&ranked_apps, 10);
                 let out = serde_json::json!({
                     "app_id": serde_json::Value::Null,
                     "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
@@ -3239,7 +3652,14 @@ Do not include any extra prose.",
         }
 
         let out = self
-            .restart_deployed_app_from_metadata(&resolved_app_id)
+            .restart_deployed_app_from_metadata(
+                &resolved_app_id,
+                if title_override.is_empty() {
+                    None
+                } else {
+                    Some(title_override.as_str())
+                },
+            )
             .await?;
         if out
             .get("status")
@@ -3284,6 +3704,13 @@ Do not include any extra prose.",
             .unwrap_or("")
             .trim()
             .to_string();
+        let bundle_id = call
+            .arguments
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let include_files = call
             .arguments
             .get("include_files")
@@ -3310,6 +3737,43 @@ Do not include any extra prose.",
                 "apps": Vec::<serde_json::Value>::new(),
                 "message": "No deployed apps are currently registered."
             });
+            let formatted = serde_json::to_string_pretty(&out)?;
+            if let Some(tx) = stream_tx {
+                let _ = tx.try_send(StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                });
+            }
+            return Ok(formatted);
+        }
+
+        if !bundle_id.is_empty() {
+            let bundle_apps = self.find_repo_bundle_apps(&bundle_id).await;
+            let mut inspections = Vec::new();
+            for (app, _meta) in &bundle_apps {
+                if let Some(details) = self
+                    .build_deployed_app_inspection(app, include_files, include_logs)
+                    .await
+                {
+                    inspections.push(details);
+                }
+            }
+            let out = if inspections.is_empty() {
+                serde_json::json!({
+                    "bundle_id": bundle_id,
+                    "status": "not_found",
+                    "apps": Vec::<serde_json::Value>::new(),
+                    "message": "No deployed repo bundle matched that bundle_id."
+                })
+            } else {
+                serde_json::json!({
+                    "bundle_id": bundle_id,
+                    "status": "ok",
+                    "service_count": inspections.len(),
+                    "apps": inspections,
+                    "message": "Matched repo deployment bundle. Inspect or manage the listed services directly."
+                })
+            };
             let formatted = serde_json::to_string_pretty(&out)?;
             if let Some(tx) = stream_tx {
                 let _ = tx.try_send(StreamEvent::ToolResult {
@@ -3392,7 +3856,7 @@ Do not include any extra prose.",
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             format!(
-                "Matched deployed app '{}'. Use file_read/file_write on {} to inspect or repair it, then app_restart to apply changes.",
+                "Matched deployed app '{}'. Use file_read/file_write on {} to inspect or repair it, then app_restart to apply changes. Use app_stop or app_delete for lifecycle control.",
                 title, app_dir
             )
         };
@@ -3404,6 +3868,385 @@ Do not include any extra prose.",
             "apps": app_summaries,
             "message": message,
         });
+        let formatted = serde_json::to_string_pretty(&out)?;
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: formatted.clone(),
+            });
+        }
+        Ok(formatted)
+    }
+
+    pub(crate) async fn handle_app_stop_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        _request_channel: &str,
+    ) -> Result<String> {
+        let explicit_app_id = call
+            .arguments
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let bundle_id = call
+            .arguments
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let out = if !bundle_id.is_empty() {
+            let bundle_apps = self.find_repo_bundle_apps(&bundle_id).await;
+            if bundle_apps.is_empty() {
+                serde_json::json!({
+                    "status": "not_found",
+                    "bundle_id": bundle_id,
+                    "message": "No deployed repo bundle matched that bundle_id."
+                })
+            } else {
+                let mut results = Vec::new();
+                let mut stopped_count = 0usize;
+                let mut skipped_static_count = 0usize;
+                let mut failed_count = 0usize;
+                for (app, _meta) in bundle_apps {
+                    let app_id = app
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = app
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("App")
+                        .to_string();
+                    if app
+                        .get("is_static")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        skipped_static_count += 1;
+                        results.push(serde_json::json!({
+                            "app_id": app_id,
+                            "title": title,
+                            "status": "skipped_static",
+                            "message": "Static apps do not have a runtime to stop."
+                        }));
+                        continue;
+                    }
+                    match self.app_registry.stop_runtime(&app_id).await {
+                        Ok(_) => {
+                            stopped_count += 1;
+                            results.push(serde_json::json!({
+                                "app_id": app_id,
+                                "title": title,
+                                "status": "stopped"
+                            }));
+                        }
+                        Err(error) => {
+                            failed_count += 1;
+                            results.push(serde_json::json!({
+                                "app_id": app_id,
+                                "title": title,
+                                "status": "failed",
+                                "error": error.to_string()
+                            }));
+                        }
+                    }
+                }
+                if stopped_count > 0 {
+                    self.trigger_arkpulse_refresh("app_stop");
+                }
+                serde_json::json!({
+                    "status": if failed_count == 0 { "stopped" } else { "partial_failure" },
+                    "bundle_id": bundle_id,
+                    "stopped_count": stopped_count,
+                    "skipped_static_count": skipped_static_count,
+                    "failed_count": failed_count,
+                    "apps": results,
+                })
+            }
+        } else {
+            let apps = self.app_registry.list().await;
+            if apps.is_empty() {
+                serde_json::json!({
+                    "status": "not_found",
+                    "app_id": serde_json::Value::Null,
+                    "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                    "message": "No deployed apps are currently registered."
+                })
+            } else {
+                let mut resolved_app_id = explicit_app_id.clone();
+                if resolved_app_id.is_empty() {
+                    let ranked_apps = Self::rank_deployed_apps(&query, &apps);
+                    let best_match = Self::select_best_ranked_app(&query, &ranked_apps);
+                    if let Some((_, app_id, _, _)) = best_match {
+                        resolved_app_id = app_id.clone();
+                    } else {
+                        let app_summaries = Self::summarize_ranked_apps_for_user(&ranked_apps, 10);
+                        let out = serde_json::json!({
+                            "status": "not_found",
+                            "app_id": serde_json::Value::Null,
+                            "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                            "apps": app_summaries,
+                            "message": if query.is_empty() {
+                                "app_stop needs an app_id, query, or bundle_id to identify which deployed app to stop."
+                            } else {
+                                "No single deployed app matched the stop request."
+                            }
+                        });
+                        let formatted = serde_json::to_string_pretty(&out)?;
+                        if let Some(tx) = stream_tx {
+                            let _ = tx.try_send(StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: formatted.clone(),
+                            });
+                        }
+                        return Ok(formatted);
+                    }
+                }
+
+                if let Some(app) = apps.iter().find(|row| {
+                    row.get("id").and_then(|v| v.as_str()) == Some(resolved_app_id.as_str())
+                }) {
+                    let title = app.get("title").and_then(|v| v.as_str()).unwrap_or("App");
+                    if app
+                        .get("is_static")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        serde_json::json!({
+                            "status": "skipped_static",
+                            "app_id": resolved_app_id,
+                            "title": title,
+                            "message": "Static apps do not have a runtime to stop."
+                        })
+                    } else {
+                        match self.app_registry.stop_runtime(&resolved_app_id).await {
+                            Ok(_) => {
+                                self.trigger_arkpulse_refresh("app_stop");
+                                serde_json::json!({
+                                    "status": "stopped",
+                                    "app_id": resolved_app_id,
+                                    "title": title,
+                                })
+                            }
+                            Err(error) => serde_json::json!({
+                                "status": "failed",
+                                "app_id": resolved_app_id,
+                                "title": title,
+                                "error": error.to_string(),
+                            }),
+                        }
+                    }
+                } else {
+                    serde_json::json!({
+                        "status": "not_found",
+                        "app_id": resolved_app_id,
+                        "message": "The requested app is not currently deployed."
+                    })
+                }
+            }
+        };
+
+        let formatted = serde_json::to_string_pretty(&out)?;
+        if let Some(tx) = stream_tx {
+            let _ = tx.try_send(StreamEvent::ToolResult {
+                name: call.name.clone(),
+                content: formatted.clone(),
+            });
+        }
+        Ok(formatted)
+    }
+
+    pub(crate) async fn handle_app_delete_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        _request_channel: &str,
+    ) -> Result<String> {
+        let explicit_app_id = call
+            .arguments
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let bundle_id = call
+            .arguments
+            .get("bundle_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let out = if !bundle_id.is_empty() {
+            let bundle_apps = self.find_repo_bundle_apps(&bundle_id).await;
+            if bundle_apps.is_empty() {
+                serde_json::json!({
+                    "status": "not_found",
+                    "bundle_id": bundle_id,
+                    "message": "No deployed repo bundle matched that bundle_id."
+                })
+            } else {
+                let mut results = Vec::new();
+                let mut deleted_count = 0usize;
+                let mut failed_count = 0usize;
+                for (app, _meta) in bundle_apps {
+                    let app_id = app
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let title = app
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("App")
+                        .to_string();
+                    match self
+                        .stop_and_remove_existing_app(&app_id, Some(title.as_str()))
+                        .await
+                    {
+                        Ok(()) => {
+                            deleted_count += 1;
+                            results.push(serde_json::json!({
+                                "app_id": app_id,
+                                "title": title,
+                                "status": "deleted"
+                            }));
+                        }
+                        Err(error) => {
+                            failed_count += 1;
+                            results.push(serde_json::json!({
+                                "app_id": app_id,
+                                "title": title,
+                                "status": "failed",
+                                "error": error.to_string()
+                            }));
+                        }
+                    }
+                }
+                if deleted_count > 0 {
+                    self.trigger_arkpulse_refresh("app_delete");
+                }
+                if self.find_repo_bundle_apps(&bundle_id).await.is_empty() {
+                    let _ = self.cleanup_repo_bundle_artifacts(&bundle_id).await;
+                }
+                serde_json::json!({
+                    "status": if failed_count == 0 { "deleted" } else { "partial_failure" },
+                    "bundle_id": bundle_id,
+                    "deleted_count": deleted_count,
+                    "failed_count": failed_count,
+                    "apps": results,
+                })
+            }
+        } else {
+            let apps = self.app_registry.list().await;
+            if apps.is_empty() {
+                serde_json::json!({
+                    "status": "not_found",
+                    "app_id": serde_json::Value::Null,
+                    "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                    "message": "No deployed apps are currently registered."
+                })
+            } else {
+                let mut resolved_app_id = explicit_app_id.clone();
+                if resolved_app_id.is_empty() {
+                    let ranked_apps = Self::rank_deployed_apps(&query, &apps);
+                    let best_match = Self::select_best_ranked_app(&query, &ranked_apps);
+                    if let Some((_, app_id, _, _)) = best_match {
+                        resolved_app_id = app_id.clone();
+                    } else {
+                        let app_summaries = Self::summarize_ranked_apps_for_user(&ranked_apps, 10);
+                        let out = serde_json::json!({
+                            "status": "not_found",
+                            "app_id": serde_json::Value::Null,
+                            "query": if query.is_empty() { serde_json::Value::Null } else { serde_json::json!(query) },
+                            "apps": app_summaries,
+                            "message": if query.is_empty() {
+                                "app_delete needs an app_id, query, or bundle_id to identify which deployed app to remove."
+                            } else {
+                                "No single deployed app matched the delete request."
+                            }
+                        });
+                        let formatted = serde_json::to_string_pretty(&out)?;
+                        if let Some(tx) = stream_tx {
+                            let _ = tx.try_send(StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: formatted.clone(),
+                            });
+                        }
+                        return Ok(formatted);
+                    }
+                }
+
+                if let Some(app) = apps.iter().find(|row| {
+                    row.get("id").and_then(|v| v.as_str()) == Some(resolved_app_id.as_str())
+                }) {
+                    let title = app
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("App")
+                        .to_string();
+                    let bundle_for_cleanup = self
+                        .load_app_metadata(&resolved_app_id)
+                        .await
+                        .and_then(|meta| {
+                            meta.get("repo_bundle_id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string)
+                        });
+                    match self
+                        .stop_and_remove_existing_app(&resolved_app_id, Some(title.as_str()))
+                        .await
+                    {
+                        Ok(()) => {
+                            self.trigger_arkpulse_refresh("app_delete");
+                            if let Some(bundle_id) = bundle_for_cleanup.as_deref() {
+                                if self.find_repo_bundle_apps(bundle_id).await.is_empty() {
+                                    let _ = self.cleanup_repo_bundle_artifacts(bundle_id).await;
+                                }
+                            }
+                            serde_json::json!({
+                                "status": "deleted",
+                                "app_id": resolved_app_id,
+                                "title": title,
+                            })
+                        }
+                        Err(error) => serde_json::json!({
+                            "status": "failed",
+                            "app_id": resolved_app_id,
+                            "title": title,
+                            "error": error.to_string(),
+                        }),
+                    }
+                } else {
+                    serde_json::json!({
+                        "status": "not_found",
+                        "app_id": resolved_app_id,
+                        "message": "The requested app is not currently deployed."
+                    })
+                }
+            }
+        };
+
         let formatted = serde_json::to_string_pretty(&out)?;
         if let Some(tx) = stream_tx {
             let _ = tx.try_send(StreamEvent::ToolResult {
@@ -4507,6 +5350,24 @@ Do not include any extra prose.",
         trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
+        // Check if self-evolve is enabled in settings.
+        let enabled = self
+            .storage
+            .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if !enabled {
+            return Ok(serde_json::json!({
+                "status": "disabled",
+                "message": "Self-evolution is currently disabled. Enable it in Settings > Evolution."
+            })
+            .to_string());
+        }
+
         let request = call
             .arguments
             .get("request")
@@ -5147,7 +6008,6 @@ Do not include any extra prose.",
                 unique_calls.push(call);
             }
         }
-
         let mut results: Vec<ToolCallOutput> = Vec::new();
         for call in unique_calls {
             let call_started = std::time::Instant::now();
@@ -5950,11 +6810,15 @@ Do not include any extra prose.",
                     .get("expose_public")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                let allow_duplicate_requested = resolved_args
+                    .get("allow_duplicate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let replace_existing_requested = resolved_args
                     .get("replace_existing")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if !replace_existing_requested {
+                if !replace_existing_requested && !allow_duplicate_requested {
                     if let Some(duplicate_match) =
                         self.find_existing_duplicate_app(&resolved_args).await
                     {
@@ -6108,6 +6972,179 @@ Do not include any extra prose.",
                         .await;
                         // Parse result to extract URL for a nice response
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                            if parsed
+                                .get("deployment_kind")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|kind| kind == "repo_bundle")
+                            {
+                                let title = parsed
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Repo deployment");
+                                let bundle_id = parsed
+                                    .get("bundle_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("bundle");
+                                let repo_url = parsed
+                                    .get("repo_url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let repo_ref = parsed
+                                    .get("repo_ref")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let status = parsed
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("deployed");
+                                let readme_file = parsed
+                                    .get("readme_file")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let local_base = Self::user_facing_local_base_url();
+                                let mut lines =
+                                    vec![format!("Repository deployment ready: **{}**.", title)];
+                                if !repo_url.is_empty() {
+                                    lines.push(format!("- Source: {}", repo_url));
+                                }
+                                if !repo_ref.is_empty() {
+                                    lines.push(format!("- Ref: `{}`", repo_ref));
+                                }
+                                lines.push(format!("- Bundle ID: `{}`", bundle_id));
+                                lines.push(format!("- Status: {}", status.replace('_', " ")));
+                                if !readme_file.is_empty() {
+                                    lines.push(format!("- README inspected: `{}`", readme_file));
+                                }
+                                let services = parsed
+                                    .get("services")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if services.is_empty() {
+                                    lines.push("- No runnable services were returned.".to_string());
+                                } else {
+                                    lines.push("- Services:".to_string());
+                                    for service in services {
+                                        let title = service
+                                            .get("title")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Service");
+                                        let kind = service
+                                            .get("kind")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("service");
+                                        let service_status = service
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown");
+                                        let relative_dir = service
+                                            .get("relative_dir")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let detection_reason = service
+                                            .get("detection_reason")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let result_obj = service.get("result");
+                                        let local_url = result_obj
+                                            .and_then(|result| result.get("url"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|url| {
+                                                Self::absolutize_public_url(
+                                                    Some(local_base.as_str()),
+                                                    url,
+                                                )
+                                            });
+                                        let public_url = if expose_public_requested {
+                                            if let Some(app_id) = result_obj
+                                                .and_then(|result| result.get("app_id"))
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                if let Some(relative_url) = result_obj
+                                                    .and_then(|result| result.get("url"))
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    self.ensure_public_tunnel_base_url(
+                                                        Some(app_id),
+                                                        stream_tx.as_ref(),
+                                                    )
+                                                    .await
+                                                    .map(|base| {
+                                                        Self::absolutize_public_url(
+                                                            Some(base.as_str()),
+                                                            relative_url,
+                                                        )
+                                                    })
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        lines.push(format!(
+                                            "  - {} ({}) — {}{}",
+                                            title,
+                                            kind,
+                                            service_status.replace('_', " "),
+                                            if relative_dir.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" from `{}`", relative_dir)
+                                            }
+                                        ));
+                                        if let Some(local_url) = local_url {
+                                            lines.push(format!(
+                                                "    Local: [Open app]({})",
+                                                local_url
+                                            ));
+                                        }
+                                        if let Some(public_url) = public_url {
+                                            lines.push(format!(
+                                                "    Public: [Open app]({})",
+                                                public_url
+                                            ));
+                                        }
+                                        if let Some(port) = result_obj
+                                            .and_then(|result| result.get("port"))
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            lines.push(format!("    Port: `{}`", port));
+                                        }
+                                        if !detection_reason.is_empty() {
+                                            lines.push(format!(
+                                                "    Detected from: {}",
+                                                detection_reason
+                                            ));
+                                        }
+                                        if service_status == "failed" {
+                                            if let Some(error) =
+                                                service.get("error").and_then(|v| v.as_str())
+                                            {
+                                                lines.push(format!("    Error: {}", error));
+                                            }
+                                        } else if service_status == "needs_secrets" {
+                                            if let Some(message) = result_obj
+                                                .and_then(|result| result.get("message"))
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                lines.push(format!("    Needs input: {}", message));
+                                            }
+                                        }
+                                    }
+                                }
+                                let msg = lines.join("\n");
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.try_send(StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: msg.clone(),
+                                    });
+                                }
+                                results.push(msg);
+                                continue;
+                            }
                             if parsed
                                 .get("status")
                                 .and_then(|v| v.as_str())
@@ -6486,7 +7523,32 @@ Do not include any extra prose.",
                         let formatted = if error_text.contains("Missing 'files'")
                             || error_text.contains("provide an object mapping filename to content")
                         {
-                            "Error deploying app: app_deploy was called without a valid `files` object. This is a malformed tool payload, not your app code. Retrying the same request should regenerate a valid deploy payload.".to_string()
+                            let received_keys = call
+                                .arguments
+                                .as_object()
+                                .map(|obj| {
+                                    obj.keys()
+                                        .map(|k| format!("`{}`", k))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "(non-object: {})",
+                                        call.arguments
+                                            .to_string()
+                                            .chars()
+                                            .take(120)
+                                            .collect::<String>()
+                                    )
+                                });
+                            format!(
+                                "Error: app_deploy requires either a `files` object mapping filenames to their content, or a `repo_url` for an existing repository. \
+                                You sent keys: [{}]. \
+                                Expected formats: {{\"files\": {{\"index.html\": \"<html>...\", \"style.css\": \"body{{...}}\"}}, \"title\": \"My App\"}} OR {{\"repo_url\": \"https://github.com/org/repo\", \"service_mode\": \"auto\"}}. \
+                                If you use `files`, the `files` key must be present and must be an object (not a string or array).",
+                                received_keys
+                            )
                         } else {
                             format!("Error deploying app: {}", error_text)
                         };
@@ -7055,6 +8117,41 @@ Do not include any extra prose.",
 
                     // Format gmail_scan results with LLM classification + summary
                     if call.name == "gmail_scan" {
+                        let scan_args = serde_json::from_value::<
+                            crate::actions::gmail::GmailScanArgs,
+                        >(call.arguments.clone())
+                        .ok();
+                        let scan_mode = scan_args
+                            .as_ref()
+                            .map(crate::actions::gmail::effective_scan_mode)
+                            .unwrap_or(crate::actions::gmail::GmailScanMode::Triage);
+                        let parsed_messages = parse_gmail_scan_messages(&result);
+
+                        if !parsed_messages.is_empty()
+                            && matches!(
+                                scan_mode,
+                                crate::actions::gmail::GmailScanMode::Recent
+                                    | crate::actions::gmail::GmailScanMode::Search
+                            )
+                        {
+                            if let Some(ref tx) = stream_tx {
+                                let _ = tx.try_send(StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: format!(
+                                        "Gmail scan returned {} exact result{}",
+                                        parsed_messages.len(),
+                                        if parsed_messages.len() == 1 { "" } else { "s" }
+                                    ),
+                                });
+                            }
+                            results.push(format_gmail_scan_exact_results(
+                                scan_mode,
+                                scan_args.as_ref(),
+                                &parsed_messages,
+                            ));
+                            continue;
+                        }
+
                         let email_format_hint = {
                             let profile = self.user_profile.read().await;
                             profile.email_format.clone().unwrap_or_default()
@@ -7374,6 +8471,38 @@ mod tests {
     }
 
     #[test]
+    fn normalize_app_deploy_arguments_preserves_repo_source_metadata() {
+        let input = json!({
+            "payload": {
+                "repo_url": "https://github.com/example/demo",
+                "repo_ref": "main",
+                "service_mode": "fullstack"
+            },
+            "runtime_preference": "container"
+        });
+
+        let normalized = Agent::normalize_app_deploy_arguments(&input);
+        assert_eq!(
+            normalized.get("repo_url").and_then(|v| v.as_str()),
+            Some("https://github.com/example/demo")
+        );
+        assert_eq!(
+            normalized.get("repo_ref").and_then(|v| v.as_str()),
+            Some("main")
+        );
+        assert_eq!(
+            normalized.get("service_mode").and_then(|v| v.as_str()),
+            Some("fullstack")
+        );
+        assert_eq!(
+            normalized
+                .get("runtime_preference")
+                .and_then(|v| v.as_str()),
+            Some("container")
+        );
+    }
+
+    #[test]
     fn resolve_duplicate_app_reuses_only_exact_files_with_live_runtime() {
         assert_eq!(
             Agent::resolve_duplicate_app("exact_files", true),
@@ -7395,5 +8524,30 @@ mod tests {
             Agent::resolve_duplicate_app("fuzzy", true),
             DuplicateAppResolution::ReplaceExisting
         );
+    }
+
+    #[test]
+    fn gmail_exact_formatter_preserves_order_and_count() {
+        let raw = "- From: Alice Example <alice@example.com>\n  Subject: Quarterly update\n  Date: Fri, 28 Mar 2026 12:00:00 +0530\n  Labels: INBOX\n  Id: 1\n  ThreadId: t1\n  Snippet: Revenue is up.\n\n- From: Bob Example <bob@example.com>\n  Subject: Meeting invite\n  Date: Fri, 28 Mar 2026 11:00:00 +0530\n  Labels: INBOX\n  Id: 2\n  ThreadId: t2\n  Snippet: Please join at 2 PM.";
+        let parsed = parse_gmail_scan_messages(raw);
+        assert_eq!(parsed.len(), 2);
+
+        let args = crate::actions::gmail::GmailScanArgs {
+            mode: crate::actions::gmail::GmailScanMode::Recent,
+            query: None,
+            labels: Vec::new(),
+            max_results: Some(2),
+        };
+        let formatted = format_gmail_scan_exact_results(
+            crate::actions::gmail::GmailScanMode::Recent,
+            Some(&args),
+            &parsed,
+        );
+
+        assert!(formatted.contains("Here are your latest 2 emails:"));
+        assert!(formatted.contains("1. **Alice Example** — Quarterly update"));
+        assert!(formatted.contains("2. **Bob Example** — Meeting invite"));
+        assert!(!formatted.contains("Action Needed"));
+        assert!(!formatted.contains("Security Alerts"));
     }
 }

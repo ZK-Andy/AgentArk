@@ -12,7 +12,9 @@ import {
 } from "@mui/material";
 import type { BriefingResponse, RecommendedSkill } from "../types";
 import { api } from "../api/client";
-import { useState } from "react";
+import { useState, useCallback } from "react";
+import IconButton from "@mui/material/IconButton";
+import CloseIcon from "@mui/icons-material/Close";
 
 type Props = {
   briefing?: BriefingResponse;
@@ -22,6 +24,10 @@ type Props = {
 export function BriefingPanel({ briefing, compact = false }: Props) {
   const queryClient = useQueryClient();
   const [execNotice, setExecNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+  const [dismissedSkills, setDismissedSkills] = useState<Set<string>>(new Set());
+  const dismissSkill = useCallback((id: string) => {
+    setDismissedSkills((prev) => new Set(prev).add(id));
+  }, []);
   const actionableRisks = (briefing?.top_risks || []).filter((risk) => {
     const typedRisk = risk as Record<string, unknown>;
     const type = String(typedRisk.type || "").toLowerCase();
@@ -173,7 +179,7 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
         ) : null}
         {execNotice ? <Alert severity={execNotice.kind}>{execNotice.text}</Alert> : null}
         <Stack spacing={1}>
-          {visibleSkills.slice(0, compact ? 2 : 3).map((skill) => (
+          {visibleSkills.filter((s) => !dismissedSkills.has(s.id)).slice(0, compact ? 2 : 3).map((skill) => (
             <Stack
               key={skill.id}
               direction={{ xs: "column", md: "row" }}
@@ -182,7 +188,7 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
               alignItems={{ xs: "flex-start", md: "center" }}
               className="action-row"
             >
-              <Stack spacing={0.3}>
+              <Stack spacing={0.3} sx={{ flex: 1, minWidth: 0 }}>
                 <Typography variant="body2" fontWeight={700}>
                   {skill.title}
                 </Typography>
@@ -190,14 +196,19 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
                   {skill.summary || skill.description || "No description"}
                 </Typography>
               </Stack>
-              <Button
-                variant="contained"
-                size="small"
-                disabled={executeSkill.isPending}
-                onClick={() => executeSkill.mutate(skill)}
-              >
-                {executeSkill.isPending ? "Executing..." : "Execute"}
-              </Button>
+              <Stack direction="row" spacing={0.5} alignItems="center">
+                <Button
+                  variant="contained"
+                  size="small"
+                  disabled={executeSkill.isPending}
+                  onClick={() => executeSkill.mutate(skill)}
+                >
+                  {executeSkill.isPending ? "Executing..." : "Execute"}
+                </Button>
+                <IconButton size="small" onClick={() => dismissSkill(skill.id)} title="Dismiss">
+                  <CloseIcon fontSize="small" />
+                </IconButton>
+              </Stack>
             </Stack>
           ))}
         </Stack>

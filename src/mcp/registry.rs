@@ -48,6 +48,7 @@ pub enum McpTransportView {
         command: String,
         args: Vec<String>,
         working_dir: Option<String>,
+        env_keys: Vec<String>,
     },
 }
 
@@ -98,49 +99,13 @@ impl McpRegistry {
         config: &AgentConfig,
         secrets: &Secrets,
         runtime: &ActionRuntime,
-        safety: &mut SafetyEngine,
+        safety: &SafetyEngine,
     ) -> Result<()> {
         runtime.unregister_mcp_actions().await;
         self.servers.clear();
 
         for server in &config.mcp.servers {
-            let auth_secret = secrets.mcp_auth.get(&server.id);
-            let (auth, auth_warnings, has_auth) = resolve_auth(&server.auth, auth_secret);
-            let mut warnings = compute_mcp_warnings(server);
-            warnings.extend(auth_warnings);
-
-            let mut client = McpClient::new(server, auth)?;
-            let mut tools = Vec::new();
-            let mut resources = Vec::new();
-            let mut last_error = None;
-
-            if server.enabled {
-                match client.list_tools().await {
-                    Ok(list) => tools = filter_tools(list, &server.tool_allowlist),
-                    Err(e) => last_error = Some(e.to_string()),
-                }
-
-                if server.resources_enabled {
-                    match client.list_resources().await {
-                        Ok(list) => resources = filter_resources(list, &server.resource_allowlist),
-                        Err(e) => last_error = Some(e.to_string()),
-                    }
-                }
-            }
-
-            if server.enabled && last_error.is_none() {
-                register_actions(runtime, safety, server, &tools, &resources).await?;
-            }
-
-            let state = McpServerState {
-                config: server.clone(),
-                client: tokio::sync::Mutex::new(client),
-                tools,
-                resources,
-                warnings,
-                last_error,
-                has_auth,
-            };
+            let state = build_server_state(server, config, secrets, runtime, safety).await?;
             self.servers.insert(server.id.clone(), state);
         }
 
@@ -150,48 +115,20 @@ impl McpRegistry {
     pub async fn refresh_server(
         &mut self,
         id: &str,
+        config: &AgentConfig,
+        secrets: &Secrets,
         runtime: &ActionRuntime,
-        safety: &mut SafetyEngine,
+        safety: &SafetyEngine,
     ) -> Result<()> {
-        let Some(state) = self.servers.get_mut(id) else {
-            return Err(anyhow!("MCP server not found"));
-        };
-
         runtime.unregister_mcp_actions_for_server(id).await;
-
-        let mut client = state.client.lock().await;
-        state.last_error = None;
-        let mut tools = Vec::new();
-        let mut resources = Vec::new();
-        if state.config.enabled {
-            match client.list_tools().await {
-                Ok(list) => tools = filter_tools(list, &state.config.tool_allowlist),
-                Err(e) => state.last_error = Some(e.to_string()),
-            }
-
-            if state.config.resources_enabled {
-                match client.list_resources().await {
-                    Ok(list) => {
-                        resources = filter_resources(list, &state.config.resource_allowlist)
-                    }
-                    Err(e) => state.last_error = Some(e.to_string()),
-                }
-            }
-        }
-
-        state.tools = tools;
-        state.resources = resources;
-        if state.config.enabled && state.last_error.is_none() {
-            register_actions(
-                runtime,
-                safety,
-                &state.config,
-                &state.tools,
-                &state.resources,
-            )
-            .await?;
-        }
-
+        let server = config
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .ok_or_else(|| anyhow!("MCP server not found"))?;
+        let state = build_server_state(server, config, secrets, runtime, safety).await?;
+        self.servers.insert(id.to_string(), state);
         Ok(())
     }
 
@@ -225,6 +162,53 @@ impl McpRegistry {
         let result = client.read_resource(uri).await?;
         Ok(format_mcp_result(&result))
     }
+}
+
+async fn build_server_state(
+    server: &McpServerConfig,
+    config: &AgentConfig,
+    secrets: &Secrets,
+    runtime: &ActionRuntime,
+    safety: &SafetyEngine,
+) -> Result<McpServerState> {
+    let auth_secret = secrets.mcp_auth.get(&server.id);
+    let (auth, auth_warnings, has_auth) = resolve_auth(&server.auth, auth_secret);
+    let mut warnings = compute_mcp_warnings(server);
+    warnings.extend(auth_warnings);
+    let env = resolve_stdio_env(server, config, secrets);
+
+    let mut client = McpClient::new(server, auth, env)?;
+    let mut tools = Vec::new();
+    let mut resources = Vec::new();
+    let mut last_error = None;
+
+    if server.enabled {
+        match client.list_tools().await {
+            Ok(list) => tools = filter_tools(list, &server.tool_allowlist),
+            Err(e) => last_error = Some(e.to_string()),
+        }
+
+        if server.resources_enabled {
+            match client.list_resources().await {
+                Ok(list) => resources = filter_resources(list, &server.resource_allowlist),
+                Err(e) => last_error = Some(e.to_string()),
+            }
+        }
+    }
+
+    if server.enabled && last_error.is_none() {
+        register_actions(runtime, safety, server, &tools, &resources).await?;
+    }
+
+    Ok(McpServerState {
+        config: server.clone(),
+        client: tokio::sync::Mutex::new(client),
+        tools,
+        resources,
+        warnings,
+        last_error,
+        has_auth,
+    })
 }
 
 impl McpServerState {
@@ -266,10 +250,12 @@ fn transport_view(transport: &McpTransportConfig) -> McpTransportView {
             command,
             args,
             working_dir,
+            env_keys,
         } => McpTransportView::Stdio {
             command: command.clone(),
             args: args.clone(),
             working_dir: working_dir.clone(),
+            env_keys: env_keys.clone(),
         },
     }
 }
@@ -307,6 +293,17 @@ fn auth_view(auth: &Option<McpAuthConfig>, has_auth: bool) -> McpAuthView {
             name: Some(name.clone()),
         },
     }
+}
+
+fn resolve_stdio_env(
+    server: &McpServerConfig,
+    _config: &AgentConfig,
+    secrets: &Secrets,
+) -> HashMap<String, String> {
+    let mut env = secrets.mcp_env.get(&server.id).cloned().unwrap_or_default();
+
+    env.retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
+    env
 }
 
 pub fn compute_mcp_warnings(config: &McpServerConfig) -> Vec<String> {
@@ -452,7 +449,7 @@ fn filter_resources(resources: Vec<McpResource>, allowlist: &[String]) -> Vec<Mc
 
 async fn register_actions(
     runtime: &ActionRuntime,
-    safety: &mut SafetyEngine,
+    safety: &SafetyEngine,
     server: &McpServerConfig,
     tools: &[McpTool],
     resources: &[McpResource],
@@ -485,10 +482,10 @@ async fn register_actions(
 
         safety.add_rule(SafetyRule {
             name: format!("mcp_approve_{}", action_name),
-            description: format!("MCP tool requires approval: {}", tool.name),
+            description: mcp_safety_rule_description(server, &tool.name, false),
             trigger: RuleTrigger::Action { name: action_name },
             condition: None,
-            action: RuleAction::RequireApproval,
+            action: mcp_safety_rule_action(server, &tool.name, false),
             verified: true,
         });
     }
@@ -523,15 +520,31 @@ async fn register_actions(
 
         safety.add_rule(SafetyRule {
             name: format!("mcp_approve_{}", action_name),
-            description: format!("MCP resource requires approval: {}", resource.name),
+            description: mcp_safety_rule_description(server, &resource.name, true),
             trigger: RuleTrigger::Action { name: action_name },
             condition: None,
-            action: RuleAction::RequireApproval,
+            action: mcp_safety_rule_action(server, &resource.name, true),
             verified: true,
         });
     }
 
     Ok(())
+}
+
+fn mcp_safety_rule_action(_server: &McpServerConfig, _item_name: &str, _is_resource: bool) -> RuleAction {
+    RuleAction::RequireApproval
+}
+
+fn mcp_safety_rule_description(server: &McpServerConfig, item_name: &str, is_resource: bool) -> String {
+    let action = mcp_safety_rule_action(server, item_name, is_resource);
+    let kind = if is_resource { "resource" } else { "tool" };
+    match action {
+        RuleAction::LogAndAllow => format!("MCP {} is trusted and logged without approval: {}", kind, item_name),
+        RuleAction::RequireApproval => format!("MCP {} requires approval: {}", kind, item_name),
+        RuleAction::Allow => format!("MCP {} is allowed: {}", kind, item_name),
+        RuleAction::Block { .. } => format!("MCP {} is blocked: {}", kind, item_name),
+        RuleAction::Delay { .. } => format!("MCP {} is delayed: {}", kind, item_name),
+    }
 }
 
 fn unique_action_name(
@@ -645,3 +658,4 @@ fn format_mcp_result(result: &Value) -> String {
         fallback
     }
 }
+

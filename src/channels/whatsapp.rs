@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 use crate::core::{Agent, TaskStatus};
+use crate::storage::Storage;
 
 type SharedAgent = Arc<RwLock<Agent>>;
 
@@ -186,6 +188,52 @@ fn default_bridge_url() -> String {
 
 fn default_dm_policy() -> String {
     "pairing".to_string()
+}
+
+fn normalize_whatsapp_sender(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+}
+
+fn whatsapp_sender_identity(from: &str, preview: Option<&str>) -> SenderIdentity {
+    SenderIdentity {
+        channel: SenderChannel::Whatsapp,
+        sender_id: from.trim().to_string(),
+        sender_label: Some(from.trim().to_string()),
+        scope_id: None,
+        scope_label: None,
+        conversation_id: Some(format!("whatsapp:{}", from.trim())),
+        message_preview: preview.map(str::to_string),
+    }
+}
+
+async fn whatsapp_sender_is_approved(storage: &Storage, from: &str) -> bool {
+    let identity = whatsapp_sender_identity(from, None);
+    if sender_verification::is_sender_approved(storage, &identity)
+        .await
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let legacy_key = format!("whatsapp:approved:{}", normalize_whatsapp_sender(from));
+    storage.get(&legacy_key).await.ok().flatten().is_some()
+}
+
+async fn approve_whatsapp_sender(storage: &Storage, from: &str, approved_by: &str) -> Result<()> {
+    let identity = whatsapp_sender_identity(from, None);
+    sender_verification::approve_sender(storage, &identity, Some(approved_by)).await?;
+    let normalized = normalize_whatsapp_sender(from);
+    if !normalized.is_empty() {
+        storage
+            .set(&format!("whatsapp:approved:{}", normalized), b"1")
+            .await?;
+        let _ = storage
+            .delete(&format!("whatsapp:pairing:{}", normalized))
+            .await;
+    }
+    Ok(())
 }
 
 fn parse_set_secret(text: &str) -> Option<(String, String)> {
@@ -840,47 +888,8 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         // For "pairing" with empty allowed_numbers, check storage for approved senders.
     }
     if config.dm_policy == "pairing" && config.allowed_numbers.is_empty() {
-        let approved_key = format!("whatsapp:approved:{}", from);
-        let is_approved = {
-            let agent_read = agent.read().await;
-            agent_read
-                .storage
-                .get(&approved_key)
-                .await
-                .ok()
-                .flatten()
-                .is_some()
-        };
-        if !is_approved {
-            // Generate a pairing code and ask sender to approve
-            let code = format!(
-                "{:06}",
-                from.as_bytes().iter().map(|b| *b as u64).sum::<u64>() % 1000000
-            );
-            let pairing_msg = format!(
-                "Hello! I'm a AgentArk AI agent.\n\n\
-                 For security, new contacts must be approved.\n\
-                 Please ask the agent owner to run:\n\n\
-                 _/approve {}_{}\n\n\
-                 Your pairing code: *{}*",
-                from, "", code
-            );
-            let _ = send_reply(&config, from, &pairing_msg).await;
-            // Store the pairing code for verification
-            {
-                let agent_read = agent.read().await;
-                let _ = agent_read
-                    .storage
-                    .set(&format!("whatsapp:pairing:{}", from), code.as_bytes())
-                    .await;
-            }
-            tracing::info!(
-                "WhatsApp: sent pairing request to {} (code: {})",
-                from,
-                code
-            );
-            return Ok("ok".to_string());
-        }
+        // Unknown senders are gated after text extraction so the approval request can
+        // carry a useful preview for the operator.
     }
 
     // ---- Mark as read (fire and forget, Cloud API only — Baileys does it on bridge side) ----
@@ -892,15 +901,6 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
                 tracing::warn!("Failed to mark WhatsApp message as read: {}", e);
             }
         });
-    }
-
-    // ---- Persist last sender for push notifications ----
-    {
-        let agent_read = agent.read().await;
-        let _ = agent_read
-            .storage
-            .set("whatsapp:last_sender", from.as_bytes())
-            .await;
     }
 
     // ---- Extract text content ----
@@ -962,6 +962,73 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         return Ok("ok".to_string());
     }
 
+    if config.dm_policy == "pairing" && config.allowed_numbers.is_empty() {
+        let trust_decision = {
+            let agent_read = agent.read().await;
+            sender_verification::evaluate_sender_with_rules(
+                &agent_read.storage,
+                &whatsapp_sender_identity(from, Some(&text)),
+                sender_verification::SenderTrustPolicy::Pairing,
+                &[],
+            )
+            .await?
+        };
+        if let SenderTrustDecision::NeedsApproval { created_new, .. } = trust_decision {
+            let code = format!(
+                "{:06}",
+                from.as_bytes().iter().map(|b| *b as u64).sum::<u64>() % 1000000
+            );
+            let pairing_msg = format!(
+                "Hello! I'm AgentArk.\n\nFor security, new contacts must be approved before I can act here.\nAsk the owner to approve this sender in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run:\n\n_/approve {}_\n\nYour pairing code: *{}*",
+                from, code
+            );
+            let _ = send_reply(&config, from, &pairing_msg).await;
+            let normalized_from = normalize_whatsapp_sender(from);
+            {
+                let agent_read = agent.read().await;
+                let _ = agent_read
+                    .storage
+                    .set(
+                        &format!("whatsapp:pairing:{}", normalized_from),
+                        code.as_bytes(),
+                    )
+                    .await;
+                if created_new {
+                    let body = format!(
+                        "A new WhatsApp sender needs approval before AgentArk will act.\nSender: {}\nMessage: {}\nApprove it in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run /approve {}.",
+                        from,
+                        text.chars().take(180).collect::<String>(),
+                        from
+                    );
+                    agent_read
+                        .emit_notification_forced(
+                            "Sender Approval Needed",
+                            &body,
+                            "warning",
+                            "sender_verification",
+                        )
+                        .await;
+                }
+            }
+            tracing::info!(
+                "WhatsApp: sent pairing request to {} (code: {})",
+                from,
+                code
+            );
+            return Ok("ok".to_string());
+        }
+    }
+
+    // ---- Persist last sender for push notifications ----
+    {
+        let agent_read = agent.read().await;
+        let normalized_sender = normalize_whatsapp_sender(from);
+        let _ = agent_read
+            .storage
+            .set("whatsapp:last_sender", normalized_sender.as_bytes())
+            .await;
+    }
+
     let conversation_id = format!("whatsapp:{}", from);
 
     tracing::info!(
@@ -989,15 +1056,8 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
     let can_store_secret = if !config.allowed_numbers.is_empty() {
         config.allowed_numbers.iter().any(|n| n == from)
     } else if config.dm_policy == "pairing" {
-        let approved_key = format!("whatsapp:approved:{}", from);
         let agent_read = agent.read().await;
-        agent_read
-            .storage
-            .get(&approved_key)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
+        whatsapp_sender_is_approved(&agent_read.storage, from).await
     } else {
         false
     };
@@ -1384,8 +1444,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             let allowlisted =
                 !cfg.allowed_numbers.is_empty() && cfg.allowed_numbers.iter().any(|n| n == from);
             let approved = if cfg.dm_policy == "pairing" {
-                let key = format!("whatsapp:approved:{}", from);
-                storage.get(&key).await.ok().flatten().is_some()
+                whatsapp_sender_is_approved(&storage, from).await
             } else {
                 false
             };
@@ -1435,8 +1494,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             let allowlisted =
                 !cfg.allowed_numbers.is_empty() && cfg.allowed_numbers.iter().any(|n| n == from);
             let approved = if cfg.dm_policy == "pairing" {
-                let key = format!("whatsapp:approved:{}", from);
-                storage.get(&key).await.ok().flatten().is_some()
+                whatsapp_sender_is_approved(&storage, from).await
             } else {
                 false
             };
@@ -1596,14 +1654,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             } else {
                 let number = args.trim();
                 let agent = agent.read().await;
-                let approved_key = format!("whatsapp:approved:{}", number);
-                match agent.storage.set(&approved_key, b"1").await {
+                match approve_whatsapp_sender(&agent.storage, number, "whatsapp_command").await {
                     Ok(_) => {
-                        // Clear pending pairing code
-                        let _ = agent
-                            .storage
-                            .delete(&format!("whatsapp:pairing:{}", number))
-                            .await;
                         format!("Approved {}. They can now chat with the agent.", number)
                     }
                     Err(e) => format!("Failed to approve: {}", e),
