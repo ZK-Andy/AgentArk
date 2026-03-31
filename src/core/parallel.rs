@@ -6,7 +6,7 @@
 //! - Cross-validation to reduce hallucination
 //! - Best-of-N selection for quality
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -163,9 +163,33 @@ impl ParallelThinkingController {
                 strategy.prompt_modifier()
             );
 
-            let response = llm
-                .chat(&modified_prompt, user_message, memories, actions)
-                .await?;
+            let timeout_secs = self.config.path_timeout_secs.max(1);
+            let supervisor = crate::core::ExecutionSupervisor::default();
+            let request = crate::core::ExecutionRequest {
+                kind: format!("parallel_path_{:?}", strategy),
+                channel: Some("parallel".to_string()),
+                message_preview: Some(user_message.chars().take(200).collect()),
+                ..Default::default()
+            };
+            let response = crate::core::execution::execute_supervised_transport_chat(
+                &supervisor,
+                llm.as_ref(),
+                &request,
+                &modified_prompt,
+                user_message,
+                memories,
+                actions,
+                Some(timeout_secs.saturating_mul(1000)),
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "Parallel path {} ({:?}) failed under supervision: {}",
+                    path_id + 1,
+                    strategy,
+                    error
+                )
+            })?;
 
             let execution_time_ms = path_start.elapsed().as_millis() as u64;
             let confidence = calculate_confidence(&response);

@@ -67,7 +67,17 @@ function integrationLabel(id: string, integrations: IntegrationItem[]): string {
   const normalized = id.trim().toLowerCase();
   if (!normalized) return "-";
   const found = integrations.find((item) => item.id.trim().toLowerCase() === normalized);
-  return found?.name || normalized;
+  if (found?.name) return found.name;
+  const fallbacks: Record<string, string> = {
+    email: "Email",
+    telegram: "Telegram",
+    slack: "Slack",
+    discord: "Discord",
+    matrix: "Matrix",
+    teams: "Teams",
+    whatsapp: "WhatsApp"
+  };
+  return fallbacks[normalized] || normalized;
 }
 
 function completionTargetSummary(source: JsonRecord, integrations: IntegrationItem[]): string {
@@ -92,24 +102,27 @@ function notificationSummary(source: JsonRecord): string {
 function completionChannelOptions(integrations: IntegrationItem[]): Array<{ id: string; label: string }> {
   const options: Array<{ id: string; label: string }> = [];
   const seen = new Set<string>();
+  const labelFallbacks: Record<string, string> = {
+    telegram: "Telegram",
+    slack: "Slack",
+    discord: "Discord",
+    matrix: "Matrix",
+    teams: "Teams",
+    whatsapp: "WhatsApp"
+  };
   const push = (id: string, label: string) => {
     const normalized = id.trim().toLowerCase();
     if (!normalized || seen.has(normalized)) return;
     seen.add(normalized);
     options.push({ id: normalized, label });
   };
-  push("telegram", "Telegram");
-  push("slack", "Slack");
-  push("discord", "Discord");
-  push("matrix", "Matrix");
-  push("teams", "Teams");
-  push("whatsapp", "WhatsApp");
-  push("email", "Email");
   integrations.forEach((item) => {
-    if (item.enabled || item.status === "connected") {
-      push(item.id, item.name || item.id);
-    }
+    if (item.status !== "connected") return;
+    push(item.id, item.name || labelFallbacks[item.id.trim().toLowerCase()] || item.id);
   });
+  if (integrations.some((item) => item.id === "google_workspace" && item.status === "connected")) {
+    push("email", "Email");
+  }
   return options;
 }
 
@@ -203,7 +216,8 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
   });
   const testSource = useMutation({
     mutationFn: (id: string) => api.rawPost(`/webhooks/sources/${encodeURIComponent(id)}/test`, {}),
-    onSuccess: async () => {
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings-webhook-sources"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-webhook-events"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["trace"] });
@@ -509,7 +523,7 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
         <DialogActions sx={{ px: 3, py: 2 }}>
           {editingId ? (
             <Button
-              variant="outlined"
+              variant="contained"
               onClick={async () => {
                 try {
                   setError(null);

@@ -31,5 +31,12 @@
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.3",
     "vite": "^6.1.0"
+  },
+  "overrides": {
+    "picomatch": "^4.0.4",
+    "yaml": "^2.8.3",
+    "cosmiconfig": {
+      "yaml": "^1.10.3"
+    }
   }
 }

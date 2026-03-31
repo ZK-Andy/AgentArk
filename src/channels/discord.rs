@@ -636,8 +636,9 @@ async fn handle_message_create_event(
             }
         }
         agent
-            .process_message(&content, "discord", Some(&conversation_id), None)
-            .await?
+            .process_message_with_meta(&content, "discord", Some(&conversation_id), None)
+            .await
+            .map(Agent::render_plain_channel_response)?
     };
 
     if reply.trim().is_empty() {
@@ -735,8 +736,9 @@ pub async fn handle_message_create(agent: SharedAgent, raw_body: &[u8]) -> Resul
         let agent = agent.read().await;
         persist_destination(&agent, &context).await?;
         agent
-            .process_message(&content, "discord", Some(&conversation_id), None)
-            .await?
+            .process_message_with_meta(&content, "discord", Some(&conversation_id), None)
+            .await
+            .map(Agent::render_plain_channel_response)?
     };
 
     if !response.trim().is_empty() {

@@ -1,21 +1,23 @@
-//! Database storage using SeaORM
+//! Database storage using SeaORM backed by PostgreSQL.
 
 pub mod encrypted;
 pub mod entities;
 pub mod legacy_recovery;
+mod migrations;
 
 use crate::crypto::KeyManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::sea_query::Expr;
 #[allow(unused_imports)]
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Set,
-    Statement, TransactionTrait, TryGetable, Unchanged,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
+    DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Schema, Set, Statement, TransactionTrait, TryGetable, Unchanged,
 };
-use std::path::Path;
+use serde_json::Value as JsonValue;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 pub use entities::*;
 
@@ -23,6 +25,137 @@ pub use entities::*;
 #[derive(Clone)]
 pub struct Storage {
     db: DatabaseConnection,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub connect_timeout_secs: u64,
+    pub statement_timeout_ms: u64,
+    pub idle_timeout_secs: u64,
+    pub schema: Option<String>,
+}
+
+impl DatabaseConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            max_connections: 20,
+            connect_timeout_secs: 5,
+            statement_timeout_ms: 30_000,
+            idle_timeout_secs: 300,
+            schema: None,
+        }
+    }
+
+    pub fn apply_optional_env_overrides(&mut self) {
+        if let Ok(value) = std::env::var("AGENTARK_DB_MAX_CONNECTIONS") {
+            if let Ok(parsed) = value.parse::<u32>() {
+                self.max_connections = parsed.max(1);
+            }
+        }
+        if let Ok(value) = std::env::var("AGENTARK_DB_CONNECT_TIMEOUT_SECS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                self.connect_timeout_secs = parsed.max(1);
+            }
+        }
+        if let Ok(value) = std::env::var("AGENTARK_DB_STATEMENT_TIMEOUT_MS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                self.statement_timeout_ms = parsed.max(1);
+            }
+        }
+        if let Ok(value) = std::env::var("AGENTARK_DB_IDLE_TIMEOUT_SECS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                self.idle_timeout_secs = parsed.max(1);
+            }
+        }
+        if let Ok(value) = std::env::var("AGENTARK_DB_SCHEMA") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                self.schema = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let url = std::env::var("AGENTARK_DATABASE_URL")
+            .context("AGENTARK_DATABASE_URL must be set for Postgres-backed storage")?;
+        let mut config = Self::new(url);
+        config.apply_optional_env_overrides();
+        Ok(config)
+    }
+
+    #[cfg(test)]
+    pub fn for_tests() -> Result<Self> {
+        let base = std::env::var("AGENTARK_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://agentark:agentark@127.0.0.1:5432/agentark".to_string());
+        let schema = format!(
+            "test_{}",
+            uuid::Uuid::new_v4().to_string().replace('-', "_")
+        );
+        let mut config = Self::new(base);
+        config.schema = Some(schema);
+        config.max_connections = 4;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let lower = self.url.to_ascii_lowercase();
+        if !lower.starts_with("postgres://") && !lower.starts_with("postgresql://") {
+            anyhow::bail!("AGENTARK_DATABASE_URL must be a postgres:// or postgresql:// URL");
+        }
+        if let Some(schema) = self.schema.as_deref() {
+            if !schema
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                anyhow::bail!(
+                    "Database schema names may only contain ASCII letters, digits, and underscores"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn quoted_schema_identifier(&self) -> Option<String> {
+        self.schema.as_ref().map(|schema| format!("\"{}\"", schema))
+    }
+
+    fn target_summary(&self) -> String {
+        match url::Url::parse(&self.url) {
+            Ok(parsed) => {
+                let host = parsed.host_str().unwrap_or("unknown-host");
+                let port = parsed.port_or_known_default().unwrap_or(5432);
+                let database = parsed
+                    .path_segments()
+                    .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+                    .unwrap_or("unknown-db");
+                format!("{host}:{port}/{database}")
+            }
+            Err(_) => "<invalid-postgres-url>".to_string(),
+        }
+    }
+
+    fn connect_options(&self) -> ConnectOptions {
+        let mut options = ConnectOptions::new(self.url.clone());
+        let statement_timeout_ms = self.statement_timeout_ms.max(1).to_string();
+        options
+            .max_connections(self.max_connections.max(1))
+            .min_connections(1)
+            .connect_timeout(Duration::from_secs(self.connect_timeout_secs.max(1)))
+            .idle_timeout(Duration::from_secs(self.idle_timeout_secs.max(1)))
+            .acquire_timeout(Duration::from_secs(self.connect_timeout_secs.max(1)))
+            .sqlx_logging(false)
+            .map_sqlx_postgres_opts(move |opts| {
+                opts.application_name("agentark")
+                    .options([("statement_timeout", statement_timeout_ms.as_str())])
+            });
+        if let Some(schema) = self.schema.as_deref() {
+            options.set_schema_search_path(schema);
+        }
+        options
+    }
 }
 
 static STORAGE_KEY_MANAGER: OnceLock<RwLock<Option<Arc<KeyManager>>>> = OnceLock::new();
@@ -159,6 +292,139 @@ fn decrypt_storage_bytes(value: &[u8]) -> Vec<u8> {
     }
 }
 
+fn json_text(value: &JsonValue) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+}
+
+fn parse_json_text(raw: Option<String>, fallback: JsonValue) -> JsonValue {
+    raw.and_then(|value| serde_json::from_str::<JsonValue>(&value).ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_experience_run_row(row: &sea_orm::QueryResult) -> Result<experience_run::Model> {
+    Ok(experience_run::Model {
+        id: row.try_get("", "id")?,
+        execution_run_id: row.try_get("", "execution_run_id").ok(),
+        trace_id: row.try_get("", "trace_id").ok(),
+        conversation_id: row.try_get("", "conversation_id").ok(),
+        project_id: row.try_get("", "project_id").ok(),
+        channel: row.try_get("", "channel")?,
+        scope: row.try_get("", "scope")?,
+        intent_key: row.try_get("", "intent_key")?,
+        task_type: row.try_get("", "task_type").ok(),
+        request_text: row.try_get("", "request_text").ok(),
+        tool_sequence_digest: row.try_get("", "tool_sequence_digest").ok(),
+        tool_sequence_json: parse_json_text(
+            row.try_get("", "tool_sequence_json").ok(),
+            JsonValue::Array(Vec::new()),
+        ),
+        strategy_version: row.try_get("", "strategy_version").ok(),
+        policy_version: row.try_get("", "policy_version").ok(),
+        prompt_version: row.try_get("", "prompt_version").ok(),
+        model_slot: row.try_get("", "model_slot").ok(),
+        success_state: row.try_get("", "success_state")?,
+        correction_state: row.try_get("", "correction_state")?,
+        outcome_summary: row.try_get("", "outcome_summary").ok(),
+        failure_reason: row.try_get("", "failure_reason").ok(),
+        metadata: parse_json_text(
+            row.try_get("", "metadata").ok(),
+            JsonValue::Object(serde_json::Map::new()),
+        ),
+        consolidated: row.try_get("", "consolidated")?,
+        accepted_at: row.try_get("", "accepted_at").ok(),
+        corrected_at: row.try_get("", "corrected_at").ok(),
+        created_at: row.try_get("", "created_at")?,
+        updated_at: row.try_get("", "updated_at")?,
+    })
+}
+
+fn parse_experience_item_row(row: &sea_orm::QueryResult) -> Result<experience_item::Model> {
+    Ok(experience_item::Model {
+        id: row.try_get("", "id")?,
+        kind: row.try_get("", "kind")?,
+        scope: row.try_get("", "scope")?,
+        project_id: row.try_get("", "project_id").ok(),
+        conversation_id: row.try_get("", "conversation_id").ok(),
+        title: row.try_get("", "title")?,
+        content: row.try_get("", "content")?,
+        normalized_key: row.try_get("", "normalized_key")?,
+        confidence: row.try_get("", "confidence")?,
+        support_count: row.try_get("", "support_count")?,
+        contradiction_count: row.try_get("", "contradiction_count")?,
+        status: row.try_get("", "status")?,
+        metadata: parse_json_text(
+            row.try_get("", "metadata").ok(),
+            JsonValue::Object(serde_json::Map::new()),
+        ),
+        last_supported_at: row.try_get("", "last_supported_at").ok(),
+        last_contradicted_at: row.try_get("", "last_contradicted_at").ok(),
+        created_at: row.try_get("", "created_at")?,
+        updated_at: row.try_get("", "updated_at")?,
+    })
+}
+
+fn parse_procedural_pattern_row(row: &sea_orm::QueryResult) -> Result<procedural_pattern::Model> {
+    Ok(procedural_pattern::Model {
+        id: row.try_get("", "id")?,
+        intent_key: row.try_get("", "intent_key")?,
+        scope: row.try_get("", "scope")?,
+        project_id: row.try_get("", "project_id").ok(),
+        conversation_id: row.try_get("", "conversation_id").ok(),
+        title: row.try_get("", "title")?,
+        trigger_summary: row.try_get("", "trigger_summary")?,
+        summary: row.try_get("", "summary")?,
+        tool_sequence_digest: row.try_get("", "tool_sequence_digest").ok(),
+        steps_json: parse_json_text(
+            row.try_get("", "steps_json").ok(),
+            JsonValue::Array(Vec::new()),
+        ),
+        tool_sequence_json: parse_json_text(
+            row.try_get("", "tool_sequence_json").ok(),
+            JsonValue::Array(Vec::new()),
+        ),
+        sample_count: row.try_get("", "sample_count")?,
+        success_count: row.try_get("", "success_count")?,
+        correction_count: row.try_get("", "correction_count")?,
+        success_rate: row.try_get("", "success_rate")?,
+        last_validated_at: row.try_get("", "last_validated_at").ok(),
+        status: row.try_get("", "status")?,
+        metadata: parse_json_text(
+            row.try_get("", "metadata").ok(),
+            JsonValue::Object(serde_json::Map::new()),
+        ),
+        created_at: row.try_get("", "created_at")?,
+        updated_at: row.try_get("", "updated_at")?,
+    })
+}
+
+fn parse_learning_candidate_row(row: &sea_orm::QueryResult) -> Result<learning_candidate::Model> {
+    Ok(learning_candidate::Model {
+        id: row.try_get("", "id")?,
+        candidate_type: row.try_get("", "candidate_type")?,
+        subject_key: row.try_get("", "subject_key")?,
+        title: row.try_get("", "title")?,
+        summary: row.try_get("", "summary").ok(),
+        project_id: row.try_get("", "project_id").ok(),
+        conversation_id: row.try_get("", "conversation_id").ok(),
+        pattern_id: row.try_get("", "pattern_id").ok(),
+        evidence_refs: parse_json_text(
+            row.try_get("", "evidence_refs").ok(),
+            JsonValue::Array(Vec::new()),
+        ),
+        proposed_content: parse_json_text(
+            row.try_get("", "proposed_content").ok(),
+            JsonValue::Object(serde_json::Map::new()),
+        ),
+        confidence: row.try_get("", "confidence")?,
+        approval_status: row.try_get("", "approval_status")?,
+        review_notes: row.try_get("", "review_notes").ok(),
+        reviewed_at: row.try_get("", "reviewed_at").ok(),
+        approved_ref: row.try_get("", "approved_ref").ok(),
+        created_at: row.try_get("", "created_at")?,
+        updated_at: row.try_get("", "updated_at")?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct NewUserDataItem<'a> {
     pub kind: &'a str,
@@ -171,18 +437,40 @@ pub struct NewUserDataItem<'a> {
     pub pinned: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExperienceItemSearchHit {
+    pub item: experience_item::Model,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProceduralPatternSearchHit {
+    pub pattern: procedural_pattern::Model,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LearningQueueCounts {
+    pub provisional_runs: u64,
+    pub pending_consolidation: u64,
+    pub draft_candidates: u64,
+    pub active_patterns: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LeaseStatusSummary {
+    pub pending_task_backlog: u64,
+    pub active_task_leases: u64,
+    pub tasks_waiting_retry: u64,
+    pub watcher_poll_backlog: u64,
+    pub active_watcher_leases: u64,
+    pub watchers_waiting_retry: u64,
+    pub active_run_leases: u64,
+    pub runs_pending_cancellation: u64,
+}
+
 impl Storage {
-    const SQLITE_MAX_INTEGER: u64 = i64::MAX as u64;
-    const EXECUTION_TRACE_RETENTION_DAYS: i64 = 30;
-    const EXECUTION_PROOF_RETENTION_DAYS: i64 = 30;
-    const OPERATIONAL_LOG_RETENTION_DAYS: i64 = 30;
-    const SECURITY_LOG_RETENTION_DAYS: i64 = 30;
-    const APPROVAL_LOG_RETENTION_DAYS: i64 = 30;
-    const SWARM_DELEGATION_RETENTION_DAYS: i64 = 30;
-    const LLM_USAGE_RETENTION_DAYS: i64 = 30;
-    const TERMINAL_TASK_RETENTION_DAYS: i64 = 90;
-    const MESSAGE_RETENTION_DAYS: i64 = 365;
-    const HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
+    const DATABASE_MAX_INTEGER: u64 = i64::MAX as u64;
     const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
     const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
     const MAX_DOCUMENTS_FOR_SEARCH: u64 = 5_000;
@@ -191,13 +479,66 @@ impl Storage {
         "storage_sensitive_payload_backfill_v4";
 
     #[inline]
-    fn sqlite_limit(limit: u64) -> u64 {
-        limit.min(Self::SQLITE_MAX_INTEGER)
+    fn db_limit(limit: u64) -> u64 {
+        limit.min(Self::DATABASE_MAX_INTEGER)
     }
 
     #[inline]
-    fn sqlite_offset(offset: u64) -> u64 {
-        offset.min(Self::SQLITE_MAX_INTEGER)
+    fn db_offset(offset: u64) -> u64 {
+        offset.min(Self::DATABASE_MAX_INTEGER)
+    }
+
+    #[inline]
+    fn db_bound_integer(value: u64) -> i64 {
+        value.min(Self::DATABASE_MAX_INTEGER) as i64
+    }
+
+    fn backend_bind_sql(backend: DbBackend, sql: &str) -> String {
+        if backend != DbBackend::Postgres {
+            return sql.to_string();
+        }
+
+        let mut out = String::with_capacity(sql.len() + 16);
+        let mut index = 1_u32;
+        let mut chars = sql.chars().peekable();
+        let mut in_single_quote = false;
+
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                out.push(ch);
+                if in_single_quote && chars.peek() == Some(&'\'') {
+                    out.push(chars.next().unwrap_or('\''));
+                    continue;
+                }
+                in_single_quote = !in_single_quote;
+                continue;
+            }
+
+            if ch == '?' && !in_single_quote {
+                out.push('$');
+                out.push_str(&index.to_string());
+                index += 1;
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out
+    }
+
+    fn statement_with_values(
+        backend: DbBackend,
+        sql: impl Into<String>,
+        values: Vec<sea_orm::Value>,
+    ) -> Statement {
+        let sql = sql.into();
+        Statement::from_sql_and_values(backend, Self::backend_bind_sql(backend, &sql), values)
+    }
+
+    fn sql_placeholder_list(count: usize) -> String {
+        std::iter::repeat_n("?", count)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
@@ -235,44 +576,40 @@ impl Storage {
         }
     }
 
-    /// Create a new storage instance
-    pub async fn new(data_dir: &Path) -> Result<Self> {
-        let db_path = data_dir.join("agentark.db");
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-
-        let db = Database::connect(&db_url).await?;
-        Self::configure_sqlite(&db).await?;
-
-        // Create tables if they don't exist
-        Self::create_tables(&db).await?;
-        Self::validate_sqlite_schema(&db).await?;
-
+    /// Connect to the configured PostgreSQL database and run ordered migrations.
+    pub async fn connect(config: DatabaseConfig) -> Result<Self> {
+        config.validate()?;
+        let target_summary = config.target_summary();
+        let connect_timeout_secs = config.connect_timeout_secs.max(1);
+        let db = Database::connect(config.connect_options())
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to connect to Postgres at {} within {}s",
+                    target_summary, connect_timeout_secs
+                )
+            })?;
+        if db.get_database_backend() != DbBackend::Postgres {
+            anyhow::bail!("Postgres storage requires the SeaORM Postgres backend");
+        }
+        if let Some(schema_identifier) = config.quoted_schema_identifier() {
+            db.execute_unprepared(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {};",
+                schema_identifier
+            ))
+            .await?;
+        }
+        migrations::run(&db).await?;
         Ok(Self { db })
     }
 
-    async fn configure_sqlite(db: &DatabaseConnection) -> Result<()> {
-        if db.get_database_backend() != DbBackend::Sqlite {
-            return Ok(());
-        }
-
-        db.execute_unprepared(
-            "\
-PRAGMA journal_mode = WAL;\n\
-PRAGMA synchronous = NORMAL;\n\
-PRAGMA foreign_keys = ON;\n\
-PRAGMA busy_timeout = 5000;\n",
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Create all tables
-    async fn create_tables(db: &DatabaseConnection) -> Result<()> {
+    #[allow(dead_code)]
+    /// Legacy schema bootstrap snapshot kept only until the remaining dead code is deleted.
+    async fn create_legacy_tables(db: &DatabaseConnection) -> Result<()> {
         let backend = db.get_database_backend();
         let _schema = Schema::new(backend);
 
-        // Create tables using raw SQL for SQLite compatibility
+        // This path is intentionally unused; ordered Postgres migrations are authoritative.
         db.execute_unprepared(
             r#"
             CREATE TABLE IF NOT EXISTS kv_store (
@@ -679,7 +1016,7 @@ PRAGMA busy_timeout = 5000;\n",
             "ALTER TABLE conversations ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
         ];
         for stmt in alter_stmts {
-            Self::apply_sqlite_add_column_migration(db, stmt).await?;
+            Self::apply_legacy_add_column_migration(db, stmt).await?;
         }
 
         db.execute_unprepared(
@@ -690,63 +1027,12 @@ PRAGMA busy_timeout = 5000;\n",
         Ok(())
     }
 
-    async fn apply_sqlite_add_column_migration(db: &DatabaseConnection, stmt: &str) -> Result<()> {
-        match db.execute_unprepared(stmt).await {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string().to_ascii_lowercase();
-                if message.contains("duplicate column name") {
-                    Ok(())
-                } else {
-                    Err(error.into())
-                }
-            }
-        }
-    }
-
-    async fn validate_sqlite_schema(db: &DatabaseConnection) -> Result<()> {
-        if db.get_database_backend() != DbBackend::Sqlite {
-            return Ok(());
-        }
-
-        let quick_check = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA quick_check".to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<String>("", "quick_check").ok())
-            .unwrap_or_else(|| "unknown".to_string());
-        if !quick_check.eq_ignore_ascii_case("ok") {
-            anyhow::bail!("SQLite quick_check failed: {}", quick_check);
-        }
-
-        let fk_violations = db
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_key_check".to_string(),
-            ))
-            .await?;
-        if let Some(row) = fk_violations.first() {
-            let table = row
-                .try_get::<String>("", "table")
-                .unwrap_or_else(|_| "unknown".to_string());
-            let rowid = row
-                .try_get::<i64>("", "rowid")
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            let parent = row
-                .try_get::<String>("", "parent")
-                .unwrap_or_else(|_| "unknown".to_string());
-            anyhow::bail!(
-                "SQLite foreign_key_check failed: table={} rowid={} parent={}",
-                table,
-                rowid,
-                parent
-            );
-        }
-
-        Ok(())
+    #[allow(dead_code)]
+    async fn apply_legacy_add_column_migration(
+        _db: &DatabaseConnection,
+        _stmt: &str,
+    ) -> Result<()> {
+        anyhow::bail!("Legacy column migrations have been removed")
     }
 
     // ==================== Key-Value Store ====================
@@ -1145,7 +1431,7 @@ PRAGMA busy_timeout = 5000;\n",
                 .decrypt_string(&payload)
                 .unwrap_or_else(|_| payload.clone());
             let encrypted = new_key.encrypt_string(&plaintext)?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute(Self::statement_with_values(
                 backend,
                 "UPDATE automation_runs SET payload = ? WHERE id = ?".to_string(),
                 vec![encrypted.into(), id.into()],
@@ -1166,7 +1452,7 @@ PRAGMA busy_timeout = 5000;\n",
                 .decrypt_string(&payload)
                 .unwrap_or_else(|_| payload.clone());
             let encrypted = new_key.encrypt_string(&plaintext)?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute(Self::statement_with_values(
                 backend,
                 "UPDATE automation_supervisor_states SET payload = ? WHERE automation_id = ?"
                     .to_string(),
@@ -1339,7 +1625,7 @@ PRAGMA busy_timeout = 5000;\n",
             .select_only()
             .column(episode::Column::Id)
             .order_by_desc(episode::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .into_tuple::<String>()
             .all(&self.db)
             .await?;
@@ -1365,7 +1651,7 @@ PRAGMA busy_timeout = 5000;\n",
             .filter(episode::Column::Importance.lte(max_importance))
             .filter(episode::Column::AccessCount.lte(max_access_count))
             .order_by_asc(episode::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit));
+            .limit(Self::db_limit(limit));
         if require_consolidated {
             query = query.filter(episode::Column::Consolidated.eq(true));
         }
@@ -1443,8 +1729,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(episode::Column::ProjectId.eq(pid));
         }
         let episodes = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         Ok(episodes)
@@ -1472,8 +1758,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(semantic_fact::Column::ProjectId.eq(pid));
         }
         let facts = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         Ok(facts)
@@ -1580,8 +1866,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
         let mut rows = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for row in &mut rows {
@@ -1715,8 +2001,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(user_data_item::Column::Kind.eq(kind_value));
         }
         let mut rows = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for row in &mut rows {
@@ -1797,8 +2083,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
         let mut rows = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for row in &mut rows {
@@ -1827,6 +2113,7 @@ PRAGMA busy_timeout = 5000;\n",
 
     /// Insert a task
     pub async fn insert_task(&self, task: &crate::core::Task) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
         let description = encrypt_storage_string(&task.description)?;
         let arguments = encrypt_storage_string(&serde_json::to_string(&task.arguments)?)?;
         let approval = encrypt_storage_string(&serde_json::to_string(&task.approval)?)?;
@@ -1839,6 +2126,7 @@ PRAGMA busy_timeout = 5000;\n",
             approval: Set(approval),
             status: Set(serde_json::to_string(&task.status)?),
             created_at: Set(task.created_at.to_rfc3339()),
+            updated_at: Set(now),
             scheduled_for: Set(task.scheduled_for.map(|t| t.to_rfc3339())),
             cron: Set(task.cron.clone()),
             result: Set(result),
@@ -1847,6 +2135,12 @@ PRAGMA busy_timeout = 5000;\n",
             urgency: Set(task.urgency.map(|v| v as f64)),
             importance: Set(task.importance.map(|v| v as f64)),
             eisenhower_quadrant: Set(task.eisenhower_quadrant.map(|v| v as i32)),
+            lease_owner: Set(None),
+            lease_expires_at: Set(None),
+            lease_version: Set(0),
+            next_retry_at: Set(None),
+            last_run_id: Set(None),
+            consecutive_failures: Set(0),
         }
         .insert(&self.db)
         .await?;
@@ -1859,6 +2153,9 @@ PRAGMA busy_timeout = 5000;\n",
         task::ActiveModel {
             id: Set(id.to_string()),
             status: Set(status.to_string()),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            lease_owner: Set(None),
+            lease_expires_at: Set(None),
             ..Default::default()
         }
         .update(&self.db)
@@ -1893,6 +2190,7 @@ PRAGMA busy_timeout = 5000;\n",
         if scheduled_for.is_some() {
             model.scheduled_for = Set(scheduled_for);
         }
+        model.updated_at = Set(chrono::Utc::now().to_rfc3339());
 
         model.update(&self.db).await?;
         Ok(())
@@ -1907,6 +2205,9 @@ PRAGMA busy_timeout = 5000;\n",
         let mut model = task::ActiveModel {
             id: Set(id.to_string()),
             status: Set(status.to_string()),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            lease_owner: Set(None),
+            lease_expires_at: Set(None),
             ..Default::default()
         };
         if let Some(res) = result {
@@ -1929,11 +2230,68 @@ PRAGMA busy_timeout = 5000;\n",
             scheduled_for: Set(scheduled_for),
             result: Set(None),
             proof_id: Set(None),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            lease_owner: Set(None),
+            lease_expires_at: Set(None),
             ..Default::default()
         }
         .update(&self.db)
         .await?;
 
+        Ok(())
+    }
+
+    pub async fn try_claim_task(
+        &self,
+        id: &str,
+        expected_status: &str,
+        in_progress_status: &str,
+        lease_owner: &str,
+        lease_expires_at: &str,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let backend = self.db.get_database_backend();
+        let result = self
+            .db
+            .execute(Self::statement_with_values(
+                backend,
+                "UPDATE tasks
+                 SET status = ?, updated_at = ?, lease_owner = ?, lease_expires_at = ?, lease_version = lease_version + 1
+                 WHERE id = ?
+                   AND status = ?
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
+                    .to_string(),
+                vec![
+                    in_progress_status.to_string().into(),
+                    now.into(),
+                    lease_owner.to_string().into(),
+                    lease_expires_at.to_string().into(),
+                    id.to_string().into(),
+                    expected_status.to_string().into(),
+                    chrono::Utc::now().to_rfc3339().into(),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn record_task_run_metadata(
+        &self,
+        id: &str,
+        last_run_id: Option<&str>,
+        next_retry_at: Option<&str>,
+        consecutive_failures: Option<i32>,
+    ) -> Result<()> {
+        task::ActiveModel {
+            id: Set(id.to_string()),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            last_run_id: Set(last_run_id.map(|value| value.to_string())),
+            next_retry_at: Set(next_retry_at.map(|value| value.to_string())),
+            consecutive_failures: Set(consecutive_failures.unwrap_or(0)),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -1964,7 +2322,7 @@ PRAGMA busy_timeout = 5000;\n",
         let backend = self.db.get_database_backend();
         let rows = self
             .db
-            .query_all(Statement::from_sql_and_values(
+            .query_all(Self::statement_with_values(
                 backend,
                 "SELECT payload FROM automation_runs ORDER BY started_at DESC LIMIT ?".to_string(),
                 vec![(limit.max(1) as i64).into()],
@@ -1989,7 +2347,7 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<()> {
         let backend = self.db.get_database_backend();
         self.db
-            .execute(Statement::from_sql_and_values(
+            .execute(Self::statement_with_values(
                 backend,
                 "INSERT INTO automation_runs (id, automation_id, started_at, payload) VALUES (?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET automation_id=excluded.automation_id, started_at=excluded.started_at, payload=excluded.payload"
@@ -2003,7 +2361,7 @@ PRAGMA busy_timeout = 5000;\n",
             ))
             .await?;
         self.db
-            .execute(Statement::from_sql_and_values(
+            .execute(Self::statement_with_values(
                 backend,
                 "DELETE FROM automation_runs WHERE id NOT IN (SELECT id FROM automation_runs ORDER BY started_at DESC LIMIT ?)"
                     .to_string(),
@@ -2044,7 +2402,7 @@ PRAGMA busy_timeout = 5000;\n",
         let backend = self.db.get_database_backend();
         let row = self
             .db
-            .query_one(Statement::from_sql_and_values(
+            .query_one(Self::statement_with_values(
                 backend,
                 "SELECT payload FROM automation_supervisor_states WHERE automation_id = ?"
                     .to_string(),
@@ -2071,15 +2429,25 @@ PRAGMA busy_timeout = 5000;\n",
             .or_else(|| state.created_at.clone())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         self.db
-            .execute(Statement::from_sql_and_values(
+            .execute(Self::statement_with_values(
                 backend,
-                "INSERT INTO automation_supervisor_states (automation_id, updated_at, payload) VALUES (?, ?, ?) \
-                 ON CONFLICT(automation_id) DO UPDATE SET updated_at=excluded.updated_at, payload=excluded.payload"
+                "INSERT INTO automation_supervisor_states
+                    (automation_id, updated_at, payload, next_retry_at, last_run_id, consecutive_failures)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(automation_id) DO UPDATE
+                 SET updated_at=excluded.updated_at,
+                     payload=excluded.payload,
+                     next_retry_at=excluded.next_retry_at,
+                     last_run_id=excluded.last_run_id,
+                     consecutive_failures=excluded.consecutive_failures"
                     .to_string(),
                 vec![
                     state.automation_id.clone().into(),
                     updated_at.into(),
                     encrypt_storage_string(&serde_json::to_string(state)?)?.into(),
+                    state.next_retry_at.clone().into(),
+                    state.last_run_id.clone().into(),
+                    (state.consecutive_failures as i64).into(),
                 ],
             ))
             .await?;
@@ -2089,7 +2457,7 @@ PRAGMA busy_timeout = 5000;\n",
     pub async fn delete_automation_supervisor_state(&self, automation_id: &str) -> Result<bool> {
         let result = self
             .db
-            .execute(Statement::from_sql_and_values(
+            .execute(Self::statement_with_values(
                 self.db.get_database_backend(),
                 "DELETE FROM automation_supervisor_states WHERE automation_id = ?".to_string(),
                 vec![automation_id.to_string().into()],
@@ -2099,16 +2467,13 @@ PRAGMA busy_timeout = 5000;\n",
     }
 
     pub async fn list_watchers(&self) -> Result<Vec<crate::core::watcher::Watcher>> {
-        let rows = self
-            .db
-            .query_all(Statement::from_string(
-                self.db.get_database_backend(),
-                "SELECT payload FROM watchers ORDER BY created_at ASC".to_string(),
-            ))
-            .await?;
         let mut watchers = Vec::new();
+        let rows = watcher::Entity::find()
+            .order_by_asc(watcher::Column::CreatedAt)
+            .all(&self.db)
+            .await?;
         for row in rows {
-            let payload: String = row.try_get("", "payload")?;
+            let payload = row.payload;
             if let Ok(watcher) = serde_json::from_str::<crate::core::watcher::Watcher>(&payload) {
                 watchers.push(watcher);
             }
@@ -2122,11 +2487,18 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<()> {
         let backend = self.db.get_database_backend();
         let txn = self.db.begin().await?;
-        txn.execute(Statement::from_string(
-            backend,
-            "DELETE FROM watchers".to_string(),
-        ))
-        .await?;
+        if watchers.is_empty() {
+            watcher::Entity::delete_many().exec(&txn).await?;
+        } else {
+            let active_ids = watchers
+                .iter()
+                .map(|watcher| watcher.id.to_string())
+                .collect::<Vec<_>>();
+            watcher::Entity::delete_many()
+                .filter(watcher::Column::Id.is_not_in(active_ids))
+                .exec(&txn)
+                .await?;
+        }
         for watcher in watchers {
             let status = match &watcher.status {
                 crate::core::watcher::WatcherStatus::Active => "active",
@@ -2136,21 +2508,1412 @@ PRAGMA busy_timeout = 5000;\n",
                 crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
                 crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
             };
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute(Self::statement_with_values(
                 backend,
-                "INSERT INTO watchers (id, status, created_at, payload) VALUES (?, ?, ?, ?)"
+                "INSERT INTO watchers
+                    (id, status, created_at, updated_at, payload, next_retry_at, last_run_id, consecutive_failures)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE
+                 SET status = excluded.status,
+                     updated_at = excluded.updated_at,
+                     payload = excluded.payload,
+                     next_retry_at = excluded.next_retry_at,
+                     last_run_id = excluded.last_run_id,
+                     consecutive_failures = excluded.consecutive_failures"
                     .to_string(),
                 vec![
                     watcher.id.to_string().into(),
                     status.into(),
                     watcher.created_at.to_rfc3339().into(),
+                    chrono::Utc::now().to_rfc3339().into(),
                     serde_json::to_string(watcher)?.into(),
+                    watcher
+                        .next_poll_not_before
+                        .map(|value| value.to_rfc3339())
+                        .into(),
+                    Option::<String>::None.into(),
+                    (watcher.consecutive_failures as i64).into(),
                 ],
             ))
             .await?;
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO execution_runs
+                    (id, kind, request_id, status, current_stage, lease_owner, lease_expires_at, attempt,
+                     deadline_at, cancellation_requested, degradation, last_error, result_summary,
+                     trace_id, conversation_id, channel, request_message, attempted_models,
+                     created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     request_id = excluded.request_id,
+                     status = excluded.status,
+                     current_stage = excluded.current_stage,
+                     lease_owner = excluded.lease_owner,
+                     lease_expires_at = excluded.lease_expires_at,
+                     attempt = excluded.attempt,
+                     deadline_at = excluded.deadline_at,
+                     cancellation_requested = excluded.cancellation_requested,
+                     degradation = excluded.degradation,
+                     last_error = excluded.last_error,
+                     result_summary = excluded.result_summary,
+                     trace_id = excluded.trace_id,
+                     conversation_id = excluded.conversation_id,
+                     channel = excluded.channel,
+                     request_message = excluded.request_message,
+                     attempted_models = excluded.attempted_models,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    run.id.clone().into(),
+                    run.kind.clone().into(),
+                    run.request_id.clone().into(),
+                    run.status.as_str().to_string().into(),
+                    run.current_stage.clone().into(),
+                    run.lease_owner.clone().into(),
+                    run.lease_expires_at.clone().into(),
+                    (run.attempt as i64).into(),
+                    run.deadline_at.clone().into(),
+                    run.cancellation_requested.into(),
+                    encrypt_storage_string(&serde_json::to_string(&run.degradation)?)?.into(),
+                    encrypt_optional_storage_string(run.last_error.as_deref())?.into(),
+                    encrypt_optional_storage_string(run.result_summary.as_deref())?.into(),
+                    run.trace_id.clone().into(),
+                    run.conversation_id.clone().into(),
+                    run.channel.clone().into(),
+                    encrypt_optional_storage_string(run.request_message.as_deref())?.into(),
+                    encrypt_storage_string(&serde_json::to_string(&run.attempted_models)?)?.into(),
+                    run.created_at.clone().into(),
+                    run.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_execution_run(&self, id: &str) -> Result<Option<crate::core::ExecutionRun>> {
+        let backend = self.db.get_database_backend();
+        let row = self
+            .db
+            .query_one(Self::statement_with_values(
+                backend,
+                "SELECT * FROM execution_runs WHERE id = ?".to_string(),
+                vec![id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row.try_get("", "status")?;
+        let attempted_models =
+            decrypt_storage_string(&row.try_get::<String>("", "attempted_models")?);
+        let degradation = decrypt_storage_string(&row.try_get::<String>("", "degradation")?);
+        Ok(Some(crate::core::ExecutionRun {
+            id: row.try_get("", "id")?,
+            kind: row.try_get("", "kind")?,
+            request_id: row.try_get("", "request_id").ok(),
+            status: serde_json::from_str(&format!("\"{}\"", status))
+                .unwrap_or(crate::core::ExecutionRunStatus::PlatformFailed),
+            current_stage: row.try_get("", "current_stage")?,
+            lease_owner: row.try_get("", "lease_owner").ok(),
+            lease_expires_at: row.try_get("", "lease_expires_at").ok(),
+            attempt: row.try_get::<i32>("", "attempt").unwrap_or_default().max(0) as u32,
+            deadline_at: row.try_get("", "deadline_at").ok(),
+            cancellation_requested: row
+                .try_get::<bool>("", "cancellation_requested")
+                .unwrap_or(false),
+            degradation: serde_json::from_str(&degradation).unwrap_or_default(),
+            last_error: decrypt_optional_storage_string(row.try_get("", "last_error").ok()),
+            result_summary: decrypt_optional_storage_string(row.try_get("", "result_summary").ok()),
+            trace_id: row.try_get("", "trace_id").ok(),
+            conversation_id: row.try_get("", "conversation_id").ok(),
+            channel: row.try_get("", "channel").ok(),
+            request_message: decrypt_optional_storage_string(
+                row.try_get("", "request_message").ok(),
+            ),
+            attempted_models: serde_json::from_str(&attempted_models).unwrap_or_default(),
+            created_at: row.try_get("", "created_at")?,
+            updated_at: row.try_get("", "updated_at")?,
+        }))
+    }
+
+    pub async fn append_execution_checkpoint(
+        &self,
+        checkpoint: &crate::core::ExecutionCheckpoint,
+    ) -> Result<()> {
+        self.db
+            .execute(Self::statement_with_values(
+                self.db.get_database_backend(),
+                "INSERT INTO run_checkpoints (run_id, sequence_no, stage, payload, created_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(run_id, sequence_no) DO UPDATE
+                 SET stage = excluded.stage, payload = excluded.payload, created_at = excluded.created_at"
+                    .to_string(),
+                vec![
+                    checkpoint.run_id.clone().into(),
+                    (checkpoint.sequence_no as i64).into(),
+                    checkpoint.stage.clone().into(),
+                    encrypt_storage_string(&checkpoint.payload)?.into(),
+                    checkpoint.created_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn append_tool_attempt(&self, attempt: &crate::core::ToolAttempt) -> Result<()> {
+        self.db
+            .execute(Self::statement_with_values(
+                self.db.get_database_backend(),
+                "INSERT INTO tool_attempts
+                    (id, run_id, sequence_no, tool_name, status, failure_class, retryable,
+                     side_effect_level, idempotency_key, arguments_json, output_json,
+                     started_at, completed_at, error_text)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     status = excluded.status,
+                     failure_class = excluded.failure_class,
+                     retryable = excluded.retryable,
+                     side_effect_level = excluded.side_effect_level,
+                     idempotency_key = excluded.idempotency_key,
+                     arguments_json = excluded.arguments_json,
+                     output_json = excluded.output_json,
+                     started_at = excluded.started_at,
+                     completed_at = excluded.completed_at,
+                     error_text = excluded.error_text"
+                    .to_string(),
+                vec![
+                    attempt.id.clone().into(),
+                    attempt.run_id.clone().into(),
+                    (attempt.sequence_no as i64).into(),
+                    attempt.tool_name.clone().into(),
+                    attempt.status.as_str().to_string().into(),
+                    attempt
+                        .failure_class
+                        .as_ref()
+                        .map(|value| {
+                            serde_json::to_string(value)
+                                .unwrap_or_else(|_| "\"platform_error\"".to_string())
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                        .into(),
+                    attempt.retryable.into(),
+                    attempt.side_effect_level.clone().into(),
+                    attempt.idempotency_key.clone().into(),
+                    encrypt_storage_string(&attempt.arguments_json)?.into(),
+                    encrypt_storage_string(&attempt.output_json)?.into(),
+                    attempt.started_at.clone().into(),
+                    attempt.completed_at.clone().into(),
+                    encrypt_optional_storage_string(attempt.error_text.as_deref())?.into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Experience Graph ====================
+
+    pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO experience_runs
+                    (id, execution_run_id, trace_id, conversation_id, project_id, channel, scope,
+                     intent_key, task_type, request_text, tool_sequence_digest, tool_sequence_json,
+                     strategy_version, policy_version, prompt_version, model_slot, success_state,
+                     correction_state, outcome_summary, failure_reason, metadata, consolidated,
+                     accepted_at, corrected_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     execution_run_id = excluded.execution_run_id,
+                     trace_id = excluded.trace_id,
+                     conversation_id = excluded.conversation_id,
+                     project_id = excluded.project_id,
+                     channel = excluded.channel,
+                     scope = excluded.scope,
+                     intent_key = excluded.intent_key,
+                     task_type = excluded.task_type,
+                     request_text = excluded.request_text,
+                     tool_sequence_digest = excluded.tool_sequence_digest,
+                     tool_sequence_json = excluded.tool_sequence_json,
+                     strategy_version = excluded.strategy_version,
+                     policy_version = excluded.policy_version,
+                     prompt_version = excluded.prompt_version,
+                     model_slot = excluded.model_slot,
+                     success_state = excluded.success_state,
+                     correction_state = excluded.correction_state,
+                     outcome_summary = excluded.outcome_summary,
+                     failure_reason = excluded.failure_reason,
+                     metadata = excluded.metadata,
+                     consolidated = excluded.consolidated,
+                     accepted_at = excluded.accepted_at,
+                     corrected_at = excluded.corrected_at,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    run.id.clone().into(),
+                    run.execution_run_id.clone().into(),
+                    run.trace_id.clone().into(),
+                    run.conversation_id.clone().into(),
+                    run.project_id.clone().into(),
+                    run.channel.clone().into(),
+                    run.scope.clone().into(),
+                    run.intent_key.clone().into(),
+                    run.task_type.clone().into(),
+                    run.request_text.clone().into(),
+                    run.tool_sequence_digest.clone().into(),
+                    json_text(&run.tool_sequence_json).into(),
+                    run.strategy_version.clone().into(),
+                    run.policy_version.clone().into(),
+                    run.prompt_version.clone().into(),
+                    run.model_slot.clone().into(),
+                    run.success_state.clone().into(),
+                    run.correction_state.clone().into(),
+                    run.outcome_summary.clone().into(),
+                    run.failure_reason.clone().into(),
+                    json_text(&run.metadata).into(),
+                    run.consolidated.into(),
+                    run.accepted_at.clone().into(),
+                    run.corrected_at.clone().into(),
+                    run.created_at.clone().into(),
+                    run.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_tool_attempts_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::core::ToolAttempt>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                backend,
+                "SELECT id, run_id, sequence_no, tool_name, status, failure_class, retryable,
+                        side_effect_level, idempotency_key, arguments_json, output_json,
+                        started_at, completed_at, error_text
+                 FROM tool_attempts
+                 WHERE run_id = ?
+                 ORDER BY sequence_no ASC"
+                    .to_string(),
+                vec![run_id.to_string().into()],
+            ))
+            .await?;
+        let mut attempts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let status_raw: String = row.try_get("", "status")?;
+            let failure_class_raw: Option<String> = row.try_get("", "failure_class").ok();
+            let arguments_json =
+                decrypt_storage_string(&row.try_get::<String>("", "arguments_json")?);
+            let output_json = decrypt_storage_string(&row.try_get::<String>("", "output_json")?);
+            attempts.push(crate::core::ToolAttempt {
+                id: row.try_get("", "id")?,
+                run_id: row.try_get("", "run_id")?,
+                sequence_no: row
+                    .try_get::<i32>("", "sequence_no")
+                    .unwrap_or_default()
+                    .max(0) as u32,
+                tool_name: row.try_get("", "tool_name")?,
+                status: serde_json::from_str(&format!("\"{}\"", status_raw))
+                    .unwrap_or(crate::core::ToolOutcomeStatus::FatalError),
+                failure_class: failure_class_raw.and_then(|value| {
+                    serde_json::from_str::<crate::core::FailureClass>(&format!("\"{}\"", value))
+                        .ok()
+                }),
+                retryable: row.try_get::<bool>("", "retryable").unwrap_or(false),
+                side_effect_level: row.try_get("", "side_effect_level")?,
+                idempotency_key: row.try_get("", "idempotency_key").ok(),
+                arguments_json,
+                output_json,
+                started_at: row.try_get("", "started_at")?,
+                completed_at: row.try_get("", "completed_at").ok(),
+                error_text: decrypt_optional_storage_string(row.try_get("", "error_text").ok()),
+            });
+        }
+        Ok(attempts)
+    }
+
+    pub async fn mark_latest_provisional_experience_run_corrected(
+        &self,
+        conversation_id: &str,
+        correction_signal: &str,
+        within_minutes: i64,
+    ) -> Result<Option<experience_run::Model>> {
+        let backend = self.db.get_database_backend();
+        let now = chrono::Utc::now().to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::minutes(within_minutes.max(1))).to_rfc3339();
+        let payload = serde_json::json!({
+            "correction_signal": correction_signal,
+            "correction_recorded_at": now,
+        });
+        let row = self
+            .db
+            .query_one(Self::statement_with_values(
+                backend,
+                "WITH target AS (
+                    SELECT id
+                    FROM experience_runs
+                    WHERE conversation_id = ?
+                      AND success_state = 'provisional'
+                      AND correction_state = 'none'
+                      AND created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                 )
+                 UPDATE experience_runs
+                 SET correction_state = 'corrected',
+                     success_state = CASE
+                         WHEN success_state = 'provisional' THEN 'failed'
+                         ELSE success_state
+                     END,
+                     corrected_at = ?,
+                     updated_at = ?,
+                     metadata = COALESCE(metadata, '{}'::jsonb) || CAST(? AS JSONB)
+                 WHERE id IN (SELECT id FROM target)
+                 RETURNING id, execution_run_id, trace_id, conversation_id, project_id, channel,
+                           scope, intent_key, task_type, request_text, tool_sequence_digest,
+                           tool_sequence_json::text AS tool_sequence_json, strategy_version,
+                           policy_version, prompt_version, model_slot, success_state,
+                           correction_state, outcome_summary, failure_reason,
+                           metadata::text AS metadata, consolidated, accepted_at, corrected_at,
+                           created_at, updated_at"
+                    .to_string(),
+                vec![
+                    conversation_id.to_string().into(),
+                    cutoff.into(),
+                    now.clone().into(),
+                    now.into(),
+                    json_text(&payload).into(),
+                ],
+            ))
+            .await?;
+        row.as_ref().map(parse_experience_run_row).transpose()
+    }
+
+    pub async fn finalize_stale_provisional_experience_runs(
+        &self,
+        older_than_minutes: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        let backend = self.db.get_database_backend();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(older_than_minutes.max(1)))
+            .to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = self
+            .db
+            .execute(Self::statement_with_values(
+                backend,
+                "WITH target AS (
+                    SELECT id
+                    FROM experience_runs
+                    WHERE success_state = 'provisional'
+                      AND correction_state = 'none'
+                      AND created_at < ?
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                 )
+                 UPDATE experience_runs
+                 SET success_state = 'accepted',
+                     accepted_at = ?,
+                     updated_at = ?
+                 WHERE id IN (SELECT id FROM target)"
+                    .to_string(),
+                vec![
+                    cutoff.into(),
+                    Self::db_bound_integer(limit).into(),
+                    now.clone().into(),
+                    now.into(),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn list_experience_runs_for_consolidation(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<experience_run::Model>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                backend,
+                "SELECT id, execution_run_id, trace_id, conversation_id, project_id, channel,
+                        scope, intent_key, task_type, request_text, tool_sequence_digest,
+                        tool_sequence_json::text AS tool_sequence_json, strategy_version,
+                        policy_version, prompt_version, model_slot, success_state,
+                        correction_state, outcome_summary, failure_reason,
+                        metadata::text AS metadata, consolidated, accepted_at, corrected_at,
+                        created_at, updated_at
+                 FROM experience_runs
+                 WHERE consolidated = FALSE
+                   AND (success_state <> 'provisional' OR correction_state = 'corrected')
+                 ORDER BY created_at ASC
+                 LIMIT ?"
+                    .to_string(),
+                vec![Self::db_bound_integer(limit).into()],
+            ))
+            .await?;
+        rows.iter().map(parse_experience_run_row).collect()
+    }
+
+    pub async fn list_recent_experience_runs(
+        &self,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<experience_run::Model>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                backend,
+                "SELECT id, execution_run_id, trace_id, conversation_id, project_id, channel,
+                        scope, intent_key, task_type, request_text, tool_sequence_digest,
+                        tool_sequence_json::text AS tool_sequence_json, strategy_version,
+                        policy_version, prompt_version, model_slot, success_state,
+                        correction_state, outcome_summary, failure_reason,
+                        metadata::text AS metadata, consolidated, accepted_at, corrected_at,
+                        created_at, updated_at
+                 FROM experience_runs
+                 WHERE (conversation_id IS NULL OR conversation_id = ?)
+                   AND (project_id IS NULL OR project_id = ?)
+                 ORDER BY
+                   CASE
+                       WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
+                       WHEN project_id IS NOT NULL AND project_id = ? THEN 2
+                       WHEN scope = 'global' THEN 1
+                       ELSE 0
+                   END DESC,
+                   updated_at DESC
+                 LIMIT ?"
+                    .to_string(),
+                vec![
+                    conversation_id.map(|v| v.to_string()).into(),
+                    project_id.map(|v| v.to_string()).into(),
+                    conversation_id.map(|v| v.to_string()).into(),
+                    project_id.map(|v| v.to_string()).into(),
+                    Self::db_bound_integer(limit).into(),
+                ],
+            ))
+            .await?;
+        rows.iter().map(parse_experience_run_row).collect()
+    }
+
+    pub async fn mark_experience_run_consolidated(&self, id: &str) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "UPDATE experience_runs
+                 SET consolidated = TRUE, updated_at = ?
+                 WHERE id = ?"
+                    .to_string(),
+                vec![
+                    chrono::Utc::now().to_rfc3339().into(),
+                    id.to_string().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_experience_item(&self, item: &experience_item::Model) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO experience_items
+                    (id, kind, scope, project_id, conversation_id, title, content,
+                     normalized_key, confidence, support_count, contradiction_count, status,
+                     metadata, last_supported_at, last_contradicted_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     kind = excluded.kind,
+                     scope = excluded.scope,
+                     project_id = excluded.project_id,
+                     conversation_id = excluded.conversation_id,
+                     title = excluded.title,
+                     content = excluded.content,
+                     normalized_key = excluded.normalized_key,
+                     confidence = excluded.confidence,
+                     support_count = excluded.support_count,
+                     contradiction_count = excluded.contradiction_count,
+                     status = excluded.status,
+                     metadata = excluded.metadata,
+                     last_supported_at = excluded.last_supported_at,
+                     last_contradicted_at = excluded.last_contradicted_at,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    item.id.clone().into(),
+                    item.kind.clone().into(),
+                    item.scope.clone().into(),
+                    item.project_id.clone().into(),
+                    item.conversation_id.clone().into(),
+                    item.title.clone().into(),
+                    item.content.clone().into(),
+                    item.normalized_key.clone().into(),
+                    item.confidence.into(),
+                    item.support_count.into(),
+                    item.contradiction_count.into(),
+                    item.status.clone().into(),
+                    json_text(&item.metadata).into(),
+                    item.last_supported_at.clone().into(),
+                    item.last_contradicted_at.clone().into(),
+                    item.created_at.clone().into(),
+                    item.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_experience_item_status(&self, id: &str, status: &str) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "UPDATE experience_items
+                 SET status = ?, updated_at = ?
+                 WHERE id = ?"
+                    .to_string(),
+                vec![
+                    status.to_string().into(),
+                    chrono::Utc::now().to_rfc3339().into(),
+                    id.to_string().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_experience_item(&self, id: &str) -> Result<Option<experience_item::Model>> {
+        let backend = self.db.get_database_backend();
+        let row = self
+            .db
+            .query_one(Self::statement_with_values(
+                backend,
+                "SELECT id, kind, scope, project_id, conversation_id, title, content,
+                        normalized_key, confidence, support_count, contradiction_count, status,
+                        metadata::text AS metadata, last_supported_at, last_contradicted_at,
+                        created_at, updated_at
+                 FROM experience_items
+                 WHERE id = ?"
+                    .to_string(),
+                vec![id.to_string().into()],
+            ))
+            .await?;
+        row.as_ref().map(parse_experience_item_row).transpose()
+    }
+
+    pub async fn list_active_experience_items(
+        &self,
+        kinds: &[&str],
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<experience_item::Model>> {
+        let backend = self.db.get_database_backend();
+        let kind_clause = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!(" AND kind IN ({})", Self::sql_placeholder_list(kinds.len()))
+        };
+        let sql = format!(
+            "SELECT id, kind, scope, project_id, conversation_id, title, content,
+                    normalized_key, confidence, support_count, contradiction_count, status,
+                    metadata::text AS metadata, last_supported_at, last_contradicted_at,
+                    created_at, updated_at
+             FROM experience_items
+             WHERE status = 'active'
+               AND (conversation_id IS NULL OR conversation_id = ?)
+               AND (project_id IS NULL OR project_id = ?)
+               {kind_clause}
+             ORDER BY
+               CASE
+                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
+                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
+                   WHEN scope = 'global' THEN 1
+                   ELSE 0
+               END DESC,
+               CASE kind
+                   WHEN 'constraint' THEN 0
+                   WHEN 'personal_fact' THEN 1
+                   WHEN 'lesson' THEN 2
+                   WHEN 'procedure' THEN 3
+                   ELSE 4
+               END ASC,
+               confidence DESC,
+               support_count DESC,
+               updated_at DESC
+             LIMIT ?"
+        );
+        let mut params: Vec<sea_orm::Value> = vec![
+            conversation_id.map(|v| v.to_string()).into(),
+            project_id.map(|v| v.to_string()).into(),
+        ];
+        for kind in kinds {
+            params.push((*kind).to_string().into());
+        }
+        params.push(conversation_id.map(|v| v.to_string()).into());
+        params.push(project_id.map(|v| v.to_string()).into());
+        params.push(Self::db_bound_integer(limit).into());
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(backend, sql, params))
+            .await?;
+        rows.iter().map(parse_experience_item_row).collect()
+    }
+
+    pub async fn search_experience_items(
+        &self,
+        query: &str,
+        kinds: &[&str],
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ExperienceItemSearchHit>> {
+        let backend = self.db.get_database_backend();
+        let kind_clause = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!(" AND kind IN ({})", Self::sql_placeholder_list(kinds.len()))
+        };
+        let sql = format!(
+            "SELECT id, kind, scope, project_id, conversation_id, title, content,
+                    normalized_key, confidence, support_count, contradiction_count, status,
+                    metadata::text AS metadata, last_supported_at, last_contradicted_at,
+                    created_at, updated_at,
+                    ts_rank(
+                        to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(content, '')),
+                        plainto_tsquery('simple', ?)
+                    ) AS search_rank
+             FROM experience_items
+             WHERE status = 'active'
+               AND (conversation_id IS NULL OR conversation_id = ?)
+               AND (project_id IS NULL OR project_id = ?)
+               AND to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(content, ''))
+                   @@ plainto_tsquery('simple', ?)
+               {kind_clause}
+             ORDER BY
+               CASE
+                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
+                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
+                   WHEN scope = 'global' THEN 1
+                   ELSE 0
+               END DESC,
+               CASE kind
+                   WHEN 'constraint' THEN 0
+                   WHEN 'personal_fact' THEN 1
+                   WHEN 'lesson' THEN 2
+                   WHEN 'procedure' THEN 3
+                   ELSE 4
+               END ASC,
+               search_rank DESC,
+               support_count DESC,
+               updated_at DESC
+             LIMIT ?"
+        );
+        let mut params: Vec<sea_orm::Value> = vec![
+            query.to_string().into(),
+            conversation_id.map(|v| v.to_string()).into(),
+            project_id.map(|v| v.to_string()).into(),
+            query.to_string().into(),
+        ];
+        for kind in kinds {
+            params.push((*kind).to_string().into());
+        }
+        params.push(conversation_id.map(|v| v.to_string()).into());
+        params.push(project_id.map(|v| v.to_string()).into());
+        params.push(Self::db_bound_integer(limit).into());
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(backend, sql, params))
+            .await?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let score = row.try_get::<f64>("", "search_rank").unwrap_or(0.0);
+            hits.push(ExperienceItemSearchHit {
+                item: parse_experience_item_row(&row)?,
+                score,
+            });
+        }
+        Ok(hits)
+    }
+
+    pub async fn upsert_experience_edge(&self, edge: &experience_edge::Model) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO experience_edges
+                    (id, source_ref, source_kind, target_ref, target_kind, edge_type,
+                     weight, source_run_id, metadata, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     source_ref = excluded.source_ref,
+                     source_kind = excluded.source_kind,
+                     target_ref = excluded.target_ref,
+                     target_kind = excluded.target_kind,
+                     edge_type = excluded.edge_type,
+                     weight = excluded.weight,
+                     source_run_id = excluded.source_run_id,
+                     metadata = excluded.metadata,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    edge.id.clone().into(),
+                    edge.source_ref.clone().into(),
+                    edge.source_kind.clone().into(),
+                    edge.target_ref.clone().into(),
+                    edge.target_kind.clone().into(),
+                    edge.edge_type.clone().into(),
+                    edge.weight.into(),
+                    edge.source_run_id.clone().into(),
+                    json_text(&edge.metadata).into(),
+                    edge.created_at.clone().into(),
+                    edge.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_related_experience_items(
+        &self,
+        seed_refs: &[String],
+        limit: u64,
+    ) -> Result<Vec<experience_item::Model>> {
+        if seed_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let refs = Self::sql_placeholder_list(seed_refs.len());
+        let sql = format!(
+            "SELECT DISTINCT i.id, i.kind, i.scope, i.project_id, i.conversation_id, i.title,
+                    i.content, i.normalized_key, i.confidence, i.support_count,
+                    i.contradiction_count, i.status, i.metadata::text AS metadata,
+                    i.last_supported_at, i.last_contradicted_at, i.created_at, i.updated_at
+             FROM experience_edges e
+             JOIN experience_items i
+               ON (
+                    e.source_ref IN ({refs}) AND e.target_kind = 'experience_item' AND e.target_ref = i.id
+                  )
+               OR (
+                    e.target_ref IN ({refs}) AND e.source_kind = 'experience_item' AND e.source_ref = i.id
+                  )
+             WHERE i.status = 'active'
+               AND i.id NOT IN ({refs})
+             ORDER BY i.support_count DESC, i.confidence DESC, i.updated_at DESC
+             LIMIT ?"
+        );
+        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(seed_refs.len() * 3 + 1);
+        for seed_ref in seed_refs {
+            params.push(seed_ref.clone().into());
+        }
+        for seed_ref in seed_refs {
+            params.push(seed_ref.clone().into());
+        }
+        for seed_ref in seed_refs {
+            params.push(seed_ref.clone().into());
+        }
+        params.push(Self::db_bound_integer(limit).into());
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                self.db.get_database_backend(),
+                sql,
+                params,
+            ))
+            .await?;
+        rows.iter().map(parse_experience_item_row).collect()
+    }
+
+    pub async fn upsert_procedural_pattern(
+        &self,
+        pattern: &procedural_pattern::Model,
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO procedural_patterns
+                    (id, intent_key, scope, project_id, conversation_id, title, trigger_summary,
+                     summary, tool_sequence_digest, steps_json, tool_sequence_json, sample_count,
+                     success_count, correction_count, success_rate, last_validated_at, status,
+                     metadata, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     intent_key = excluded.intent_key,
+                     scope = excluded.scope,
+                     project_id = excluded.project_id,
+                     conversation_id = excluded.conversation_id,
+                     title = excluded.title,
+                     trigger_summary = excluded.trigger_summary,
+                     summary = excluded.summary,
+                     tool_sequence_digest = excluded.tool_sequence_digest,
+                     steps_json = excluded.steps_json,
+                     tool_sequence_json = excluded.tool_sequence_json,
+                     sample_count = excluded.sample_count,
+                     success_count = excluded.success_count,
+                     correction_count = excluded.correction_count,
+                     success_rate = excluded.success_rate,
+                     last_validated_at = excluded.last_validated_at,
+                     status = excluded.status,
+                     metadata = excluded.metadata,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    pattern.id.clone().into(),
+                    pattern.intent_key.clone().into(),
+                    pattern.scope.clone().into(),
+                    pattern.project_id.clone().into(),
+                    pattern.conversation_id.clone().into(),
+                    pattern.title.clone().into(),
+                    pattern.trigger_summary.clone().into(),
+                    pattern.summary.clone().into(),
+                    pattern.tool_sequence_digest.clone().into(),
+                    json_text(&pattern.steps_json).into(),
+                    json_text(&pattern.tool_sequence_json).into(),
+                    pattern.sample_count.into(),
+                    pattern.success_count.into(),
+                    pattern.correction_count.into(),
+                    pattern.success_rate.into(),
+                    pattern.last_validated_at.clone().into(),
+                    pattern.status.clone().into(),
+                    json_text(&pattern.metadata).into(),
+                    pattern.created_at.clone().into(),
+                    pattern.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn search_procedural_patterns(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ProceduralPatternSearchHit>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                backend,
+                "SELECT id, intent_key, scope, project_id, conversation_id, title,
+                        trigger_summary, summary, tool_sequence_digest,
+                        steps_json::text AS steps_json,
+                        tool_sequence_json::text AS tool_sequence_json,
+                        sample_count, success_count, correction_count, success_rate,
+                        last_validated_at, status, metadata::text AS metadata,
+                        created_at, updated_at,
+                        ts_rank(
+                            to_tsvector(
+                                'simple',
+                                COALESCE(title, '') || ' ' || COALESCE(trigger_summary, '') || ' ' || COALESCE(summary, '')
+                            ),
+                            plainto_tsquery('simple', ?)
+                        ) AS search_rank
+                 FROM procedural_patterns
+                 WHERE status IN ('active', 'draft')
+                   AND (conversation_id IS NULL OR conversation_id = ?)
+                   AND (project_id IS NULL OR project_id = ?)
+                   AND to_tsvector(
+                        'simple',
+                        COALESCE(title, '') || ' ' || COALESCE(trigger_summary, '') || ' ' || COALESCE(summary, '')
+                   ) @@ plainto_tsquery('simple', ?)
+                 ORDER BY
+                   CASE
+                       WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
+                       WHEN project_id IS NOT NULL AND project_id = ? THEN 2
+                       WHEN scope = 'global' THEN 1
+                       ELSE 0
+                   END DESC,
+                   search_rank DESC,
+                   sample_count DESC,
+                   success_rate DESC,
+                   updated_at DESC
+                 LIMIT ?"
+                    .to_string(),
+                vec![
+                    query.to_string().into(),
+                    conversation_id.map(|v| v.to_string()).into(),
+                    project_id.map(|v| v.to_string()).into(),
+                    query.to_string().into(),
+                    conversation_id.map(|v| v.to_string()).into(),
+                    project_id.map(|v| v.to_string()).into(),
+                    Self::db_bound_integer(limit).into(),
+                ],
+            ))
+            .await?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let score = row.try_get::<f64>("", "search_rank").unwrap_or(0.0);
+            hits.push(ProceduralPatternSearchHit {
+                pattern: parse_procedural_pattern_row(&row)?,
+                score,
+            });
+        }
+        Ok(hits)
+    }
+
+    pub async fn list_candidate_ready_patterns(
+        &self,
+        min_samples: i32,
+        min_success_rate: f64,
+        limit: u64,
+    ) -> Result<Vec<procedural_pattern::Model>> {
+        let backend = self.db.get_database_backend();
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(
+                backend,
+                "SELECT id, intent_key, scope, project_id, conversation_id, title,
+                        trigger_summary, summary, tool_sequence_digest,
+                        steps_json::text AS steps_json,
+                        tool_sequence_json::text AS tool_sequence_json,
+                        sample_count, success_count, correction_count, success_rate,
+                        last_validated_at, status, metadata::text AS metadata,
+                        created_at, updated_at
+                 FROM procedural_patterns
+                 WHERE sample_count >= ?
+                   AND success_rate >= ?
+                   AND status IN ('active', 'draft')
+                 ORDER BY success_rate DESC, sample_count DESC, updated_at DESC
+                 LIMIT ?"
+                    .to_string(),
+                vec![
+                    min_samples.into(),
+                    min_success_rate.into(),
+                    Self::db_bound_integer(limit).into(),
+                ],
+            ))
+            .await?;
+        rows.iter().map(parse_procedural_pattern_row).collect()
+    }
+
+    pub async fn list_procedural_patterns(
+        &self,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        statuses: &[&str],
+        limit: u64,
+    ) -> Result<Vec<procedural_pattern::Model>> {
+        let backend = self.db.get_database_backend();
+        let status_clause = if statuses.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND status IN ({})",
+                Self::sql_placeholder_list(statuses.len())
+            )
+        };
+        let sql = format!(
+            "SELECT id, intent_key, scope, project_id, conversation_id, title,
+                    trigger_summary, summary, tool_sequence_digest,
+                    steps_json::text AS steps_json,
+                    tool_sequence_json::text AS tool_sequence_json,
+                    sample_count, success_count, correction_count, success_rate,
+                    last_validated_at, status, metadata::text AS metadata,
+                    created_at, updated_at
+             FROM procedural_patterns
+             WHERE (conversation_id IS NULL OR conversation_id = ?)
+               AND (project_id IS NULL OR project_id = ?)
+               {status_clause}
+             ORDER BY
+               CASE
+                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
+                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
+                   WHEN scope = 'global' THEN 1
+                   ELSE 0
+               END DESC,
+               CASE
+                   WHEN status = 'active' THEN 2
+                   WHEN status = 'draft' THEN 1
+                   ELSE 0
+               END DESC,
+               sample_count DESC,
+               success_rate DESC,
+               updated_at DESC
+             LIMIT ?"
+        );
+        let mut params: Vec<sea_orm::Value> = vec![
+            conversation_id.map(|v| v.to_string()).into(),
+            project_id.map(|v| v.to_string()).into(),
+        ];
+        for status in statuses {
+            params.push((*status).to_string().into());
+        }
+        params.push(conversation_id.map(|v| v.to_string()).into());
+        params.push(project_id.map(|v| v.to_string()).into());
+        params.push(Self::db_bound_integer(limit).into());
+
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(backend, sql, params))
+            .await?;
+        rows.iter().map(parse_procedural_pattern_row).collect()
+    }
+
+    pub async fn upsert_learning_candidate(
+        &self,
+        candidate: &learning_candidate::Model,
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "INSERT INTO learning_candidates
+                    (id, candidate_type, subject_key, title, summary, project_id,
+                     conversation_id, pattern_id, evidence_refs, proposed_content, confidence,
+                     approval_status, review_notes, reviewed_at, approved_ref, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     candidate_type = excluded.candidate_type,
+                     subject_key = excluded.subject_key,
+                     title = excluded.title,
+                     summary = excluded.summary,
+                     project_id = excluded.project_id,
+                     conversation_id = excluded.conversation_id,
+                     pattern_id = excluded.pattern_id,
+                     evidence_refs = excluded.evidence_refs,
+                     proposed_content = excluded.proposed_content,
+                     confidence = excluded.confidence,
+                     approval_status = excluded.approval_status,
+                     review_notes = excluded.review_notes,
+                     reviewed_at = excluded.reviewed_at,
+                     approved_ref = excluded.approved_ref,
+                     updated_at = excluded.updated_at"
+                    .to_string(),
+                vec![
+                    candidate.id.clone().into(),
+                    candidate.candidate_type.clone().into(),
+                    candidate.subject_key.clone().into(),
+                    candidate.title.clone().into(),
+                    candidate.summary.clone().into(),
+                    candidate.project_id.clone().into(),
+                    candidate.conversation_id.clone().into(),
+                    candidate.pattern_id.clone().into(),
+                    json_text(&candidate.evidence_refs).into(),
+                    json_text(&candidate.proposed_content).into(),
+                    candidate.confidence.into(),
+                    candidate.approval_status.clone().into(),
+                    candidate.review_notes.clone().into(),
+                    candidate.reviewed_at.clone().into(),
+                    candidate.approved_ref.clone().into(),
+                    candidate.created_at.clone().into(),
+                    candidate.updated_at.clone().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_learning_candidate(
+        &self,
+        id: &str,
+    ) -> Result<Option<learning_candidate::Model>> {
+        let backend = self.db.get_database_backend();
+        let row = self
+            .db
+            .query_one(Self::statement_with_values(
+                backend,
+                "SELECT id, candidate_type, subject_key, title, summary, project_id,
+                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
+                        proposed_content::text AS proposed_content, confidence,
+                        approval_status, review_notes, reviewed_at, approved_ref,
+                        created_at, updated_at
+                 FROM learning_candidates
+                 WHERE id = ?"
+                    .to_string(),
+                vec![id.to_string().into()],
+            ))
+            .await?;
+        row.as_ref().map(parse_learning_candidate_row).transpose()
+    }
+
+    pub async fn list_learning_candidates(
+        &self,
+        approval_status: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<learning_candidate::Model>> {
+        let backend = self.db.get_database_backend();
+        let (sql, params) = if let Some(status) = approval_status.filter(|v| !v.trim().is_empty()) {
+            (
+                "SELECT id, candidate_type, subject_key, title, summary, project_id,
+                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
+                        proposed_content::text AS proposed_content, confidence,
+                        approval_status, review_notes, reviewed_at, approved_ref,
+                        created_at, updated_at
+                 FROM learning_candidates
+                 WHERE approval_status = ?
+                 ORDER BY updated_at DESC
+                 LIMIT ?"
+                    .to_string(),
+                vec![
+                    status.to_string().into(),
+                    Self::db_bound_integer(limit).into(),
+                ],
+            )
+        } else {
+            (
+                "SELECT id, candidate_type, subject_key, title, summary, project_id,
+                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
+                        proposed_content::text AS proposed_content, confidence,
+                        approval_status, review_notes, reviewed_at, approved_ref,
+                        created_at, updated_at
+                 FROM learning_candidates
+                 ORDER BY updated_at DESC
+                 LIMIT ?"
+                    .to_string(),
+                vec![Self::db_bound_integer(limit).into()],
+            )
+        };
+        let rows = self
+            .db
+            .query_all(Self::statement_with_values(backend, sql, params))
+            .await?;
+        rows.iter().map(parse_learning_candidate_row).collect()
+    }
+
+    pub async fn update_learning_candidate_review(
+        &self,
+        id: &str,
+        approval_status: &str,
+        review_notes: Option<&str>,
+        approved_ref: Option<&str>,
+    ) -> Result<()> {
+        let backend = self.db.get_database_backend();
+        self.db
+            .execute(Self::statement_with_values(
+                backend,
+                "UPDATE learning_candidates
+                 SET approval_status = ?,
+                     review_notes = ?,
+                     reviewed_at = ?,
+                     approved_ref = ?,
+                     updated_at = ?
+                 WHERE id = ?"
+                    .to_string(),
+                vec![
+                    approval_status.to_string().into(),
+                    review_notes.map(|value| value.to_string()).into(),
+                    chrono::Utc::now().to_rfc3339().into(),
+                    approved_ref.map(|value| value.to_string()).into(),
+                    chrono::Utc::now().to_rfc3339().into(),
+                    id.to_string().into(),
+                ],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn learning_queue_counts(&self) -> Result<LearningQueueCounts> {
+        let backend = self.db.get_database_backend();
+        let row = self
+            .db
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT
+                    (SELECT COUNT(*)::BIGINT FROM experience_runs WHERE success_state = 'provisional') AS provisional_runs,
+                    (SELECT COUNT(*)::BIGINT FROM experience_runs WHERE consolidated = FALSE AND (success_state <> 'provisional' OR correction_state = 'corrected')) AS pending_consolidation,
+                    (SELECT COUNT(*)::BIGINT FROM learning_candidates WHERE approval_status = 'draft') AS draft_candidates,
+                    (SELECT COUNT(*)::BIGINT FROM procedural_patterns WHERE status = 'active') AS active_patterns"
+                    .to_string(),
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(LearningQueueCounts::default());
+        };
+        Ok(LearningQueueCounts {
+            provisional_runs: row
+                .try_get::<i64>("", "provisional_runs")
+                .unwrap_or_default()
+                .max(0) as u64,
+            pending_consolidation: row
+                .try_get::<i64>("", "pending_consolidation")
+                .unwrap_or_default()
+                .max(0) as u64,
+            draft_candidates: row
+                .try_get::<i64>("", "draft_candidates")
+                .unwrap_or_default()
+                .max(0) as u64,
+            active_patterns: row
+                .try_get::<i64>("", "active_patterns")
+                .unwrap_or_default()
+                .max(0) as u64,
+        })
+    }
+
+    pub async fn request_execution_run_cancel(&self, id: &str) -> Result<bool> {
+        let result = self
+            .db
+            .execute(Self::statement_with_values(
+                self.db.get_database_backend(),
+                "UPDATE execution_runs
+                 SET cancellation_requested = TRUE, updated_at = ?
+                 WHERE id = ?"
+                    .to_string(),
+                vec![
+                    chrono::Utc::now().to_rfc3339().into(),
+                    id.to_string().into(),
+                ],
+            ))
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn latest_migration_version(&self) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_one(Statement::from_string(
+                self.db.get_database_backend(),
+                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1".to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<i64>("", "version").ok()))
+    }
+
+    pub async fn database_table_names(&self) -> Result<Vec<String>> {
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                self.db.get_database_backend(),
+                "SELECT table_name
+                 FROM information_schema.tables
+                 WHERE table_schema = current_schema()
+                 ORDER BY table_name"
+                    .to_string(),
+            ))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "table_name").ok())
+            .collect())
+    }
+
+    pub async fn database_size_bytes(&self) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_one(Statement::from_string(
+                self.db.get_database_backend(),
+                "SELECT pg_database_size(current_database()) AS size_bytes".to_string(),
+            ))
+            .await?
+            .and_then(|row| row.try_get::<i64>("", "size_bytes").ok()))
+    }
+
+    pub async fn lease_status_summary(&self) -> Result<LeaseStatusSummary> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let pending_status = serde_json::to_string(&crate::core::TaskStatus::Pending)
+            .unwrap_or_else(|_| "\"pending\"".to_string());
+        let row = self
+            .db
+            .query_one(Self::statement_with_values(
+                self.db.get_database_backend(),
+                "SELECT
+                    (SELECT COUNT(*)::BIGINT
+                     FROM tasks
+                     WHERE status = ?
+                       AND (scheduled_for IS NULL OR scheduled_for <= ?)
+                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS pending_task_backlog,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM tasks
+                     WHERE lease_expires_at IS NOT NULL
+                       AND lease_expires_at > ?) AS active_task_leases,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM tasks
+                     WHERE next_retry_at IS NOT NULL
+                       AND next_retry_at > ?) AS tasks_waiting_retry,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM watchers
+                     WHERE status = 'active'
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS watcher_poll_backlog,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM watchers
+                     WHERE lease_expires_at IS NOT NULL
+                       AND lease_expires_at > ?) AS active_watcher_leases,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM watchers
+                     WHERE next_retry_at IS NOT NULL
+                       AND next_retry_at > ?) AS watchers_waiting_retry,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM execution_runs
+                     WHERE lease_expires_at IS NOT NULL
+                       AND lease_expires_at > ?) AS active_run_leases,
+                    (SELECT COUNT(*)::BIGINT
+                     FROM execution_runs
+                     WHERE cancellation_requested = TRUE
+                       AND status NOT IN ('completed', 'degraded', 'needs_input', 'blocked', 'platform_failed', 'cancelled')
+                    ) AS runs_pending_cancellation"
+                    .to_string(),
+                vec![
+                    pending_status.into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                    now.clone().into(),
+                ],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(LeaseStatusSummary::default());
+        };
+        Ok(LeaseStatusSummary {
+            pending_task_backlog: row
+                .try_get::<i64>("", "pending_task_backlog")
+                .unwrap_or_default()
+                .max(0) as u64,
+            active_task_leases: row
+                .try_get::<i64>("", "active_task_leases")
+                .unwrap_or_default()
+                .max(0) as u64,
+            tasks_waiting_retry: row
+                .try_get::<i64>("", "tasks_waiting_retry")
+                .unwrap_or_default()
+                .max(0) as u64,
+            watcher_poll_backlog: row
+                .try_get::<i64>("", "watcher_poll_backlog")
+                .unwrap_or_default()
+                .max(0) as u64,
+            active_watcher_leases: row
+                .try_get::<i64>("", "active_watcher_leases")
+                .unwrap_or_default()
+                .max(0) as u64,
+            watchers_waiting_retry: row
+                .try_get::<i64>("", "watchers_waiting_retry")
+                .unwrap_or_default()
+                .max(0) as u64,
+            active_run_leases: row
+                .try_get::<i64>("", "active_run_leases")
+                .unwrap_or_default()
+                .max(0) as u64,
+            runs_pending_cancellation: row
+                .try_get::<i64>("", "runs_pending_cancellation")
+                .unwrap_or_default()
+                .max(0) as u64,
+        })
     }
 
     // ==================== Expenses ====================
@@ -2347,7 +4110,7 @@ PRAGMA busy_timeout = 5000;\n",
     pub async fn get_recent_delegations(&self, limit: u64) -> Result<Vec<swarm_delegation::Model>> {
         let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for delegation in &mut delegations {
@@ -2443,8 +4206,8 @@ PRAGMA busy_timeout = 5000;\n",
         }
 
         let convs = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         Ok(convs)
@@ -2481,7 +4244,7 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(cursor_filter);
         }
 
-        let convs = query.limit(Self::sqlite_limit(limit)).all(&self.db).await?;
+        let convs = query.limit(Self::db_limit(limit)).all(&self.db).await?;
         Ok(convs)
     }
 
@@ -2643,8 +4406,8 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::ConversationId.eq(conversation_id))
             .order_by_asc(message::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
@@ -2662,7 +4425,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::ConversationId.eq(conversation_id))
             .order_by_desc(message::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         msgs.reverse();
@@ -2677,7 +4440,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut msgs = message::Entity::find()
             .filter(message::Column::Role.eq("user"))
             .order_by_desc(message::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
@@ -2875,8 +4638,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(document::Column::ProjectId.eq(pid));
         }
         let mut docs = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for doc in &mut docs {
@@ -2984,12 +4747,10 @@ PRAGMA busy_timeout = 5000;\n",
 
     // ==================== Notifications ====================
 
-    const NOTIFICATION_RETENTION_DAYS: i64 = 7;
     // Deduplicate repetitive notifications (same root message) to avoid spamming users/UI.
-    // This is separate from retention, which deletes old rows after NOTIFICATION_RETENTION_DAYS.
+    // This is separate from retention, which deletes old rows according to data lifecycle settings.
     const NOTIFICATION_DEDUP_COOLDOWN_DAYS: i64 = 7;
     const ARKPULSE_NOTIFICATION_WINDOW_HOURS: i64 = 24;
-    const NOTIFICATION_PURGE_MIN_INTERVAL_SECS: i64 = 3600;
     const NOTIFICATION_PURGE_LAST_RUN_KEY: &'static str = "notifications_retention_last_purge_v1";
 
     fn notification_is_critical(level: &str, source: &str, title: &str) -> bool {
@@ -3049,6 +4810,7 @@ PRAGMA busy_timeout = 5000;\n",
 
     async fn maybe_purge_old_notifications(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
+        let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
         let last_run = self
             .get(Self::NOTIFICATION_PURGE_LAST_RUN_KEY)
             .await?
@@ -3056,18 +4818,9 @@ PRAGMA busy_timeout = 5000;\n",
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
 
-        if last_run > 0 && (now - last_run) < Self::NOTIFICATION_PURGE_MIN_INTERVAL_SECS {
+        if last_run > 0 && (now - last_run) < lifecycle.notification_cleanup_interval_secs as i64 {
             return Ok(());
         }
-
-        let cutoff = (chrono::Utc::now()
-            - chrono::Duration::days(Self::NOTIFICATION_RETENTION_DAYS))
-        .to_rfc3339();
-
-        let result = notification::Entity::delete_many()
-            .filter(notification::Column::CreatedAt.lt(cutoff))
-            .exec(&self.db)
-            .await?;
 
         let _ = self
             .set(
@@ -3076,11 +4829,24 @@ PRAGMA busy_timeout = 5000;\n",
             )
             .await;
 
+        if lifecycle.notifications_retention_days == 0 {
+            return Ok(());
+        }
+
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::days(lifecycle.notifications_retention_days as i64))
+        .to_rfc3339();
+
+        let result = notification::Entity::delete_many()
+            .filter(notification::Column::CreatedAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+
         if result.rows_affected > 0 {
             tracing::info!(
                 "Purged {} notifications older than {} days",
                 result.rows_affected,
-                Self::NOTIFICATION_RETENTION_DAYS
+                lifecycle.notifications_retention_days
             );
         }
 
@@ -3178,8 +4944,8 @@ PRAGMA busy_timeout = 5000;\n",
             query = query.filter(notification::Column::Read.eq(false));
         }
         let mut notifs = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for notif in &mut notifs {
@@ -3342,7 +5108,7 @@ PRAGMA busy_timeout = 5000;\n",
         let episodes = episode::Entity::find()
             .filter(episode::Column::Consolidated.eq(false))
             .order_by_asc(episode::Column::Timestamp)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         Ok(episodes)
@@ -3358,8 +5124,8 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<Vec<approval_log::Model>> {
         let mut log = approval_log::Entity::find()
             .order_by_desc(approval_log::Column::RequestedAt)
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for row in &mut log {
@@ -3549,8 +5315,8 @@ PRAGMA busy_timeout = 5000;\n",
     ) -> Result<Vec<crate::storage::entities::execution_trace::Model>> {
         let mut traces = crate::storage::entities::execution_trace::Entity::find()
             .order_by_desc(crate::storage::entities::execution_trace::Column::CreatedAt)
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for trace in &mut traces {
@@ -3606,7 +5372,7 @@ PRAGMA busy_timeout = 5000;\n",
     pub async fn list_security_logs(&self, limit: u64) -> Result<Vec<security_log::Model>> {
         let mut logs = security_log::Entity::find()
             .order_by_desc(security_log::Column::CreatedAt)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for log in &mut logs {
@@ -3630,8 +5396,8 @@ PRAGMA busy_timeout = 5000;\n",
         }
 
         let mut logs = query
-            .limit(Self::sqlite_limit(limit))
-            .offset(Self::sqlite_offset(offset))
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
             .all(&self.db)
             .await?;
         for log in &mut logs {
@@ -3702,7 +5468,7 @@ PRAGMA busy_timeout = 5000;\n",
         let mut rows = operational_log::Entity::find()
             .filter(operational_log::Column::EventType.eq(event_type.to_string()))
             .order_by_desc(operational_log::Column::CreatedAt)
-            .limit(Self::sqlite_limit(limit))
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for row in &mut rows {
@@ -3733,11 +5499,12 @@ PRAGMA busy_timeout = 5000;\n",
 
     async fn maybe_purge_housekeeping_tables(&self) -> Result<()> {
         let now = chrono::Utc::now();
+        let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
         if let Some(bytes) = self.get(Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY).await? {
             if let Ok(raw) = String::from_utf8(bytes) {
                 if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&raw) {
                     if (now - last.with_timezone(&chrono::Utc)).num_seconds()
-                        < Self::HOUSEKEEPING_PURGE_MIN_INTERVAL_SECS
+                        < lifecycle.housekeeping_interval_secs as i64
                     {
                         return Ok(());
                     }
@@ -3745,92 +5512,142 @@ PRAGMA busy_timeout = 5000;\n",
             }
         }
 
-        let trace_cutoff =
-            (now - chrono::Duration::days(Self::EXECUTION_TRACE_RETENTION_DAYS)).to_rfc3339();
-        let proof_cutoff =
-            (now - chrono::Duration::days(Self::EXECUTION_PROOF_RETENTION_DAYS)).to_rfc3339();
-        let operational_cutoff =
-            (now - chrono::Duration::days(Self::OPERATIONAL_LOG_RETENTION_DAYS)).to_rfc3339();
-        let security_cutoff =
-            (now - chrono::Duration::days(Self::SECURITY_LOG_RETENTION_DAYS)).to_rfc3339();
-        let approval_cutoff =
-            (now - chrono::Duration::days(Self::APPROVAL_LOG_RETENTION_DAYS)).to_rfc3339();
-        let delegation_cutoff =
-            (now - chrono::Duration::days(Self::SWARM_DELEGATION_RETENTION_DAYS)).to_rfc3339();
-        let llm_usage_cutoff =
-            (now - chrono::Duration::days(Self::LLM_USAGE_RETENTION_DAYS)).to_rfc3339();
-        let terminal_task_cutoff =
-            (now - chrono::Duration::days(Self::TERMINAL_TASK_RETENTION_DAYS)).to_rfc3339();
-        let message_cutoff =
-            (now - chrono::Duration::days(Self::MESSAGE_RETENTION_DAYS)).to_rfc3339();
+        let all_retention_disabled = lifecycle.execution_trace_retention_days == 0
+            && lifecycle.execution_proof_retention_days == 0
+            && lifecycle.operational_log_retention_days == 0
+            && lifecycle.security_log_retention_days == 0
+            && lifecycle.approval_log_retention_days == 0
+            && lifecycle.swarm_delegation_retention_days == 0
+            && lifecycle.llm_usage_retention_days == 0
+            && lifecycle.terminal_task_retention_days == 0
+            && lifecycle.message_retention_days == 0;
+
+        if all_retention_disabled {
+            self.set(
+                Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY,
+                now.to_rfc3339().as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
 
         let txn = self.db.begin().await?;
-        let message_delete = message::Entity::delete_many()
-            .filter(message::Column::Timestamp.lt(message_cutoff.clone()))
-            .exec(&txn)
-            .await?;
-        if message_delete.rows_affected > 0 {
-            txn.execute(Statement::from_string(
-                DbBackend::Sqlite,
-                "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.conversation_id = conversations.id);".to_string(),
-            ))
-            .await?;
-            conversation::Entity::delete_many()
-                .filter(conversation::Column::MessageCount.eq(0))
-                .filter(conversation::Column::UpdatedAt.lt(message_cutoff))
+        if lifecycle.message_retention_days > 0 {
+            let message_cutoff = (now
+                - chrono::Duration::days(lifecycle.message_retention_days as i64))
+            .to_rfc3339();
+            let message_delete = message::Entity::delete_many()
+                .filter(message::Column::Timestamp.lt(message_cutoff.clone()))
+                .exec(&txn)
+                .await?;
+            if message_delete.rows_affected > 0 {
+                txn.execute(Statement::from_string(
+                    self.db.get_database_backend(),
+                    "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.conversation_id = conversations.id);".to_string(),
+                ))
+                .await?;
+                conversation::Entity::delete_many()
+                    .filter(conversation::Column::MessageCount.eq(0))
+                    .filter(conversation::Column::UpdatedAt.lt(message_cutoff))
+                    .exec(&txn)
+                    .await?;
+            }
+        }
+
+        if lifecycle.execution_trace_retention_days > 0 {
+            let trace_cutoff = (now
+                - chrono::Duration::days(lifecycle.execution_trace_retention_days as i64))
+            .to_rfc3339();
+            crate::storage::entities::execution_trace::Entity::delete_many()
+                .filter(
+                    crate::storage::entities::execution_trace::Column::CreatedAt.lt(trace_cutoff),
+                )
                 .exec(&txn)
                 .await?;
         }
-        crate::storage::entities::execution_trace::Entity::delete_many()
-            .filter(crate::storage::entities::execution_trace::Column::CreatedAt.lt(trace_cutoff))
-            .exec(&txn)
-            .await?;
-        crate::storage::entities::execution_proof::Entity::delete_many()
-            .filter(crate::storage::entities::execution_proof::Column::Timestamp.lt(proof_cutoff))
-            .exec(&txn)
-            .await?;
-        operational_log::Entity::delete_many()
-            .filter(operational_log::Column::CreatedAt.lt(operational_cutoff))
-            .exec(&txn)
-            .await?;
-        security_log::Entity::delete_many()
-            .filter(security_log::Column::CreatedAt.lt(security_cutoff))
-            .exec(&txn)
-            .await?;
-        approval_log::Entity::delete_many()
-            .filter(approval_log::Column::RequestedAt.lt(approval_cutoff))
-            .filter(approval_log::Column::Status.ne("pending"))
-            .exec(&txn)
-            .await?;
-        swarm_delegation::Entity::delete_many()
-            .filter(swarm_delegation::Column::CreatedAt.lt(delegation_cutoff))
-            .exec(&txn)
-            .await?;
-        llm_usage::Entity::delete_many()
-            .filter(llm_usage::Column::CreatedAt.lt(llm_usage_cutoff))
-            .exec(&txn)
-            .await?;
+        if lifecycle.execution_proof_retention_days > 0 {
+            let proof_cutoff = (now
+                - chrono::Duration::days(lifecycle.execution_proof_retention_days as i64))
+            .to_rfc3339();
+            crate::storage::entities::execution_proof::Entity::delete_many()
+                .filter(
+                    crate::storage::entities::execution_proof::Column::Timestamp.lt(proof_cutoff),
+                )
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.operational_log_retention_days > 0 {
+            let operational_cutoff = (now
+                - chrono::Duration::days(lifecycle.operational_log_retention_days as i64))
+            .to_rfc3339();
+            operational_log::Entity::delete_many()
+                .filter(operational_log::Column::CreatedAt.lt(operational_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.security_log_retention_days > 0 {
+            let security_cutoff = (now
+                - chrono::Duration::days(lifecycle.security_log_retention_days as i64))
+            .to_rfc3339();
+            security_log::Entity::delete_many()
+                .filter(security_log::Column::CreatedAt.lt(security_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.approval_log_retention_days > 0 {
+            let approval_cutoff = (now
+                - chrono::Duration::days(lifecycle.approval_log_retention_days as i64))
+            .to_rfc3339();
+            approval_log::Entity::delete_many()
+                .filter(approval_log::Column::RequestedAt.lt(approval_cutoff))
+                .filter(approval_log::Column::Status.ne("pending"))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.swarm_delegation_retention_days > 0 {
+            let delegation_cutoff = (now
+                - chrono::Duration::days(lifecycle.swarm_delegation_retention_days as i64))
+            .to_rfc3339();
+            swarm_delegation::Entity::delete_many()
+                .filter(swarm_delegation::Column::CreatedAt.lt(delegation_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.llm_usage_retention_days > 0 {
+            let llm_usage_cutoff = (now
+                - chrono::Duration::days(lifecycle.llm_usage_retention_days as i64))
+            .to_rfc3339();
+            llm_usage::Entity::delete_many()
+                .filter(llm_usage::Column::CreatedAt.lt(llm_usage_cutoff))
+                .exec(&txn)
+                .await?;
+        }
 
-        let stale_tasks = task::Entity::find()
-            .filter(task::Column::CreatedAt.lt(terminal_task_cutoff))
-            .all(&txn)
-            .await?;
-        for stale_task in stale_tasks {
-            if stale_task.cron.is_some() {
-                continue;
+        if lifecycle.terminal_task_retention_days > 0 {
+            let terminal_task_cutoff = (now
+                - chrono::Duration::days(lifecycle.terminal_task_retention_days as i64))
+            .to_rfc3339();
+            let stale_tasks = task::Entity::find()
+                .filter(task::Column::CreatedAt.lt(terminal_task_cutoff))
+                .all(&txn)
+                .await?;
+            for stale_task in stale_tasks {
+                if stale_task.cron.is_some() {
+                    continue;
+                }
+                let status = serde_json::from_str::<crate::core::TaskStatus>(&stale_task.status)
+                    .unwrap_or(crate::core::TaskStatus::Pending);
+                let terminal = matches!(
+                    status,
+                    crate::core::TaskStatus::Completed
+                        | crate::core::TaskStatus::Cancelled
+                        | crate::core::TaskStatus::Failed { .. }
+                );
+                if !terminal {
+                    continue;
+                }
+                task::Entity::delete_by_id(stale_task.id).exec(&txn).await?;
             }
-            let status = serde_json::from_str::<crate::core::TaskStatus>(&stale_task.status)
-                .unwrap_or(crate::core::TaskStatus::Pending);
-            let terminal = matches!(
-                status,
-                crate::core::TaskStatus::Completed
-                    | crate::core::TaskStatus::Cancelled
-                    | crate::core::TaskStatus::Failed { .. }
-            );
-            if !terminal {
-                continue;
-            }
-            task::Entity::delete_by_id(stale_task.id).exec(&txn).await?;
         }
         txn.commit().await?;
 
@@ -3840,46 +5657,5 @@ PRAGMA busy_timeout = 5000;\n",
         )
         .await?;
         Ok(())
-    }
-
-    /// Run SQLite quick integrity check.
-    pub async fn sqlite_quick_check(&self) -> Result<String> {
-        let row = self
-            .db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA quick_check(1);".to_string(),
-            ))
-            .await?;
-
-        if let Some(row) = row {
-            let result: String = row
-                .try_get("", "quick_check")
-                .unwrap_or_else(|_| "unknown".to_string());
-            Ok(result)
-        } else {
-            Ok("unknown".to_string())
-        }
-    }
-
-    /// List SQLite table names (excluding internal sqlite_* tables).
-    pub async fn sqlite_table_names(&self) -> Result<Vec<String>> {
-        let rows = self
-            .db
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;".to_string(),
-            ))
-            .await?;
-
-        let mut names = Vec::new();
-        for row in rows {
-            if let Ok(name) = row.try_get::<String>("", "name") {
-                if !name.starts_with("sqlite_") {
-                    names.push(name);
-                }
-            }
-        }
-        Ok(names)
     }
 }

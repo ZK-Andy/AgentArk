@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::channels;
+use crate::core::data_lifecycle::load_data_lifecycle_settings;
 use crate::core::{Agent, TaskStatus};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -1367,37 +1368,51 @@ async fn run_runtime_hardening_checks(
     }
 }
 
-fn run_resource_checks(
-    data_dir: &Path,
+async fn run_resource_checks(
+    agent: &Agent,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
     security_thresholds: ArkPulseSecurityThresholds,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    let db_path = data_dir.join("agentark.db");
-    if let Ok(meta) = std::fs::metadata(&db_path) {
-        let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
-        if size_mb > 1024.0 {
-            push_finding!(
-                findings,
-                "high",
-                "resource",
-                db_path.display().to_string(),
-                "Database size is very large",
-                format!("{:.1} MB", size_mb),
-                "Database growth can degrade query performance and backup times.",
-                "Archive old rows and run VACUUM during maintenance window".to_string(),
-            );
-        } else if size_mb > 512.0 {
+    match agent.storage.database_size_bytes().await {
+        Ok(Some(size_bytes)) => {
+            let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+            if size_mb > 1024.0 {
+                push_finding!(
+                    findings,
+                    "high",
+                    "resource",
+                    "postgres",
+                    "Database size is very large",
+                    format!("{:.1} MB", size_mb),
+                    "Database growth can degrade query performance and backup times.",
+                    "Archive old rows and review Postgres vacuum/backup cadence".to_string(),
+                );
+            } else if size_mb > 512.0 {
+                push_finding!(
+                    findings,
+                    "medium",
+                    "resource",
+                    "postgres",
+                    "Database size growth warning",
+                    format!("{:.1} MB", size_mb),
+                    "Storage growth trend may indicate missing retention policies.",
+                    "Review retention windows for traces, logs, and notifications".to_string(),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
             push_finding!(
                 findings,
                 "medium",
                 "resource",
-                db_path.display().to_string(),
-                "Database size growth warning",
-                format!("{:.1} MB", size_mb),
-                "Storage growth trend may indicate missing retention policies.",
-                "Review retention windows for traces, logs, and notifications".to_string(),
+                "postgres",
+                "Could not read database size",
+                error.to_string(),
+                "Database growth could not be evaluated.",
+                "Verify Postgres connectivity and permissions for size introspection".to_string(),
             );
         }
     }
@@ -1516,35 +1531,47 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
                 "Backup directory is empty",
                 "No backup artifacts found".to_string(),
                 "No restore point is available if DB corruption occurs.",
-                "Create first full backup of data/agentark.db".to_string(),
+                "Create a Postgres logical backup or snapshot the Postgres volume".to_string(),
             );
         }
     }
 
-    match agent.storage.sqlite_quick_check().await {
-        Ok(result) => {
-            if result.to_lowercase() != "ok" {
+    match agent.storage.latest_migration_version().await {
+        Ok(Some(version)) => {
+            if version < 1 {
                 push_finding!(
                     findings,
                     "critical",
                     "data_safety",
-                    "sqlite",
-                    "SQLite integrity check failed",
-                    format!("PRAGMA quick_check => {}", result),
-                    "Database may be corrupted or partially inconsistent.",
-                    "Stop writes, restore from backup, and run PRAGMA integrity_check".to_string(),
+                    "postgres schema",
+                    "Migration state is behind baseline",
+                    format!("Latest migration version: {}", version),
+                    "Expected Postgres schema baseline was not applied.",
+                    "Run migrations before accepting traffic".to_string(),
                 );
             }
+        }
+        Ok(None) => {
+            push_finding!(
+                findings,
+                "critical",
+                "data_safety",
+                "postgres schema",
+                "Migration state missing",
+                "schema_migrations table returned no version".to_string(),
+                "The Postgres schema may be uninitialized or partially applied.",
+                "Re-run the bootstrap/migration path against Postgres".to_string(),
+            );
         }
         Err(e) => {
             push_finding!(
                 findings,
                 "high",
                 "data_safety",
-                "sqlite",
-                "SQLite integrity check unavailable",
+                "postgres schema",
+                "Migration status unavailable",
                 e.to_string(),
-                "Could not validate database integrity.",
+                "Could not validate database migration state.",
                 "Investigate DB connectivity and permissions".to_string(),
             );
         }
@@ -1558,8 +1585,12 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
         "messages",
         "conversations",
         "approval_log",
+        "execution_runs",
+        "run_checkpoints",
+        "tool_attempts",
+        "watchers",
     ];
-    match agent.storage.sqlite_table_names().await {
+    match agent.storage.database_table_names().await {
         Ok(tables) => {
             let table_set: HashSet<String> = tables.into_iter().collect();
             let missing: Vec<&str> = required_tables
@@ -1572,11 +1603,11 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
                     findings,
                     "critical",
                     "data_safety",
-                    "sqlite schema",
+                    "postgres schema",
                     "Schema drift or failed migration",
                     format!("Missing tables: {}", missing.join(", ")),
                     "Expected storage schema is incomplete.",
-                    "Run migration/bootstrap table creation and restore missing schema".to_string(),
+                    "Run Postgres migrations and restore missing schema".to_string(),
                 );
             }
         }
@@ -1585,11 +1616,11 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
                 findings,
                 "medium",
                 "data_safety",
-                "sqlite schema",
+                "postgres schema",
                 "Could not verify schema",
                 e.to_string(),
                 "Schema validation query failed.",
-                "Check SQLite permissions and migration code path".to_string(),
+                "Check Postgres permissions and migration code path".to_string(),
             );
         }
     }
@@ -2000,12 +2031,13 @@ async fn run_doctor_checks(
     .await;
     run_runtime_hardening_checks(http_client, &http_base, &app_endpoints, &mut findings).await;
     run_resource_checks(
-        &data_dir,
+        agent,
         deployed_apps,
         security,
         security_thresholds,
         &mut findings,
-    );
+    )
+    .await;
     run_data_safety_checks(agent, &data_dir, &mut findings).await;
     run_policy_compliance_checks(&mut findings);
 
@@ -2043,6 +2075,12 @@ pub struct SentinelConfig {
     pub integration_sync_interval: u64,
     /// How often to run memory consolidation (seconds)
     pub consolidation_interval: u64,
+    /// How often to consolidate execution experiences into learned memory (seconds)
+    pub experience_consolidation_interval: u64,
+    /// How often to induce procedural patterns from learned procedures (seconds)
+    pub pattern_induction_interval: u64,
+    /// How often to generate approval-gated learning candidates (seconds)
+    pub candidate_generation_interval: u64,
     /// How often to expire old approvals (seconds)
     pub approval_expiry_interval: u64,
     /// How often to run ArkPulse (seconds, 0 = disabled)
@@ -2065,6 +2103,9 @@ impl Default for SentinelConfig {
             watcher_interval: 15,
             integration_sync_interval: 120,
             consolidation_interval: 600,
+            experience_consolidation_interval: 600,
+            pattern_induction_interval: 900,
+            candidate_generation_interval: 1200,
             approval_expiry_interval: 300,
             pulse_interval: 1800,              // 30 minutes
             mem0_cleanup_check_interval: 3600, // Check hourly, but only run monthly when idle
@@ -2198,6 +2239,87 @@ pub fn start(
                     || {
                         let agent = agent.clone();
                         async move { run_consolidation(&agent).await }
+                    },
+                )
+                .await;
+            }
+        })
+    });
+
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                config.experience_consolidation_interval,
+            ));
+            interval.tick().await;
+            loop {
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
+                run_with_busy_deferral(
+                    &agent,
+                    "experience_consolidation",
+                    MAINTENANCE_DEFER_MINUTES,
+                    MAINTENANCE_MAX_DEFERS,
+                    || {
+                        let agent = agent.clone();
+                        async move { run_experience_consolidation_job(&agent).await }
+                    },
+                )
+                .await;
+            }
+        })
+    });
+
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                config.pattern_induction_interval,
+            ));
+            interval.tick().await;
+            loop {
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
+                run_with_busy_deferral(
+                    &agent,
+                    "pattern_induction",
+                    MAINTENANCE_DEFER_MINUTES,
+                    MAINTENANCE_MAX_DEFERS,
+                    || {
+                        let agent = agent.clone();
+                        async move { run_pattern_induction_job(&agent).await }
+                    },
+                )
+                .await;
+            }
+        })
+    });
+
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                config.candidate_generation_interval,
+            ));
+            interval.tick().await;
+            loop {
+                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                    break;
+                }
+                run_with_busy_deferral(
+                    &agent,
+                    "candidate_generation",
+                    MAINTENANCE_DEFER_MINUTES,
+                    MAINTENANCE_MAX_DEFERS,
+                    || {
+                        let agent = agent.clone();
+                        async move { run_candidate_generation_job(&agent).await }
                     },
                 )
                 .await;
@@ -2449,7 +2571,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, pulse={}s, auto_analysis={}s, mem0_cleanup=monthly",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, mem0_cleanup=monthly",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -2458,6 +2580,9 @@ pub fn start(
             "off".to_string()
         },
         config.consolidation_interval,
+        config.experience_consolidation_interval,
+        config.pattern_induction_interval,
+        config.candidate_generation_interval,
         if config.pulse_interval > 0 {
             config.pulse_interval.to_string()
         } else {
@@ -2734,6 +2859,57 @@ async fn run_consolidation(agent: &SharedAgent) {
             }
         }
         Err(e) => tracing::debug!("ArkSentinel: consolidation skipped: {}", e),
+    }
+}
+
+async fn run_experience_consolidation_job(agent: &SharedAgent) {
+    let storage = {
+        let agent = agent.read().await;
+        agent.storage.clone()
+    };
+    match crate::core::learning::run_experience_consolidation(&storage).await {
+        Ok(processed) if processed > 0 => {
+            tracing::info!(
+                "ArkSentinel: experience consolidation processed {} run(s)",
+                processed
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::debug!("ArkSentinel: experience consolidation skipped: {}", error),
+    }
+}
+
+async fn run_pattern_induction_job(agent: &SharedAgent) {
+    let storage = {
+        let agent = agent.read().await;
+        agent.storage.clone()
+    };
+    match crate::core::learning::run_pattern_induction(&storage).await {
+        Ok(processed) if processed > 0 => {
+            tracing::info!(
+                "ArkSentinel: pattern induction updated {} pattern(s)",
+                processed
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::debug!("ArkSentinel: pattern induction skipped: {}", error),
+    }
+}
+
+async fn run_candidate_generation_job(agent: &SharedAgent) {
+    let storage = {
+        let agent = agent.read().await;
+        agent.storage.clone()
+    };
+    match crate::core::learning::run_candidate_generation(&storage).await {
+        Ok(processed) if processed > 0 => {
+            tracing::info!(
+                "ArkSentinel: candidate generation updated {} draft(s)",
+                processed
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::debug!("ArkSentinel: candidate generation skipped: {}", error),
     }
 }
 
@@ -3614,30 +3790,30 @@ pub async fn run_pulse(agent: &SharedAgent) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const SECURITY_CLEANUP_KEY: &str = "security_log_last_cleanup";
-/// 15 days between cleanups
-const SECURITY_CLEANUP_INTERVAL_SECS: i64 = 15 * 24 * 3600;
-/// Only run if no user activity in the last 5 minutes
-const SECURITY_IDLE_THRESHOLD_SECS: i64 = 300;
 
 async fn run_security_log_cleanup(agent: &SharedAgent) {
-    let (last_cleanup_bytes, last_activity) = {
+    let (storage, lifecycle, last_cleanup_bytes, last_activity) = {
         let agent_guard = agent.read().await;
-        let lc = agent_guard
-            .storage
-            .get(SECURITY_CLEANUP_KEY)
-            .await
-            .unwrap_or(None);
+        let storage = agent_guard.storage.clone();
+        let lifecycle = load_data_lifecycle_settings(&storage).await;
+        let lc = storage.get(SECURITY_CLEANUP_KEY).await.unwrap_or(None);
         let la = agent_guard.last_activity_at();
-        (lc, la)
+        (storage, lifecycle, lc, la)
     };
 
+    if lifecycle.security_log_retention_days == 0 {
+        return;
+    }
+
     let now = chrono::Utc::now();
+    let cleanup_interval_secs = (lifecycle.security_cleanup_interval_days as i64) * 24 * 3600;
+    let idle_threshold_secs = lifecycle.security_cleanup_idle_threshold_secs as i64;
 
     // Check if enough time has passed since last cleanup
     if let Some(bytes) = last_cleanup_bytes {
         if let Ok(ts_str) = String::from_utf8(bytes) {
             if let Ok(last_ts) = ts_str.parse::<chrono::DateTime<chrono::Utc>>() {
-                if (now - last_ts).num_seconds() < SECURITY_CLEANUP_INTERVAL_SECS {
+                if (now - last_ts).num_seconds() < cleanup_interval_secs {
                     return;
                 }
             }
@@ -3646,22 +3822,24 @@ async fn run_security_log_cleanup(agent: &SharedAgent) {
 
     // Check if server is idle
     if let Some(last) = last_activity {
-        if (now - last).num_seconds() < SECURITY_IDLE_THRESHOLD_SECS {
+        if (now - last).num_seconds() < idle_threshold_secs {
             return;
         }
     }
 
-    let agent_guard = agent.read().await;
-    match agent_guard.storage.cleanup_old_security_logs(15).await {
+    match storage
+        .cleanup_old_security_logs(lifecycle.security_log_retention_days as i64)
+        .await
+    {
         Ok(deleted) => {
             if deleted > 0 {
                 tracing::info!(
-                    "Security log cleanup: pruned {} entries older than 15 days",
-                    deleted
+                    "Security log cleanup: pruned {} entries older than {} days",
+                    deleted,
+                    lifecycle.security_log_retention_days
                 );
             }
-            let _ = agent_guard
-                .storage
+            let _ = storage
                 .set(SECURITY_CLEANUP_KEY, now.to_rfc3339().as_bytes())
                 .await;
         }

@@ -19,6 +19,7 @@ use super::orchestra::SubAgentType;
 use super::prompt_policy::{delegated_policy_v2_block, synthesis_policy_v2_block};
 use super::swarm::agent_trait::SwarmAgent;
 use super::swarm::specialist::SpecialistAgent;
+use super::{DegradationNote, DelegationStatus, FailureKind};
 use crate::actions::ActionDef;
 use crate::memory::MemoryEntry;
 
@@ -27,6 +28,206 @@ fn compact_text(text: &str, max_chars: usize) -> String {
         text.to_string()
     } else {
         format!("{}...", text.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn classify_agent_failure(error_text: &str) -> (DelegationStatus, FailureKind, String) {
+    let lower = error_text.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        (
+            DelegationStatus::TimedOut,
+            FailureKind::Timeout,
+            "Retry the delegated step with a longer timeout or continue with the completed work."
+                .to_string(),
+        )
+    } else {
+        (
+            DelegationStatus::Failed,
+            FailureKind::DelegationFailed,
+            "Retry the delegated step or continue with the partial results.".to_string(),
+        )
+    }
+}
+
+fn summarize_delegation_status(results: &[AgentExecResult]) -> DelegationStatus {
+    if results
+        .iter()
+        .all(|result| result.status == DelegationStatus::Completed)
+    {
+        return DelegationStatus::Completed;
+    }
+
+    let successful = results
+        .iter()
+        .filter(|result| result.status == DelegationStatus::Completed)
+        .count();
+    if successful > 0 {
+        return DelegationStatus::Partial;
+    }
+
+    if results
+        .iter()
+        .any(|result| result.status == DelegationStatus::Panicked)
+    {
+        DelegationStatus::Panicked
+    } else if results
+        .iter()
+        .any(|result| result.status == DelegationStatus::TimedOut)
+    {
+        DelegationStatus::TimedOut
+    } else {
+        DelegationStatus::Failed
+    }
+}
+
+fn render_agent_result_metadata(result: &AgentExecResult) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(confidence) = result.confidence {
+        parts.push(format!(
+            "confidence {:.0}%",
+            confidence.clamp(0.0, 1.0) * 100.0
+        ));
+    }
+    if !result.artifacts.is_empty() {
+        let preview = result
+            .artifacts
+            .iter()
+            .take(3)
+            .map(|artifact| compact_text(artifact, 80))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if result.artifacts.len() > 3 {
+            ", ..."
+        } else {
+            ""
+        };
+        parts.push(format!("artifacts: {}{}", preview, suffix));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
+}
+
+fn build_delegation_degradation(results: &[AgentExecResult]) -> Vec<DegradationNote> {
+    let degraded: Vec<&AgentExecResult> = results
+        .iter()
+        .filter(|result| result.status != DelegationStatus::Completed)
+        .collect();
+    if degraded.is_empty() {
+        return Vec::new();
+    }
+
+    let detail = degraded
+        .iter()
+        .map(|result| {
+            let name = result
+                .agent_name
+                .as_deref()
+                .unwrap_or(result.agent_type.as_str());
+            let failure_kind = result
+                .failure_kind
+                .as_ref()
+                .map(|kind| format!("{:?}", kind))
+                .unwrap_or_else(|| "unknown".to_string());
+            let metadata = render_agent_result_metadata(result)
+                .map(|value| format!(" | {}", value))
+                .unwrap_or_default();
+            format!(
+                "{} [{} / {}{}]: {}",
+                name,
+                result.status.as_str(),
+                failure_kind,
+                metadata,
+                compact_text(&result.content, 180)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    vec![DegradationNote {
+        kind: "delegation".to_string(),
+        summary: format!("{} delegated execution path(s) degraded", degraded.len()),
+        detail: Some(compact_text(&detail, 500)),
+    }]
+}
+
+fn build_fallback_delegation_response(
+    original_task: &str,
+    results: &[AgentExecResult],
+) -> super::llm::LlmResponse {
+    let completed: Vec<String> = results
+        .iter()
+        .filter(|result| result.status == DelegationStatus::Completed)
+        .map(|result| {
+            let metadata = render_agent_result_metadata(result)
+                .map(|value| format!(" ({})", value))
+                .unwrap_or_default();
+            format!(
+                "- {}{}: {}",
+                compact_text(&result.task, 100),
+                metadata,
+                compact_text(&result.content, 220)
+            )
+        })
+        .collect();
+    let follow_up: Vec<String> = results
+        .iter()
+        .filter(|result| result.status != DelegationStatus::Completed)
+        .map(|result| {
+            let label = result
+                .agent_name
+                .as_deref()
+                .unwrap_or(result.agent_type.as_str());
+            let reason = result
+                .failure_kind
+                .as_ref()
+                .map(|kind| format!("{:?}", kind))
+                .unwrap_or_else(|| "unknown".to_string());
+            let hint = result
+                .next_action_hint
+                .as_deref()
+                .map(|value| format!(" {}", value))
+                .unwrap_or_default();
+            format!(
+                "- {}: {} ({}){}",
+                label,
+                compact_text(&result.task, 100),
+                reason,
+                hint
+            )
+        })
+        .collect();
+
+    let mut sections = Vec::new();
+    if !completed.is_empty() {
+        sections.push(format!("Completed so far:\n{}", completed.join("\n")));
+    }
+    if !follow_up.is_empty() {
+        sections.push(format!("Still needs follow-up:\n{}", follow_up.join("\n")));
+    }
+    if sections.is_empty() {
+        sections.push("No delegated paths completed cleanly.".to_string());
+    }
+
+    let intro = if completed.is_empty() {
+        format!(
+            "I couldn't complete the delegated execution cleanly for this request: {}.",
+            compact_text(original_task, 160)
+        )
+    } else {
+        "I completed part of this request, but some delegated work degraded and needs follow-up."
+            .to_string()
+    };
+
+    super::llm::LlmResponse {
+        content: format!("{}\n\n{}", intro, sections.join("\n\n")),
+        tool_calls: vec![],
+        reasoning: Some("delegation_fallback_synthesis".to_string()),
+        usage: None,
+        provider: "internal".to_string(),
+        model: "delegation-fallback".to_string(),
     }
 }
 
@@ -176,6 +377,10 @@ pub struct DelegatedResult {
     pub _agent_results: Vec<AgentExecResult>,
     /// Total wall-clock time in milliseconds
     pub _total_time_ms: u64,
+    /// Whether delegation completed fully or only partially succeeded.
+    pub delegation_status: DelegationStatus,
+    /// Degradation notes that should be surfaced to the caller.
+    pub degradation: Vec<DegradationNote>,
 }
 
 /// Result from a single agent execution (for trace)
@@ -197,6 +402,16 @@ pub struct AgentExecResult {
     pub llm_response: Option<super::llm::LlmResponse>,
     /// Execution time in ms
     pub execution_time_ms: u64,
+    /// Typed status for this delegated execution path.
+    pub status: DelegationStatus,
+    /// Structured failure classification when the path did not complete cleanly.
+    pub failure_kind: Option<FailureKind>,
+    /// Optional next step hint for degraded sub-agent results.
+    pub next_action_hint: Option<String>,
+    /// Confidence reported by the delegation layer when available.
+    pub confidence: Option<f32>,
+    /// Artifact identifiers or summaries produced by the delegated path.
+    pub artifacts: Vec<String>,
 }
 
 /// Configuration for the task router
@@ -342,13 +557,73 @@ impl TaskRouter {
             .execute_assignments(&assignments, system_prompt, memories, actions, trace)
             .await?;
 
+        let delegation_status = summarize_delegation_status(&results);
+        let mut degradation = build_delegation_degradation(&results);
+        let completed_paths = results
+            .iter()
+            .filter(|result| result.status == DelegationStatus::Completed)
+            .count();
+
         // Aggregate
-        let mut final_response = if results.len() == 1 {
-            if let Some(resp) = results[0].llm_response.clone() {
-                resp
+        let mut final_response = if completed_paths == 0 {
+            degradation.push(DegradationNote {
+                kind: "delegation_synthesis".to_string(),
+                summary: "delegated synthesis skipped".to_string(),
+                detail: Some(
+                    "No delegated execution path completed cleanly, so the router returned a best-effort internal summary without another model hop."
+                        .to_string(),
+                ),
+            });
+            {
+                let mut t = trace.write().await;
+                t.steps.push(super::agent::ExecutionStep {
+                    icon: "[fallback]".to_string(),
+                    title: "Delegation Fallback Summary".to_string(),
+                    detail:
+                        "All delegated paths degraded, so AgentArk returned a best-effort summary."
+                            .to_string(),
+                    step_type: "warning".to_string(),
+                    data: None,
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                });
+            }
+            build_fallback_delegation_response(message, &results)
+        } else {
+            let aggregate_result = if results.len() == 1 {
+                if let Some(resp) = results[0].llm_response.clone() {
+                    Ok(resp)
+                } else {
+                    // Specialist-only single result: run a final synthesis pass so tool calls
+                    // can still be emitted by the primary model.
+                    self.aggregate(
+                        primary_llm,
+                        message,
+                        system_prompt,
+                        &results,
+                        memories,
+                        actions,
+                    )
+                    .await
+                }
             } else {
-                // Specialist-only single result: run a final synthesis pass so tool calls
-                // can still be emitted by the primary model.
+                // Trace: aggregating
+                {
+                    let mut t = trace.write().await;
+                    t.steps.push(super::agent::ExecutionStep {
+                        icon: "\u{1F504}".to_string(), // arrows
+                        title: format!("Synthesizing {} agent results", results.len()),
+                        detail: results
+                            .iter()
+                            .map(|r| r.agent_type.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        step_type: "thinking".to_string(),
+                        data: None,
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
+                }
                 self.aggregate(
                     primary_llm,
                     message,
@@ -357,35 +632,33 @@ impl TaskRouter {
                     memories,
                     actions,
                 )
-                .await?
+                .await
+            };
+
+            match aggregate_result {
+                Ok(response) => response,
+                Err(error) => {
+                    let error_text = compact_text(&error.to_string(), 240);
+                    degradation.push(DegradationNote {
+                        kind: "delegation_synthesis".to_string(),
+                        summary: "delegated synthesis fallback".to_string(),
+                        detail: Some(error_text.clone()),
+                    });
+                    {
+                        let mut t = trace.write().await;
+                        t.steps.push(super::agent::ExecutionStep {
+                            icon: "[fallback]".to_string(),
+                            title: "Delegation Synthesis Fallback".to_string(),
+                            detail: "The primary synthesis pass failed, so AgentArk returned a best-effort summary.".to_string(),
+                            step_type: "warning".to_string(),
+                            data: Some(error_text),
+                            timestamp: chrono::Utc::now(),
+                            duration_ms: None,
+                        });
+                    }
+                    build_fallback_delegation_response(message, &results)
+                }
             }
-        } else {
-            // Trace: aggregating
-            {
-                let mut t = trace.write().await;
-                t.steps.push(super::agent::ExecutionStep {
-                    icon: "\u{1F504}".to_string(), // arrows
-                    title: format!("Synthesizing {} agent results", results.len()),
-                    detail: results
-                        .iter()
-                        .map(|r| r.agent_type.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    step_type: "thinking".to_string(),
-                    data: None,
-                    timestamp: chrono::Utc::now(),
-                    duration_ms: None,
-                });
-            }
-            self.aggregate(
-                primary_llm,
-                message,
-                system_prompt,
-                &results,
-                memories,
-                actions,
-            )
-            .await?
         };
 
         // Safety net: delegated synthesis can occasionally omit tool calls even when
@@ -412,8 +685,17 @@ impl TaskRouter {
             t.steps.push(super::agent::ExecutionStep {
                 icon: "\u{2705}".to_string(), // checkmark
                 title: "Agent Delegation Complete".to_string(),
-                detail: format!("{} agents | {}ms", results.len(), total_time_ms),
-                step_type: "success".to_string(),
+                detail: format!(
+                    "{} agents | {}ms | status={}",
+                    results.len(),
+                    total_time_ms,
+                    delegation_status.as_str()
+                ),
+                step_type: if degradation.is_empty() {
+                    "success".to_string()
+                } else {
+                    "warning".to_string()
+                },
                 data: Some(
                     results
                         .iter()
@@ -423,7 +705,13 @@ impl TaskRouter {
                             } else {
                                 "auto"
                             };
-                            format!("{} [{}] ({}ms)", r.agent_type, tag, r.execution_time_ms)
+                            format!(
+                                "{} [{} / {}] ({}ms)",
+                                r.agent_type,
+                                tag,
+                                r.status.as_str(),
+                                r.execution_time_ms
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join(", "),
@@ -437,6 +725,8 @@ impl TaskRouter {
             final_response,
             _agent_results: results,
             _total_time_ms: total_time_ms,
+            delegation_status,
+            degradation,
         }))
     }
 
@@ -637,6 +927,11 @@ impl TaskRouter {
                                         content,
                                         llm_response: None,
                                         execution_time_ms: elapsed,
+                                        status: DelegationStatus::Completed,
+                                        failure_kind: None,
+                                        next_action_hint: None,
+                                        confidence: Some(1.0),
+                                        artifacts: Vec::new(),
                                     }),
                                     Ok(Err(e)) => Err(anyhow!("Specialist error: {}", e)),
                                     Err(_) => {
@@ -678,6 +973,11 @@ impl TaskRouter {
                                         content: resp.content.clone(),
                                         llm_response: Some(resp),
                                         execution_time_ms: elapsed,
+                                        status: DelegationStatus::Completed,
+                                        failure_kind: None,
+                                        next_action_hint: None,
+                                        confidence: Some(1.0),
+                                        artifacts: Vec::new(),
                                     }),
                                     Ok(Err(e)) => Err(anyhow!("Agent error: {}", e)),
                                     Err(_) => Err(anyhow!("Agent timed out after {}s", timeout)),
@@ -718,7 +1018,7 @@ impl TaskRouter {
                                     result.content.len()
                                 ),
                                 step_type: "success".to_string(),
-                                data: None,
+                                data: render_agent_result_metadata(&result),
                                 timestamp: chrono::Utc::now(),
                                 duration_ms: Some(result.execution_time_ms),
                             });
@@ -728,6 +1028,8 @@ impl TaskRouter {
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("Agent {} failed: {}", idx, e);
+                        let (status, failure_kind, next_action_hint) =
+                            classify_agent_failure(&e.to_string());
                         // Create a failure result so we can continue
                         results[idx] = Some(AgentExecResult {
                             agent_type: assignments[idx].agent_type.name(),
@@ -738,6 +1040,11 @@ impl TaskRouter {
                             content: format!("Agent failed: {}", e),
                             llm_response: None,
                             execution_time_ms: 0,
+                            status,
+                            failure_kind: Some(failure_kind),
+                            next_action_hint: Some(next_action_hint),
+                            confidence: None,
+                            artifacts: Vec::new(),
                         });
                         completed[idx] = true;
                     }
@@ -752,6 +1059,14 @@ impl TaskRouter {
                             content: format!("Agent panicked: {}", e),
                             llm_response: None,
                             execution_time_ms: 0,
+                            status: DelegationStatus::Panicked,
+                            failure_kind: Some(FailureKind::Panic),
+                            next_action_hint: Some(
+                                "Retry the delegated step or continue with the completed results."
+                                    .to_string(),
+                            ),
+                            confidence: None,
+                            artifacts: Vec::new(),
                         });
                         completed[idx] = true;
                     }
@@ -788,12 +1103,48 @@ impl TaskRouter {
                         r.agent_name.as_deref().unwrap_or("?")
                     )
                 };
-                format!(
-                    "## {} - {}\n{}",
-                    tag,
-                    compact_text(&r.task, 240),
-                    compact_text(&r.content, 1600)
-                )
+                let status_line = if r.status == DelegationStatus::Completed {
+                    String::new()
+                } else {
+                    let failure_kind = r
+                        .failure_kind
+                        .as_ref()
+                        .map(|kind| format!("{:?}", kind))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let next_step = r
+                        .next_action_hint
+                        .as_deref()
+                        .map(|hint| format!("\nNext step hint: {}", hint))
+                        .unwrap_or_default();
+                    format!(
+                        "Status: {} ({}){}",
+                        r.status.as_str(),
+                        failure_kind,
+                        next_step
+                    )
+                };
+                let metadata_line = render_agent_result_metadata(r)
+                    .map(|value| format!("\nMetadata: {}", value))
+                    .unwrap_or_default();
+                let body = compact_text(&r.content, 1600);
+                if status_line.is_empty() {
+                    format!(
+                        "## {} - {}{}\n{}",
+                        tag,
+                        compact_text(&r.task, 240),
+                        metadata_line,
+                        body
+                    )
+                } else {
+                    format!(
+                        "## {} - {}\n{}{}\n{}",
+                        tag,
+                        compact_text(&r.task, 240),
+                        status_line,
+                        metadata_line,
+                        body
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
@@ -808,6 +1159,7 @@ impl TaskRouter {
             - If the task maps cleanly to an available action, emit that tool call with complete arguments.\n\
             - If the task targets the current workspace or framework itself, prefer local code, file, or shell actions over deploying a separate artifact.\n\
             - Any retry/repair plan must explicitly state a maximum attempts cap.\n\
+            - If any delegated path failed, timed out, or panicked, state what completed and what still needs follow-up.\n\
             - Include a compact evidence summary for actions used.\n\
             - Keep the response concise and practical.",
             compact_text(original_task, 1200),
@@ -849,6 +1201,116 @@ Be concise and action-oriented.\n\n{}",
 
         llm.chat(&synth_system_prompt, &prompt, memories, &filtered_actions)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn degraded_result(status: DelegationStatus) -> AgentExecResult {
+        let failure_kind = match status {
+            DelegationStatus::TimedOut => FailureKind::Timeout,
+            DelegationStatus::Panicked => FailureKind::Panic,
+            _ => FailureKind::DelegationFailed,
+        };
+        AgentExecResult {
+            agent_type: "planner".to_string(),
+            task: "do something".to_string(),
+            is_specialist: false,
+            agent_name: Some("Turing".to_string()),
+            model_name: "test-model".to_string(),
+            content: "Agent failed: timeout".to_string(),
+            llm_response: None,
+            execution_time_ms: 0,
+            status,
+            failure_kind: Some(failure_kind),
+            next_action_hint: Some("retry".to_string()),
+            confidence: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn summarize_delegation_status_returns_partial_when_some_paths_succeed() {
+        let results = vec![
+            AgentExecResult {
+                agent_type: "coder".to_string(),
+                task: "ship".to_string(),
+                is_specialist: false,
+                agent_name: Some("Curie".to_string()),
+                model_name: "test-model".to_string(),
+                content: "ok".to_string(),
+                llm_response: None,
+                execution_time_ms: 12,
+                status: DelegationStatus::Completed,
+                failure_kind: None,
+                next_action_hint: None,
+                confidence: Some(1.0),
+                artifacts: Vec::new(),
+            },
+            degraded_result(DelegationStatus::TimedOut),
+        ];
+
+        assert_eq!(
+            summarize_delegation_status(&results),
+            DelegationStatus::Partial
+        );
+    }
+
+    #[test]
+    fn build_delegation_degradation_includes_failed_paths() {
+        let degradation =
+            build_delegation_degradation(&[degraded_result(DelegationStatus::Panicked)]);
+
+        assert_eq!(degradation.len(), 1);
+        assert_eq!(degradation[0].kind, "delegation");
+        assert!(degradation[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("panicked"));
+    }
+
+    #[test]
+    fn fallback_delegation_response_exposes_partial_completion() {
+        let response = build_fallback_delegation_response(
+            "Ship the feature",
+            &[
+                AgentExecResult {
+                    agent_type: "coder".to_string(),
+                    task: "implement".to_string(),
+                    is_specialist: false,
+                    agent_name: Some("Curie".to_string()),
+                    model_name: "test-model".to_string(),
+                    content: "Patched the core runtime.".to_string(),
+                    llm_response: None,
+                    execution_time_ms: 8,
+                    status: DelegationStatus::Completed,
+                    failure_kind: None,
+                    next_action_hint: None,
+                    confidence: Some(1.0),
+                    artifacts: Vec::new(),
+                },
+                degraded_result(DelegationStatus::TimedOut),
+            ],
+        );
+
+        assert!(response.content.contains("Completed so far"));
+        assert!(response.content.contains("Still needs follow-up"));
+    }
+
+    #[test]
+    fn fallback_delegation_response_handles_total_failure() {
+        let response = build_fallback_delegation_response(
+            "Ship the feature",
+            &[degraded_result(DelegationStatus::TimedOut)],
+        );
+
+        assert!(response
+            .content
+            .contains("couldn't complete the delegated execution cleanly"));
+        assert!(response.content.contains("Still needs follow-up"));
     }
 }
 

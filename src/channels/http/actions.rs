@@ -2088,14 +2088,16 @@ async fn import_action_from_content(
     .await
 }
 
-pub(crate) async fn import_action_from_url_shared(
+#[derive(Debug, Clone)]
+pub(crate) struct FetchedSkillMarkdown {
+    pub source_url: String,
+    pub content: String,
+}
+
+pub(crate) async fn fetch_skill_markdown_from_url_shared(
     agent: &Agent,
     url: &str,
-    name: Option<&str>,
-    force: bool,
-    model: Option<&str>,
-    preview_only: bool,
-) -> Result<serde_json::Value, String> {
+) -> Result<FetchedSkillMarkdown, String> {
     let url = url.trim();
     let _validated = validate_import_fetch_url(url).await?;
 
@@ -2179,7 +2181,13 @@ pub(crate) async fn import_action_from_url_shared(
     let content = content.ok_or_else(|| {
         if let Ok(parsed) = reqwest::Url::parse(url) {
             let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-            if is_clawhub_host(&host) && !parsed.path().trim_matches('/').to_ascii_lowercase().ends_with(".md") {
+            if is_clawhub_host(&host)
+                && !parsed
+                    .path()
+                    .trim_matches('/')
+                    .to_ascii_lowercase()
+                    .ends_with(".md")
+            {
                 return format!(
                     "Failed to resolve a raw SKILL.md/ACTION.md from this ClawHub/OpenClaw page URL. Tried {:?}: {}",
                     urls_to_try, last_error
@@ -2202,11 +2210,25 @@ pub(crate) async fn import_action_from_url_shared(
         }
     })?;
 
-    let source_url_for_name = fetched_url.as_deref().unwrap_or(candidate_source_url);
+    Ok(FetchedSkillMarkdown {
+        source_url: fetched_url.unwrap_or_else(|| candidate_source_url.to_string()),
+        content,
+    })
+}
+
+pub(crate) async fn import_action_from_url_shared(
+    agent: &Agent,
+    url: &str,
+    name: Option<&str>,
+    force: bool,
+    model: Option<&str>,
+    preview_only: bool,
+) -> Result<serde_json::Value, String> {
+    let fetched = fetch_skill_markdown_from_url_shared(agent, url).await?;
     import_action_from_content_with_agent(
         agent,
-        source_url_for_name,
-        content,
+        &fetched.source_url,
+        fetched.content,
         name,
         force,
         model,

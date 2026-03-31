@@ -1,4 +1,5 @@
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import { ChannelIcon } from "./IntegrationsPanel";
 import {
   Alert,
   Box,
@@ -84,8 +85,10 @@ type IntegrationQuickstartPanelProps = {
   integrations: IntegrationItem[];
   autoRefresh: boolean;
   loading?: boolean;
+  loadError?: string | null;
   onConfigureIntegration: (integration: IntegrationItem) => void;
   embedded?: boolean;
+  mode?: "all" | "custom-apis-only";
 };
 
 const FEATURED_PREBUILT = ["google_workspace", "github", "jira", "sentry", "notion"];
@@ -171,19 +174,30 @@ function webhookEndpoint(id: string): string {
 }
 
 function completionChannelOptions(integrations: IntegrationItem[]): Array<{ id: string; label: string }> {
-  const items = [
-    { id: "preferred", label: "Preferred channel" },
-    ...integrations
-      .filter((item) => item.enabled || item.status === "connected")
-      .map((item) => ({ id: item.id, label: item.name || item.id }))
-  ];
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const key = item.id.trim().toLowerCase();
-    if (!key || seen.has(key)) return false;
+  const items = [{ id: "preferred", label: "Preferred channel" }];
+  const seen = new Set<string>(["preferred"]);
+  const push = (id: string, label: string) => {
+    const key = id.trim().toLowerCase();
+    if (!key || seen.has(key)) return;
     seen.add(key);
-    return true;
+    items.push({ id: key, label });
+  };
+  const labelFallbacks: Record<string, string> = {
+    telegram: "Telegram",
+    slack: "Slack",
+    discord: "Discord",
+    matrix: "Matrix",
+    teams: "Teams",
+    whatsapp: "WhatsApp"
+  };
+  integrations.forEach((item) => {
+    if (item.status !== "connected") return;
+    push(item.id, item.name || labelFallbacks[item.id.trim().toLowerCase()] || item.id);
   });
+  if (integrations.some((item) => item.id === "google_workspace" && item.status === "connected")) {
+    push("email", "Email");
+  }
+  return items;
 }
 
 type ConnectorDisplayState =
@@ -197,6 +211,7 @@ type ConnectorDisplayState =
 function connectorDisplayState(integration: IntegrationItem): ConnectorDisplayState {
   if (integration.status === "error") return "error";
   if (integration.status === "starting") return "starting";
+  if (integration.status === "configured") return "configured";
   if (integration.status === "needs_auth") return "needs_auth";
   if (integration.status === "disabled") {
     return "configured";
@@ -256,9 +271,12 @@ export function IntegrationQuickstartPanel({
   integrations,
   autoRefresh,
   loading = false,
+  loadError = null,
   onConfigureIntegration,
-  embedded = false
+  embedded = false,
+  mode = "all"
 }: IntegrationQuickstartPanelProps) {
+  const showCustomApisOnly = mode === "custom-apis-only";
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
   const [prebuiltOpen, setPrebuiltOpen] = useState(false);
@@ -296,7 +314,7 @@ export function IntegrationQuickstartPanel({
   });
   const testCustomApi = useMutation({
     mutationFn: (id: string) => api.rawPost(`/custom-apis/${encodeURIComponent(id)}/test`, {}),
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-custom-apis"] });
     }
   });
@@ -309,7 +327,7 @@ export function IntegrationQuickstartPanel({
   });
   const testWebhook = useMutation({
     mutationFn: (id: string) => api.rawPost(`/webhooks/sources/${encodeURIComponent(id)}/test`, {}),
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: ["integrations-quickstart-webhooks"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-webhook-events"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -328,26 +346,11 @@ export function IntegrationQuickstartPanel({
   }, [integrations]);
   const actionButtonSx = {
     minWidth: 0,
-    minHeight: 32,
-    px: 1.4,
-    py: 0.55,
-    borderRadius: 999,
-    background: "#35cfff",
-    color: "#062338",
     width: "auto",
     maxWidth: "fit-content",
     alignSelf: "flex-start",
     flex: "0 0 auto",
     whiteSpace: "nowrap",
-    textTransform: "none",
-    fontSize: "0.78rem",
-    fontWeight: 700,
-    letterSpacing: "0.01em",
-    boxShadow: "none",
-    "&:hover": {
-      background: "#5ed9ff",
-      boxShadow: "none"
-    }
   } as const;
   const tagChipSx = {
     height: 22,
@@ -402,7 +405,7 @@ export function IntegrationQuickstartPanel({
           notify_on_queued: webhookForm.notify_on_queued,
           notify_on_success: webhookForm.notify_on_success,
           notify_on_failure: webhookForm.notify_on_failure,
-          output_target: webhookForm.output_target === "preferred" ? "preferred" : "channel",
+          output_target: webhookForm.output_target,
           output_channel:
             webhookForm.output_target === "channel" ? webhookForm.output_channel.trim() : undefined,
           instruction: webhookForm.instruction.trim()
@@ -511,6 +514,7 @@ export function IntegrationQuickstartPanel({
     <Stack spacing={2}>
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
 
+      {!showCustomApisOnly ? (
       <Box className="list-shell">
         <Stack spacing={1.5}>
           {!embedded ? (
@@ -597,8 +601,28 @@ export function IntegrationQuickstartPanel({
           </Grid2>
         </Stack>
       </Box>
+      ) : (
+        <Box className="list-shell">
+          <Stack spacing={1.5}>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Box>
+                <Typography variant="subtitle2">Custom APIs</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Import approved API endpoints as tools the agent can use safely. Secrets stay encrypted.
+                </Typography>
+              </Box>
+              <Button variant="contained" sx={actionButtonSx} onClick={() => {
+                setCustomApiForm(defaultCustomApiForm());
+                setCustomApiOpen(true);
+              }}>
+                Import API
+              </Button>
+            </Stack>
+          </Stack>
+        </Box>
+      )}
 
-      {webhookSources.length > 0 ? (
+      {!showCustomApisOnly && webhookSources.length > 0 ? (
         <Box className="list-shell">
           <Stack spacing={1}>
             <Typography variant="subtitle2">Incoming Webhooks</Typography>
@@ -665,7 +689,7 @@ export function IntegrationQuickstartPanel({
                     <TableRow key={configId}>
                       <TableCell>{str(config.name, configId)}</TableCell>
                       <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>{str(config.base_url)}</TableCell>
-                      <TableCell>{str(config.action_count, "0")}</TableCell>
+                      <TableCell>{String(Number(config.action_count) || 0)}</TableCell>
                       <TableCell>{str(config.last_test_outcome, "-")}</TableCell>
                       <TableCell align="right">
                         <Stack direction="row" spacing={0.5} justifyContent="flex-end">
@@ -698,7 +722,9 @@ export function IntegrationQuickstartPanel({
             <Typography variant="body2" color="text.secondary">
               Choose a connector, then finish auth, scopes, and triggers in its setup dialog.
             </Typography>
-            {loading && integrations.length === 0 ? (
+            {loadError && integrations.length === 0 ? (
+              <Alert severity="error">Failed to load available integrations: {loadError}</Alert>
+            ) : loading && integrations.length === 0 ? (
               <Stack spacing={1.25} alignItems="center" sx={{ py: 4 }}>
                 <CircularProgress size={22} />
                 <Typography variant="body2" color="text.secondary">
@@ -728,7 +754,10 @@ export function IntegrationQuickstartPanel({
                   >
                     <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
                       <Box sx={{ minWidth: 0 }}>
-                        <Typography variant="subtitle2" noWrap>{integration.name}</Typography>
+                        <Stack direction="row" spacing={0.75} alignItems="center">
+                          <ChannelIcon name={integration.id || integration.name} size={20} />
+                          <Typography variant="subtitle2" noWrap>{integration.name}</Typography>
+                        </Stack>
                         <Typography variant="caption" color="text.secondary">
                           {integration.description}
                         </Typography>
@@ -904,7 +933,7 @@ export function IntegrationQuickstartPanel({
             {customApiForm.source_mode === "curl" ? (
               <TextField label="Sample curl" fullWidth multiline minRows={6} value={customApiForm.curl_text} onChange={(e) => setCustomApiForm((current) => ({ ...current, curl_text: e.target.value }))} />
             ) : null}
-            <Button variant="outlined" onClick={() => void handlePreviewCustomApi()} disabled={previewCustomApi.isPending}>
+            <Button variant="contained" onClick={() => void handlePreviewCustomApi()} disabled={previewCustomApi.isPending}>
               {previewCustomApi.isPending ? "Analyzing..." : "Discover Endpoints"}
             </Button>
             {customApiForm.notes.length > 0 ? (
@@ -994,7 +1023,14 @@ export function IntegrationQuickstartPanel({
               createCustomApi.isPending ||
               customApiForm.operations.length === 0 ||
               !customApiForm.name.trim() ||
-              !customApiForm.base_url.trim()
+              !customApiForm.base_url.trim() ||
+              ((customApiForm.auth_mode === "bearer" ||
+                customApiForm.auth_mode === "api_key_header" ||
+                customApiForm.auth_mode === "api_key_query" ||
+                customApiForm.auth_mode === "oauth2" ||
+                customApiForm.auth_mode === "basic") &&
+                !customApiForm.secret.trim()) ||
+              (customApiForm.auth_mode === "basic" && !customApiForm.auth_username.trim())
             }
           >
             {createCustomApi.isPending ? "Importing..." : "Import API"}

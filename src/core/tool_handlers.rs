@@ -377,6 +377,7 @@ impl ToolHandler for AppDeployToolHandler {
         let out = agent
             .handle_app_deploy_tool_call(
                 call,
+                ctx.trace_ref,
                 ctx.stream_tx,
                 ctx.request_channel,
                 ctx.conversation_id,
@@ -433,7 +434,7 @@ impl ToolHandler for GoalManageToolHandler {
         ctx: &ToolHandlerContext<'_>,
     ) -> Result<Option<String>> {
         let out = agent
-            .handle_goal_manage_tool_call(call, ctx.stream_tx)
+            .handle_goal_manage_tool_call(call, ctx.stream_tx, ctx.conversation_id)
             .await?;
         Ok(Some(out))
     }

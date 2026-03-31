@@ -12,7 +12,7 @@ import {
   Typography,
 } from "@mui/material";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import type { Task, TraceSummary } from "../types";
 import { NativeWorkspace, type WorkspaceView } from "./NativeWorkspace";
@@ -117,7 +117,27 @@ export function WorkspaceHub({
   const tasks = useMemo(() => pickTasks(tasksQ.data), [tasksQ.data]);
   const traces = useMemo(() => pickTraceHistory(traceQ.data), [traceQ.data]);
   const projects = useMemo(() => pickRecords(projectsQ.data, "projects"), [projectsQ.data]);
-  const apps = useMemo(() => pickRecords(appsQ.data, "apps"), [appsQ.data]);
+  const appsPayload = useMemo(() => asRecord(appsQ.data), [appsQ.data]);
+  const apps = useMemo(() => pickRecords(appsPayload, "apps"), [appsPayload]);
+  const restoreInfo = useMemo(() => asRecord(appsPayload.restore), [appsPayload]);
+  const restoreActive = String(restoreInfo.active || "").toLowerCase() === "true";
+  const restoringApps = useMemo(
+    () =>
+      apps.filter((app) => {
+        const restoring = app.restoring;
+        const status = String(app.restore_status || "").toLowerCase();
+        return restoring === true || String(restoring).toLowerCase() === "true" || status === "restoring";
+      }),
+    [apps]
+  );
+  const degradedApps = useMemo(
+    () =>
+      apps.filter((app) => {
+        const status = String(app.restore_status || "").toLowerCase();
+        return status === "degraded";
+      }),
+    [apps]
+  );
 
   const runningTasks = useMemo(
     () => tasks.filter((task) => taskStatusKey(task).includes("inprogress")),
@@ -151,6 +171,14 @@ export function WorkspaceHub({
   const latestTrace = traces[0];
   const drawerMeta = DRAWER_VIEWS.find((entry) => entry.view === drawerView) || null;
 
+  useEffect(() => {
+    if (autoRefresh || (!restoreActive && restoringApps.length === 0)) return;
+    const timer = setInterval(() => {
+      void appsQ.refetch();
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [autoRefresh, restoreActive, restoringApps.length, appsQ]);
+
   return (
     <Box className="workspace-hub-shell" data-tour-target="workspace-shell">
       <Box className="workspace-launch-bar">
@@ -179,7 +207,6 @@ export function WorkspaceHub({
                 variant={drawerView === entry.view ? "contained" : "outlined"}
                 size="small"
                 onClick={() => setDrawerView(entry.view)}
-                sx={{ textTransform: "none", borderRadius: 999 }}
               >
                 {entry.label}
               </Button>
@@ -188,7 +215,6 @@ export function WorkspaceHub({
               size="small"
               variant="text"
               onClick={() => onNavigateToView("projects")}
-              sx={{ textTransform: "none", borderRadius: 999 }}
             >
               Projects
             </Button>
@@ -267,6 +293,12 @@ export function WorkspaceHub({
                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
                   <Chip size="small" label={`${projects.length} projects`} />
                   <Chip size="small" label={`${activeApps.length} live apps`} />
+                  {restoringApps.length > 0 ? (
+                    <Chip size="small" color="info" label={`${restoringApps.length} restoring`} />
+                  ) : null}
+                  {degradedApps.length > 0 ? (
+                    <Chip size="small" color="warning" label={`${degradedApps.length} need review`} />
+                  ) : null}
                   <Chip size="small" label={`${traces.length} traces`} />
                   <Chip size="small" color={unreadCount > 0 ? "warning" : "default"} label={`${unreadCount} inbox`} />
                 </Stack>

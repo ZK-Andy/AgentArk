@@ -28,12 +28,21 @@ const MAX_APP_COMMAND_LEN: usize = 1024;
 const LOCAL_RUNTIME_STDOUT_LOG_FILE: &str = ".agentark_runtime_stdout.log";
 const LOCAL_RUNTIME_STDERR_LOG_FILE: &str = ".agentark_runtime_stderr.log";
 const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
+const DYNAMIC_RUNTIME_READY_TIMEOUT_SECS: u64 = 30;
+const DYNAMIC_RUNTIME_READY_POLL_MS: u64 = 500;
+const DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS: u64 = 5;
 const MAX_REPO_CLONE_TIMEOUT_SECS: u64 = 240;
 const MAX_REPO_COMMAND_COUNT: usize = 120;
 const MAX_REPO_TEXT_FILE_BYTES: usize = 512 * 1024;
 const MAX_REPO_TOTAL_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPO_TEXT_FILES: usize = 600;
 const MAX_README_BYTES: usize = 256 * 1024;
+
+fn startup_restore_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get().clamp(2, 8))
+        .unwrap_or(4)
+}
 
 fn default_runtime_image() -> String {
     std::env::var("AGENTARK_APP_IMAGE")
@@ -2127,6 +2136,13 @@ fn docker_required() -> bool {
         .unwrap_or(false)
 }
 
+fn container_runtime_configured() -> bool {
+    std::env::var("DOCKER_HOST")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || Path::new("/var/run/docker.sock").exists()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePreference {
     Local,
@@ -2150,7 +2166,14 @@ fn default_runtime_preference() -> RuntimePreference {
         .as_str()
     {
         "container" | "docker" => RuntimePreference::Container,
-        _ => RuntimePreference::Local,
+        "local" | "native" | "process" => RuntimePreference::Local,
+        _ => {
+            if container_runtime_configured() {
+                RuntimePreference::Container
+            } else {
+                RuntimePreference::Local
+            }
+        }
     }
 }
 
@@ -2719,7 +2742,10 @@ pub async fn launch_dynamic_runtime(
     {
         Ok(container_id) => Ok(DynamicRuntimeHandle::Container(container_id)),
         Err(container_err) => {
-            if docker_required() {
+            if matches!(runtime_preference, RuntimePreference::Container)
+                || docker_required()
+                || container_runtime_configured()
+            {
                 return Err(container_err);
             }
             tracing::warn!(
@@ -2751,14 +2777,62 @@ pub async fn launch_dynamic_runtime(
 
 async fn emit_progress(stream_tx: &Option<Sender<StreamEvent>>, message: &str) {
     if let Some(tx) = stream_tx {
+        let payload = app_deploy_phase_status_payload(message);
         let _ = tx
             .send(StreamEvent::ToolProgress {
                 name: "app_deploy".to_string(),
                 content: message.to_string(),
-                payload: None,
+                payload,
             })
             .await;
     }
+}
+
+fn app_deploy_phase_status_payload(message: &str) -> Option<serde_json::Value> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (phase, label) =
+        if lower.starts_with("deploying '") || lower.starts_with("deploying repo service ") {
+            ("deploying", "Deploying")
+        } else if lower.starts_with("cloning repository ")
+            || lower.starts_with("checking out repo ref ")
+        {
+            ("planning", "Preparing source")
+        } else if lower == "reading repo readme and local manifests"
+            || (lower.starts_with("detected ") && lower.contains("repo service"))
+        {
+            ("planning", "Planning")
+        } else if lower.starts_with("wrote ") || lower.contains(" files ready") {
+            ("generating_files", "Generating files")
+        } else if lower == "saved app metadata" || lower.starts_with("assigned port ") {
+            ("preparing_runtime", "Preparing runtime")
+        } else if lower == "installing dependencies..." || lower == "no dependencies to install" {
+            ("installing", "Installing")
+        } else if lower.starts_with("starting server on port ")
+            || lower == "server container started"
+            || lower == "docker unavailable; started local app process"
+            || lower == "waiting for server readiness"
+        {
+            ("starting_runtime", "Starting runtime")
+        } else if lower.starts_with("static app ready at ")
+            || lower.starts_with("dynamic app ready at ")
+        {
+            ("validating", "Validating")
+        } else {
+            return None;
+        };
+
+    Some(serde_json::json!({
+        "kind": "phase_status",
+        "phase": phase,
+        "label": label,
+        "detail": trimmed,
+        "elapsed_secs": 0,
+        "stream_key": format!("phase-status:app_deploy:{}", phase),
+    }))
 }
 
 async fn emit_file_write_progress(
@@ -2850,6 +2924,77 @@ pub struct RunningApp {
     pub access_key: String,
     /// Whether access guard/key is enforced.
     pub access_guard_enabled: bool,
+    /// Whether the user wants this app enabled and serveable.
+    pub enabled: bool,
+    /// Whether this app is still being restored in the background.
+    pub restoring: bool,
+    /// Most recent restore-time warning or failure detail, if any.
+    pub restore_error: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct AppRestoreSnapshot {
+    pub active: bool,
+    pub total: usize,
+    pub pending: usize,
+    pub ready: usize,
+    pub degraded: usize,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AppRestoreTracker {
+    active: bool,
+    total: usize,
+    pending: usize,
+    ready: usize,
+    degraded: usize,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl AppRestoreTracker {
+    fn begin(&mut self, total: usize) {
+        self.active = total > 0;
+        self.total = total;
+        self.pending = total;
+        self.ready = 0;
+        self.degraded = 0;
+        self.started_at = Some(chrono::Utc::now());
+        self.completed_at = if total == 0 {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+    }
+
+    fn finish_one(&mut self, degraded: bool) {
+        if self.pending > 0 {
+            self.pending -= 1;
+        }
+        if degraded {
+            self.degraded += 1;
+        } else {
+            self.ready += 1;
+        }
+        if self.pending == 0 {
+            self.active = false;
+            self.completed_at = Some(chrono::Utc::now());
+        }
+    }
+
+    fn snapshot(&self) -> AppRestoreSnapshot {
+        AppRestoreSnapshot {
+            active: self.active,
+            total: self.total,
+            pending: self.pending,
+            ready: self.ready,
+            degraded: self.degraded,
+            started_at: self.started_at.map(|value| value.to_rfc3339()),
+            completed_at: self.completed_at.map(|value| value.to_rfc3339()),
+        }
+    }
 }
 
 /// Generate a random access key for app authentication
@@ -2857,23 +3002,41 @@ pub fn generate_access_key() -> String {
     format!("ak_{}", uuid::Uuid::new_v4().simple())
 }
 
-async fn persist_app_access_guard_meta(
-    app_dir: &Path,
-    access_guard_enabled: bool,
-    access_key: &str,
-) -> Result<()> {
+async fn load_app_meta_json(app_dir: &Path) -> serde_json::Value {
     let meta_path = app_dir.join(".app_meta.json");
-    let mut meta: serde_json::Value = match tokio::fs::read(&meta_path).await {
+    let mut meta = match tokio::fs::read(&meta_path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     };
     if !meta.is_object() {
         meta = serde_json::json!({});
     }
+    meta
+}
+
+async fn write_app_meta_json(app_dir: &Path, meta: &serde_json::Value) -> Result<()> {
+    let meta_path = app_dir.join(".app_meta.json");
+    let bytes = serde_json::to_vec_pretty(meta)?;
+    tokio::fs::write(&meta_path, bytes).await?;
+    Ok(())
+}
+
+async fn persist_app_access_guard_meta(
+    app_dir: &Path,
+    access_guard_enabled: bool,
+    access_key: &str,
+) -> Result<()> {
+    let mut meta = load_app_meta_json(app_dir).await;
     meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
     meta["access_key"] = serde_json::Value::String(access_key.to_string());
-    let bytes = serde_json::to_vec_pretty(&meta)?;
-    tokio::fs::write(&meta_path, bytes).await?;
+    write_app_meta_json(app_dir, &meta).await?;
+    Ok(())
+}
+
+async fn persist_app_enabled_meta(app_dir: &Path, enabled: bool) -> Result<()> {
+    let mut meta = load_app_meta_json(app_dir).await;
+    meta["enabled"] = serde_json::Value::Bool(enabled);
+    write_app_meta_json(app_dir, &meta).await?;
     Ok(())
 }
 
@@ -2891,6 +3054,7 @@ pub struct AppHealthSnapshot {
 #[derive(Clone)]
 pub struct AppRegistry {
     apps: Arc<RwLock<HashMap<String, Arc<RwLock<RunningApp>>>>>,
+    restore_tracker: Arc<RwLock<AppRestoreTracker>>,
 }
 
 pub struct DynamicAppRegistration {
@@ -2901,13 +3065,57 @@ pub struct DynamicAppRegistration {
     pub port: u16,
     pub access_key: String,
     pub access_guard_enabled: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RestoreAppCandidate {
+    id: String,
+    title: String,
+    app_dir: PathBuf,
+    entry_command: Option<String>,
+    install_command: Option<String>,
+    runtime_image: Option<String>,
+    runtime_preference: RuntimePreference,
+    required_inputs: Vec<AppRequiredInput>,
+    config_values: HashMap<String, String>,
+    access_guard_enabled: bool,
+    access_key: String,
+    enabled: bool,
 }
 
 impl AppRegistry {
     pub fn new() -> Self {
         Self {
             apps: Arc::new(RwLock::new(HashMap::new())),
+            restore_tracker: Arc::new(RwLock::new(AppRestoreTracker::default())),
         }
+    }
+
+    pub async fn restore_snapshot(&self) -> AppRestoreSnapshot {
+        self.restore_tracker.read().await.snapshot()
+    }
+
+    async fn begin_restore_batch(&self, total: usize) {
+        self.restore_tracker.write().await.begin(total);
+    }
+
+    async fn finish_restore_item(&self, degraded: bool) {
+        self.restore_tracker.write().await.finish_one(degraded);
+    }
+
+    pub fn spawn_restore_from_disk(
+        &self,
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        llm_env: HashMap<String, String>,
+    ) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            registry
+                .restore_from_disk(&config_dir, &data_dir, &llm_env)
+                .await;
+        });
     }
 
     /// List all deployed apps
@@ -2922,7 +3130,11 @@ impl AppRegistry {
         for (id, app) in app_entries {
             let mut app = app.write().await;
             let mut mark_stopped = false;
-            let running = if app.is_static {
+            let running = if !app.enabled {
+                false
+            } else if app.restoring {
+                false
+            } else if app.is_static {
                 true
             } else if let Some(container_id) = app.container_id.as_ref() {
                 let up = is_container_running(container_id).await;
@@ -2947,7 +3159,11 @@ impl AppRegistry {
                 app.container_id = None;
                 app.port = None;
             }
-            let runtime_mode = if app.is_static {
+            let runtime_mode = if app.restoring {
+                "restoring"
+            } else if !app.enabled {
+                "disabled"
+            } else if app.is_static {
                 "static"
             } else if app.container_id.is_some() {
                 "isolated_container"
@@ -2977,8 +3193,35 @@ impl AppRegistry {
                     String::new()
                 },
                 "access_guard_enabled": app.access_guard_enabled,
+                "enabled": app.enabled,
+                "restoring": app.restoring,
+                "restore_error": app.restore_error.clone(),
+                "restore_status": if app.restoring {
+                    "restoring"
+                } else if !app.enabled {
+                    "disabled"
+                } else if app.restore_error.is_some() {
+                    "degraded"
+                } else {
+                    "ready"
+                },
             }));
         }
+        result.sort_by(|a, b| {
+            let a_title = a
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let b_title = b
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            a_title.cmp(b_title).then_with(|| {
+                let a_id = a.get("id").and_then(|value| value.as_str()).unwrap_or("");
+                let b_id = b.get("id").and_then(|value| value.as_str()).unwrap_or("");
+                a_id.cmp(b_id)
+            })
+        });
         result
     }
 
@@ -3024,6 +3267,9 @@ impl AppRegistry {
             return false;
         };
         let mut app = app_handle.write().await;
+        if !app.enabled {
+            return false;
+        }
         if app.is_static {
             return true;
         }
@@ -3051,6 +3297,7 @@ impl AppRegistry {
         app_dir: PathBuf,
         access_key: String,
         access_guard_enabled: bool,
+        enabled: bool,
     ) {
         let app = RunningApp {
             title,
@@ -3064,6 +3311,9 @@ impl AppRegistry {
             request_count: 0,
             access_key,
             access_guard_enabled,
+            enabled,
+            restoring: false,
+            restore_error: None,
         };
         self.apps
             .write()
@@ -3085,11 +3335,102 @@ impl AppRegistry {
             request_count: 0,
             access_key: registration.access_key,
             access_guard_enabled: registration.access_guard_enabled,
+            enabled: registration.enabled,
+            restoring: false,
+            restore_error: None,
         };
         self.apps
             .write()
             .await
             .insert(id, Arc::new(RwLock::new(app)));
+    }
+
+    pub async fn register_disabled(
+        &self,
+        id: String,
+        title: String,
+        app_dir: PathBuf,
+        is_static: bool,
+        access_key: String,
+        access_guard_enabled: bool,
+    ) {
+        let app = RunningApp {
+            title,
+            port: None,
+            process: None,
+            container_id: None,
+            app_dir,
+            is_static,
+            created_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+            request_count: 0,
+            access_key,
+            access_guard_enabled,
+            enabled: false,
+            restoring: false,
+            restore_error: None,
+        };
+        self.apps
+            .write()
+            .await
+            .insert(id, Arc::new(RwLock::new(app)));
+    }
+
+    pub async fn reserve_restoring_dynamic(
+        &self,
+        id: String,
+        title: String,
+        app_dir: PathBuf,
+        access_key: String,
+        access_guard_enabled: bool,
+    ) -> Option<u16> {
+        let now = chrono::Utc::now();
+        let mut apps = self.apps.write().await;
+        let used_ports: Vec<u16> = apps
+            .values()
+            .filter_map(|entry| entry.try_read().ok().and_then(|app| app.port))
+            .collect();
+
+        for port in PORT_RANGE_START..PORT_RANGE_END {
+            if used_ports.contains(&port) {
+                continue;
+            }
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                continue;
+            }
+
+            let app = RunningApp {
+                title,
+                port: Some(port),
+                process: None,
+                container_id: None,
+                app_dir,
+                is_static: false,
+                created_at: now,
+                last_accessed: now,
+                request_count: 0,
+                access_key,
+                access_guard_enabled,
+                enabled: true,
+                restoring: true,
+                restore_error: None,
+            };
+            apps.insert(id, Arc::new(RwLock::new(app)));
+            return Some(port);
+        }
+        None
+    }
+
+    pub async fn mark_restore_error(&self, app_id: &str, error: impl Into<String>) {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        if let Some(app) = app_handle {
+            let mut app = app.write().await;
+            app.restoring = false;
+            app.restore_error = Some(error.into());
+        }
     }
 
     /// Verify access key for an app
@@ -3100,6 +3441,9 @@ impl AppRegistry {
         };
         if let Some(app) = app_handle {
             let app = app.read().await;
+            if !app.enabled {
+                return false;
+            }
             if !app.access_guard_enabled {
                 return true;
             }
@@ -3118,6 +3462,38 @@ impl AppRegistry {
             return app.read().await.access_guard_enabled;
         }
         false
+    }
+
+    pub async fn is_enabled(&self, app_id: &str) -> bool {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        };
+        if let Some(app) = app_handle {
+            return app.read().await.enabled;
+        }
+        false
+    }
+
+    pub async fn set_enabled(&self, app_id: &str, enabled: bool) -> Result<()> {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        }
+        .ok_or_else(|| anyhow::anyhow!("App not found"))?;
+
+        let app_dir = {
+            let mut app = app_handle.write().await;
+            app.enabled = enabled;
+            if !enabled {
+                app.restoring = false;
+                app.port = None;
+            }
+            app.app_dir.clone()
+        };
+
+        persist_app_enabled_meta(&app_dir, enabled).await?;
+        Ok(())
     }
 
     /// Toggle access guard for an app and optionally rotate its access key.
@@ -3175,7 +3551,9 @@ impl AppRegistry {
         for (id, app) in app_entries {
             let mut app = app.write().await;
             let mut mark_stopped = false;
-            let process_alive = if app.is_static {
+            let process_alive = if !app.enabled {
+                false
+            } else if app.is_static {
                 true
             } else if let Some(container_id) = app.container_id.as_ref() {
                 let up = is_container_running(container_id).await;
@@ -3228,6 +3606,9 @@ impl AppRegistry {
         let mut unused = Vec::new();
         for (id, app) in app_entries {
             let app = app.read().await;
+            if !app.enabled {
+                continue;
+            }
             if app.last_accessed < cutoff {
                 unused.push((id, app.title.clone(), app.last_accessed));
             }
@@ -3316,8 +3697,150 @@ impl AppRegistry {
         None
     }
 
+    async fn restore_dynamic_candidate_from_disk(
+        &self,
+        candidate: RestoreAppCandidate,
+        port: u16,
+        config_dir: &Path,
+        data_dir: &Path,
+        llm_env: &HashMap<String, String>,
+    ) -> bool {
+        let RestoreAppCandidate {
+            id,
+            title,
+            app_dir,
+            entry_command,
+            install_command,
+            runtime_image,
+            runtime_preference,
+            required_inputs,
+            config_values,
+            access_guard_enabled,
+            access_key,
+            enabled: _enabled,
+        } = candidate;
+        let Some(entry_cmd) = entry_command else {
+            return false;
+        };
+
+        let (resolved_env, missing_sensitive, missing_config) = match resolve_required_env_values(
+            config_dir,
+            data_dir,
+            &required_inputs,
+            llm_env,
+            &config_values,
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                let detail = format!("Restore failed while resolving config: {}", e);
+                tracing::warn!("{} (app={})", detail, id);
+                self.register_static(
+                    id.clone(),
+                    title,
+                    app_dir,
+                    access_key.clone(),
+                    access_guard_enabled,
+                    true,
+                )
+                .await;
+                self.mark_restore_error(&id, detail).await;
+                return true;
+            }
+        };
+
+        if !missing_sensitive.is_empty() || !missing_config.is_empty() {
+            let detail = format!(
+                "Restore needs inputs before runtime can start (missing_sensitive={:?}, missing_config={:?})",
+                missing_sensitive, missing_config
+            );
+            tracing::warn!("{} (app={})", detail, id);
+            self.register_static(
+                id.clone(),
+                title,
+                app_dir,
+                access_key.clone(),
+                access_guard_enabled,
+                true,
+            )
+            .await;
+            self.mark_restore_error(&id, detail).await;
+            return true;
+        }
+
+        match launch_dynamic_runtime(DynamicRuntimeLaunch {
+            app_id: &id,
+            app_dir: &app_dir,
+            entry_command: &entry_cmd,
+            install_command: install_command.as_deref(),
+            port,
+            extra_env: &resolved_env,
+            runtime_image: runtime_image.as_deref(),
+            runtime_preference,
+            stream_tx: None,
+        })
+        .await
+        {
+            Ok(runtime_handle) => {
+                let (container_id, child) = match runtime_handle {
+                    DynamicRuntimeHandle::Container(container_id) => (Some(container_id), None),
+                    DynamicRuntimeHandle::Process(child) => (None, Some(*child)),
+                };
+                self.register_dynamic(
+                    id.clone(),
+                    DynamicAppRegistration {
+                        title: title.clone(),
+                        app_dir: app_dir.clone(),
+                        child,
+                        container_id,
+                        port,
+                        access_key: access_key.clone(),
+                        access_guard_enabled,
+                        enabled: true,
+                    },
+                )
+                .await;
+                let no_stream = None;
+                if let Err(e) = wait_for_dynamic_runtime_ready(self, &id, port, &no_stream).await {
+                    let detail = format!("Runtime did not become ready: {}", e);
+                    tracing::warn!("{} (app={})", detail, id);
+                    let _ = self.stop_runtime(&id).await;
+                    self.register_static(
+                        id.clone(),
+                        title,
+                        app_dir,
+                        access_key.clone(),
+                        access_guard_enabled,
+                        true,
+                    )
+                    .await;
+                    self.mark_restore_error(&id, detail).await;
+                    return true;
+                }
+                tracing::info!("Restarted dynamic app: {}", id);
+                false
+            }
+            Err(e) => {
+                let detail = format!("Runtime launch failed: {}", e);
+                tracing::warn!("{} (app={})", detail, id);
+                self.register_static(
+                    id.clone(),
+                    title,
+                    app_dir,
+                    access_key.clone(),
+                    access_guard_enabled,
+                    true,
+                )
+                .await;
+                self.mark_restore_error(&id, detail).await;
+                true
+            }
+        }
+    }
+
     /// Restore apps from disk on startup. Static apps are served immediately.
-    /// Dynamic apps with entry_command are restarted automatically.
+    /// Dynamic apps with entry_command are restarted in the background.
     pub async fn restore_from_disk(
         &self,
         config_dir: &Path,
@@ -3328,218 +3851,265 @@ impl AppRegistry {
         if !apps_dir.exists() {
             return;
         }
+
+        let mut candidates = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir(&apps_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                if path.is_dir() {
-                    let id = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if id.is_empty() {
-                        continue;
-                    }
+                if !path.is_dir() {
+                    continue;
+                }
 
-                    // Read metadata
-                    let meta_path = path.join(".app_meta.json");
-                    let meta: Option<serde_json::Value> = tokio::fs::read(&meta_path)
-                        .await
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                let id = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
 
-                    let title = meta
-                        .as_ref()
-                        .and_then(|m| m.get("title").and_then(|t| t.as_str()))
-                        .unwrap_or(&id)
-                        .to_string();
+                let meta_path = path.join(".app_meta.json");
+                let meta: Option<serde_json::Value> = tokio::fs::read(&meta_path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-                    let entry_command = meta
-                        .as_ref()
-                        .and_then(|m| m.get("entry_command").and_then(|c| c.as_str()))
-                        .map(|s| s.to_string());
-                    let install_command = meta
-                        .as_ref()
-                        .and_then(|m| m.get("install_command").and_then(|c| c.as_str()))
-                        .map(|s| s.to_string());
-                    let runtime_image = meta
-                        .as_ref()
-                        .and_then(|m| m.get("runtime_image").and_then(|c| c.as_str()))
-                        .map(|s| s.to_string());
-                    let runtime_preference = runtime_preference_from_opt(
-                        meta.as_ref()
-                            .and_then(|m| m.get("runtime_preference").and_then(|c| c.as_str())),
-                    );
-                    let required_inputs =
-                        meta.as_ref().map(parse_required_inputs).unwrap_or_default();
-                    let config_values: HashMap<String, String> = meta
-                        .as_ref()
-                        .and_then(|m| m.get("config_values").and_then(|v| v.as_object()))
-                        .map(|obj| {
-                            obj.iter()
-                                .filter_map(|(k, v)| {
-                                    let value = match v {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Bool(b) => b.to_string(),
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        _ => return None,
-                                    };
-                                    Some((k.clone(), value))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    // Legacy apps defaulted to guarded mode, so missing flag => true.
-                    let access_guard_enabled = meta
-                        .as_ref()
-                        .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
-                        .unwrap_or(true);
-                    // Restore or regenerate access key only when guard is enabled.
-                    let access_key = meta
-                        .as_ref()
-                        .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| {
-                            if access_guard_enabled {
-                                generate_access_key()
-                            } else {
-                                String::new()
-                            }
-                        });
-
-                    if let Some(entry_cmd) = entry_command {
-                        // Dynamic app — restart in isolated container runtime
-                        if let Some(port) = self.find_available_port().await {
-                            tracing::info!(
-                                "Restarting app '{}' (id={}) on port {}",
-                                title,
-                                id,
-                                port
-                            );
-                            let (resolved_env, missing_sensitive, missing_config) =
-                                match resolve_required_env_values(
-                                    config_dir,
-                                    data_dir,
-                                    &required_inputs,
-                                    llm_env,
-                                    &config_values,
-                                )
-                                .await
-                                {
-                                    Ok(out) => out,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                        "Failed to resolve secrets for app {} during restore: {}",
-                                        id,
-                                        e
-                                    );
-                                        self.register_static(
-                                            id.clone(),
-                                            title,
-                                            path,
-                                            access_key.clone(),
-                                            access_guard_enabled,
-                                        )
-                                        .await;
-                                        continue;
-                                    }
+                let title = meta
+                    .as_ref()
+                    .and_then(|m| m.get("title").and_then(|t| t.as_str()))
+                    .unwrap_or(&id)
+                    .to_string();
+                let entry_command = meta
+                    .as_ref()
+                    .and_then(|m| m.get("entry_command").and_then(|c| c.as_str()))
+                    .map(|s| s.to_string());
+                let install_command = meta
+                    .as_ref()
+                    .and_then(|m| m.get("install_command").and_then(|c| c.as_str()))
+                    .map(|s| s.to_string());
+                let runtime_image = meta
+                    .as_ref()
+                    .and_then(|m| m.get("runtime_image").and_then(|c| c.as_str()))
+                    .map(|s| s.to_string());
+                let runtime_preference = runtime_preference_from_opt(
+                    meta.as_ref()
+                        .and_then(|m| m.get("runtime_preference").and_then(|c| c.as_str())),
+                );
+                let required_inputs = meta.as_ref().map(parse_required_inputs).unwrap_or_default();
+                let config_values: HashMap<String, String> = meta
+                    .as_ref()
+                    .and_then(|m| m.get("config_values").and_then(|v| v.as_object()))
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| {
+                                let value = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    _ => return None,
                                 };
-                            if !missing_sensitive.is_empty() || !missing_config.is_empty() {
-                                tracing::warn!(
-                                    "Skipping dynamic restore for app '{}' (id={}): missing_sensitive={:?}, missing_config={:?}",
-                                    title,
-                                    id,
-                                    missing_sensitive,
-                                    missing_config
-                                );
-                                self.register_static(
-                                    id.clone(),
-                                    title,
-                                    path,
-                                    access_key.clone(),
-                                    access_guard_enabled,
-                                )
-                                .await;
-                                continue;
-                            }
-                            match launch_dynamic_runtime(DynamicRuntimeLaunch {
-                                app_id: &id,
-                                app_dir: &path,
-                                entry_command: &entry_cmd,
-                                install_command: install_command.as_deref(),
-                                port,
-                                extra_env: &resolved_env,
-                                runtime_image: runtime_image.as_deref(),
-                                runtime_preference,
-                                stream_tx: None,
+                                Some((k.clone(), value))
                             })
-                            .await
-                            {
-                                Ok(runtime_handle) => {
-                                    let (container_id, child) = match runtime_handle {
-                                        DynamicRuntimeHandle::Container(container_id) => {
-                                            (Some(container_id), None)
-                                        }
-                                        DynamicRuntimeHandle::Process(child) => {
-                                            (None, Some(*child))
-                                        }
-                                    };
-                                    self.register_dynamic(
-                                        id.clone(),
-                                        DynamicAppRegistration {
-                                            title,
-                                            app_dir: path,
-                                            child,
-                                            container_id,
-                                            port,
-                                            access_key: access_key.clone(),
-                                            access_guard_enabled,
-                                        },
-                                    )
-                                    .await;
-                                    tracing::info!("Restarted dynamic app: {}", id);
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to restart app {}: {}", id, e);
-                                    // Register as static fallback so files are still accessible.
-                                    self.register_static(
-                                        id.clone(),
-                                        title,
-                                        path,
-                                        access_key.clone(),
-                                        access_guard_enabled,
-                                    )
-                                    .await;
-                                }
-                            }
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let access_guard_enabled = meta
+                    .as_ref()
+                    .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
+                    .unwrap_or(true);
+                let access_key = meta
+                    .as_ref()
+                    .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        if access_guard_enabled {
+                            generate_access_key()
                         } else {
-                            tracing::warn!("No available port to restart app {}", id);
-                            self.register_static(
-                                id.clone(),
-                                title,
-                                path,
-                                access_key.clone(),
-                                access_guard_enabled,
-                            )
-                            .await;
+                            String::new()
                         }
-                    } else {
-                        // Static app
-                        self.register_static(
-                            id.clone(),
-                            title,
-                            path,
-                            access_key.clone(),
-                            access_guard_enabled,
-                        )
-                        .await;
-                        tracing::info!("Restored static app: {}", id);
-                    }
+                    });
+                let enabled = meta
+                    .as_ref()
+                    .and_then(|m| m.get("enabled").and_then(|v| v.as_bool()))
+                    .unwrap_or(true);
+
+                candidates.push(RestoreAppCandidate {
+                    id,
+                    title,
+                    app_dir: path,
+                    entry_command,
+                    install_command,
+                    runtime_image,
+                    runtime_preference,
+                    required_inputs,
+                    config_values,
+                    access_guard_enabled,
+                    access_key,
+                    enabled,
+                });
+            }
+        }
+
+        self.begin_restore_batch(candidates.len()).await;
+        if candidates.is_empty() {
+            return;
+        }
+
+        let config_dir = config_dir.to_path_buf();
+        let data_dir = data_dir.to_path_buf();
+        let llm_env = Arc::new(llm_env.clone());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(startup_restore_parallelism()));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for candidate in candidates {
+            if !candidate.enabled {
+                self.register_disabled(
+                    candidate.id.clone(),
+                    candidate.title.clone(),
+                    candidate.app_dir.clone(),
+                    candidate.entry_command.is_none(),
+                    candidate.access_key.clone(),
+                    candidate.access_guard_enabled,
+                )
+                .await;
+                self.finish_restore_item(false).await;
+                tracing::info!("Restored disabled app metadata: {}", candidate.id);
+                continue;
+            }
+
+            if candidate.entry_command.is_none() {
+                self.register_static(
+                    candidate.id.clone(),
+                    candidate.title.clone(),
+                    candidate.app_dir.clone(),
+                    candidate.access_key.clone(),
+                    candidate.access_guard_enabled,
+                    true,
+                )
+                .await;
+                self.finish_restore_item(false).await;
+                tracing::info!("Restored static app: {}", candidate.id);
+                continue;
+            }
+
+            let Some(port) = self
+                .reserve_restoring_dynamic(
+                    candidate.id.clone(),
+                    candidate.title.clone(),
+                    candidate.app_dir.clone(),
+                    candidate.access_key.clone(),
+                    candidate.access_guard_enabled,
+                )
+                .await
+            else {
+                let detail = "No available runtime port for background restore.".to_string();
+                tracing::warn!("{} (app={})", detail, candidate.id);
+                self.register_static(
+                    candidate.id.clone(),
+                    candidate.title.clone(),
+                    candidate.app_dir.clone(),
+                    candidate.access_key.clone(),
+                    candidate.access_guard_enabled,
+                    true,
+                )
+                .await;
+                self.mark_restore_error(&candidate.id, detail).await;
+                self.finish_restore_item(true).await;
+                continue;
+            };
+
+            tracing::info!(
+                "Queued background restore for app '{}' (id={}) on port {}",
+                candidate.title,
+                candidate.id,
+                port
+            );
+            let registry = self.clone();
+            let config_dir = config_dir.clone();
+            let data_dir = data_dir.clone();
+            let llm_env = Arc::clone(&llm_env);
+            let semaphore = Arc::clone(&semaphore);
+            join_set.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("restore semaphore should stay alive");
+                registry
+                    .restore_dynamic_candidate_from_disk(
+                        candidate,
+                        port,
+                        &config_dir,
+                        &data_dir,
+                        llm_env.as_ref(),
+                    )
+                    .await
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(degraded) => self.finish_restore_item(degraded).await,
+                Err(err) => {
+                    tracing::warn!("Background app restore task failed: {}", err);
+                    self.finish_restore_item(true).await;
                 }
             }
         }
+    }
+}
+
+async fn wait_for_dynamic_runtime_ready(
+    registry: &AppRegistry,
+    app_id: &str,
+    port: u16,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(DYNAMIC_RUNTIME_READY_TIMEOUT_SECS);
+    let mut last_progress_at = tokio::time::Instant::now()
+        - std::time::Duration::from_secs(DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS);
+
+    loop {
+        if !registry.runtime_is_alive(app_id).await {
+            anyhow::bail!("App {} stopped before it opened port {}", app_id, port);
+        }
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(1200),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => return Ok(()),
+            Ok(Err(_)) | Err(_) => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "App {} did not accept connections on port {} within {}s",
+                app_id,
+                port,
+                DYNAMIC_RUNTIME_READY_TIMEOUT_SECS
+            );
+        }
+
+        if last_progress_at.elapsed()
+            >= std::time::Duration::from_secs(DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS)
+        {
+            emit_progress(
+                stream_tx,
+                &format!("Waiting for server readiness on port {}", port),
+            )
+            .await;
+            last_progress_at = tokio::time::Instant::now();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            DYNAMIC_RUNTIME_READY_POLL_MS,
+        ))
+        .await;
     }
 }
 
@@ -3712,6 +4282,7 @@ pub async fn app_deploy(
         "config_values": config_values.clone(),
         "access_guard_enabled": access_guard_enabled,
         "access_key": access_key,
+        "enabled": true,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
     tokio::fs::write(
@@ -3730,6 +4301,7 @@ pub async fn app_deploy(
                 app_dir,
                 access_key.clone(),
                 access_guard_enabled,
+                true,
             )
             .await;
         let url = format!("/apps/{}/", app_id);
@@ -3786,6 +4358,7 @@ pub async fn app_deploy(
                 app_dir,
                 access_key.clone(),
                 access_guard_enabled,
+                true,
             )
             .await;
         emit_progress(
@@ -3887,24 +4460,22 @@ pub async fn app_deploy(
                 port,
                 access_key: access_key.clone(),
                 access_guard_enabled,
+                enabled: true,
             },
         )
         .await;
 
-    // Wait briefly for the server to start
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    if !registry.runtime_is_alive(&app_id).await {
+    emit_progress(&stream_tx, "Waiting for server readiness").await;
+    if let Err(wait_err) = wait_for_dynamic_runtime_ready(registry, &app_id, port, &stream_tx).await
+    {
+        let _ = registry.stop(&app_id).await;
         let log_tail =
             read_local_runtime_log_tail(&app_dir_for_diagnostics, LOCAL_RUNTIME_LOG_TAIL_BYTES)
                 .await;
         if log_tail.is_empty() {
-            anyhow::bail!("App {} stopped shortly after launch.", app_id);
+            anyhow::bail!("{}", wait_err);
         }
-        anyhow::bail!(
-            "App {} stopped shortly after launch. Recent runtime logs:\n{}",
-            app_id,
-            log_tail
-        );
+        anyhow::bail!("{}. Recent runtime logs:\n{}", wait_err, log_tail);
     }
 
     let url = format!("/apps/{}/", app_id);
@@ -4009,5 +4580,105 @@ $ npm run dev
                     .as_deref()
                     .is_some_and(|command| command.contains("uvicorn"))
         }));
+    }
+
+    #[tokio::test]
+    async fn disabled_app_lists_as_disabled_and_not_running() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let registry = AppRegistry::new();
+        registry
+            .register_disabled(
+                "demo".to_string(),
+                "Demo".to_string(),
+                app_dir.path().to_path_buf(),
+                false,
+                "ak_demo".to_string(),
+                false,
+            )
+            .await;
+
+        let apps = registry.list().await;
+        let row = apps
+            .iter()
+            .find(|row| row.get("id").and_then(|v| v.as_str()) == Some("demo"))
+            .expect("disabled app should be listed");
+
+        assert_eq!(row.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(row.get("running").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            row.get("runtime_mode").and_then(|v| v.as_str()),
+            Some("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_enabled_persists_app_meta_flag() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        tokio::fs::write(app_dir.path().join(".app_meta.json"), "{}")
+            .await
+            .expect("meta should be written");
+
+        let registry = AppRegistry::new();
+        registry
+            .register_static(
+                "demo".to_string(),
+                "Demo".to_string(),
+                app_dir.path().to_path_buf(),
+                "ak_demo".to_string(),
+                false,
+                true,
+            )
+            .await;
+
+        registry
+            .set_enabled("demo", false)
+            .await
+            .expect("app should be disabled");
+
+        let meta_raw = tokio::fs::read(app_dir.path().join(".app_meta.json"))
+            .await
+            .expect("meta should be readable");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&meta_raw).expect("meta should parse as json");
+        assert_eq!(meta.get("enabled").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn restore_from_disk_keeps_disabled_dynamic_app_disabled() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let app_dir = data_dir.path().join("apps").join("demo");
+        tokio::fs::create_dir_all(&app_dir)
+            .await
+            .expect("app dir should exist");
+        tokio::fs::write(
+            app_dir.join(".app_meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "title": "Demo",
+                "entry_command": "python server.py",
+                "enabled": false,
+                "access_guard_enabled": false
+            }))
+            .expect("meta should serialize"),
+        )
+        .await
+        .expect("meta should be written");
+
+        let registry = AppRegistry::new();
+        registry
+            .restore_from_disk(config_dir.path(), data_dir.path(), &HashMap::new())
+            .await;
+
+        let apps = registry.list().await;
+        let row = apps
+            .iter()
+            .find(|row| row.get("id").and_then(|v| v.as_str()) == Some("demo"))
+            .expect("restored app should be listed");
+        assert_eq!(row.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(row.get("running").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            row.get("runtime_mode").and_then(|v| v.as_str()),
+            Some("disabled")
+        );
     }
 }

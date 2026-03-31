@@ -67,6 +67,9 @@ import { ChannelsControlPanel } from "./ChannelsControlPanel";
 import { DevicesControlPanel } from "./DevicesControlPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
 import { ObservabilityPanel } from "./ObservabilityPanel";
+import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
+import { PluginSdkPanel } from "./PluginSdkPanel";
+import { WebhooksPanel } from "./WebhooksPanel";
 import { RoutingControlPanel } from "./RoutingControlPanel";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { SwarmManager } from "./SwarmManager";
@@ -97,6 +100,7 @@ const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const SHOW_EXPERIMENTAL_AUTONOMY_TOOLS = false;
 const CHAT_LAST_CONVERSATION_STORAGE_KEY = "agentark.chat.lastConversationId";
 const CHAT_PENDING_RUN_STORAGE_KEY = "agentark.chat.pendingRun";
+const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
 const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
 const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
 const CHAT_PENDING_STREAM_STEPS_MAX = 48;
@@ -105,12 +109,17 @@ const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
 const CHAT_CONVERSATIONS_PAGE_SIZE = 20;
 const CHAT_STARRED_LIMIT = 3;
 type ImportRiskBand = "secure" | "review" | "risky";
+type ChatPendingRunMode = "fresh" | "resume";
+type ChatPendingRunPhase = "running" | "interrupted";
 
 type ChatPendingRunSnapshot = {
   conversationId: string;
   message: string;
   projectId: string;
   startedAt: number;
+  mode?: ChatPendingRunMode;
+  phase?: ChatPendingRunPhase;
+  taskId?: string;
   streamingResponse?: string;
   streamingSteps?: JsonRecord[];
   failedUserMessage?: string;
@@ -120,10 +129,22 @@ type ChatLaunchRunDetail = {
   message: string;
   conversationId?: string;
   projectId?: string;
+  taskId?: string;
+  launchMode?: "message" | "resume_task";
   navigateToChat?: boolean;
   source?: string;
   resolve?: (started: boolean) => void;
   reject?: (message: string) => void;
+};
+
+type ChatPendingLaunch = {
+  createdAt: number;
+  launchMode: "message" | "resume_task";
+  message?: string;
+  conversationId?: string;
+  projectId?: string;
+  taskId?: string;
+  source?: string;
 };
 
 type ChatRunStatusDetail = {
@@ -183,6 +204,303 @@ type LiveFileWriteState = {
   line: number;
   totalLines: number;
   done: boolean;
+};
+
+type StreamPhaseStatus = {
+  toolName: string;
+  phase: string;
+  label: string;
+  detail: string;
+  elapsedSecs: number;
+  streamKey: string;
+};
+
+type CodeLanguage =
+  | "markup"
+  | "script"
+  | "css"
+  | "json"
+  | "python"
+  | "sql"
+  | "shell"
+  | "markdown"
+  | "config"
+  | "text";
+
+type CodeToken = {
+  text: string;
+  className?: string;
+};
+
+function guessCodeLanguage(fileName = "", content = ""): CodeLanguage {
+  const normalizedName = fileName.trim().toLowerCase();
+  if (/\.(html?|xml|svg)$/.test(normalizedName)) return "markup";
+  if (/\.(css|scss|less)$/.test(normalizedName)) return "css";
+  if (/\.(json)$/.test(normalizedName)) return "json";
+  if (/\.(py|pyw)$/.test(normalizedName)) return "python";
+  if (/\.(sql)$/.test(normalizedName)) return "sql";
+  if (/\.(sh|bash|zsh|fish|ps1)$/.test(normalizedName)) return "shell";
+  if (/\.(md|markdown)$/.test(normalizedName)) return "markdown";
+  if (/\.(ya?ml|toml|ini|env)$/.test(normalizedName)) return "config";
+  if (/\.(js|jsx|ts|tsx|mjs|cjs|java|kt|go|rs|php|rb|c|cc|cpp|cs)$/.test(normalizedName)) {
+    return "script";
+  }
+
+  const trimmed = content.trim();
+  if (!trimmed) return "text";
+  if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html") || /^<[\w-]+/.test(trimmed)) return "markup";
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
+  if (/^\s*#\s/.test(trimmed) || /^\s*[-*+]\s/.test(trimmed)) return "markdown";
+  if (/^\s*(def |class |import |from )/.test(trimmed)) return "python";
+  if (/^\s*SELECT\b|^\s*WITH\b|^\s*INSERT\b|^\s*UPDATE\b|^\s*CREATE\b/i.test(trimmed)) return "sql";
+  if (/^\s*(const |let |var |function |import |export )/.test(trimmed)) return "script";
+  return "text";
+}
+
+function tokenizeByPattern(
+  line: string,
+  pattern: RegExp,
+  classify: (value: string) => string | undefined
+): CodeToken[] {
+  const tokens: CodeToken[] = [];
+  let lastIndex = 0;
+  pattern.lastIndex = 0;
+  for (const match of line.matchAll(pattern)) {
+    const value = match[0];
+    const start = match.index ?? 0;
+    if (start > lastIndex) {
+      tokens.push({ text: line.slice(lastIndex, start) });
+    }
+    tokens.push({ text: value, className: classify(value) });
+    lastIndex = start + value.length;
+  }
+  if (lastIndex < line.length) {
+    tokens.push({ text: line.slice(lastIndex) });
+  }
+  return tokens.length > 0 ? tokens : [{ text: line }];
+}
+
+function highlightMarkupLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /<!--.*?-->|<\/?[A-Za-z][\w:-]*|\/?>|[A-Za-z_:][-A-Za-z0-9_:.]*(?==)|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g,
+    (value) => {
+      if (value.startsWith("<!--")) return "comment";
+      if (value.startsWith("</") || value.startsWith("<") || value === "/>" || value === ">") return "tag";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      return "attr";
+    }
+  );
+}
+
+function highlightCssLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /\/\*.*?\*\/|@[A-Za-z-]+|--?[\w-]+(?=\s*:)|#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%|s|ms|deg)?\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{}():;,.]/g,
+    (value) => {
+      if (value.startsWith("/*")) return "comment";
+      if (value.startsWith("@")) return "keyword";
+      if (value.startsWith("--") || /^[A-Za-z-]+$/.test(value)) return "attr";
+      if (value.startsWith("#")) return "number";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      if (/^\d/.test(value)) return "number";
+      return "punctuation";
+    }
+  );
+}
+
+function highlightJsonLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b|[{}\[\],:]/g,
+    (value) => {
+      if (value.startsWith("\"")) return value.endsWith(":") ? "attr" : "string";
+      if (/^(true|false|null)$/.test(value)) return "keyword";
+      if (/^-?\d/.test(value)) return "number";
+      return "punctuation";
+    }
+  );
+}
+
+function highlightPythonLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:def|class|import|from|return|if|elif|else|for|while|try|except|finally|with|as|pass|break|continue|lambda|yield|async|await|True|False|None|in|is|and|or|not)\b|\b(?:print|len|range|dict|list|set|tuple|str|int|float|bool)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#")) return "comment";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      if (/^-?\d/.test(value)) return "number";
+      if (/^(print|len|range|dict|list|set|tuple|str|int|float|bool)$/.test(value)) return "builtin";
+      return "keyword";
+    }
+  );
+}
+
+function highlightSqlLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /--.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:SELECT|FROM|WHERE|GROUP BY|ORDER BY|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|NULL|AS|LIMIT|OFFSET|WITH|UNION|DISTINCT)\b|-?\b\d+(?:\.\d+)?\b/gi,
+    (value) => {
+      if (value.startsWith("--")) return "comment";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      if (/^-?\d/.test(value)) return "number";
+      return "keyword";
+    }
+  );
+}
+
+function highlightShellLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\$(?:\w+|{[^}]+})|\b(?:if|then|else|fi|for|do|done|case|esac|export|sudo|echo|cd|ls|cat|grep|find|curl|npm|node|python|pip|cargo|git|docker)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#")) return "comment";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      if (value.startsWith("$")) return "builtin";
+      if (/^-?\d/.test(value)) return "number";
+      return "keyword";
+    }
+  );
+}
+
+function highlightMarkdownLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /^#{1,6}\s.*$|^\s*[-*+]\s.*$|`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)/g,
+    (value) => {
+      if (value.startsWith("#")) return "keyword";
+      if (/^\s*[-*+]\s/.test(value)) return "punctuation";
+      if (value.startsWith("`")) return "string";
+      if (value.startsWith("[") || value.startsWith("**") || value.startsWith("__")) return "builtin";
+      return undefined;
+    }
+  );
+}
+
+function highlightConfigLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /#.*$|;.*$|[A-Za-z_][\w.-]*(?=\s*[:=])|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("#") || value.startsWith(";")) return "comment";
+      if (value.startsWith("\"") || value.startsWith("'")) return "string";
+      if (/^(true|false|null)$/i.test(value)) return "keyword";
+      if (/^-?\d/.test(value)) return "number";
+      return "attr";
+    }
+  );
+}
+
+function highlightScriptLine(line: string): CodeToken[] {
+  return tokenizeByPattern(
+    line,
+    /\/\/.*$|\/\*.*?\*\/|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|async|await|class|new|import|export|from|try|catch|finally|throw|extends|implements|interface|type|public|private|protected|static|readonly|true|false|null|undefined)\b|\b(?:document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)\b|=>|-?\b\d+(?:\.\d+)?\b/g,
+    (value) => {
+      if (value.startsWith("//") || value.startsWith("/*")) return "comment";
+      if (value.startsWith("\"") || value.startsWith("'") || value.startsWith("`")) return "string";
+      if (value === "=>") return "operator";
+      if (/^-?\d/.test(value)) return "number";
+      if (/^(document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)$/.test(value)) {
+        return "builtin";
+      }
+      return "keyword";
+    }
+  );
+}
+
+function highlightCodeLine(line: string, language: CodeLanguage): CodeToken[] {
+  switch (language) {
+    case "markup":
+      return highlightMarkupLine(line);
+    case "css":
+      return highlightCssLine(line);
+    case "json":
+      return highlightJsonLine(line);
+    case "python":
+      return highlightPythonLine(line);
+    case "sql":
+      return highlightSqlLine(line);
+    case "shell":
+      return highlightShellLine(line);
+    case "markdown":
+      return highlightMarkdownLine(line);
+    case "config":
+      return highlightConfigLine(line);
+    case "script":
+      return highlightScriptLine(line);
+    default:
+      return [{ text: line }];
+  }
+}
+
+function renderCodeBlockLines(
+  content: string,
+  options?: {
+    fileName?: string;
+    startLine?: number;
+    activeLine?: number | null;
+  }
+): ReactNode[] {
+  const language = guessCodeLanguage(options?.fileName, content);
+  const startLine = options?.startLine ?? 1;
+  const activeLine = options?.activeLine ?? null;
+  return content.split(/\r?\n/).map((line, index) => {
+    const lineNumber = startLine + index;
+    const tokens = highlightCodeLine(line, language);
+    return (
+      <span
+        key={`${options?.fileName || "code"}-${lineNumber}`}
+        className={`code-line${activeLine === lineNumber ? " code-line-active" : ""}`}
+      >
+        <span className="code-line-number">{lineNumber}</span>
+        <span className="code-line-content">
+          {tokens.map((token, tokenIndex) => (
+            <span
+              key={`${lineNumber}-${tokenIndex}`}
+              className={token.className ? `code-token code-token-${token.className}` : undefined}
+            >
+              {token.text}
+            </span>
+          ))}
+        </span>
+        {"\n"}
+      </span>
+    );
+  });
+}
+
+function canonicalizeLiveFileWrites(
+  current: Record<string, LiveFileWriteState>,
+  appDir = ""
+): Record<string, LiveFileWriteState> {
+  const next: Record<string, LiveFileWriteState> = {};
+  for (const [name, state] of Object.entries(current)) {
+    const normalizedName = normalizeWorkspaceFileName(name, appDir);
+    if (!normalizedName) continue;
+    const existing = next[normalizedName];
+    if (!existing) {
+      next[normalizedName] = {
+        ...state,
+        content: choosePreferredWorkspaceFileContent("", state.content)
+      };
+      continue;
+    }
+    next[normalizedName] = {
+      content: choosePreferredWorkspaceFileContent(existing.content, state.content),
+      line: Math.max(existing.line, state.line),
+      totalLines: Math.max(existing.totalLines, state.totalLines),
+      done: existing.done || state.done
+    };
+  }
+  return next;
+}
+
+type ExecutionPlanItem = {
+  id: number;
+  title: string;
+  description: string;
+  status: string;
+  tool_hint: string | null;
 };
 
 type ToolProgressPresentation = {
@@ -255,6 +573,232 @@ type SkillImportSummary = {
   result: SkillImportResponse;
   message?: string;
 };
+
+function normalizeExecutionPlanSteps(
+  rawSteps: unknown[],
+  options?: { markFirstRunning?: boolean }
+): ExecutionPlanItem[] {
+  const steps = rawSteps.map((value, index) => {
+    const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+    const id = typeof record.id === "number" ? record.id : index + 1;
+    return {
+      id,
+      title: typeof record.title === "string" ? record.title : `Step ${id}`,
+      description: typeof record.description === "string" ? record.description : "",
+      status: typeof record.status === "string" ? record.status : "pending",
+      tool_hint: typeof record.tool_hint === "string" ? record.tool_hint : null
+    };
+  });
+
+  if (
+    options?.markFirstRunning &&
+    !steps.some((step) => step.status === "running" || step.status === "completed" || step.status === "failed")
+  ) {
+    const firstPendingIndex = steps.findIndex((step) => step.status === "pending");
+    if (firstPendingIndex >= 0) {
+      steps[firstPendingIndex] = {
+        ...steps[firstPendingIndex],
+        status: "running"
+      };
+    }
+  }
+
+  return steps;
+}
+
+function normalizeExecutionPlanToolHint(value: string | null): string {
+  return str(value, "").trim().toLowerCase();
+}
+
+function advanceExecutionPlanSequentially(
+  plan: ExecutionPlanItem[],
+  phase: "start" | "result"
+): ExecutionPlanItem[] {
+  if (plan.length === 0) return plan;
+  const runningIndex = plan.findIndex((step) => step.status === "running");
+  const firstPendingIndex = plan.findIndex((step) => step.status === "pending");
+  const activeIndex = runningIndex >= 0 ? runningIndex : firstPendingIndex;
+  if (activeIndex < 0) return plan;
+
+  const next = plan.map((step) => ({ ...step }));
+  if (phase === "start") {
+    if (runningIndex < 0 && next[activeIndex]) {
+      next[activeIndex].status = "running";
+    }
+    return next;
+  }
+
+  if (next[activeIndex] && next[activeIndex].status !== "failed" && next[activeIndex].status !== "skipped") {
+    next[activeIndex].status = "completed";
+  }
+  if (!next.some((step) => step.status === "running")) {
+    const nextPendingIndex = next.findIndex((step, index) => index > activeIndex && step.status === "pending");
+    if (nextPendingIndex >= 0) {
+      next[nextPendingIndex].status = "running";
+    }
+  }
+  return next;
+}
+
+function advanceExecutionPlanForToolEvent(
+  plan: ExecutionPlanItem[],
+  toolName: string,
+  phase: "start" | "result"
+): ExecutionPlanItem[] {
+  if (plan.length === 0) return plan;
+  const normalizedToolName = str(toolName, "").trim().toLowerCase();
+  const hasToolHints = plan.some((step) => normalizeExecutionPlanToolHint(step.tool_hint) !== "");
+  if (!normalizedToolName) {
+    return hasToolHints ? plan : advanceExecutionPlanSequentially(plan, phase);
+  }
+
+  const matchingIndex = plan.findIndex(
+    (step) => normalizeExecutionPlanToolHint(step.tool_hint) === normalizedToolName
+  );
+  if (matchingIndex < 0) {
+    const currentActiveIndex = plan.findIndex((step) => step.status === "running");
+    if (
+      currentActiveIndex >= 0 &&
+      normalizeExecutionPlanToolHint(plan[currentActiveIndex].tool_hint) === ""
+    ) {
+      return advanceExecutionPlanSequentially(plan, phase);
+    }
+    return hasToolHints ? plan : advanceExecutionPlanSequentially(plan, phase);
+  }
+
+  const next = plan.map((step) => ({ ...step }));
+  for (let index = 0; index < matchingIndex; index += 1) {
+    if (next[index].status === "pending" || next[index].status === "running") {
+      next[index].status = "completed";
+    }
+  }
+
+  if (phase === "start") {
+    if (next[matchingIndex].status === "pending") {
+      next[matchingIndex].status = "running";
+    }
+    return next;
+  }
+
+  if (next[matchingIndex].status !== "failed" && next[matchingIndex].status !== "skipped") {
+    next[matchingIndex].status = "completed";
+  }
+  if (!next.some((step) => step.status === "running")) {
+    const nextPendingIndex = next.findIndex(
+      (step, index) => index > matchingIndex && step.status === "pending"
+    );
+    if (nextPendingIndex >= 0) {
+      next[nextPendingIndex].status = "running";
+    }
+  }
+  return next;
+}
+
+function inferExecutionPlanTraceOutcome(steps: JsonRecord[]): "completed" | "failed" | null {
+  const meaningfulSteps = steps.filter((step) => {
+    const stepType = str(step.step_type, "").trim().toLowerCase();
+    return stepType !== "thinking";
+  });
+  if (meaningfulSteps.some((step) => str(step.step_type, "").trim().toLowerCase() === "error")) {
+    return "failed";
+  }
+  if (
+    meaningfulSteps.some((step) => str(step.title, "").trim().toLowerCase() === "response complete")
+  ) {
+    return "completed";
+  }
+  return null;
+}
+
+function applyTraceOutcomeToExecutionPlan(
+  plan: ExecutionPlanItem[],
+  steps: JsonRecord[]
+): ExecutionPlanItem[] {
+  if (plan.length === 0) return plan;
+  const outcome = inferExecutionPlanTraceOutcome(steps);
+  if (outcome === "completed") {
+    return plan.map((step) =>
+      step.status === "failed" || step.status === "skipped"
+        ? step
+        : {
+            ...step,
+            status: "completed"
+          }
+    );
+  }
+  if (outcome === "failed" && !plan.some((step) => step.status === "failed")) {
+    const runningIndex = plan.findIndex((step) => step.status === "running");
+    const pendingIndex = plan.findIndex((step) => step.status === "pending");
+    const targetIndex = runningIndex >= 0 ? runningIndex : pendingIndex;
+    if (targetIndex >= 0) {
+      return plan.map((step, index) =>
+        index === targetIndex
+          ? {
+              ...step,
+              status: "failed"
+            }
+          : step
+      );
+    }
+  }
+  if (!plan.some((step) => step.status === "running" || step.status === "completed" || step.status === "failed")) {
+    const firstPendingIndex = plan.findIndex((step) => step.status === "pending");
+    if (firstPendingIndex >= 0) {
+      return plan.map((step, index) =>
+        index === firstPendingIndex
+          ? {
+              ...step,
+              status: "running"
+            }
+          : step
+      );
+    }
+  }
+  return plan;
+}
+
+function extractExecutionPlanFromTraceSteps(steps: JsonRecord[]): ExecutionPlanItem[] {
+  for (const step of [...steps].reverse()) {
+    const title = typeof step.title === "string" ? step.title.trim().toLowerCase() : "";
+    const stepType = typeof step.step_type === "string" ? step.step_type.trim().toLowerCase() : "";
+    if (stepType !== "plan" && title !== "execution plan") continue;
+
+    const rawData = step.data;
+    if (Array.isArray(rawData)) {
+      return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(rawData), steps);
+    }
+
+    if (rawData && typeof rawData === "object") {
+      const record = rawData as Record<string, unknown>;
+      const nested = Array.isArray(record.steps) ? record.steps : [];
+      if (nested.length > 0) {
+        return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(nested), steps);
+      }
+    }
+
+    if (typeof rawData === "string" && rawData.trim()) {
+      try {
+        const parsed = JSON.parse(rawData) as unknown;
+        if (Array.isArray(parsed)) {
+          return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(parsed), steps);
+        }
+        if (parsed && typeof parsed === "object") {
+          const record = parsed as Record<string, unknown>;
+          if (Array.isArray(record.steps)) {
+            return applyTraceOutcomeToExecutionPlan(
+              normalizeExecutionPlanSteps(record.steps),
+              steps
+            );
+          }
+        }
+      } catch {
+        // Ignore malformed trace payloads and continue scanning.
+      }
+    }
+  }
+
+  return [];
+}
 
 type ImportCallback = (summary: SkillImportSummary) => Promise<void> | void;
 
@@ -348,6 +892,33 @@ function toBool(value: unknown): boolean {
   return false;
 }
 
+function workspaceAppRootName(appDir = ""): string {
+  const normalized = appDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!normalized) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function isLikelyWorkspaceFileContent(value: string): boolean {
+  const trimmed = (value || "").trim();
+  if (!trimmed) return false;
+  if (/^(written|saved|created|updated|deleted|moved|renamed)\b/i.test(trimmed) && trimmed.split(/\r?\n/).length <= 3) {
+    return false;
+  }
+  if (/^(file|app)\s+(saved|written|created|updated)\b/i.test(trimmed) && trimmed.length < 240) {
+    return false;
+  }
+  return true;
+}
+
+function choosePreferredWorkspaceFileContent(current = "", incoming = ""): string {
+  const currentContent = isLikelyWorkspaceFileContent(current) ? current : "";
+  const incomingContent = isLikelyWorkspaceFileContent(incoming) ? incoming : "";
+  if (!currentContent) return incomingContent;
+  if (!incomingContent) return currentContent;
+  return incomingContent.length >= currentContent.length ? incomingContent : currentContent;
+}
+
 function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
   const raw = str(pathOrName, "").trim();
   if (!raw) return "";
@@ -360,25 +931,35 @@ function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
     normalized = normalized.slice(normalizedAppDir.length + 1);
   }
   normalized = normalized.replace(/^.*\/apps\/[^/]+\//i, "");
+  const appRootName = workspaceAppRootName(normalizedAppDir);
+  if (appRootName && normalized.toLowerCase().startsWith(`${appRootName.toLowerCase()}/`)) {
+    normalized = normalized.slice(appRootName.length + 1);
+  }
   normalized = normalized.replace(/^\/+/, "");
   return normalized || raw;
 }
 
 function mergeWorkspaceFiles(
   current: WorkspaceFileEntry[],
-  incoming: WorkspaceFileEntry[]
+  incoming: WorkspaceFileEntry[],
+  appDir = ""
 ): WorkspaceFileEntry[] {
-  const merged = new Map(current.map((file) => [file.name, file] as const));
-  for (const file of incoming) {
-    if (!file.name) continue;
-    const existing = merged.get(file.name);
+  const merged = new Map<string, WorkspaceFileEntry>();
+  for (const file of [...current, ...incoming]) {
+    const name = normalizeWorkspaceFileName(file.name, appDir);
+    if (!name) continue;
+    const existing = merged.get(name);
     if (!existing) {
-      merged.set(file.name, file);
+      merged.set(name, {
+        name,
+        content: choosePreferredWorkspaceFileContent("", file.content)
+      });
       continue;
     }
-    if (file.content && file.content !== existing.content) {
-      merged.set(file.name, file);
-    }
+    merged.set(name, {
+      name,
+      content: choosePreferredWorkspaceFileContent(existing.content, file.content)
+    });
   }
   return Array.from(merged.values());
 }
@@ -402,6 +983,7 @@ function extractWorkspaceAppFromStreamPayload(name: string, payload: unknown): J
     local_url: url,
     local_access_url: accessUrl,
     app_dir: str(source.app_dir, "").trim(),
+    enabled: source.enabled ?? true,
     running: source.running ?? true,
     is_static: source.is_static ?? true,
     runtime_mode: str(source.runtime_mode, toBool(source.is_static) ? "static" : "unknown")
@@ -438,6 +1020,32 @@ function extractWorkspaceFilesFromStreamPayload(
     .filter((file) => !!file.name);
   if (mappedFiles.length > 0) {
     return mappedFiles;
+  }
+
+  const singleFilePath = source.path ?? source.file ?? obj.path ?? obj.file;
+  const singleFileName = normalizeWorkspaceFileName(singleFilePath, appDir);
+  if (singleFileName) {
+    const structuredContent = str(
+      source.content_snapshot,
+      str(
+        source.file_content,
+        str(
+          source.raw_content,
+          str(
+            obj.content_snapshot,
+            str(obj.file_content, str(obj.raw_content, ""))
+          )
+        )
+      )
+    );
+    const fallbackContent = str(
+      source.content_delta,
+      str(source.content, str(obj.content_delta, str(obj.content, "")))
+    );
+    return [{
+      name: singleFileName,
+      content: choosePreferredWorkspaceFileContent(structuredContent, fallbackContent)
+    }];
   }
 
   const fileNames = Array.isArray(source.file_names)
@@ -505,7 +1113,6 @@ function extractStepDetailText(step: JsonRecord, maxLen = 2200): string {
 function normalizeHeartbeatDetailText(detail: string): string {
   let text = (detail || "").trim();
   text = text.replace(/^still working:\s*/i, "");
-  text = text.replace(/\s*\(\d+\s*[smh]\s*idle\)\.?\s*/gi, " ");
   text = text.replace(/\bno new output yet\b\.?/gi, "");
   text = text.replace(/\s+\./g, ".");
   text = text.replace(/([.!?])\s*[.!?]+/g, "$1");
@@ -612,6 +1219,66 @@ function buildToolProgressPresentation(
   const isFileWriteProgress =
     (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
     name === "file_write";
+  const isArgumentStream = str(payloadObj.kind, "") === "argument_stream";
+  const isDraftFile = str(payloadObj.kind, "") === "draft_file";
+  const isPhaseStatus = str(payloadObj.kind, "") === "phase_status";
+
+  if (isArgumentStream) {
+    const stage = str(payloadObj.stage, "");
+    const chars = Math.max(0, num(payloadObj.chars, 0));
+    const elapsedSecs = Math.max(0, num(payloadObj.elapsed_secs, 0));
+    const streamKey = str(payloadObj.stream_key, `argument-stream:${name || "tool"}`);
+    const toolLabel = (name || "tool").replace(/[_-]+/g, " ").trim() || "tool";
+    let title = `Preparing ${toolLabel}`;
+    if (stage === "payload_build" && name === "app_deploy") {
+      title = "Generating deploy payload";
+    } else if (stage === "payload_repair" && name === "app_deploy") {
+      title = "Repairing deploy payload";
+    }
+    const detailParts: string[] = [];
+    if (chars > 0) detailParts.push(`${chars.toLocaleString()} chars`);
+    if (elapsedSecs > 0) detailParts.push(`${elapsedSecs}s elapsed`);
+    return {
+      title,
+      detail: detailParts.join(" - ") || detail || preview || "Working...",
+      streamKey
+    };
+  }
+
+  if (isPhaseStatus) {
+    const label = str(payloadObj.label, "").trim() || "Working";
+    const phaseDetail = str(payloadObj.detail, preview).trim();
+    const elapsedSecs = Math.max(0, num(payloadObj.elapsed_secs, 0));
+    const streamKey = str(payloadObj.stream_key, `phase-status:${name || "tool"}`);
+    const detailParts = [phaseDetail];
+    if (elapsedSecs > 0) detailParts.push(`${elapsedSecs}s elapsed`);
+    return {
+      title: label,
+      detail: detailParts.filter(Boolean).join(" - "),
+      streamKey
+    };
+  }
+
+  if (isDraftFile) {
+    const fileName = normalizeWorkspaceFileName(
+      payloadObj.file ?? payloadObj.path,
+      appDir
+    );
+    const snapshot = str(payloadObj.content_snapshot, str(payloadObj.content_delta, "")).trim();
+    const lineNo = Math.max(0, num(payloadObj.line, snapshot ? snapshot.split(/\r?\n/).length : 0));
+    const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+    const lineLabel =
+      totalLines > 0
+        ? `Line ${Math.min(lineNo, totalLines)}/${totalLines}`
+        : lineNo > 0
+          ? `${lineNo} line${lineNo === 1 ? "" : "s"}`
+          : "Draft ready";
+    return {
+      title: `Drafting ${fileName || "file"}`,
+      detail: snapshot ? `${lineLabel}: ${snapshot.split(/\r?\n/).slice(-1)[0]}` : lineLabel,
+      streamKey: str(payloadObj.stream_key, fileName ? `draft-file:${fileName}` : "draft-file")
+    };
+  }
 
   if (isFileWriteProgress) {
     const fileName = normalizeWorkspaceFileName(
@@ -637,6 +1304,26 @@ function buildToolProgressPresentation(
   return {
     title: `Tool progress: ${name || "tool"}`,
     detail: detail || preview
+  };
+}
+
+function extractPhaseStatusFromProgress(
+  name: string,
+  payload: unknown,
+  fallbackDetail = ""
+): StreamPhaseStatus | null {
+  const payloadObj = asRecord(payload);
+  if (str(payloadObj.kind, "") !== "phase_status") return null;
+  const phase = str(payloadObj.phase, "").trim();
+  const label = str(payloadObj.label, "").trim() || "Working";
+  const detail = str(payloadObj.detail, fallbackDetail).trim();
+  return {
+    toolName: name,
+    phase,
+    label,
+    detail,
+    elapsedSecs: Math.max(0, num(payloadObj.elapsed_secs, 0)),
+    streamKey: str(payloadObj.stream_key, `phase-status:${name || "tool"}:${phase || "unknown"}`)
   };
 }
 
@@ -713,10 +1400,49 @@ function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
       message: typeof parsed.message === "string" ? parsed.message : "",
       projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
       startedAt,
+      mode: parsed.mode === "resume" ? "resume" : "fresh",
+      phase: parsed.phase === "interrupted" ? "interrupted" : "running",
+      taskId: typeof parsed.taskId === "string" ? parsed.taskId : "",
       streamingResponse,
       streamingSteps,
       failedUserMessage:
         typeof parsed.failedUserMessage === "string" ? parsed.failedUserMessage : ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadChatPendingLaunch(): ChatPendingLaunch | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<ChatPendingLaunch>;
+    const createdAt = typeof parsed.createdAt === "number" ? parsed.createdAt : 0;
+    if (createdAt <= 0 || Date.now() - createdAt > CHAT_PENDING_RUN_TTL_MS) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    const launchMode = parsed.launchMode === "resume_task" ? "resume_task" : "message";
+    const message = typeof parsed.message === "string" ? parsed.message : "";
+    const taskId = typeof parsed.taskId === "string" ? parsed.taskId.trim() : "";
+    if (launchMode === "resume_task" && !taskId) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    if (launchMode === "message" && !message.trim()) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return null;
+    }
+    return {
+      createdAt,
+      launchMode,
+      message,
+      conversationId: typeof parsed.conversationId === "string" ? parsed.conversationId : "",
+      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+      taskId,
+      source: typeof parsed.source === "string" ? parsed.source : ""
     };
   } catch {
     return null;
@@ -731,6 +1457,19 @@ function storeChatPendingRunSnapshot(snapshot: ChatPendingRunSnapshot | null): v
       return;
     }
     window.sessionStorage.setItem(CHAT_PENDING_RUN_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+      // Ignore storage failures.
+  }
+}
+
+function storeChatPendingLaunch(snapshot: ChatPendingLaunch | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!snapshot) {
+      window.sessionStorage.removeItem(CHAT_PENDING_LAUNCH_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(CHAT_PENDING_LAUNCH_STORAGE_KEY, JSON.stringify(snapshot));
   } catch {
     // Ignore storage failures.
   }
@@ -818,7 +1557,7 @@ function computeImportRiskSummary(security: SkillImportResponse["security"] | nu
 
   // Common integration patterns (curl/env refs/placeholders) should count as context, not danger.
   if (contextualRatio >= 0.8) {
-    // Nearly all findings are standard patterns — cap score regardless of backend value.
+    // Nearly all findings are standard patterns â€” cap score regardless of backend value.
     score = Math.min(score, 4);
   } else if (contextualRatio >= 0.5) {
     score = Math.min(score, 6);
@@ -1719,7 +2458,7 @@ function formatCompactValue(value: unknown): { text: string; tooltip?: string } 
     // Avoid dumping JSON; just give a hint.
     const sample = value
       .slice(0, 4)
-      .map((v) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : typeof v === "boolean" ? (v ? "true" : "false") : "…"))
+      .map((v) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : typeof v === "boolean" ? (v ? "true" : "false") : "â€¦"))
       .join(", ");
     const tooltip = sample ? `Examples: ${sample}${value.length > 4 ? ` (+${value.length - 4})` : ""}` : undefined;
     return { text: `List (${value.length})`, tooltip };
@@ -1817,7 +2556,7 @@ function formatTimestampForHumans(value: string): { label: string; tooltip: stri
 
 /** Format a trace step time string to local human-readable.
  *  Input: ISO timestamp like "2026-03-16T09:02:40Z" or "2026-03-16T09:02:40Z (1396ms)"
- *  Output: "12 Mar, 2:32 PM (1396ms)" — local time with optional duration
+ *  Output: "12 Mar, 2:32 PM (1396ms)" â€” local time with optional duration
  */
 function formatTraceStepTime(raw: string): string {
   if (!raw) return "";
@@ -1906,7 +2645,7 @@ function formatChatTimestamp(value: string): { label: string; tooltip: string } 
     timeZoneName: "short"
   }).format(dt);
 
-  return { label: `${absolute} · ${relative}`, tooltip };
+  return { label: `${absolute} * ${relative}`, tooltip };
 }
 
 /** Format any ISO timestamp string into a human-readable relative label with absolute tooltip. */
@@ -2014,7 +2753,7 @@ function KeyValuePanel({
             const renderValue = () => {
               if (typeof v === "string" && looksLikeUrl(v)) {
                 const trimmed = v.trim();
-                const label = trimmed.length > 54 ? `${trimmed.slice(0, 54)}…` : trimmed;
+                const label = trimmed.length > 54 ? `${trimmed.slice(0, 54)}â€¦` : trimmed;
                 return (
                   <Typography variant="body2" sx={{ wordBreak: "break-all" }} title={trimmed}>
                     <a href={trimmed} target="_blank" rel="noreferrer" style={{ color: "inherit", textDecoration: "underline" }}>
@@ -2041,7 +2780,7 @@ function KeyValuePanel({
               }
               if (typeof v === "string" && (looksLikeUuid(v) || keyLower.endsWith("_id") || keyLower === "id")) {
                 const trimmed = v.trim();
-                const label = trimmed.length > 22 ? `${trimmed.slice(0, 8)}…${trimmed.slice(-6)}` : trimmed;
+                const label = trimmed.length > 22 ? `${trimmed.slice(0, 8)}â€¦${trimmed.slice(-6)}` : trimmed;
                 return (
                   <Chip
                     size="small"
@@ -2135,7 +2874,7 @@ function BulkImportDialog({
       .map((l) => l.trim())
       .filter((l) => l.length > 0 && !l.startsWith("#"))
       .map((u) => {
-        // Auto-fix common GitHub mistake: /blob/ → /tree/ for folder URLs
+        // Auto-fix common GitHub mistake: /blob/ â†’ /tree/ for folder URLs
         if (u.includes("github.com/") && u.includes("/blob/") && !u.match(/\.\w+$/)) {
           return u.replace("/blob/", "/tree/");
         }
@@ -2636,12 +3375,12 @@ https://clawhub.ai/org/my-skill`}
                                 </TableCell>
                                 <TableCell>
                                   <Typography variant="caption" sx={{ color: risk.chipColor === "success" ? "rgba(15,240,179,0.8)" : risk.chipColor === "error" ? "#ff5f57" : risk.chipColor === "warning" ? "#febc2e" : "rgba(180,220,200,0.6)" }}>
-                                    {risk.score10.toFixed(1)}/10 · {risk.bandLabel}
+                                    {risk.score10.toFixed(1)}/10 * {risk.bandLabel}
                                   </Typography>
                                 </TableCell>
                                 <TableCell>
                                   <Typography variant="caption" sx={{ color: threatColor === "success" ? "rgba(15,240,179,0.8)" : threatColor === "error" ? "#ff5f57" : threatColor === "warning" ? "#febc2e" : "rgba(180,220,200,0.6)" }}>
-                                    {threatLabel} · {securityLabel}
+                                    {threatLabel} * {securityLabel}
                                   </Typography>
                                 </TableCell>
                                 <TableCell>
@@ -2788,9 +3527,9 @@ function ImportUrlDialog({
             const secretsOut = await api.setSkillSecrets(result.name, { secrets: filledSecrets as { env: string; store_as: string; value?: string }[] });
             if ((secretsOut.missing_env || []).length === 0) {
               setSecretsSaved(true);
-              setInfo(`Imported ${result.name} — secrets saved automatically.`);
+              setInfo(`Imported ${result.name} â€” secrets saved automatically.`);
             }
-          } catch { /* silent — user can still save manually */ }
+          } catch { /* silent â€” user can still save manually */ }
         }
       }
 
@@ -2931,7 +3670,7 @@ function ImportUrlDialog({
               <Box sx={{ px: 1.5, py: 1, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${riskColor}15` }}>
                 <Box sx={{ width: 8, height: 8, borderRadius: "50%", background: riskColor, boxShadow: `0 0 6px ${riskColor}60`, flexShrink: 0 }} />
                 <Typography variant="subtitle2" sx={{ fontSize: "12px", fontWeight: 700, color: riskColor }}>
-                  {riskEmoji} — {importRisk.score10.toFixed(1)}/10
+                  {riskEmoji} â€” {importRisk.score10.toFixed(1)}/10
                 </Typography>
                 <Box sx={{ flex: 1 }} />
                 {securityBlocked ? (
@@ -2950,8 +3689,8 @@ function ImportUrlDialog({
                       : `Threat level: ${raw}`;
                     return display;
                   })()}
-                  {importRisk.totalFindings > 0 ? ` · ${importRisk.totalFindings} signal${importRisk.totalFindings === 1 ? "" : "s"} found` : " · No signals"}
-                  {importRisk.contextualFindings > 0 ? ` (${importRisk.contextualFindings} likely safe — common in integrations)` : ""}
+                  {importRisk.totalFindings > 0 ? ` * ${importRisk.totalFindings} signal${importRisk.totalFindings === 1 ? "" : "s"} found` : " * No signals"}
+                  {importRisk.contextualFindings > 0 ? ` (${importRisk.contextualFindings} likely safe â€” common in integrations)` : ""}
                 </Typography>
                 {Array.isArray(importResult.security.findings) && importResult.security.findings.length > 0 ? (
                   <Stack spacing={0.3} sx={{ mt: 0.75 }}>
@@ -2967,7 +3706,7 @@ function ImportUrlDialog({
                           <Typography sx={{ fontSize: "9.5px", fontWeight: 700, color: sevColor, minWidth: "30px", flexShrink: 0 }}>{sevLabel}</Typography>
                           <Typography sx={{ fontSize: "10.5px", color: "rgba(200,230,210,0.7)", flex: 1 }}>
                             {humanCat}{num(f.line, -1) >= 0 ? ` at line ${num(f.line)}` : ""}
-                            {str(f.matched_text, "").trim() ? <span style={{ color: "rgba(130,170,160,0.4)" }}>{` — ${str(f.matched_text).slice(0, 80)}`}</span> : null}
+                            {str(f.matched_text, "").trim() ? <span style={{ color: "rgba(130,170,160,0.4)" }}>{` â€” ${str(f.matched_text).slice(0, 80)}`}</span> : null}
                           </Typography>
                         </Box>
                       );
@@ -2975,7 +3714,7 @@ function ImportUrlDialog({
                   </Stack>
                 ) : (
                   <Typography variant="caption" sx={{ color: "#0ff0b3" }}>
-                    No signals detected — looks safe.
+                    No signals detected â€” looks safe.
                   </Typography>
                 )}
               </Box>
@@ -3000,7 +3739,7 @@ function ImportUrlDialog({
                     <Box key={`${entry?.url || child?.name || idx}-${idx}`} sx={{ display: "flex", gap: 1.5, py: 0.4, borderBottom: "1px solid rgba(0,255,170,0.03)", alignItems: "baseline" }}>
                       <Typography sx={{ fontFamily: "inherit", fontSize: "10.5px", color: "rgba(200,230,210,0.8)", minWidth: "120px", flexShrink: 0 }}>{child?.name || "-"}</Typography>
                       <Typography sx={{ fontFamily: "inherit", fontSize: "10px", color: riskColor, fontWeight: 600, minWidth: "55px", flexShrink: 0 }}>{childRisk.score10.toFixed(1)}/10</Typography>
-                      <Typography sx={{ fontFamily: "inherit", fontSize: "10px", color: "rgba(180,220,200,0.5)", flex: 1 }}>{str(sec?.threat_level, "-")} · {findingsCount} signals</Typography>
+                      <Typography sx={{ fontFamily: "inherit", fontSize: "10px", color: "rgba(180,220,200,0.5)", flex: 1 }}>{str(sec?.threat_level, "-")} * {findingsCount} signals</Typography>
                     </Box>
                   );
                 })}
@@ -3435,7 +4174,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [failedUserMessage, setFailedUserMessage] = useState<string | null>(null);
   const [streamingResponse, setStreamingResponse] = useState("");
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
-  const [executionPlan, setExecutionPlan] = useState<Array<{ id: number; title: string; description: string; status: string; tool_hint: string | null }>>([]);
+  const [executionPlan, setExecutionPlan] = useState<ExecutionPlanItem[]>([]);
+  const [executionPlanExpanded, setExecutionPlanExpanded] = useState(false);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
   const [completedProgressMessagesByConversation, setCompletedProgressMessagesByConversation] =
     useState<Record<string, { messages: string[]; beforeMessageId: string }>>({});
@@ -3443,7 +4183,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [workspaceOpen, setWorkspaceOpen] = useState(
     () => typeof window !== "undefined" && window.innerWidth >= 1280
   );
-  const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [conversationSidebarOpen, setConversationSidebarOpen] = useState(
+    () => typeof window !== "undefined" && window.innerWidth >= 1480
+  );
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
@@ -3454,6 +4196,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const [deployedFiles, setDeployedFiles] = useState<WorkspaceFileEntry[]>([]);
   const [streamedWorkspaceApp, setStreamedWorkspaceApp] = useState<JsonRecord | null>(null);
   const [liveFileWrites, setLiveFileWrites] = useState<Record<string, LiveFileWriteState>>({});
+  const [streamPhaseStatus, setStreamPhaseStatus] = useState<StreamPhaseStatus | null>(null);
   const [codeViewerOpen, setCodeViewerOpen] = useState(false);
   const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
@@ -3480,6 +4223,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
   const pendingFileReadPathRef = useRef("");
+  const pendingFileWritePathRef = useRef("");
+  const lastProgressBubbleCategoryRef = useRef("");
+  const lastProgressBubbleAtRef = useRef(0);
   const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
 
@@ -3721,23 +4467,34 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (preservedSteps.length > 0) {
       setLastRunSteps(preservedSteps);
     }
-    if (streamingProgressMessages.length > 0) {
-      setCompletedProgressMessagesByConversation((prev) => ({
-        ...prev,
-        [pendingRunSnapshot.conversationId]: {
-          messages: streamingProgressMessages.slice(-5),
-          beforeMessageId: str(latestMessage?.id, "")
-        }
-      }));
-    }
-    storeChatPendingRunSnapshot(null);
-    setPendingRunSnapshot(null);
-    setPendingUserMessage(null);
-    setStreamingResponse("");
-    setStreamingSteps([]); setExecutionPlan([]);
-    setStreamingProgressMessages([]);
-    streamingStepsRef.current = [];
-  }, [
+      if (streamingProgressMessages.length > 0) {
+        setCompletedProgressMessagesByConversation((prev) => ({
+          ...prev,
+          [pendingRunSnapshot.conversationId]: {
+            messages: streamingProgressMessages.slice(-5),
+            beforeMessageId: str(latestMessage?.id, "")
+          }
+        }));
+      }
+      setExecutionPlan((prev) =>
+        prev.map((step) =>
+          step.status === "failed"
+            ? step
+            : {
+                ...step,
+                status: "completed"
+              }
+        )
+      );
+      storeChatPendingRunSnapshot(null);
+      setPendingRunSnapshot(null);
+      setPendingUserMessage(null);
+      setStreamingResponse("");
+      setStreamingSteps([]);
+      setStreamingProgressMessages([]);
+      resetStreamingProgressBubbleState();
+      streamingStepsRef.current = [];
+    }, [
     pendingRunSnapshot,
     conversationId,
     messages,
@@ -3803,6 +4560,110 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       label: `Running ${toHumanToolName(name).toLowerCase()}`,
       detail: "Executing this action."
     };
+  };
+
+  const resetStreamingProgressBubbleState = () => {
+    lastProgressBubbleCategoryRef.current = "";
+    lastProgressBubbleAtRef.current = 0;
+  };
+
+  const pushStreamingProgressBubble = (
+    message: string,
+    options?: { category?: string; replace?: boolean; minIntervalMs?: number }
+  ) => {
+    const text = (message || "").replace(/\s+/g, " ").trim();
+    if (!text) return;
+    const category = str(options?.category, "").trim();
+    const replace = Boolean(options?.replace && category);
+    const minIntervalMs = Math.max(0, num(options?.minIntervalMs, 0));
+    const now = Date.now();
+    setStreamingProgressMessages((prev) => {
+      if (replace && category) {
+        const sameCategory = lastProgressBubbleCategoryRef.current === category;
+        if (sameCategory && now - lastProgressBubbleAtRef.current < minIntervalMs) {
+          return prev;
+        }
+        if (sameCategory && prev.length > 0) {
+          if (prev[prev.length - 1] === text) return prev;
+          lastProgressBubbleAtRef.current = now;
+          return [...prev.slice(0, -1), text];
+        }
+      }
+      if (prev.some((entry) => entry === text)) {
+        if (replace && category) {
+          lastProgressBubbleCategoryRef.current = category;
+          lastProgressBubbleAtRef.current = now;
+        }
+        return prev;
+      }
+      if (replace && category) {
+        lastProgressBubbleCategoryRef.current = category;
+        lastProgressBubbleAtRef.current = now;
+      }
+      return [...prev.slice(-4), text];
+    });
+  };
+
+  const maybeSurfaceThinkingProgressBubble = (step: JsonRecord) => {
+    if (!isHeartbeatStreamingStep(step)) return;
+    const detail = normalizeHeartbeatDetailText(str(step.detail, ""));
+    if (!detail) return;
+    pushStreamingProgressBubble(detail, {
+      category: "heartbeat",
+      replace: true,
+      minIntervalMs: 12000
+    });
+  };
+
+  const maybeSurfaceToolStartProgressBubble = (name: string) => {
+    const copy = toolStartCopy(name);
+    const message = (copy.detail || copy.label || `Starting ${toHumanToolName(name)}.`).trim();
+    if (!message) return;
+    pushStreamingProgressBubble(message, {
+      category: `tool-start:${str(name, "").trim().toLowerCase() || "tool"}`,
+      replace: true,
+      minIntervalMs: 4000
+    });
+  };
+
+  const maybeSurfaceToolProgressBubble = (
+    name: string,
+    content: string,
+    payloadObj: JsonRecord,
+    progressPresentation: ToolProgressPresentation
+  ) => {
+    const kind = str(payloadObj.kind, "");
+    if (kind === "file_write" || name === "file_write") return;
+
+    if (kind === "argument_stream") {
+      const stage = str(payloadObj.stage, "");
+      const toolLabel = toHumanToolName(name).toLowerCase();
+      let message = `I'm preparing ${toolLabel} inputs now.`;
+      if (stage === "payload_build" && name === "app_deploy") {
+        message = "I'm assembling the deploy payload now.";
+      } else if (stage === "payload_repair" && name === "app_deploy") {
+        message = "I'm repairing the deploy payload now.";
+      }
+      pushStreamingProgressBubble(message, {
+        category: str(payloadObj.stream_key, `argument-stream:${name || "tool"}`),
+        replace: true,
+        minIntervalMs: 6000
+      });
+      return;
+    }
+
+    if (/^writing\s+/i.test(progressPresentation.title)) return;
+    const message = (
+      progressPresentation.detail ||
+      simplifyConsoleDetail(summarizeActivityDetail(content.trim().slice(0, 1600))) ||
+      `I'm still running ${toHumanToolName(name).toLowerCase()}.`
+    ).trim();
+    if (!message || /^working\.{0,3}$/i.test(message)) return;
+    pushStreamingProgressBubble(message, {
+      category: `tool-progress:${str(name, "").trim().toLowerCase() || "tool"}`,
+      replace: true,
+      minIntervalMs: 8000
+    });
   };
 
   const simplifyConsoleDetail = (detail: string): string => {
@@ -4263,12 +5124,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setAttachedFiles([]);
     setChatError(null);
     setChatNotice(null);
-    setPendingUserMessage(null);
-    setFailedUserMessage(null);
-    setStreamingResponse("");
-    setStreamingSteps([]); setExecutionPlan([]);
-    setStreamingProgressMessages([]);
-    streamingStepsRef.current = [];
+      setPendingUserMessage(null);
+      setFailedUserMessage(null);
+      setStreamingResponse("");
+      setStreamingSteps([]); setExecutionPlan([]);
+      setExecutionPlanExpanded(false);
+      setStreamingProgressMessages([]);
+      resetStreamingProgressBubbleState();
+      streamingStepsRef.current = [];
     setTraceStepsById({});
     setTraceLoadingById({});
     setTraceErrorById({});
@@ -4276,30 +5139,42 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     setCompletedProgressMessagesByConversation({});
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setStreamPhaseStatus(null);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setMessageTraceOpen({});
+    pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
   };
 
   const openConversationById = (id: string) => {
     if (!id) return;
     setChatError(null);
     if (conversationId === id) return;
-    setPendingUserMessage(null);
-    setFailedUserMessage(null);
-    setStreamingResponse("");
-    setStreamingSteps([]); setExecutionPlan([]);
-    setStreamingProgressMessages([]);
-    streamingStepsRef.current = [];
+      setPendingUserMessage(null);
+      setFailedUserMessage(null);
+      setStreamingResponse("");
+      setStreamingSteps([]); setExecutionPlan([]);
+      setExecutionPlanExpanded(false);
+      setStreamingProgressMessages([]);
+      resetStreamingProgressBubbleState();
+      streamingStepsRef.current = [];
     setTraceStepsById({});
     setTraceLoadingById({});
     setTraceErrorById({});
     setLastRunSteps([]);
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setStreamPhaseStatus(null);
+    setStreamedWorkspaceApp(null);
+    streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setMessageTraceOpen({});
+    pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
     setConversationId(id);
     if (typeof window !== "undefined" && window.innerWidth < 980) {
       setConversationSidebarOpen(false);
@@ -4470,7 +5345,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       /missing ['"`]?files['"`]?/i.test(message) ||
       /object mapping filename to content/i.test(message)
     ) {
-      return "Deploy payload was malformed — the LLM did not provide a valid `files` object. The agent has been given details to self-correct on retry.";
+      return "Deploy payload was malformed â€” the LLM did not provide a valid `files` object. The agent has been given details to self-correct on retry.";
     }
     if (
       /error decoding response body/i.test(message) ||
@@ -4889,6 +5764,19 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       }
       return "Preparing deployment package.";
     }
+    if (normalizedName === "file_write") {
+      const root = asRecord(payload);
+      const fileName = normalizeWorkspaceFileName(
+        root.path ?? root.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, "")
+      );
+      const lineCount = Math.max(0, num(root.line_count, 0));
+      if (fileName) {
+        return lineCount > 0
+          ? `Preparing ${fileName} (${lineCount} line${lineCount === 1 ? "" : "s"}).`
+          : `Preparing ${fileName}.`;
+      }
+    }
     const compact = compactUnknown(payload, 320);
     if (!compact) return `Starting ${toHumanToolName(name)}.`;
     return simplifyConsoleDetail(compact);
@@ -4899,16 +5787,8 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     const stepType = str(step.step_type, "");
     if (stepType === "plan_generated") {
       const rawSteps = Array.isArray(step.steps) ? step.steps : [];
-      setExecutionPlan(rawSteps.map((s: unknown) => {
-        const r = s && typeof s === "object" ? s as Record<string, unknown> : {};
-        return {
-          id: typeof r.id === "number" ? r.id : 0,
-          title: typeof r.title === "string" ? r.title : "Step",
-          description: typeof r.description === "string" ? r.description : "",
-          status: typeof r.status === "string" ? r.status : "pending",
-          tool_hint: typeof r.tool_hint === "string" ? r.tool_hint : null,
-        };
-      }));
+      setExecutionPlan(normalizeExecutionPlanSteps(rawSteps, { markFirstRunning: true }));
+      setExecutionPlanExpanded(false);
     }
     if (stepType === "plan_step_update" && typeof step.step_id === "number") {
       const sid = step.step_id as number;
@@ -4971,8 +5851,318 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   const rememberStreamedWorkspaceApp = (nextApp: JsonRecord | null) => {
     if (!nextApp) return;
     const merged = { ...(streamedWorkspaceAppRef.current || {}), ...nextApp };
+    const appDir = str(merged.app_dir, "");
     streamedWorkspaceAppRef.current = merged;
     setStreamedWorkspaceApp(merged);
+    if (appDir) {
+      setDeployedFiles((prev) => mergeWorkspaceFiles(prev, [], appDir));
+      setLiveFileWrites((prev) => canonicalizeLiveFileWrites(prev, appDir));
+    }
+  };
+
+  const handleStreamToolStart = (name: string, payload?: Record<string, unknown>) => {
+    const payloadSummary = summarizeToolStartPayload(name, payload);
+    const payloadObj = asRecord(payload);
+    pushStreamingStep({
+      step_type: "tool_start",
+      title: `Tool started: ${name}`,
+      detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
+      data: name
+    });
+    if (name === "file_read") {
+      pendingFileReadPathRef.current = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, "")
+      );
+    }
+    if (name === "file_write") {
+      pendingFileWritePathRef.current = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file,
+        str(streamedWorkspaceAppRef.current?.app_dir, "")
+      );
+    }
+    const capturedApp = extractWorkspaceAppFromStreamPayload(name, payload);
+    rememberStreamedWorkspaceApp(capturedApp);
+    const workspaceAppDir = str(
+      capturedApp?.app_dir,
+      str(streamedWorkspaceAppRef.current?.app_dir, "")
+    );
+    const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payload);
+    if (capturedFiles.length > 0) {
+      setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles, workspaceAppDir));
+      setLiveFileWrites((prev) => {
+        const next = { ...prev };
+        for (const file of capturedFiles) {
+          const normalizedName = normalizeWorkspaceFileName(file.name, workspaceAppDir);
+          if (!normalizedName) continue;
+          if (!next[normalizedName]) {
+            const totalLines =
+              file.content.length > 0
+                ? file.content.split(/\r?\n/).length
+                : 0;
+            next[normalizedName] = {
+              content: choosePreferredWorkspaceFileContent("", file.content),
+              line: 0,
+              totalLines,
+              done: false
+            };
+          } else if (file.content && !next[normalizedName].content) {
+            const totalLines = file.content.split(/\r?\n/).length;
+            next[normalizedName] = {
+              ...next[normalizedName],
+              content: choosePreferredWorkspaceFileContent(next[normalizedName].content, file.content),
+              totalLines: next[normalizedName].totalLines || totalLines
+            };
+          }
+        }
+        return canonicalizeLiveFileWrites(next, workspaceAppDir);
+      });
+      setCodeViewerFileIdx(0);
+      setWorkspaceOpen(true);
+    }
+  };
+
+  const handleStreamToolResult = (
+    name: string,
+    content: string,
+    payload?: Record<string, unknown>
+  ) => {
+    const preview = content.trim().slice(0, 1600);
+    const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
+    const payloadObj = asRecord(payload);
+    const capturedApp = extractWorkspaceAppFromStreamPayload(name, payloadObj);
+    rememberStreamedWorkspaceApp(capturedApp);
+    const workspaceAppDir = str(
+      capturedApp?.app_dir,
+      str(streamedWorkspaceAppRef.current?.app_dir, "")
+    );
+    if (capturedApp) setWorkspaceOpen(true);
+    const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payloadObj);
+    if (capturedFiles.length > 0) {
+      setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles, workspaceAppDir));
+      setWorkspaceOpen(true);
+    }
+    if (name === "file_read") {
+      const rawContent = str(payloadObj.raw_content, "").trim();
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.path ?? payloadObj.file ?? pendingFileReadPathRef.current,
+        workspaceAppDir
+      );
+      if (fileName && rawContent) {
+        setDeployedFiles((prev) =>
+          mergeWorkspaceFiles(prev, [{ name: fileName, content: rawContent }], workspaceAppDir)
+        );
+        setWorkspaceOpen(true);
+      }
+      pendingFileReadPathRef.current = "";
+    }
+    if (name === "file_write") {
+      const resultPathMatch = content.match(/written to\s+(.+)$/i);
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.path ??
+          payloadObj.file ??
+          resultPathMatch?.[1] ??
+          pendingFileWritePathRef.current,
+        workspaceAppDir
+      );
+      const resultContent = choosePreferredWorkspaceFileContent(
+        str(payloadObj.file_content, str(payloadObj.raw_content, "")),
+        str(payloadObj.content, "")
+      );
+      if (fileName) {
+        setDeployedFiles((prev) => {
+          const existing = prev.find((file) => file.name === fileName);
+          const fallbackContent = existing?.content || "";
+          return mergeWorkspaceFiles(
+            prev,
+            [{
+              name: fileName,
+              content: resultContent || fallbackContent
+            }],
+            workspaceAppDir
+          );
+        });
+        setLiveFileWrites((prev) => {
+          const existing = prev[fileName];
+          const mergedContent = choosePreferredWorkspaceFileContent(
+            existing?.content || "",
+            resultContent
+          );
+          const totalLines = mergedContent
+            ? mergedContent.split(/\r?\n/).length
+            : Math.max(existing?.totalLines ?? 0, 0);
+          return canonicalizeLiveFileWrites({
+            ...prev,
+            [fileName]: {
+              content: mergedContent,
+              line: totalLines > 0 ? totalLines : Math.max(existing?.line ?? 0, 0),
+              totalLines,
+              done: true
+            }
+          }, workspaceAppDir);
+        });
+        setWorkspaceOpen(true);
+      }
+      pendingFileWritePathRef.current = "";
+    }
+    if (name === "app_deploy" || name === "app_restart") {
+      setLiveFileWrites((prev) => {
+        const next: Record<string, LiveFileWriteState> = {};
+        for (const [file, state] of Object.entries(prev)) {
+          next[file] = { ...state, done: true };
+        }
+        return next;
+      });
+    }
+    pushStreamingStep({
+      step_type: "tool_result",
+      title: `Tool finished: ${name || "tool"}`,
+      detail: detail || preview,
+      data: payload || detail || preview
+    });
+  };
+
+  const handleStreamToolProgress = (
+    name: string,
+    content: string,
+    payload?: Record<string, unknown>
+  ) => {
+    const payloadObj = asRecord(payload);
+    const workspaceAppDir = str(streamedWorkspaceAppRef.current?.app_dir, "");
+    const progressPresentation = buildToolProgressPresentation(
+      name,
+      content,
+      payloadObj,
+      workspaceAppDir
+    );
+    const phaseStatus = extractPhaseStatusFromProgress(name, payloadObj, progressPresentation.detail);
+    if (phaseStatus) {
+      setStreamPhaseStatus(phaseStatus);
+      if (
+        ["app_deploy", "file_write", "app_restart"].includes(name) ||
+        [
+          "planning",
+          "generating_files",
+          "writing_files",
+          "deploying",
+          "installing",
+          "preparing_runtime",
+          "starting_runtime",
+          "validating",
+          "link_setup"
+        ].includes(phaseStatus.phase)
+      ) {
+        setWorkspaceOpen(true);
+      }
+    }
+
+    const isDraftFile = str(payloadObj.kind, "") === "draft_file";
+    if (isDraftFile) {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir
+      );
+      if (fileName) {
+        const snapshot = str(payloadObj.content_snapshot, "");
+        const delta = str(payloadObj.content_delta, "");
+        const done = toBool(payloadObj.done);
+        const derivedLines = snapshot
+          ? snapshot.split(/\r?\n/).length
+          : delta
+            ? delta.split(/\r?\n/).length
+            : 0;
+        const lineNo = Math.max(0, num(payloadObj.line, derivedLines));
+        const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+        const currentContentHint = liveFileWrites[fileName]?.content || "";
+        setLiveFileWrites((prev) => {
+          const current = prev[fileName];
+          let nextContent = current?.content ?? "";
+          if (snapshot) {
+            nextContent = choosePreferredWorkspaceFileContent(nextContent, snapshot);
+          } else if (delta) {
+            nextContent = `${nextContent}${delta}`;
+          }
+          const nextDerivedLines = nextContent ? nextContent.split(/\r?\n/).length : derivedLines;
+          const nextLine = Math.max(current?.line ?? 0, lineNo || nextDerivedLines);
+          const nextTotalLines =
+            totalLines > 0
+              ? totalLines
+              : Math.max(current?.totalLines ?? 0, nextDerivedLines);
+          return canonicalizeLiveFileWrites({
+            ...prev,
+            [fileName]: {
+              content: nextContent,
+              line: nextLine,
+              totalLines: nextTotalLines,
+              done: done || (nextTotalLines > 0 && nextLine >= nextTotalLines)
+            }
+          }, workspaceAppDir);
+        });
+        setDeployedFiles((prev) => {
+          const existing = prev.find((file) => file.name === fileName);
+          const baseContent = currentContentHint || existing?.content || "";
+          const mergedContent = snapshot
+            ? choosePreferredWorkspaceFileContent(baseContent, snapshot)
+            : delta
+              ? `${baseContent}${delta}`
+              : baseContent;
+          return mergeWorkspaceFiles(
+            prev,
+            [{ name: fileName, content: mergedContent }],
+            workspaceAppDir
+          );
+        });
+        setWorkspaceOpen(true);
+      }
+    }
+
+    const isFileWriteProgress =
+      (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
+      name === "file_write";
+    if (isFileWriteProgress) {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir
+      );
+      if (fileName) {
+        const lineNo = Math.max(0, num(payloadObj.line, 0));
+        const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+        const done =
+          toBool(payloadObj.done) || (totalLines > 0 && lineNo >= totalLines);
+        const text = str(payloadObj.text, "");
+        setLiveFileWrites((prev) => {
+          const current = prev[fileName];
+          const currentLine = current?.line ?? 0;
+          let nextContent = current?.content ?? "";
+          if (lineNo > currentLine) {
+            if (lineNo > 0) nextContent += `${text}\n`;
+          } else if (!current && text) {
+            nextContent = `${text}\n`;
+          }
+          return canonicalizeLiveFileWrites({
+            ...prev,
+            [fileName]: {
+              content: nextContent,
+              line: Math.max(currentLine, lineNo),
+              totalLines: totalLines > 0 ? totalLines : (current?.totalLines ?? 0),
+              done
+            }
+          }, workspaceAppDir);
+        });
+        setDeployedFiles((prev) =>
+          mergeWorkspaceFiles(prev, [{ name: fileName, content: "" }], workspaceAppDir)
+        );
+        setWorkspaceOpen(true);
+      }
+    }
+
+    pushStreamingStep({
+      step_type: "tool_progress",
+      title: progressPresentation.title,
+      detail: progressPresentation.detail,
+      data: Object.keys(payloadObj).length > 0 ? payloadObj : progressPresentation.detail,
+      ...(progressPresentation.streamKey ? { __streamKey: progressPresentation.streamKey } : {})
+    });
   };
 
   const runStreamingChat = async (
@@ -4984,30 +6174,40 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       projectIdOverride?: string;
       statusSource?: string;
       deepResearch?: boolean;
+      resumeTaskId?: string;
     }
   ): Promise<boolean> => {
+    const resumeTaskId = (opts?.resumeTaskId || "").trim();
+    const isResumeMode = !!resumeTaskId;
     const requestedConversationOverride = (opts?.conversationIdOverride || "").trim();
     const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
     const targetConversationId =
-      requestedConversationOverride || conversationId || generateConversationId();
+      requestedConversationOverride || conversationId || (isResumeMode ? "" : generateConversationId());
     const targetProjectId = requestedProjectOverride || activeProjectId || "";
-    let activeMessage =
-      message.trim() ||
-      (files.length > 0
-        ? "Please analyze the attached documents and answer using them."
-        : "");
-    if (/^\s*use current (llm|model) (key|config)\s*$/i.test(activeMessage)) {
+    let activeMessage = isResumeMode
+      ? ""
+      : message.trim() ||
+        (files.length > 0
+          ? "Please analyze the attached documents and answer using them."
+          : "");
+    if (!isResumeMode && /^\s*use current (llm|model) (key|config)\s*$/i.test(activeMessage)) {
       const fallbackKey = (secretHelperKey || "OPENAI_API_KEY").trim().toUpperCase();
       activeMessage = `use current llm key for ${fallbackKey}`;
     }
-    if (!activeMessage || isStreaming || streamLockRef.current) return false;
+    if ((!activeMessage && !isResumeMode) || isStreaming || streamLockRef.current) return false;
+    if (isResumeMode && !targetConversationId) {
+      setChatError("This stopped task is missing its conversation, so it cannot be resumed.");
+      return false;
+    }
     const now = Date.now();
     const deepResearch = Boolean(opts?.deepResearch);
     const executionMode: ChatExecutionMode = "auto";
-    const fingerprint = `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim()}::${deepResearch ? "research" : "chat"}::${executionMode}`;
+    const fingerprint = isResumeMode
+      ? `resume::${resumeTaskId}::${targetConversationId || "__no_conversation__"}`
+      : `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim()}::${deepResearch ? "research" : "chat"}::${executionMode}`;
     const lastSend = recentSendRef.current;
     if (lastSend && lastSend.fingerprint === fingerprint && now - lastSend.at < 1500) {
       setChatNotice("Duplicate send ignored.");
@@ -5016,20 +6216,23 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     recentSendRef.current = { fingerprint, at: now };
     streamLockRef.current = true;
     stopRequestedRef.current = false;
-    activeChatTaskIdRef.current = null;
+    activeChatTaskIdRef.current = isResumeMode ? resumeTaskId : null;
     const abortController = new AbortController();
     streamAbortRef.current = abortController;
 
     setChatError(null);
     const sensitiveMessage =
-      Boolean(opts?.sensitive) ||
-      /^\s*set secret\s+/i.test(activeMessage) ||
-      /^\s*use current (llm|model) (key|config)(?:\s+for\s+.+)?\s*$/i.test(activeMessage);
-    setPendingUserMessage(sensitiveMessage ? null : activeMessage);
+      !isResumeMode &&
+      (Boolean(opts?.sensitive) ||
+        /^\s*set secret\s+/i.test(activeMessage) ||
+        /^\s*use current (llm|model) (key|config)(?:\s+for\s+.+)?\s*$/i.test(activeMessage));
+    setPendingUserMessage(!isResumeMode && !sensitiveMessage ? activeMessage : null);
     setFailedUserMessage(null);
     setStreamingResponse("");
     setStreamingSteps([]); setExecutionPlan([]);
+    setExecutionPlanExpanded(false);
     setStreamingProgressMessages([]);
+    resetStreamingProgressBubbleState();
     setCompletedProgressMessagesByConversation((prev) => {
       if (!targetConversationId || !prev[targetConversationId]) return prev;
       const next = { ...prev };
@@ -5038,12 +6241,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     });
     setLiveFileWrites({});
     setDeployedFiles([]);
+    setStreamPhaseStatus(null);
     setStreamedWorkspaceApp(null);
     streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
     setIsStreaming(true);
     pendingFileReadPathRef.current = "";
+    pendingFileWritePathRef.current = "";
 
     if (conversationId !== targetConversationId) {
       setConversationId(targetConversationId);
@@ -5053,9 +6258,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
     const initialPendingSnapshot: ChatPendingRunSnapshot = {
       conversationId: targetConversationId,
-      message: sensitiveMessage ? "" : activeMessage,
+      message: !isResumeMode && !sensitiveMessage ? activeMessage : "",
       projectId: targetProjectId,
       startedAt: Date.now(),
+      mode: isResumeMode ? "resume" : "fresh",
+      phase: "running",
+      taskId: resumeTaskId,
       streamingResponse: "",
       streamingSteps: [],
       failedUserMessage: ""
@@ -5066,6 +6274,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     let resolvedConversationId = targetConversationId;
     let payloadMessage = activeMessage;
     let streamError: string | null = null;
+    let latestStreamingResponse = "";
     const absorbConversationId = (payload: unknown) => {
       const obj = asRecord(payload);
       const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, "")));
@@ -5081,7 +6290,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     };
 
     try {
-      if (files.length > 0) {
+      if (!isResumeMode && files.length > 0) {
         setChatNotice(`Indexing ${files.length} attachment${files.length === 1 ? "" : "s"}...`);
         const uploaded = await uploadAttachmentsForKnowledge(files);
         if (uploaded.length > 0) {
@@ -5093,185 +6302,44 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           );
         }
       }
-        await api.chatStream(
-          {
-            message: payloadMessage,
-            channel: "web",
-            conversation_id: targetConversationId,
-            project_id: targetProjectId || undefined,
-            deep_research: deepResearch,
-            execution_mode: executionMode,
-            attachments_present: files.length > 0
-          },
-          {
-          signal: abortController.signal,
-          onEvent: (_eventName, payload) => {
-            absorbConversationId(payload);
-          },
-          onToken: (token) => {
-            setStreamingResponse((prev) => prev + token);
-          },
+      await (isResumeMode
+        ? api.resumeChatTaskStream(resumeTaskId, {
+            signal: abortController.signal,
+            onEvent: (eventName, payload) => {
+              absorbConversationId(payload);
+              if (eventName === "plan_generated" || eventName === "plan_step_update") {
+                const planPayload = asRecord(payload);
+                if (Object.keys(planPayload).length > 0) {
+                  pushStreamingStep(planPayload);
+                }
+              }
+            },
+            onToken: (token) => {
+              latestStreamingResponse += token;
+              setStreamingResponse((prev) => prev + token);
+            },
           onThinking: (step) => {
             absorbConversationId(step);
             pushStreamingStep(step);
           },
-          onToolStart: (name, payload) => {
-            const payloadSummary = summarizeToolStartPayload(name, payload);
-            pushStreamingStep({
-              step_type: "tool_start",
-              title: `Tool started: ${name}`,
-              detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
-              data: name
-            });
-            if (name === "file_read") {
-              const readPayload = asRecord(payload);
-              pendingFileReadPathRef.current = normalizeWorkspaceFileName(
-                readPayload.path ?? readPayload.file,
-                str(streamedWorkspaceAppRef.current?.app_dir, "")
-              );
-            }
-            const capturedApp = extractWorkspaceAppFromStreamPayload(name, payload);
-            rememberStreamedWorkspaceApp(capturedApp);
-            const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payload);
-            if (capturedFiles.length > 0) {
-              setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles));
-              setLiveFileWrites((prev) => {
-                const next = { ...prev };
-                for (const file of capturedFiles) {
-                  if (!next[file.name]) {
-                    const totalLines =
-                      file.content.length > 0
-                        ? file.content.split(/\r?\n/).length
-                        : 0;
-                    next[file.name] = {
-                      content: "",
-                      line: 0,
-                      totalLines,
-                      done: false
-                    };
-                  }
-                }
-                return next;
-              });
-              setCodeViewerFileIdx(0);
-              setWorkspaceOpen(true);
-            }
-          },
-          onToolResult: (name, content, payload) => {
-            const preview = content.trim().slice(0, 1600);
-            const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
-            const payloadObj = asRecord(payload);
-            const capturedApp = extractWorkspaceAppFromStreamPayload(name, payloadObj);
-            rememberStreamedWorkspaceApp(capturedApp);
-            if (capturedApp) setWorkspaceOpen(true);
-            const capturedFiles = extractWorkspaceFilesFromStreamPayload(name, payloadObj);
-            if (capturedFiles.length > 0) {
-              setDeployedFiles((prev) => mergeWorkspaceFiles(prev, capturedFiles));
-              setWorkspaceOpen(true);
-            }
-            if (name === "file_read") {
-              const rawContent = str(payloadObj.raw_content, "").trim();
-              const fileName = normalizeWorkspaceFileName(
-                payloadObj.path ?? payloadObj.file ?? pendingFileReadPathRef.current,
-                str(capturedApp?.app_dir, str(streamedWorkspaceAppRef.current?.app_dir, ""))
-              );
-              if (fileName && rawContent) {
-                setDeployedFiles((prev) =>
-                  mergeWorkspaceFiles(prev, [{ name: fileName, content: rawContent }])
-                );
-                setWorkspaceOpen(true);
-              }
-              pendingFileReadPathRef.current = "";
-            }
-            if (name === "app_deploy" || name === "app_restart") {
-              setLiveFileWrites((prev) => {
-                const next: Record<string, LiveFileWriteState> = {};
-                for (const [file, state] of Object.entries(prev)) {
-                  next[file] = { ...state, done: true };
-                }
-                return next;
-              });
-            }
-            pushStreamingStep({
-              step_type: "tool_result",
-              title: `Tool finished: ${name || "tool"}`,
-              detail: detail || preview,
-              data: payload || detail || preview
-            });
-          },
-          onToolProgress: (name, content, payload) => {
-            const payloadObj = asRecord(payload);
-            const progressPresentation = buildToolProgressPresentation(
-              name,
-              content,
-              payloadObj,
-              str(streamedWorkspaceAppRef.current?.app_dir, "")
-            );
-            if (toBool(payloadObj.chat_visible)) {
-              const chatMessage = str(
-                payloadObj.chat_message,
-                progressPresentation.detail || content.trim().slice(0, 1600)
-              ).trim();
-              if (chatMessage) {
-                setStreamingProgressMessages((prev) => {
-                  if (prev.some((entry) => entry === chatMessage)) return prev;
-                  return [...prev.slice(-5), chatMessage];
-                });
-              }
-            }
-            const isFileWriteProgress =
-              (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
-              name === "file_write";
-            if (isFileWriteProgress) {
-              const fileName = normalizeWorkspaceFileName(
-                payloadObj.file ?? payloadObj.path,
-                str(streamedWorkspaceAppRef.current?.app_dir, "")
-              );
-              if (fileName) {
-                const lineNo = Math.max(0, num(payloadObj.line, 0));
-                const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
-                const done =
-                  toBool(payloadObj.done) || (totalLines > 0 && lineNo >= totalLines);
-                const text = str(payloadObj.text, "");
-                setLiveFileWrites((prev) => {
-                  const current = prev[fileName];
-                  const currentLine = current?.line ?? 0;
-                  let nextContent = current?.content ?? "";
-                  if (lineNo > currentLine) {
-                    if (lineNo > 0) nextContent += `${text}\n`;
-                  } else if (!current && text) {
-                    nextContent = `${text}\n`;
-                  }
-                  return {
-                    ...prev,
-                    [fileName]: {
-                      content: nextContent,
-                      line: Math.max(currentLine, lineNo),
-                      totalLines: totalLines > 0 ? totalLines : (current?.totalLines ?? 0),
-                      done
-                    }
-                  };
-                });
-                setDeployedFiles((prev) => {
-                  if (prev.some((f) => f.name === fileName)) return prev;
-                  return [...prev, { name: fileName, content: "" }];
-                });
-                setWorkspaceOpen(true);
-              }
-            }
-            pushStreamingStep({
-              step_type: "tool_progress",
-              title: progressPresentation.title,
-              detail: progressPresentation.detail,
-              data: Object.keys(payloadObj).length > 0 ? payloadObj : progressPresentation.detail,
-              ...(progressPresentation.streamKey ? { __streamKey: progressPresentation.streamKey } : {})
-            });
-          },
+          onToolStart: handleStreamToolStart,
+          onToolResult: handleStreamToolResult,
+          onToolProgress: handleStreamToolProgress,
           onTaskStarted: (payload) => {
             const taskId = str(payload.task_id, "");
             const description = str(payload.description, "Task");
             if (!taskId) return;
             activeChatTaskIdRef.current = taskId;
+            setPendingRunSnapshot((prev) => {
+              const next = {
+                ...(prev ?? initialPendingSnapshot),
+                taskId,
+                mode: (isResumeMode ? "resume" : "fresh") as ChatPendingRunMode,
+                phase: "running" as ChatPendingRunPhase
+              };
+              storeChatPendingRunSnapshot(next);
+              return next;
+            });
             setChatNotice(`Task started: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
@@ -5297,14 +6365,99 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           },
           onContent: (payload) => {
             const text = str(payload.content, "");
-            if (text) setStreamingResponse(text);
+            if (text) {
+              latestStreamingResponse = text;
+              setStreamingResponse(text);
+            }
+            absorbConversationId(payload);
+          },
+          onError: (messageText) => {
+            streamError = normalizeChatError(messageText);
+          }
+        })
+        : api.chatStream(
+            {
+              message: payloadMessage,
+              channel: "web",
+              conversation_id: targetConversationId,
+              project_id: targetProjectId || undefined,
+              deep_research: deepResearch,
+              execution_mode: executionMode,
+              attachments_present: files.length > 0
+            },
+            {
+              signal: abortController.signal,
+            onEvent: (eventName, payload) => {
+                absorbConversationId(payload);
+                if (eventName === "plan_generated" || eventName === "plan_step_update") {
+                  const planPayload = asRecord(payload);
+                  if (Object.keys(planPayload).length > 0) {
+                    pushStreamingStep(planPayload);
+                  }
+                }
+              },
+              onToken: (token) => {
+                latestStreamingResponse += token;
+                setStreamingResponse((prev) => prev + token);
+              },
+            onThinking: (step) => {
+              absorbConversationId(step);
+              pushStreamingStep(step);
+            },
+            onToolStart: handleStreamToolStart,
+            onToolResult: handleStreamToolResult,
+            onToolProgress: handleStreamToolProgress,
+          onTaskStarted: (payload) => {
+            const taskId = str(payload.task_id, "");
+            const description = str(payload.description, "Task");
+            if (!taskId) return;
+            activeChatTaskIdRef.current = taskId;
+            setPendingRunSnapshot((prev) => {
+              const next = {
+                ...(prev ?? initialPendingSnapshot),
+                taskId,
+                mode: "fresh" as ChatPendingRunMode,
+                phase: "running" as ChatPendingRunPhase
+              };
+              storeChatPendingRunSnapshot(next);
+              return next;
+            });
+            setChatNotice(`Task started: ${description}`);
+            void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+            void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+          },
+          onTaskStatus: (payload) => {
+            const taskId = str(payload.task_id, "");
+            const description = str(payload.description, "Task");
+            const status = str(payload.status, "");
+            if (!taskId || !status) return;
+            const statusLabel =
+              status === "completed"
+                ? "completed"
+                : status === "failed"
+                  ? "failed"
+                  : status === "paused"
+                    ? "paused"
+                    : status === "awaiting_approval"
+                      ? "awaiting approval"
+                      : status.replace(/_/g, " ");
+            setChatNotice(`Task ${statusLabel}: ${description}`);
+            void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+            void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+          },
+          onContent: (payload) => {
+            const text = str(payload.content, "");
+            if (text) {
+              latestStreamingResponse = text;
+              setStreamingResponse(text);
+            }
             absorbConversationId(payload);
           },
           onError: (messageText) => {
             streamError = normalizeChatError(messageText);
           }
         }
-      );
+      ));
     } catch (err) {
       const aborted =
         stopRequestedRef.current &&
@@ -5314,16 +6467,18 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         streamError = normalizeChatError(errMessage(err));
       }
     } finally {
+      const wasStopped = stopRequestedRef.current && !streamError;
+      const finalTaskId = activeChatTaskIdRef.current || resumeTaskId || "";
       if (streamError) {
         setChatError(streamError);
-        if (!sensitiveMessage) {
+        if (!sensitiveMessage && !isResumeMode) {
           setFailedUserMessage(activeMessage);
         }
       }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
-      if (!streamError) {
+      if (!streamError && !wasStopped) {
         setFailedUserMessage(null);
         const candidateConversationId = resolvedConversationId || targetConversationId;
         if (candidateConversationId) {
@@ -5350,11 +6505,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           await queryClient.invalidateQueries({ queryKey: ["chat-messages", resolvedConversationId] });
         }
       }
-      if (!streamError) setAttachedFiles([]);
-      if (!streamError && streamingStepsRef.current.length > 0) {
+      if (!streamError && !wasStopped) setAttachedFiles([]);
+      if (!streamError && !wasStopped && streamingStepsRef.current.length > 0) {
         setLastRunSteps(trimTrailingHeartbeatSteps(streamingStepsRef.current));
       }
-      if (typeof window !== "undefined" && opts?.statusSource) {
+      if (typeof window !== "undefined" && opts?.statusSource && !wasStopped) {
         window.dispatchEvent(
           new CustomEvent<ChatRunStatusDetail>(CHAT_RUN_STATUS_EVENT, {
             detail: {
@@ -5368,11 +6523,43 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           })
         );
       }
-      if (streamError) {
+      if (wasStopped) {
+        setFailedUserMessage(null);
+        if (finalTaskId) {
+          const interruptedSteps = trimTrailingHeartbeatSteps(streamingStepsRef.current)
+            .slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+          const interruptedSnapshot: ChatPendingRunSnapshot = {
+            ...initialPendingSnapshot,
+            conversationId: resolvedConversationId || targetConversationId,
+            projectId: targetProjectId || initialPendingSnapshot.projectId || "",
+            taskId: finalTaskId,
+            mode: isResumeMode ? "resume" : "fresh",
+            phase: "interrupted",
+            streamingResponse: latestStreamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
+            streamingSteps: interruptedSteps,
+            failedUserMessage: ""
+          };
+          storeChatPendingRunSnapshot(interruptedSnapshot);
+          setPendingRunSnapshot(interruptedSnapshot);
+          setPendingUserMessage(null);
+          setStreamingResponse(interruptedSnapshot.streamingResponse || "");
+          setStreamingSteps(interruptedSteps);
+          streamingStepsRef.current = interruptedSteps;
+        } else {
+          storeChatPendingRunSnapshot(null);
+          setPendingRunSnapshot(null);
+          setPendingUserMessage(null);
+          setStreamingSteps([]); setExecutionPlan([]);
+          setExecutionPlanExpanded(false);
+          streamingStepsRef.current = [];
+          setStreamingResponse("");
+        }
+      } else if (streamError) {
         storeChatPendingRunSnapshot(null);
         setPendingRunSnapshot(null);
         setPendingUserMessage(null);
         setStreamingSteps([]); setExecutionPlan([]);
+        setExecutionPlanExpanded(false);
         streamingStepsRef.current = [];
         setStreamingResponse("");
       }
@@ -5412,20 +6599,29 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (typeof window === "undefined") return;
     const handleLaunchRun = (event: Event) => {
       const detail = (event as CustomEvent<ChatLaunchRunDetail>).detail;
-      const message = str(detail?.message, "").trim();
-      if (!message) {
-        detail?.reject?.("No message provided.");
-        return;
-      }
       if (isStreaming || streamLockRef.current) {
         detail?.reject?.("Chat is already busy with another run. Wait for it to finish, then retry this fix.");
         return;
       }
+      const resumeTaskId = str(detail?.taskId, "").trim();
+      const launchMode = (!!resumeTaskId || detail?.launchMode === "resume_task")
+        ? "resume_task"
+        : "message";
+      const message = str(detail?.message, "").trim();
+      if (launchMode === "message" && !message) {
+        detail?.reject?.("No message provided.");
+        return;
+      }
+      if (launchMode === "resume_task" && !resumeTaskId) {
+        detail?.reject?.("No resumable task was provided.");
+        return;
+      }
       detail?.resolve?.(true);
-      void runStreamingChat(message, [], {
+      void runStreamingChat(launchMode === "resume_task" ? "" : message, [], {
         conversationIdOverride: str(detail?.conversationId, "").trim() || undefined,
         projectIdOverride: str(detail?.projectId, "").trim() || undefined,
-        statusSource: str(detail?.source, "").trim() || undefined
+        statusSource: str(detail?.source, "").trim() || undefined,
+        resumeTaskId: launchMode === "resume_task" ? resumeTaskId : undefined
       }).catch((err) => {
         if (typeof window !== "undefined" && detail?.source) {
           window.dispatchEvent(
@@ -5447,7 +6643,29 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     };
   }, [isStreaming, runStreamingChat]);
 
-  // Pin scroll to bottom during streaming — useLayoutEffect runs before paint
+  useEffect(() => {
+    if (!isActive || isStreaming || streamLockRef.current) return;
+    const pendingLaunch = loadChatPendingLaunch();
+    if (!pendingLaunch) return;
+    storeChatPendingLaunch(null);
+    void runStreamingChat(
+      pendingLaunch.launchMode === "resume_task" ? "" : str(pendingLaunch.message, ""),
+      [],
+      {
+        conversationIdOverride: str(pendingLaunch.conversationId, "").trim() || undefined,
+        projectIdOverride: str(pendingLaunch.projectId, "").trim() || undefined,
+        statusSource: str(pendingLaunch.source, "").trim() || undefined,
+        resumeTaskId:
+          pendingLaunch.launchMode === "resume_task"
+            ? str(pendingLaunch.taskId, "").trim() || undefined
+            : undefined
+      }
+    ).catch(() => {
+      // The normal chat error UI will surface the failure.
+    });
+  }, [isActive, isStreaming, runStreamingChat]);
+
+  // Pin scroll to bottom during streaming â€” useLayoutEffect runs before paint
   // so the user never sees the intermediate jank position.
   const stickToBottom = useRef(true);
   useLayoutEffect(() => {
@@ -5478,7 +6696,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
   useEffect(() => {
     if (!pendingUserMessage) return;
-    // Don't clear pending message while streaming — avoids layout jump
+    // Don't clear pending message while streaming â€” avoids layout jump
     // when the pending row disappears and the real message appears above.
     if (isStreaming) return;
     const pendingNormalized = stripAttachmentContextMarker(pendingUserMessage).trim();
@@ -5502,7 +6720,16 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     return () => window.clearTimeout(timer);
   }, [chatNotice]);
 
-  const hasRecoveredStream = !isStreamingForCurrentConversation && hasPendingSnapshotForConversation;
+  const pendingSnapshotPhase = pendingRunSnapshot?.phase === "interrupted" ? "interrupted" : "running";
+  const pendingSnapshotMode = pendingRunSnapshot?.mode === "resume" ? "resume" : "fresh";
+  const hasRecoveredStream =
+    !isStreamingForCurrentConversation &&
+    hasPendingSnapshotForConversation &&
+    pendingSnapshotPhase === "running";
+  const showInterruptedRunCard =
+    hasPendingSnapshotForConversation &&
+    pendingSnapshotPhase === "interrupted" &&
+    !isStreamingForCurrentConversation;
   // Track the messages count when streaming started so we can detect when the
   // final assistant message has actually landed in the messages list.
   const streamStartMsgCount = useRef(messages.length);
@@ -5520,7 +6747,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   // Show streaming bubble while streaming OR while waiting for final message to land
   const showStreamingAssistant =
     isStreamingForCurrentConversation || (hasRecoveredStream && !finalMessageLanded);
-  const visiblePendingUserMessage = hasPendingSnapshotForConversation ? pendingUserMessage : null;
+  const visiblePendingUserMessage =
+    hasPendingSnapshotForConversation &&
+    pendingSnapshotMode === "fresh" &&
+    pendingSnapshotPhase === "running"
+      ? pendingUserMessage
+      : null;
   const visibleFailedUserMessage = hasPendingSnapshotForConversation ? failedUserMessage : null;
   const visibleStreamingResponse = hasPendingSnapshotForConversation ? streamingResponse : "";
   const completedProgressSnapshot =
@@ -5623,10 +6855,18 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     ""
   );
   const latestAssistantTraceSteps = latestAssistantTraceId
-    ? traceStepsById[latestAssistantTraceId] || []
-    : [];
+      ? traceStepsById[latestAssistantTraceId] || []
+      : [];
   const completedLastRunSteps = trimTrailingHeartbeatSteps(lastRunSteps);
   const completedPersistedTraceSteps = trimTrailingHeartbeatSteps(latestAssistantTraceSteps);
+  const persistedExecutionPlan = useMemo(
+    () =>
+      showStreamingAssistant || hasPendingSnapshotForConversation
+        ? []
+        : extractExecutionPlanFromTraceSteps(completedPersistedTraceSteps),
+    [showStreamingAssistant, hasPendingSnapshotForConversation, completedPersistedTraceSteps]
+  );
+  const displayedExecutionPlan = executionPlan.length > 0 ? executionPlan : persistedExecutionPlan;
   const completedWorkspaceSteps =
     completedPersistedTraceSteps.length >= completedLastRunSteps.length &&
     completedPersistedTraceSteps.length > 0
@@ -5685,10 +6925,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
     return rows.slice(-16);
   }, [workspaceCards]);
-  const progressDoneCount = useMemo(
-    () => progressRows.filter((row) => row.status === "done").length,
-    [progressRows]
-  );
 
   const codeFromCards = (() => {
     for (let i = workspaceCards.length - 1; i >= 0; i -= 1) {
@@ -5707,13 +6943,14 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     extractFirstCodeFence(latestAssistantMessageText);
   const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
   const activeLiveWrite = activeCodeFile ? liveFileWrites[activeCodeFile.name] : undefined;
+  const activePhaseStatus = streamPhaseStatus;
+  const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
+    activeLiveWrite?.content || "",
+    activeCodeFile?.content || ""
+  );
   const codeViewerContent = activeCodeFile
-    ? activeLiveWrite && !activeLiveWrite.done
-      ? activeLiveWrite.content ||
-        `Waiting for streamed lines from ${activeCodeFile.name}...`
-      : activeCodeFile.content ||
-        activeLiveWrite?.content ||
-        `File content for ${activeCodeFile.name} was not captured during this run.`
+    ? resolvedActiveFileContent ||
+      `Preview unavailable for ${activeCodeFile.name} until file contents are captured.`
     : "";
   const codeViewerWriteStatus = activeLiveWrite
     ? activeLiveWrite.totalLines > 0
@@ -5722,13 +6959,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         ? "File write complete"
         : "Writing file..."
     : "";
-  const panelCodePreview = useMemo(() => {
-    if (!codeViewerContent || (activeLiveWrite && !activeLiveWrite.done)) return "";
-    const lines = codeViewerContent.split(/\r?\n/);
-    return lines.slice(0, 24).join("\n");
-  }, [activeLiveWrite, codeViewerContent]);
-  const canShowInlineFilePreview = Boolean(activeCodeFile && panelCodePreview.trim());
-  const panelCodePreviewLabel = codeViewerWriteStatus || "Preview excerpt";
 
   const appsWorkspaceQ = useQuery({
     queryKey: ["chat-workspace-apps"],
@@ -5758,7 +6988,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (streamedWorkspaceApp) {
       return streamedWorkspaceApp;
     }
-    // No app deployed in this conversation — don't show stale preview from previous ones.
+    // No app deployed in this conversation â€” don't show stale preview from previous ones.
     return null;
   }, [workspaceApps, streamedWorkspaceApp]);
   const activeWorkspaceAppId = str(
@@ -5794,6 +7024,9 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       : "";
   const runtimeMode = str(activeWorkspaceApp?.runtime_mode, "").toLowerCase();
   const runtimeSummary = (() => {
+    if (activeWorkspaceApp?.enabled === false || str(activeWorkspaceApp?.enabled, "").toLowerCase() === "false") {
+      return { label: "Disabled", tone: "default" as const };
+    }
     if (runtimeMode === "isolated_container") {
       return { label: "Sandboxed container", tone: "success" as const };
     }
@@ -5858,7 +7091,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     : showStreamingAssistant
       ? `${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
       : hasCompletedWorkspaceRun
-        ? `Run completed • ${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
+        ? `Run completed - ${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
         : `${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`;
   const workspaceStatusCopy = useMemo(() => {
     if (apiKeyActionNeeded) {
@@ -5878,8 +7111,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     if (isStreamingForCurrentConversation) {
       const active = latestRunningCard || latestWorkspaceCard;
       return {
-        line1: "Status: Running",
-        line2: active?.detail || "Agent is actively running actions.",
+        line1: `Status: ${activePhaseStatus?.label || "Running"}`,
+        line2:
+          activePhaseStatus?.detail ||
+          active?.detail ||
+          "Agent is actively running actions.",
         tone: "info"
       };
     }
@@ -5902,13 +7138,28 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       line2: "Send a request to start a run.",
       tone: "default"
     };
-  }, [apiKeyActionNeeded, isStreamingForCurrentConversation, latestRunningCard, latestWorkspaceCard, safetyPolicyBlocked]);
+  }, [
+    activePhaseStatus?.detail,
+    activePhaseStatus?.label,
+    apiKeyActionNeeded,
+    isStreamingForCurrentConversation,
+    latestRunningCard,
+    latestWorkspaceCard,
+    safetyPolicyBlocked
+  ]);
   const nowDoingLabel = useMemo(() => {
     if (apiKeyActionNeeded) return "Waiting for your approval/input";
     if (safetyPolicyBlocked) return "Blocked by safety policy";
+    if (activePhaseStatus?.label) return activePhaseStatus.label;
     const active = latestRunningCard || latestWorkspaceCard;
     return active?.label || "Waiting for next step";
-  }, [apiKeyActionNeeded, latestRunningCard, latestWorkspaceCard, safetyPolicyBlocked]);
+  }, [
+    activePhaseStatus?.label,
+    apiKeyActionNeeded,
+    latestRunningCard,
+    latestWorkspaceCard,
+    safetyPolicyBlocked
+  ]);
   const liveWriteEntries = useMemo(
     () =>
       Object.entries(liveFileWrites).sort((a, b) => {
@@ -5923,16 +7174,45 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     [liveWriteEntries]
   );
   const activeLiveWriteName = activeLiveWriteEntry?.[0] || "";
-  const activeLiveWriteState = activeLiveWriteEntry?.[1] || null;
-  const liveWriteSummary = activeLiveWriteName
-    ? activeLiveWriteState?.totalLines
-      ? `${activeLiveWriteName} ${Math.min(activeLiveWriteState.line, activeLiveWriteState.totalLines)}/${activeLiveWriteState.totalLines}`
-      : activeLiveWriteState?.done
-        ? `${activeLiveWriteName} ready`
-        : activeLiveWriteName
-    : deployedFiles.length > 0
-      ? `${deployedFiles.length} tracked file${deployedFiles.length === 1 ? "" : "s"}`
-      : "Waiting for file sync";
+  const activeLiveWriteProgressLabel = activeLiveWriteEntry
+    ? (() => {
+        const state = activeLiveWriteEntry[1];
+        if (state.totalLines > 0) {
+          return `${Math.min(state.line, state.totalLines)}/${state.totalLines} lines${state.done ? " done" : ""}`;
+        }
+        return state.done ? "Write complete" : "Writing...";
+      })()
+    : "";
+
+  useEffect(() => {
+    if (!activeLiveWriteName) return;
+    const nextIndex = deployedFiles.findIndex((file) => file.name === activeLiveWriteName);
+    if (nextIndex >= 0 && nextIndex !== codeViewerFileIdx) {
+      setCodeViewerFileIdx(nextIndex);
+    }
+  }, [activeLiveWriteName, deployedFiles, codeViewerFileIdx]);
+  const executionPlanCompletedCount = displayedExecutionPlan.filter((step) => step.status === "completed").length;
+  const executionPlanActiveCount = displayedExecutionPlan.filter((step) => step.status === "running").length;
+  const executionPlanFailedCount = displayedExecutionPlan.filter((step) => step.status === "failed").length;
+  const executionPlanPendingCount = Math.max(
+    0,
+    displayedExecutionPlan.length - executionPlanCompletedCount - executionPlanActiveCount - executionPlanFailedCount
+  );
+  const executionPlanStatusLabel = executionPlanFailedCount > 0
+    ? "Needs attention"
+    : executionPlanActiveCount > 0
+      ? "Working"
+      : displayedExecutionPlan.length > 0 && executionPlanCompletedCount === displayedExecutionPlan.length
+        ? "Completed"
+        : "Ready";
+  const executionPlanSummaryText = displayedExecutionPlan.length > 0
+    ? [
+        `${displayedExecutionPlan.length} step${displayedExecutionPlan.length === 1 ? "" : "s"}`,
+        `${executionPlanCompletedCount} done`,
+        executionPlanActiveCount > 0 ? `${executionPlanActiveCount} running` : null,
+        executionPlanPendingCount > 0 ? `${executionPlanPendingCount} pending` : null
+      ].filter(Boolean).join(" - ")
+    : "";
   const activeWorkspaceAppTitle = str(
     activeWorkspaceApp?.title,
     str(activeWorkspaceApp?.app_id, str(activeWorkspaceApp?.id, ""))
@@ -5954,24 +7234,12 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       });
     }
 
-    if (activeLiveWriteName) {
-      const lineDetail = activeLiveWriteState?.totalLines
-        ? `Line ${Math.min(activeLiveWriteState.line, activeLiveWriteState.totalLines)}/${activeLiveWriteState.totalLines}${activeLiveWriteState.done ? " complete" : ""}`
-        : activeLiveWriteState?.done
-          ? "Write complete"
-          : "Writing now";
+    if (activePhaseStatus) {
       rows.push({
-        label: "Writing file",
-        value: activeLiveWriteName,
-        detail: lineDetail,
-        tone: activeLiveWriteState?.done ? "success" : "live"
-      });
-    } else if (deployedFiles.length > 0) {
-      rows.push({
-        label: "Files written",
-        value: `${deployedFiles.length} file${deployedFiles.length === 1 ? "" : "s"}`,
-        detail: deployedFiles[deployedFiles.length - 1]?.name || "",
-        tone: "success"
+        label: "Phase",
+        value: activePhaseStatus.label,
+        detail: activePhaseStatus.detail,
+        tone: "live"
       });
     }
 
@@ -6001,13 +7269,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
 
     return rows;
   }, [
-    activeLiveWriteName,
-    activeLiveWriteState,
     activeWorkspaceApp,
     activeWorkspaceAppId,
     activeWorkspaceAppTitle,
+    activePhaseStatus,
     apiKeyActionNeeded,
-    deployedFiles,
     previewUrl,
     publicPreviewUrl,
     runtimeSummary.label,
@@ -6018,13 +7284,20 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
   ]);
   const termFooterSignals = useMemo(() => {
     const rows: Array<{ label: string; value: string }> = [];
+    if (activePhaseStatus) {
+      rows.push({ label: "Phase", value: activePhaseStatus.label });
+      if (activePhaseStatus.toolName) {
+        rows.push({ label: "Tool", value: toHumanToolName(activePhaseStatus.toolName) });
+      }
+      if (activePhaseStatus.elapsedSecs > 0) {
+        rows.push({ label: "Elapsed", value: `${activePhaseStatus.elapsedSecs}s` });
+      }
+    }
     if (activeLiveWriteName) {
-      rows.push({ label: "File", value: liveWriteSummary });
-    } else if (deployedFiles.length > 0) {
-      rows.push({
-        label: "Files",
-        value: `${deployedFiles.length} written`
-      });
+      rows.push({ label: "File", value: activeLiveWriteName });
+    }
+    if (activeLiveWriteProgressLabel) {
+      rows.push({ label: "Progress", value: activeLiveWriteProgressLabel });
     }
     if (activeWorkspaceApp) {
       rows.push({ label: "Runtime", value: runtimeSummary.label });
@@ -6037,10 +7310,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
     }
     return rows;
   }, [
-    activeLiveWriteName,
     activeWorkspaceApp,
-    deployedFiles.length,
-    liveWriteSummary,
+    activeLiveWriteName,
+    activeLiveWriteProgressLabel,
+    activePhaseStatus,
     previewUrl,
     publicPreviewUrl,
     runtimeSummary.label
@@ -6103,18 +7376,25 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         display: "grid",
         gridTemplateColumns: {
           xs: "1fr",
+          md: showConversationSidebar
+            ? "clamp(240px, 28vw, 294px) minmax(0,1fr)"
+            : "1fr",
           lg: showWorkspacePanel
-            ? "minmax(0,1fr) clamp(300px, 24vw, 340px)"
-            : "minmax(0,1fr)",
+            ? showConversationSidebar
+              ? "clamp(236px, 18vw, 276px) minmax(0,1fr) clamp(316px, 23vw, 360px)"
+              : "minmax(0,1fr) clamp(316px, 23vw, 360px)"
+            : showConversationSidebar
+              ? "clamp(236px, 18vw, 276px) minmax(0,1fr)"
+              : "minmax(0,1fr)",
           xl: showWorkspacePanel
             ? showConversationSidebar
-              ? "clamp(210px, 16vw, 232px) minmax(0,1fr) clamp(300px, 24vw, 340px)"
-              : "minmax(0,1fr) clamp(300px, 24vw, 340px)"
+              ? "clamp(244px, 16vw, 288px) minmax(0,1fr) clamp(328px, 23vw, 372px)"
+              : "minmax(0,1fr) clamp(328px, 23vw, 372px)"
             : showConversationSidebar
-              ? "clamp(210px, 16vw, 232px) minmax(0,1fr)"
+              ? "clamp(244px, 16vw, 288px) minmax(0,1fr)"
               : "minmax(0,1fr)"
         },
-        gap: 1
+        gap: { xs: 1, md: 1.25 }
       }}
     >
       {showConversationSidebar ? (
@@ -6124,10 +7404,10 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             minHeight: 0,
             display: "flex",
             flexDirection: "column",
-            maxHeight: { xs: 280, xl: "none" }
+            maxHeight: { xs: 280, lg: "none" }
           }}
         >
-          <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.25}>
             <Typography variant="h6">Conversations</Typography>
             <Button size="small" onClick={startNewConversation}>
               New chat
@@ -6135,7 +7415,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           </Stack>
 
           <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
-            <Stack spacing={0.5} className="conversation-list">
+            <Stack spacing={0.9} className="conversation-list">
               {starredConversations.length === 0 && conversations.length === 0 ? (
                 <Typography variant="body2" color="text.secondary">
                   No conversations yet.
@@ -6147,7 +7427,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                       <Typography variant="caption" className="conversation-group-label">
                         Starred
                       </Typography>
-                      <Stack spacing={0.5}>
+                      <Stack spacing={0.9}>
                         {starredConversations.map((conv) => renderConversationCard(conv))}
                       </Stack>
                     </Box>
@@ -6162,7 +7442,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                           Page {conversationPageLabel}
                         </Typography>
                       </Stack>
-                      <Stack spacing={0.5}>
+                      <Stack spacing={0.9}>
                         {conversations.map((conv) => renderConversationCard(conv))}
                       </Stack>
                     </Box>
@@ -6171,11 +7451,11 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               )}
             </Stack>
           </Box>
-          <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between" sx={{ mt: 1 }}>
+          <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" sx={{ mt: 1.25 }}>
             <Typography variant="caption" className="conversation-pagination-copy">
               {conversationListTotal} chat{conversationListTotal === 1 ? "" : "s"}
             </Typography>
-            <Stack direction="row" spacing={0.75} alignItems="center">
+            <Stack direction="row" spacing={1} alignItems="center">
               <Button
                 size="small"
                 variant="outlined"
@@ -6245,14 +7525,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
         onDragLeave={handleChatDragLeave}
         onDrop={handleChatDrop}
       >
-        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }} spacing={1} mb={1}>
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap" }} useFlexGap>
+        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }} spacing={1.25} mb={1.25}>
+          <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap" }} useFlexGap>
             <Button
               size="small"
               variant={showConversationSidebar ? "contained" : "outlined"}
               startIcon={showConversationSidebar ? <ChevronLeftRoundedIcon fontSize="small" /> : <ChevronRightRoundedIcon fontSize="small" />}
               onClick={() => setConversationSidebarOpen((prev) => !prev)}
-              sx={{ textTransform: "none", borderRadius: 999 }}
             >
               {showConversationSidebar ? "Hide conversations" : "Conversations"}
             </Button>
@@ -6262,23 +7541,22 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 variant="outlined"
                 onClick={startNewConversation}
                 disabled={isStreaming}
-                sx={{ textTransform: "none", borderRadius: 999 }}
               >
                 New chat
               </Button>
             ) : null}
             <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
-            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>AgentArk Console</Typography>
+            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Agent Workspace</Typography>
           </Stack>
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
-            <Tooltip title={showWorkspacePanel ? "Hide agent activity" : "Show agent activity"}>
+          <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
+            <Tooltip title={showWorkspacePanel ? "Hide workspace panel" : "Show workspace panel"}>
               <span
                 className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
                 onClick={() => setWorkspaceOpen((prev) => !prev)}
                 style={{ display: "inline-flex" }}
               >
                 <span className="toggle-dot" />
-                Activity
+                Workspace
               </span>
             </Tooltip>
             {conversationId ? (
@@ -6303,7 +7581,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           }}
         >
           {!selectedConversation ? (
-            <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{ mb: 1 }} alignItems={{ xs: "stretch", md: "center" }}>
+            <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} sx={{ mb: 1.25 }} alignItems={{ xs: "stretch", md: "center" }}>
               <TextField
                 fullWidth
                 size="small"
@@ -6329,7 +7607,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               </Typography>
             </Stack>
           ) : selectedConversationProjectId ? (
-            <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 1 }} useFlexGap flexWrap="wrap">
+            <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 1.25 }} useFlexGap flexWrap="wrap">
               <Chip
                 size="small"
                 variant="outlined"
@@ -6374,7 +7652,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                 </Stack>
               </Box>
             ) : (
-            <Stack spacing={1.2}>
+            <Stack spacing={1.5}>
               {messages.map((message, idx) => {
                 const role = str(message.role, "").toLowerCase();
                 const isUser = role === "user";
@@ -6513,6 +7791,50 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               (showStreamingAssistant || !completedProgressBeforeMessageId)
                 ? renderProgressRows(showStreamingAssistant ? "stream-progress-live" : "stream-progress-fallback")
                 : null}
+
+              {showInterruptedRunCard ? (
+                <Box className="chat-row">
+                  <Avatar
+                    variant="rounded"
+                    className="chat-avatar"
+                    sx={{ width: 30, height: 30, bgcolor: "rgba(12,22,40,0.85)" }}
+                  >
+                    <SmartToyRoundedIcon sx={{ fontSize: 16 }} />
+                  </Avatar>
+                  <Box className="chat-bubble chat-bubble-assistant">
+                    <Stack spacing={1}>
+                      <Typography variant="caption" color="warning.main">
+                        AgentArk | stopped
+                      </Typography>
+                      {visibleStreamingResponse.trim()
+                        ? renderChatMarkdown(visibleStreamingResponse)
+                        : (
+                          <Typography variant="body2" color="text.secondary">
+                            This run was stopped before a full reply was sent.
+                          </Typography>
+                        )}
+                      <Box>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          disabled={!str(pendingRunSnapshot?.taskId, "").trim() || isStreaming}
+                          onClick={() => {
+                            const taskId = str(pendingRunSnapshot?.taskId, "").trim();
+                            if (!taskId) return;
+                            void runStreamingChat("", [], {
+                              conversationIdOverride: conversationId || undefined,
+                              projectIdOverride: activeProjectId || undefined,
+                              resumeTaskId: taskId
+                            });
+                          }}
+                        >
+                          Resume
+                        </Button>
+                      </Box>
+                    </Stack>
+                  </Box>
+                </Box>
+              ) : null}
 
               {showStreamingAssistant ? (
                 <Box className="chat-row">
@@ -6658,6 +7980,61 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
             ))}
           </Stack>
         ) : null}
+        {displayedExecutionPlan.length > 0 ? (
+          <Accordion
+            expanded={executionPlanExpanded}
+            onChange={(_, expanded) => setExecutionPlanExpanded(expanded)}
+            disableGutters
+            elevation={0}
+            className={`chat-plan-strip${executionPlanExpanded ? " expanded" : ""}`}
+          >
+            <AccordionSummary
+              expandIcon={<ExpandMoreIcon sx={{ color: "rgba(196, 223, 255, 0.82)" }} />}
+              className="chat-plan-summary"
+            >
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ width: "100%", minWidth: 0 }} spacing={1}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
+                    <Typography variant="caption" className="chat-plan-kicker">
+                      Planner
+                    </Typography>
+                    {executionPlanActiveCount > 0 ? (
+                      <CircularProgress size={12} thickness={6} className="chat-plan-spinner" />
+                    ) : null}
+                    <Typography variant="body2" className="chat-plan-status">
+                      {executionPlanStatusLabel}
+                    </Typography>
+                  </Stack>
+                  <Typography variant="caption" className="chat-plan-summary-copy">
+                    {executionPlanSummaryText}
+                  </Typography>
+                </Box>
+              </Stack>
+            </AccordionSummary>
+            <AccordionDetails className="chat-plan-details">
+              <Stack spacing={0.75}>
+                {displayedExecutionPlan.map((step) => {
+                  const isCompleted = step.status === "completed";
+                  const isRunning = step.status === "running";
+                  const isFailed = step.status === "failed";
+                  return (
+                    <Box
+                      key={step.id}
+                      className={`chat-plan-step${isCompleted ? " done" : ""}${isRunning ? " running" : ""}${isFailed ? " failed" : ""}`}
+                    >
+                      <Box className="chat-plan-step-marker">
+                        {isCompleted ? "✓" : isFailed ? "✗" : null}
+                      </Box>
+                      <Typography variant="body2" className="chat-plan-step-title" sx={{ minWidth: 0, flex: 1 }}>
+                        {step.id}. {step.title}
+                      </Typography>
+                    </Box>
+                  );
+                })}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        ) : null}
         <Box className="chat-composer-shell">
           <textarea
             className="chat-composer-textarea"
@@ -6723,7 +8100,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
               ))}
               </Stack>
             ) : null}
-            <Tooltip title={deepResearchEnabled ? "Deep Research enabled — slower, source-backed" : "Enable Deep Research"}>
+            <Tooltip title={deepResearchEnabled ? "Deep Research enabled â€” slower, source-backed" : "Enable Deep Research"}>
               <FormControlLabel
                 control={
                   <Switch
@@ -6791,7 +8168,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
       {showWorkspacePanel ? (
         <Box
           className="list-shell chat-workspace-shell"
-          sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1 }}
+          sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1.15 }}
         >
           <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }} className="chat-workspace-sections">
               {signalRows.length > 0 ? (
@@ -6830,47 +8207,16 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   <Typography variant="caption" className="term-titlebar-text">
                     agentark://console
                   </Typography>
+                  {activePhaseStatus ? (
+                    <span className="term-phase-pill" title={activePhaseStatus.detail || activePhaseStatus.label}>
+                      {activePhaseStatus.label}
+                    </span>
+                  ) : null}
                   <Box sx={{ flex: 1 }} />
                   <Typography variant="caption" className="term-titlebar-stats">
                     {progressSummary}
                   </Typography>
                 </Box>
-                  {executionPlan.length > 0 ? (
-                    <Box sx={{ px: 1.5, py: 1, borderBottom: "1px solid rgba(64,196,255,0.12)", bgcolor: "rgba(6,14,28,0.6)" }}>
-                      <Typography variant="caption" sx={{ fontWeight: 600, color: "rgba(214,228,255,0.7)", letterSpacing: "0.04em", mb: 0.75, display: "block" }}>
-                        EXECUTION PLAN
-                      </Typography>
-                      <Stack spacing={0.5}>
-                        {executionPlan.map((step) => (
-                          <Stack key={step.id} direction="row" spacing={0.75} alignItems="flex-start">
-                            <Box sx={{ mt: "2px", flexShrink: 0, width: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              {step.status === "completed" ? (
-                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", bgcolor: "rgba(74,210,157,0.85)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#0a1220" }}>&#10003;</Box>
-                              ) : step.status === "running" ? (
-                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", border: "2px solid #39d0ff", borderTopColor: "transparent", animation: "spin 0.8s linear infinite" }} />
-                              ) : step.status === "failed" ? (
-                                <Box sx={{ width: 14, height: 14, borderRadius: "50%", bgcolor: "rgba(255,100,100,0.85)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", color: "#fff" }}>&#10007;</Box>
-                              ) : (
-                                <Box sx={{ width: 12, height: 12, borderRadius: "50%", border: "1.5px solid rgba(140,170,210,0.25)" }} />
-                              )}
-                            </Box>
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: step.status === "running" ? "#e8f4ff" : step.status === "completed" ? "rgba(214,228,255,0.45)" : "rgba(214,228,255,0.65)",
-                                textDecoration: step.status === "completed" ? "line-through" : "none",
-                                fontWeight: step.status === "running" ? 600 : 400,
-                                fontSize: "0.76rem",
-                                lineHeight: 1.4,
-                              }}
-                            >
-                              {step.title}
-                            </Typography>
-                          </Stack>
-                        ))}
-                      </Stack>
-                    </Box>
-                  ) : null}
                   <Box
                     className="term-body"
                     ref={workspaceActivityRef}
@@ -6903,7 +8249,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                                   : "rgba(191, 222, 255, 0.92)";
                         return (
                           <Box key={`activity-${row.id}`} className={`term-line${isActive ? " term-line-active" : ""}`}>
-                            <span className="term-prompt" style={{ color: lineTone }}>•</span>
+                            <span className="term-prompt" style={{ color: lineTone }}>-</span>
                             <Box className="term-content">
                               <span className="term-label" style={{ color: lineTone }}>
                                 {row.time ? `[${formatTraceStepTime(row.time)}] ` : ""}{row.label}
@@ -6931,31 +8277,6 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   ) : null}
               </Box>
 
-            {canShowInlineFilePreview ? (
-              <Accordion className="chat-workspace-section" disableGutters>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Typography variant="subtitle2">File Preview</Typography>
-                </AccordionSummary>
-                <AccordionDetails sx={{ p: "6px 8px 10px" }}>
-                  <Box className="chat-workspace-code">
-                    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={1} sx={{ mb: 0.8 }}>
-                      <Box sx={{ minWidth: 0 }}>
-                        <Typography variant="caption" className="file-preview-name">
-                          {activeCodeFile.name}
-                        </Typography>
-                        <Typography variant="caption" className="file-preview-meta">
-                          {codeViewerWriteStatus || panelCodePreviewLabel}
-                        </Typography>
-                      </Box>
-                      <Button size="small" variant="outlined" onClick={() => setCodeViewerOpen(true)}>
-                        Open full file
-                      </Button>
-                    </Stack>
-                    <pre className="chat-workspace-pre chat-workspace-pre-compact"><code>{panelCodePreview}</code></pre>
-                  </Box>
-                </AccordionDetails>
-              </Accordion>
-            ) : null}
 
             {deployedFiles.length > 0 ? (
               <Accordion className="chat-workspace-section" disableGutters>
@@ -6970,7 +8291,7 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                         <Box
                           key={f.name}
                           className={`deployed-file-row${live && !live.done ? " is-live" : ""}${i === codeViewerFileIdx ? " is-selected" : ""}`}
-                          onClick={() => { setCodeViewerFileIdx(i); setCodeViewerOpen(true); }}
+                          onClick={() => { setCodeViewerFileIdx(i); }}
                         >
                           <span className="deployed-file-icon">&#128196;</span>
                           <span className="deployed-file-name">{f.name}</span>
@@ -6989,13 +8310,79 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
                   </Stack>
                 </AccordionDetails>
               </Accordion>
+            ) : null}
+
+            {activeCodeFile ? (
+              <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
+                  <Stack direction="row" spacing={1} alignItems="center" sx={{ width: "100%", minWidth: 0 }}>
+                    <Typography variant="subtitle2">Live code</Typography>
+                    <Typography
+                      variant="caption"
+                      className="chat-workspace-code-path"
+                      noWrap
+                      title={activeCodeFile.name}
+                    >
+                      {activeCodeFile.name}
+                    </Typography>
+                    <Box sx={{ flex: 1 }} />
+                    {codeViewerWriteStatus ? (
+                      <Typography variant="caption" color="text.secondary" noWrap>
+                        {codeViewerWriteStatus}
+                      </Typography>
+                    ) : null}
+                    <Button
+                      size="small"
+                      variant="text"
+                      className="chat-workspace-code-open"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setCodeViewerOpen(true);
+                      }}
+                    >
+                      Open full screen
+                    </Button>
+                  </Stack>
+                </AccordionSummary>
+                <AccordionDetails>
+                  {deployedFiles.length > 1 ? (
+                    <Box className="code-file-tabs chat-workspace-file-tabs">
+                      {deployedFiles.map((f, i) => (
+                        <button
+                          key={f.name}
+                          className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
+                          onClick={() => setCodeViewerFileIdx(i)}
+                        >
+                          {f.name}
+                        </button>
+                      ))}
+                    </Box>
+                  ) : null}
+                  <pre className="code-viewer-pre chat-workspace-code-inline">
+                    <code>{renderCodeBlockLines(codeViewerContent || "", {
+                      fileName: activeCodeFile.name,
+                      activeLine:
+                        activeLiveWrite && !activeLiveWrite.done
+                          ? activeLiveWrite.line
+                          : null
+                    })}</code>
+                  </pre>
+                  {activeLiveWrite && !activeLiveWrite.done ? (
+                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                      Writing in progress...
+                    </Typography>
+                  ) : null}
+                </AccordionDetails>
+              </Accordion>
             ) : codeSnapshot ? (
               <Accordion className="chat-workspace-section" disableGutters>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Typography variant="subtitle2">Code</Typography>
                 </AccordionSummary>
                 <AccordionDetails>
-                  <pre className="chat-workspace-pre"><code>{codeSnapshot}</code></pre>
+                  <pre className="code-viewer-pre chat-workspace-pre">
+                    <code>{renderCodeBlockLines(codeSnapshot)}</code>
+                  </pre>
                 </AccordionDetails>
               </Accordion>
             ) : null}
@@ -7103,16 +8490,13 @@ function ChatManager({ autoRefresh, isActive }: { autoRefresh: boolean; isActive
           {activeCodeFile && (
             <>
               <pre className="code-viewer-pre">
-                <code>{(codeViewerContent || "").split(/\r?\n/).map((line, i) => (
-                  <span
-                    key={i}
-                    className={`code-line${activeLiveWrite && !activeLiveWrite.done && i + 1 === activeLiveWrite.line ? " code-line-active" : ""}`}
-                  >
-                    <span className="code-line-number">{i + 1}</span>
-                    <span className="code-line-content">{line}</span>
-                    {"\n"}
-                  </span>
-                ))}</code>
+                <code>{renderCodeBlockLines(codeViewerContent || "", {
+                  fileName: activeCodeFile.name,
+                  activeLine:
+                    activeLiveWrite && !activeLiveWrite.done
+                      ? activeLiveWrite.line
+                      : null
+                })}</code>
               </pre>
               {activeLiveWrite && !activeLiveWrite.done ? (
                 <Box sx={{ px: 1.5, pb: 1 }}>
@@ -7299,6 +8683,39 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
 
   const tasks = pickRecords(tasksQ.data, "tasks");
+  const isWebChatRequestTask = (task: JsonRecord): boolean => {
+    const argumentsObj = asRecord(task.arguments);
+    return (
+      str(task.action, "").trim() === "chat_request" &&
+      str(argumentsObj._origin, "").trim() === "chat" &&
+      str(argumentsObj.channel, "").trim() === "web"
+    );
+  };
+  const launchChatResumeForTask = (task: JsonRecord) => {
+    const argumentsObj = asRecord(task.arguments);
+    const taskId = str(task.id, "").trim();
+    const conversationId = str(argumentsObj.conversation_id, "").trim();
+    const projectId = str(argumentsObj.project_id, "").trim();
+    if (!taskId || !conversationId) {
+      window.alert("This chat task is missing its conversation metadata and cannot be resumed in chat.");
+      return;
+    }
+    storeChatPendingLaunch({
+      createdAt: Date.now(),
+      launchMode: "resume_task",
+      conversationId,
+      projectId,
+      taskId
+    });
+    if (typeof window !== "undefined") {
+      const nextUrl = `/ui/chat${window.location.search || ""}`;
+      const current = `${window.location.pathname}${window.location.search}`;
+      if (current !== nextUrl) {
+        window.history.pushState(null, "", nextUrl);
+      }
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }
+  };
   const counts = useMemo(() => {
     const by = { total: tasks.length, queued: 0, running: 0, needs_approval: 0, paused: 0, done: 0 };
     for (const t of tasks) {
@@ -7391,6 +8808,72 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                 const cronExpr = str(task.cron, "");
                 const schedule = cronExpr ? `cron: ${cronExpr}` : "manual";
                 const rawStatus = str(task.status, "-");
+                const rawStatusLower = rawStatus.toLowerCase();
+                const isChatRequestTask = isWebChatRequestTask(task);
+                const rowActions: RowMenuAction[] = [
+                  {
+                    label: "View",
+                    onClick: () => setSelectedTask(asRecord(task))
+                  },
+                  {
+                    label: "Approve",
+                    disabled: !rawStatusLower.includes("awaitingapproval"),
+                    onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/approve`, method: "POST" })
+                  },
+                  {
+                    label: "Reject",
+                    tone: "warning",
+                    disabled: !rawStatusLower.includes("awaitingapproval"),
+                    onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/reject`, method: "POST" })
+                  },
+                  {
+                    label: "Pause",
+                    disabled: !["pending", "awaitingapproval"].some((token) => rawStatusLower.includes(token)),
+                    onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/pause`, method: "POST" })
+                  }
+                ];
+                if (isChatRequestTask) {
+                  if (rawStatusLower.includes("cancelled")) {
+                    rowActions.push({
+                      label: "Resume in chat",
+                      onClick: () => launchChatResumeForTask(task)
+                    });
+                  } else if (rawStatusLower.includes("failed")) {
+                    rowActions.push({
+                      label: "Retry in chat",
+                      onClick: () => launchChatResumeForTask(task)
+                    });
+                  }
+                } else {
+                  rowActions.push({
+                    label: "Resume",
+                    disabled: !rawStatusLower.includes("paused"),
+                    onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/resume`, method: "POST" })
+                  });
+                }
+                rowActions.push({
+                  label: "Cancel",
+                  tone: "warning",
+                  disabled: !["pending", "awaitingapproval", "paused", "inprogress"].some((token) => rawStatusLower.includes(token)),
+                  onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/cancel`, method: "POST" })
+                });
+                if (!isChatRequestTask) {
+                  rowActions.push({
+                    label: "Retry",
+                    disabled: !["failed", "cancelled"].some((token) => rawStatusLower.includes(token)),
+                    onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/retry`, method: "POST" })
+                  });
+                }
+                rowActions.push({
+                  label: "Delete",
+                  tone: "error",
+                  divider: true,
+                  onClick: async () => {
+                    const ok = window.confirm("Delete this task? This cannot be undone.");
+                    if (!ok) return;
+                    opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}`, method: "DELETE" });
+                  }
+                });
                 return (
                   <TableRow key={id}>
                     <TableCell sx={{ maxWidth: 520 }}>
@@ -7414,54 +8897,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                     <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(task.created_at)).tip}>{humanTs(str(task.created_at)).label}</TableCell>
                     <TableCell align="right">
                       <RowOpsMenu
-                        actions={[
-                          {
-                            label: "View",
-                            onClick: () => setSelectedTask(asRecord(task))
-                          },
-                          {
-                            label: "Approve",
-                            disabled: !rawStatus.toLowerCase().includes("awaitingapproval"),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/approve`, method: "POST" })
-                          },
-                          {
-                            label: "Reject",
-                            tone: "warning",
-                            disabled: !rawStatus.toLowerCase().includes("awaitingapproval"),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/reject`, method: "POST" })
-                          },
-                          {
-                            label: "Pause",
-                            disabled: !["pending", "awaitingapproval"].some((token) => rawStatus.toLowerCase().includes(token)),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/pause`, method: "POST" })
-                          },
-                          {
-                            label: "Resume",
-                            disabled: !rawStatus.toLowerCase().includes("paused"),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/resume`, method: "POST" })
-                          },
-                          {
-                            label: "Cancel",
-                            tone: "warning",
-                            disabled: !["pending", "awaitingapproval", "paused", "inprogress"].some((token) => rawStatus.toLowerCase().includes(token)),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/cancel`, method: "POST" })
-                          },
-                          {
-                            label: "Retry",
-                            disabled: !["failed", "cancelled"].some((token) => rawStatus.toLowerCase().includes(token)),
-                            onClick: () => opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}/retry`, method: "POST" })
-                          },
-                          {
-                            label: "Delete",
-                            tone: "error",
-                            divider: true,
-                            onClick: async () => {
-                              const ok = window.confirm("Delete this task? This cannot be undone.");
-                              if (!ok) return;
-                              opMutation.mutate({ path: `/tasks/${encodeURIComponent(id)}`, method: "DELETE" });
-                            }
-                          }
-                        ]}
+                        actions={rowActions}
                         ariaLabel="Task options"
                       />
                     </TableCell>
@@ -9070,7 +10506,18 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   });
 
-  const apps = pickRecords(appsQ.data, "apps");
+  const appsPayload = asRecord(appsQ.data);
+  const apps = pickRecords(appsPayload, "apps");
+  const restoreInfo = asRecord(appsPayload.restore);
+  const restoreActive = toBool(restoreInfo.active);
+  const restoreTotal = Math.max(0, num(restoreInfo.total, apps.length));
+  const restorePending = Math.max(0, num(restoreInfo.pending, 0));
+  const restoreReady = Math.max(0, num(restoreInfo.ready, 0));
+  const restoreDegraded = Math.max(0, num(restoreInfo.degraded, 0));
+  const restoringAppsCount = apps.filter((app) => {
+    const status = str(app.restore_status, "").trim().toLowerCase();
+    return toBool(app.restoring) || status === "restoring";
+  }).length;
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const tunnel = asRecord(tunnelQ.data);
   const tunnelMeta = getTunnelAccessMeta(tunnel);
@@ -9102,6 +10549,14 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
       return () => clearTimeout(timer);
     }
   }, [appsActionSuccess]);
+
+  useEffect(() => {
+    if (autoRefresh || (!restoreActive && restoringAppsCount === 0)) return;
+    const timer = setInterval(() => {
+      void appsQ.refetch();
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [autoRefresh, restoreActive, restoringAppsCount, appsQ]);
 
   useEffect(() => {
     if (tunnelActionState === "idle") return;
@@ -9206,13 +10661,18 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
         {tunnelActionError ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelActionError}</Alert> : null}
         {appsActionError ? <Alert severity="error" sx={{ mb: 1 }}>{appsActionError}</Alert> : null}
         {appsActionSuccess ? <Alert severity="success" sx={{ mb: 1 }}>{appsActionSuccess}</Alert> : null}
+        {restoreActive ? (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            Restoring {restoreTotal} app{restoreTotal === 1 ? "" : "s"} in the background. {restorePending} remaining, {restoreReady} ready{restoreDegraded > 0 ? `, ${restoreDegraded} degraded` : ""}.
+          </Alert>
+        ) : null}
         <TableContainer className="table-shell">
           <Table size="small">
             <TableHead>
               <TableRow>
                 <TableCell>Title</TableCell>
                 <TableCell>ID</TableCell>
-                <TableCell>Running</TableCell>
+                <TableCell>Status</TableCell>
                 <TableCell>Links</TableCell>
                 <TableCell align="right">Ops</TableCell>
               </TableRow>
@@ -9222,7 +10682,9 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                 <TableRow>
                   <TableCell colSpan={5}>
                     <Typography variant="body2" color="text.secondary">
-                      There are no deployed apps at this time. When you create any app with agent, it will show here.
+                      {restoreActive
+                        ? "App restore is still running in the background. This list will populate as saved apps are discovered."
+                        : "There are no deployed apps at this time. When you create any app with agent, it will show here."}
                     </Typography>
                   </TableCell>
                 </TableRow>
@@ -9236,10 +10698,14 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                   const localAccessUrl = toAbsoluteAppUrl(accessUrl || url, origin);
                   const isSelectedPublicApp = selectedPublicAppId === id;
                   const runtimeMode = str(appItem.runtime_mode, "").trim().toLowerCase();
+                  const restoreStatus = str(appItem.restore_status, "").trim().toLowerCase();
+                  const isRestoring = toBool(appItem.restoring) || restoreStatus === "restoring";
+                  const restoreError = str(appItem.restore_error, "").trim();
                   const isStaticApp = runtimeMode === "static";
+                  const isEnabled = appItem.enabled === undefined ? true : toBool(appItem.enabled);
                   const isRunning = toBool(appItem.running);
-                  const canStopApp = !isStaticApp && isRunning;
-                  const canRestartApp = !isStaticApp || isRunning;
+                  const canStopApp = isEnabled && !isRestoring;
+                  const canRestartApp = !isRestoring && (!isEnabled || !isStaticApp || isRunning);
                   const appTunnelActive = tunnelActive && !!tunnelBaseUrl && !!selectedPublicAppId;
                   const publicUrl = appTunnelActive ? toAbsoluteAppUrl(url, tunnelBaseUrl) : "";
                   const hasProtectedVariant = !!accessUrl && localAccessUrl !== localUrl;
@@ -9258,7 +10724,21 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                     <TableRow key={id}>
                       <TableCell>{str(appItem.title)}</TableCell>
                       <TableCell>{id}</TableCell>
-                      <TableCell>{str(appItem.running)}</TableCell>
+                      <TableCell>
+                        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                          {!isEnabled ? (
+                            <Chip size="small" color="default" label="Disabled" />
+                          ) : isRestoring ? (
+                            <Chip size="small" color="info" label="Restoring" />
+                          ) : restoreStatus === "degraded" ? (
+                            <Chip size="small" color="warning" label="Degraded" />
+                          ) : isRunning ? (
+                            <Chip size="small" color="success" label="Running" />
+                          ) : (
+                            <Chip size="small" variant="outlined" label="Stopped" />
+                          )}
+                        </Stack>
+                      </TableCell>
                       <TableCell sx={{ maxWidth: 420 }}>
                         <Stack spacing={0.2}>
                           {localUrl ? (
@@ -9281,6 +10761,21 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                           <Typography variant="caption" component="div" color={toBool(appItem.access_guard_enabled) ? "warning.main" : "text.secondary"} noWrap>
                             Guard: {toBool(appItem.access_guard_enabled) ? "enabled" : "disabled"}
                           </Typography>
+                          {!isEnabled ? (
+                            <Typography variant="caption" component="div" color="text.secondary">
+                              Disabled until you start it again from this page.
+                            </Typography>
+                          ) : null}
+                          {isRestoring ? (
+                            <Typography variant="caption" component="div" color="info.main">
+                              Restore is still bringing this runtime up in the background.
+                            </Typography>
+                          ) : null}
+                          {restoreError ? (
+                            <Typography variant="caption" component="div" color="warning.main" title={restoreError}>
+                              Restore note: {restoreError}
+                            </Typography>
+                          ) : null}
                           {publicShareUrl ? (
                             <Typography variant="caption" component="div" color="info.main" noWrap title={publicShareUrl}>
                               {shareCaptionLabel}{" "}
@@ -9406,11 +10901,11 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                                 })
                             },
                             {
-                              label: isStaticApp ? "Reload Metadata" : isRunning ? "Restart" : "Start App",
+                              label: !isEnabled ? "Start App" : isStaticApp ? "Reload Metadata" : isRunning ? "Restart" : "Start App",
                               disabled: appsActionBusy != null || !canRestartApp,
                               onClick: () =>
                                 void runAppOp({
-                                  label: isStaticApp ? "Reload Metadata" : isRunning ? "Restart App" : "Start App",
+                                  label: !isEnabled ? "Start App" : isStaticApp ? "Reload Metadata" : isRunning ? "Restart App" : "Start App",
                                   path: `/api/apps/${encodeURIComponent(id)}/restart`,
                                   method: "POST"
                                 })
@@ -11717,7 +13212,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <Stack spacing={2}>
-      {/* ── Compact stat row ── */}
+      {/* â”€â”€ Compact stat row â”€â”€ */}
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, 1fr)", sm: "repeat(3, 1fr)", md: "repeat(5, 1fr)" }, gap: 1.5 }}>
         {[
           { label: "Episodes", value: num(stats.episodes), color: "#2fd4ff" },
@@ -11744,7 +13239,7 @@ function MemoryManager({ autoRefresh }: { autoRefresh: boolean }) {
         ))}
       </Box>
 
-      {/* ── Memory tabs ── */}
+      {/* â”€â”€ Memory tabs â”€â”€ */}
       <Tabs
         value={memoryTab}
         onChange={(_e, next) => setMemoryTab(next)}
@@ -13412,7 +14907,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                 </Stack>
               ) : null}
 
-              {/* Execution steps — the main view */}
+              {/* Execution steps â€” the main view */}
               <Box>
                 <Typography variant="subtitle2" sx={{ mb: 0.75 }}>Execution Steps</Typography>
                 <Box className="metadata-box" sx={{ maxHeight: 500 }}>
@@ -13775,7 +15270,7 @@ function StatusManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Stack spacing={0.5}>
               <Typography variant="body2">Mode: {str(security.encryption_mode)}</Typography>
               {toBool(security.using_default) ? (
-                <Typography variant="body2" color="warning.main">Using default password — set a custom one in Settings.</Typography>
+                <Typography variant="body2" color="warning.main">Using default password â€” set a custom one in Settings.</Typography>
               ) : (
                 <Typography variant="body2" color="success.main">Custom master password active.</Typography>
               )}
@@ -13912,7 +15407,7 @@ function watcherPreviewText(raw: unknown, maxChars = 180): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (!compact) return "";
   if (compact.length <= maxChars) return compact;
-  return `${compact.slice(0, Math.max(0, maxChars - 1))}…`;
+  return `${compact.slice(0, Math.max(0, maxChars - 1))}â€¦`;
 }
 
 function watcherPayloadText(raw: unknown): string {
@@ -14158,7 +15653,7 @@ function WatchersManager({ autoRefresh }: { autoRefresh: boolean }) {
                           {str(w.description, "-")}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" noWrap>
-                          {str(w.notify_channel, "-")} • {formatDurationFromSeconds(num(w.timeout_secs, 0))}
+                          {str(w.notify_channel, "-")} - {formatDurationFromSeconds(num(w.timeout_secs, 0))}
                         </Typography>
                       </TableCell>
                       <TableCell>
@@ -14539,33 +16034,35 @@ function SettingsManager({
       quick: 0,
       setup: 0,
       models: 1,
-      channels: 2,
-      connections: 2,
-      integrations: 2,
+      channels: 20,
+      connections: 20,
+      integrations: 20,
+      messaging: 20,
       media: 3,
       security: 4,
       observability: 6,
       telemetry: 6,
-      webhooks: 2,
+      webhooks: 22,
       verification: 16,
       trust: 16,
       "sender-verification": 16,
       senderverification: 16,
-      plugins: 2,
-      plugin: 2,
-      sdk: 2,
-      ingress: 2,
-      events: 2,
+      plugins: 23,
+      plugin: 23,
+      sdk: 23,
+      ingress: 22,
+      events: 22,
+      connectors: 21,
+      prebuilt: 21,
       advanced: 5,
+      lifecycle: 14,
+      "data-lifecycle": 14,
+      retention: 14,
       moltbook: 7,
       mcp: 8,
-      routing: 2,
-      // Browser profile UI is intentionally hidden for now.
-      // Keep the underlying code path so the surface can be re-enabled later.
-      browser: 2,
-      // Companion-device UI is intentionally hidden for now.
-      // Keep the underlying code path so the surface can be re-enabled later.
-      devices: 2,
+      routing: 20,
+      browser: 20,
+      devices: 20,
       failover: 1,
       reliability: 1,
       gateway: 9,
@@ -14727,18 +16224,24 @@ function SettingsManager({
   const evolutionDevQ = useQuery({
     queryKey: ["settings-evolution-dev"],
     queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
-    enabled: developerModeEnabled && tab === 13,
+    enabled: tab === 13,
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
   const settings = asRecord(settingsQ.data);
   const observabilitySettings = asRecord(settings.observability);
+  const dataLifecycleSettings = asRecord(settings.data_lifecycle);
   const media = asRecord(mediaQ.data);
   const modelsPayload = asRecord(modelsQ.data);
   const evolution = asRecord(evolutionQ.data);
   const evolutionCanary = asRecord(evolution.canary);
+  const evolutionLearningQueue = asRecord(evolution.learning_queue);
   const evolutionDev = asRecord(evolutionDevQ.data);
   const evolutionStrategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const evolutionLineage = pickRecords(evolutionDev, "lineage_recent");
+  const evolutionLearningCandidates = pickRecords(evolutionDev, "learning_candidates");
+  const evolutionLearningItems = pickRecords(evolutionDev, "learning_items");
+  const evolutionLearningPatterns = pickRecords(evolutionDev, "learning_patterns");
+  const evolutionRecentExperienceRuns = pickRecords(evolutionDev, "recent_experience_runs");
   const observabilityLogsPayload = asRecord(observabilityLogsQ.data);
   const observabilityLogs = pickRecords(observabilityLogsPayload, "logs");
   const observabilityIssues = Array.isArray(observabilityLogsPayload.issues)
@@ -14860,6 +16363,32 @@ function SettingsManager({
     moltbook_write_enabled: true,
     moltbook_defer_when_busy: true,
 
+    memory_retention_enabled: false,
+    memory_retention_min_age_days: "180",
+    memory_retention_keep_last: "2500",
+    memory_retention_max_importance: "0.6",
+    memory_retention_max_access_count: "1",
+    memory_retention_require_consolidated: true,
+    memory_retention_run_interval_days: "7",
+    memory_retention_idle_threshold_secs: "600",
+    memory_retention_max_delete_per_run: "500",
+    memory_retention_protect_fact_sources: true,
+
+    data_lifecycle_notifications_retention_days: "7",
+    data_lifecycle_notification_cleanup_interval_secs: "3600",
+    data_lifecycle_execution_trace_retention_days: "30",
+    data_lifecycle_execution_proof_retention_days: "30",
+    data_lifecycle_operational_log_retention_days: "30",
+    data_lifecycle_security_log_retention_days: "30",
+    data_lifecycle_approval_log_retention_days: "30",
+    data_lifecycle_swarm_delegation_retention_days: "30",
+    data_lifecycle_llm_usage_retention_days: "30",
+    data_lifecycle_terminal_task_retention_days: "90",
+    data_lifecycle_message_retention_days: "365",
+    data_lifecycle_housekeeping_interval_secs: "3600",
+    data_lifecycle_security_cleanup_interval_days: "15",
+    data_lifecycle_security_cleanup_idle_threshold_secs: "300",
+
     observability_enabled: false,
     observability_provider: "langtrace",
     observability_endpoint: "",
@@ -14937,6 +16466,34 @@ function SettingsManager({
       out[k] = v;
     }
     return out;
+  }
+
+  function parseNonNegativeInt(value: string, label: string): number {
+    const trimmed = value.trim();
+    if (!trimmed) throw new Error(`${label} is required.`);
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      throw new Error(`${label} must be a whole number 0 or greater.`);
+    }
+    return Math.trunc(parsed);
+  }
+
+  function parsePositiveInt(value: string, label: string, minimum = 1): number {
+    const parsed = parseNonNegativeInt(value, label);
+    if (parsed < minimum) {
+      throw new Error(`${label} must be at least ${minimum}.`);
+    }
+    return parsed;
+  }
+
+  function parseBoundedFloat(value: string, label: string, min: number, max: number): number {
+    const trimmed = value.trim();
+    if (!trimmed) throw new Error(`${label} is required.`);
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+      throw new Error(`${label} must be between ${min} and ${max}.`);
+    }
+    return parsed;
   }
 
   function recordToStringMap(value: unknown): Record<string, string> {
@@ -15116,6 +16673,80 @@ function SettingsManager({
         settings.moltbook_write_enabled == null ? true : toBool(settings.moltbook_write_enabled),
       moltbook_defer_when_busy: toBool(settings.moltbook_defer_when_busy),
 
+      memory_retention_enabled: toBool(settings.memory_retention_enabled),
+      memory_retention_min_age_days: str(settings.memory_retention_min_age_days, "180"),
+      memory_retention_keep_last: str(settings.memory_retention_keep_last, "2500"),
+      memory_retention_max_importance: str(settings.memory_retention_max_importance, "0.6"),
+      memory_retention_max_access_count: str(settings.memory_retention_max_access_count, "1"),
+      memory_retention_require_consolidated:
+        settings.memory_retention_require_consolidated == null
+          ? true
+          : toBool(settings.memory_retention_require_consolidated),
+      memory_retention_run_interval_days: str(settings.memory_retention_run_interval_days, "7"),
+      memory_retention_idle_threshold_secs: str(settings.memory_retention_idle_threshold_secs, "600"),
+      memory_retention_max_delete_per_run: str(settings.memory_retention_max_delete_per_run, "500"),
+      memory_retention_protect_fact_sources:
+        settings.memory_retention_protect_fact_sources == null
+          ? true
+          : toBool(settings.memory_retention_protect_fact_sources),
+
+      data_lifecycle_notifications_retention_days: str(
+        dataLifecycleSettings.notifications_retention_days,
+        "7"
+      ),
+      data_lifecycle_notification_cleanup_interval_secs: str(
+        dataLifecycleSettings.notification_cleanup_interval_secs,
+        "3600"
+      ),
+      data_lifecycle_execution_trace_retention_days: str(
+        dataLifecycleSettings.execution_trace_retention_days,
+        "30"
+      ),
+      data_lifecycle_execution_proof_retention_days: str(
+        dataLifecycleSettings.execution_proof_retention_days,
+        "30"
+      ),
+      data_lifecycle_operational_log_retention_days: str(
+        dataLifecycleSettings.operational_log_retention_days,
+        "30"
+      ),
+      data_lifecycle_security_log_retention_days: str(
+        dataLifecycleSettings.security_log_retention_days,
+        "30"
+      ),
+      data_lifecycle_approval_log_retention_days: str(
+        dataLifecycleSettings.approval_log_retention_days,
+        "30"
+      ),
+      data_lifecycle_swarm_delegation_retention_days: str(
+        dataLifecycleSettings.swarm_delegation_retention_days,
+        "30"
+      ),
+      data_lifecycle_llm_usage_retention_days: str(
+        dataLifecycleSettings.llm_usage_retention_days,
+        "30"
+      ),
+      data_lifecycle_terminal_task_retention_days: str(
+        dataLifecycleSettings.terminal_task_retention_days,
+        "90"
+      ),
+      data_lifecycle_message_retention_days: str(
+        dataLifecycleSettings.message_retention_days,
+        "365"
+      ),
+      data_lifecycle_housekeeping_interval_secs: str(
+        dataLifecycleSettings.housekeeping_interval_secs,
+        "3600"
+      ),
+      data_lifecycle_security_cleanup_interval_days: str(
+        dataLifecycleSettings.security_cleanup_interval_days,
+        "15"
+      ),
+      data_lifecycle_security_cleanup_idle_threshold_secs: str(
+        dataLifecycleSettings.security_cleanup_idle_threshold_secs,
+        "300"
+      ),
+
       observability_enabled: toBool(observabilitySettings.enabled),
       observability_provider: str(observabilitySettings.provider, "langtrace"),
       observability_endpoint: str(observabilitySettings.endpoint, ""),
@@ -15240,6 +16871,103 @@ function SettingsManager({
           if (k === "google_gemini") mediaProviders["google_veo"] = trimmed;
         }
       }
+      const memoryRetentionMinAgeDays = parsePositiveInt(
+        form.memory_retention_min_age_days,
+        "Episode retention minimum age (days)",
+        30
+      );
+      const memoryRetentionKeepLast = parsePositiveInt(
+        form.memory_retention_keep_last,
+        "Episodes to always keep",
+        500
+      );
+      const memoryRetentionMaxImportance = parseBoundedFloat(
+        form.memory_retention_max_importance,
+        "Episode retention max importance",
+        0,
+        1
+      );
+      const memoryRetentionMaxAccessCount = parseNonNegativeInt(
+        form.memory_retention_max_access_count,
+        "Episode retention max access count"
+      );
+      const memoryRetentionRunIntervalDays = parsePositiveInt(
+        form.memory_retention_run_interval_days,
+        "Episode retention run interval (days)",
+        1
+      );
+      const memoryRetentionIdleThresholdSecs = parsePositiveInt(
+        form.memory_retention_idle_threshold_secs,
+        "Episode retention idle threshold (seconds)",
+        60
+      );
+      const memoryRetentionMaxDeletePerRun = parsePositiveInt(
+        form.memory_retention_max_delete_per_run,
+        "Episode retention max delete per run",
+        10
+      );
+      const dataLifecycle = {
+        notifications_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_notifications_retention_days,
+          "Notification retention (days)"
+        ),
+        notification_cleanup_interval_secs: parsePositiveInt(
+          form.data_lifecycle_notification_cleanup_interval_secs,
+          "Notification cleanup cadence (seconds)",
+          300
+        ),
+        execution_trace_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_execution_trace_retention_days,
+          "Execution trace retention (days)"
+        ),
+        execution_proof_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_execution_proof_retention_days,
+          "Execution proof retention (days)"
+        ),
+        operational_log_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_operational_log_retention_days,
+          "Operational log retention (days)"
+        ),
+        security_log_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_security_log_retention_days,
+          "Security log retention (days)"
+        ),
+        approval_log_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_approval_log_retention_days,
+          "Approval log retention (days)"
+        ),
+        swarm_delegation_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_swarm_delegation_retention_days,
+          "Delegation retention (days)"
+        ),
+        llm_usage_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_llm_usage_retention_days,
+          "LLM usage retention (days)"
+        ),
+        terminal_task_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_terminal_task_retention_days,
+          "Completed task retention (days)"
+        ),
+        message_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_message_retention_days,
+          "Conversation retention (days)"
+        ),
+        housekeeping_interval_secs: parsePositiveInt(
+          form.data_lifecycle_housekeeping_interval_secs,
+          "Housekeeping cleanup cadence (seconds)",
+          300
+        ),
+        security_cleanup_interval_days: parsePositiveInt(
+          form.data_lifecycle_security_cleanup_interval_days,
+          "Security cleanup cadence (days)",
+          1
+        ),
+        security_cleanup_idle_threshold_secs: parsePositiveInt(
+          form.data_lifecycle_security_cleanup_idle_threshold_secs,
+          "Security cleanup idle threshold (seconds)",
+          60
+        )
+      };
       const payload: Record<string, unknown> = {
         bot_name: form.bot_name || "AgentArk",
         personality: form.personality || "friendly",
@@ -15285,6 +17013,17 @@ function SettingsManager({
         moltbook_sync_frequency: form.moltbook_sync_frequency || null,
         moltbook_write_enabled: form.moltbook_write_enabled,
         moltbook_defer_when_busy: form.moltbook_defer_when_busy,
+        memory_retention_enabled: form.memory_retention_enabled,
+        memory_retention_min_age_days: memoryRetentionMinAgeDays,
+        memory_retention_keep_last: memoryRetentionKeepLast,
+        memory_retention_max_importance: memoryRetentionMaxImportance,
+        memory_retention_max_access_count: memoryRetentionMaxAccessCount,
+        memory_retention_require_consolidated: form.memory_retention_require_consolidated,
+        memory_retention_run_interval_days: memoryRetentionRunIntervalDays,
+        memory_retention_idle_threshold_secs: memoryRetentionIdleThresholdSecs,
+        memory_retention_max_delete_per_run: memoryRetentionMaxDeletePerRun,
+        memory_retention_protect_fact_sources: form.memory_retention_protect_fact_sources,
+        data_lifecycle: dataLifecycle,
 
         observability: {
           enabled: form.observability_enabled,
@@ -15293,7 +17032,7 @@ function SettingsManager({
           service_name: form.observability_service_name || "agentark",
           header_name: form.observability_header_name || "x-api-key",
           privacy_mode: form.observability_privacy_mode || "metadata_only",
-          // Only send auth_token when user entered a new value — blank means "keep existing"
+          // Only send auth_token when user entered a new value â€” blank means "keep existing"
           ...(form.observability_auth_token.trim() ? { auth_token: form.observability_auth_token } : {})
         }
       };
@@ -15457,7 +17196,7 @@ function SettingsManager({
     }
   });
   const runEvolutionDevActionMutation = useMutation({
-    mutationFn: (action: string) => api.rawPost("/settings/evolution/dev/action", { action }),
+    mutationFn: (payload: JsonRecord) => api.rawPost("/settings/evolution/dev/action", payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-evolution-dev"] });
@@ -16331,11 +18070,11 @@ function moltbookSummary(action: string, details: JsonRecord): string | null {
     }
     const runSummaryText = parts.join(" | ");
     return runSummaryText;
-    const normalizedRunSummary = parts.join(" • ");
+    const normalizedRunSummary = parts.join(" - ");
     return normalizedRunSummary;
-    const runSummary = parts.join(" • ");
+    const runSummary = parts.join(" - ");
     return runSummary;
-    return parts.join(" • ");
+    return parts.join(" - ");
   }
   if (a === "engagement_plan_created" || a === "engagement_plan_fallback") {
     return summaryPreview || "Prepared an engagement plan.";
@@ -17348,8 +19087,17 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       items: [
         { value: 0, label: "General" },
         { value: 1, label: "Models" },
-        { value: 2, label: "Integrations" },
         { value: 3, label: "Media" }
+      ]
+    },
+    {
+      id: "integrations",
+      label: "Integrations",
+      items: [
+        { value: 20, label: "Messaging Channels" },
+        { value: 21, label: "Prebuilt Connectors" },
+        { value: 22, label: "Webhooks & APIs" },
+        { value: 23, label: "Plugins" }
       ]
     },
     {
@@ -17361,20 +19109,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       ]
     },
     {
-      id: "connected-systems",
-      label: "Connected Systems",
+      id: "admin",
+      label: "Admin",
       items: [
-        // Browser profiles stay implemented in code, but are hidden from novice-facing settings.
-        // Companion devices stay implemented in code, but are hidden until real device pairing exists.
+        { value: 14, label: "Data Lifecycle" },
+        { value: 6, label: "Observability" },
+        { value: 13, label: "Evolution" }
       ]
-    },
-      {
-        id: "admin",
-        label: "Admin",
-        items: [
-          { value: 6, label: "Observability" },
-          { value: 13, label: "Evolution" }
-        ]
     },
     {
       id: "security",
@@ -17405,12 +19146,28 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             }
           : settingsNavActual[0]);
   useEffect(() => {
-    if (tab === 10 || tab === 14 || tab === 15) {
-      setTab(2);
+    if (tab === 2 || tab === 10 || tab === 15) {
+      setTab(20);
     }
   }, [tab]);
 
-  const tabSupportsSave = ![9, 11, 16, 17].includes(tab);
+  const tabSupportsSave = ![9, 11, 16, 17, 20, 21, 22, 23].includes(tab);
+  const foreverLifecycleRules = [
+    { label: "Notifications", value: form.data_lifecycle_notifications_retention_days },
+    { label: "Execution traces", value: form.data_lifecycle_execution_trace_retention_days },
+    { label: "Execution proofs", value: form.data_lifecycle_execution_proof_retention_days },
+    { label: "Operational logs", value: form.data_lifecycle_operational_log_retention_days },
+    { label: "Security logs", value: form.data_lifecycle_security_log_retention_days },
+    { label: "Approval logs", value: form.data_lifecycle_approval_log_retention_days },
+    { label: "Delegations", value: form.data_lifecycle_swarm_delegation_retention_days },
+    { label: "LLM usage", value: form.data_lifecycle_llm_usage_retention_days },
+    { label: "Completed tasks", value: form.data_lifecycle_terminal_task_retention_days },
+    { label: "Conversations", value: form.data_lifecycle_message_retention_days }
+  ].filter((rule) => {
+    const parsed = Number(rule.value.trim());
+    return Number.isFinite(parsed) && parsed === 0;
+  });
+  const foreverLifecycleSummary = foreverLifecycleRules.map((rule) => rule.label).join(", ");
 
   return (
     <Stack spacing={2}>
@@ -17499,7 +19256,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
       {tab === 0 ? (
         <Stack spacing={2.5}>
-          {/* ── Status Overview ── */}
+          {/* â”€â”€ Status Overview â”€â”€ */}
           <Box>
             <Typography className="settings-section-label">Status</Typography>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", md: "repeat(4, 1fr)" }, gap: 1.5 }}>
@@ -17618,7 +19375,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               ))}
             </Box>
             <Box sx={{ display: "flex", gap: 2, mt: 1.5, flexWrap: "wrap" }}>
-              <Chip size="small" variant="outlined" label={modelsQ.isLoading && modelSlots.length === 0 ? "Loading models…" : `${modelSlots.length} model${modelSlots.length !== 1 ? "s" : ""}`} sx={{ borderColor: "rgba(47,212,255,0.25)", color: "rgba(47,212,255,0.85)", fontSize: "0.72rem" }} />
+              <Chip size="small" variant="outlined" label={modelsQ.isLoading && modelSlots.length === 0 ? "Loading modelsâ€¦" : `${modelSlots.length} model${modelSlots.length !== 1 ? "s" : ""}`} sx={{ borderColor: "rgba(47,212,255,0.25)", color: "rgba(47,212,255,0.85)", fontSize: "0.72rem" }} />
               <Chip size="small" variant="outlined" label={configuredProviders.length ? configuredProviders.join(", ") : "No media providers"} sx={{ borderColor: "rgba(255,255,255,0.08)", color: "rgba(180,200,225,0.55)", fontSize: "0.72rem" }} />
               {settingsComplete ? (
                 <Chip size="small" variant="outlined" label="Setup complete" sx={{ borderColor: "rgba(20,241,149,0.25)", color: "rgba(20,241,149,0.85)", fontSize: "0.72rem" }} />
@@ -17630,7 +19387,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <hr className="settings-divider" />
 
-          {/* ── Identity ── */}
+          {/* â”€â”€ Identity â”€â”€ */}
           <Stack spacing={2}>
             <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Identity</Typography>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
@@ -17674,7 +19431,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <hr className="settings-divider" />
 
-          {/* ── Preferences ── */}
+          {/* â”€â”€ Preferences â”€â”€ */}
           <Stack spacing={2}>
             <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Preferences</Typography>
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
@@ -17994,7 +19751,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       <a href="https://chatgpt.com/settings/security" target="_blank" rel="noopener noreferrer" style={{ color: "inherit" }}>
                         chatgpt.com/settings/security
                       </a>{" "}
-                      → toggle <strong>"Enable device code authorization"</strong> on.
+                      â†’ toggle <strong>"Enable device code authorization"</strong> on.
                     </Alert>
                     <Stack direction="row" spacing={1}>
                       <Button
@@ -18760,13 +20517,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
       {tab === 5 ? (
         <Stack spacing={2.5}>
-          {/* ── Warning banner ── */}
+          {/* â”€â”€ Warning banner â”€â”€ */}
           <Box className="adv-banner">
             <span className="adv-banner-icon">&#9888;</span>
             Advanced settings can impact stability or security. Change only if you understand the effect.
           </Box>
 
-          {/* ── System Controls group ── */}
+          {/* â”€â”€ System Controls group â”€â”€ */}
           <Box className="adv-group">
             <div className="adv-group-header">
               <div className="adv-group-header-icon" style={{ background: "rgba(47, 212, 255, 0.10)", border: "1px solid rgba(47, 212, 255, 0.22)" }}>
@@ -18855,7 +20612,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             </div>
           </Box>
 
-          {/* ── Permissions group ── */}
+          {/* â”€â”€ Permissions group â”€â”€ */}
           <Box className="adv-group">
             <div className="adv-group-header">
               <div className="adv-group-header-icon" style={{ background: "rgba(20, 241, 149, 0.10)", border: "1px solid rgba(20, 241, 149, 0.22)" }}>
@@ -18932,7 +20689,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             })()}
           </Box>
 
-          {/* ── API Access group ── */}
+          {/* â”€â”€ API Access group â”€â”€ */}
           <Box className="adv-group">
             <div className="adv-group-header">
               <div className="adv-group-header-icon" style={{ background: "rgba(255, 180, 50, 0.10)", border: "1px solid rgba(255, 180, 50, 0.22)" }}>
@@ -19039,6 +20796,413 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Stack>
       ) : null}
 
+      {tab === 14 ? (
+        <Stack spacing={2.5}>
+          <Alert severity={foreverLifecycleRules.length > 0 ? "warning" : "info"}>
+            <Stack spacing={0.35}>
+              <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                Longer retention means more history, but also more database growth.
+              </Typography>
+              <Typography variant="body2" color="inherit">
+                {foreverLifecycleRules.length > 0
+                  ? `Forever is enabled for ${foreverLifecycleSummary}.`
+                  : "Set any retention field below to 0 if you intentionally want to keep that data forever."} Keeping rows forever or far beyond the defaults can increase DB size, slow queries, and make the server feel heavier over time.
+              </Typography>
+            </Stack>
+          </Alert>
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              <Stack spacing={0.45}>
+                <Typography className="settings-section-label">Episode Retention</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Controls pruning for episodic memory. Turning this off keeps all episodes forever.
+                </Typography>
+              </Stack>
+              <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Chip
+                  size="small"
+                  color={form.memory_retention_enabled ? "warning" : "default"}
+                  label={form.memory_retention_enabled ? "Pruning enabled" : "Keeping all episodes"}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={form.memory_retention_require_consolidated ? "Only consolidated episodes" : "Consolidation guard off"}
+                />
+              </Stack>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={form.memory_retention_enabled}
+                    onChange={(e) => setField("memory_retention_enabled", e.target.checked)}
+                  />
+                }
+                label="Enable episode pruning"
+              />
+              <Grid2
+                container
+                spacing={1.5}
+                sx={{
+                  opacity: form.memory_retention_enabled ? 1 : 0.55,
+                  pointerEvents: form.memory_retention_enabled ? "auto" : "none",
+                  transition: "opacity 0.2s"
+                }}
+              >
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Minimum age (days)"
+                    value={form.memory_retention_min_age_days}
+                    onChange={(e) => setField("memory_retention_min_age_days", e.target.value)}
+                    inputProps={{ min: 30, step: 1 }}
+                    helperText="Older than this before pruning is allowed."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Always keep newest episodes"
+                    value={form.memory_retention_keep_last}
+                    onChange={(e) => setField("memory_retention_keep_last", e.target.value)}
+                    inputProps={{ min: 500, step: 1 }}
+                    helperText="Safety floor for recent history."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Max importance"
+                    value={form.memory_retention_max_importance}
+                    onChange={(e) => setField("memory_retention_max_importance", e.target.value)}
+                    inputProps={{ min: 0, max: 1, step: 0.05 }}
+                    helperText="Only prune episodes at or below this score."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Max access count"
+                    value={form.memory_retention_max_access_count}
+                    onChange={(e) => setField("memory_retention_max_access_count", e.target.value)}
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="Protects frequently revisited episodes."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Run interval (days)"
+                    value={form.memory_retention_run_interval_days}
+                    onChange={(e) => setField("memory_retention_run_interval_days", e.target.value)}
+                    inputProps={{ min: 1, step: 1 }}
+                    helperText="Minimum days between prune runs."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Idle threshold (seconds)"
+                    value={form.memory_retention_idle_threshold_secs}
+                    onChange={(e) => setField("memory_retention_idle_threshold_secs", e.target.value)}
+                    inputProps={{ min: 60, step: 60 }}
+                    helperText="Only prune when the server has been idle this long."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Max delete per run"
+                    value={form.memory_retention_max_delete_per_run}
+                    onChange={(e) => setField("memory_retention_max_delete_per_run", e.target.value)}
+                    inputProps={{ min: 10, step: 10 }}
+                    helperText="Caps each cleanup pass."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={form.memory_retention_require_consolidated}
+                        onChange={(e) =>
+                          setField("memory_retention_require_consolidated", e.target.checked)
+                        }
+                      />
+                    }
+                    label="Require consolidation"
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={form.memory_retention_protect_fact_sources}
+                        onChange={(e) =>
+                          setField("memory_retention_protect_fact_sources", e.target.checked)
+                        }
+                      />
+                    }
+                    label="Protect fact-linked episodes"
+                  />
+                </Grid2>
+              </Grid2>
+            </Stack>
+          </Box>
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              <Stack spacing={0.45}>
+                <Typography className="settings-section-label">Notifications</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Controls how long in-product notifications stay in the database.
+                </Typography>
+              </Stack>
+              <Grid2 container spacing={1.5}>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Retention (days)"
+                    value={form.data_lifecycle_notifications_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_notifications_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps notifications forever."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Cleanup cadence (seconds)"
+                    value={form.data_lifecycle_notification_cleanup_interval_secs}
+                    onChange={(e) =>
+                      setField("data_lifecycle_notification_cleanup_interval_secs", e.target.value)
+                    }
+                    inputProps={{ min: 300, step: 60 }}
+                    helperText="How often stale notifications are purged."
+                  />
+                </Grid2>
+              </Grid2>
+            </Stack>
+          </Box>
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              <Stack spacing={0.45}>
+                <Typography className="settings-section-label">Logs & Traces</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Retention windows for operational tables. Use 0 only when you really want to keep a category forever.
+                </Typography>
+              </Stack>
+              <Grid2 container spacing={1.5}>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Execution traces (days)"
+                    value={form.data_lifecycle_execution_trace_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_execution_trace_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all traces."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Execution proofs (days)"
+                    value={form.data_lifecycle_execution_proof_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_execution_proof_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all proofs."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Operational logs (days)"
+                    value={form.data_lifecycle_operational_log_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_operational_log_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all operational logs."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Security logs (days)"
+                    value={form.data_lifecycle_security_log_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_security_log_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="Used by both housekeeping and idle cleanup."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Approval logs (days)"
+                    value={form.data_lifecycle_approval_log_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_approval_log_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all approval history."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Delegations (days)"
+                    value={form.data_lifecycle_swarm_delegation_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_swarm_delegation_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all delegation records."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="LLM usage (days)"
+                    value={form.data_lifecycle_llm_usage_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_llm_usage_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all token/accounting usage."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Completed tasks (days)"
+                    value={form.data_lifecycle_terminal_task_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_terminal_task_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="Recurring cron tasks are never purged."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Conversations (days)"
+                    value={form.data_lifecycle_message_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_message_retention_days", e.target.value)
+                    }
+                    inputProps={{ min: 0, step: 1 }}
+                    helperText="0 keeps all messages and conversation history."
+                  />
+                </Grid2>
+              </Grid2>
+            </Stack>
+          </Box>
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              <Stack spacing={0.45}>
+                <Typography className="settings-section-label">Cleanup Cadence</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Controls how often background cleanup passes run when retention is enabled.
+                </Typography>
+              </Stack>
+              <Grid2 container spacing={1.5}>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Housekeeping cadence (seconds)"
+                    value={form.data_lifecycle_housekeeping_interval_secs}
+                    onChange={(e) =>
+                      setField("data_lifecycle_housekeeping_interval_secs", e.target.value)
+                    }
+                    inputProps={{ min: 300, step: 60 }}
+                    helperText="Used for trace, log, task, and message cleanup passes."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Security cleanup cadence (days)"
+                    value={form.data_lifecycle_security_cleanup_interval_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_security_cleanup_interval_days", e.target.value)
+                    }
+                    inputProps={{ min: 1, step: 1 }}
+                    helperText="How often the idle security-log cleanup may run."
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Security idle threshold (seconds)"
+                    value={form.data_lifecycle_security_cleanup_idle_threshold_secs}
+                    onChange={(e) =>
+                      setField(
+                        "data_lifecycle_security_cleanup_idle_threshold_secs",
+                        e.target.value
+                      )
+                    }
+                    inputProps={{ min: 60, step: 60 }}
+                    helperText="Server must stay idle this long before the security sweep runs."
+                  />
+                </Grid2>
+              </Grid2>
+            </Stack>
+          </Box>
+        </Stack>
+      ) : null}
+
       {tab === 6 ? (
         <Stack spacing={2.5}>
           <ObservabilityPanel
@@ -19095,7 +21259,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
       {tab === 7 ? (
         <Stack spacing={2}>
-          {/* ── Header + Enable + API Key ── */}
+          {/* â”€â”€ Header + Enable + API Key â”€â”€ */}
           <Box className="list-shell">
             <Stack spacing={1.5}>
               <Stack direction="row" justifyContent="space-between" alignItems="center">
@@ -19115,7 +21279,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 />
               </Stack>
               <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 680 }}>
-                Decentralized agent-to-agent network. Zero-knowledge — no user data or conversation content leaves your instance.
+                Decentralized agent-to-agent network. Zero-knowledge â€” no user data or conversation content leaves your instance.
               </Typography>
               {form.moltbook_enabled ? (
                 <Stack spacing={0.5} sx={{ mt: 0.5 }}>
@@ -19168,7 +21332,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 >
                   {moltbookParticipationModes.map((option) => (
                     <MenuItem key={option.value} value={option.value}>
-                      {option.label}{option.value === "autopost" ? " (recommended)" : ""} — {option.shortLabel}
+                      {option.label}{option.value === "autopost" ? " (recommended)" : ""} â€” {option.shortLabel}
                     </MenuItem>
                   ))}
                 </TextField>
@@ -19232,7 +21396,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             </Stack>
           </Box>
 
-          {/* ── Connector Status (inline compact) ── */}
+          {/* â”€â”€ Connector Status (inline compact) â”€â”€ */}
           <Box className="list-shell" sx={{ opacity: form.moltbook_enabled ? 1 : 0.4, pointerEvents: form.moltbook_enabled ? "auto" : "none", transition: "opacity 0.2s" }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
               <Stack direction="row" spacing={1.5} alignItems="center">
@@ -19449,9 +21613,38 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Stack>
       ) : null}
 
-        {tab === 2 ? (
+        {tab === 20 ? (
           <Box className="list-shell">
-            <IntegrationsPanel autoRefresh={autoRefresh} embedded mode="integrations" />
+            <IntegrationsPanel autoRefresh={autoRefresh} embedded mode="channels" />
+          </Box>
+        ) : null}
+
+        {tab === 21 ? (
+          <Box className="list-shell">
+            <IntegrationsPanel autoRefresh={autoRefresh} embedded mode="connectors" />
+          </Box>
+        ) : null}
+
+        {tab === 22 ? (
+          <Stack spacing={2}>
+            <Box className="list-shell">
+              <WebhooksPanel autoRefresh={autoRefresh} />
+            </Box>
+            <Box className="list-shell">
+              <IntegrationQuickstartPanel
+                integrations={[]}
+                autoRefresh={autoRefresh}
+                embedded
+                onConfigureIntegration={() => {}}
+                mode="custom-apis-only"
+              />
+            </Box>
+          </Stack>
+        ) : null}
+
+        {tab === 23 ? (
+          <Box className="list-shell">
+            <PluginSdkPanel autoRefresh={autoRefresh} embedded />
           </Box>
         ) : null}
 
@@ -19611,7 +21804,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       {tab === 13 ? (
         <Stack spacing={2}>
           <Alert severity="info" sx={{ borderRadius: 2 }}>
-            Evolution lets AgentArk improve its own routing and decision-making over time. It tests new strategies via canary rollouts, measures performance, and automatically promotes winners.
+            Evolution is where AgentArk shows what it has learned from past runs. Learned memory and procedures above are already used in future chats and tasks when relevant. Draft candidates below are only suggestions until they are approved.
           </Alert>
           <Grid2 container spacing={2}>
             <Grid2 size={{ xs: 12, lg: 6 }}>
@@ -19645,6 +21838,43 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         }}
                         sx={{ cursor: "pointer" }}
                       />
+                    </Stack>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Tooltip title="When On, AgentArk learns from completed runs and corrections to build procedures, lessons, and draft workflow candidates." arrow>
+                        <Typography variant="body2" sx={{ cursor: "help", textDecoration: "underline dotted", textDecorationColor: "rgba(140,170,210,0.35)", textUnderlineOffset: 3 }}>Learning:</Typography>
+                      </Tooltip>
+                      <Chip
+                        size="small"
+                        color={toBool(evolution.learning_enabled) ? "success" : "default"}
+                        label={toBool(evolution.learning_enabled) ? "On" : "Off"}
+                        onClick={async () => {
+                          try {
+                            await updateEvolutionSettingsMutation.mutateAsync({
+                              learning_enabled: !toBool(evolution.learning_enabled),
+                            });
+                          } catch (_) {
+                            // best-effort toggle
+                          }
+                        }}
+                        sx={{ cursor: "pointer" }}
+                      />
+                      <Tooltip title="Local-only keeps learning synthesis and storage scoped to this installation instead of depending on remote services." arrow>
+                        <Chip
+                          size="small"
+                          color={toBool(evolution.learning_local_only) ? "info" : "default"}
+                          label={toBool(evolution.learning_local_only) ? "Local-only" : "Remote allowed"}
+                          onClick={async () => {
+                            try {
+                              await updateEvolutionSettingsMutation.mutateAsync({
+                                learning_local_only: !toBool(evolution.learning_local_only),
+                              });
+                            } catch (_) {
+                              // best-effort toggle
+                            }
+                          }}
+                          sx={{ cursor: "pointer" }}
+                        />
+                      </Tooltip>
                     </Stack>
                     <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
                       <Tooltip title="Canary deploys route a percentage of traffic to a new candidate policy to compare its performance against the current baseline before fully promoting it." arrow>
@@ -19682,6 +21912,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         Replay gate: {str(evolution.replay_gate_result, "-")}
                       </Typography>
                     </Tooltip>
+                    <Tooltip title="Background learning queue state: provisional runs still inside the correction window, consolidation backlog, draft candidates, and active patterns." arrow placement="right">
+                      <Typography variant="body2" sx={{ cursor: "help" }}>
+                        Learning queue: provisional {num(evolutionLearningQueue.provisional_runs, 0)} | backlog {num(evolutionLearningQueue.pending_consolidation, 0)} | drafts {num(evolutionLearningQueue.draft_candidates, 0)} | active patterns {num(evolutionLearningQueue.active_patterns, 0)}
+                      </Typography>
+                    </Tooltip>
+                    <Typography variant="body2" color="text.secondary">
+                      Learning model slot: {str(evolution.learning_model_slot, "auto")} | Queue cap: {num(evolution.learning_queue_cap, 64)}
+                    </Typography>
                   </Stack>
                 )}
               </Box>
@@ -19749,6 +21987,336 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             </Grid2>
           </Grid2>
 
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Tooltip title="Durable memories consolidated from successful runs, corrections, and captured user facts. This shows what the system has actually learned." arrow placement="top-start">
+                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learned Memory</Typography>
+                </Tooltip>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  Facts, preferences, and operating rules that now guide future responses.
+                </Typography>
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading learned memory...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionLearningItems.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No learned memory yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Kind</TableCell>
+                          <TableCell>Memory</TableCell>
+                          <TableCell align="right">Confidence</TableCell>
+                          <TableCell align="right">Support</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionLearningItems.map((row, idx) => (
+                          <TableRow key={`${str(row.id, "memory")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }}>
+                              <Chip size="small" variant="outlined" label={str(row.kind, "-")} />
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 520 }}>
+                              <Typography variant="body2">{str(row.title, "-")}</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {str(row.content, "-")}
+                              </Typography>
+                            </TableCell>
+                            <TableCell align="right">{(num(row.confidence, 0) * 100).toFixed(0)}%</TableCell>
+                            <TableCell align="right">
+                              {num(row.support_count, 0)} / {num(row.contradiction_count, 0)}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Tooltip title="Reusable learned procedures distilled from repeated successful runs. Draft patterns are still being validated; active ones are the strongest learned workflows." arrow placement="top-start">
+                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learned Procedures</Typography>
+                </Tooltip>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  Repeatable ways of working the system discovered from successful runs.
+                </Typography>
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading learned procedures...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionLearningPatterns.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No learned procedures yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Procedure</TableCell>
+                          <TableCell align="right">Samples</TableCell>
+                          <TableCell align="right">Success</TableCell>
+                          <TableCell>Status</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionLearningPatterns.map((row, idx) => (
+                          <TableRow key={`${str(row.id, "pattern")}-${idx}`}>
+                            <TableCell sx={{ maxWidth: 520 }}>
+                              <Typography variant="body2">{str(row.title, "-")}</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {str(row.summary, str(row.trigger_summary, "-"))}
+                              </Typography>
+                              {Array.isArray(row.steps_preview) && row.steps_preview.length > 0 ? (
+                                <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                                  Steps: {(row.steps_preview as unknown[]).map((value) => str(value, "")).filter((value) => value.trim().length > 0).join(" | ")}
+                                </Typography>
+                              ) : null}
+                            </TableCell>
+                            <TableCell align="right">{num(row.sample_count, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(0)}%</TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                color={str(row.status, "draft") === "active" ? "success" : "warning"}
+                                label={str(row.status, "draft")}
+                              />
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Tooltip title="The most recent normalized experience runs feeding the learning graph. This shows whether runs were accepted, corrected, or failed before consolidation into memory." arrow placement="top-start">
+                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Recent Experience Runs</Typography>
+                </Tooltip>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  The raw evidence the learning system is using before it turns patterns into durable memory.
+                </Typography>
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading recent experience runs...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionRecentExperienceRuns.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No experience runs yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Updated</TableCell>
+                          <TableCell>Intent</TableCell>
+                          <TableCell>Status</TableCell>
+                          <TableCell>Outcome</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionRecentExperienceRuns.map((row, idx) => (
+                          <TableRow key={`${str(row.id, "experience-run")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.updated_at, "-")).tip}>
+                              {humanTs(str(row.updated_at, "-")).label}
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 360 }}>
+                              <Typography variant="body2">{str(row.intent_key, "-")}</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {str(row.task_type, str(row.channel, "-"))}
+                              </Typography>
+                              {Array.isArray(row.tool_names) && row.tool_names.length > 0 ? (
+                                <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                                  Tools: {(row.tool_names as unknown[]).map((value) => str(value, "")).filter((value) => value.trim().length > 0).join(" -> ")}
+                                </Typography>
+                              ) : null}
+                            </TableCell>
+                            <TableCell sx={{ whiteSpace: "nowrap" }}>
+                              <Chip
+                                size="small"
+                                color={
+                                  str(row.correction_state, "none") === "corrected"
+                                    ? "warning"
+                                    : str(row.success_state, "failed") === "accepted"
+                                      ? "success"
+                                      : str(row.success_state, "failed") === "provisional"
+                                        ? "info"
+                                        : "default"
+                                }
+                                label={`${str(row.success_state, "-")} / ${str(row.correction_state, "-")}`}
+                              />
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 360 }}>
+                              <Typography variant="body2" color="text.secondary">
+                                {str(row.outcome_summary, str(row.failure_reason, "-"))}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Tooltip title="Draft and approved workflows, strategies, and memory actions generated by the learning system." arrow placement="top-start">
+                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learning Candidates</Typography>
+                </Tooltip>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  Suggestions created from evidence. These do not become active workflows or strategies until approved.
+                </Typography>
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading learning candidates...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionLearningCandidates.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No learning candidates yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Type</TableCell>
+                          <TableCell>Title</TableCell>
+                          <TableCell align="right">Confidence</TableCell>
+                          <TableCell>Status</TableCell>
+                          {developerModeEnabled ? <TableCell align="right">Ops</TableCell> : null}
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionLearningCandidates.map((row, idx) => (
+                          <TableRow key={`${str(row.id, "candidate")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }}>{str(row.candidate_type, "-")}</TableCell>
+                            <TableCell sx={{ maxWidth: 540 }}>
+                              <Typography variant="body2">{str(row.title, "-")}</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {str(row.summary, str(row.preview, str(row.proposed_name, str(row.strategy_version, ""))))}
+                              </Typography>
+                              {str(row.approved_ref, "").trim() ? (
+                                <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                                  Applied as: {str(row.approved_ref, "-")}
+                                </Typography>
+                              ) : null}
+                            </TableCell>
+                            <TableCell align="right">{(num(row.confidence, 0) * 100).toFixed(0)}%</TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                color={
+                                  str(row.approval_status, "draft") === "approved"
+                                    ? "success"
+                                    : str(row.approval_status, "draft") === "rejected"
+                                      ? "default"
+                                      : "warning"
+                                }
+                                label={str(row.approval_status, "draft")}
+                              />
+                            </TableCell>
+                            {developerModeEnabled ? (
+                              <TableCell align="right">
+                                <Stack direction="row" spacing={1} justifyContent="flex-end">
+                                  <Button
+                                    size="small"
+                                    variant="contained"
+                                    onClick={async () => {
+                                      setError(null);
+                                      setSuccess(null);
+                                      try {
+                                        const result = await runEvolutionDevActionMutation.mutateAsync({
+                                          action: "approve_learning_candidate",
+                                          candidate_id: str(row.id, ""),
+                                        });
+                                        setSuccess(`Learning candidate approved.${evolutionTraceIdHint(result)}`);
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    }}
+                                    disabled={runEvolutionDevActionMutation.isPending || str(row.approval_status, "draft") === "approved"}
+                                  >
+                                    Approve
+                                  </Button>
+                                  <Button
+                                    size="small"
+                                    color="inherit"
+                                    onClick={async () => {
+                                      setError(null);
+                                      setSuccess(null);
+                                      try {
+                                        const result = await runEvolutionDevActionMutation.mutateAsync({
+                                          action: "reject_learning_candidate",
+                                          candidate_id: str(row.id, ""),
+                                        });
+                                        setSuccess(`Learning candidate rejected.${evolutionTraceIdHint(result)}`);
+                                      } catch (e) {
+                                        setError(errMessage(e));
+                                      }
+                                    }}
+                                    disabled={runEvolutionDevActionMutation.isPending || str(row.approval_status, "draft") === "rejected"}
+                                  >
+                                    Reject
+                                  </Button>
+                                </Stack>
+                              </TableCell>
+                            ) : null}
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                <Tooltip title="History of all evolution promotion attempts. Shows when candidates were tested and whether they improved baseline performance." arrow placement="top-start">
+                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Lineage</Typography>
+                </Tooltip>
+                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                  A timeline of experiments showing what changed, what improved, and what was promoted.
+                </Typography>
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading lineage...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionLineage.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No lineage entries found.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Timestamp</TableCell>
+                          <TableCell>Source</TableCell>
+                          <TableCell align="right">Gain</TableCell>
+                          <TableCell align="right">Promoted</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionLineage.slice().reverse().map((row, idx) => (
+                          <TableRow key={`${str(row.entry_id, "lineage")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.timestamp_utc, "-")).tip}>{humanTs(str(row.timestamp_utc, "-")).label}</TableCell>
+                            <TableCell>{str(row.candidate_source, "-")}</TableCell>
+                            <TableCell align="right">{num(row.accuracy_gain, 0).toFixed(4)}</TableCell>
+                            <TableCell align="right">{toBool(row.promoted) ? "yes" : "no"}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
           {developerModeEnabled ? (
             <Grid2 container spacing={2}>
               <Grid2 size={{ xs: 12 }}>
@@ -19767,7 +22335,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                const result = await runEvolutionDevActionMutation.mutateAsync("disable_canary");
+                                const result = await runEvolutionDevActionMutation.mutateAsync({ action: "disable_canary" });
                                 setSuccess(`Canary disabled.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
@@ -19790,7 +22358,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                const result = await runEvolutionDevActionMutation.mutateAsync("promote_candidate");
+                                const result = await runEvolutionDevActionMutation.mutateAsync({ action: "promote_candidate" });
                                 setSuccess(`Candidate promoted to baseline.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
@@ -19813,7 +22381,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               setError(null);
                               setSuccess(null);
                               try {
-                                const result = await runEvolutionDevActionMutation.mutateAsync("rollback_baseline");
+                                const result = await runEvolutionDevActionMutation.mutateAsync({ action: "rollback_baseline" });
                                 setSuccess(`Rolled back to baseline snapshot.${evolutionTraceIdHint(result)}`);
                               } catch (e) {
                                 setError(errMessage(e));
@@ -19835,6 +22403,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   <Tooltip title="Performance metrics for task-routing strategies. Strategies determine how the agent selects which model or approach to use for each request." arrow placement="top-start">
                     <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Strategy Metrics</Typography>
                   </Tooltip>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
+                    Advanced diagnostics for routing strategy experiments and canary performance.
+                  </Typography>
                   {evolutionDevQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
                   ) : evolutionDevQ.error ? (
@@ -19869,52 +22440,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   )}
                 </Box>
               </Grid2>
-
-              <Grid2 size={{ xs: 12 }}>
-                <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Tooltip title="History of all evolution promotion attempts. Shows when candidates were tested, whether they improved accuracy, and if they were promoted to become the new baseline." arrow placement="top-start">
-                    <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Lineage</Typography>
-                  </Tooltip>
-                  {evolutionDevQ.isLoading ? (
-                    <Typography variant="body2" color="text.secondary">Loading lineage...</Typography>
-                  ) : evolutionDevQ.error ? (
-                    <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
-                  ) : evolutionLineage.length === 0 ? (
-                    <Typography variant="body2" color="text.secondary">No lineage entries found.</Typography>
-                  ) : (
-                    <TableContainer className="table-shell">
-                      <Table size="small">
-                        <TableHead>
-                          <TableRow>
-                            <TableCell>Timestamp</TableCell>
-                            <TableCell>Source</TableCell>
-                            <TableCell align="right">Gain</TableCell>
-                            <TableCell align="right">p-value</TableCell>
-                            <TableCell align="right">Promoted</TableCell>
-                          </TableRow>
-                        </TableHead>
-                        <TableBody>
-                          {evolutionLineage.slice().reverse().map((row, idx) => (
-                            <TableRow key={`${str(row.entry_id, "lineage")}-${idx}`}>
-                              <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.timestamp_utc, "-")).tip}>{humanTs(str(row.timestamp_utc, "-")).label}</TableCell>
-                              <TableCell>{str(row.candidate_source, "-")}</TableCell>
-                              <TableCell align="right">{num(row.accuracy_gain, 0).toFixed(4)}</TableCell>
-                              <TableCell align="right">{num(row.p_value, 1).toFixed(4)}</TableCell>
-                              <TableCell align="right">{toBool(row.promoted) ? "yes" : "no"}</TableCell>
-                            </TableRow>
-                          ))}
-                        </TableBody>
-                      </Table>
-                    </TableContainer>
-                  )}
-                </Box>
-              </Grid2>
             </Grid2>
-          ) : (
-            <Alert severity="info">
-              Enable Developer mode in Settings -&gt; Advanced to view replay metrics, lineage, and manual canary controls.
-            </Alert>
-          )}
+          ) : null}
         </Stack>
       ) : null}
         </Box>
@@ -20398,7 +22925,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                               entry.actions.length ? `last activity ${lastActivity.label}` : "",
                             ]
                               .filter(Boolean)
-                              .join(" • ")}
+                              .join(" - ")}
                           </Typography>
                         ) : null}
                         <Stack spacing={0.55} sx={{ mt: 0.9 }}>
@@ -20735,7 +23262,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
   );
 }
 
-/* ───────────── Analytics (top-level page) ───────────── */
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Analytics (top-level page) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   type AnalyticsRange = "1h" | "2h" | "6h" | "24h" | "3d" | "7d" | "14d" | "21d" | "30d" | "45d" | "60d" | "90d" | "custom";
@@ -20995,7 +23522,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <MenuItem value="90d">90 days</MenuItem>
           <Divider />
           {activeRange === "custom" ? (
-            <MenuItem value="custom">Custom ({appliedCustomFrom.replace("T", " ")} — {appliedCustomTo.replace("T", " ")})</MenuItem>
+            <MenuItem value="custom">Custom ({appliedCustomFrom.replace("T", " ")} â€” {appliedCustomTo.replace("T", " ")})</MenuItem>
           ) : null}
           <MenuItem value={"open_custom" as string}>Custom range...</MenuItem>
         </TextField>
@@ -21070,7 +23597,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
         ))}
       </Box>
 
-      {/* ── Usage Over Time ── */}
+      {/* â”€â”€ Usage Over Time â”€â”€ */}
       {(resp?.series || []).length > 1 ? (
         <Grid2 container spacing={1.5}>
           <Grid2 size={{ xs: 12, lg: 6 }}>
@@ -21920,7 +24447,7 @@ export function NativeWorkspace({
   return (
     <Box
       sx={{
-        p: { xs: 0.5, md: 0.75 },
+        p: { xs: 0.75, md: 1 },
         height: "100%",
         overflow: isChat ? "hidden" : "auto",
         display: "flex",

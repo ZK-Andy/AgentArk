@@ -124,6 +124,23 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct GoogleApiErrorEnvelope {
+    error: GoogleApiErrorPayload,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GoogleApiErrorPayload {
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    enable_url: Option<String>,
+}
+
 pub fn supported_bundles() -> &'static [&'static str] {
     &[
         "gmail", "calendar", "drive", "docs", "sheets", "chat", "admin",
@@ -160,6 +177,37 @@ pub fn normalize_bundle_id(value: &str) -> Option<String> {
         _ => return None,
     };
     Some(mapped.to_string())
+}
+
+pub fn infer_required_bundles_from_gws_argv(argv: &[String]) -> Vec<String> {
+    let mut inferred = BTreeSet::new();
+    for arg in argv {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            continue;
+        }
+        let normalized = trimmed
+            .trim_start_matches('+')
+            .split(':')
+            .next()
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_");
+        let mapped = match normalized.as_str() {
+            "gmail" => Some("gmail"),
+            "calendar" => Some("calendar"),
+            "drive" => Some("drive"),
+            "docs" => Some("docs"),
+            "sheets" => Some("sheets"),
+            "chat" => Some("chat"),
+            "admin" | "admin_reports" | "reports" => Some("admin"),
+            _ => None,
+        };
+        if let Some(bundle) = mapped {
+            inferred.insert(bundle.to_string());
+        }
+    }
+    inferred.into_iter().collect()
 }
 
 pub fn parse_bundle_list_from_str(value: &str) -> Vec<String> {
@@ -487,6 +535,90 @@ fn format_gws_output(stdout: &[u8], stderr: &[u8]) -> String {
         return stdout_text;
     }
     String::from_utf8_lossy(stderr).trim().to_string()
+}
+
+fn extract_google_api_error(raw: &str) -> Option<GoogleApiErrorPayload> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    serde_json::from_str::<GoogleApiErrorEnvelope>(trimmed)
+        .or_else(|_| {
+            let json_start = trimmed.find('{').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON body",
+                ))
+            })?;
+            serde_json::from_str::<GoogleApiErrorEnvelope>(&trimmed[json_start..])
+        })
+        .ok()
+        .map(|parsed| parsed.error)
+}
+
+fn format_google_api_failure(
+    operation: &str,
+    status: Option<reqwest::StatusCode>,
+    raw_body: &str,
+) -> String {
+    if let Some(error) = extract_google_api_error(raw_body) {
+        let code = error
+            .code
+            .map(|value| value.to_string())
+            .or_else(|| status.map(|value| value.as_u16().to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let reason = error.reason.unwrap_or_else(|| "unknown_error".to_string());
+        let mut message = format!(
+            "{} failed: Google reported {} (code {}).",
+            operation, reason, code
+        );
+        if let Some(detail) = error.message.map(|value| value.trim().to_string()) {
+            if !detail.is_empty() {
+                message.push(' ');
+                message.push_str(&detail);
+            }
+        }
+        if let Some(enable_url) = error.enable_url.map(|value| value.trim().to_string()) {
+            if !enable_url.is_empty() {
+                message.push(' ');
+                message.push_str("Enable or inspect the API here: ");
+                message.push_str(&enable_url);
+            }
+        }
+        return message;
+    }
+
+    match status {
+        Some(status) if !raw_body.trim().is_empty() => {
+            format!("{} failed ({}): {}", operation, status, raw_body.trim())
+        }
+        Some(status) => format!("{} failed: {}", operation, status),
+        None if !raw_body.trim().is_empty() => format!("{} failed: {}", operation, raw_body.trim()),
+        None => format!("{} failed.", operation),
+    }
+}
+
+async fn ensure_google_response_success(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow!(
+        "{}",
+        format_google_api_failure(operation, Some(status), &body)
+    ))
+}
+
+fn probe_status_counts_as_connected(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 async fn current_workspace_access_token(config_dir: &Path) -> Result<String> {
@@ -1137,7 +1269,22 @@ pub async fn gws_command(config_dir: &Path, arguments: &serde_json::Value) -> Re
             "gws auth commands are not exposed through AgentArk. Use the Google Workspace integration popup for sign-in."
         ));
     }
-    run_gws_command(Some(config_dir), &args.argv, &args.required_bundles, true).await
+    let mut required_bundles = BTreeSet::new();
+    for bundle in args.required_bundles {
+        if let Some(normalized) = normalize_bundle_id(&bundle) {
+            required_bundles.insert(normalized);
+        }
+    }
+    for bundle in infer_required_bundles_from_gws_argv(&args.argv) {
+        required_bundles.insert(bundle);
+    }
+    run_gws_command(
+        Some(config_dir),
+        &args.argv,
+        &required_bundles.into_iter().collect::<Vec<_>>(),
+        true,
+    )
+    .await
 }
 
 pub async fn gws_skills(config_dir: &Path, arguments: &serde_json::Value) -> Result<String> {
@@ -1251,10 +1398,10 @@ pub async fn drive_search(config_dir: &Path, arguments: &serde_json::Value) -> R
                     }
                 }
                 let response = client.get(url).bearer_auth(access_token).send().await?;
-                if !response.status().is_success() {
-                    return Err(anyhow!("Google Drive search failed: {}", response.status()));
-                }
-                response.json().await?
+                ensure_google_response_success(response, "Google Drive search")
+                    .await?
+                    .json()
+                    .await?
             }
         }
     } else {
@@ -1281,10 +1428,10 @@ pub async fn drive_search(config_dir: &Path, arguments: &serde_json::Value) -> R
             }
         }
         let response = client.get(url).bearer_auth(access_token).send().await?;
-        if !response.status().is_success() {
-            return Err(anyhow!("Google Drive search failed: {}", response.status()));
-        }
-        response.json().await?
+        ensure_google_response_success(response, "Google Drive search")
+            .await?
+            .json()
+            .await?
     };
     let files = data
         .get("files")
@@ -1324,9 +1471,13 @@ pub async fn drive_search(config_dir: &Path, arguments: &serde_json::Value) -> R
             .get("webViewLink")
             .and_then(|value| value.as_str())
             .unwrap_or("-");
+        let file_id = file
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
         lines.push(format!(
-            "- {} | {} | modified {} | owner {} | {}",
-            name, mime, modified, owner, link
+            "- {} | {} | modified {} | owner {} | {} | id {}",
+            name, mime, modified, owner, link, file_id
         ));
     }
     Ok(lines.join("\n"))
@@ -1356,10 +1507,10 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
                     .bearer_auth(access_token)
                     .send()
                     .await?;
-                if !response.status().is_success() {
-                    return Err(anyhow!("Google Docs read failed: {}", response.status()));
-                }
-                response.json().await?
+                ensure_google_response_success(response, "Google Docs read")
+                    .await?
+                    .json()
+                    .await?
             }
         }
     } else {
@@ -1372,10 +1523,10 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
             .bearer_auth(access_token)
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(anyhow!("Google Docs read failed: {}", response.status()));
-        }
-        response.json().await?
+        ensure_google_response_success(response, "Google Docs read")
+            .await?
+            .json()
+            .await?
     };
     let title = data
         .get("title")
@@ -1454,10 +1605,10 @@ pub async fn sheets_read(config_dir: &Path, arguments: &serde_json::Value) -> Re
                     .bearer_auth(access_token)
                     .send()
                     .await?;
-                if !response.status().is_success() {
-                    return Err(anyhow!("Google Sheets read failed: {}", response.status()));
-                }
-                response.json().await?
+                ensure_google_response_success(response, "Google Sheets read")
+                    .await?
+                    .json()
+                    .await?
             }
         }
     } else {
@@ -1475,10 +1626,10 @@ pub async fn sheets_read(config_dir: &Path, arguments: &serde_json::Value) -> Re
             .bearer_auth(access_token)
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(anyhow!("Google Sheets read failed: {}", response.status()));
-        }
-        response.json().await?
+        ensure_google_response_success(response, "Google Sheets read")
+            .await?
+            .json()
+            .await?
     };
     let values = data
         .get("values")
@@ -1536,13 +1687,10 @@ pub async fn chat_list_spaces(config_dir: &Path, arguments: &serde_json::Value) 
                 url.query_pairs_mut()
                     .append_pair("pageSize", &page_size.to_string());
                 let response = client.get(url).bearer_auth(access_token).send().await?;
-                if !response.status().is_success() {
-                    return Err(anyhow!(
-                        "Google Chat spaces request failed: {}",
-                        response.status()
-                    ));
-                }
-                response.json().await?
+                ensure_google_response_success(response, "Google Chat spaces request")
+                    .await?
+                    .json()
+                    .await?
             }
         }
     } else {
@@ -1554,13 +1702,10 @@ pub async fn chat_list_spaces(config_dir: &Path, arguments: &serde_json::Value) 
         url.query_pairs_mut()
             .append_pair("pageSize", &page_size.to_string());
         let response = client.get(url).bearer_auth(access_token).send().await?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Google Chat spaces request failed: {}",
-                response.status()
-            ));
-        }
-        response.json().await?
+        ensure_google_response_success(response, "Google Chat spaces request")
+            .await?
+            .json()
+            .await?
     };
     let spaces = data
         .get("spaces")
@@ -1657,13 +1802,10 @@ pub async fn admin_list_users(config_dir: &Path, arguments: &serde_json::Value) 
                     }
                 }
                 let response = client.get(url).bearer_auth(access_token).send().await?;
-                if !response.status().is_success() {
-                    return Err(anyhow!(
-                        "Google Admin users request failed: {}",
-                        response.status()
-                    ));
-                }
-                response.json().await?
+                ensure_google_response_success(response, "Google Admin users request")
+                    .await?
+                    .json()
+                    .await?
             }
         }
     } else {
@@ -1695,13 +1837,10 @@ pub async fn admin_list_users(config_dir: &Path, arguments: &serde_json::Value) 
             }
         }
         let response = client.get(url).bearer_auth(access_token).send().await?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Google Admin users request failed: {}",
-                response.status()
-            ));
-        }
-        response.json().await?
+        ensure_google_response_success(response, "Google Admin users request")
+            .await?
+            .json()
+            .await?
     };
     let users = data
         .get("users")
@@ -1736,11 +1875,112 @@ pub async fn admin_list_users(config_dir: &Path, arguments: &serde_json::Value) 
     Ok(lines.join("\n"))
 }
 
-pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, String>> {
-    let bundles = load_saved_bundles(config_dir)?;
+pub async fn test_bundle_access(config_dir: &Path, bundle: &str) -> Result<String> {
+    let normalized = normalize_bundle_id(bundle)
+        .ok_or_else(|| anyhow!("Unsupported Google Workspace bundle '{}'.", bundle))?;
+    let access_token = ensure_access_token_for_bundles(config_dir, &[normalized.as_str()]).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
+
+    match normalized.as_str() {
+        "gmail" => {
+            let response = client
+                .get("https://gmail.googleapis.com/gmail/v1/users/me/profile")
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            ensure_google_response_success(response, "Gmail profile request").await?;
+            Ok("Gmail connected".to_string())
+        }
+        "calendar" => {
+            let response = client
+                .get("https://www.googleapis.com/calendar/v3/calendars/primary")
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            ensure_google_response_success(response, "Calendar primary request").await?;
+            Ok("Calendar connected".to_string())
+        }
+        "drive" => {
+            let response = client
+                .get(format!(
+                    "{}/files?pageSize=1&fields=files(id,name)",
+                    DRIVE_API_BASE
+                ))
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            ensure_google_response_success(response, "Drive files request").await?;
+            Ok("Drive connected".to_string())
+        }
+        "docs" => {
+            let response = client
+                .get(format!("{}/documents/__agentark_probe__", DOCS_API_BASE))
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() || probe_status_counts_as_connected(status) {
+                Ok("Docs connected".to_string())
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                Err(anyhow!(
+                    "{}",
+                    format_google_api_failure("Docs probe request", Some(status), &body)
+                ))
+            }
+        }
+        "sheets" => {
+            let response = client
+                .get(format!(
+                    "{}/spreadsheets/__agentark_probe__?includeGridData=false&fields=spreadsheetId",
+                    SHEETS_API_BASE
+                ))
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() || probe_status_counts_as_connected(status) {
+                Ok("Sheets connected".to_string())
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                Err(anyhow!(
+                    "{}",
+                    format_google_api_failure("Sheets probe request", Some(status), &body)
+                ))
+            }
+        }
+        "chat" => {
+            let response = client
+                .get(format!("{}/spaces?pageSize=1", CHAT_API_BASE))
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            ensure_google_response_success(response, "Chat spaces request").await?;
+            Ok("Chat connected".to_string())
+        }
+        "admin" => {
+            let response = client
+                .get(format!(
+                    "{}/users?customer=my_customer&maxResults=1",
+                    ADMIN_API_BASE
+                ))
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
+            ensure_google_response_success(response, "Admin users request").await?;
+            Ok("Admin connected".to_string())
+        }
+        _ => Err(anyhow!(
+            "Unsupported Google Workspace bundle '{}'.",
+            normalized
+        )),
+    }
+}
+
+pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, String>> {
+    let bundles = load_saved_bundles(config_dir)?;
     let mut results = HashMap::new();
     match gws_version().await {
         Ok(version) => {
@@ -1763,43 +2003,13 @@ pub async fn test_selected_bundles(config_dir: &Path) -> Result<HashMap<String, 
     }
 
     for bundle in bundles {
-        let access_token = ensure_access_token_for_bundles(config_dir, &[bundle.as_str()]).await?;
-        let (url, label) = match bundle.as_str() {
-            "gmail" => (
-                "https://gmail.googleapis.com/gmail/v1/users/me/profile".to_string(),
-                "Gmail".to_string(),
-            ),
-            "calendar" => (
-                "https://www.googleapis.com/calendar/v3/calendars/primary".to_string(),
-                "Calendar".to_string(),
-            ),
-            "drive" => (
-                format!("{}/files?pageSize=1&fields=files(id,name)", DRIVE_API_BASE),
-                "Drive".to_string(),
-            ),
-            "docs" => {
-                results.insert(bundle, "Docs access granted".to_string());
-                continue;
+        match test_bundle_access(config_dir, &bundle).await {
+            Ok(message) => {
+                results.insert(bundle, message);
             }
-            "sheets" => {
-                results.insert(bundle, "Sheets access granted".to_string());
-                continue;
+            Err(error) => {
+                results.insert(bundle, error.to_string());
             }
-            "chat" => (
-                format!("{}/spaces?pageSize=1", CHAT_API_BASE),
-                "Chat".to_string(),
-            ),
-            "admin" => (
-                format!("{}/users?customer=my_customer&maxResults=1", ADMIN_API_BASE),
-                "Admin".to_string(),
-            ),
-            _ => continue,
-        };
-        let response = client.get(url).bearer_auth(access_token).send().await?;
-        if response.status().is_success() {
-            results.insert(bundle, format!("{} connected", label));
-        } else {
-            results.insert(bundle, format!("{} failed ({})", label, response.status()));
         }
     }
 
@@ -1844,6 +2054,47 @@ mod tests {
         ]);
         assert!(scopes.iter().any(|scope| scope.contains("gmail.readonly")));
         assert!(scopes.iter().any(|scope| scope.contains("calendar")));
+    }
+
+    #[test]
+    fn infers_required_bundles_from_gws_argv() {
+        assert_eq!(
+            infer_required_bundles_from_gws_argv(&[
+                "drive".to_string(),
+                "files".to_string(),
+                "list".to_string()
+            ]),
+            vec!["drive".to_string()]
+        );
+        assert_eq!(
+            infer_required_bundles_from_gws_argv(&[
+                "help".to_string(),
+                "docs".to_string(),
+                "--format".to_string(),
+                "json".to_string()
+            ]),
+            vec!["docs".to_string()]
+        );
+        assert_eq!(
+            infer_required_bundles_from_gws_argv(&[
+                "admin-reports:v1".to_string(),
+                "activities".to_string(),
+                "list".to_string()
+            ]),
+            vec!["admin".to_string()]
+        );
+    }
+
+    #[test]
+    fn google_api_failure_preserves_reason_and_enable_url() {
+        let rendered = format_google_api_failure(
+            "Drive files request",
+            Some(reqwest::StatusCode::FORBIDDEN),
+            r#"{"error":{"code":403,"message":"Drive API disabled","reason":"accessNotConfigured","enable_url":"https://example.com/enable"}}"#,
+        );
+        assert!(rendered.contains("accessNotConfigured"));
+        assert!(rendered.contains("Drive API disabled"));
+        assert!(rendered.contains("https://example.com/enable"));
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub struct McpServerView {
     pub transport: McpTransportView,
     pub auth: McpAuthView,
     pub tool_allowlist: Vec<String>,
+    pub tool_blocklist: Vec<String>,
     pub resource_allowlist: Vec<String>,
     pub timeout_secs: u64,
     pub max_response_bytes: usize,
@@ -184,7 +185,7 @@ async fn build_server_state(
 
     if server.enabled {
         match client.list_tools().await {
-            Ok(list) => tools = filter_tools(list, &server.tool_allowlist),
+            Ok(list) => tools = filter_tools(list, &server.tool_allowlist, &server.tool_blocklist),
             Err(e) => last_error = Some(e.to_string()),
         }
 
@@ -222,6 +223,7 @@ impl McpServerState {
             transport: transport_view(&self.config.transport),
             auth: auth_view(&self.config.auth, self.has_auth),
             tool_allowlist: self.config.tool_allowlist.clone(),
+            tool_blocklist: self.config.tool_blocklist.clone(),
             resource_allowlist: self.config.resource_allowlist.clone(),
             timeout_secs: self.config.timeout_secs,
             max_response_bytes: self.config.max_response_bytes,
@@ -425,14 +427,23 @@ fn resolve_auth(
     }
 }
 
-fn filter_tools(tools: Vec<McpTool>, allowlist: &[String]) -> Vec<McpTool> {
-    if allowlist.is_empty() {
-        return tools;
-    }
+fn filter_tools(tools: Vec<McpTool>, allowlist: &[String], blocklist: &[String]) -> Vec<McpTool> {
+    let blocked: HashSet<&str> = blocklist.iter().map(|s| s.as_str()).collect();
     let allowed: HashSet<&str> = allowlist.iter().map(|s| s.as_str()).collect();
     tools
         .into_iter()
-        .filter(|t| allowed.contains(t.name.as_str()))
+        .filter(|t| {
+            // Blocklist always takes precedence
+            if blocked.contains(t.name.as_str()) {
+                return false;
+            }
+            // If allowlist is empty, allow all non-blocked tools
+            if allowed.is_empty() {
+                return true;
+            }
+            // Otherwise, must be in allowlist
+            allowed.contains(t.name.as_str())
+        })
         .collect()
 }
 
@@ -531,15 +542,28 @@ async fn register_actions(
     Ok(())
 }
 
-fn mcp_safety_rule_action(_server: &McpServerConfig, _item_name: &str, _is_resource: bool) -> RuleAction {
-    RuleAction::RequireApproval
+fn mcp_safety_rule_action(
+    _server: &McpServerConfig,
+    _item_name: &str,
+    _is_resource: bool,
+) -> RuleAction {
+    // User explicitly connected this server — treat as trusted.
+    // All calls are logged for audit but don't require per-call approval.
+    RuleAction::LogAndAllow
 }
 
-fn mcp_safety_rule_description(server: &McpServerConfig, item_name: &str, is_resource: bool) -> String {
+fn mcp_safety_rule_description(
+    server: &McpServerConfig,
+    item_name: &str,
+    is_resource: bool,
+) -> String {
     let action = mcp_safety_rule_action(server, item_name, is_resource);
     let kind = if is_resource { "resource" } else { "tool" };
     match action {
-        RuleAction::LogAndAllow => format!("MCP {} is trusted and logged without approval: {}", kind, item_name),
+        RuleAction::LogAndAllow => format!(
+            "MCP {} is trusted and logged without approval: {}",
+            kind, item_name
+        ),
         RuleAction::RequireApproval => format!("MCP {} requires approval: {}", kind, item_name),
         RuleAction::Allow => format!("MCP {} is allowed: {}", kind, item_name),
         RuleAction::Block { .. } => format!("MCP {} is blocked: {}", kind, item_name),
@@ -658,4 +682,3 @@ fn format_mcp_result(result: &Value) -> String {
         fallback
     }
 }
-

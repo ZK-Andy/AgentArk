@@ -61,7 +61,6 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
               size="small"
               variant={activeView === entry.view ? "contained" : "outlined"}
               onClick={() => setActiveView(entry.view)}
-              sx={{ textTransform: "none", borderRadius: 999 }}
             >
               {entry.label}
             </Button>
@@ -70,7 +69,6 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
             size="small"
             variant="text"
             onClick={() => onNavigateToView("projects")}
-            sx={{ textTransform: "none", borderRadius: 999 }}
           >
             Projects
           </Button>

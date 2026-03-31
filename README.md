@@ -171,14 +171,22 @@ Open **http://localhost:8990** when it's done.
 ```bash
 git clone https://github.com/agentark-ai/AgentArk.git && cd AgentArk
 
-# Start
-docker compose up -d --build          # uses an external LLM (OpenRouter, Anthropic, OpenAI …)
+# Start the full stack with bundled Postgres
+docker compose up -d --build
+
+# Optional extras
 docker compose --profile with-ollama up -d --build   # bundle a local Ollama instance
 docker compose --profile with-search up -d --build   # bundle SearXNG private search
+
+# Reset everything, including the Postgres data volume
+docker compose down -v
 
 # Windows
 scripts\start.bat
 ```
+
+The compose file sets `AGENTARK_DATABASE_URL` automatically for the app container. If you run the binary directly, you must provide your own Postgres URL.
+Optional Postgres tuning env vars are also supported for native and container runs: `AGENTARK_DB_MAX_CONNECTIONS`, `AGENTARK_DB_CONNECT_TIMEOUT_SECS`, `AGENTARK_DB_STATEMENT_TIMEOUT_MS`, `AGENTARK_DB_IDLE_TIMEOUT_SECS`, and `AGENTARK_DB_SCHEMA`.
 
 ### Container variants
 
@@ -187,7 +195,7 @@ AgentArk publishes two GHCR variants for deployments: a lean `base` image and a 
 | Variant | What it includes | Approx. size (linux/amd64) |
 |:--|:--|:--|
 | `ghcr.io/agentark-ai/agentark:base` | Core AgentArk server, web UI, Git, Python app runtime | ~900 MB |
-| `ghcr.io/agentark-ai/agentark:full` | Base image plus Playwright/Chromium, Mem0 bridge, ffmpeg, cloudflared, tailscale, Lightpanda, Google Workspace CLI, Remotion template, WhatsApp bridge, Ollama CLI | ~12.8 GB |
+| `ghcr.io/agentark-ai/agentark:full` | Base image plus Playwright/Chromium, Mem0 bridge, ffmpeg, cloudflared, tailscale, Lightpanda, Google Workspace CLI, WhatsApp bridge | ~4.5 GB |
 
 Pull whichever image matches your deployment:
 
@@ -226,6 +234,11 @@ docker compose up -d --force-recreate
 
 ```bash
 # Rust 1.75+
+export AGENTARK_DATABASE_URL=postgres://agentark:agentark@localhost:5432/agentark
+export AGENTARK_DB_MAX_CONNECTIONS=20
+export AGENTARK_DB_CONNECT_TIMEOUT_SECS=5
+export AGENTARK_DB_STATEMENT_TIMEOUT_MS=30000
+export AGENTARK_DB_IDLE_TIMEOUT_SECS=300
 cargo build --release
 ./target/release/agentark --headless
 ```
@@ -236,9 +249,12 @@ Built-in remote access is toggleable from the Settings page in the web UI. Cloud
 
 ### Management
 
+Updates are manual today. Rebuild and restart source-based installs with the commands below, or use the installer-provided `agentark update` wrapper on managed installs.
+
 ```bash
 docker compose up -d --build                    # build and start
 docker compose down                             # stop
+docker compose down -v                           # stop and reset Postgres + volumes
 docker compose logs -f agentark                 # follow logs
 docker compose up -d --build --force-recreate   # rebuild and restart
 ```
@@ -340,25 +356,6 @@ Notes:
 - If AgentArk is running in Docker and Ollama is running on your host machine, use `http://host.docker.internal:11434` instead of `http://localhost:11434`.
 - If you start AgentArk with `docker compose --profile with-ollama up -d --build`, the registry will default to the bundled Ollama service at `http://agentark-ollama:11434`.
 - OpenCode and OpenClaw work best with models that support **64K context or more**.
-
-### Upcoming: Self-Update
-
-In-app self-update is planned, but it is currently disabled in the product.
-
-- The UI entry points are hidden.
-- The HTTP routes are unmounted.
-- The updater worker is not started by Docker Compose or the helper scripts.
-- The implementation code is still kept in the repo for a later return.
-
-When it comes back, the intended flow is:
-
-1. A user explicitly approves an update request from the app.
-2. AgentArk writes an update job instead of updating itself inline.
-3. A separate updater process picks up that job outside the main app process.
-4. The updater validates the change, rebuilds the image/service, restarts it, and runs health checks.
-5. If the new version fails health checks, the updater can roll back to the previous known-good version.
-
-It is disabled for now to avoid accidental or confusing in-app upgrades for non-technical users. For the moment, use the manual update path above when you want to upgrade a deployment.
 
 ---
 
@@ -597,7 +594,7 @@ src/
 ├── channels/       # HTTP API, Telegram, WhatsApp
 ├── security/       # Action guard, safety rules
 ├── runtime/        # WASM + Docker sandboxing
-├── storage/        # SQLite persistence, entities
+├── storage/        # PostgreSQL persistence, entities
 ├── integrations/   # GitHub, Notion, Twitter, MCP, etc.
 └── main.rs         # Entrypoint
 
@@ -623,7 +620,7 @@ AgentArk is built on the shoulders of outstanding open-source projects:
 | [Rust](https://www.rust-lang.org/) | Core runtime — memory safety, performance, and fearless concurrency |
 | [Tokio](https://tokio.rs/) | Async runtime powering all concurrent operations |
 | [Axum](https://github.com/tokio-rs/axum) | HTTP server and API framework |
-| [SeaORM](https://www.sea-ql.org/SeaORM/) | Database ORM over SQLite |
+| [SeaORM](https://www.sea-ql.org/SeaORM/) | Database ORM over PostgreSQL |
 | [React](https://react.dev/) + [MUI](https://mui.com/) | Web UI framework and component library |
 | [Playwright](https://playwright.dev/) | Browser automation for screenshots and complex SPA interaction |
 | [Lightpanda](https://github.com/lightpanda-io/browser) | Fast headless browser for content extraction and web scraping |

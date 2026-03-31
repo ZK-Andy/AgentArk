@@ -2,6 +2,7 @@ use super::*;
 use anyhow::{anyhow, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 const WEBHOOK_SOURCES_KEY: &str = "webhooks:sources:v1";
 const WEBHOOK_EVENTS_KEY: &str = "webhooks:events:v1";
@@ -337,6 +338,46 @@ fn sanitize_output_channel(value: Option<&str>) -> Option<String> {
     value
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
+}
+
+async fn available_completion_channels(state: &AppState) -> Result<HashSet<String>> {
+    let (config_dir, data_dir, infos) = {
+        let agent = state.agent.read().await;
+        (
+            agent.config_dir.clone(),
+            agent.data_dir.clone(),
+            agent.integrations.list().await,
+        )
+    };
+
+    let mut channels = infos
+        .into_iter()
+        .filter(|info| {
+            info.capabilities
+                .iter()
+                .any(|capability| *capability == crate::integrations::Capability::Notify)
+                && matches!(
+                    info.status,
+                    crate::integrations::IntegrationStatus::Connected
+                )
+        })
+        .map(|info| info.id.trim().to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>();
+
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(&config_dir, Some(&data_dir))?;
+    let has_legacy_gmail = manager
+        .get_custom_secret("gmail_tokens")?
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_workspace_gmail = crate::actions::google_workspace::granted_bundles(&config_dir)
+        .map(|bundles| bundles.iter().any(|bundle| bundle == "gmail"))
+        .unwrap_or(false);
+    if has_legacy_gmail || has_workspace_gmail {
+        channels.insert("email".to_string());
+    }
+
+    Ok(channels)
 }
 
 fn describe_output_target(source: &WebhookSource) -> String {
@@ -702,10 +743,25 @@ fn normalize_event(
         raw_body.to_string()
     };
     let payload_excerpt = sanitize_excerpt(&excerpt_raw, WEBHOOK_EXCERPT_MAX_CHARS);
+    // Summary for display — includes source name for human context.
     let summary = sanitize_excerpt(
         &format!(
             "{} {}{} for {}",
             source.name,
+            event_type,
+            status
+                .as_deref()
+                .map(|value| format!(" ({})", value))
+                .unwrap_or_default(),
+            subject
+        ),
+        WEBHOOK_SUMMARY_MAX_CHARS,
+    );
+    // Classification summary — excludes source name to avoid false positives
+    // (e.g. source named "Deploy Failures" shouldn't make every event a failure).
+    let classify_summary = sanitize_excerpt(
+        &format!(
+            "{}{} for {}",
             event_type,
             status
                 .as_deref()
@@ -729,8 +785,8 @@ fn normalize_event(
         .as_ref()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
-    let is_failure = classify_failure(&event_type, status.as_deref(), &subject, &summary);
-    let is_change = classify_change(&event_type, status.as_deref(), &subject, &summary);
+    let is_failure = classify_failure(&event_type, status.as_deref(), &subject, &classify_summary);
+    let is_change = classify_change(&event_type, status.as_deref(), &subject, &classify_summary);
 
     NormalizedWebhookEvent {
         event_type,
@@ -1527,6 +1583,15 @@ async fn upsert_source_internal(
             "Select a completion channel or switch completion delivery to none/preferred."
         );
     }
+    if let Some(channel) = output_channel.as_deref() {
+        let available_channels = available_completion_channels(state).await?;
+        if !available_channels.contains(channel) {
+            anyhow::bail!(
+                "Completion channel '{}' is not currently available. Connect that channel first or switch completion delivery.",
+                channel
+            );
+        }
+    }
 
     let source = WebhookSource {
         id: id.clone(),
@@ -1909,9 +1974,15 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let shared = Arc::new(RwLock::new(
-            Agent::init(config_dir.path(), data_dir.path(), None)
-                .await
-                .unwrap(),
+            Agent::init(
+                config_dir.path(),
+                data_dir.path(),
+                crate::storage::DatabaseConfig::for_tests()
+                    .expect("test database config should initialize"),
+                None,
+            )
+            .await
+            .unwrap(),
         ));
         let (trace_history, last_trace, tasks, user_profile, security_events, app_registry) = {
             let guard = shared.read().await;
@@ -2024,6 +2095,38 @@ mod tests {
         let list_response = router.oneshot(list_request).await.unwrap();
         let list_body = json_response(list_response).await;
         assert!(!list_body.to_string().contains("super-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn webhook_source_rejects_unknown_completion_channel() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/webhooks/sources", post(create_webhook_source))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhooks/sources")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "name": "Invalid Route",
+                    "provider": "generic",
+                    "auth_mode": "none",
+                    "output_target": "channel",
+                    "output_channel": "definitely-not-real",
+                    "instruction": "Do nothing"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_response(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.contains("not currently available")));
     }
 
     #[tokio::test]

@@ -710,7 +710,10 @@ export default function App() {
       <Box className="bg-orb orb-b" />
       <Box className="app-frame">
         <AppBar position="static" elevation={0} color="transparent" className="glass-appbar shell-appbar">
-          <Toolbar className="shell-toolbar" sx={{ minHeight: "var(--appbar-height)", px: 1.5 }}>
+          <Toolbar
+            className="shell-toolbar"
+            sx={{ minHeight: "var(--appbar-height)", px: { xs: 1.75, md: 2.25 } }}
+          >
             <Stack direction="row" alignItems="center" spacing={1} sx={{ flexGrow: 1, minWidth: 0 }}>
               <Box className="shell-brand-mark">
                 <img src="/logo.svg" alt="AgentArk" width={36} height={36} />

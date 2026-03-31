@@ -59,6 +59,7 @@ pub struct ActionRuntime {
     disabled_actions: tokio::sync::RwLock<HashSet<String>>,
     disabled_actions_file: PathBuf,
     actions_dir: PathBuf,
+    cli_skills_dir: PathBuf,
     config_dir: PathBuf,
     /// Shared task queue for list_tasks action
     task_queue: Option<std::sync::Arc<tokio::sync::RwLock<crate::core::TaskQueue>>>,
@@ -84,6 +85,8 @@ struct LoadedAction {
     wasm_module: Option<Vec<u8>>,
     /// Workflow content from SKILL.md (legacy ACTION.md still supported)
     workflow_content: Option<String>,
+    /// Optional fixed local CLI binding backed by a verified host executable
+    cli_binding: Option<CliToolBinding>,
     /// Optional MCP binding (external tool/resource)
     mcp_binding: Option<McpBinding>,
     /// Optional plugin binding (third-party HTTP extension)
@@ -108,6 +111,25 @@ pub enum McpBindingKind {
 pub struct PluginBinding {
     pub plugin_id: String,
     pub action_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliToolBinding {
+    pub executable_path: String,
+    #[serde(default)]
+    pub verify_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledCliSkillManifest {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub executable_path: String,
+    #[serde(default)]
+    pub verify_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +543,8 @@ impl ActionRuntime {
         // User skills go in data dir
         let actions_dir = data_dir.join("skills");
         std::fs::create_dir_all(&actions_dir)?;
+        let cli_skills_dir = data_dir.join("cli_skills");
+        std::fs::create_dir_all(&cli_skills_dir)?;
         let disabled_actions_file = data_dir.join("disabled_actions.json");
         let disabled_actions = Self::load_disabled_actions(&disabled_actions_file);
 
@@ -538,6 +562,7 @@ impl ActionRuntime {
             disabled_actions: tokio::sync::RwLock::new(disabled_actions),
             disabled_actions_file,
             actions_dir: actions_dir.clone(),
+            cli_skills_dir,
             config_dir: config_dir.to_path_buf(),
             task_queue: None,
             action_guard: None,
@@ -613,6 +638,14 @@ impl ActionRuntime {
                 .await?;
         }
 
+        if self.cli_skills_dir.exists() {
+            tracing::info!(
+                "Loading installed CLI skills from {:?}",
+                self.cli_skills_dir
+            );
+            self.load_cli_skill_actions().await?;
+        }
+
         Ok(())
     }
 
@@ -667,6 +700,8 @@ impl ActionRuntime {
                     "limit": { "type": "integer", "description": "Maximum number of memory hits to return (default: 5)" },
                     "include_semantic": { "type": "boolean", "description": "Include semantic memory matches (default: true)" },
                     "include_structured": { "type": "boolean", "description": "Include structured preferences, user data, and knowledge base context (default: true)" },
+                    "include_procedures": { "type": "boolean", "description": "Include learned procedural patterns and workflow guidance (default: true)" },
+                    "include_lessons": { "type": "boolean", "description": "Include learned lessons and operating constraints (default: true)" },
                     "external_sources": {
                         "type": "array",
                         "description": "Optional source-scoped external memory surfaces to include only when directly relevant, for example [\"moltbook\"]",
@@ -1939,7 +1974,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "google_drive_search".to_string(),
-            description: "Search Google Drive files using the connected Google Workspace account. Use when the user asks to find a file, document, folder, spreadsheet, or deck in Drive.".to_string(),
+            description: "Search Google Drive files using the connected Google Workspace account with read-only Drive access. Use when the user asks to find a file, document, folder, spreadsheet, or deck in Drive.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1991,7 +2026,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "google_chat_list_spaces".to_string(),
-            description: "List the Google Chat spaces visible to the connected Google Workspace account.".to_string(),
+            description: "List the Google Chat spaces visible to the connected Google Workspace account with read-only Chat access.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2007,7 +2042,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "google_admin_list_users".to_string(),
-            description: "List Google Workspace users from the Admin Directory. Use when the user asks about Workspace users, seats, or directory accounts.".to_string(),
+            description: "List Google Workspace users from the Admin Directory with read-only directory access. Use when the user asks about Workspace users, seats, or directory accounts.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2092,7 +2127,7 @@ impl ActionRuntime {
 
         self.register_builtin_action(ActionDef {
             name: "google_workspace_gws_command".to_string(),
-            description: "Execute any non-auth Google Workspace CLI command against the connected Google Workspace account. Use this when you need broader Workspace API coverage than the built-in Gmail/Calendar/Drive helpers provide. Prefer google_workspace_gws_skills for examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] , [\"calendar\",\"+agenda\"], or [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
+            description: "Execute any non-auth Google Workspace CLI command against the connected Google Workspace account. Use this when you need broader Workspace API coverage than the built-in Gmail/Calendar/Drive helpers provide. Actual behavior is still limited by the granted OAuth scopes: Gmail supports read/send, Calendar supports calendar access, and the current Drive/Docs/Sheets/Chat/Admin bundles are read-only. Prefer google_workspace_gws_skills for examples and google_workspace_gws_schema for exact method shapes before executing unfamiliar commands. Provide argv as the command parts after `gws`, for example [\"drive\",\"files\",\"list\",\"--params\",\"{\\\"pageSize\\\":5}\"] , [\"calendar\",\"+agenda\"], or [\"gmail\",\"users\",\"messages\",\"list\",\"--params\",\"{\\\"maxResults\\\":5,\\\"labelIds\\\":[\\\"INBOX\\\"]}\"] . Set required_bundles when you know which Workspace bundles this command needs, such as [\"drive\"] or [\"gmail\",\"calendar\"].".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2269,11 +2304,11 @@ impl ActionRuntime {
                     "runtime_preference": {
                         "type": "string",
                         "enum": ["local", "container"],
-                        "description": "Preferred runtime for dynamic apps. Default: local (local process first, container fallback unless docker is required)."
+                        "description": "Preferred runtime for dynamic apps. Default: container when Docker is configured for AgentArk, otherwise local."
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: false."
+                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: true."
                     },
                     "access_guard": {
                         "type": "boolean",
@@ -2295,31 +2330,18 @@ impl ActionRuntime {
             file_path: None,
         }).await;
 
-        // Video generation — Remotion-powered programmatic video rendering
-        self.register_builtin_action(ActionDef {
-            name: "video_generate".to_string(),
-            description: "Generate a product showcase or scripted explainer video using Remotion (React-based). Use this when the user wants custom branded/product promo animation where the agent writes TSX animation code. If the user requests normal AI text-to-video and does not ask for showcase/Remotion style, prefer generate_video instead. If unclear, ask which mode they want.".to_string(),
-            version: "1.0.0".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "component": {
-                        "type": "string",
-                        "description": "React TSX component code for the video. Must export 'Main' as a named export. Use Remotion's useCurrentFrame(), useVideoConfig(), interpolate(), spring(), Sequence, AbsoluteFill for animations."
-                    },
-                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 120, "description": "Video duration in seconds (default: 10, allowed: 1-120)" },
-                    "width": { "type": "integer", "minimum": 256, "maximum": 3840, "description": "Video width in pixels (default: 1920, allowed: 256-3840)" },
-                    "height": { "type": "integer", "minimum": 256, "maximum": 2160, "description": "Video height in pixels (default: 1080, allowed: 256-2160)" },
-                    "fps": { "type": "integer", "minimum": 12, "maximum": 60, "description": "Frames per second (default: 30, allowed: 12-60)" },
-                    "filename": { "type": "string", "description": "Output filename (default: video.mp4)" }
-                },
-                "required": ["component"]
-            }),
-            capabilities: vec!["video_generation".to_string()],
-            sandbox_mode: Some(SandboxMode::Native),
-            source: ActionSource::System,
-            file_path: None,
-        }).await;
+        // NOTE: Remotion video_generate action disabled.
+        // Limitations that need addressing before re-enabling:
+        //   - No TTS/speech integration — videos are visual-only
+        //   - No video player in chat UI — only download links
+        //   - No validation of LLM-generated React/Remotion code
+        //   - 141MB image size overhead for Remotion template + node_modules
+        //   - Requires Chromium for rendering (already in Playwright image)
+        // To re-enable: uncomment this block and the Remotion Dockerfile sections.
+        // self.register_builtin_action(ActionDef {
+        //     name: "video_generate".to_string(),
+        //     ...
+        // }).await;
 
         // Provider-based text/image-to-video generation (Runway/Luma/Fal/Veo/etc.)
         self.register_builtin_action(ActionDef {
@@ -2415,6 +2437,7 @@ impl ActionRuntime {
                 info,
                 wasm_module: None,
                 workflow_content: None,
+                cli_binding: None,
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: None,
@@ -2430,6 +2453,22 @@ impl ActionRuntime {
                 info,
                 wasm_module: None,
                 workflow_content: Some(workflow),
+                cli_binding: None,
+                mcp_binding: None,
+                plugin_binding: None,
+                custom_api_binding: None,
+            },
+        );
+    }
+
+    async fn register_cli_action(&self, info: ActionDef, binding: CliToolBinding) {
+        self.actions.write().await.insert(
+            info.name.clone(),
+            LoadedAction {
+                info,
+                wasm_module: None,
+                workflow_content: None,
+                cli_binding: Some(binding),
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: None,
@@ -2445,6 +2484,7 @@ impl ActionRuntime {
                 info,
                 wasm_module: None,
                 workflow_content: None,
+                cli_binding: None,
                 mcp_binding: Some(binding),
                 plugin_binding: None,
                 custom_api_binding: None,
@@ -2460,6 +2500,7 @@ impl ActionRuntime {
                 info,
                 wasm_module: None,
                 workflow_content: None,
+                cli_binding: None,
                 mcp_binding: None,
                 plugin_binding: Some(binding),
                 custom_api_binding: None,
@@ -2475,11 +2516,164 @@ impl ActionRuntime {
                 info,
                 wasm_module: None,
                 workflow_content: None,
+                cli_binding: None,
                 mcp_binding: None,
                 plugin_binding: None,
                 custom_api_binding: Some(binding),
             },
         );
+    }
+
+    fn build_cli_action_input_schema(action_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "args": {
+                    "type": "array",
+                    "description": format!("Argument list to pass to {}. Do not include the executable name itself.", action_name),
+                    "items": { "type": "string" }
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory. Must stay within allowed workspace/data roots."
+                },
+                "stdin": {
+                    "type": "string",
+                    "description": "Optional text to pipe to stdin."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "description": "Optional timeout in seconds. Default 60."
+                }
+            },
+            "required": ["args"]
+        })
+    }
+
+    fn build_cli_action_def(manifest: &InstalledCliSkillManifest, skill_path: &Path) -> ActionDef {
+        ActionDef {
+            name: manifest.name.clone(),
+            description: format!(
+                "{} Use this action to call the verified local CLI directly. Pass exact argv items in `args`, and use `--help` whenever syntax is unclear.",
+                manifest.description.trim()
+            ),
+            version: manifest.version.clone(),
+            input_schema: Self::build_cli_action_input_schema(&manifest.name),
+            capabilities: vec!["local_cli".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::Custom,
+            file_path: Some(skill_path.to_string_lossy().to_string()),
+        }
+    }
+
+    pub async fn install_cli_skill_action(
+        &self,
+        manifest: InstalledCliSkillManifest,
+        skill_markdown: &str,
+    ) -> Result<()> {
+        let skill_name = manifest.name.trim();
+        if skill_name.is_empty() {
+            anyhow::bail!("CLI skill name cannot be empty");
+        }
+
+        {
+            let actions = self.actions.read().await;
+            if let Some(existing) = actions.get(skill_name) {
+                if existing.info.source == ActionSource::System {
+                    anyhow::bail!(
+                        "Cannot install CLI skill '{}': a built-in action with that name already exists",
+                        skill_name
+                    );
+                }
+                if existing.cli_binding.is_none() && existing.workflow_content.is_some() {
+                    anyhow::bail!(
+                        "Cannot install CLI skill '{}': a markdown workflow skill with that name already exists",
+                        skill_name
+                    );
+                }
+            }
+        }
+
+        let skill_dir = self.cli_skills_dir.join(skill_name);
+        tokio::fs::create_dir_all(&skill_dir).await?;
+        let skill_path = skill_dir.join("SKILL.md");
+        let manifest_path = skill_dir.join("manifest.json");
+
+        tokio::fs::write(&skill_path, skill_markdown).await?;
+        tokio::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?).await?;
+
+        let info = Self::build_cli_action_def(&manifest, &skill_path);
+        let binding = CliToolBinding {
+            executable_path: manifest.executable_path.clone(),
+            verify_args: manifest.verify_args.clone(),
+        };
+        self.register_cli_action(info, binding).await;
+        tracing::info!(
+            "Installed CLI skill '{}' backed by {}",
+            skill_name,
+            manifest.executable_path
+        );
+        Ok(())
+    }
+
+    async fn load_cli_skill_actions(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.cli_skills_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not read CLI skills directory {:?}: {}",
+                    self.cli_skills_dir,
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let manifest_path = path.join("manifest.json");
+            let skill_path = path.join("SKILL.md");
+            if !manifest_path.exists() || !skill_path.exists() {
+                continue;
+            }
+
+            let manifest = match tokio::fs::read_to_string(&manifest_path).await {
+                Ok(raw) => match serde_json::from_str::<InstalledCliSkillManifest>(&raw) {
+                    Ok(manifest) => manifest,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse CLI skill manifest {:?}: {}",
+                            manifest_path,
+                            e
+                        );
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read CLI skill manifest {:?}: {}",
+                        manifest_path,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let info = Self::build_cli_action_def(&manifest, &skill_path);
+            let binding = CliToolBinding {
+                executable_path: manifest.executable_path.clone(),
+                verify_args: manifest.verify_args.clone(),
+            };
+            self.register_cli_action(info, binding).await;
+        }
+
+        Ok(())
     }
 
     /// Remove all MCP-backed actions
@@ -2534,13 +2728,127 @@ impl ActionRuntime {
         before.saturating_sub(actions.len())
     }
 
+    fn resolve_optional_cli_cwd(&self, raw: Option<&str>) -> Result<Option<PathBuf>> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let candidate = self.absolutize_tool_path(raw)?;
+        let resolved = candidate.canonicalize().with_context(|| {
+            format!(
+                "CLI working directory '{}' does not exist",
+                candidate.display()
+            )
+        })?;
+        self.ensure_tool_path_allowed(&resolved)?;
+        Ok(Some(resolved))
+    }
+
+    async fn execute_cli_action(
+        &self,
+        binding: CliToolBinding,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let executable = binding.executable_path.trim();
+        if executable.is_empty() {
+            anyhow::bail!("CLI executable path is empty");
+        }
+
+        let args = arguments
+            .get("args")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'args' array"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("CLI args must be strings"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stdin_text = arguments
+            .get("stdin")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let timeout_secs = arguments
+            .get("timeout_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 300);
+        let cwd =
+            self.resolve_optional_cli_cwd(arguments.get("cwd").and_then(|value| value.as_str()))?;
+
+        let mut command = tokio::process::Command::new(executable);
+        command.args(&args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        if stdin_text.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "Failed to launch CLI executable '{}'",
+                binding.executable_path
+            )
+        })?;
+
+        if let Some(stdin_text) = stdin_text {
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(stdin_text.as_bytes()).await?;
+            }
+        }
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("CLI command timed out after {}s", timeout_secs))??;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut combined = String::new();
+        if !stdout.is_empty() {
+            combined.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push_str("\n\nstderr:\n");
+            } else {
+                combined.push_str("stderr:\n");
+            }
+            combined.push_str(&stderr);
+        }
+        if combined.is_empty() {
+            combined = "(no output)".to_string();
+        }
+
+        if output.status.success() {
+            Ok(combined)
+        } else {
+            Err(anyhow::anyhow!(
+                "CLI command exited with status {}. {}",
+                output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                combined
+            ))
+        }
+    }
+
     /// Execute an action with given arguments
     pub async fn execute_action(
         &self,
         action_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String> {
-        let (sandbox_mode, mcp_binding, plugin_binding, custom_api_binding, source) = {
+        let (sandbox_mode, cli_binding, mcp_binding, plugin_binding, custom_api_binding, source) = {
             let actions = self.actions.read().await;
             let action = actions
                 .get(action_name)
@@ -2551,6 +2859,7 @@ impl ActionRuntime {
                     .sandbox_mode
                     .clone()
                     .unwrap_or(self.config.default_sandbox.clone()),
+                action.cli_binding.clone(),
                 action.mcp_binding.clone(),
                 action.plugin_binding.clone(),
                 action.custom_api_binding.clone(),
@@ -2581,6 +2890,10 @@ impl ActionRuntime {
         // Resolve secrets at execution time so they never appear in LLM-visible
         // tool-call arguments or execution traces.
         let resolved_args = self.resolve_secret_placeholders(action_name, arguments)?;
+
+        if let Some(binding) = cli_binding {
+            return self.execute_cli_action(binding, &resolved_args).await;
+        }
 
         if let Some(binding) = mcp_binding {
             return self.execute_mcp_action(binding, &resolved_args).await;
@@ -3193,6 +3506,9 @@ impl ActionRuntime {
                     let status_str = match &t.status {
                         crate::core::TaskStatus::Pending => "Pending",
                         crate::core::TaskStatus::AwaitingApproval => "Awaiting Approval",
+                        crate::core::TaskStatus::ExpiredNeedsReapproval => {
+                            "Expired - Needs Reapproval"
+                        }
                         crate::core::TaskStatus::Paused => "Paused",
                         crate::core::TaskStatus::InProgress => "In Progress",
                         crate::core::TaskStatus::Completed => "Completed",
@@ -5831,7 +6147,6 @@ print(result["text"])
             "sndhdr",
             "socket",
             "socketserver",
-            "sqlite3",
             "ssl",
             "stat",
             "statistics",
@@ -7642,6 +7957,15 @@ required:{required_block}
             .and_then(|s| s.workflow_content.clone())
     }
 
+    pub async fn is_cli_action(&self, action_name: &str) -> bool {
+        self.actions
+            .read()
+            .await
+            .get(action_name)
+            .map(|action| action.cli_binding.is_some())
+            .unwrap_or(false)
+    }
+
     /// Execute a workflow action with LLM orchestration
     /// This performs web searches based on the workflow, then passes everything to the LLM
     pub async fn execute_workflow_action(
@@ -8459,6 +8783,7 @@ mod tests {
             disabled_actions: tokio::sync::RwLock::new(HashSet::new()),
             disabled_actions_file: PathBuf::from("./disabled_actions.json"),
             actions_dir: PathBuf::from("./skills"),
+            cli_skills_dir: PathBuf::from("./cli_skills"),
             config_dir: PathBuf::from("."),
             task_queue: None,
             action_guard: None,
@@ -8486,5 +8811,75 @@ mod tests {
         assert!(ActionRuntime::ip_is_public(IpAddr::V4(Ipv4Addr::new(
             1, 1, 1, 1
         ))));
+    }
+
+    #[tokio::test]
+    async fn install_cli_skill_action_persists_and_reloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        let skill_markdown = r#"---
+name: officecli
+description: Office CLI
+version: "1.2.3"
+---
+# officecli
+"#;
+        let manifest = InstalledCliSkillManifest {
+            name: "officecli".to_string(),
+            description: "Office CLI".to_string(),
+            version: "1.2.3".to_string(),
+            executable_path: temp.path().join("officecli").display().to_string(),
+            verify_args: vec!["--version".to_string()],
+            source_url: Some("https://officecli.ai/SKILL.md".to_string()),
+        };
+
+        runtime
+            .install_cli_skill_action(manifest.clone(), skill_markdown)
+            .await
+            .unwrap();
+
+        let actions = runtime.list_actions().await.unwrap();
+        assert!(actions.iter().any(|action| action.name == "officecli"));
+
+        let reloaded = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        reloaded.load_all_actions().await.unwrap();
+        let reloaded_actions = reloaded.list_actions().await.unwrap();
+        assert!(reloaded_actions
+            .iter()
+            .any(|action| action.name == "officecli"));
+    }
+
+    #[tokio::test]
+    async fn cli_skill_action_executes_bound_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+        let manifest = InstalledCliSkillManifest {
+            name: "echo-cli".to_string(),
+            description: "Echo CLI".to_string(),
+            version: "1.0.0".to_string(),
+            executable_path: if cfg!(windows) {
+                "cmd".to_string()
+            } else {
+                "sh".to_string()
+            },
+            verify_args: vec![],
+            source_url: None,
+        };
+
+        runtime
+            .install_cli_skill_action(
+                manifest,
+                "---\nname: echo-cli\ndescription: Echo CLI\n---\n# echo-cli\n",
+            )
+            .await
+            .unwrap();
+
+        let args = if cfg!(windows) {
+            serde_json::json!({ "args": ["/C", "echo", "ready"] })
+        } else {
+            serde_json::json!({ "args": ["-lc", "printf ready"] })
+        };
+        let output = runtime.execute_action("echo-cli", &args).await.unwrap();
+        assert!(output.contains("ready"));
     }
 }

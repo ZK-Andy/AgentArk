@@ -63,6 +63,36 @@ pub enum ModelRole {
     Fallback,
 }
 
+/// Relative capability level for a configured model slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilityTier {
+    Economy,
+    #[default]
+    Balanced,
+    Premium,
+}
+
+/// Relative cost level for a configured model slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCostTier {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+/// Scope used when recording model/runtime health.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelHealthScope {
+    #[default]
+    Provider,
+    Slot,
+    Session,
+}
+
 /// A single model slot in the pool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSlot {
@@ -77,6 +107,21 @@ pub struct ModelSlot {
     /// Whether this slot is active
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Relative capability tier used for escalation decisions.
+    #[serde(default)]
+    pub capability_tier: ModelCapabilityTier,
+    /// Relative cost tier used to prefer cheaper models first.
+    #[serde(default)]
+    pub cost_tier: ModelCostTier,
+    /// Whether the supervisor may auto-step-up into this slot.
+    #[serde(default = "default_true")]
+    pub auto_escalate: bool,
+    /// Lower values are tried earlier within the same role/cost band.
+    #[serde(default)]
+    pub escalation_rank: i32,
+    /// Scope used for health/cooldown bookkeeping.
+    #[serde(default)]
+    pub health_scope: ModelHealthScope,
 }
 
 /// Multi-model pool configuration
@@ -529,10 +574,13 @@ pub struct McpServerConfig {
     /// Optional auth configuration (secrets stored separately)
     #[serde(default)]
     pub auth: Option<McpAuthConfig>,
-    /// Allowlist of tool names to auto-approve (empty = require approval)
+    /// Allowlist of tool names (empty = all tools allowed)
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
-    /// Allowlist of resource URIs to auto-approve (empty = require approval)
+    /// Blocklist of tool names (takes precedence over allowlist)
+    #[serde(default)]
+    pub tool_blocklist: Vec<String>,
+    /// Allowlist of resource URIs (empty = all resources allowed)
     #[serde(default)]
     pub resource_allowlist: Vec<String>,
     /// Request timeout in seconds
@@ -602,8 +650,8 @@ pub const AUTO_APPROVE_BLOCKED: &[&str] = &[
     "file_move",
     "docker_exec",
     "http_request",
-    "gmail_send",
-    "gmail_reply",
+    "gmail_send", // Sending unsolicited emails is always gated
+                  // gmail_reply is intentionally NOT blocked — user can enable auto-reply in settings
 ];
 
 /// Encrypted secrets storage
@@ -921,6 +969,11 @@ impl SecureConfigManager {
                     role: ModelRole::Primary,
                     provider: config.llm.clone(),
                     enabled: true,
+                    capability_tier: ModelCapabilityTier::Balanced,
+                    cost_tier: ModelCostTier::Medium,
+                    auto_escalate: true,
+                    escalation_rank: 0,
+                    health_scope: ModelHealthScope::Provider,
                 };
                 config.model_pool.slots.push(primary_slot);
 
@@ -931,6 +984,11 @@ impl SecureConfigManager {
                         role: ModelRole::Fallback,
                         provider: fallback.clone(),
                         enabled: true,
+                        capability_tier: ModelCapabilityTier::Premium,
+                        cost_tier: ModelCostTier::High,
+                        auto_escalate: true,
+                        escalation_rank: 100,
+                        health_scope: ModelHealthScope::Provider,
                     };
                     config.model_pool.slots.push(fallback_slot);
                 }

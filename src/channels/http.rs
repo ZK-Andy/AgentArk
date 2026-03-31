@@ -53,7 +53,9 @@ mod tunnel;
 mod tunnel_auth;
 mod webhooks;
 
-pub(crate) use self::actions::import_action_from_url_shared;
+pub(crate) use self::actions::{
+    fetch_skill_markdown_from_url_shared, import_action_from_content_with_agent,
+};
 use self::moltbook::MoltbookSettings;
 
 use crate::channels::{
@@ -63,6 +65,9 @@ use crate::channels::{
 use crate::core::config::{
     DeploymentMode, TelegramConfig, TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig,
     TunnelProviderKind, TunnelTailscaleConfig,
+};
+use crate::core::data_lifecycle::{
+    load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
 };
 use crate::core::{
     score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
@@ -186,6 +191,8 @@ struct McpServerRequest {
     auth: Option<McpAuthRequest>,
     #[serde(default)]
     tool_allowlist: Vec<String>,
+    #[serde(default)]
+    tool_blocklist: Vec<String>,
     #[serde(default)]
     resource_allowlist: Vec<String>,
     #[serde(default)]
@@ -422,8 +429,7 @@ pub struct AppState {
     /// Task queue - can be read without locking agent
     pub tasks: Arc<RwLock<TaskQueue>>,
     /// Cancellation signals for actively streamed chat tasks.
-    pub chat_task_cancellations:
-        Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    pub chat_task_cancellations: Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     /// User profile - can be read without locking agent
     pub user_profile: Arc<RwLock<UserProfile>>,
     /// Tiered rate limiter for all endpoints
@@ -1550,6 +1556,18 @@ pub struct ChatResponse {
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradation: Vec<crate::core::DegradationNote>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempted_models: Vec<crate::core::ModelAttemptRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_outcome: Option<crate::core::UserFacingOutcome>,
 }
 
 /// Agent status response
@@ -1811,6 +1829,7 @@ pub struct SettingsResponse {
     pub memory_retention_idle_threshold_secs: u64,
     pub memory_retention_max_delete_per_run: u64,
     pub memory_retention_protect_fact_sources: bool,
+    pub data_lifecycle: DataLifecycleSettings,
     pub observability: observability::ObservabilitySettingsResponse,
 }
 
@@ -2006,7 +2025,41 @@ pub struct SettingsUpdate {
     #[serde(default)]
     pub memory_retention_protect_fact_sources: Option<bool>,
     #[serde(default)]
+    pub data_lifecycle: Option<DataLifecycleSettingsUpdate>,
+    #[serde(default)]
     pub observability: Option<observability::ObservabilitySettingsUpdate>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DataLifecycleSettingsUpdate {
+    #[serde(default)]
+    pub notifications_retention_days: Option<u64>,
+    #[serde(default)]
+    pub notification_cleanup_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub execution_trace_retention_days: Option<u64>,
+    #[serde(default)]
+    pub execution_proof_retention_days: Option<u64>,
+    #[serde(default)]
+    pub operational_log_retention_days: Option<u64>,
+    #[serde(default)]
+    pub security_log_retention_days: Option<u64>,
+    #[serde(default)]
+    pub approval_log_retention_days: Option<u64>,
+    #[serde(default)]
+    pub swarm_delegation_retention_days: Option<u64>,
+    #[serde(default)]
+    pub llm_usage_retention_days: Option<u64>,
+    #[serde(default)]
+    pub terminal_task_retention_days: Option<u64>,
+    #[serde(default)]
+    pub message_retention_days: Option<u64>,
+    #[serde(default)]
+    pub housekeeping_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub security_cleanup_interval_days: Option<u64>,
+    #[serde(default)]
+    pub security_cleanup_idle_threshold_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2150,6 +2203,11 @@ struct EvolutionCanarySummary {
 #[derive(Debug, Serialize)]
 struct EvolutionSettingsResponse {
     self_evolve_enabled: bool,
+    learning_enabled: bool,
+    learning_local_only: bool,
+    learning_model_slot: Option<String>,
+    learning_queue_cap: u64,
+    learning_queue: crate::storage::LearningQueueCounts,
     canary: EvolutionCanarySummary,
     last_promotion_result: String,
     replay_gate_result: Option<String>,
@@ -2161,6 +2219,10 @@ struct EvolutionSettingsResponse {
 struct EvolutionSettingsUpdateRequest {
     deploy_guard_default: Option<bool>,
     self_evolve_enabled: Option<bool>,
+    learning_enabled: Option<bool>,
+    learning_local_only: Option<bool>,
+    learning_model_slot: Option<String>,
+    learning_queue_cap: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2184,11 +2246,17 @@ struct EvolutionDevResponse {
     lineage_recent: Vec<serde_json::Value>,
     policy_metrics: Vec<EvolutionVersionMetric>,
     strategy_metrics: Vec<EvolutionVersionMetric>,
+    learning_queue: crate::storage::LearningQueueCounts,
+    learning_candidates: Vec<serde_json::Value>,
+    learning_items: Vec<serde_json::Value>,
+    learning_patterns: Vec<serde_json::Value>,
+    recent_experience_runs: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EvolutionDevActionRequest {
     action: String,
+    candidate_id: Option<String>,
 }
 
 const AUTONOMY_LAST_BRIEF_KEY: &str = "autonomy_last_brief_v1";
@@ -3347,6 +3415,10 @@ pub async fn serve(
         .route("/tasks/{id}", axum::routing::delete(delete_task))
         .route("/tasks/{id}/pause", post(pause_task))
         .route("/tasks/{id}/resume", post(resume_task))
+        .route(
+            "/tasks/{id}/resume-chat/stream",
+            post(resume_chat_task_stream),
+        )
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/retry", post(retry_task))
         .route("/tasks/{id}/approve", post(approve_task))
@@ -3759,6 +3831,10 @@ pub async fn serve(
         .route("/watchers/{id}/resume", post(resume_watcher))
         .route("/watchers/{id}/run-now", post(run_watcher_now))
         .route("/watchers/{id}/extend", post(extend_watcher))
+        // Persisted execution runs
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/cancel", post(cancel_run))
+        .route("/runs/{id}/resume", post(resume_run))
         // Greetings (LLM-generated, cached in DB)
         // ArkPulse log
         .route("/arkpulse", get(get_pulse_log))
@@ -4500,6 +4576,12 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     add("/tasks/plan", "POST", "Plan task", "Tasks");
     add("/tasks/{id}", "POST", "Update task", "Tasks");
     add("/tasks/{id}", "DELETE", "Delete task", "Tasks");
+    add(
+        "/tasks/{id}/resume-chat/stream",
+        "POST",
+        "Resume cancelled or failed web chat task in chat",
+        "Tasks",
+    );
     add("/tasks/{id}/retry", "POST", "Retry failed task", "Tasks");
     add("/tasks/{id}/approve", "POST", "Approve task", "Tasks");
     add("/tasks/{id}/reject", "POST", "Reject task", "Tasks");
@@ -5639,7 +5721,8 @@ async fn list_apps(State(state): State<AppState>) -> Json<serde_json::Value> {
             row
         })
         .collect::<Vec<_>>();
-    Json(serde_json::json!({ "apps": apps }))
+    let restore = state.app_registry.restore_snapshot().await;
+    Json(serde_json::json!({ "apps": apps, "restore": restore }))
 }
 
 fn is_valid_app_id(app_id: &str) -> bool {
@@ -5678,7 +5761,7 @@ fn rewrite_external_proxy_urls_for_public_apps(content: &str) -> String {
     const ARXIV_EXPORT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_EXPORT_API__";
     const ARXIV_ROOT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_ROOT_API__";
 
-    content
+    let mut rewritten = content
         // Redirect direct ArXiv API calls through our same-origin public proxy
         // to avoid browser CORS failures on tunneled/public app URLs.
         .replace(
@@ -5707,7 +5790,16 @@ fn rewrite_external_proxy_urls_for_public_apps(content: &str) -> String {
         .replace(
             ARXIV_ROOT_PLACEHOLDER,
             "/public/proxy/raw?url=https://arxiv.org/api/query",
-        )
+        );
+
+    while rewritten.contains("/public/proxy/raw?url=/public/proxy/raw?url=") {
+        rewritten = rewritten.replace(
+            "/public/proxy/raw?url=/public/proxy/raw?url=",
+            "/public/proxy/raw?url=",
+        );
+    }
+
+    rewritten
 }
 
 fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
@@ -5721,6 +5813,7 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
   window.__agentarkLlmProxyShimApplied = true;
   const APP_ID = "{app_id}";
   const PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/llm/chat";
+  const ARXIV_PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/arxiv/search";
 
   const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
   if (nativeFetch) {{
@@ -5746,19 +5839,48 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
         lower.endsWith("/v1/completions")
       );
     }};
+    const shouldProxyArxiv = (url) => {{
+      const lower = String(url || "").toLowerCase();
+      return (
+        !lower.includes("/__agentark/arxiv/search") &&
+        (
+          lower.includes("export.arxiv.org/api/query") ||
+          lower.includes("arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=https://export.arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=http://export.arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=https://arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=http://arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=/public/proxy/raw?url=https://export.arxiv.org/api/query") ||
+          lower.includes("/public/proxy/raw?url=/public/proxy/raw?url=https://arxiv.org/api/query")
+        )
+      );
+    }};
     window.fetch = function(input, init) {{
       const targetUrl = extractUrl(input);
-      if (!shouldProxy(targetUrl)) {{
-        return nativeFetch(input, init);
-      }}
-      const proxyInit = Object.assign({{}}, init || {{}});
+      const baseInit = Object.assign({{}}, init || {{}});
       const inferredMethod = (
-        proxyInit.method ||
+        baseInit.method ||
         (input && input.method) ||
-        "POST"
+        "GET"
       )
         .toString()
         .toUpperCase();
+      if (shouldProxyArxiv(targetUrl) && inferredMethod === "GET") {{
+        const arxivHeaders = new Headers();
+        arxivHeaders.set("x-agentark-app-proxy", "arxiv");
+        return nativeFetch(
+          ARXIV_PROXY_PATH + "?source_url=" + encodeURIComponent(targetUrl),
+          {{
+            method: "GET",
+            headers: arxivHeaders,
+            credentials: "same-origin"
+          }}
+        );
+      }}
+      if (!shouldProxy(targetUrl)) {{
+        return nativeFetch(input, init);
+      }}
+      const proxyInit = baseInit;
       proxyInit.method = inferredMethod;
       if (inferredMethod !== "POST") {{
         return nativeFetch(input, init);
@@ -5850,6 +5972,663 @@ fn extract_openai_message_text(value: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct AppArxivPaper {
+    id: String,
+    paper_url: String,
+    pdf_url: String,
+    title: String,
+    summary: String,
+    published: String,
+    updated: String,
+    authors: Vec<String>,
+    primary_category: String,
+    categories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AppArxivSearchRequest {
+    source_url: String,
+    search_query: String,
+    start: usize,
+    max_results: usize,
+    sort_by: String,
+    sort_order: String,
+    categories: Vec<String>,
+    keywords: Vec<String>,
+}
+
+fn app_origin_request_allowed(
+    headers: &axum::http::HeaderMap,
+    app_id: &str,
+    proxy_tag: &str,
+) -> bool {
+    let has_proxy_header = headers
+        .get("x-agentark-app-proxy")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case(proxy_tag));
+    let referer_ok = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| reqwest::Url::parse(v).ok())
+        .map(|url| {
+            let path_prefix = format!("/apps/{}/", app_id);
+            url.path().starts_with(&path_prefix) || url.path() == format!("/apps/{}", app_id)
+        })
+        .unwrap_or(false);
+    has_proxy_header || referer_ok
+}
+
+fn collapse_inline_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_app_query_csv(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|raw| {
+            raw.split([',', '|', '\n'])
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn push_unique_ci(items: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    let normalized = collapse_inline_whitespace(value.trim().trim_matches('"').trim_matches('\''));
+    if normalized.is_empty() {
+        return;
+    }
+    let key = normalized.to_ascii_lowercase();
+    if seen.insert(key) {
+        items.push(normalized);
+    }
+}
+
+fn normalize_arxiv_field_aliases(raw: &str) -> String {
+    static ARXIV_FIELD_ALIAS_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ARXIV_FIELD_ALIAS_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(title|abstract)\s*[:=]").expect("valid arxiv alias regex")
+    });
+    re.replace_all(raw, |caps: &regex::Captures| {
+        let field = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        if field.eq_ignore_ascii_case("title") {
+            "ti:"
+        } else {
+            "abs:"
+        }
+    })
+    .into_owned()
+}
+
+fn extract_arxiv_categories_and_keywords(search_query: &str) -> (Vec<String>, Vec<String>) {
+    static BOOLEAN_SPLIT_RE: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY_VALUE_RE: OnceLock<Regex> = OnceLock::new();
+    let split_re = BOOLEAN_SPLIT_RE.get_or_init(|| {
+        Regex::new(r"(?i)\bANDNOT\b|\bAND\b|\bOR\b").expect("valid boolean split regex")
+    });
+    let category_re = CATEGORY_VALUE_RE
+        .get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9.\-]+$").expect("valid category regex"));
+
+    let decoded = urlencoding::decode(search_query)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| search_query.to_string());
+    let normalized = normalize_arxiv_field_aliases(&decoded);
+    let mut categories = Vec::new();
+    let mut keywords = Vec::new();
+    let mut seen_categories = HashSet::new();
+    let mut seen_keywords = HashSet::new();
+
+    for token in split_re.split(&normalized) {
+        let cleaned = collapse_inline_whitespace(
+            token
+                .trim()
+                .trim_matches('(')
+                .trim_matches(')')
+                .trim_matches('"')
+                .trim(),
+        );
+        if cleaned.is_empty() {
+            continue;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        if lower.starts_with("submitteddate:") {
+            continue;
+        }
+        if lower.starts_with("cat:") {
+            let category = cleaned[4..].trim().trim_matches('"');
+            if category_re.is_match(category) {
+                push_unique_ci(&mut categories, &mut seen_categories, category);
+            }
+            continue;
+        }
+        if lower.starts_with("ti:") || lower.starts_with("abs:") {
+            let value = cleaned
+                .split_once(':')
+                .map(|(_, value)| value)
+                .unwrap_or_default();
+            push_unique_ci(&mut keywords, &mut seen_keywords, value);
+            continue;
+        }
+        if !cleaned.contains(':') {
+            push_unique_ci(&mut keywords, &mut seen_keywords, &cleaned);
+        }
+    }
+
+    (categories, keywords)
+}
+
+fn build_canonical_arxiv_search_query(
+    categories: &[String],
+    keywords: &[String],
+    raw_fallback: Option<&str>,
+) -> String {
+    let mut groups = Vec::new();
+
+    if !categories.is_empty() {
+        let category_group = categories
+            .iter()
+            .map(|category| format!("cat:{}", category))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        groups.push(if categories.len() > 1 {
+            format!("({})", category_group)
+        } else {
+            category_group
+        });
+    }
+
+    if !keywords.is_empty() {
+        let keyword_group = keywords
+            .iter()
+            .flat_map(|keyword| {
+                let value = if keyword.contains(' ') {
+                    format!("\"{}\"", keyword)
+                } else {
+                    keyword.to_string()
+                };
+                [format!("ti:{}", value), format!("abs:{}", value)]
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        groups.push(if keywords.len() > 1 {
+            format!("({})", keyword_group)
+        } else {
+            keyword_group
+        });
+    }
+
+    if !groups.is_empty() {
+        return groups.join(" AND ");
+    }
+
+    raw_fallback
+        .map(normalize_arxiv_field_aliases)
+        .map(|value| collapse_inline_whitespace(&value))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "all:electron".to_string())
+}
+
+fn arxiv_sort_by_param(raw: Option<&str>) -> String {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "relevance" => "relevance".to_string(),
+        "lastupdateddate" | "last_updated_date" | "updated" => "lastUpdatedDate".to_string(),
+        _ => "submittedDate".to_string(),
+    }
+}
+
+fn arxiv_sort_order_param(raw: Option<&str>) -> String {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "ascending" | "asc" => "ascending".to_string(),
+        _ => "descending".to_string(),
+    }
+}
+
+fn unwrap_nested_public_proxy_url(raw: &str) -> String {
+    let mut current = raw.trim().to_string();
+    for _ in 0..5 {
+        let decoded = urlencoding::decode(&current)
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|_| current.clone());
+        let trimmed = decoded.trim().to_string();
+        if trimmed.starts_with("/public/proxy/raw?url=") {
+            current = trimmed
+                .trim_start_matches("/public/proxy/raw?url=")
+                .trim()
+                .to_string();
+            continue;
+        }
+        if let Ok(parsed) = reqwest::Url::parse(&trimmed) {
+            if parsed.path() == "/public/proxy/raw" {
+                if let Some(raw_query) = parsed.query() {
+                    if raw_query.starts_with("url=http://") || raw_query.starts_with("url=https://")
+                    {
+                        current = raw_query.trim_start_matches("url=").trim().to_string();
+                        continue;
+                    }
+                    if let Some(url_value) = url::form_urlencoded::parse(raw_query.as_bytes())
+                        .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))
+                    {
+                        current = url_value;
+                        continue;
+                    }
+                }
+            }
+        }
+        return trimmed;
+    }
+    current
+}
+
+fn build_arxiv_search_request_from_source_url(
+    raw_source_url: &str,
+) -> Option<AppArxivSearchRequest> {
+    let source_url = unwrap_nested_public_proxy_url(raw_source_url);
+    let without_fragment = source_url.split('#').next()?.trim();
+    let (base, raw_query) = without_fragment.split_once('?')?;
+    let mut base_url = reqwest::Url::parse(base).ok()?;
+    if !is_allowed_public_proxy_host(base_url.host_str().unwrap_or_default()) {
+        return None;
+    }
+    if base_url.path() != "/api/query" {
+        return None;
+    }
+    if base_url.scheme() == "http" {
+        let _ = base_url.set_scheme("https");
+    }
+
+    let params: HashMap<String, String> = url::form_urlencoded::parse(raw_query.as_bytes())
+        .into_owned()
+        .collect();
+    let raw_search_query = params.get("search_query").cloned().unwrap_or_default();
+    let (categories, keywords) = extract_arxiv_categories_and_keywords(&raw_search_query);
+    Some(AppArxivSearchRequest {
+        source_url,
+        search_query: build_canonical_arxiv_search_query(
+            &categories,
+            &keywords,
+            Some(&raw_search_query),
+        ),
+        start: params
+            .get("start")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
+        max_results: params
+            .get("max_results")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 50))
+            .unwrap_or(25),
+        sort_by: arxiv_sort_by_param(params.get("sortBy").map(String::as_str)),
+        sort_order: arxiv_sort_order_param(params.get("sortOrder").map(String::as_str)),
+        categories,
+        keywords,
+    })
+}
+
+fn build_arxiv_search_request_from_query(raw_query: Option<&str>) -> Option<AppArxivSearchRequest> {
+    let params: HashMap<String, String> = raw_query
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(source_url) = params
+        .get("source_url")
+        .filter(|value| !value.trim().is_empty())
+    {
+        return build_arxiv_search_request_from_source_url(source_url);
+    }
+
+    let mut categories = split_app_query_csv(
+        params
+            .get("categories")
+            .or_else(|| params.get("subjects"))
+            .or_else(|| params.get("category")),
+    );
+    let mut keywords = split_app_query_csv(
+        params
+            .get("keywords")
+            .or_else(|| params.get("terms"))
+            .or_else(|| params.get("q")),
+    );
+    let raw_search_query = params.get("search_query").cloned().unwrap_or_default();
+    if (categories.is_empty() && keywords.is_empty()) && !raw_search_query.trim().is_empty() {
+        let extracted = extract_arxiv_categories_and_keywords(&raw_search_query);
+        categories = extracted.0;
+        keywords = extracted.1;
+    }
+
+    if categories.is_empty() && keywords.is_empty() && raw_search_query.trim().is_empty() {
+        return None;
+    }
+
+    Some(AppArxivSearchRequest {
+        source_url: String::new(),
+        search_query: build_canonical_arxiv_search_query(
+            &categories,
+            &keywords,
+            (!raw_search_query.trim().is_empty()).then_some(raw_search_query.as_str()),
+        ),
+        start: params
+            .get("start")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
+        max_results: params
+            .get("max_results")
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 50))
+            .unwrap_or(25),
+        sort_by: arxiv_sort_by_param(
+            params
+                .get("sortBy")
+                .or_else(|| params.get("sort_by"))
+                .map(String::as_str),
+        ),
+        sort_order: arxiv_sort_order_param(
+            params
+                .get("sortOrder")
+                .or_else(|| params.get("sort_order"))
+                .map(String::as_str),
+        ),
+        categories,
+        keywords,
+    })
+}
+
+fn arxiv_upstream_url(request: &AppArxivSearchRequest) -> reqwest::Url {
+    let mut url =
+        reqwest::Url::parse("https://export.arxiv.org/api/query").expect("valid arxiv url");
+    url.query_pairs_mut()
+        .append_pair("search_query", &request.search_query)
+        .append_pair("start", &request.start.to_string())
+        .append_pair("max_results", &request.max_results.to_string())
+        .append_pair("sortBy", &request.sort_by)
+        .append_pair("sortOrder", &request.sort_order);
+    url
+}
+
+fn canonical_arxiv_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(parsed) = reqwest::Url::parse(trimmed) {
+        let path = parsed.path().trim_start_matches('/');
+        return path
+            .strip_prefix("abs/")
+            .or_else(|| path.strip_prefix("pdf/"))
+            .unwrap_or(path)
+            .trim_end_matches(".pdf")
+            .to_string();
+    }
+    trimmed.to_string()
+}
+
+fn decode_arxiv_xml_entities(raw: &str) -> String {
+    raw.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn first_xml_tag_text(block: &str, tag: &str) -> String {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_]+:)?{tag}\b[^>]*>(.*?)</(?:[A-Za-z0-9_]+:)?{tag}>",
+        tag = regex::escape(tag)
+    );
+    Regex::new(&pattern)
+        .ok()
+        .and_then(|re| re.captures(block))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        .map(|value| collapse_inline_whitespace(&decode_arxiv_xml_entities(&value)))
+        .unwrap_or_default()
+}
+
+fn all_xml_tag_text(block: &str, tag: &str) -> Vec<String> {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_]+:)?{tag}\b[^>]*>(.*?)</(?:[A-Za-z0-9_]+:)?{tag}>",
+        tag = regex::escape(tag)
+    );
+    Regex::new(&pattern)
+        .ok()
+        .map(|re| {
+            re.captures_iter(block)
+                .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
+                .map(decode_arxiv_xml_entities)
+                .map(|value| collapse_inline_whitespace(&value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn xml_attr_value(attrs: &str, key: &str) -> String {
+    let pattern = format!(r#"(?is)\b{}\s*=\s*"([^"]*)""#, regex::escape(key));
+    Regex::new(&pattern)
+        .ok()
+        .and_then(|re| re.captures(attrs))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        .map(|value| decode_arxiv_xml_entities(&value))
+        .unwrap_or_default()
+}
+
+fn parse_arxiv_atom_feed(xml: &str) -> anyhow::Result<serde_json::Value> {
+    static ENTRY_RE: OnceLock<Regex> = OnceLock::new();
+    static LINK_RE: OnceLock<Regex> = OnceLock::new();
+    static CATEGORY_RE: OnceLock<Regex> = OnceLock::new();
+    static PRIMARY_CATEGORY_RE: OnceLock<Regex> = OnceLock::new();
+    let entry_re = ENTRY_RE.get_or_init(|| {
+        Regex::new(r"(?is)<entry\b[^>]*>(.*?)</entry>").expect("valid arxiv entry regex")
+    });
+    let link_re = LINK_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:[A-Za-z0-9_]+:)?link\b([^>]*)/?>").expect("valid arxiv link regex")
+    });
+    let category_re = CATEGORY_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:[A-Za-z0-9_]+:)?category\b([^>]*)/?>")
+            .expect("valid arxiv category regex")
+    });
+    let primary_category_re = PRIMARY_CATEGORY_RE.get_or_init(|| {
+        Regex::new(r"(?is)<(?:[A-Za-z0-9_]+:)?primary_category\b([^>]*)/?>")
+            .expect("valid arxiv primary category regex")
+    });
+
+    let total_results = first_xml_tag_text(xml, "totalResults")
+        .parse::<usize>()
+        .unwrap_or(0);
+    let start_index = first_xml_tag_text(xml, "startIndex")
+        .parse::<usize>()
+        .unwrap_or(0);
+    let items_per_page = first_xml_tag_text(xml, "itemsPerPage")
+        .parse::<usize>()
+        .unwrap_or(0);
+    let mut papers = Vec::new();
+
+    for entry_caps in entry_re.captures_iter(xml) {
+        let Some(entry_block) = entry_caps.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+
+        let mut paper_url = String::new();
+        let mut pdf_url = String::new();
+        for link_caps in link_re.captures_iter(entry_block) {
+            let attrs = link_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let href = xml_attr_value(attrs, "href");
+            let rel = xml_attr_value(attrs, "rel");
+            let title = xml_attr_value(attrs, "title");
+            let content_type = xml_attr_value(attrs, "type");
+            if rel == "alternate" && paper_url.is_empty() {
+                paper_url = href.clone();
+            }
+            if title.eq_ignore_ascii_case("pdf")
+                || (rel == "related" && content_type.contains("pdf"))
+            {
+                pdf_url = href;
+            }
+        }
+
+        let mut categories = Vec::new();
+        for category_caps in category_re.captures_iter(entry_block) {
+            let attrs = category_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let value = xml_attr_value(attrs, "term");
+            if !value.is_empty() && !categories.iter().any(|item| item == &value) {
+                categories.push(value);
+            }
+        }
+        let primary_category = primary_category_re
+            .captures(entry_block)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+            .map(|attrs| xml_attr_value(&attrs, "term"))
+            .filter(|value| !value.is_empty())
+            .or_else(|| categories.first().cloned())
+            .unwrap_or_default();
+        let id = canonical_arxiv_id(&first_xml_tag_text(entry_block, "id"));
+
+        papers.push(AppArxivPaper {
+            id,
+            paper_url,
+            pdf_url,
+            title: first_xml_tag_text(entry_block, "title"),
+            summary: first_xml_tag_text(entry_block, "summary"),
+            published: first_xml_tag_text(entry_block, "published"),
+            updated: first_xml_tag_text(entry_block, "updated"),
+            authors: all_xml_tag_text(entry_block, "name"),
+            primary_category,
+            categories,
+        });
+    }
+
+    Ok(serde_json::json!({
+        "total_results": total_results,
+        "start_index": start_index,
+        "items_per_page": items_per_page,
+        "papers": papers,
+    }))
+}
+
+async fn app_scoped_arxiv_search_proxy(
+    _state: &AppState,
+    app_id: &str,
+    headers: &axum::http::HeaderMap,
+    raw_query: Option<&str>,
+) -> Response {
+    if !app_origin_request_allowed(headers, app_id, "arxiv") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "app-scoped arXiv helper requires app-origin request context"
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(request) = build_arxiv_search_request_from_query(raw_query) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_query",
+                "message": "Provide source_url, search_query, categories, keywords, or q."
+            })),
+        )
+            .into_response();
+    };
+
+    let upstream_url = arxiv_upstream_url(&request);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent("AgentArk/0.1 arXiv app helper")
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let response = match client.get(upstream_url.clone()).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "arxiv_fetch_failed",
+                    "message": error.to_string(),
+                    "query": request.search_query,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !response.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "arxiv_upstream_error",
+                "status": response.status().as_u16(),
+                "query": request.search_query,
+                "upstream_url": upstream_url.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    let xml = match response.text().await {
+        Ok(xml) => xml,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "arxiv_read_failed",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let parsed = match parse_arxiv_atom_feed(&xml) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "arxiv_parse_failed",
+                    "message": error.to_string(),
+                    "query": request.search_query,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut payload = parsed.as_object().cloned().unwrap_or_default();
+    payload.insert(
+        "query".to_string(),
+        serde_json::json!({
+            "search_query": request.search_query,
+            "start": request.start,
+            "max_results": request.max_results,
+            "sortBy": request.sort_by,
+            "sortOrder": request.sort_order,
+            "categories": request.categories,
+            "keywords": request.keywords,
+            "source_url": request.source_url,
+            "upstream_url": upstream_url.to_string(),
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        serde_json::Value::Object(payload).to_string(),
+    )
+        .into_response()
 }
 
 async fn app_scoped_llm_chat_proxy(
@@ -6629,6 +7408,13 @@ async fn serve_app_file_inner(
     let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if !state.app_registry.is_enabled(app_id).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This app is disabled. Start it again from the Apps page.",
+        )
+            .into_response();
+    }
 
     let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
     let cookie_name = format!("ark_app_{}", app_id);
@@ -6713,6 +7499,13 @@ async fn serve_app_file_inner(
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         return app_scoped_llm_chat_proxy(state, app_id, &headers, body).await;
+    }
+    if normalized_path.eq_ignore_ascii_case("__agentark/arxiv/search") {
+        if method != Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return app_scoped_arxiv_search_proxy(state, app_id, &headers, clean_query.as_deref())
+            .await;
     }
 
     if let Some(port) = state.app_registry.get_port(app_id).await {
@@ -7002,7 +7795,7 @@ struct AppAccessGuardUpdateRequest {
     regenerate_key: bool,
 }
 
-/// Stop a running app
+/// Disable an app and stop its runtime if it has one.
 async fn stop_app(State(state): State<AppState>, Path(app_id): Path<String>) -> Response {
     if !is_valid_app_id(&app_id) {
         return (
@@ -7018,22 +7811,27 @@ async fn stop_app(State(state): State<AppState>, Path(app_id): Path<String>) -> 
         )
             .into_response();
     }
-    if state.app_registry.is_static(&app_id).await {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "Static apps cannot be stopped" })),
-        )
-            .into_response();
-    }
-    match state.app_registry.stop_runtime(&app_id).await {
-        Ok(_) => {
-            trigger_arkpulse_after_app_change(&state, "app_stop_runtime").await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "status": "stopped", "app_id": app_id })),
+    let stop_result = if state.app_registry.is_static(&app_id).await {
+        Ok(())
+    } else {
+        state.app_registry.stop_runtime(&app_id).await
+    };
+    match stop_result {
+        Ok(_) => match state.app_registry.set_enabled(&app_id, false).await {
+            Ok(_) => {
+                trigger_arkpulse_after_app_change(&state, "app_disable").await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "status": "disabled", "app_id": app_id })),
+                )
+                    .into_response()
+            }
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
             )
-                .into_response()
-        }
+                .into_response(),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -7193,6 +7991,15 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
         )
         .await;
     }
+    if meta.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        meta["enabled"] = serde_json::Value::Bool(true);
+        let _ = tokio::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+        )
+        .await;
+    }
+    let _ = state.app_registry.set_enabled(&app_id, true).await;
 
     if let Err(e) = state.app_registry.stop_runtime(&app_id).await {
         return (
@@ -7310,6 +8117,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                             port,
                             access_key: access_key.clone(),
                             access_guard_enabled,
+                            enabled: true,
                         },
                     )
                     .await;
@@ -7373,6 +8181,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                 app_dir,
                 access_key.clone(),
                 access_guard_enabled,
+                true,
             )
             .await;
         trigger_arkpulse_after_app_change(&state, "app_restart").await;
@@ -7581,11 +8390,36 @@ async fn serve_upload_file(
 async fn health(State(state): State<AppState>) -> Response {
     let storage = { state.agent.read().await.storage.clone() };
     let storage_ok = storage.get("__health_probe").await.is_ok();
-    let sqlite_quick_check = storage.sqlite_quick_check().await.ok();
-    let sqlite_ok = sqlite_quick_check
-        .as_deref()
-        .map(|value| value.eq_ignore_ascii_case("ok"))
-        .unwrap_or(false);
+    let migration_version = storage.latest_migration_version().await.ok().flatten();
+    let table_names = storage.database_table_names().await.ok();
+    let database_size_bytes = storage.database_size_bytes().await.ok().flatten();
+    let lease_status = storage
+        .lease_status_summary()
+        .await
+        .ok()
+        .unwrap_or_default();
+    let required_tables = [
+        "approval_log",
+        "automation_runs",
+        "automation_supervisor_states",
+        "conversations",
+        "execution_runs",
+        "kv_store",
+        "messages",
+        "notifications",
+        "run_checkpoints",
+        "tasks",
+        "tool_attempts",
+        "watchers",
+    ];
+    let schema_ok = table_names
+        .as_ref()
+        .map(|tables| {
+            let set = tables.iter().cloned().collect::<HashSet<_>>();
+            required_tables.iter().all(|table| set.contains(*table))
+        })
+        .unwrap_or(false)
+        && migration_version.is_some();
     let scheduler_heartbeat = storage
         .get(crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY)
         .await
@@ -7672,7 +8506,7 @@ async fn health(State(state): State<AppState>) -> Response {
         true
     };
     let healthy = storage_ok
-        && sqlite_ok
+        && schema_ok
         && mem0_ok
         && playwright_ok
         && public_app_origin_ok
@@ -7691,10 +8525,19 @@ async fn health(State(state): State<AppState>) -> Response {
                 HttpServerRole::PublicApps => "public_apps",
             },
             "deployment_mode": state.deployment_mode.as_str(),
+            "database": {
+                "kind": "postgres",
+                "connected": storage_ok,
+                "migration_version": migration_version,
+                "schema_ok": schema_ok,
+                "table_count": table_names.as_ref().map(|tables| tables.len()).unwrap_or(0),
+                "size_bytes": database_size_bytes,
+                "lease_status": lease_status,
+            },
             "checks": {
                 "storage": storage_ok,
-                "sqlite_quick_check": sqlite_quick_check.unwrap_or("unavailable".to_string()),
-                "sqlite_ok": sqlite_ok,
+                "postgres_connected": storage_ok,
+                "schema_ok": schema_ok,
                 "mem0_bridge": mem0_ok,
                 "playwright_bridge": playwright_ok,
                 "whatsapp_bridge": whatsapp_active,
@@ -7706,6 +8549,181 @@ async fn health(State(state): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let storage = { state.agent.read().await.storage.clone() };
+    match storage.load_execution_run(&id).await {
+        Ok(Some(run)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "run": run,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Run not found",
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to load run: {}", error),
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let storage = { state.agent.read().await.storage.clone() };
+    match storage.request_execution_run_cancel(&id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "run_id": id,
+                "cancellation_requested": true,
+            })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Run not found",
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to request cancellation: {}", error),
+                "run_id": id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn resume_run(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let prior_run = {
+        let storage = { state.agent.read().await.storage.clone() };
+        match storage.load_execution_run(&id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Run not found",
+                        "run_id": id,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to load run: {}", error),
+                        "run_id": id,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let Some(message) = prior_run
+        .request_message
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Run cannot be resumed because no replayable request_message was stored",
+                "run_id": id,
+            })),
+        )
+            .into_response();
+    };
+
+    let channel = prior_run
+        .channel
+        .clone()
+        .unwrap_or_else(|| "web".to_string());
+    let result = {
+        let agent = state.agent.read().await;
+        agent
+            .process_message_with_meta_and_hints(
+                &message,
+                &channel,
+                prior_run.conversation_id.as_deref(),
+                None,
+                crate::core::RequestExecutionHints::default(),
+            )
+            .await
+    };
+
+    match result {
+        Ok(processed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "resumed_from_run_id": id,
+                "response": processed.response,
+                "conversation_id": processed.conversation_id.or(prior_run.conversation_id),
+                "conversation_title": processed.conversation_title,
+                "run_id": processed.run_id,
+                "run_status": processed.run_status,
+                "trace_id": processed.trace_id,
+                "degradation": processed.degradation,
+                "attempted_models": processed.attempted_models,
+                "user_outcome": processed.user_outcome,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let response =
+                "I hit a framework-level problem while resuming the run. Please retry.".to_string();
+            let degradation = vec![crate::core::DegradationNote {
+                kind: "platform".to_string(),
+                summary: "framework error".to_string(),
+                detail: Some(error.to_string()),
+            }];
+            let user_outcome = crate::core::ExecutionSupervisor::default()
+                .build_service_outage_outcome(&response, "framework_error", &degradation, &[]);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "resumed_from_run_id": id,
+                    "response": response,
+                    "run_status": "platform_failed",
+                    "error": error.to_string(),
+                    "degradation": degradation,
+                    "attempted_models": user_outcome.attempted_models,
+                    "user_outcome": user_outcome,
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // - WhatsApp Webhook -
@@ -7779,6 +8797,19 @@ async fn slack_webhook_handler(
         }
     };
 
+    let agent = state.agent.clone();
+    if let Err(error) = crate::channels::slack::verify_webhook_request(
+        agent.clone(),
+        &body_bytes,
+        timestamp.as_deref(),
+        signature.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!("Slack webhook request rejected: {}", error);
+        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+    }
+
     let is_url_verification = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
         .and_then(|payload| {
@@ -7790,7 +8821,6 @@ async fn slack_webhook_handler(
         .is_some_and(|event_type| event_type == "url_verification");
 
     if is_url_verification {
-        let agent = state.agent.clone();
         return match crate::channels::slack::handle_webhook(
             agent,
             &body_bytes,
@@ -7807,7 +8837,6 @@ async fn slack_webhook_handler(
         };
     }
 
-    let agent = state.agent.clone();
     let timestamp_owned = timestamp.clone();
     let signature_owned = signature.clone();
     let body_owned = body_bytes.to_vec();
@@ -9273,6 +10302,12 @@ async fn chat(
                 proof_id: None,
                 conversation_id: cid,
                 conversation_title: None,
+                run_id: None,
+                run_status: None,
+                trace_id: None,
+                degradation: Vec::new(),
+                attempted_models: Vec::new(),
+                user_outcome: None,
             }),
         )
             .into_response();
@@ -9359,6 +10394,12 @@ async fn chat(
                 proof_id: None,
                 conversation_id: cid,
                 conversation_title: None,
+                run_id: None,
+                run_status: None,
+                trace_id: None,
+                degradation: Vec::new(),
+                attempted_models: Vec::new(),
+                user_outcome: None,
             }),
         )
             .into_response();
@@ -9375,6 +10416,12 @@ async fn chat(
                         proof_id: None,
                         conversation_id: request.conversation_id.clone(),
                         conversation_title: None,
+                        run_id: None,
+                        run_status: None,
+                        trace_id: None,
+                        degradation: Vec::new(),
+                        attempted_models: Vec::new(),
+                        user_outcome: None,
                     }),
                 )
                     .into_response();
@@ -9396,6 +10443,12 @@ async fn chat(
                         proof_id: None,
                         conversation_id: request.conversation_id.clone(),
                         conversation_title: None,
+                        run_id: None,
+                        run_status: None,
+                        trace_id: None,
+                        degradation: Vec::new(),
+                        attempted_models: Vec::new(),
+                        user_outcome: None,
                     }),
                 )
                     .into_response();
@@ -9421,6 +10474,12 @@ async fn chat(
                         proof_id: None,
                         conversation_id: request.conversation_id.clone(),
                         conversation_title: None,
+                        run_id: None,
+                        run_status: None,
+                        trace_id: None,
+                        degradation: Vec::new(),
+                        attempted_models: Vec::new(),
+                        user_outcome: None,
                     }),
                 )
                     .into_response();
@@ -9456,17 +10515,45 @@ async fn chat(
                     proof_id: None,
                     conversation_id: processed.conversation_id.or(request.conversation_id),
                     conversation_title: processed.conversation_title,
+                    run_id: processed.run_id,
+                    run_status: processed.run_status,
+                    trace_id: processed.trace_id,
+                    degradation: processed.degradation,
+                    attempted_models: processed.attempted_models,
+                    user_outcome: processed.user_outcome,
                 }),
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Framework-level web chat failure: {}", e);
+            let response = "I hit a framework-level problem before supervised execution could finish. Please retry. If it keeps happening, restart the runtime or check the server logs.".to_string();
+            let degradation = vec![crate::core::DegradationNote {
+                kind: "platform".to_string(),
+                summary: "framework error".to_string(),
+                detail: Some(
+                    "The request left the supervised execution path before completion.".to_string(),
+                ),
+            }];
+            let user_outcome = crate::core::ExecutionSupervisor::default()
+                .build_service_outage_outcome(&response, "framework_error", &degradation, &[]);
+            (
+                StatusCode::OK,
+                Json(ChatResponse {
+                    response,
+                    proof_id: None,
+                    conversation_id: request.conversation_id,
+                    conversation_title: None,
+                    run_id: None,
+                    run_status: Some("platform_failed".to_string()),
+                    trace_id: None,
+                    degradation,
+                    attempted_models: Vec::new(),
+                    user_outcome: Some(user_outcome),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -9980,6 +11067,7 @@ fn chat_task_status_key(status: &crate::core::TaskStatus) -> &'static str {
     match status {
         crate::core::TaskStatus::Pending => "pending",
         crate::core::TaskStatus::AwaitingApproval => "awaiting_approval",
+        crate::core::TaskStatus::ExpiredNeedsReapproval => "expired_needs_reapproval",
         crate::core::TaskStatus::Paused => "paused",
         crate::core::TaskStatus::InProgress => "in_progress",
         crate::core::TaskStatus::Completed => "completed",
@@ -10001,6 +11089,684 @@ fn chat_task_terminal_status(response: &str) -> crate::core::TaskStatus {
     } else {
         crate::core::TaskStatus::Completed
     }
+}
+
+#[derive(Clone)]
+struct StreamedChatTask {
+    task: crate::core::Task,
+    work_type: String,
+    user_message_already_recorded: bool,
+}
+
+#[derive(Clone)]
+enum ChatStreamTaskMode {
+    CreateIfNeeded {
+        execution_mode: Option<String>,
+        attachments_present: bool,
+    },
+    Existing(StreamedChatTask),
+}
+
+#[derive(Clone)]
+struct ChatStreamRunRequest {
+    message: String,
+    channel: String,
+    conversation_id: Option<String>,
+    project_id: Option<String>,
+    deep_research: bool,
+    task_mode: ChatStreamTaskMode,
+}
+
+fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    // Per-request trace so concurrent requests cannot clobber each other.
+    let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
+    let agent_ref = state.agent.clone();
+    let message = request.message.clone();
+    let channel = request.channel.clone();
+    let conversation_id = request.conversation_id.clone();
+    let project_id = request.project_id.clone();
+    let deep_research = request.deep_research;
+    let task_mode = request.task_mode.clone();
+    let app_state = state.clone();
+
+    tokio::spawn(async move {
+        let tracked_task = match task_mode {
+            ChatStreamTaskMode::CreateIfNeeded {
+                execution_mode,
+                attachments_present,
+            } => {
+                if chat_request_should_create_task(
+                    execution_mode.as_deref(),
+                    &message,
+                    deep_research,
+                    attachments_present,
+                ) {
+                    let work_type =
+                        classify_chat_task_work_type(&message, deep_research, attachments_present)
+                            .to_string();
+                    let description = build_chat_task_description(&message, &work_type);
+                    let mut task = crate::core::Task::new(
+                        description.clone(),
+                        "chat_request".to_string(),
+                        serde_json::json!({
+                            "_task_kind": "chat_request",
+                            "_origin": "chat",
+                            "_execution_mode": normalized_chat_execution_mode(execution_mode.as_deref()),
+                            "_work_type": work_type,
+                            "message": message.clone(),
+                            "channel": channel.clone(),
+                            "conversation_id": conversation_id.clone(),
+                            "project_id": project_id.clone(),
+                            "deep_research": deep_research,
+                            "attachments_present": attachments_present,
+                        }),
+                    );
+                    task.status = crate::core::TaskStatus::InProgress;
+                    task.approval = crate::core::TaskApproval::Auto;
+
+                    let add_result = {
+                        let agent_guard = agent_ref.read().await;
+                        agent_guard.add_task(task.clone()).await
+                    };
+
+                    match add_result {
+                        Ok(()) => {
+                            let payload = serde_json::json!({
+                                "task_id": task.id.to_string(),
+                                "description": description,
+                                "status": "in_progress",
+                                "work_type": work_type,
+                                "conversation_id": conversation_id.clone(),
+                                "project_id": project_id.clone(),
+                            });
+                            let event = Event::default()
+                                .event("task_started")
+                                .data(serde_json::to_string(&payload).unwrap_or_default());
+                            let _ = tx.send(Ok(event)).await;
+                            Some(StreamedChatTask {
+                                task,
+                                work_type: classify_chat_task_work_type(
+                                    &message,
+                                    deep_research,
+                                    attachments_present,
+                                )
+                                .to_string(),
+                                user_message_already_recorded: false,
+                            })
+                        }
+                        Err(error) => {
+                            tracing::warn!("Failed to create chat task anchor: {}", error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            ChatStreamTaskMode::Existing(task) => {
+                let payload = serde_json::json!({
+                    "task_id": task.task.id.to_string(),
+                    "description": task.task.description.clone(),
+                    "status": "in_progress",
+                    "work_type": task.work_type.clone(),
+                    "conversation_id": conversation_id.clone(),
+                    "project_id": project_id.clone(),
+                });
+                let event = Event::default()
+                    .event("task_started")
+                    .data(serde_json::to_string(&payload).unwrap_or_default());
+                let _ = tx.send(Ok(event)).await;
+                Some(task)
+            }
+        };
+
+        let mut cancel_rx = if let Some(task) = tracked_task.as_ref() {
+            Some(register_chat_task_cancellation(&app_state, &task.task.id.to_string()).await)
+        } else {
+            None
+        };
+
+        // Stream model tokens + tool progress as dedicated SSE events.
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
+        let stream_forwarder = {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut last_thinking_detail = String::new();
+                while let Some(ev) = stream_rx.recv().await {
+                    let (maybe_event, next_thinking_detail) =
+                        normalize_stream_event_for_sse(ev, &last_thinking_detail);
+                    last_thinking_detail = next_thinking_detail;
+                    let Some((event_name, payload)) = maybe_event else {
+                        continue;
+                    };
+                    let event = Event::default()
+                        .event(event_name)
+                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        // Poll trace for new steps and emit as SSE events.
+        let trace_poller = {
+            let tx = tx.clone();
+            let trace_ref = trace_ref.clone();
+            tokio::spawn(async move {
+                let mut last_step_count = 0;
+                let start = std::time::Instant::now();
+                let mut last_progress_at = std::time::Instant::now();
+                let mut last_heartbeat_at = std::time::Instant::now();
+                const HEARTBEAT_SECS: u64 = 3;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if start.elapsed().as_secs() > 1800 {
+                        break;
+                    }
+                    let trace = trace_ref.read().await;
+                    let current_count = trace.steps.len();
+                    if current_count > last_step_count {
+                        for step in &trace.steps[last_step_count..current_count] {
+                            let event_data = serde_json::json!({
+                                "icon": step.icon,
+                                "title": step.title,
+                                "detail": step.detail,
+                                "step_type": step.step_type,
+                                "data": step.data,
+                                "time": step.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                "duration_ms": step.duration_ms,
+                            });
+                            let event = Event::default()
+                                .event("thinking")
+                                .data(serde_json::to_string(&event_data).unwrap_or_default());
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                        last_step_count = current_count;
+                        last_progress_at = std::time::Instant::now();
+                        last_heartbeat_at = last_progress_at;
+                    }
+                    if trace.completed_at.is_some() {
+                        break;
+                    }
+                    if last_progress_at.elapsed().as_secs() >= HEARTBEAT_SECS
+                        && last_heartbeat_at.elapsed().as_secs() >= HEARTBEAT_SECS
+                    {
+                        let idle_secs = last_progress_at.elapsed().as_secs();
+                        let phase_hint = trace
+                            .steps
+                            .last()
+                            .map(|s| {
+                                let title = s.title.to_ascii_lowercase();
+                                let detail = s.detail.to_ascii_lowercase();
+                                let memory_is_active = (title.contains("memory")
+                                    || detail.contains("memory")
+                                    || title.contains("mem0")
+                                    || detail.contains("mem0"))
+                                    && !detail.contains("available on demand");
+                                if memory_is_active {
+                                    if detail.contains("mem0 pending") {
+                                        "Memory layer is starting up (first run may include embedding warmup)."
+                                    } else if detail.contains("mem0 active") {
+                                        "Retrieving semantic memory/context."
+                                    } else if detail.contains("warmup") {
+                                        "Memory layer warmup in progress."
+                                    } else {
+                                        "Memory/context setup in progress."
+                                    }
+                                } else if title.contains("context") || detail.contains("context") {
+                                    "Preparing conversation context."
+                                } else if title.contains("repairing deploy payload")
+                                    || detail.contains("deploy payload")
+                                    || detail.contains("files payload")
+                                {
+                                    "Regenerating deploy payload (model is building required files map)."
+                                } else if title.contains("llm request") || title.contains("llm call") {
+                                    "Waiting on model response."
+                                } else if title.contains("tool") || detail.contains("tool") {
+                                    "Waiting on tool execution."
+                                } else {
+                                    "Still processing."
+                                }
+                            })
+                            .unwrap_or("Still processing.");
+                        let event_data = serde_json::json!({
+                            "icon": "[wait]",
+                            "title": "Still Working",
+                            "detail": format!("{} No new output yet ({}s idle).", phase_hint, idle_secs),
+                            "step_type": "heartbeat",
+                            "data": serde_json::json!({ "idle_secs": idle_secs })
+                        });
+                        let event = Event::default()
+                            .event("thinking")
+                            .data(serde_json::to_string(&event_data).unwrap_or_default());
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                        last_heartbeat_at = std::time::Instant::now();
+                    }
+                }
+            })
+        };
+
+        let initial_status = Event::default().event("thinking").data(
+            serde_json::json!({
+                "icon": "[recv]",
+                "title": "Request received",
+                "detail": "Preparing model call and tool plan...",
+                "step_type": "thinking",
+                "data": null
+            })
+            .to_string(),
+        );
+        let _ = tx.send(Ok(initial_status)).await;
+
+        let user_message_already_recorded = tracked_task
+            .as_ref()
+            .map(|task| task.user_message_already_recorded)
+            .unwrap_or(false);
+        let mut process_handle = {
+            let agent_ref = agent_ref.clone();
+            let message = message.clone();
+            let channel = channel.clone();
+            let conversation_id = conversation_id.clone();
+            let project_id = project_id.clone();
+            let trace_ref = trace_ref.clone();
+            tokio::spawn(async move {
+                let agent_guard = agent_ref.read().await;
+                if user_message_already_recorded {
+                    agent_guard
+                        .process_message_stream_resume_with_meta_and_hints(
+                            &message,
+                            &channel,
+                            conversation_id.as_deref(),
+                            project_id.as_deref(),
+                            trace_ref,
+                            stream_tx,
+                            crate::core::RequestExecutionHints { deep_research },
+                        )
+                        .await
+                } else {
+                    agent_guard
+                        .process_message_stream_with_meta_and_hints(
+                            &message,
+                            &channel,
+                            conversation_id.as_deref(),
+                            project_id.as_deref(),
+                            trace_ref,
+                            stream_tx,
+                            crate::core::RequestExecutionHints { deep_research },
+                        )
+                        .await
+                }
+            })
+        };
+
+        let mut was_cancelled = false;
+        let result = if let Some(ref mut cancel_rx) = cancel_rx {
+            tokio::select! {
+                worker = &mut process_handle => {
+                    match worker {
+                        Ok(result) => result,
+                        Err(error) if error.is_cancelled() => {
+                            was_cancelled = true;
+                            Err(anyhow::anyhow!("Chat run cancelled"))
+                        }
+                        Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+                    }
+                }
+                changed = cancel_rx.changed() => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        was_cancelled = true;
+                        process_handle.abort();
+                        let _ = process_handle.await;
+                        Err(anyhow::anyhow!("Chat run cancelled"))
+                    } else {
+                        match process_handle.await {
+                            Ok(result) => result,
+                            Err(error) if error.is_cancelled() => {
+                                was_cancelled = true;
+                                Err(anyhow::anyhow!("Chat run cancelled"))
+                            }
+                            Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+                        }
+                    }
+                }
+            }
+        } else {
+            match process_handle.await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => {
+                    was_cancelled = true;
+                    Err(anyhow::anyhow!("Chat run cancelled"))
+                }
+                Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
+            }
+        };
+
+        {
+            let mut trace = trace_ref.write().await;
+            if trace.completed_at.is_none() {
+                trace.completed_at = Some(chrono::Utc::now());
+            }
+        }
+
+        let _ = trace_poller.await;
+        let _ = stream_forwarder.await;
+
+        if let Some(task) = tracked_task.as_ref() {
+            unregister_chat_task_cancellation(&app_state, &task.task.id.to_string()).await;
+        }
+
+        match result {
+            Ok(processed) => {
+                if let Some(task) = tracked_task.as_ref() {
+                    let terminal_status = chat_task_terminal_status(&processed.response);
+                    let result_preview = truncate_stream_task_text(
+                        if processed.response.trim().is_empty() {
+                            "Task completed."
+                        } else {
+                            &processed.response
+                        },
+                        400,
+                    );
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(error) = agent_guard
+                            .finalize_task(
+                                task.task.id,
+                                terminal_status.clone(),
+                                Some(result_preview.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize streamed chat task '{}': {}",
+                                task.task.id,
+                                error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.task.id.to_string(),
+                            "description": task.task.description.clone(),
+                            "status": chat_task_status_key(&terminal_status),
+                            "work_type": task.work_type.clone(),
+                            "result_preview": result_preview,
+                            "conversation_id": processed.conversation_id.clone().or(conversation_id.clone()),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
+
+                let mut content = serde_json::json!({
+                    "content": processed.response,
+                    "conversation_id": processed.conversation_id.or(conversation_id),
+                    "run_id": processed.run_id,
+                    "run_status": processed.run_status,
+                    "trace_id": processed.trace_id,
+                    "degradation": processed.degradation,
+                    "attempted_models": processed.attempted_models,
+                    "user_outcome": processed.user_outcome,
+                });
+                if let Some(title) = processed.conversation_title {
+                    content["conversation_title"] = serde_json::json!(title);
+                }
+                let event = Event::default()
+                    .event("content")
+                    .data(serde_json::to_string(&content).unwrap_or_default());
+                let _ = tx.send(Ok(event)).await;
+                let run_status = Event::default().event("run_status").data(
+                    serde_json::json!({
+                        "run_id": content["run_id"],
+                        "run_status": content["run_status"],
+                        "trace_id": content["trace_id"],
+                        "degradation": content["degradation"],
+                        "attempted_models": content["attempted_models"],
+                        "user_outcome": content["user_outcome"],
+                    })
+                    .to_string(),
+                );
+                let _ = tx.send(Ok(run_status)).await;
+            }
+            Err(error) if was_cancelled => {
+                if let Some(task) = tracked_task.as_ref() {
+                    let result_preview = "Cancelled by user.";
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(finalize_error) = agent_guard
+                            .finalize_task(
+                                task.task.id,
+                                crate::core::TaskStatus::Cancelled,
+                                Some(result_preview.to_string()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize cancelled streamed chat task '{}': {}",
+                                task.task.id,
+                                finalize_error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.task.id.to_string(),
+                            "description": task.task.description.clone(),
+                            "status": "cancelled",
+                            "work_type": task.work_type.clone(),
+                            "result_preview": result_preview,
+                            "conversation_id": conversation_id.clone(),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
+                let run_status = Event::default().event("run_status").data(
+                    serde_json::json!({
+                        "run_id": serde_json::Value::Null,
+                        "run_status": "cancelled",
+                        "trace_id": serde_json::Value::Null,
+                        "degradation": [{
+                            "kind": "cancellation",
+                            "summary": "run cancelled",
+                            "detail": error.to_string(),
+                        }],
+                        "attempted_models": [],
+                        "user_outcome": serde_json::Value::Null,
+                    })
+                    .to_string(),
+                );
+                let _ = tx.send(Ok(run_status)).await;
+            }
+            Err(error) => {
+                if let Some(task) = tracked_task.as_ref() {
+                    let error_text = error.to_string();
+                    {
+                        let agent_guard = agent_ref.read().await;
+                        if let Err(finalize_error) = agent_guard
+                            .finalize_task(
+                                task.task.id,
+                                crate::core::TaskStatus::Failed {
+                                    error: error_text.clone(),
+                                },
+                                Some(truncate_stream_task_text(&error_text, 400)),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to finalize failed streamed chat task '{}': {}",
+                                task.task.id,
+                                finalize_error
+                            );
+                        }
+                    }
+                    let status_event = Event::default().event("task_status").data(
+                        serde_json::json!({
+                            "task_id": task.task.id.to_string(),
+                            "description": task.task.description.clone(),
+                            "status": "failed",
+                            "work_type": task.work_type.clone(),
+                            "result_preview": truncate_stream_task_text(&error_text, 400),
+                            "conversation_id": conversation_id.clone(),
+                            "project_id": project_id.clone(),
+                        })
+                        .to_string(),
+                    );
+                    let _ = tx.send(Ok(status_event)).await;
+                }
+
+                let error_payload = serde_json::json!({ "error": error.to_string() });
+                let event = Event::default()
+                    .event("error")
+                    .data(serde_json::to_string(&error_payload).unwrap_or_default());
+                let _ = tx.send(Ok(event)).await;
+                let response =
+                    "I hit a framework-level problem before supervised execution could finish. Please retry."
+                        .to_string();
+                let degradation = vec![crate::core::DegradationNote {
+                    kind: "platform".to_string(),
+                    summary: "framework error".to_string(),
+                    detail: Some(error.to_string()),
+                }];
+                let user_outcome = crate::core::ExecutionSupervisor::default()
+                    .build_service_outage_outcome(&response, "framework_error", &degradation, &[]);
+                let run_status = Event::default().event("run_status").data(
+                    serde_json::json!({
+                        "run_id": serde_json::Value::Null,
+                        "run_status": "platform_failed",
+                        "trace_id": serde_json::Value::Null,
+                        "degradation": degradation,
+                        "attempted_models": user_outcome.attempted_models,
+                        "user_outcome": user_outcome,
+                    })
+                    .to_string(),
+                );
+                let _ = tx.send(Ok(run_status)).await;
+            }
+        }
+
+        let done = Event::default().event("done").data("{}");
+        let _ = tx.send(Ok(done)).await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+#[derive(Clone)]
+struct ResumableChatTaskRequest {
+    message: String,
+    channel: String,
+    conversation_id: String,
+    project_id: Option<String>,
+    deep_research: bool,
+    work_type: String,
+}
+
+fn extract_resumable_web_chat_task(
+    task: &crate::core::Task,
+) -> std::result::Result<ResumableChatTaskRequest, String> {
+    if task.action != "chat_request" {
+        return Err("Only chat-request tasks can be resumed in chat.".to_string());
+    }
+    if !matches!(
+        task.status,
+        crate::core::TaskStatus::Cancelled | crate::core::TaskStatus::Failed { .. }
+    ) {
+        return Err("Only cancelled or failed chat tasks can be resumed in chat.".to_string());
+    }
+
+    let arguments = task
+        .arguments
+        .as_object()
+        .ok_or_else(|| "This chat task is missing its stored arguments.".to_string())?;
+
+    let origin = arguments
+        .get("_origin")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if origin != "chat" {
+        return Err("Only chat-origin tasks can be resumed in chat.".to_string());
+    }
+
+    let channel = arguments
+        .get("channel")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if channel != "web" {
+        return Err("Only web chat tasks can be resumed in chat.".to_string());
+    }
+
+    let message = arguments
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        return Err(
+            "This chat task no longer has its stored message, so it cannot be resumed.".to_string(),
+        );
+    }
+
+    let conversation_id = arguments
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if conversation_id.is_empty() {
+        return Err(
+            "This chat task no longer has a conversation id, so it cannot be resumed.".to_string(),
+        );
+    }
+
+    let project_id = arguments
+        .get("project_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let deep_research = arguments
+        .get("deep_research")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let attachments_present = arguments
+        .get("attachments_present")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let work_type = arguments
+        .get("_work_type")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            classify_chat_task_work_type(&message, deep_research, attachments_present).to_string()
+        });
+
+    Ok(ResumableChatTaskRequest {
+        message,
+        channel,
+        conversation_id,
+        project_id,
+        deep_research,
+        work_type,
+    })
 }
 
 async fn chat_stream(
@@ -10256,449 +12022,20 @@ async fn chat_stream(
             .into_response();
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
-    // Per-request trace so concurrent requests cannot clobber each other.
-    let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
-    let agent_ref = state.agent.clone();
-    let message = request.message.clone();
-    let channel = request.channel.clone();
-    let conversation_id = request.conversation_id.clone();
-    let project_id = request.project_id.clone();
-    let deep_research = request.deep_research;
-    let execution_mode = request.execution_mode.clone();
-    let app_state = state.clone();
-
-    tokio::spawn(async move {
-        let tracked_task = if chat_request_should_create_task(
-            execution_mode.as_deref(),
-            &message,
-            deep_research,
-            request.attachments_present,
-        ) {
-            let work_type =
-                classify_chat_task_work_type(&message, deep_research, request.attachments_present)
-                    .to_string();
-            let description = build_chat_task_description(&message, &work_type);
-            let mut task = crate::core::Task::new(
-                description.clone(),
-                "chat_request".to_string(),
-                serde_json::json!({
-                    "_task_kind": "chat_request",
-                    "_origin": "chat",
-                    "_execution_mode": normalized_chat_execution_mode(execution_mode.as_deref()),
-                    "_work_type": work_type,
-                    "message": message.clone(),
-                    "channel": channel.clone(),
-                    "conversation_id": conversation_id.clone(),
-                    "project_id": project_id.clone(),
-                    "deep_research": deep_research,
-                    "attachments_present": request.attachments_present,
-                }),
-            );
-            task.status = crate::core::TaskStatus::InProgress;
-            task.approval = crate::core::TaskApproval::Auto;
-
-            let add_result = {
-                let agent_guard = agent_ref.read().await;
-                agent_guard.add_task(task.clone()).await
-            };
-
-            match add_result {
-                Ok(()) => {
-                    let payload = serde_json::json!({
-                        "task_id": task.id.to_string(),
-                        "description": description.clone(),
-                        "status": "in_progress",
-                        "work_type": work_type.clone(),
-                        "conversation_id": conversation_id.clone(),
-                        "project_id": project_id.clone(),
-                    });
-                    let event = Event::default()
-                        .event("task_started")
-                        .data(serde_json::to_string(&payload).unwrap_or_default());
-                    let _ = tx.send(Ok(event)).await;
-                    Some((task, work_type))
-                }
-                Err(error) => {
-                    tracing::warn!("Failed to create chat task anchor: {}", error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let mut cancel_rx = if let Some((task, _)) = tracked_task.as_ref() {
-            Some(register_chat_task_cancellation(&app_state, &task.id.to_string()).await)
-        } else {
-            None
-        };
-
-        // Stream model tokens + tool progress as dedicated SSE events.
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
-        let stream_forwarder = {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut last_thinking_detail = String::new();
-                while let Some(ev) = stream_rx.recv().await {
-                    let (maybe_event, next_thinking_detail) =
-                        normalize_stream_event_for_sse(ev, &last_thinking_detail);
-                    last_thinking_detail = next_thinking_detail;
-                    let Some((event_name, payload)) = maybe_event else {
-                        continue;
-                    };
-                    let event = Event::default()
-                        .event(event_name)
-                        .data(serde_json::to_string(&payload).unwrap_or_default());
-                    if tx.send(Ok(event)).await.is_err() {
-                        break;
-                    }
-                }
-            })
-        };
-
-        // Poll trace for new steps and emit as SSE events
-        let trace_poller = {
-            let tx = tx.clone();
-            let trace_ref = trace_ref.clone();
-            tokio::spawn(async move {
-                let mut last_step_count = 0;
-                let start = std::time::Instant::now();
-                let mut last_progress_at = std::time::Instant::now();
-                let mut last_heartbeat_at = std::time::Instant::now();
-                const HEARTBEAT_SECS: u64 = 3;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    // Timeout safety: 30 min max (long app deploys / self-heal retries can take a while)
-                    if start.elapsed().as_secs() > 1800 {
-                        break;
-                    }
-                    let trace = trace_ref.read().await;
-                    let current_count = trace.steps.len();
-                    if current_count > last_step_count {
-                        for step in &trace.steps[last_step_count..current_count] {
-                            let event_data = serde_json::json!({
-                                "icon": step.icon,
-                                "title": step.title,
-                                "detail": step.detail,
-                                "step_type": step.step_type,
-                                "data": step.data,
-                                "time": step.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                "duration_ms": step.duration_ms,
-                            });
-                            let event = Event::default()
-                                .event("thinking")
-                                .data(serde_json::to_string(&event_data).unwrap_or_default());
-                            if tx.send(Ok(event)).await.is_err() {
-                                return;
-                            }
-                        }
-                        last_step_count = current_count;
-                        last_progress_at = std::time::Instant::now();
-                        last_heartbeat_at = last_progress_at;
-                    }
-                    if trace.completed_at.is_some() {
-                        break;
-                    }
-                    if last_progress_at.elapsed().as_secs() >= HEARTBEAT_SECS
-                        && last_heartbeat_at.elapsed().as_secs() >= HEARTBEAT_SECS
-                    {
-                        let idle_secs = last_progress_at.elapsed().as_secs();
-                        let phase_hint = trace
-                            .steps
-                            .last()
-                            .map(|s| {
-                                let title = s.title.to_ascii_lowercase();
-                                let detail = s.detail.to_ascii_lowercase();
-                                let memory_is_active = (title.contains("memory")
-                                    || detail.contains("memory")
-                                    || title.contains("mem0")
-                                    || detail.contains("mem0"))
-                                    && !detail.contains("available on demand");
-                                if memory_is_active {
-                                    if detail.contains("mem0 pending") {
-                                        "Memory layer is starting up (first run may include embedding warmup)."
-                                    } else if detail.contains("mem0 active") {
-                                        "Retrieving semantic memory/context."
-                                    } else if detail.contains("warmup") {
-                                        "Memory layer warmup in progress."
-                                    } else {
-                                        "Memory/context setup in progress."
-                                    }
-                                } else if title.contains("context") || detail.contains("context") {
-                                    "Preparing conversation context."
-                                } else if title.contains("repairing deploy payload")
-                                    || detail.contains("deploy payload")
-                                    || detail.contains("files payload")
-                                {
-                                    "Regenerating deploy payload (model is building required files map)."
-                                } else if title.contains("llm request") || title.contains("llm call") {
-                                    "Waiting on model response."
-                                } else if title.contains("tool") || detail.contains("tool") {
-                                    "Waiting on tool execution."
-                                } else {
-                                    "Still processing."
-                                }
-                            })
-                            .unwrap_or("Still processing.");
-                        let event_data = serde_json::json!({
-                            "icon": "[wait]",
-                            "title": "Still Working",
-                            "detail": format!("{} No new output yet.", phase_hint),
-                            "step_type": "heartbeat",
-                            "data": serde_json::json!({ "idle_secs": idle_secs })
-                        });
-                        let event = Event::default()
-                            .event("thinking")
-                            .data(serde_json::to_string(&event_data).unwrap_or_default());
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                        last_heartbeat_at = std::time::Instant::now();
-                    }
-                }
-            })
-        };
-
-        // Run the actual agent processing
-        let initial_status = Event::default().event("thinking").data(
-            serde_json::json!({
-                "icon": "[recv]",
-                "title": "Request received",
-                "detail": "Preparing model call and tool plan...",
-                "step_type": "thinking",
-                "data": null
-            })
-            .to_string(),
-        );
-        let _ = tx.send(Ok(initial_status)).await;
-
-        let mut process_handle = {
-            let agent_ref = agent_ref.clone();
-            let message = message.clone();
-            let channel = channel.clone();
-            let conversation_id = conversation_id.clone();
-            let project_id = project_id.clone();
-            let trace_ref = trace_ref.clone();
-            tokio::spawn(async move {
-                let agent_guard = agent_ref.read().await;
-                agent_guard
-                    .process_message_stream_with_meta_and_hints(
-                        &message,
-                        &channel,
-                        conversation_id.as_deref(),
-                        project_id.as_deref(),
-                        trace_ref,
-                        stream_tx,
-                        crate::core::RequestExecutionHints { deep_research },
-                    )
-                    .await
-            })
-        };
-        let mut was_cancelled = false;
-        let result = if let Some(ref mut cancel_rx) = cancel_rx {
-            tokio::select! {
-                worker = &mut process_handle => {
-                    match worker {
-                        Ok(result) => result,
-                        Err(error) if error.is_cancelled() => {
-                            was_cancelled = true;
-                            Err(anyhow::anyhow!("Chat run cancelled"))
-                        }
-                        Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
-                    }
-                }
-                changed = cancel_rx.changed() => {
-                    if changed.is_ok() && *cancel_rx.borrow() {
-                        was_cancelled = true;
-                        process_handle.abort();
-                        let _ = process_handle.await;
-                        Err(anyhow::anyhow!("Chat run cancelled"))
-                    } else {
-                        match process_handle.await {
-                            Ok(result) => result,
-                            Err(error) if error.is_cancelled() => {
-                                was_cancelled = true;
-                                Err(anyhow::anyhow!("Chat run cancelled"))
-                            }
-                            Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
-                        }
-                    }
-                }
-            }
-        } else {
-            match process_handle.await {
-                Ok(result) => result,
-                Err(error) if error.is_cancelled() => {
-                    was_cancelled = true;
-                    Err(anyhow::anyhow!("Chat run cancelled"))
-                }
-                Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
-            }
-        };
-
-        // Ensure the trace is marked complete even on early errors, so the poller can't hang.
-        {
-            let mut trace = trace_ref.write().await;
-            if trace.completed_at.is_none() {
-                trace.completed_at = Some(chrono::Utc::now());
-            }
-        }
-
-        // Wait for poller to catch up
-        let _ = trace_poller.await;
-        let _ = stream_forwarder.await;
-
-        if let Some((task, _)) = tracked_task.as_ref() {
-            unregister_chat_task_cancellation(&app_state, &task.id.to_string()).await;
-        }
-
-        // Emit final response
-        match result {
-            Ok(processed) => {
-                if let Some((task, work_type)) = tracked_task.as_ref() {
-                    let terminal_status = chat_task_terminal_status(&processed.response);
-                    let result_preview = truncate_stream_task_text(
-                        if processed.response.trim().is_empty() {
-                            "Task completed."
-                        } else {
-                            &processed.response
-                        },
-                        400,
-                    );
-                    {
-                        let agent_guard = agent_ref.read().await;
-                        if let Err(error) = agent_guard
-                            .finalize_task(
-                                task.id,
-                                terminal_status.clone(),
-                                Some(result_preview.clone()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize streamed chat task '{}': {}",
-                                task.id,
-                                error
-                            );
-                        }
-                    }
-                    let status_event = Event::default().event("task_status").data(
-                        serde_json::json!({
-                            "task_id": task.id.to_string(),
-                            "description": task.description,
-                            "status": chat_task_status_key(&terminal_status),
-                            "work_type": work_type,
-                            "result_preview": result_preview,
-                            "conversation_id": processed.conversation_id.clone().or(conversation_id.clone()),
-                            "project_id": project_id.clone(),
-                        })
-                        .to_string(),
-                    );
-                    let _ = tx.send(Ok(status_event)).await;
-                }
-
-                let mut content = serde_json::json!({
-                    "content": processed.response,
-                    "conversation_id": processed.conversation_id.or(conversation_id),
-                });
-                if let Some(title) = processed.conversation_title {
-                    content["conversation_title"] = serde_json::json!(title);
-                }
-                let event = Event::default()
-                    .event("content")
-                    .data(serde_json::to_string(&content).unwrap_or_default());
-                let _ = tx.send(Ok(event)).await;
-            }
-            Err(e) if was_cancelled => {
-                if let Some((task, work_type)) = tracked_task.as_ref() {
-                    let result_preview = "Cancelled by user.";
-                    {
-                        let agent_guard = agent_ref.read().await;
-                        if let Err(finalize_error) = agent_guard
-                            .finalize_task(
-                                task.id,
-                                crate::core::TaskStatus::Cancelled,
-                                Some(result_preview.to_string()),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize cancelled streamed chat task '{}': {}",
-                                task.id,
-                                finalize_error
-                            );
-                        }
-                    }
-                    let status_event = Event::default().event("task_status").data(
-                        serde_json::json!({
-                            "task_id": task.id.to_string(),
-                            "description": task.description,
-                            "status": "cancelled",
-                            "work_type": work_type,
-                            "result_preview": result_preview,
-                            "conversation_id": conversation_id.clone(),
-                            "project_id": project_id.clone(),
-                        })
-                        .to_string(),
-                    );
-                    let _ = tx.send(Ok(status_event)).await;
-                }
-            }
-            Err(e) => {
-                if let Some((task, work_type)) = tracked_task.as_ref() {
-                    let error_text = e.to_string();
-                    {
-                        let agent_guard = agent_ref.read().await;
-                        if let Err(finalize_error) = agent_guard
-                            .finalize_task(
-                                task.id,
-                                crate::core::TaskStatus::Failed {
-                                    error: error_text.clone(),
-                                },
-                                Some(truncate_stream_task_text(&error_text, 400)),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to finalize failed streamed chat task '{}': {}",
-                                task.id,
-                                finalize_error
-                            );
-                        }
-                    }
-                    let status_event = Event::default().event("task_status").data(
-                        serde_json::json!({
-                            "task_id": task.id.to_string(),
-                            "description": task.description,
-                            "status": "failed",
-                            "work_type": work_type,
-                            "result_preview": truncate_stream_task_text(&error_text, 400),
-                            "conversation_id": conversation_id.clone(),
-                            "project_id": project_id.clone(),
-                        })
-                        .to_string(),
-                    );
-                    let _ = tx.send(Ok(status_event)).await;
-                }
-
-                let error = serde_json::json!({ "error": e.to_string() });
-                let event = Event::default()
-                    .event("error")
-                    .data(serde_json::to_string(&error).unwrap_or_default());
-                let _ = tx.send(Ok(event)).await;
-            }
-        }
-
-        let done = Event::default().event("done").data("{}");
-        let _ = tx.send(Ok(done)).await;
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    spawn_chat_stream_response(
+        state,
+        ChatStreamRunRequest {
+            message: request.message,
+            channel: request.channel,
+            conversation_id: request.conversation_id,
+            project_id: request.project_id,
+            deep_research: request.deep_research,
+            task_mode: ChatStreamTaskMode::CreateIfNeeded {
+                execution_mode: request.execution_mode,
+                attachments_present: request.attachments_present,
+            },
+        },
+    )
 }
 
 /// Clear conversation history for a channel
@@ -10771,6 +12108,7 @@ fn automation_task_status_label(status: &TaskStatus) -> String {
     match status {
         TaskStatus::Pending => "pending".to_string(),
         TaskStatus::AwaitingApproval => "awaiting_approval".to_string(),
+        TaskStatus::ExpiredNeedsReapproval => "expired_needs_reapproval".to_string(),
         TaskStatus::Paused => "paused".to_string(),
         TaskStatus::InProgress => "in_progress".to_string(),
         TaskStatus::Completed => "completed".to_string(),
@@ -11054,6 +12392,7 @@ async fn list_automation_objects(State(state): State<AppState>) -> Json<serde_js
     for app in state.app_registry.list().await {
         let row = app.as_object().cloned().unwrap_or_default();
         totals.apps += 1;
+        let enabled = row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
         let running = row
             .get("running")
             .and_then(|v| v.as_bool())
@@ -11076,7 +12415,9 @@ async fn list_automation_objects(State(state): State<AppState>) -> Json<serde_js
                     .unwrap_or("unknown")
                     .to_string(),
             ),
-            status: if running {
+            status: if !enabled {
+                "disabled".to_string()
+            } else if running {
                 "running".to_string()
             } else {
                 "stopped".to_string()
@@ -11102,7 +12443,7 @@ async fn list_automation_objects(State(state): State<AppState>) -> Json<serde_js
                 .get("access_url")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            enabled: Some(running),
+            enabled: Some(enabled),
             connected: None,
         });
     }
@@ -11981,6 +13322,18 @@ async fn resume_task(State(state): State<AppState>, Path(id): Path<String>) -> R
                 .into_response();
         };
 
+        if task.action == "chat_request" {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error:
+                        "Chat-request tasks must be resumed from chat via /tasks/{id}/resume-chat/stream."
+                            .to_string(),
+                }),
+            )
+                .into_response();
+        }
+
         if !matches!(task.status, TaskStatus::Paused) {
             return (
                 StatusCode::CONFLICT,
@@ -12041,6 +13394,92 @@ async fn resume_task(State(state): State<AppState>, Path(id): Path<String>) -> R
         .into_response()
 }
 
+async fn resume_chat_task_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid task id".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let (resume_request, resumed_task, previous_task, status_json) = {
+        let mut tasks = state.tasks.write().await;
+        let Some(task) = tasks.get_mut(uuid) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Task not found".to_string(),
+                }),
+            )
+                .into_response();
+        };
+
+        let resume_request = match extract_resumable_web_chat_task(task) {
+            Ok(request) => request,
+            Err(error) => {
+                return (StatusCode::CONFLICT, Json(ErrorResponse { error })).into_response();
+            }
+        };
+
+        let previous_task = task.clone();
+        task.status = TaskStatus::InProgress;
+        task.result = None;
+        task.proof_id = None;
+        task.scheduled_for = None;
+
+        (
+            resume_request,
+            task.clone(),
+            previous_task,
+            serde_json::to_string(&task.status).unwrap_or("\"InProgress\"".to_string()),
+        )
+    };
+
+    let save_result = {
+        let agent = state.agent.read().await;
+        agent.storage.retry_task(&id, &status_json, None).await
+    };
+
+    if let Err(error) = save_result {
+        let mut tasks = state.tasks.write().await;
+        if let Some(task) = tasks.get_mut(uuid) {
+            *task = previous_task;
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to resume chat task: {}", error),
+            }),
+        )
+            .into_response();
+    }
+
+    spawn_chat_stream_response(
+        state,
+        ChatStreamRunRequest {
+            message: resume_request.message,
+            channel: resume_request.channel,
+            conversation_id: Some(resume_request.conversation_id),
+            project_id: resume_request.project_id,
+            deep_research: resume_request.deep_research,
+            task_mode: ChatStreamTaskMode::Existing(StreamedChatTask {
+                task: resumed_task,
+                work_type: resume_request.work_type,
+                user_message_already_recorded: true,
+            }),
+        },
+    )
+}
+
 /// Retry a failed or cancelled task.
 async fn retry_task(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
@@ -12067,6 +13506,18 @@ async fn retry_task(State(state): State<AppState>, Path(id): Path<String>) -> Re
             )
                 .into_response();
         };
+
+        if task.action == "chat_request" {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error:
+                        "Chat-request tasks must be retried from chat via /tasks/{id}/resume-chat/stream."
+                            .to_string(),
+                }),
+            )
+                .into_response();
+        }
 
         if !matches!(
             task.status,
@@ -13862,6 +15313,228 @@ async fn load_deploy_guard_default(storage: &crate::storage::Storage) -> bool {
         .unwrap_or(false)
 }
 
+async fn load_learning_enabled(storage: &crate::storage::Storage) -> bool {
+    storage
+        .get(crate::core::learning::LEARNING_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+async fn load_learning_local_only(storage: &crate::storage::Storage) -> bool {
+    storage
+        .get(crate::core::learning::LEARNING_LOCAL_ONLY_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+async fn load_learning_model_slot(storage: &crate::storage::Storage) -> Option<String> {
+    storage
+        .get(crate::core::learning::LEARNING_MODEL_SLOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn load_learning_queue_cap(storage: &crate::storage::Storage) -> u64 {
+    storage
+        .get(crate::core::learning::LEARNING_QUEUE_CAP_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64)
+}
+
+fn build_learning_candidate_summary(
+    candidate: &crate::storage::learning_candidate::Model,
+) -> serde_json::Value {
+    let proposed_name = candidate
+        .proposed_content
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let strategy_version = candidate
+        .proposed_content
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let preview = match candidate.candidate_type.as_str() {
+        "workflow" => candidate
+            .proposed_content
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(|value| value.lines().take(4).collect::<Vec<_>>().join(" ")),
+        "strategy" => candidate
+            .proposed_content
+            .get("default_guidance")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .filter(|value| !value.is_empty()),
+        _ => serde_json::to_string(&candidate.proposed_content).ok(),
+    };
+    serde_json::json!({
+        "id": candidate.id,
+        "candidate_type": candidate.candidate_type,
+        "subject_key": candidate.subject_key,
+        "title": candidate.title,
+        "summary": candidate.summary,
+        "pattern_id": candidate.pattern_id,
+        "confidence": candidate.confidence,
+        "approval_status": candidate.approval_status,
+        "updated_at": candidate.updated_at,
+        "review_notes": candidate.review_notes,
+        "reviewed_at": candidate.reviewed_at,
+        "approved_ref": candidate.approved_ref,
+        "evidence_refs": candidate.evidence_refs,
+        "proposed_name": proposed_name,
+        "strategy_version": strategy_version,
+        "preview": preview,
+    })
+}
+
+fn build_experience_item_summary(
+    item: &crate::storage::experience_item::Model,
+) -> serde_json::Value {
+    let suggested_steps = item
+        .metadata
+        .get("suggested_steps")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .take(3)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": item.id,
+        "kind": item.kind,
+        "scope": item.scope,
+        "title": item.title,
+        "content": item.content,
+        "confidence": item.confidence,
+        "support_count": item.support_count,
+        "contradiction_count": item.contradiction_count,
+        "status": item.status,
+        "project_id": item.project_id,
+        "conversation_id": item.conversation_id,
+        "updated_at": item.updated_at,
+        "suggested_steps": suggested_steps,
+        "intent_key": item.metadata.get("intent_key").cloned().unwrap_or(serde_json::Value::Null),
+        "source": item.metadata.get("source").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn build_procedural_pattern_summary(
+    pattern: &crate::storage::procedural_pattern::Model,
+) -> serde_json::Value {
+    let steps_preview = pattern
+        .steps_json
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .take(4)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tool_sequence = pattern
+        .tool_sequence_json
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .take(5)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": pattern.id,
+        "intent_key": pattern.intent_key,
+        "scope": pattern.scope,
+        "title": pattern.title,
+        "trigger_summary": pattern.trigger_summary,
+        "summary": pattern.summary,
+        "sample_count": pattern.sample_count,
+        "success_count": pattern.success_count,
+        "correction_count": pattern.correction_count,
+        "success_rate": pattern.success_rate,
+        "status": pattern.status,
+        "project_id": pattern.project_id,
+        "conversation_id": pattern.conversation_id,
+        "updated_at": pattern.updated_at,
+        "last_validated_at": pattern.last_validated_at,
+        "steps_preview": steps_preview,
+        "tool_sequence": tool_sequence,
+    })
+}
+
+fn build_experience_run_summary(run: &crate::storage::experience_run::Model) -> serde_json::Value {
+    let tool_names = run
+        .tool_sequence_json
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("tool_name").and_then(|value| value.as_str()))
+                .take(6)
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": run.id,
+        "execution_run_id": run.execution_run_id,
+        "trace_id": run.trace_id,
+        "scope": run.scope,
+        "channel": run.channel,
+        "intent_key": run.intent_key,
+        "task_type": run.task_type,
+        "success_state": run.success_state,
+        "correction_state": run.correction_state,
+        "outcome_summary": run.outcome_summary,
+        "failure_reason": run.failure_reason,
+        "project_id": run.project_id,
+        "conversation_id": run.conversation_id,
+        "strategy_version": run.strategy_version,
+        "policy_version": run.policy_version,
+        "prompt_version": run.prompt_version,
+        "model_slot": run.model_slot,
+        "consolidated": run.consolidated,
+        "accepted_at": run.accepted_at,
+        "corrected_at": run.corrected_at,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "tool_names": tool_names,
+    })
+}
+
 async fn build_evolution_settings_response(
     storage: &crate::storage::Storage,
 ) -> EvolutionSettingsResponse {
@@ -13935,9 +15608,15 @@ async fn build_evolution_settings_response(
         .and_then(|raw| String::from_utf8(raw).ok())
         .map(|s| !s.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true);
+    let learning_queue = storage.learning_queue_counts().await.unwrap_or_default();
 
     EvolutionSettingsResponse {
         self_evolve_enabled,
+        learning_enabled: load_learning_enabled(storage).await,
+        learning_local_only: load_learning_local_only(storage).await,
+        learning_model_slot: load_learning_model_slot(storage).await,
+        learning_queue_cap: load_learning_queue_cap(storage).await,
+        learning_queue,
         canary,
         last_promotion_result,
         replay_gate_result,
@@ -14018,12 +15697,50 @@ async fn build_evolution_dev_response(
         .unwrap_or_default();
     let policy_metrics = aggregate_version_metrics(&logs, |row| row.policy_version.as_deref());
     let strategy_metrics = aggregate_version_metrics(&logs, |row| row.strategy_version.as_deref());
+    let learning_candidates = storage
+        .list_learning_candidates(None, 24)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|candidate| build_learning_candidate_summary(&candidate))
+        .collect::<Vec<_>>();
+    let learning_items = storage
+        .list_active_experience_items(
+            &["constraint", "personal_fact", "lesson", "procedure"],
+            None,
+            None,
+            36,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| build_experience_item_summary(&item))
+        .collect::<Vec<_>>();
+    let learning_patterns = storage
+        .list_procedural_patterns(None, None, &["active", "draft"], 24)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pattern| build_procedural_pattern_summary(&pattern))
+        .collect::<Vec<_>>();
+    let recent_experience_runs = storage
+        .list_recent_experience_runs(None, None, 24)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run| build_experience_run_summary(&run))
+        .collect::<Vec<_>>();
     EvolutionDevResponse {
         canary_state: load_evolution_canary_state(storage).await,
         last_result: load_last_self_evolve_result(storage).await,
         lineage_recent: read_recent_lineage(40).await,
         policy_metrics,
         strategy_metrics,
+        learning_queue: storage.learning_queue_counts().await.unwrap_or_default(),
+        learning_candidates,
+        learning_items,
+        learning_patterns,
+        recent_experience_runs,
     }
 }
 
@@ -14082,6 +15799,79 @@ async fn update_evolution_settings(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: format!("Failed to update evolution settings: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if let Some(enabled) = request.learning_enabled {
+        let raw = if enabled {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        };
+        if let Err(e) = storage
+            .set(crate::core::learning::LEARNING_ENABLED_KEY, raw)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update learning_enabled: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if let Some(local_only) = request.learning_local_only {
+        let raw = if local_only {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        };
+        if let Err(e) = storage
+            .set(crate::core::learning::LEARNING_LOCAL_ONLY_KEY, raw)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update learning_local_only: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if let Some(slot) = request.learning_model_slot.as_deref() {
+        if let Err(e) = storage
+            .set(
+                crate::core::learning::LEARNING_MODEL_SLOT_KEY,
+                slot.trim().as_bytes(),
+            )
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update learning_model_slot: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+    if let Some(cap) = request.learning_queue_cap {
+        let cap_value = cap.max(1).to_string();
+        if let Err(e) = storage
+            .set(
+                crate::core::learning::LEARNING_QUEUE_CAP_KEY,
+                cap_value.as_bytes(),
+            )
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update learning_queue_cap: {}", e),
                 }),
             )
                 .into_response();
@@ -14305,11 +16095,397 @@ async fn run_evolution_dev_action(
             }
             "Rolled back to the stored baseline snapshot.".to_string()
         }
+        "approve_learning_candidate" => {
+            let Some(candidate_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for learning approvals.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let Some(candidate) = (match storage.get_learning_candidate(candidate_id).await {
+                Ok(value) => value,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to load learning candidate: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
+            }) else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Learning candidate not found.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+
+            let approved_ref = match candidate.candidate_type.as_str() {
+                "workflow" => {
+                    let name = candidate
+                        .proposed_content
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("workflow candidate missing proposed name"));
+                    let content = candidate
+                        .proposed_content
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("workflow candidate missing content"));
+                    let (name, content) = match (name, content) {
+                        (Ok(name), Ok(content)) => (name, content),
+                        (Err(error), _) | (_, Err(error)) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: error.to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    let agent = state.agent.read().await;
+                    let verdict = match agent.runtime.create_action(name, content, false).await {
+                        Ok(verdict) => verdict,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to materialize workflow candidate as a custom action: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    if verdict.as_ref().is_some_and(|value| !value.allow_load) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error:
+                                    "Workflow candidate was blocked by the action security guard."
+                                        .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    name.to_string()
+                }
+                "strategy" => {
+                    let profile: crate::core::self_evolve::strategy_runtime::ToolStrategyProfile =
+                        match serde_json::from_value(candidate.proposed_content.clone()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(ErrorResponse {
+                                        error: format!(
+                                            "Invalid strategy candidate payload: {}",
+                                            error
+                                        ),
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                        };
+                    let candidate_bytes = match serde_json::to_vec(&profile) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to serialize strategy candidate: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    let baseline_version = storage
+                        .get(crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_KEY)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| {
+                            serde_json::from_slice::<
+                                crate::core::self_evolve::strategy_runtime::ToolStrategyProfile,
+                            >(&raw)
+                            .ok()
+                        })
+                        .map(|value| value.version)
+                        .unwrap_or_else(|| "strategy-v1".to_string());
+                    if let Err(error) = storage
+                        .set(
+                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_PROFILE_CANARY_KEY,
+                            &candidate_bytes,
+                        )
+                        .await
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to store strategy candidate profile: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    let canary_state =
+                        crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                            enabled: true,
+                            baseline_version,
+                            candidate_version: profile.version.clone(),
+                            rollout_percent: 20,
+                            ..Default::default()
+                        };
+                    let canary_bytes = match serde_json::to_vec(&canary_state) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to serialize strategy canary state: {}",
+                                        error
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+                    if let Err(error) = storage
+                        .set(
+                            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+                            &canary_bytes,
+                        )
+                        .await
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to activate strategy canary: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    profile.version
+                }
+                "memory_deprecate" => {
+                    let item_id = candidate
+                        .proposed_content
+                        .get("item_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let next_status = candidate
+                        .proposed_content
+                        .get("next_status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("deprecated");
+                    let Some(item_id) = item_id else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "memory_deprecate candidate missing item_id.".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    };
+                    if let Err(error) = storage
+                        .update_experience_item_status(item_id, next_status)
+                        .await
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to apply memory deprecation candidate: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    item_id.to_string()
+                }
+                "memory_merge" => {
+                    let target_item_id = candidate
+                        .proposed_content
+                        .get("target_item_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let source_item_id = candidate
+                        .proposed_content
+                        .get("source_item_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let (Some(target_item_id), Some(source_item_id)) =
+                        (target_item_id, source_item_id)
+                    else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "memory_merge candidate missing source/target item ids."
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    };
+                    if let Err(error) = storage
+                        .update_experience_item_status(source_item_id, "deprecated")
+                        .await
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "Failed to deprecate merged source memory: {}",
+                                    error
+                                ),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    if let Err(error) = storage
+                        .upsert_experience_edge(&crate::storage::experience_edge::Model {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            source_ref: target_item_id.to_string(),
+                            source_kind: "experience_item".to_string(),
+                            target_ref: source_item_id.to_string(),
+                            target_kind: "experience_item".to_string(),
+                            edge_type: "supersedes".to_string(),
+                            weight: 1.0,
+                            source_run_id: None,
+                            metadata: serde_json::json!({ "approved_via": "evolution" }),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                        })
+                        .await
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("Failed to connect merged memory edge: {}", error),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    target_item_id.to_string()
+                }
+                other => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Unsupported learning candidate type '{}'.", other),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            if let Err(error) = storage
+                .update_learning_candidate_review(
+                    candidate_id,
+                    "approved",
+                    Some("Approved from Evolution developer controls."),
+                    Some(&approved_ref),
+                )
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to record candidate approval: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+            format!("Approved learning candidate '{}'.", candidate.title)
+        }
+        "reject_learning_candidate" => {
+            let Some(candidate_id) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "candidate_id is required for learning rejections.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            let Some(candidate) = (match storage.get_learning_candidate(candidate_id).await {
+                Ok(value) => value,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Failed to load learning candidate: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
+            }) else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Learning candidate not found.".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            if let Err(error) = storage
+                .update_learning_candidate_review(
+                    candidate_id,
+                    "rejected",
+                    Some("Rejected from Evolution developer controls."),
+                    None,
+                )
+                .await
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to record candidate rejection: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+            format!("Rejected learning candidate '{}'.", candidate.title)
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Unsupported action. Use disable_canary, promote_candidate, or rollback_baseline."
+                    error: "Unsupported action. Use disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, or reject_learning_candidate."
                         .to_string(),
                 }),
             )
@@ -14400,6 +16576,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         .ok()
         .flatten()
         .and_then(|b| String::from_utf8(b).ok());
+    let data_lifecycle = load_data_lifecycle_settings(&storage).await;
     let search_cfg = tokio::fs::read_to_string(config_dir.join("search.toml"))
         .await
         .ok()
@@ -14911,6 +17088,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         memory_retention_idle_threshold_secs: config.memory.retention_idle_threshold_secs,
         memory_retention_max_delete_per_run: config.memory.retention_max_delete_per_run,
         memory_retention_protect_fact_sources: config.memory.retention_protect_fact_sources,
+        data_lifecycle,
         observability: observability::build_observability_settings_response(
             &config.observability,
             &config_dir,
@@ -15196,6 +17374,7 @@ async fn update_settings(
     let mut deferred_profile_bytes: Option<Vec<u8>> = None;
     let mut deferred_search_config_dir: Option<PathBuf> = None;
     let mut deferred_moltbook_settings: Option<MoltbookSettings> = None;
+    let mut deferred_data_lifecycle_settings: Option<DataLifecycleSettings> = None;
     let existing_daily_brief_tasks = {
         let tasks = state.tasks.read().await;
         tasks
@@ -15349,6 +17528,53 @@ async fn update_settings(
             current.defer_when_busy = v;
         }
         deferred_moltbook_settings = Some(current);
+    }
+
+    if let Some(update) = settings.data_lifecycle.as_ref() {
+        let mut current = load_data_lifecycle_settings(&deferred_storage).await;
+        if let Some(v) = update.notifications_retention_days {
+            current.notifications_retention_days = v;
+        }
+        if let Some(v) = update.notification_cleanup_interval_secs {
+            current.notification_cleanup_interval_secs = v;
+        }
+        if let Some(v) = update.execution_trace_retention_days {
+            current.execution_trace_retention_days = v;
+        }
+        if let Some(v) = update.execution_proof_retention_days {
+            current.execution_proof_retention_days = v;
+        }
+        if let Some(v) = update.operational_log_retention_days {
+            current.operational_log_retention_days = v;
+        }
+        if let Some(v) = update.security_log_retention_days {
+            current.security_log_retention_days = v;
+        }
+        if let Some(v) = update.approval_log_retention_days {
+            current.approval_log_retention_days = v;
+        }
+        if let Some(v) = update.swarm_delegation_retention_days {
+            current.swarm_delegation_retention_days = v;
+        }
+        if let Some(v) = update.llm_usage_retention_days {
+            current.llm_usage_retention_days = v;
+        }
+        if let Some(v) = update.terminal_task_retention_days {
+            current.terminal_task_retention_days = v;
+        }
+        if let Some(v) = update.message_retention_days {
+            current.message_retention_days = v;
+        }
+        if let Some(v) = update.housekeeping_interval_secs {
+            current.housekeeping_interval_secs = v;
+        }
+        if let Some(v) = update.security_cleanup_interval_days {
+            current.security_cleanup_interval_days = v;
+        }
+        if let Some(v) = update.security_cleanup_idle_threshold_secs {
+            current.security_cleanup_idle_threshold_secs = v;
+        }
+        deferred_data_lifecycle_settings = Some(current.normalized());
     }
 
     let result = {
@@ -16470,7 +18696,9 @@ async fn update_settings(
             if !rejected.is_empty() {
                 tracing::warn!("Rejected auto-approve entries: {:?}", rejected);
             }
-            agent_guard.config.auto_approve = allowed;
+            agent_guard.config.auto_approve = allowed.clone();
+            // Sync to safety engine so RequireApproval rules are skipped for these actions
+            agent_guard.safety.set_auto_approved(&allowed);
         }
 
         // Save media provider API keys to config (they will be encrypted by SecureConfigManager)
@@ -16739,6 +18967,12 @@ async fn update_settings(
                 }),
             )
             .await;
+        }
+    }
+
+    if let Some(data_lifecycle_cfg) = deferred_data_lifecycle_settings.as_ref() {
+        if let Err(e) = save_data_lifecycle_settings(&deferred_storage, data_lifecycle_cfg).await {
+            tracing::warn!("Failed to persist data lifecycle settings: {}", e);
         }
     }
 
@@ -17574,6 +19808,11 @@ async fn add_model(
             role,
             provider: provider.clone(),
             enabled: request.enabled.unwrap_or(true),
+            capability_tier: crate::core::config::ModelCapabilityTier::Balanced,
+            cost_tier: crate::core::config::ModelCostTier::Medium,
+            auto_escalate: true,
+            escalation_rank: 0,
+            health_scope: crate::core::config::ModelHealthScope::Provider,
         };
 
         agent.config.model_pool.slots.push(slot.clone());
@@ -17732,6 +19971,11 @@ async fn update_model(
             role,
             provider: provider.clone(),
             enabled,
+            capability_tier: crate::core::config::ModelCapabilityTier::Balanced,
+            cost_tier: crate::core::config::ModelCostTier::Medium,
+            auto_escalate: true,
+            escalation_rank: 0,
+            health_scope: crate::core::config::ModelHealthScope::Provider,
         };
 
         agent.config.model_pool.slots[idx] = slot.clone();
@@ -21148,9 +23392,51 @@ async fn handle_voice_command(
                 "Voice command: {}. Respond with a short actionable interpretation.",
                 request.command
             );
-            match agent.process_message_with_meta(&prompt, "voice", None, None).await {
-                Ok(r) => (StatusCode::OK, Json(serde_json::json!({"status":"ok","response": crate::security::redact_pii(&r.response)}))).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })).into_response(),
+            match agent
+                .process_message_with_meta(&prompt, "voice", None, None)
+                .await
+            {
+                Ok(r) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "response": crate::security::redact_pii(&r.response),
+                        "run_status": r.run_status,
+                        "degradation": r.degradation,
+                        "attempted_models": r.attempted_models,
+                        "user_outcome": r.user_outcome,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => {
+                    let response =
+                        "I hit a framework-level problem while handling the voice command."
+                            .to_string();
+                    let degradation = vec![crate::core::DegradationNote {
+                        kind: "platform".to_string(),
+                        summary: "framework error".to_string(),
+                        detail: Some(e.to_string()),
+                    }];
+                    let user_outcome = crate::core::ExecutionSupervisor::default()
+                        .build_service_outage_outcome(
+                            &response,
+                            "framework_error",
+                            &degradation,
+                            &[],
+                        );
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "response": response,
+                            "run_status": "platform_failed",
+                            "degradation": degradation,
+                            "attempted_models": user_outcome.attempted_models,
+                            "user_outcome": user_outcome,
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
     }
@@ -23242,9 +25528,33 @@ async fn mcp_handler(
                         "content": [{ "type": "text", "text": processed.response }],
                         "conversation_id": processed.conversation_id,
                         "conversation_title": processed.conversation_title,
+                        "run_status": processed.run_status,
+                        "degradation": processed.degradation,
+                        "attempted_models": processed.attempted_models,
+                        "user_outcome": processed.user_outcome,
                     }),
                     Err(e) => {
-                        serde_json::json!({ "content": [{ "type": "text", "text": format!("Error: {}", e) }], "isError": true })
+                        let response = "I hit a framework-level problem before the MCP request could finish cleanly. Please retry.".to_string();
+                        let degradation = vec![crate::core::DegradationNote {
+                            kind: "platform".to_string(),
+                            summary: "framework error".to_string(),
+                            detail: Some(e.to_string()),
+                        }];
+                        let user_outcome = crate::core::ExecutionSupervisor::default()
+                            .build_service_outage_outcome(
+                                &response,
+                                "framework_error",
+                                &degradation,
+                                &[],
+                            );
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": response }],
+                            "isError": true,
+                            "run_status": "platform_failed",
+                            "degradation": degradation,
+                            "attempted_models": user_outcome.attempted_models,
+                            "user_outcome": user_outcome,
+                        })
                     }
                 }
             }
@@ -23351,7 +25661,7 @@ async fn mcp_list_tools() -> Json<serde_json::Value> {
     let mcp = crate::mcp::McpServer::new();
     Json(
         serde_json::json!({ "tools": mcp.handle_request(&crate::mcp::McpRequest {
-        _jsonrpc: "2.0".to_string(),
+        jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
         method: "tools/list".to_string(),
         params: serde_json::json!({}),
@@ -23693,6 +26003,12 @@ fn build_mcp_config(
         resources_enabled: request.resources_enabled,
         auth: auth_config,
         tool_allowlist: clean_allowlist(&request.tool_allowlist),
+        tool_blocklist: request
+            .tool_blocklist
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
         resource_allowlist: clean_allowlist(&request.resource_allowlist),
         timeout_secs,
         max_response_bytes,
@@ -24805,9 +27121,15 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let shared = Arc::new(RwLock::new(
-            Agent::init(config_dir.path(), data_dir.path(), None)
-                .await
-                .unwrap(),
+            Agent::init(
+                config_dir.path(),
+                data_dir.path(),
+                crate::storage::DatabaseConfig::for_tests()
+                    .expect("test database config should initialize"),
+                None,
+            )
+            .await
+            .unwrap(),
         ));
         let (trace_history, last_trace, tasks, user_profile, security_events, app_registry) = {
             let guard = shared.read().await;
@@ -24855,6 +27177,51 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn add_test_task(state: &AppState, task: crate::core::Task) {
+        let agent = state.agent.read().await;
+        agent
+            .add_task(task)
+            .await
+            .expect("test task should be added");
+    }
+
+    async fn create_test_conversation_with_user_message(
+        state: &AppState,
+        conversation_id: &str,
+        message_text: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let agent = state.agent.read().await;
+        agent
+            .storage
+            .create_conversation(&crate::storage::entities::conversation::Model {
+                id: conversation_id.to_string(),
+                title: "Resume test conversation".to_string(),
+                channel: "web".to_string(),
+                project_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                message_count: 1,
+                archived: false,
+                starred: false,
+            })
+            .await
+            .expect("conversation should be created");
+        agent
+            .encrypted_storage
+            .insert_message_encrypted(&crate::storage::entities::message::Model {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.to_string(),
+                role: "user".to_string(),
+                content: message_text.to_string(),
+                timestamp: now,
+                model_used: None,
+                trace_id: None,
+            })
+            .await
+            .expect("user message should be inserted");
+    }
+
     #[test]
     fn summarize_stream_tool_activity_content_hides_html_payloads() {
         let summary = summarize_stream_tool_activity_content(
@@ -24866,6 +27233,60 @@ mod tests {
             "Read HTML document: arXiv Research Monitor | RL & Time-Series."
         );
         assert!(!summary.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn rewrite_external_proxy_urls_for_public_apps_rewrites_direct_arxiv_api_calls() {
+        let input = r#"fetch("https://export.arxiv.org/api/query?search_query=all:transformer");"#;
+
+        let rewritten = rewrite_external_proxy_urls_for_public_apps(input);
+
+        assert!(rewritten.contains(
+            "/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=all:transformer"
+        ));
+        assert!(!rewritten.contains("fetch(\"https://export.arxiv.org/api/query"));
+    }
+
+    #[test]
+    fn rewrite_external_proxy_urls_for_public_apps_does_not_double_proxy_arxiv_urls() {
+        let input = r#"fetch("/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=all:transformer");"#;
+
+        let rewritten = rewrite_external_proxy_urls_for_public_apps(input);
+
+        assert_eq!(rewritten, input);
+        assert!(!rewritten.contains("/public/proxy/raw?url=/public/proxy/raw?url="));
+    }
+
+    #[test]
+    fn build_arxiv_search_request_from_source_url_repairs_nested_proxy_and_field_aliases() {
+        let source = "/public/proxy/raw?url=/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=(cat:cs.LG OR cat:cs.RO OR (cat:stat.ML AND (title:time series OR abs:time series OR forecasting OR abs:forecasting)))&start=0&max_results=50&sortBy=submittedDate&sortOrder=descending";
+
+        let request = build_arxiv_search_request_from_source_url(source)
+            .expect("nested arxiv proxy url should normalize");
+
+        assert_eq!(request.start, 0);
+        assert_eq!(request.max_results, 50);
+        assert_eq!(request.sort_by, "submittedDate");
+        assert_eq!(request.sort_order, "descending");
+        assert!(request.search_query.contains("cat:cs.LG"));
+        assert!(request.search_query.contains("cat:cs.RO"));
+        assert!(request.search_query.contains("cat:stat.ML"));
+        assert!(request.search_query.contains("ti:\"time series\""));
+        assert!(request.search_query.contains("abs:\"time series\""));
+        assert!(request.search_query.contains("ti:forecasting"));
+        assert!(request.search_query.contains("abs:forecasting"));
+    }
+
+    #[test]
+    fn inject_app_runtime_fetch_shims_adds_arxiv_helper_proxy() {
+        let html = "<!DOCTYPE html><html><head></head><body></body></html>";
+
+        let rewritten = inject_app_runtime_fetch_shims(html, "demo-app");
+
+        assert!(rewritten
+            .contains("/apps/\" + encodeURIComponent(APP_ID) + \"/__agentark/arxiv/search"));
+        assert!(rewritten.contains("source_url="));
+        assert!(rewritten.contains("x-agentark-app-proxy\", \"arxiv"));
     }
 
     #[test]
@@ -24975,6 +27396,82 @@ mod tests {
     }
 
     #[test]
+    fn normalize_stream_event_for_sse_preserves_draft_file_progress_payload() {
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: "Drafting src/App.tsx".to_string(),
+                payload: Some(serde_json::json!({
+                    "kind": "draft_file",
+                    "file": "src/App.tsx",
+                    "phase": "generating_files",
+                    "stream_key": "draft-file:app_deploy:src/App.tsx",
+                    "content_snapshot": "export default function App() {}",
+                    "line": 1,
+                    "total_lines": 1,
+                    "done": true
+                })),
+            },
+            "",
+        );
+
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected tool_progress event");
+        };
+        assert_eq!(event_name, "tool_progress");
+        assert_eq!(
+            payload.get("kind").and_then(|v| v.as_str()),
+            Some("draft_file")
+        );
+        assert_eq!(
+            payload.get("file").and_then(|v| v.as_str()),
+            Some("src/App.tsx")
+        );
+        assert_eq!(
+            payload.get("content_snapshot").and_then(|v| v.as_str()),
+            Some("export default function App() {}")
+        );
+    }
+
+    #[test]
+    fn normalize_stream_event_for_sse_preserves_phase_status_progress_payload() {
+        let (event, next_state) = normalize_stream_event_for_sse(
+            crate::core::StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: "Installing dependencies".to_string(),
+                payload: Some(serde_json::json!({
+                    "kind": "phase_status",
+                    "phase": "installing",
+                    "label": "Installing",
+                    "detail": "Installing dependencies",
+                    "elapsed_secs": 18,
+                    "stream_key": "phase-status:app_deploy:installing"
+                })),
+            },
+            "",
+        );
+
+        assert!(next_state.is_empty());
+        let Some((event_name, payload)) = event else {
+            panic!("expected tool_progress event");
+        };
+        assert_eq!(event_name, "tool_progress");
+        assert_eq!(
+            payload.get("kind").and_then(|v| v.as_str()),
+            Some("phase_status")
+        );
+        assert_eq!(
+            payload.get("phase").and_then(|v| v.as_str()),
+            Some("installing")
+        );
+        assert_eq!(
+            payload.get("elapsed_secs").and_then(|v| v.as_u64()),
+            Some(18)
+        );
+    }
+
+    #[test]
     fn chat_task_classifier_promotes_plain_english_app_requests() {
         let message = "Spin up an admin console for lead triage and deploy it";
         assert!(chat_message_requests_app_work(
@@ -25020,6 +27517,240 @@ mod tests {
                 true
             ),
             "workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_chat_stream_rejects_non_chat_and_paused_tasks() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route(
+                "/tasks/{id}/resume-chat/stream",
+                post(resume_chat_task_stream),
+            )
+            .with_state(state.clone());
+
+        let mut non_chat_task = crate::core::Task::new(
+            "Daily brief".to_string(),
+            "daily_brief".to_string(),
+            serde_json::json!({}),
+        );
+        non_chat_task.status = TaskStatus::Cancelled;
+        let non_chat_id = non_chat_task.id;
+        add_test_task(&state, non_chat_task).await;
+
+        let non_chat_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/resume-chat/stream", non_chat_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_chat_response.status(), StatusCode::CONFLICT);
+        let non_chat_body = response_json(non_chat_response).await;
+        assert!(non_chat_body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("Only chat-request tasks"));
+
+        let mut paused_chat_task = crate::core::Task::new(
+            "Paused chat task".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_task_kind": "chat_request",
+                "_origin": "chat",
+                "message": "hello",
+                "channel": "web",
+                "conversation_id": "paused-conversation",
+            }),
+        );
+        paused_chat_task.status = TaskStatus::Paused;
+        let paused_chat_id = paused_chat_task.id;
+        add_test_task(&state, paused_chat_task).await;
+
+        let paused_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/resume-chat/stream", paused_chat_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused_response.status(), StatusCode::CONFLICT);
+        let paused_body = response_json(paused_response).await;
+        assert!(paused_body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("cancelled or failed"));
+    }
+
+    #[tokio::test]
+    async fn generic_resume_and_retry_reject_chat_request_tasks() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/tasks/{id}/resume", post(resume_task))
+            .route("/tasks/{id}/retry", post(retry_task))
+            .with_state(state.clone());
+
+        let mut paused_chat_task = crate::core::Task::new(
+            "Paused chat task".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_task_kind": "chat_request",
+                "_origin": "chat",
+                "message": "hello",
+                "channel": "web",
+                "conversation_id": "resume-conflict-conversation",
+            }),
+        );
+        paused_chat_task.status = TaskStatus::Paused;
+        let paused_chat_id = paused_chat_task.id;
+        add_test_task(&state, paused_chat_task).await;
+
+        let resume_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/resume", paused_chat_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resume_response.status(), StatusCode::CONFLICT);
+        let resume_body = response_json(resume_response).await;
+        assert!(resume_body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("resume-chat/stream"));
+
+        let mut cancelled_chat_task = crate::core::Task::new(
+            "Cancelled chat task".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_task_kind": "chat_request",
+                "_origin": "chat",
+                "message": "hello",
+                "channel": "web",
+                "conversation_id": "retry-conflict-conversation",
+            }),
+        );
+        cancelled_chat_task.status = TaskStatus::Cancelled;
+        let cancelled_chat_id = cancelled_chat_task.id;
+        add_test_task(&state, cancelled_chat_task).await;
+
+        let retry_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/retry", cancelled_chat_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::CONFLICT);
+        let retry_body = response_json(retry_response).await;
+        assert!(retry_body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("resume-chat/stream"));
+    }
+
+    #[tokio::test]
+    async fn resume_chat_stream_reuses_task_and_does_not_duplicate_user_message() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route(
+                "/tasks/{id}/resume-chat/stream",
+                post(resume_chat_task_stream),
+            )
+            .with_state(state.clone());
+
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        create_test_conversation_with_user_message(&state, &conversation_id, "hello").await;
+
+        let mut task = crate::core::Task::new(
+            "Chat task: hello".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_task_kind": "chat_request",
+                "_origin": "chat",
+                "_work_type": "task",
+                "message": "hello",
+                "channel": "web",
+                "conversation_id": conversation_id.clone(),
+                "project_id": serde_json::Value::Null,
+                "deep_research": false,
+                "attachments_present": false,
+            }),
+        );
+        task.status = TaskStatus::Cancelled;
+        let task_id = task.id;
+        add_test_task(&state, task).await;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{}/resume-chat/stream", task_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("stream body should complete")
+                .to_vec(),
+        )
+        .expect("sse body should be utf8");
+        assert!(body.contains("event: task_started"));
+        assert!(body.contains("event: content"));
+        assert!(body.contains("Hello! What would you like help with today?"));
+
+        let tasks = state.tasks.read().await;
+        let stored_task = tasks
+            .all()
+            .iter()
+            .find(|candidate| candidate.id == task_id)
+            .expect("resumed task should remain in queue");
+        assert!(matches!(stored_task.status, TaskStatus::Completed));
+        drop(tasks);
+
+        let agent = state.agent.read().await;
+        let messages = agent
+            .storage
+            .get_messages(&conversation_id, 20, 0)
+            .await
+            .expect("messages should load");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .count(),
+            1
         );
     }
 
@@ -25155,6 +27886,48 @@ mod tests {
                 serde_json::json!({
                     "type": "url_verification",
                     "challenge": "abc"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.to_ascii_lowercase().contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn slack_webhook_endpoint_rejects_unsigned_event_callback_when_secret_is_configured() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.slack = Some(crate::channels::slack::SlackChannelConfig {
+                bot_token: "xoxb-test-token".to_string(),
+                signing_secret: "topsecret".to_string(),
+                ..Default::default()
+            });
+        }
+        let router = Router::new()
+            .route("/webhook/slack", post(slack_webhook_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/slack")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "type": "event_callback",
+                    "event_id": "evt-1",
+                    "team_id": "T123",
+                    "event": {
+                        "type": "message",
+                        "user": "U123",
+                        "text": "hello",
+                        "channel": "C123",
+                        "ts": "1710000000.000100"
+                    }
                 })
                 .to_string(),
             ))

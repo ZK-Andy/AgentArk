@@ -14,6 +14,7 @@ pub struct Model {
     pub approval: String,
     pub status: String,
     pub created_at: String,
+    pub updated_at: String,
     #[sea_orm(nullable)]
     pub scheduled_for: Option<String>,
     #[sea_orm(nullable)]
@@ -30,6 +31,16 @@ pub struct Model {
     pub importance: Option<f64>,
     #[sea_orm(nullable)]
     pub eisenhower_quadrant: Option<i32>,
+    #[sea_orm(nullable)]
+    pub lease_owner: Option<String>,
+    #[sea_orm(nullable)]
+    pub lease_expires_at: Option<String>,
+    pub lease_version: i32,
+    #[sea_orm(nullable)]
+    pub next_retry_at: Option<String>,
+    #[sea_orm(nullable)]
+    pub last_run_id: Option<String>,
+    pub consecutive_failures: i32,
 }
 
 #[allow(dead_code)]

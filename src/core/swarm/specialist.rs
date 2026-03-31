@@ -87,10 +87,24 @@ impl SpecialistAgent {
             context
         );
 
-        let response = self
-            .llm
-            .chat(&system_prompt, task, &[], &self.available_actions)
-            .await?;
+        let supervisor = crate::core::ExecutionSupervisor::default();
+        let request = crate::core::ExecutionRequest {
+            kind: "swarm_specialist_task".to_string(),
+            channel: Some("swarm".to_string()),
+            message_preview: Some(task.chars().take(200).collect()),
+            ..Default::default()
+        };
+        let response = crate::core::execution::execute_supervised_transport_chat(
+            &supervisor,
+            &self.llm,
+            &request,
+            &system_prompt,
+            task,
+            &[],
+            &self.available_actions,
+            Some(60_000),
+        )
+        .await?;
 
         Ok(response.content)
     }

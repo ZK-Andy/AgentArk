@@ -303,6 +303,7 @@ impl AgentArkApp {
                             let status_emoji = match &task.status {
                                 crate::core::TaskStatus::Pending => "O",
                                 crate::core::TaskStatus::AwaitingApproval => "!",
+                                crate::core::TaskStatus::ExpiredNeedsReapproval => "?",
                                 crate::core::TaskStatus::Paused => "||",
                                 crate::core::TaskStatus::InProgress => "*",
                                 crate::core::TaskStatus::Completed => "+",

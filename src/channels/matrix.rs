@@ -563,11 +563,12 @@ pub async fn sync_once(
             let result = {
                 let guard = agent.read().await;
                 guard
-                    .process_message(&body, "matrix", Some(&conversation_id), None)
+                    .process_message_with_meta(&body, "matrix", Some(&conversation_id), None)
                     .await
             };
             match result {
-                Ok(response) => {
+                Ok(processed) => {
+                    let response = Agent::render_plain_channel_response(processed);
                     summary.messages_forwarded += 1;
                     if !response.trim().is_empty() {
                         if let Err(error) = send_message_to_room(

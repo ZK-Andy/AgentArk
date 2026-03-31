@@ -114,6 +114,21 @@ async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) 
     }
 }
 
+async fn process_telegram_prompt(
+    agent: &SharedAgent,
+    prompt: &str,
+    conversation_id: &str,
+) -> String {
+    let guard = agent.read().await;
+    match guard
+        .process_message_with_meta(prompt, "telegram", Some(conversation_id), None)
+        .await
+    {
+        Ok(processed) => Agent::render_plain_channel_response(processed),
+        Err(error) => format!("Error: {}", error),
+    }
+}
+
 fn parse_set_secret(text: &str) -> Option<(String, String)> {
     // Accept both:
     // - "/setsecret KEY=VALUE" (Telegram command)
@@ -730,15 +745,9 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     // Process with agent
                     let conversation_id = format!("telegram:{}", chat_id.0);
                     let (response, _trace_ref) = {
-                        let agent = agent.read().await;
-                        let r = match agent
-                            .process_message(text, "telegram", Some(&conversation_id), None)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => format!("Error: {}", e),
-                        };
-                        (r, agent.last_trace.clone())
+                        let trace_ref = agent.read().await.last_trace.clone();
+                        let response = process_telegram_prompt(&agent, text, &conversation_id).await;
+                        (response, trace_ref)
                     };
                     typing_done.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -1004,15 +1013,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             } else {
                 // Process through agent with image generation intent
                 let response = {
-                    let agent = agent.read().await;
                     let prompt = format!("Generate an image of: {}", args);
-                    match agent
-                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
-                    }
+                    process_telegram_prompt(agent, &prompt, &conversation_id).await
                 };
                 response
             }
@@ -1023,17 +1025,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 "Usage: /video <prompt>\n\nExample: /video a rocket launching into space"
                     .to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Generate a video of: {}", args);
-                    match agent
-                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
-                    }
-                };
+                let prompt = format!("Generate a video of: {}", args);
+                let response = process_telegram_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }
@@ -1042,34 +1035,16 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             if args.is_empty() {
                 "Usage: /remind <time> <message>\n\nExamples:\n/remind 5m Check the oven\n/remind 2h Call mom\n/remind tomorrow 9am Meeting".to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Set a reminder: {}", args);
-                    match agent
-                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
-                    }
-                };
+                let prompt = format!("Set a reminder: {}", args);
+                let response = process_telegram_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }
 
         "/weather" => {
             let location = if args.is_empty() { "my location" } else { args };
-            let response = {
-                let agent = agent.read().await;
-                let prompt = format!("What's the weather in {}?", location);
-                match agent
-                    .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
-                }
-            };
+            let prompt = format!("What's the weather in {}?", location);
+            let response = process_telegram_prompt(agent, &prompt, &conversation_id).await;
             response
         }
 
@@ -1078,17 +1053,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 "Usage: /translate <text>\n\nExample: /translate Hello, how are you? to Spanish"
                     .to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Translate: {}", args);
-                    match agent
-                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
-                    }
-                };
+                let prompt = format!("Translate: {}", args);
+                let response = process_telegram_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }
@@ -1097,17 +1063,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             if args.is_empty() {
                 "Usage: /search <query>\n\nExample: /search latest news about AI".to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Search the web for: {}", args);
-                    match agent
-                        .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("❌ Error: {}", e),
-                    }
-                };
+                let prompt = format!("Search the web for: {}", args);
+                let response = process_telegram_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }
@@ -1117,33 +1074,17 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 "Usage: /install <skill_url>".to_string()
             } else {
                 let prompt = format!("install this skill {}", args.trim());
-                let agent = agent.read().await;
-                match agent
-                    .process_message(&prompt, "telegram", Some(&conversation_id), None)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
-                }
+                process_telegram_prompt(agent, &prompt, &conversation_id).await
             }
         }
 
         "/summarize" => {
-            let response = {
-                let agent = agent.read().await;
-                match agent
-                    .process_message(
-                        "Summarize our recent conversation",
-                        "telegram",
-                        Some(&conversation_id),
-                        None,
-                    )
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
-                }
-            };
+            let response = process_telegram_prompt(
+                agent,
+                "Summarize our recent conversation",
+                &conversation_id,
+            )
+            .await;
             response
         }
 

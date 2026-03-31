@@ -312,7 +312,11 @@ mod tests {
     #[tokio::test]
     async fn reencrypt_all_sensitive_data_updates_rows_and_live_key() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         let old_key = Arc::new(
             KeyManager::from_password("old-password", &[1_u8; crate::crypto::SALT_LEN]).unwrap(),
         );

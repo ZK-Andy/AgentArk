@@ -125,14 +125,15 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
   });
   const refreshPlugin = useMutation({
     mutationFn: (id: string) => api.rawPost(`/plugins/${encodeURIComponent(id)}/refresh`, {}),
-    onSuccess: async () => {
+    onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: ["settings-plugins"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-plugin-logs"] });
     }
   });
   const testPlugin = useMutation({
     mutationFn: (id: string) => api.rawPost(`/plugins/${encodeURIComponent(id)}/test`, {}),
-    onSuccess: async () => {
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings-plugins"] });
       await queryClient.invalidateQueries({ queryKey: ["settings-plugin-logs"] });
     }
   });
@@ -330,7 +331,11 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
               approvals, and task outcomes.
             </Typography>
           </Box>
-          <Button variant="contained" onClick={openCreateDialog} disabled={busy}>
+          <Button variant="contained" onClick={openCreateDialog} disabled={busy} sx={{
+              textTransform: "none",
+              fontWeight: 600,
+              px: 3,
+            }}>
             Install plugin
           </Button>
         </Stack>
@@ -456,7 +461,11 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
         </DialogContent>
         <DialogActions sx={{ px: 3, py: 2 }}>
           {editingId ? (
-            <Button variant="outlined" onClick={() => handleTest(editingId)} disabled={busy}>
+            <Button variant="contained" onClick={() => handleTest(editingId)} disabled={busy} sx={{
+                textTransform: "none",
+                fontWeight: 600,
+                px: 3,
+              }}>
               Test plugin
             </Button>
           ) : null}
@@ -464,7 +473,11 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           <Button onClick={closeDialog} disabled={busy}>
             Cancel
           </Button>
-          <Button variant="contained" onClick={handleSave} disabled={busy}>
+          <Button variant="contained" onClick={handleSave} disabled={busy} sx={{
+              textTransform: "none",
+              fontWeight: 600,
+              px: 3,
+            }}>
             {editingId ? "Save Plugin" : "Install Plugin"}
           </Button>
         </DialogActions>

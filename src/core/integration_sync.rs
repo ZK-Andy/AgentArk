@@ -526,6 +526,22 @@ async fn google_workspace_connected(ctx: &IntegrationSyncContext) -> bool {
         .unwrap_or(false)
 }
 
+fn integration_uses_config_only_status(integration_id: &str) -> bool {
+    matches!(
+        integration_id,
+        "twitter"
+            | "google_places"
+            | "twilio"
+            | "ordering"
+            | "garmin"
+            | "whoop"
+            | "ga4"
+            | "gsc"
+            | "social_analytics"
+            | "moltbook"
+    )
+}
+
 async fn integration_connected(
     ctx: &IntegrationSyncContext,
     manager: &crate::integrations::IntegrationManager,
@@ -539,6 +555,9 @@ async fn integration_connected(
     }
     if integration_id == "google_workspace" {
         return google_workspace_connected(ctx).await;
+    }
+    if integration_uses_config_only_status(integration_id) {
+        return false;
     }
     let Some(integration) = manager.get(integration_id) else {
         return false;

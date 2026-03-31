@@ -588,6 +588,42 @@ fn require_slack_signature_headers(
     Ok(())
 }
 
+fn verify_webhook_request_with_config(
+    config: Option<&SlackChannelConfig>,
+    raw_body: &[u8],
+    timestamp: Option<&str>,
+    signature: Option<&str>,
+) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+
+    require_slack_signature_headers(&config.signing_secret, timestamp, signature)?;
+    if config.signing_secret.trim().is_empty() {
+        return Ok(());
+    }
+
+    let (Some(ts), Some(sig)) = (timestamp, signature) else {
+        return Err(anyhow!(
+            "Slack signature headers are required when a signing secret is configured"
+        ));
+    };
+    verify_slack_signature(&config.signing_secret, ts, sig, raw_body)
+}
+
+pub async fn verify_webhook_request(
+    agent: SharedAgent,
+    raw_body: &[u8],
+    timestamp: Option<&str>,
+    signature: Option<&str>,
+) -> Result<()> {
+    let config = {
+        let agent = agent.read().await;
+        load_config(&agent).await?
+    };
+    verify_webhook_request_with_config(config.as_ref(), raw_body, timestamp, signature)
+}
+
 /// Send a Slack message to the last seen destination or default channel.
 pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     let config = load_config(agent)
@@ -613,18 +649,7 @@ pub async fn handle_webhook(
         let agent = agent.read().await;
         load_config(&agent).await?
     };
-
-    if let Some(config) = &config {
-        require_slack_signature_headers(&config.signing_secret, timestamp, signature)?;
-        if !config.signing_secret.trim().is_empty() {
-            let (Some(ts), Some(sig)) = (timestamp, signature) else {
-                return Err(anyhow!(
-                    "Slack signature headers are required when a signing secret is configured"
-                ));
-            };
-            verify_slack_signature(&config.signing_secret, ts, sig, raw_body)?;
-        }
-    }
+    verify_webhook_request_with_config(config.as_ref(), raw_body, timestamp, signature)?;
 
     if payload.event_type == "url_verification" {
         let challenge = payload
@@ -732,9 +757,10 @@ pub async fn handle_webhook(
     let response = {
         let agent = agent.read().await;
         persist_destination(&agent, &conversation_context).await?;
-        agent
-            .process_message(text, "slack", Some(&conversation_id), None)
-            .await?
+        let processed = agent
+            .process_message_with_meta(text, "slack", Some(&conversation_id), None)
+            .await?;
+        Agent::render_plain_channel_response(processed)
     };
 
     if response.trim().is_empty() {
@@ -806,7 +832,11 @@ mod tests {
     #[tokio::test]
     async fn record_event_id_is_idempotent_for_retries() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         assert!(!record_slack_event_id(&storage, "evt-1").await.unwrap());
         assert!(record_slack_event_id(&storage, "evt-1").await.unwrap());
     }

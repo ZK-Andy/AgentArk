@@ -36,6 +36,24 @@ fn app_deploy_chat_progress_message(
         )
     } else if lower.starts_with("deploying repo service ") {
         Some("I'm standing up one of the detected repo services now.".to_string())
+    } else if lower == "deploy payload is malformed. regenerating tool arguments." {
+        Some(
+            "The first deploy payload was invalid. I'm repairing it automatically now.".to_string(),
+        )
+    } else if lower.starts_with("still regenerating deploy payload") {
+        Some("I'm still repairing the deploy payload automatically.".to_string())
+    } else if lower == "recovered a valid direct deploy plan."
+        || lower == "recovered valid deploy payload. continuing deployment."
+        || lower.starts_with("recovered deploy payload from ")
+        || lower.starts_with("recovered deployment from ")
+        || lower.starts_with("detected deployable app files after a read-only detour")
+    {
+        Some("Self-heal worked. I'm continuing with deployment now.".to_string())
+    } else if lower == "shell-first app plan detected. regenerating as direct deploy." {
+        Some(
+            "I detected a shell detour and switched back to direct deploy automatically."
+                .to_string(),
+        )
     } else if lower.starts_with("writing ") || lower.contains(" line ") {
         if state.announced_file_writes {
             None
@@ -95,6 +113,106 @@ fn app_deploy_chat_progress_message(
     Some(message)
 }
 
+async fn maybe_advance_app_deploy_plan_to_validation(
+    trace_ref: &Arc<RwLock<ExecutionTrace>>,
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    detail: &str,
+) {
+    let phase_ids = {
+        let trace = trace_ref.read().await;
+        trace.plan.as_ref().map(|plan| {
+            (
+                super::find_execution_plan_step_id(
+                    plan,
+                    super::APP_DEPLOY_PREPARE_TOOL_HINT,
+                    &[PlanStepStatus::Pending, PlanStepStatus::Running],
+                ),
+                super::find_execution_plan_step_id(
+                    plan,
+                    super::APP_DEPLOY_VALIDATE_TOOL_HINT,
+                    &[PlanStepStatus::Pending, PlanStepStatus::Running],
+                ),
+            )
+        })
+    };
+    let Some((prepare_id, validate_id)) = phase_ids else {
+        return;
+    };
+    if let Some(step_id) = prepare_id {
+        let _ = super::set_execution_plan_step_status_streaming(
+            trace_ref,
+            stream_tx,
+            step_id,
+            PlanStepStatus::Completed,
+            Some("Runtime preparation finished.".to_string()),
+        )
+        .await;
+    }
+    if let Some(step_id) = validate_id {
+        let _ = super::set_execution_plan_step_status_streaming(
+            trace_ref,
+            stream_tx,
+            step_id,
+            PlanStepStatus::Running,
+            Some(detail.to_string()),
+        )
+        .await;
+    }
+}
+
+async fn maybe_advance_app_deploy_plan_from_progress(
+    trace_ref: &Arc<RwLock<ExecutionTrace>>,
+    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    ev: &crate::core::StreamEvent,
+) {
+    let content = match ev {
+        crate::core::StreamEvent::ToolProgress { name, content, .. }
+        | crate::core::StreamEvent::ToolResult { name, content }
+            if name == "app_deploy" =>
+        {
+            content.trim()
+        }
+        _ => return,
+    };
+    if content.is_empty() {
+        return;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    if lower.starts_with("validating deployed app")
+        || lower.starts_with("starting server on port ")
+        || lower == "server container started"
+        || lower.starts_with("static app ready at ")
+        || lower.starts_with("dynamic app ready at ")
+        || lower.starts_with("starting remote access for app sharing")
+        || lower.starts_with("starting public tunnel for app access")
+        || lower.starts_with("starting cloudflare tunnel for public app access")
+    {
+        maybe_advance_app_deploy_plan_to_validation(trace_ref, stream_tx, content).await;
+    }
+}
+
+fn summarize_file_write_stream_payload(arguments: &serde_json::Value) -> serde_json::Value {
+    let path = arguments
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let content = arguments
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    serde_json::json!({
+        "kind": "file_write",
+        "path": path,
+        "content": content,
+        "file_bytes": content.len(),
+        "line_count": content.lines().count()
+    })
+}
+
 fn merge_chat_visible_progress_payload(
     payload: Option<serde_json::Value>,
     chat_message: &str,
@@ -111,6 +229,23 @@ fn merge_chat_visible_progress_payload(
     merged.insert("chat_visible".to_string(), serde_json::json!(true));
     merged.insert("chat_message".to_string(), serde_json::json!(chat_message));
     Some(serde_json::Value::Object(merged))
+}
+
+fn phase_status_payload(
+    tool_name: &str,
+    phase: &str,
+    label: &str,
+    detail: &str,
+    elapsed_secs: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "phase_status",
+        "phase": phase,
+        "label": label,
+        "detail": detail,
+        "elapsed_secs": elapsed_secs,
+        "stream_key": format!("phase-status:{}:{}", tool_name, phase),
+    })
 }
 
 fn trace_json_data(value: serde_json::Value) -> Option<String> {
@@ -238,6 +373,7 @@ pub(crate) struct ToolCallOutput {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolExecutionBatch {
     pub outputs: Vec<ToolCallOutput>,
+    pub outcomes: Vec<crate::core::ToolOutcome>,
 }
 
 fn action_has_dangerous_capabilities(action_def: Option<&crate::actions::ActionDef>) -> bool {
@@ -396,6 +532,23 @@ impl ToolExecutionBatch {
             .map(|output| output.content.clone())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    pub(crate) fn degradation_notes(&self) -> Vec<crate::core::DegradationNote> {
+        self.outcomes
+            .iter()
+            .filter_map(|outcome| match outcome.status {
+                crate::core::ToolOutcomeStatus::Success => None,
+                _ => Some(crate::core::DegradationNote {
+                    kind: "tool".to_string(),
+                    summary: format!("{}: {}", outcome.name, outcome.status.as_str()),
+                    detail: outcome
+                        .error
+                        .clone()
+                        .or_else(|| Some(outcome.content.clone())),
+                }),
+            })
+            .collect()
     }
 }
 
@@ -1805,6 +1958,7 @@ impl Agent {
           "local_url": local_url,
           "access_url": relative_access_url,
           "local_access_url": local_access_url,
+          "enabled": app.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
           "running": app.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
           "is_static": app.get("is_static").and_then(|v| v.as_bool()).unwrap_or(true),
           "runtime_mode": app.get("runtime_mode").and_then(|v| v.as_str()).unwrap_or("unknown"),
@@ -2164,25 +2318,54 @@ impl Agent {
         best_fuzzy
     }
 
-    #[allow(dead_code)]
-    async fn build_app_deploy_self_heal_arguments(
+    fn build_app_deploy_self_heal_context(current_args: &serde_json::Value) -> serde_json::Value {
+        let normalized = Self::normalize_app_deploy_arguments(current_args);
+        let normalized_obj = normalized.as_object();
+        let raw_serialized = match current_args {
+            serde_json::Value::String(raw) => raw.clone(),
+            other => other.to_string(),
+        };
+
+        serde_json::json!({
+            "raw_argument_kind": match current_args {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+            },
+            "raw_arguments_excerpt": safe_truncate(&raw_serialized, 12_000),
+            "normalized_arguments": normalized,
+            "surviving_metadata": {
+                "title": normalized_obj.and_then(|obj| obj.get("title")).cloned(),
+                "repo_url": normalized_obj.and_then(|obj| obj.get("repo_url")).cloned(),
+                "repo_ref": normalized_obj.and_then(|obj| obj.get("repo_ref")).cloned(),
+                "repo_subdir": normalized_obj.and_then(|obj| obj.get("repo_subdir")).cloned(),
+                "service_mode": normalized_obj.and_then(|obj| obj.get("service_mode")).cloned(),
+                "entry_command": normalized_obj.and_then(|obj| obj.get("entry_command")).cloned(),
+                "install_command": normalized_obj.and_then(|obj| obj.get("install_command")).cloned(),
+                "runtime_image": normalized_obj.and_then(|obj| obj.get("runtime_image")).cloned(),
+                "runtime_preference": normalized_obj.and_then(|obj| obj.get("runtime_preference")).cloned(),
+                "required_inputs": normalized_obj.and_then(|obj| obj.get("required_inputs")).cloned(),
+                "config": normalized_obj.and_then(|obj| obj.get("config")).cloned(),
+                "files": normalized_obj.and_then(|obj| obj.get("files")).cloned(),
+            }
+        })
+    }
+
+    pub(crate) async fn build_app_deploy_self_heal_arguments(
         &self,
+        llm_client: &crate::core::llm::LlmClient,
         current_args: &serde_json::Value,
         validation_issue: &str,
+        original_request: Option<&str>,
         request_channel: &str,
         attempt: usize,
         max_attempts: usize,
+        token_tx: Option<tokio::sync::mpsc::Sender<crate::core::StreamEvent>>,
     ) -> Result<serde_json::Value> {
-        let context = serde_json::json!({
-            "title": current_args.get("title"),
-            "entry_command": current_args.get("entry_command"),
-            "install_command": current_args.get("install_command"),
-            "runtime_image": current_args.get("runtime_image"),
-            "runtime_preference": current_args.get("runtime_preference"),
-            "required_inputs": current_args.get("required_inputs"),
-            "config": current_args.get("config"),
-            "files": current_args.get("files"),
-        });
+        let context = Self::build_app_deploy_self_heal_context(current_args);
         let context_json = serde_json::to_string(&context).unwrap_or_default();
         if context_json.len() > 180_000 {
             anyhow::bail!(
@@ -2191,26 +2374,52 @@ impl Agent {
             );
         }
 
-        let system_prompt = "You repair broken deployed apps. Return ONLY a JSON object. No markdown, no explanations.";
+        let system_prompt = "You repair malformed app_deploy arguments. Return ONLY a JSON object. No markdown, no explanations.";
         let user_prompt = format!(
-            "A deployed app failed runtime validation.\n\
+            "An app_deploy payload must be repaired before execution.\n\
 Attempt {}/{}.\n\
-Validation issue:\n{}\n\n\
-Current app_deploy context (JSON):\n{}\n\n\
-Return a JSON object with at least a complete `files` object.\n\
-Optional keys you may include when needed: `entry_command`, `install_command`, `runtime_image`, `runtime_preference`, `required_inputs`, `config`.\n\
-Do not include any extra prose.",
+Issue:\n{}\n\n\
+Original user request:\n{}\n\n\
+Malformed payload context (JSON):\n{}\n\n\
+Return a JSON object that can be used directly as the `app_deploy` arguments.\n\
+Requirements:\n\
+- Include a complete non-empty `files` object unless a real `repo_url` is present.\n\
+- Preserve valid metadata when it helps, but drop broken or oversized fields.\n\
+- Prefer a compact implementation with a small set of real project files.\n\
+- Avoid giant inline shell bootstrap commands, long `python -c` strings, or huge one-line setup scripts when normal files are enough.\n\
+- Do not include any extra prose.",
             attempt,
             max_attempts,
             validation_issue.trim(),
+            original_request.unwrap_or("(not available)"),
             context_json
         );
 
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
-        let repair = self
-            .llm
-            .chat(system_prompt, &user_prompt, &[], &empty_actions)
-            .await?;
+        let repair = match super::run_timed_llm_call_with_heartbeat(
+            llm_client,
+            system_prompt,
+            &user_prompt,
+            &[],
+            &[],
+            &empty_actions,
+            token_tx,
+            super::TOOL_FOLLOWUP_LLM_TIMEOUT_SECS,
+            "Rebuilding deploy payload from malformed arguments",
+            false,
+            "app_deploy",
+        )
+        .await
+        {
+            super::TimedLlmCallOutcome::Success(repair) => repair,
+            super::TimedLlmCallOutcome::Error(error) => return Err(error),
+            super::TimedLlmCallOutcome::TimedOut => {
+                anyhow::bail!(
+                    "self-heal model timed out after {} seconds",
+                    super::TOOL_FOLLOWUP_LLM_TIMEOUT_SECS
+                )
+            }
+        };
         self.record_llm_usage(request_channel, "app_deploy_self_heal", &repair)
             .await;
 
@@ -2297,13 +2506,20 @@ Do not include any extra prose.",
 
         for attempt in 1..=MAX_APP_VERIFY_ATTEMPTS {
             if let Some(tx) = stream_tx {
+                let detail = format!(
+                    "Validating deployed app (attempt {}/{})",
+                    attempt, MAX_APP_VERIFY_ATTEMPTS
+                );
                 let _ = tx.try_send(StreamEvent::ToolProgress {
                     name: "app_deploy".to_string(),
-                    content: format!(
-                        "Validating deployed app (attempt {}/{})",
-                        attempt, MAX_APP_VERIFY_ATTEMPTS
-                    ),
-                    payload: None,
+                    content: detail.clone(),
+                    payload: Some(phase_status_payload(
+                        "app_deploy",
+                        "validating",
+                        "Validating",
+                        &detail,
+                        0,
+                    )),
                 });
             }
 
@@ -2805,10 +3021,17 @@ Do not include any extra prose.",
 
         if start_accepted {
             if let Some(tx) = stream_tx {
+                let detail = "Starting remote access for app sharing...".to_string();
                 let _ = tx.try_send(StreamEvent::ToolProgress {
                     name: "app_deploy".to_string(),
-                    content: "Starting remote access for app sharing...".to_string(),
-                    payload: None,
+                    content: detail.clone(),
+                    payload: Some(phase_status_payload(
+                        "app_deploy",
+                        "link_setup",
+                        "Link setup",
+                        &detail,
+                        0,
+                    )),
                 });
             }
         } else {
@@ -3412,6 +3635,10 @@ Do not include any extra prose.",
             meta["access_key"] = serde_json::Value::String(access_key.clone());
             meta_changed = true;
         }
+        if meta.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+            meta["enabled"] = serde_json::Value::Bool(true);
+            meta_changed = true;
+        }
         if meta_changed {
             let _ = tokio::fs::write(
                 &meta_path,
@@ -3419,6 +3646,7 @@ Do not include any extra prose.",
             )
             .await;
         }
+        let _ = self.app_registry.set_enabled(app_id, true).await;
 
         self.app_registry.stop_runtime(app_id).await?;
 
@@ -3519,6 +3747,7 @@ Do not include any extra prose.",
                         port,
                         access_key: access_key.clone(),
                         access_guard_enabled,
+                        enabled: true,
                     },
                 )
                 .await;
@@ -3558,6 +3787,7 @@ Do not include any extra prose.",
                 app_dir,
                 access_key.clone(),
                 access_guard_enabled,
+                true,
             )
             .await;
         Ok(serde_json::json!({
@@ -3916,8 +4146,7 @@ Do not include any extra prose.",
                 })
             } else {
                 let mut results = Vec::new();
-                let mut stopped_count = 0usize;
-                let mut skipped_static_count = 0usize;
+                let mut disabled_count = 0usize;
                 let mut failed_count = 0usize;
                 for (app, _meta) in bundle_apps {
                     let app_id = app
@@ -3930,29 +4159,35 @@ Do not include any extra prose.",
                         .and_then(|v| v.as_str())
                         .unwrap_or("App")
                         .to_string();
-                    if app
+                    let disable_result = if app
                         .get("is_static")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                     {
-                        skipped_static_count += 1;
-                        results.push(serde_json::json!({
-                            "app_id": app_id,
-                            "title": title,
-                            "status": "skipped_static",
-                            "message": "Static apps do not have a runtime to stop."
-                        }));
-                        continue;
-                    }
-                    match self.app_registry.stop_runtime(&app_id).await {
-                        Ok(_) => {
-                            stopped_count += 1;
-                            results.push(serde_json::json!({
-                                "app_id": app_id,
-                                "title": title,
-                                "status": "stopped"
-                            }));
-                        }
+                        Ok(())
+                    } else {
+                        self.app_registry.stop_runtime(&app_id).await
+                    };
+                    match disable_result {
+                        Ok(_) => match self.app_registry.set_enabled(&app_id, false).await {
+                            Ok(_) => {
+                                disabled_count += 1;
+                                results.push(serde_json::json!({
+                                    "app_id": app_id,
+                                    "title": title,
+                                    "status": "disabled"
+                                }));
+                            }
+                            Err(error) => {
+                                failed_count += 1;
+                                results.push(serde_json::json!({
+                                    "app_id": app_id,
+                                    "title": title,
+                                    "status": "failed",
+                                    "error": error.to_string()
+                                }));
+                            }
+                        },
                         Err(error) => {
                             failed_count += 1;
                             results.push(serde_json::json!({
@@ -3964,14 +4199,13 @@ Do not include any extra prose.",
                         }
                     }
                 }
-                if stopped_count > 0 {
-                    self.trigger_arkpulse_refresh("app_stop");
+                if disabled_count > 0 {
+                    self.trigger_arkpulse_refresh("app_disable");
                 }
                 serde_json::json!({
-                    "status": if failed_count == 0 { "stopped" } else { "partial_failure" },
+                    "status": if failed_count == 0 { "disabled" } else { "partial_failure" },
                     "bundle_id": bundle_id,
-                    "stopped_count": stopped_count,
-                    "skipped_static_count": skipped_static_count,
+                    "disabled_count": disabled_count,
                     "failed_count": failed_count,
                     "apps": results,
                 })
@@ -4020,23 +4254,22 @@ Do not include any extra prose.",
                     row.get("id").and_then(|v| v.as_str()) == Some(resolved_app_id.as_str())
                 }) {
                     let title = app.get("title").and_then(|v| v.as_str()).unwrap_or("App");
-                    if app
+                    let disable_result = if app
                         .get("is_static")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                     {
-                        serde_json::json!({
-                            "status": "skipped_static",
-                            "app_id": resolved_app_id,
-                            "title": title,
-                            "message": "Static apps do not have a runtime to stop."
-                        })
+                        Ok(())
                     } else {
-                        match self.app_registry.stop_runtime(&resolved_app_id).await {
+                        self.app_registry.stop_runtime(&resolved_app_id).await
+                    };
+                    match disable_result {
+                        Ok(_) => match self.app_registry.set_enabled(&resolved_app_id, false).await
+                        {
                             Ok(_) => {
-                                self.trigger_arkpulse_refresh("app_stop");
+                                self.trigger_arkpulse_refresh("app_disable");
                                 serde_json::json!({
-                                    "status": "stopped",
+                                    "status": "disabled",
                                     "app_id": resolved_app_id,
                                     "title": title,
                                 })
@@ -4047,7 +4280,13 @@ Do not include any extra prose.",
                                 "title": title,
                                 "error": error.to_string(),
                             }),
-                        }
+                        },
+                        Err(error) => serde_json::json!({
+                            "status": "failed",
+                            "app_id": resolved_app_id,
+                            "title": title,
+                            "error": error.to_string(),
+                        }),
                     }
                 } else {
                     serde_json::json!({
@@ -4260,6 +4499,7 @@ Do not include any extra prose.",
     pub(crate) async fn handle_app_deploy_tool_call(
         &self,
         call: &crate::core::llm::ToolCall,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
         request_channel: &str,
         conversation_id: Option<&str>,
@@ -4272,10 +4512,17 @@ Do not include any extra prose.",
         let telegram_config = self.config.telegram.clone();
         let whatsapp_config = self.config.whatsapp.clone();
         let agent_name = self.config.name.clone();
+        let plan_trace_ref = trace_ref.clone();
         let relay_task = tokio::spawn(async move {
             let mut relay_state = AppDeployProgressRelayState::default();
             while let Some(ev) = progress_rx.recv().await {
                 let chat_message = app_deploy_chat_progress_message(&ev, &mut relay_state);
+                maybe_advance_app_deploy_plan_from_progress(
+                    &plan_trace_ref,
+                    upstream_tx.as_ref(),
+                    &ev,
+                )
+                .await;
                 if let Some(tx) = upstream_tx.as_ref() {
                     let forwarded = match ev {
                         StreamEvent::ToolProgress {
@@ -4368,6 +4615,16 @@ Do not include any extra prose.",
             .get("include_structured")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        let include_procedures = call
+            .arguments
+            .get("include_procedures")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let include_lessons = call
+            .arguments
+            .get("include_lessons")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         let external_sources = call
             .arguments
             .get("external_sources")
@@ -4388,6 +4645,7 @@ Do not include any extra prose.",
             || query.to_ascii_lowercase().contains("moltbook");
 
         let mut sections: Vec<String> = Vec::new();
+        let mut learning_seed_ids: Vec<String> = Vec::new();
 
         if include_semantic {
             let mem0_scope =
@@ -4440,12 +4698,156 @@ Do not include any extra prose.",
             }
         }
 
+        if include_lessons {
+            match self
+                .storage
+                .search_experience_items(
+                    query,
+                    &["constraint", "personal_fact", "lesson"],
+                    project_id,
+                    conversation_id,
+                    limit as u64,
+                )
+                .await
+            {
+                Ok(hits) if !hits.is_empty() => {
+                    learning_seed_ids.extend(hits.iter().map(|hit| hit.item.id.clone()));
+                    let lines = hits
+                        .iter()
+                        .take(limit)
+                        .map(|hit| {
+                            format!(
+                                "- [{}] {} (match {:.2}, confidence {:.0}%): {}",
+                                hit.item.kind,
+                                safe_truncate(&hit.item.title, 80),
+                                hit.score,
+                                hit.item.confidence * 100.0,
+                                safe_truncate(&hit.item.content, 180)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    sections.push(format!(
+                        "## Learned Constraints and Lessons\n{}",
+                        lines.join("\n")
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("memory_lookup learning search failed: {}", error);
+                }
+            }
+        }
+
+        if include_procedures {
+            match self
+                .storage
+                .search_procedural_patterns(query, project_id, conversation_id, limit as u64)
+                .await
+            {
+                Ok(hits) if !hits.is_empty() => {
+                    let lines = hits
+                        .iter()
+                        .take(limit)
+                        .map(|hit| {
+                            let steps = hit
+                                .pattern
+                                .steps_json
+                                .as_array()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|item| item.as_str())
+                                        .take(3)
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or_else(|| safe_truncate(&hit.pattern.summary, 140));
+                            format!(
+                                "- {} (match {:.2}, samples {}, success {:.0}%): {}",
+                                safe_truncate(&hit.pattern.title, 90),
+                                hit.score,
+                                hit.pattern.sample_count,
+                                hit.pattern.success_rate * 100.0,
+                                safe_truncate(&steps, 220)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    sections.push(format!("## Learned Procedures\n{}", lines.join("\n")));
+                }
+                Ok(_) => match self
+                    .storage
+                    .search_experience_items(
+                        query,
+                        &["procedure"],
+                        project_id,
+                        conversation_id,
+                        limit as u64,
+                    )
+                    .await
+                {
+                    Ok(hits) if !hits.is_empty() => {
+                        learning_seed_ids.extend(hits.iter().map(|hit| hit.item.id.clone()));
+                        let lines = hits
+                            .iter()
+                            .take(limit)
+                            .map(|hit| {
+                                format!(
+                                    "- {} (match {:.2}, confidence {:.0}%): {}",
+                                    safe_truncate(&hit.item.title, 90),
+                                    hit.score,
+                                    hit.item.confidence * 100.0,
+                                    safe_truncate(&hit.item.content, 200)
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        sections.push(format!("## Learned Procedures\n{}", lines.join("\n")));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!("memory_lookup procedure fallback failed: {}", error);
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("memory_lookup procedural pattern search failed: {}", error);
+                }
+            }
+        }
+
         if include_structured {
             if let Some(domain_ctx) = self
                 .build_memory_domain_context(query, project_id, &external_sources)
                 .await
             {
                 sections.push(domain_ctx);
+            }
+        }
+
+        if !learning_seed_ids.is_empty() {
+            match self
+                .storage
+                .list_related_experience_items(&learning_seed_ids, 4)
+                .await
+            {
+                Ok(related) if !related.is_empty() => {
+                    let lines = related
+                        .iter()
+                        .take(4)
+                        .map(|item| {
+                            format!(
+                                "- [{}] {}: {}",
+                                item.kind,
+                                safe_truncate(&item.title, 80),
+                                safe_truncate(&item.content, 160)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    sections.push(format!("## Related Learned Evidence\n{}", lines.join("\n")));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("memory_lookup related learning expansion failed: {}", error);
+                }
             }
         }
 
@@ -4476,6 +4878,7 @@ Do not include any extra prose.",
         &self,
         call: &crate::core::llm::ToolCall,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        conversation_id: Option<&str>,
     ) -> Result<String> {
         if let Some(tx) = stream_tx {
             let _ = tx.try_send(StreamEvent::ToolStart {
@@ -4535,6 +4938,9 @@ Do not include any extra prose.",
                         let status = match &goal.status {
                             crate::core::TaskStatus::Pending => "pending",
                             crate::core::TaskStatus::AwaitingApproval => "awaiting approval",
+                            crate::core::TaskStatus::ExpiredNeedsReapproval => {
+                                "expired, needs reapproval"
+                            }
                             crate::core::TaskStatus::Paused => "paused",
                             crate::core::TaskStatus::InProgress => "in progress",
                             crate::core::TaskStatus::Completed => "saved",
@@ -4611,7 +5017,13 @@ Do not include any extra prose.",
                             .iter()
                             .filter(|existing| existing.action == "goal")
                             .find(|existing| {
-                                crate::core::task::tasks_are_semantically_similar(existing, &task)
+                                existing
+                                    .arguments
+                                    .get("goal")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::trim)
+                                    .unwrap_or(existing.description.as_str())
+                                    .eq_ignore_ascii_case(goal)
                             })
                             .and_then(|existing| {
                                 existing
@@ -4630,9 +5042,34 @@ Do not include any extra prose.",
                         }
                     }
                 }
+                let canonical_goal_id = task
+                    .arguments
+                    .get("goal_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(goal_id.as_str())
+                    .to_string();
                 let (_, reused_existing, _) = self
                     .add_or_update_similar_task(task, allow_duplicate)
                     .await?;
+                if let Some(cid) = conversation_id.filter(|value| !value.trim().is_empty()) {
+                    let summary = if reused_existing {
+                        "Recently updated goal in this conversation"
+                    } else {
+                        "Recently saved goal in this conversation"
+                    };
+                    self.persist_conversation_artifact_context(
+                        cid,
+                        super::ConversationArtifactSpec {
+                            artifact_type: "goal",
+                            artifact_id: &canonical_goal_id,
+                            title: goal,
+                            summary,
+                            url: None,
+                            related_actions: &["goal_manage", "list_tasks"],
+                        },
+                    )
+                    .await;
+                }
 
                 if !reused_existing {
                     if let Some(due) = due_date {
@@ -4679,7 +5116,7 @@ Do not include any extra prose.",
                 if let Some(due) = due_date.as_ref() {
                     message.push_str(&format!(" Due {}.", due.format("%Y-%m-%d")));
                 }
-                message.push_str(&format!(" Goal ID: `{}`.", goal_id));
+                message.push_str(&format!(" Goal ID: `{}`.", canonical_goal_id));
                 message
             }
             "delete" => {
@@ -6009,6 +6446,7 @@ Do not include any extra prose.",
             }
         }
         let mut results: Vec<ToolCallOutput> = Vec::new();
+        let mut outcomes: Vec<crate::core::ToolOutcome> = Vec::new();
         for call in unique_calls {
             let call_started = std::time::Instant::now();
             let action_def = action_map.get(&call.name.to_ascii_lowercase());
@@ -6033,6 +6471,11 @@ Do not include any extra prose.",
                     .await;
                 side_effect_cache.insert(Self::tool_call_signature(call), classified);
                 classified
+            };
+            let side_effect_level = if side_effecting {
+                "side_effecting"
+            } else {
+                "read_only"
             };
 
             if !current_turn_is_explicit_approval
@@ -6071,6 +6514,15 @@ Do not include any extra prose.",
                 results.push(ToolCallOutput {
                     name: call.name.clone(),
                     content: msg,
+                });
+                outcomes.push(crate::core::ToolOutcome {
+                    name: call.name.clone(),
+                    content: blocked_by_saved_rule_message(&user_execution_constraints),
+                    status: crate::core::ToolOutcomeStatus::Blocked,
+                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
+                    retryable: false,
+                    side_effect_level: side_effect_level.to_string(),
+                    error: None,
                 });
                 continue;
             }
@@ -6123,7 +6575,28 @@ Do not include any extra prose.",
                         }
                         results.push(ToolCallOutput {
                             name: call.name.clone(),
-                            content: output,
+                            content: output.clone(),
+                        });
+                        outcomes.push(crate::core::ToolOutcome {
+                            name: call.name.clone(),
+                            content: output.clone(),
+                            status: if blocked {
+                                crate::core::ToolOutcomeStatus::Blocked
+                            } else if success {
+                                crate::core::ToolOutcomeStatus::Success
+                            } else {
+                                crate::core::ToolOutcomeStatus::RecoverableError
+                            },
+                            failure_class: if blocked {
+                                Some(crate::core::FailureClass::SafetyBlocked)
+                            } else if success {
+                                None
+                            } else {
+                                Some(crate::core::FailureClass::ToolError)
+                            },
+                            retryable: !blocked && !success,
+                            side_effect_level: side_effect_level.to_string(),
+                            error: (!success).then_some(output),
                         });
                         handled = true;
                         break;
@@ -6155,7 +6628,31 @@ Do not include any extra prose.",
                         .await;
                         self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
                             .await;
-                        return Err(e);
+                        let content = format!(
+                            "Tool '{}' failed, but the request can continue: {}",
+                            call.name, error_text
+                        );
+                        if let Some(ref tx) = stream_tx {
+                            let _ = tx.try_send(StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: content.clone(),
+                            });
+                        }
+                        results.push(ToolCallOutput {
+                            name: call.name.clone(),
+                            content: content.clone(),
+                        });
+                        outcomes.push(crate::core::ToolOutcome {
+                            name: call.name.clone(),
+                            content,
+                            status: crate::core::ToolOutcomeStatus::RecoverableError,
+                            failure_class: Some(crate::core::FailureClass::HandlerError),
+                            retryable: true,
+                            side_effect_level: side_effect_level.to_string(),
+                            error: Some(error_text),
+                        });
+                        handled = true;
+                        break;
                     }
                 }
             }
@@ -6194,12 +6691,24 @@ Do not include any extra prose.",
                 }
                 results.push(ToolCallOutput {
                     name: call.name.clone(),
+                    content: msg.clone(),
+                });
+                outcomes.push(crate::core::ToolOutcome {
+                    name: call.name.clone(),
                     content: msg,
+                    status: crate::core::ToolOutcomeStatus::NoHandler,
+                    failure_class: Some(crate::core::FailureClass::Validation),
+                    retryable: false,
+                    side_effect_level: side_effect_level.to_string(),
+                    error: None,
                 });
             }
         }
 
-        Ok(ToolExecutionBatch { outputs: results })
+        Ok(ToolExecutionBatch {
+            outputs: results,
+            outcomes,
+        })
     }
 
     /// Legacy monolithic tool execution path. New dispatchers route through
@@ -6239,6 +6748,8 @@ Do not include any extra prose.",
             if let Some(ref tx) = stream_tx {
                 let payload = if call.name == "app_deploy" {
                     Some(Self::summarize_app_deploy_stream_payload(&call.arguments))
+                } else if call.name == "file_write" {
+                    Some(summarize_file_write_stream_payload(&call.arguments))
                 } else {
                     None
                 };
@@ -6794,7 +7305,10 @@ Do not include any extra prose.",
                     .is_none()
                 {
                     if let Some(obj) = resolved_args.as_object_mut() {
-                        obj.insert("runtime_preference".to_string(), serde_json::json!("local"));
+                        obj.insert(
+                            "runtime_preference".to_string(),
+                            serde_json::json!("container"),
+                        );
                     }
                 }
                 if resolved_args
@@ -7229,6 +7743,13 @@ Do not include any extra prose.",
                                 if let Some(cid) =
                                     conversation_id.filter(|value| !value.trim().is_empty())
                                 {
+                                    self.persist_last_deployed_app_context(
+                                        cid,
+                                        app_id,
+                                        title,
+                                        &format!("/apps/{}/", app_id),
+                                    )
+                                    .await;
                                     self.remember_pending_secret_followup(
                                         cid,
                                         PendingSecretFollowupKind::RestartApp {
@@ -7368,13 +7889,14 @@ Do not include any extra prose.",
                                     Some(local_base_url.as_str()),
                                     &canonical_relative_url,
                                 );
-                                if let Some(cid) = call
+                                let conversation_scope_id = call
                                     .arguments
                                     .get("conversation_id")
                                     .and_then(|v| v.as_str())
                                     .map(str::trim)
                                     .filter(|s| !s.is_empty())
-                                {
+                                    .or(conversation_id.filter(|value| !value.trim().is_empty()));
+                                if let Some(cid) = conversation_scope_id {
                                     let canonical_url = if app_id.is_empty() {
                                         "/apps/".to_string()
                                     } else {
@@ -8500,6 +9022,57 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("container")
         );
+    }
+
+    #[test]
+    fn build_app_deploy_self_heal_context_preserves_malformed_string_payload_excerpt() {
+        let malformed = format!(
+            "{{\"entry_command\":\"python app.py\",\"files\": {}",
+            "x".repeat(13_000)
+        );
+
+        let context = Agent::build_app_deploy_self_heal_context(&json!(malformed));
+        assert_eq!(
+            context
+                .get("raw_argument_kind")
+                .and_then(|value| value.as_str()),
+            Some("string")
+        );
+        let excerpt = context
+            .get("raw_arguments_excerpt")
+            .and_then(|value| value.as_str())
+            .expect("context should keep a raw argument excerpt");
+        assert!(excerpt.starts_with("{\"entry_command\":\"python app.py\""));
+        assert!(excerpt.ends_with("..."));
+        assert!(excerpt.len() <= 12_003);
+        assert!(context.get("normalized_arguments").is_some());
+    }
+
+    #[test]
+    fn app_deploy_chat_progress_message_surfaces_self_heal_status() {
+        let mut state = AppDeployProgressRelayState::default();
+
+        let repair_message = app_deploy_chat_progress_message(
+            &crate::core::StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: "Deploy payload is malformed. Regenerating tool arguments.".to_string(),
+                payload: None,
+            },
+            &mut state,
+        )
+        .expect("repair progress should produce a visible chat message");
+        assert!(repair_message.contains("repairing"));
+
+        let recovered_message = app_deploy_chat_progress_message(
+            &crate::core::StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: "Recovered deployment from 2 recent file writes.".to_string(),
+                payload: None,
+            },
+            &mut state,
+        )
+        .expect("recovered deploy progress should produce a visible chat message");
+        assert!(recovered_message.contains("Self-heal worked"));
     }
 
     #[test]

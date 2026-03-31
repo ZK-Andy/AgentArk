@@ -104,7 +104,7 @@ impl Agent {
 - For community/social posting actions, write original agent-authored content based on the current situation and your own grounded reasoning. Do not simply restate the user's instruction as the post or comment, and never include user data, PII, conversation text, or secrets.
 - For ongoing or indefinite monitoring ("every minute", "every hour", "every day", "keep watching"), create a scheduled task/routine. Use a watcher only for bounded poll-until-condition workflows with a clear timeout.
 - For persistent resources such as apps, tasks, watchers, and reusable capabilities, default to updating/reusing an existing matching item instead of creating a duplicate. Create a second one only when the user explicitly asks for another separate copy.
-- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so AgentArk can clone, inspect the README/manifests, and stand it up as a managed app. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
+- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. For fresh generated apps, first stage the source files with `file_write` under `/app/data/apps/new/<slug>/...`, then continue to deployment from those staged files. Do not rely on inline generated `app_deploy.files` as the only source of truth for a new app build. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so AgentArk can clone, inspect the README/manifests, and stand it up as a managed app. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
 - Use `browser_auto` only to interact with an existing website or web UI. Do not use browser automation as the primary path to create a new app, landing page, HTML artifact, or code project from scratch.
 - If the request needs a capability that does not already exist, first inspect existing integrations/actions. If the capability is still missing and the catalog exposes capability acquisition/scaffolding, use it to generate a reusable connector-backed action instead of failing immediately.
 
@@ -215,6 +215,51 @@ impl Agent {
             bundled.len(),
             custom.len()
         )];
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let cpu_count = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(0);
+        let docker_host = std::env::var("DOCKER_HOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let container_runtime_available =
+            docker_host.is_some() || std::path::Path::new("/var/run/docker.sock").exists();
+        let managed_apps_root = std::path::Path::new("/app/data/apps").exists();
+        lines.push(format!(
+            "- Operating context: running inside AgentArk from workspace `{}`{}.",
+            cwd,
+            if cpu_count > 0 {
+                format!(" with {} logical CPU(s) visible", cpu_count)
+            } else {
+                String::new()
+            }
+        ));
+        if container_runtime_available {
+            lines.push(
+                "- Container runtime is configured for this session. Prefer containerized `app_deploy` unless the user explicitly asks for a local process."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "- Container runtime is not currently configured in this session, so deployments may need a local process fallback."
+                    .to_string(),
+            );
+        }
+        if let Some(host) = docker_host {
+            lines.push(format!(
+                "- Docker access is routed through `{}`.",
+                safe_truncate(&host, 120)
+            ));
+        }
+        if managed_apps_root {
+            lines.push(
+                "- Managed deployed apps live under `/app/data/apps/<id>` and should be treated as persistent app workspaces."
+                    .to_string(),
+            );
+        }
 
         let mut surfaces = Vec::new();
         if actions.iter().any(|action| action.name == "list_tasks") {
@@ -419,6 +464,7 @@ impl Agent {
             - 2-8 steps maximum. Be concise.\n\
             - Each step should be one logical action, not a sub-plan.\n\
             - Order matters — steps execute sequentially.\n\
+            - Use a tool_hint only when it exactly matches one available action name; otherwise return null.\n\
             - The last step should present/summarize the result to the user.\n\
             - Return ONLY the JSON array. No markdown fences, no explanation.",
             action_names.join(", ")

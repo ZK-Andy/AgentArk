@@ -349,9 +349,15 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let shared = Arc::new(RwLock::new(
-            Agent::init(config_dir.path(), data_dir.path(), None)
-                .await
-                .unwrap(),
+            Agent::init(
+                config_dir.path(),
+                data_dir.path(),
+                crate::storage::DatabaseConfig::for_tests()
+                    .expect("test database config should initialize"),
+                None,
+            )
+            .await
+            .unwrap(),
         ));
         let (trace_history, last_trace, tasks, user_profile, security_events, app_registry) = {
             let guard = shared.read().await;

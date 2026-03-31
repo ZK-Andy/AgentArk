@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
@@ -115,6 +116,240 @@ fn effective_openai_base_url(base_url: Option<&str>) -> &str {
         Some(url) if is_codex_cli_base_url(Some(url)) => "https://api.openai.com/v1",
         Some(url) => url,
         None => "https://api.openai.com/v1",
+    }
+}
+
+fn tool_argument_progress_step(tool_name: &str) -> usize {
+    if tool_name.trim().eq_ignore_ascii_case("app_deploy") {
+        250
+    } else {
+        800
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftFilePreview {
+    file: String,
+    content_snapshot: String,
+    line_count: usize,
+    total_lines: Option<usize>,
+    done: bool,
+}
+
+fn parse_partial_tool_arguments(raw: &str) -> Option<(serde_json::Value, bool)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some((parsed, true));
+    }
+    repair_truncated_json(trimmed).map(|parsed| (parsed, false))
+}
+
+fn collect_app_deploy_partial_files(
+    parsed: &serde_json::Value,
+    done: bool,
+) -> Vec<DraftFilePreview> {
+    let Some(obj) = parsed.as_object() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+
+    if let Some(files) = obj.get("files").and_then(|value| value.as_object()) {
+        for (file, value) in files {
+            let Some(content) = value.as_str() else {
+                continue;
+            };
+            if file.trim().is_empty() || content.is_empty() {
+                continue;
+            }
+            let line_count = content.lines().count().max(1);
+            out.push(DraftFilePreview {
+                file: file.trim().to_string(),
+                content_snapshot: content.to_string(),
+                line_count,
+                total_lines: done.then_some(line_count),
+                done,
+            });
+        }
+        return out;
+    }
+
+    if let Some(files) = obj.get("files").and_then(|value| value.as_array()) {
+        for entry in files {
+            let Some(file_obj) = entry.as_object() else {
+                continue;
+            };
+            let file = file_obj
+                .get("path")
+                .and_then(|value| value.as_str())
+                .or_else(|| file_obj.get("name").and_then(|value| value.as_str()))
+                .unwrap_or("")
+                .trim();
+            let content = file_obj
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if file.is_empty() || content.is_empty() {
+                continue;
+            }
+            let line_count = content.lines().count().max(1);
+            out.push(DraftFilePreview {
+                file: file.to_string(),
+                content_snapshot: content.to_string(),
+                line_count,
+                total_lines: done.then_some(line_count),
+                done,
+            });
+        }
+    }
+
+    out
+}
+
+fn collect_file_write_partial_file(
+    parsed: &serde_json::Value,
+    done: bool,
+) -> Option<DraftFilePreview> {
+    let Some(obj) = parsed.as_object() else {
+        return None;
+    };
+    let file = obj
+        .get("path")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("file_path").and_then(|value| value.as_str()))
+        .or_else(|| obj.get("filename").and_then(|value| value.as_str()))
+        .unwrap_or("")
+        .trim();
+    let content = obj
+        .get("content")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("text").and_then(|value| value.as_str()))
+        .or_else(|| obj.get("body").and_then(|value| value.as_str()))
+        .unwrap_or("");
+    if file.is_empty() || content.is_empty() {
+        return None;
+    }
+    let line_count = content.lines().count().max(1);
+    Some(DraftFilePreview {
+        file: file.to_string(),
+        content_snapshot: content.to_string(),
+        line_count,
+        total_lines: done.then_some(line_count),
+        done,
+    })
+}
+
+fn extract_partial_draft_files(tool_name: &str, raw_args: &str) -> Vec<DraftFilePreview> {
+    let Some((parsed, done)) = parse_partial_tool_arguments(raw_args) else {
+        return Vec::new();
+    };
+
+    if tool_name.trim().eq_ignore_ascii_case("app_deploy") {
+        return collect_app_deploy_partial_files(&parsed, done);
+    }
+    if tool_name.trim().eq_ignore_ascii_case("file_write") {
+        return collect_file_write_partial_file(&parsed, done)
+            .into_iter()
+            .collect();
+    }
+    Vec::new()
+}
+
+fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
+    if tool_name.trim().eq_ignore_ascii_case("app_deploy") {
+        ("generating_files", "Generating files")
+    } else if tool_name.trim().eq_ignore_ascii_case("file_write") {
+        ("writing_files", "Drafting file")
+    } else {
+        ("preparing_tool", "Preparing tool")
+    }
+}
+
+async fn emit_stream_tool_progress(
+    token_tx: &Sender<StreamEvent>,
+    name: &str,
+    content: String,
+    payload: serde_json::Value,
+) {
+    let _ = token_tx
+        .send(StreamEvent::ToolProgress {
+            name: name.to_string(),
+            content,
+            payload: Some(payload),
+        })
+        .await;
+}
+
+async fn emit_argument_phase_status(
+    token_tx: &Sender<StreamEvent>,
+    tool_name: &str,
+    detail: String,
+    elapsed_secs: u64,
+) {
+    let (phase, label) = tool_argument_phase(tool_name);
+    emit_stream_tool_progress(
+        token_tx,
+        tool_name,
+        detail.clone(),
+        serde_json::json!({
+            "kind": "phase_status",
+            "phase": phase,
+            "label": label,
+            "detail": detail,
+            "elapsed_secs": elapsed_secs,
+            "stream_key": format!("phase-status:{}:{}", tool_name, phase),
+        }),
+    )
+    .await;
+}
+
+async fn emit_partial_draft_file_previews(
+    token_tx: &Sender<StreamEvent>,
+    tool_name: &str,
+    raw_args: &str,
+    emitted_snapshots: &mut HashMap<String, (usize, bool)>,
+) {
+    for preview in extract_partial_draft_files(tool_name, raw_args) {
+        let stream_key = format!("draft-file:{}:{}", tool_name, preview.file);
+        let snapshot_len = preview.content_snapshot.len();
+        let previous = emitted_snapshots
+            .get(&stream_key)
+            .copied()
+            .unwrap_or((0, false));
+        if snapshot_len <= previous.0 && (!preview.done || previous.1) {
+            continue;
+        }
+        emitted_snapshots.insert(stream_key.clone(), (snapshot_len, preview.done));
+        let file_name = preview.file.clone();
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".to_string(), serde_json::json!("draft_file"));
+        payload.insert("file".to_string(), serde_json::json!(file_name.clone()));
+        payload.insert(
+            "phase".to_string(),
+            serde_json::json!(tool_argument_phase(tool_name).0),
+        );
+        payload.insert("stream_key".to_string(), serde_json::json!(stream_key));
+        payload.insert(
+            "content_snapshot".to_string(),
+            serde_json::json!(preview.content_snapshot),
+        );
+        payload.insert("line".to_string(), serde_json::json!(preview.line_count));
+        payload.insert("done".to_string(), serde_json::json!(preview.done));
+        if let Some(total_lines) = preview.total_lines {
+            payload.insert("total_lines".to_string(), serde_json::json!(total_lines));
+        }
+
+        emit_stream_tool_progress(
+            token_tx,
+            tool_name,
+            format!("Drafting {}", file_name),
+            serde_json::Value::Object(payload),
+        )
+        .await;
     }
 }
 
@@ -556,7 +791,9 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_openai_tool_schema;
+    use super::{
+        extract_partial_draft_files, normalize_openai_tool_schema, parse_partial_tool_arguments,
+    };
 
     #[test]
     fn normalize_openai_tool_schema_removes_top_level_anyof_requirements() {
@@ -647,6 +884,52 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert!(description.contains("Allowed value types: string, number, boolean."));
+    }
+
+    #[test]
+    fn extract_partial_draft_files_reads_partial_app_deploy_files() {
+        let previews = extract_partial_draft_files(
+            "app_deploy",
+            r#"{"title":"Demo","files":{"src/App.tsx":"export default function App() {\n  return <main>Hello</main>;\n}"}}"#,
+        );
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].file, "src/App.tsx");
+        assert!(previews[0].content_snapshot.contains("Hello"));
+        assert_eq!(previews[0].line_count, 3);
+        assert!(previews[0].done);
+    }
+
+    #[test]
+    fn extract_partial_draft_files_reads_partial_file_write_content() {
+        let previews = extract_partial_draft_files(
+            "file_write",
+            r#"{"path":"/app/data/apps/new/demo/server.js","content":"console.log('demo');\nstart();"}"#,
+        );
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].file, "/app/data/apps/new/demo/server.js");
+        assert!(previews[0].content_snapshot.contains("start();"));
+        assert_eq!(previews[0].line_count, 2);
+        assert!(previews[0].done);
+    }
+
+    #[test]
+    fn parse_partial_tool_arguments_repairs_truncated_json() {
+        let parsed = parse_partial_tool_arguments(
+            r#"{"path":"/app/data/apps/new/demo/index.html","content":"<main>Hello""#,
+        )
+        .expect("partial json should repair");
+
+        assert!(!parsed.1);
+        assert_eq!(
+            parsed.0.get("path").and_then(|value| value.as_str()),
+            Some("/app/data/apps/new/demo/index.html")
+        );
+        assert_eq!(
+            parsed.0.get("content").and_then(|value| value.as_str()),
+            Some("<main>Hello")
+        );
     }
 }
 
@@ -873,6 +1156,14 @@ impl LlmClient {
             LlmProvider::Anthropic { model, .. } => model,
             LlmProvider::OpenAI { model, .. } => model,
             LlmProvider::Ollama { model, .. } => model,
+        }
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        match &self.provider {
+            LlmProvider::Anthropic { .. } => "anthropic",
+            LlmProvider::OpenAI { base_url, .. } => openai_provider_label(base_url.as_deref()),
+            LlmProvider::Ollama { .. } => "ollama",
         }
     }
 
@@ -1964,6 +2255,8 @@ impl LlmClient {
             name: String,
             args: String,
             last_progress_emit_chars: usize,
+            last_progress_emit_at: Option<std::time::Instant>,
+            emitted_draft_snapshots: HashMap<String, (usize, bool)>,
         }
 
         let tools: Vec<OpenAITool> = actions
@@ -2096,7 +2389,6 @@ impl LlmClient {
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
         let mut first_token = true;
-        const TOOL_ARG_PROGRESS_STEP: usize = 4000;
         const INTER_CHUNK_TIMEOUT_SECS: u64 = 30;
         const FIRST_TOKEN_TIMEOUT_SECS: u64 = 300; // Slow models (GLM-5) may need minutes for TTFT
 
@@ -2204,55 +2496,116 @@ impl LlmClient {
                     }
                     if let Some(tcs) = choice.delta.tool_calls {
                         for tc in tcs {
-                            let entry = tool_builders.entry(tc.index).or_default();
-                            if entry.id.is_empty() {
-                                if let Some(id) = tc.id {
-                                    entry.id = id;
-                                }
-                            }
-                            if let Some(func) = tc.function {
-                                if entry.name.is_empty() {
-                                    if let Some(name) = func.name {
-                                        entry.name = name;
+                            let progress_update = {
+                                let entry = tool_builders.entry(tc.index).or_default();
+                                if entry.id.is_empty() {
+                                    if let Some(id) = tc.id {
+                                        entry.id = id;
                                     }
                                 }
-                                if let Some(args) = func.arguments {
-                                    match args {
-                                        OpenAIStreamFunctionArguments::String(chunk) => {
-                                            entry.args.push_str(&chunk);
+                                if let Some(func) = tc.function {
+                                    if entry.name.is_empty() {
+                                        if let Some(name) = func.name {
+                                            entry.name = name;
                                         }
-                                        OpenAIStreamFunctionArguments::Json(value) => {
-                                            if entry.args.is_empty() {
-                                                entry.args = value.to_string();
+                                    }
+                                    if let Some(args) = func.arguments {
+                                        match args {
+                                            OpenAIStreamFunctionArguments::String(chunk) => {
+                                                entry.args.push_str(&chunk);
+                                            }
+                                            OpenAIStreamFunctionArguments::Json(value) => {
+                                                if entry.args.is_empty() {
+                                                    entry.args = value.to_string();
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                let arg_chars = entry.args.chars().count();
-                                let should_emit_progress = !entry.name.is_empty()
-                                    && arg_chars > 0
-                                    && (entry.last_progress_emit_chars == 0
-                                        || arg_chars
-                                            >= entry.last_progress_emit_chars
-                                                + TOOL_ARG_PROGRESS_STEP);
-                                if should_emit_progress {
-                                    entry.last_progress_emit_chars = arg_chars;
-                                    let progress_msg = if entry.name == "app_deploy" {
-                                        format!("Generating deploy payload... {} chars", arg_chars)
+                                    let arg_chars = entry.args.chars().count();
+                                    let progress_step = tool_argument_progress_step(&entry.name);
+                                    let now = std::time::Instant::now();
+                                    let should_emit_progress = !entry.name.is_empty()
+                                        && arg_chars > 0
+                                        && (entry.last_progress_emit_chars == 0
+                                            || arg_chars
+                                                >= entry.last_progress_emit_chars + progress_step
+                                            || entry
+                                                .last_progress_emit_at
+                                                .map(|last_emit| {
+                                                    now.duration_since(last_emit).as_secs() >= 3
+                                                        && arg_chars
+                                                            > entry.last_progress_emit_chars
+                                                })
+                                                .unwrap_or(false));
+                                    if should_emit_progress {
+                                        entry.last_progress_emit_chars = arg_chars;
+                                        entry.last_progress_emit_at = Some(now);
+                                        let progress_msg = if entry.name == "app_deploy" {
+                                            format!(
+                                                "Generating deploy payload... {} chars",
+                                                arg_chars
+                                            )
+                                        } else {
+                                            format!(
+                                                "Generating {} arguments... {} chars",
+                                                entry.name, arg_chars
+                                            )
+                                        };
+                                        Some((
+                                            entry.name.clone(),
+                                            entry.args.clone(),
+                                            progress_msg,
+                                            send_start.elapsed().as_secs(),
+                                            arg_chars,
+                                        ))
                                     } else {
-                                        format!(
-                                            "Generating {} arguments... {} chars",
-                                            entry.name, arg_chars
-                                        )
-                                    };
-                                    let _ = token_tx.try_send(StreamEvent::ToolProgress {
-                                        name: entry.name.clone(),
-                                        content: progress_msg,
-                                        payload: Some(serde_json::json!({
-                                            "kind": "argument_stream",
-                                            "chars": arg_chars,
-                                        })),
-                                    });
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((
+                                tool_name,
+                                raw_args,
+                                progress_msg,
+                                elapsed_secs,
+                                arg_chars,
+                            )) = progress_update
+                            {
+                                let stage = if tool_name == "app_deploy" {
+                                    "payload_build"
+                                } else {
+                                    "argument_build"
+                                };
+                                emit_stream_tool_progress(
+                                    &token_tx,
+                                    &tool_name,
+                                    progress_msg.clone(),
+                                    serde_json::json!({
+                                        "kind": "argument_stream",
+                                        "stage": stage,
+                                        "chars": arg_chars,
+                                        "elapsed_secs": elapsed_secs,
+                                        "stream_key": format!("argument-stream:{}", tool_name),
+                                    }),
+                                )
+                                .await;
+                                emit_argument_phase_status(
+                                    &token_tx,
+                                    &tool_name,
+                                    progress_msg,
+                                    elapsed_secs,
+                                )
+                                .await;
+                                if let Some(entry) = tool_builders.get_mut(&tc.index) {
+                                    emit_partial_draft_file_previews(
+                                        &token_tx,
+                                        &tool_name,
+                                        &raw_args,
+                                        &mut entry.emitted_draft_snapshots,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -2444,6 +2797,8 @@ impl LlmClient {
             input_json: String,
             input_value: Option<serde_json::Value>,
             last_progress_emit_chars: usize,
+            last_progress_emit_at: Option<std::time::Instant>,
+            emitted_draft_snapshots: HashMap<String, (usize, bool)>,
         }
 
         let tools: Vec<AnthropicTool> = actions
@@ -2498,7 +2853,7 @@ impl LlmClient {
 
         let mut content = String::new();
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
-        const TOOL_ARG_PROGRESS_STEP: usize = 4000;
+        let stream_started = std::time::Instant::now();
 
         let mut buffer = String::new();
         let mut current_event: Option<String> = None;
@@ -2559,36 +2914,94 @@ impl LlmClient {
                                 }
                             } else if parsed.delta.delta_type == "input_json_delta" {
                                 if let Some(partial) = parsed.delta.partial_json {
-                                    let entry = tool_builders.entry(parsed.index).or_default();
-                                    entry.input_json.push_str(&partial);
-                                    let arg_chars = entry.input_json.chars().count();
-                                    let should_emit_progress = !entry.name.is_empty()
-                                        && arg_chars > 0
-                                        && (entry.last_progress_emit_chars == 0
-                                            || arg_chars
-                                                >= entry.last_progress_emit_chars
-                                                    + TOOL_ARG_PROGRESS_STEP);
-                                    if should_emit_progress {
-                                        entry.last_progress_emit_chars = arg_chars;
-                                        let progress_msg = if entry.name == "app_deploy" {
-                                            format!(
-                                                "Generating deploy payload... {} chars",
-                                                arg_chars
-                                            )
+                                    let progress_update = {
+                                        let entry = tool_builders.entry(parsed.index).or_default();
+                                        entry.input_json.push_str(&partial);
+                                        let arg_chars = entry.input_json.chars().count();
+                                        let progress_step =
+                                            tool_argument_progress_step(&entry.name);
+                                        let now = std::time::Instant::now();
+                                        let should_emit_progress = !entry.name.is_empty()
+                                            && arg_chars > 0
+                                            && (entry.last_progress_emit_chars == 0
+                                                || arg_chars
+                                                    >= entry.last_progress_emit_chars
+                                                        + progress_step
+                                                || entry
+                                                    .last_progress_emit_at
+                                                    .map(|last_emit| {
+                                                        now.duration_since(last_emit).as_secs() >= 3
+                                                            && arg_chars
+                                                                > entry.last_progress_emit_chars
+                                                    })
+                                                    .unwrap_or(false));
+                                        if should_emit_progress {
+                                            entry.last_progress_emit_chars = arg_chars;
+                                            entry.last_progress_emit_at = Some(now);
+                                            let progress_msg = if entry.name == "app_deploy" {
+                                                format!(
+                                                    "Generating deploy payload... {} chars",
+                                                    arg_chars
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Generating {} arguments... {} chars",
+                                                    entry.name, arg_chars
+                                                )
+                                            };
+                                            Some((
+                                                entry.name.clone(),
+                                                entry.input_json.clone(),
+                                                progress_msg,
+                                                stream_started.elapsed().as_secs(),
+                                                arg_chars,
+                                            ))
                                         } else {
-                                            format!(
-                                                "Generating {} arguments... {} chars",
-                                                entry.name, arg_chars
-                                            )
+                                            None
+                                        }
+                                    };
+                                    if let Some((
+                                        tool_name,
+                                        raw_input_json,
+                                        progress_msg,
+                                        elapsed_secs,
+                                        arg_chars,
+                                    )) = progress_update
+                                    {
+                                        let stage = if tool_name == "app_deploy" {
+                                            "payload_build"
+                                        } else {
+                                            "argument_build"
                                         };
-                                        let _ = token_tx.try_send(StreamEvent::ToolProgress {
-                                            name: entry.name.clone(),
-                                            content: progress_msg,
-                                            payload: Some(serde_json::json!({
+                                        emit_stream_tool_progress(
+                                            &token_tx,
+                                            &tool_name,
+                                            progress_msg.clone(),
+                                            serde_json::json!({
                                                 "kind": "argument_stream",
+                                                "stage": stage,
                                                 "chars": arg_chars,
-                                            })),
-                                        });
+                                                "elapsed_secs": elapsed_secs,
+                                                "stream_key": format!("argument-stream:{}", tool_name),
+                                            }),
+                                        )
+                                        .await;
+                                        emit_argument_phase_status(
+                                            &token_tx,
+                                            &tool_name,
+                                            progress_msg,
+                                            elapsed_secs,
+                                        )
+                                        .await;
+                                        if let Some(entry) = tool_builders.get_mut(&parsed.index) {
+                                            emit_partial_draft_file_previews(
+                                                &token_tx,
+                                                &tool_name,
+                                                &raw_input_json,
+                                                &mut entry.emitted_draft_snapshots,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }

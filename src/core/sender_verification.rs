@@ -406,7 +406,11 @@ mod tests {
     #[tokio::test]
     async fn pairing_policy_requires_approval_then_allows_sender() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         let identity = SenderIdentity {
             channel: SenderChannel::Slack,
             sender_id: "U123".to_string(),
@@ -440,7 +444,11 @@ mod tests {
     #[tokio::test]
     async fn repeated_unknown_sender_updates_pending_without_duplication() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         let identity = SenderIdentity {
             channel: SenderChannel::Teams,
             sender_id: "user@example.com".to_string(),

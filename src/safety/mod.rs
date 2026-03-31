@@ -96,6 +96,9 @@ pub struct SafetyEngine {
     rules: RwLock<Vec<SafetyRule>>,
     rate_limits: RwLock<std::collections::HashMap<String, RateLimitState>>,
     pending_approvals: RwLock<Vec<PendingApproval>>,
+    /// Actions the user has explicitly auto-approved in settings.
+    /// When an action is in this set, RequireApproval rules are downgraded to LogAndAllow.
+    auto_approved: RwLock<std::collections::HashSet<String>>,
 }
 
 struct RateLimitState {
@@ -139,7 +142,25 @@ impl SafetyEngine {
             rules: RwLock::new(rules),
             rate_limits: RwLock::new(std::collections::HashMap::new()),
             pending_approvals: RwLock::new(Vec::new()),
+            auto_approved: RwLock::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// Update the set of auto-approved actions from user settings.
+    /// Actions in AUTO_APPROVE_BLOCKED are silently ignored.
+    pub fn set_auto_approved(&self, actions: &[String]) {
+        let blocked: std::collections::HashSet<&str> = crate::core::config::AUTO_APPROVE_BLOCKED
+            .iter()
+            .copied()
+            .collect();
+        let approved: std::collections::HashSet<String> = actions
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !blocked.contains(s.as_str()))
+            .collect();
+        if let Ok(mut set) = self.auto_approved.write() {
+            *set = approved;
+        }
     }
 
     /// Check if an action is allowed by safety policies.
@@ -185,8 +206,20 @@ impl SafetyEngine {
                             return Ok(false);
                         }
                         RuleAction::RequireApproval => {
-                            // Return false to indicate approval is required
-                            // The caller (agent) should create a task with TaskApproval::RequireApproval
+                            // Check if user has auto-approved this action in settings
+                            let is_auto_approved = self
+                                .auto_approved
+                                .read()
+                                .map(|set| set.contains(action_name))
+                                .unwrap_or(false);
+                            if is_auto_approved {
+                                tracing::info!(
+                                    "Safety rule '{}' auto-approved (user setting) for action: {}",
+                                    rule.name,
+                                    action_name
+                                );
+                                continue; // User explicitly approved — skip this rule
+                            }
                             tracing::info!(
                                 "Safety rule '{}' requires approval for action: {}",
                                 rule.name,
@@ -428,6 +461,26 @@ impl SafetyEngine {
                 trigger: RuleTrigger::FileOperation,
                 condition: None,
                 action: RuleAction::LogAndAllow,
+                verified: true,
+            },
+            SafetyRule {
+                name: "approve_gmail_send".to_string(),
+                description: "Sending emails requires explicit user approval unless auto-approved in settings".to_string(),
+                trigger: RuleTrigger::Action {
+                    name: "gmail_send".to_string(),
+                },
+                condition: None,
+                action: RuleAction::RequireApproval,
+                verified: true,
+            },
+            SafetyRule {
+                name: "approve_gmail_reply".to_string(),
+                description: "Replying to emails requires explicit user approval unless auto-approved in settings".to_string(),
+                trigger: RuleTrigger::Action {
+                    name: "gmail_reply".to_string(),
+                },
+                condition: None,
+                action: RuleAction::RequireApproval,
                 verified: true,
             },
         ]

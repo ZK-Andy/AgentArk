@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, env = "AGENTARK_DATA")]
     data: Option<PathBuf>,
 
+    /// PostgreSQL database URL
+    #[arg(long, env = "AGENTARK_DATABASE_URL")]
+    database_url: Option<String>,
+
     /// Run the setup wizard
     #[arg(long)]
     setup: bool,
@@ -149,6 +153,24 @@ async fn main() -> Result<()> {
     tracing::info!("Starting AgentArk v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Config directory: {}", config_dir.display());
     tracing::info!("Data directory: {}", data_dir.display());
+    let cli_database_url = args
+        .database_url
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let mut database_config = match storage::DatabaseConfig::from_env() {
+        Ok(config) => config,
+        Err(_) => {
+            let mut config =
+                storage::DatabaseConfig::new(cli_database_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!("AGENTARK_DATABASE_URL is required for AgentArk startup")
+                })?);
+            config.apply_optional_env_overrides();
+            config
+        }
+    };
+    if let Some(database_url) = cli_database_url {
+        database_config.url = database_url;
+    }
 
     // Resolve master password → unified encryption key
     let master_mgr = crypto::master::MasterPasswordManager::new(&config_dir, &data_dir);
@@ -263,7 +285,13 @@ async fn main() -> Result<()> {
     }
 
     // Initialize core systems
-    let agent = core::Agent::init(&config_dir, &data_dir, unified_key.clone()).await?;
+    let agent = core::Agent::init(
+        &config_dir,
+        &data_dir,
+        database_config.clone(),
+        unified_key.clone(),
+    )
+    .await?;
     tracing::info!("Agent DID: {}", agent.identity.did());
 
     // Handle first run or explicit setup
@@ -287,7 +315,13 @@ async fn main() -> Result<()> {
             run_cli_setup(&config_dir, &agent).await?;
 
             // Reload the agent with new config and continue
-            let agent = core::Agent::init(&config_dir, &data_dir, unified_key.clone()).await?;
+            let agent = core::Agent::init(
+                &config_dir,
+                &data_dir,
+                database_config.clone(),
+                unified_key.clone(),
+            )
+            .await?;
             return run_headless(agent).await;
         }
     }

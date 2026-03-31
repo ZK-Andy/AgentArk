@@ -213,9 +213,24 @@ impl SwarmManager {
             task
         );
 
-        let decomposition = coordinator_llm
-            .chat(&decompose_prompt, task, &[], &[])
-            .await?;
+        let supervisor = crate::core::ExecutionSupervisor::default();
+        let decomposition_request = crate::core::ExecutionRequest {
+            kind: "swarm_decomposition".to_string(),
+            channel: Some("swarm".to_string()),
+            message_preview: Some(task.chars().take(200).collect()),
+            ..Default::default()
+        };
+        let decomposition = crate::core::execution::execute_supervised_transport_chat(
+            &supervisor,
+            coordinator_llm,
+            &decomposition_request,
+            &decompose_prompt,
+            task,
+            &[],
+            &[],
+            Some(self.config.default_timeout_secs.saturating_mul(1000)),
+        )
+        .await?;
 
         // Parse sub-tasks from LLM response
         let sub_tasks = parse_sub_tasks(&decomposition.content, &specialists);
@@ -372,9 +387,23 @@ impl SwarmManager {
                 task, results_text
             );
 
-            let aggregated = coordinator_llm
-                .chat(&aggregate_prompt, "Synthesize the results", &[], &[])
-                .await?;
+            let aggregate_request = crate::core::ExecutionRequest {
+                kind: "swarm_aggregation".to_string(),
+                channel: Some("swarm".to_string()),
+                message_preview: Some(task.chars().take(200).collect()),
+                ..Default::default()
+            };
+            let aggregated = crate::core::execution::execute_supervised_transport_chat(
+                &supervisor,
+                coordinator_llm,
+                &aggregate_request,
+                &aggregate_prompt,
+                "Synthesize the results",
+                &[],
+                &[],
+                Some(self.config.default_timeout_secs.saturating_mul(1000)),
+            )
+            .await?;
             aggregated.content
         };
 

@@ -45,6 +45,37 @@ if (-not (Test-Path $InstallDir)) {
 
 $composeContent = @'
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentark-postgres
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
+      - POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
+      - POSTGRES_PASSWORD=${AGENTARK_POSTGRES_PASSWORD:-agentark}
+    ports:
+      - "127.0.0.1:${AGENTARK_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - agentark-postgres-data:/var/lib/postgresql/data
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AGENTARK_POSTGRES_USER:-agentark} -d ${AGENTARK_POSTGRES_DB:-agentark}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
   agentark:
     image: ghcr.io/agentark-ai/agentark:latest
     container_name: agentark
@@ -55,11 +86,20 @@ services:
       - agentark-data:/app/data
       - agentark-config:/app/config
     depends_on:
-      - docker-socket-proxy
+      postgres:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
+      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
+      - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
+      - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
+      - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
+      - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
       - DOCKER_HOST=tcp://docker-socket-proxy:2375
     networks:
@@ -113,6 +153,8 @@ volumes:
     name: agentark-data
   agentark-config:
     name: agentark-config
+  agentark-postgres-data:
+    name: agentark-postgres-data
 
 networks:
   agent-network:
@@ -232,5 +274,6 @@ Write-Host "    agentark update     Pull latest and restart"
 Write-Host "    agentark logs       View logs"
 Write-Host "    agentark status     Show status"
 Write-Host ""
-Write-Host "  Your data is stored in Docker volumes and survives updates." -ForegroundColor Yellow
+Write-Host "  App data is stored in Docker volumes and survives updates." -ForegroundColor Yellow
+Write-Host "  Postgres has its own volume; use 'docker compose down -v' to reset everything." -ForegroundColor Yellow
 Write-Host ""

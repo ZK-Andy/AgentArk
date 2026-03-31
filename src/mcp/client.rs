@@ -125,7 +125,7 @@ impl McpClient {
         }
 
         let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {
                 "tools": { "listChanged": false },
                 "resources": { "subscribe": false, "listChanged": false }
@@ -146,24 +146,52 @@ impl McpClient {
 
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>> {
         self.ensure_initialized().await?;
-        let result = self.request("tools/list", serde_json::json!({})).await?;
-        let tools = match result.get("tools") {
-            Some(Value::Array(arr)) => Value::Array(arr.clone()),
-            _ => Value::Array(vec![]),
-        };
-        Ok(serde_json::from_value(tools)?)
+        let mut all_tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(ref c) = cursor {
+                params["cursor"] = Value::String(c.clone());
+            }
+            let result = self.request("tools/list", params).await?;
+            if let Some(Value::Array(arr)) = result.get("tools") {
+                let page: Vec<McpTool> = serde_json::from_value(Value::Array(arr.clone()))?;
+                all_tools.extend(page);
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(all_tools)
     }
 
     pub async fn list_resources(&mut self) -> Result<Vec<McpResource>> {
         self.ensure_initialized().await?;
-        let result = self
-            .request("resources/list", serde_json::json!({}))
-            .await?;
-        let resources = match result.get("resources") {
-            Some(Value::Array(arr)) => Value::Array(arr.clone()),
-            _ => Value::Array(vec![]),
-        };
-        Ok(serde_json::from_value(resources)?)
+        let mut all_resources = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = serde_json::json!({});
+            if let Some(ref c) = cursor {
+                params["cursor"] = Value::String(c.clone());
+            }
+            let result = self.request("resources/list", params).await?;
+            if let Some(Value::Array(arr)) = result.get("resources") {
+                let page: Vec<McpResource> = serde_json::from_value(Value::Array(arr.clone()))?;
+                all_resources.extend(page);
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(all_resources)
     }
 
     pub async fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value> {
@@ -277,14 +305,30 @@ impl HttpTransport {
 
         let response = req
             .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .header("Accept", "application/json, text/event-stream")
             .json(request)
             .send()
             .await?;
 
         let status = response.status();
+        // Check Content-Length header before downloading body (prevents memory exhaustion)
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > max_response_bytes {
+                return Err(anyhow!(
+                    "MCP response too large ({} bytes, limit {})",
+                    content_length,
+                    max_response_bytes
+                ));
+            }
+        }
         let bytes = response.bytes().await?;
         if bytes.len() > max_response_bytes {
-            return Err(anyhow!("MCP response too large ({} bytes)", bytes.len()));
+            return Err(anyhow!(
+                "MCP response too large ({} bytes, limit {})",
+                bytes.len(),
+                max_response_bytes
+            ));
         }
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes);
@@ -318,6 +362,8 @@ impl HttpTransport {
         }
         let _ = req
             .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .header("Accept", "application/json, text/event-stream")
             .json(request)
             .send()
             .await?;
@@ -361,7 +407,8 @@ impl StdioTransport {
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args)
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped());
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
         }
@@ -371,6 +418,18 @@ impl StdioTransport {
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow!("Failed to start MCP stdio server: {}", e))?;
+
+        // Drain stderr in background to prevent blocking and capture diagnostics
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let reader = tokio::io::BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "mcp_stdio_stderr", "{}", line);
+                }
+            });
+        }
 
         let stdin = child
             .stdin

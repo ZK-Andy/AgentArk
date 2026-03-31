@@ -186,7 +186,6 @@ export function WelcomeHero({
                 variant="contained"
                 startIcon={<ChatRoundedIcon />}
                 onClick={onGoChat}
-                sx={{ borderRadius: 999, px: 2.5, textTransform: "none" }}
               >
                 Open Chat
               </Button>
@@ -198,7 +197,6 @@ export function WelcomeHero({
                 startIcon={<AutoAwesomeRoundedIcon />}
                 onClick={onRunBriefing}
                 disabled={briefingLoading}
-                sx={{ borderRadius: 999, px: 2.3, textTransform: "none" }}
               >
                 {briefingLoading ? "Running..." : "Run Briefing"}
               </Button>
@@ -209,7 +207,6 @@ export function WelcomeHero({
                 variant="outlined"
                 startIcon={<ListAltRoundedIcon />}
                 onClick={onViewTasks}
-                sx={{ borderRadius: 999, px: 2.3, textTransform: "none" }}
               >
                 View Tasks
               </Button>
@@ -221,7 +218,6 @@ export function WelcomeHero({
                 startIcon={agentPaused ? <PlayCircleOutlineRoundedIcon /> : <PauseCircleOutlineRoundedIcon />}
                 onClick={onTogglePause}
                 disabled={pauseLoading}
-                sx={{ borderRadius: 999, px: 1.5, textTransform: "none" }}
               >
                 {agentPaused ? "Resume Autonomy" : "Pause Autonomy"}
               </Button>

@@ -52,6 +52,9 @@ pub(super) async fn update_plugin(
         .await
     {
         Ok(plugin) => Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            error_response(StatusCode::NOT_FOUND, error)
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -68,6 +71,9 @@ pub(super) async fn delete_plugin(
         .await
     {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            error_response(StatusCode::NOT_FOUND, error)
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -84,6 +90,9 @@ pub(super) async fn refresh_plugin(
         .await
     {
         Ok(plugin) => Json(serde_json::json!({ "status": "ok", "plugin": plugin })).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            error_response(StatusCode::NOT_FOUND, error)
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -99,6 +108,9 @@ pub(super) async fn test_plugin(
     let mut guard = plugins.write().await;
     match guard.ping_plugin(plugin_id.as_str()).await {
         Ok(result) => Json(serde_json::json!({ "status": "ok", "result": result })).into_response(),
+        Err(error) if error.to_string().contains("not found") => {
+            error_response(StatusCode::NOT_FOUND, error)
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -150,9 +162,15 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let shared = Arc::new(RwLock::new(
-            Agent::init(config_dir.path(), data_dir.path(), None)
-                .await
-                .unwrap(),
+            Agent::init(
+                config_dir.path(),
+                data_dir.path(),
+                crate::storage::DatabaseConfig::for_tests()
+                    .expect("test database config should initialize"),
+                None,
+            )
+            .await
+            .unwrap(),
         ));
         let (trace_history, last_trace, tasks, user_profile, security_events, app_registry) = {
             let guard = shared.read().await;
@@ -508,5 +526,76 @@ mod tests {
         }
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn plugin_sdk_missing_plugin_routes_return_not_found() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route(
+                "/plugins/{id}",
+                axum::routing::put(update_plugin).delete(delete_plugin),
+            )
+            .route("/plugins/{id}/refresh", post(refresh_plugin))
+            .route("/plugins/{id}/test", post(test_plugin))
+            .with_state(state);
+
+        let update_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/plugins/missing-plugin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "base_url": "https://plugins.example.com",
+                            "auth_mode": "none"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::NOT_FOUND);
+
+        let delete_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/plugins/missing-plugin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+
+        let refresh_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/plugins/missing-plugin/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_response.status(), StatusCode::NOT_FOUND);
+
+        let test_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/plugins/missing-plugin/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(test_response.status(), StatusCode::NOT_FOUND);
     }
 }

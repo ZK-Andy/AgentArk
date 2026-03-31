@@ -121,6 +121,21 @@ async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) 
     }
 }
 
+async fn process_whatsapp_prompt(
+    agent: &SharedAgent,
+    prompt: &str,
+    conversation_id: &str,
+) -> String {
+    let guard = agent.read().await;
+    match guard
+        .process_message_with_meta(prompt, "whatsapp", Some(conversation_id), None)
+        .await
+    {
+        Ok(processed) => Agent::render_plain_channel_response(processed),
+        Err(error) => format!("Error: {}", error),
+    }
+}
+
 /// Base URL for the Meta WhatsApp Business Cloud API (v18.0).
 const API_BASE: &str = "https://graph.facebook.com/v18.0";
 
@@ -1147,10 +1162,10 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
     let response = {
         let agent_read = agent.read().await;
         match agent_read
-            .process_message(&text, "whatsapp", Some(&conversation_id), None)
+            .process_message_with_meta(&text, "whatsapp", Some(&conversation_id), None)
             .await
         {
-            Ok(r) => r,
+            Ok(processed) => Agent::render_plain_channel_response(processed),
             Err(e) => {
                 tracing::error!("WhatsApp agent processing error: {}", e);
                 format!("I encountered an error processing your message: {}", e)
@@ -1395,14 +1410,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                 "Usage: /install <skill_url>".to_string()
             } else {
                 let prompt = format!("install this skill {}", args.trim());
-                let agent = agent.read().await;
-                match agent
-                    .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => format!("Error: {}", e),
-                }
+                process_whatsapp_prompt(agent, &prompt, &conversation_id).await
             }
         }
 
@@ -1419,14 +1427,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                 } else {
                     format!("run {} {}", skill_name, query)
                 };
-                let agent = agent.read().await;
-                match agent
-                    .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => format!("Error: {}", e),
-                }
+                process_whatsapp_prompt(agent, &prompt, &conversation_id).await
             }
         }
 
@@ -1606,17 +1607,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             if args.is_empty() {
                 "Usage: /search <query>\n\nExample: /search latest news about AI".to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Search the web for: {}", args);
-                    match agent
-                        .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("Error: {}", e),
-                    }
-                };
+                let prompt = format!("Search the web for: {}", args);
+                let response = process_whatsapp_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }
@@ -1625,17 +1617,8 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             if args.is_empty() {
                 "Usage: /image <prompt>\n\nExample: /image a cute robot playing guitar".to_string()
             } else {
-                let response = {
-                    let agent = agent.read().await;
-                    let prompt = format!("Generate an image of: {}", args);
-                    match agent
-                        .process_message(&prompt, "whatsapp", Some(&conversation_id), None)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => format!("Error: {}", e),
-                    }
-                };
+                let prompt = format!("Generate an image of: {}", args);
+                let response = process_whatsapp_prompt(agent, &prompt, &conversation_id).await;
                 response
             }
         }

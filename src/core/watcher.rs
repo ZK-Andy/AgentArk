@@ -27,6 +27,7 @@ pub const MAX_TIMEOUT_SECS: u64 = 9999 * 24 * 60 * 60;
 const MAX_STORED_RESULT_CHARS: usize = 16_000;
 const MAX_STORED_NOTIFICATION_MESSAGE_CHARS: usize = 8_000;
 const MAX_NOTIFICATION_ATTEMPTS: usize = 12;
+const MAX_CONSECUTIVE_FAILURES_BEFORE_PAUSE: u32 = 5;
 
 /// Status of a watcher
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,6 +145,12 @@ pub struct Watcher {
     /// The most recent poll error, if the latest poll failed.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Consecutive poll failures, used for backoff and automatic pausing.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Earliest instant when the watcher is allowed to poll again.
+    #[serde(default)]
+    pub next_poll_not_before: Option<DateTime<Utc>>,
     /// The outcome of the latest poll attempt.
     #[serde(default)]
     pub last_poll_outcome: Option<WatcherPollOutcome>,
@@ -556,6 +563,8 @@ impl WatcherManager {
                 existing.trigger_result = None;
                 existing.last_result = None;
                 existing.last_error = None;
+                existing.consecutive_failures = 0;
+                existing.next_poll_not_before = None;
                 existing.last_poll_outcome = None;
                 existing.notification_attempts.clear();
             }
@@ -599,6 +608,11 @@ impl WatcherManager {
                 if elapsed >= w.timeout_secs {
                     return false; // Will be timed out in tick()
                 }
+                if let Some(not_before) = w.next_poll_not_before {
+                    if not_before > now {
+                        return false;
+                    }
+                }
                 // Check if enough time has passed since last poll
                 match w.last_poll_at {
                     Some(last) => (now - last).num_seconds() as u64 >= w.interval_secs,
@@ -622,6 +636,8 @@ impl WatcherManager {
             w.poll_count = poll_count;
             w.last_result = Some(truncate_for_storage(&result, MAX_STORED_RESULT_CHARS));
             w.last_error = None;
+            w.consecutive_failures = 0;
+            w.next_poll_not_before = None;
             w.last_poll_outcome = Some(if matched {
                 WatcherPollOutcome::Matched
             } else {
@@ -634,9 +650,27 @@ impl WatcherManager {
     /// Update a watcher after a failed poll attempt.
     pub async fn record_poll_error(&self, id: Uuid, poll_count: u32, error: String) {
         if let Some(w) = self.watchers.write().await.get_mut(&id) {
-            w.last_poll_at = Some(Utc::now());
+            let now = Utc::now();
+            w.last_poll_at = Some(now);
             w.poll_count = poll_count;
-            w.last_error = Some(truncate_for_storage(&error, MAX_STORED_RESULT_CHARS));
+            w.consecutive_failures = w.consecutive_failures.saturating_add(1);
+            let mut error_text = truncate_for_storage(&error, MAX_STORED_RESULT_CHARS);
+            if w.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_PAUSE {
+                w.status = WatcherStatus::Paused;
+                w.next_poll_not_before = None;
+                error_text = truncate_for_storage(
+                    &format!(
+                        "{} Polling paused after {} consecutive failures.",
+                        error_text, w.consecutive_failures
+                    ),
+                    MAX_STORED_RESULT_CHARS,
+                );
+            } else {
+                let backoff_secs =
+                    watcher_failure_backoff_secs(w.interval_secs, w.consecutive_failures);
+                w.next_poll_not_before = Some(now + chrono::Duration::seconds(backoff_secs as i64));
+            }
+            w.last_error = Some(error_text);
             w.last_poll_outcome = Some(WatcherPollOutcome::Error);
         }
         self.persist().await;
@@ -717,6 +751,7 @@ impl WatcherManager {
         let paused = if let Some(w) = self.watchers.write().await.get_mut(&id) {
             if w.status == WatcherStatus::Active {
                 w.status = WatcherStatus::Paused;
+                w.next_poll_not_before = None;
                 true
             } else {
                 false
@@ -735,6 +770,8 @@ impl WatcherManager {
         let resumed = if let Some(w) = self.watchers.write().await.get_mut(&id) {
             if w.status == WatcherStatus::Paused {
                 w.status = WatcherStatus::Active;
+                w.consecutive_failures = 0;
+                w.next_poll_not_before = None;
                 true
             } else {
                 false
@@ -880,6 +917,14 @@ fn truncate_for_storage(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn watcher_failure_backoff_secs(interval_secs: u64, consecutive_failures: u32) -> u64 {
+    let multiplier = 2u64.saturating_pow(consecutive_failures.saturating_sub(1).min(6));
+    interval_secs
+        .max(30)
+        .saturating_mul(multiplier)
+        .min(60 * 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +964,8 @@ mod tests {
             trigger_result: None,
             last_result: None,
             last_error: None,
+            consecutive_failures: 0,
+            next_poll_not_before: None,
             last_poll_outcome: None,
             notification_attempts: Vec::new(),
         }

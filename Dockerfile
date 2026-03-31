@@ -2,14 +2,14 @@
 # AgentArk - AI Agent Docker Image
 # =============================================================================
 #
-# RECOMMENDED: Use docker-compose for automatic data persistence
+# RECOMMENDED: Use docker compose so Postgres, config, and app data come up together
 #
 #   ./scripts/start.sh  (Linux/Mac)
 #   scripts/start.bat   (Windows)
-#   docker-compose up -d --build
+#   docker compose up -d --build
 #
-# Your data (conversations, skills, settings) is automatically preserved
-# across rebuilds when using docker-compose.
+# Your app data (conversations, skills, settings) is automatically preserved
+# across rebuilds when using docker compose. The primary database lives in Postgres.
 #
 # =============================================================================
 # BUILD VARIANTS
@@ -29,7 +29,7 @@
 #     --build-arg INSTALL_CLOUDFLARED=true \
 #     --build-arg INSTALL_LIGHTPANDA=true \
 #     --build-arg INSTALL_GWS=true \
-#     --build-arg INSTALL_OLLAMA_CLI=true \
+#     # INSTALL_OLLAMA_CLI removed — 4GB, use external Ollama via API instead
 #     --build-arg INSTALL_REMOTION_TEMPLATE=true \
 #     --build-arg INSTALL_WHATSAPP_BRIDGE=true \
 #     .
@@ -44,7 +44,7 @@
 #     --build-arg INSTALL_CLOUDFLARED=true `
 #     --build-arg INSTALL_LIGHTPANDA=true `
 #     --build-arg INSTALL_GWS=true `
-#     --build-arg INSTALL_OLLAMA_CLI=true `
+#     # INSTALL_OLLAMA_CLI removed — 4GB, use external Ollama via API instead
 #     --build-arg INSTALL_REMOTION_TEMPLATE=true `
 #     --build-arg INSTALL_WHATSAPP_BRIDGE=true `
 #     .
@@ -57,15 +57,16 @@
 #     .
 #
 # =============================================================================
-# MANUAL DOCKER RUN (must include volumes to preserve data):
+# MANUAL DOCKER RUN (requires an external Postgres database):
 #
 #   docker run -d -p 8990:8990 \
+#     -e AGENTARK_DATABASE_URL=postgres://agentark:agentark@host.docker.internal:5432/agentark \
 #     -v agentark-data:/app/data \
 #     -v agentark-config:/app/config \
 #     --name agentark \
 #     agentark:latest
 #
-# WARNING: Running without -v volumes will LOSE YOUR DATA on container removal!
+# WARNING: Running without -v volumes will LOSE YOUR APP DATA on container removal!
 # =============================================================================
 
 # ── Stage 1: Rust build (with BuildKit cache for fast rebuilds) ─────────────
@@ -121,7 +122,7 @@ FROM node:20-slim AS node-builder
 
 ARG INSTALL_WHATSAPP_BRIDGE=true
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
-ARG INSTALL_REMOTION_TEMPLATE=false
+# ARG INSTALL_REMOTION_TEMPLATE — removed, see Remotion notes above
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -147,16 +148,20 @@ RUN if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
     fi
 COPY services/playwright-bridge/index.js ./
 
-# Remotion video template (pre-install node_modules for fast renders)
-WORKDIR /bridge/remotion-template
-COPY services/remotion-template/package.json services/remotion-template/package-lock.json ./
-RUN if [ "${INSTALL_REMOTION_TEMPLATE}" = "true" ]; then \
-        npm ci --omit=dev 2>/dev/null && \
-        npm cache clean --force && \
-        rm -rf /root/.npm /tmp/*; \
-    fi
-COPY services/remotion-template/src ./src
-COPY services/remotion-template/tsconfig.json services/remotion-template/remotion.config.ts ./
+# NOTE: Remotion video template removed from default build.
+# The code lives at services/remotion-template/ but is not shipped.
+# To re-enable: uncomment the lines below, add INSTALL_REMOTION_TEMPLATE=true,
+# and copy the template in the runtime stage.
+# Current limitations:
+#   - No TTS/speech — videos are visual-only (motion graphics, text, data viz)
+#   - No video player in chat UI — only produces a download link
+#   - LLM must generate valid React/Remotion JSX — no validation
+#   - 141MB added to image size
+# WORKDIR /bridge/remotion-template
+# COPY services/remotion-template/package.json services/remotion-template/package-lock.json ./
+# RUN npm ci --omit=dev 2>/dev/null && npm cache clean --force && rm -rf /root/.npm /tmp/*
+# COPY services/remotion-template/src ./src
+# COPY services/remotion-template/tsconfig.json services/remotion-template/remotion.config.ts ./
 
 # ── Stage 4: Minimal runtime ────────────────────────────────────────────────
 FROM node:20-bookworm-slim
@@ -168,8 +173,9 @@ ARG INSTALL_TAILSCALE=false
 ARG INSTALL_CLOUDFLARED=false
 ARG INSTALL_LIGHTPANDA=true
 ARG INSTALL_GWS=false
+ARG INSTALL_DOCKER_CLI=true
 ARG INSTALL_OLLAMA_CLI=false
-ARG INSTALL_REMOTION_TEMPLATE=false
+# ARG INSTALL_REMOTION_TEMPLATE — removed, see Remotion notes above
 
 RUN set -eux; \
     apt_packages="ca-certificates curl gosu git python3 python3-pip python3-venv"; \
@@ -178,6 +184,9 @@ RUN set -eux; \
     fi; \
     if [ "${INSTALL_FFMPEG}" = "true" ]; then \
         apt_packages="${apt_packages} ffmpeg"; \
+    fi; \
+    if [ "${INSTALL_DOCKER_CLI}" = "true" ]; then \
+        apt_packages="${apt_packages} docker.io"; \
     fi; \
     if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
         apt_packages="${apt_packages} zstd"; \
@@ -271,14 +280,14 @@ RUN if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
         rm -f /tmp/ollama-linux-amd64.tar.zst; \
     fi
 
-RUN apt-get purge -y --auto-remove curl && rm -rf /var/lib/apt/lists/*
+RUN rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built bridges with node_modules (owned by agent)
 COPY --from=node-builder --chown=agent:agent /bridge/whatsapp-bridge /app/whatsapp-bridge
 COPY --from=node-builder --chown=agent:agent /bridge/playwright-bridge /app/playwright-bridge
 
-# Copy Remotion template with pre-installed node_modules (for video generation)
-COPY --from=node-builder --chown=agent:agent /bridge/remotion-template /app/services/remotion-template
+# Remotion template disabled — see note in Stage 3 above
+# COPY --from=node-builder --chown=agent:agent /bridge/remotion-template /app/services/remotion-template
 
 # Copy AgentArk binary from builder
 COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark

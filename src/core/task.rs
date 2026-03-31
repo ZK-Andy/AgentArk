@@ -21,6 +21,7 @@ pub enum TaskApproval {
 pub enum TaskStatus {
     Pending,
     AwaitingApproval,
+    ExpiredNeedsReapproval,
     Paused,
     InProgress,
     Completed,

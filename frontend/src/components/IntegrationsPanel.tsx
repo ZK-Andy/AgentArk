@@ -47,6 +47,146 @@ import { PluginSdkPanel } from "./PluginSdkPanel";
 const REFRESH_MS = 8000;
 const OAUTH_SIGNAL_STORAGE_KEY = "agentark:oauth-callback";
 const OAUTH_SIGNAL_CHANNEL = "agentark-oauth";
+
+const CHANNEL_ICON_COLORS: Record<string, string> = {
+  telegram: "#26A5E4",
+  whatsapp: "#25D366",
+  slack: "#4A154B",
+  discord: "#5865F2",
+  matrix: "#0DBD8B",
+  teams: "#6264A7",
+  "web search": "#69e2ff",
+  google_workspace: "#4285F4",
+  github: "#f0f0f0",
+  jira: "#0052CC",
+  sentry: "#362D59",
+  notion: "#ffffff",
+  linear: "#5E6AD2",
+};
+
+// Channel & integration SVG icon imports
+import iconTelegram from "../assets/icons/telegram.svg";
+import iconWhatsapp from "../assets/icons/whatsapp.svg";
+import iconSlack from "../assets/icons/slack.svg";
+import iconDiscord from "../assets/icons/discord.svg";
+import iconMatrix from "../assets/icons/matrix.svg";
+import iconTeams from "../assets/icons/teams.svg";
+import iconGithub from "../assets/icons/github.svg";
+import iconGoogle from "../assets/icons/google.svg";
+import iconWebsearch from "../assets/icons/websearch.svg";
+import icon1Password from "../assets/icons/1password.svg";
+import iconGarmin from "../assets/icons/garmin.svg";
+import iconGoogleAnalytics from "../assets/icons/googleanalytics.svg";
+import iconGoogleMaps from "../assets/icons/googlemaps.svg";
+import iconGoogleSearchConsole from "../assets/icons/googlesearchconsole.svg";
+import iconNotion from "../assets/icons/notion.svg";
+import iconShopify from "../assets/icons/shopify.svg";
+import iconTwitter from "../assets/icons/twitter.svg";
+import iconJira from "../assets/icons/jira.svg";
+import iconSentry from "../assets/icons/sentry.svg";
+import iconLinear from "../assets/icons/linear.svg";
+
+const CHANNEL_ICON_MAP: Record<string, string> = {
+  telegram: iconTelegram,
+  whatsapp: iconWhatsapp,
+  slack: iconSlack,
+  discord: iconDiscord,
+  matrix: iconMatrix,
+  teams: iconTeams,
+  github: iconGithub,
+  google: iconGoogle,
+  google_workspace: iconGoogle,
+  "web search": iconWebsearch,
+  "1password": icon1Password,
+  onepassword: icon1Password,
+  garmin: iconGarmin,
+  "google analytics 4": iconGoogleAnalytics,
+  google_analytics: iconGoogleAnalytics,
+  "google places": iconGoogleMaps,
+  google_places: iconGoogleMaps,
+  "google search console": iconGoogleSearchConsole,
+  google_search_console: iconGoogleSearchConsole,
+  notion: iconNotion,
+  "ordering & purchasing": iconShopify,
+  shopify: iconShopify,
+  "social analytics": iconTwitter,
+  twitter: iconTwitter,
+  jira: iconJira,
+  sentry: iconSentry,
+  linear: iconLinear,
+};
+
+export function ChannelIcon({ name, size = 20 }: { name: string; size?: number }) {
+  const key = name.toLowerCase();
+  const iconSrc = CHANNEL_ICON_MAP[key];
+  if (iconSrc) {
+    return (
+      <Box
+        component="img"
+        src={iconSrc}
+        alt={name}
+        sx={{
+          width: size,
+          height: size,
+          flexShrink: 0,
+          // Simple-icons SVGs are black by default; invert to white for dark theme
+          filter: "brightness(0) invert(1)",
+          opacity: 0.85,
+        }}
+      />
+    );
+  }
+  const color = CHANNEL_ICON_COLORS[key] || "rgba(180,200,225,0.6)";
+  const letter = name.charAt(0).toUpperCase();
+  return (
+    <Box
+      component="span"
+      sx={{
+        width: size,
+        height: size,
+        borderRadius: "5px",
+        background: color,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        fontSize: size * 0.55,
+        fontWeight: 800,
+        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "rgba(0,0,0,0.85)" : "#fff",
+        lineHeight: 1,
+      }}
+    >
+      {letter}
+    </Box>
+  );
+}
+
+function ConnectorIcon({ id, name, size = 22 }: { id: string; name: string; size?: number }) {
+  const key = id.toLowerCase();
+  const color = CHANNEL_ICON_COLORS[key] || "rgba(108,156,212,0.3)";
+  const letter = name.charAt(0).toUpperCase();
+  return (
+    <Box
+      component="span"
+      sx={{
+        width: size,
+        height: size,
+        borderRadius: "6px",
+        background: color,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        fontSize: size * 0.5,
+        fontWeight: 800,
+        color: ["#ffffff", "#f0f0f0", "#25D366", "#69e2ff", "#0DBD8B"].includes(color) ? "rgba(0,0,0,0.85)" : "#fff",
+        lineHeight: 1,
+      }}
+    >
+      {letter}
+    </Box>
+  );
+}
 const GOOGLE_WORKSPACE_BUNDLES = [
   { id: "gmail", label: "Gmail" },
   { id: "calendar", label: "Calendar" },
@@ -80,6 +220,7 @@ type McpServerForm = {
   command: string;
   args_csv: string;
   working_dir: string;
+  env_csv: string;
   auth_type: McpAuthType;
   auth_header: string;
   auth_name: string;
@@ -88,6 +229,7 @@ type McpServerForm = {
   auth_password: string;
   auth_clear: boolean;
   tool_allowlist_csv: string;
+  tool_blocklist_csv: string;
   resource_allowlist_csv: string;
   timeout_secs: string;
   max_response_bytes: string;
@@ -204,6 +346,7 @@ function asErrorMessage(err: unknown): string {
 
 function statusColor(status: IntegrationItem["status"]): "success" | "warning" | "error" | "default" {
   if (status === "connected") return "success";
+  if (status === "configured") return "warning";
   if (status === "starting") return "warning";
   if (status === "disabled") return "warning";
   if (status === "needs_auth") return "warning";
@@ -211,12 +354,13 @@ function statusColor(status: IntegrationItem["status"]): "success" | "warning" |
   return "default";
 }
 
-type IntegrationCardState = "enabled" | "disabled" | "needs_auth" | "error" | "not_configured";
+type IntegrationCardState = "enabled" | "configured" | "disabled" | "needs_auth" | "error" | "not_configured";
 
 function integrationCardState(integration: IntegrationItem): IntegrationCardState {
   if (integration.status === "connected") {
     return integration.enabled ? "enabled" : "disabled";
   }
+  if (integration.status === "configured") return "configured";
   if (integration.status === "starting") return "needs_auth";
   if (integration.status === "disabled") return "disabled";
   if (integration.status === "needs_auth") return "needs_auth";
@@ -226,6 +370,7 @@ function integrationCardState(integration: IntegrationItem): IntegrationCardStat
 
 function integrationCardLabel(state: IntegrationCardState): string {
   if (state === "enabled") return "Enabled";
+  if (state === "configured") return "Configured";
   if (state === "disabled") return "Disabled";
   if (state === "needs_auth") return "Needs sign-in";
   if (state === "error") return "Error";
@@ -237,6 +382,7 @@ function integrationCardCopy(integration: IntegrationItem): string {
   if (detail) return detail;
   const state = integrationCardState(integration);
   if (state === "enabled") return integration.description;
+  if (state === "configured") return "Credentials are saved, but live connectivity has not been confirmed yet.";
   if (state === "disabled") return "Configured, but currently disabled for agent use.";
   if (state === "needs_auth") return "Finish the sign-in flow to activate this integration.";
   if (state === "error") return "The saved credentials could not be validated.";
@@ -259,6 +405,16 @@ function integrationCardAccent(state: IntegrationCardState): {
       hoverBackground: "rgba(74,210,157,0.1)",
       chipBorder: "rgba(74,210,157,0.3)",
       chipColor: "rgba(74,210,157,0.9)"
+    };
+  }
+  if (state === "configured") {
+    return {
+      border: "rgba(105,226,255,0.24)",
+      background: "rgba(105,226,255,0.05)",
+      hoverBorder: "rgba(105,226,255,0.4)",
+      hoverBackground: "rgba(105,226,255,0.08)",
+      chipBorder: "rgba(105,226,255,0.24)",
+      chipColor: "rgba(105,226,255,0.92)"
     };
   }
   if (state === "disabled") {
@@ -499,6 +655,7 @@ function defaultMcpForm(): McpServerForm {
     command: "",
     args_csv: "",
     working_dir: "",
+    env_csv: "",
     auth_type: "none",
     auth_header: "Authorization",
     auth_name: "",
@@ -507,6 +664,7 @@ function defaultMcpForm(): McpServerForm {
     auth_password: "",
     auth_clear: false,
     tool_allowlist_csv: "",
+    tool_blocklist_csv: "",
     resource_allowlist_csv: "",
     timeout_secs: "15",
     max_response_bytes: "1048576"
@@ -590,13 +748,16 @@ export function IntegrationsPanel({
 }: {
   autoRefresh: boolean;
   embedded?: boolean;
-  mode?: "all" | "integrations" | "messaging" | "mcp";
+  mode?: "all" | "integrations" | "messaging" | "mcp" | "channels" | "connectors";
 }) {
   const queryClient = useQueryClient();
   const showIntegrations = mode !== "mcp";
   const showCatalog = mode === "all" || mode === "integrations";
-  const showMessagingOnly = mode === "messaging";
+  const showMessagingOnly = mode === "messaging" || mode === "channels";
   const showMcp = mode === "all" || mode === "mcp";
+  const showChannelsPage = mode === "channels";
+  const showConnectorsPage = mode === "connectors";
+  const shouldLoadConnectorCatalog = showCatalog || showConnectorsPage;
   const [active, setActive] = useState<IntegrationItem | null>(null);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -709,7 +870,7 @@ export function IntegrationsPanel({
     queryKey: ["integrations"],
     queryFn: api.getIntegrations,
     refetchInterval: REFRESH_MS,
-    enabled: showCatalog,
+    enabled: shouldLoadConnectorCatalog,
     placeholderData: (previous) => previous
   });
   const integrationSyncStatusQ = useQuery({
@@ -921,7 +1082,7 @@ export function IntegrationsPanel({
     }
   });
 
-  const integrations = showCatalog
+  const integrations = shouldLoadConnectorCatalog
     ? (integrationsQ.data?.integrations || []).filter((item) => normalizeIntegrationId(item.id) !== "moltbook")
     : [];
   const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
@@ -1164,7 +1325,7 @@ export function IntegrationsPanel({
 
   async function refreshIntegrationState(targetId?: string | null) {
     const normalizedTargetId = normalizeIntegrationId(str(targetId, ""));
-    const refreshedIntegrations = showIntegrations ? await integrationsQ.refetch() : null;
+    const refreshedIntegrations = shouldLoadConnectorCatalog ? await integrationsQ.refetch() : null;
     if (showIntegrations) {
       await Promise.allSettled([
         integrationSyncStatusQ.refetch(),
@@ -1914,6 +2075,7 @@ export function IntegrationsPanel({
       command: str(transport.command, ""),
       args_csv: asStringList(transport.args).join(", "),
       working_dir: str(transport.working_dir, ""),
+      env_csv: asStringList(transport.env_keys).join(", "),
       auth_type: authType,
       auth_header: str(auth.header, "Authorization"),
       auth_name: str(auth.name, ""),
@@ -1922,6 +2084,7 @@ export function IntegrationsPanel({
       auth_password: "",
       auth_clear: false,
       tool_allowlist_csv: asStringList(server.tool_allowlist).join(", "),
+      tool_blocklist_csv: asStringList(server.tool_blocklist).join(", "),
       resource_allowlist_csv: asStringList(server.resource_allowlist).join(", "),
       timeout_secs: str(server.timeout_secs, "15"),
       max_response_bytes: str(server.max_response_bytes, "1048576")
@@ -1967,6 +2130,7 @@ export function IntegrationsPanel({
         resources_enabled: mcpForm.resources_enabled,
         tool_allowlist: parseCsvList(mcpForm.tool_allowlist_csv),
         resource_allowlist: parseCsvList(mcpForm.resource_allowlist_csv),
+        tool_blocklist: parseCsvList(mcpForm.tool_blocklist_csv),
         timeout_secs: Math.floor(timeoutSecs),
         max_response_bytes: Math.floor(maxResponseBytes)
       };
@@ -1974,6 +2138,10 @@ export function IntegrationsPanel({
 
       if (mcpForm.transport_type === "http") {
         if (!mcpForm.url.trim()) throw new Error("HTTP URL is required.");
+        const urlLower = mcpForm.url.trim().toLowerCase();
+        if (!urlLower.startsWith("http://") && !urlLower.startsWith("https://")) {
+            throw new Error("MCP URL must start with http:// or https://");
+        }
         payload.transport = { type: "http", url: mcpForm.url.trim() };
       } else {
         if (!mcpForm.command.trim()) throw new Error("Stdio command is required.");
@@ -1981,7 +2149,8 @@ export function IntegrationsPanel({
           type: "stdio",
           command: mcpForm.command.trim(),
           args: parseCsvList(mcpForm.args_csv),
-          working_dir: mcpForm.working_dir.trim() || undefined
+          working_dir: mcpForm.working_dir.trim() || undefined,
+          env_keys: parseCsvList(mcpForm.env_csv)
         };
       }
 
@@ -2019,6 +2188,16 @@ export function IntegrationsPanel({
           value: mcpForm.auth_token.trim() || undefined,
           clear: mcpForm.auth_clear
         };
+      }
+
+      // Warn if auth type set but no credentials provided (for new servers)
+      if (!mcpEditingId && mcpForm.auth_type !== "none") {
+          const hasCredential = mcpForm.auth_type === "basic"
+              ? (mcpForm.auth_username.trim() || mcpForm.auth_password.trim())
+              : mcpForm.auth_token.trim();
+          if (!hasCredential) {
+              throw new Error(`Auth type "${mcpForm.auth_type}" selected but no credentials provided. Add credentials or set auth to "none".`);
+          }
       }
 
       if (mcpEditingId) {
@@ -2306,7 +2485,7 @@ export function IntegrationsPanel({
 
   const activeNeedsOauth =
     !!active &&
-    (active.id === "google_workspace" ||
+    ((active.id === "google_workspace" && active.status !== "error") ||
       active.id === "gmail" ||
       active.id === "google_calendar" ||
       active.status === "needs_auth" ||
@@ -2315,6 +2494,9 @@ export function IntegrationsPanel({
     !!active &&
     active.id === "google_workspace" &&
     toBool(asRecord(active.config_values).client_secret_configured);
+  const activeIsVerified = active?.status === "connected";
+  const activeIsConfigured = active?.status === "configured";
+  const activeHasSavedConfig = activeIsVerified || activeIsConfigured;
 
   const renderField = (field: IntegrationConfigField) => {
     const value = formValues[field.key] || "";
@@ -2437,13 +2619,25 @@ export function IntegrationsPanel({
         <Typography variant="h6">
           {mode === "mcp"
             ? "MCP Servers"
-            : mode === "messaging"
-              ? "Messaging Setup"
-              : "Integrations"}
+            : mode === "channels"
+              ? "Messaging Channels"
+              : mode === "connectors"
+                ? "Prebuilt Connectors"
+                : mode === "messaging"
+                  ? "Messaging Setup"
+                  : "Integrations"}
         </Typography>
         <Stack direction="row" spacing={1} />
       </Stack>
-      {mode === "messaging" ? (
+      {mode === "channels" ? (
+        <Typography variant="caption" color="text.secondary">
+          Configure delivery transports and review live channel health. If something looks off, run ArkPulse for diagnostics.
+        </Typography>
+      ) : mode === "connectors" ? (
+        <Typography variant="caption" color="text.secondary">
+          OAuth-based integrations for Google Workspace, GitHub, Jira, and more. Connect once, then the agent can use them in any conversation.
+        </Typography>
+      ) : mode === "messaging" ? (
         <>
           <Typography
             variant="body2"
@@ -2483,11 +2677,144 @@ export function IntegrationsPanel({
       {showMcp && mcpNotice ? <Alert severity={mcpNotice.kind}>{mcpNotice.text}</Alert> : null}
       {showMcp && sshNotice ? <Alert severity={sshNotice.kind}>{sshNotice.text}</Alert> : null}
 
-      {showCatalog && integrationsQ.error ? (
+      {shouldLoadConnectorCatalog && integrationsQ.error ? (
         <Alert severity="error">
           Failed to load integrations:{" "}
           {integrationsQ.error instanceof Error ? integrationsQ.error.message : "Unknown error"}
         </Alert>
+      ) : null}
+
+      {showConnectorsPage ? (
+        <>
+          {readyList.length > 0 ? (
+            <Box className="list-shell">
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={1}
+                justifyContent="space-between"
+                alignItems={{ xs: "flex-start", sm: "center" }}
+                sx={{ mb: 1.25 }}
+              >
+                <Box>
+                  <Typography variant="subtitle2">Connected</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    These integrations are live and available to the agent.
+                  </Typography>
+                </Box>
+                <Chip size="small" variant="outlined" label={`${readyList.length} connected`} sx={sectionCountChipSx} />
+              </Stack>
+              <Grid2 container spacing={1}>
+                {readyList.map((integration) => {
+                  const cardState = integrationCardState(integration);
+                  const accent = integrationCardAccent(cardState);
+                  const sc = statusColor(integration.status);
+                  const dotColor =
+                    sc === "success"
+                      ? "#4ad29d"
+                      : sc === "error"
+                        ? "rgba(255,88,88,0.85)"
+                        : sc === "warning"
+                          ? "rgba(255,180,50,0.85)"
+                          : "rgba(255,255,255,0.25)";
+                  return (
+                    <Grid2 key={`connected-${integration.id}`} size={{ xs: 12, sm: 6, md: 4, lg: 3 }}>
+                      <Box
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => {
+                          if (integration.config_fields && integration.config_fields.length > 0) {
+                            openConfig(integration);
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if ((e.key === "Enter" || e.key === " ") && integration.config_fields && integration.config_fields.length > 0) {
+                            e.preventDefault();
+                            openConfig(integration);
+                          }
+                        }}
+                        sx={{
+                          height: "100%",
+                          p: 1.35,
+                          borderRadius: "12px",
+                          border: `1px solid ${accent.border}`,
+                          background: accent.background,
+                          cursor: "pointer",
+                          transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
+                          "&:hover": {
+                            borderColor: accent.hoverBorder,
+                            background: accent.hoverBackground,
+                            boxShadow: "0 8px 24px rgba(0,0,0,0.18)"
+                          }
+                        }}
+                      >
+                        <Stack spacing={0.75}>
+                          <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+                            <Stack direction="row" alignItems="center" spacing={0.75}>
+                              <ConnectorIcon id={integration.id} name={integration.name} />
+                              <Typography variant="subtitle2" noWrap sx={{ fontWeight: 700 }}>
+                                {integration.name}
+                              </Typography>
+                            </Stack>
+                            <Box
+                              sx={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background: dotColor,
+                                flex: "0 0 auto"
+                              }}
+                            />
+                          </Stack>
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{
+                              lineHeight: 1.45,
+                              display: "-webkit-box",
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: "vertical",
+                              overflow: "hidden"
+                            }}
+                          >
+                            {integrationCardCopy(integration)}
+                          </Typography>
+                          <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                            <Chip
+                              size="small"
+                              label={integrationCardLabel(cardState)}
+                              sx={{
+                                height: 20,
+                                fontSize: "0.68rem",
+                                fontWeight: 700,
+                                borderColor: accent.chipBorder,
+                                color: accent.chipColor
+                              }}
+                              variant="outlined"
+                            />
+                            <Button size="small" variant="text" sx={{ minWidth: 0 }} onClick={(e) => {
+                              e.stopPropagation();
+                              openConfig(integration);
+                            }}>
+                              Manage
+                            </Button>
+                          </Stack>
+                        </Stack>
+                      </Box>
+                    </Grid2>
+                  );
+                })}
+              </Grid2>
+            </Box>
+          ) : null}
+          <IntegrationQuickstartPanel
+            integrations={integrations}
+            loading={integrationsQ.isLoading || (integrationsQ.isFetching && !integrationsQ.error)}
+            loadError={integrationsQ.error instanceof Error ? integrationsQ.error.message : null}
+            autoRefresh={autoRefresh}
+            embedded
+            onConfigureIntegration={openConfig}
+          />
+        </>
       ) : null}
 
       {showCatalog ? (
@@ -2833,41 +3160,144 @@ export function IntegrationsPanel({
         </Accordion>
       ) : null}
 
-      {showIntegrations && !showMessagingOnly ? (
-        <Accordion
-          disableGutters
-          expanded={expandedSection === "messaging"}
-          onChange={(_, expanded) => setExpandedSection(expanded ? "messaging" : false)}
-          sx={sectionAccordionSx}
-        >
-          <AccordionSummary expandIcon={<ExpandMoreRoundedIcon />}>
-            <Stack
-              direction={{ xs: "column", sm: "row" }}
-              spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", sm: "center" }}
-              sx={{ width: "100%" }}
-            >
-              <Box>
-                <Typography variant="subtitle2">Messaging Channels</Typography>
-                <Typography variant="caption" color="text.secondary">
-                  Configure delivery transports and review live channel health here.
-                </Typography>
-              </Box>
-              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                <Chip size="small" label={`${messagingReadyCount} ready`} sx={sectionCountChipSx} />
-                <Chip size="small" label={`${messagingAttentionCount} need setup`} sx={sectionCountChipSx} />
-              </Stack>
-            </Stack>
-          </AccordionSummary>
-          <AccordionDetails>
+      {showChannelsPage ? (
+        <Box className="list-shell">
+          <Typography variant="subtitle2" sx={{ mb: 1 }}>
+            Connected Channels
+          </Typography>
+          {settingsQ.error ? (
+            <Alert severity="error">
+              Failed to load channels: {(settingsQ.error as Error)?.message || "Unknown error"}
+            </Alert>
+          ) : (
+            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell sx={{ fontWeight: 600, width: "22%" }}>Channel</TableCell>
+                  <TableCell sx={{ fontWeight: 600, width: "18%" }}>Status</TableCell>
+                  <TableCell sx={{ fontWeight: 600 }}>Details</TableCell>
+                  <TableCell sx={{ fontWeight: 600, width: "10%", textAlign: "right" }} />
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {[
+                  { name: "Web Search", enabled: true, statusRaw: "connected", detail: `${channelForm.search_primary || "lightpanda"} \u2192 ${channelForm.search_fallback1 || "playwright"} \u2192 ${channelForm.search_fallback2 || "duckduckgo"}`, onSetup: openSearchSetup, ready: true },
+                  { name: "Telegram", enabled: telegramEnabledSaved, statusRaw: telegramConnectionStatusRaw, detail: telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured"), onSetup: () => openTelegramSetup(!channelForm.telegram_enabled), ready: telegramDeliveryReady, actionLabel: channelForm.telegram_enabled ? "Setup" : "Enable" },
+                  { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || (channelForm.whatsapp_mode === "cloud_api" ? "Cloud API" : "QR pairing"), onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: toBool(settings.whatsapp_delivery_ready), actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
+                  { name: "Slack", enabled: toBool(settings.slack_enabled), statusRaw: slackConnectionStatusRaw, detail: slackConnectionDetail || "Not configured", onSetup: () => openSlackSetup(!channelForm.slack_enabled), ready: toBool(settings.slack_delivery_ready), actionLabel: channelForm.slack_enabled ? "Setup" : "Enable" },
+                  { name: "Discord", enabled: toBool(settings.discord_enabled), statusRaw: discordConnectionStatusRaw, detail: discordConnectionDetail || "Not configured", onSetup: () => openDiscordSetup(!channelForm.discord_enabled), ready: toBool(settings.discord_delivery_ready), actionLabel: channelForm.discord_enabled ? "Setup" : "Enable" },
+                  { name: "Matrix", enabled: toBool(settings.matrix_enabled), statusRaw: matrixConnectionStatusRaw, detail: matrixConnectionDetail || "Not configured", onSetup: () => openMatrixSetup(!channelForm.matrix_enabled), ready: toBool(settings.matrix_delivery_ready), actionLabel: channelForm.matrix_enabled ? "Setup" : "Enable" },
+                  { name: "Teams", enabled: toBool(settings.teams_enabled), statusRaw: teamsConnectionStatusRaw, detail: teamsConnectionDetail || "Not configured", onSetup: () => openTeamsSetup(!channelForm.teams_enabled), ready: toBool(settings.teams_delivery_ready), actionLabel: channelForm.teams_enabled ? "Setup" : "Enable" },
+                ]
+                  .filter((ch) => ch.ready || ch.enabled)
+                  .sort((a, b) => (a.ready === b.ready ? 0 : a.ready ? -1 : 1))
+                  .map((ch) => (
+                  <TableRow key={ch.name}>
+                    <TableCell>
+                      <Stack direction="row" alignItems="center" spacing={1}>
+                        <ChannelIcon name={ch.name} />
+                        <Typography variant="body2">{ch.name}</Typography>
+                      </Stack>
+                    </TableCell>
+                    <TableCell>
+                      <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                        <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: ch.ready ? "rgba(74,210,157,0.85)" : ch.enabled ? "rgba(255,180,50,0.85)" : "rgba(180,200,220,0.5)" }} />
+                        <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(ch.statusRaw, ch.enabled)}</Typography>
+                      </Box>
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2" color="text.secondary" noWrap>{ch.detail}</Typography>
+                    </TableCell>
+                    <TableCell align="right">
+                      <Button size="small" variant="text" onClick={ch.onSetup} sx={{ minWidth: 0 }}>{ch.actionLabel || "Setup"}</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+          <Divider sx={{ my: 1.5, borderColor: "rgba(112,153,201,0.12)" }} />
+          <Stack spacing={1.25}>
+            <Box>
+              <Typography variant="subtitle2">Setup Wizards</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run ArkPulse for diagnostics.
+              </Typography>
+            </Box>
+            {channelsQ.error ? (
+              <Alert severity="error">
+                Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
+              </Alert>
+            ) : null}
+            <Grid2 container spacing={1}>
+              {messagingSetups.map((setup) => {
+                const displayState = messagingDisplayState(setup.status, setup.enabled);
+                const accent = integrationCardAccent(
+                  displayState === "ready"
+                    ? "enabled"
+                    : displayState === "error"
+                      ? "error"
+                      : displayState === "needs_setup"
+                        ? "needs_auth"
+                        : "not_configured"
+                );
+                return (
+                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 3 }}>
+                    <Box
+                      sx={{
+                        border: `1px solid ${accent.border}`,
+                        background: accent.background,
+                        borderRadius: 1.5,
+                        p: 1.5,
+                        minHeight: 172,
+                        display: "flex",
+                        flexDirection: "column",
+                        justifyContent: "space-between"
+                      }}
+                    >
+                      <Stack spacing={1}>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Stack direction="row" alignItems="center" spacing={0.75}>
+                            <ChannelIcon name={setup.name} size={22} />
+                            <Typography variant="subtitle2">{setup.name}</Typography>
+                          </Stack>
+                          <Chip
+                            size="small"
+                            label={channelStatusLabel(setup.status, setup.enabled)}
+                            color={channelStatusColor(setup.status, setup.enabled)}
+                            variant="outlined"
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary">
+                          {setup.detail}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {messagingWizardHint(setup.status, setup.enabled)}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
+                        <Button size="small" variant="contained" onClick={setup.open}>
+                          {setup.actionLabel}
+                        </Button>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                );
+              })}
+            </Grid2>
+          </Stack>
+        </Box>
+      ) : null}
+
+      {/* Messaging Channels accordion removed — dedicated "Messaging Channels" tab exists in sidebar */}
+      {false ? (<Box>
         <Box className="list-shell">
           <Typography variant="subtitle2" sx={{ mb: 1 }}>
             Channels
           </Typography>
           {settingsQ.error ? (
             <Alert severity="error">
-              Failed to load channels: {settingsQ.error instanceof Error ? settingsQ.error.message : "Unknown error"}
+              Failed to load channels: {(settingsQ.error as Error)?.message || "Unknown error"}
             </Alert>
           ) : (
             <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
@@ -2948,7 +3378,7 @@ export function IntegrationsPanel({
             </Box>
             {channelsQ.error ? (
               <Alert severity="error">
-                Failed to load gateway channel health: {channelsQ.error instanceof Error ? channelsQ.error.message : "Unknown error"}
+                Failed to load gateway channel health: {(channelsQ.error as Error)?.message || "Unknown error"}
               </Alert>
             ) : null}
             <Grid2 container spacing={1}>
@@ -2979,7 +3409,10 @@ export function IntegrationsPanel({
                     >
                       <Stack spacing={1}>
                         <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                          <Typography variant="subtitle2">{setup.name}</Typography>
+                          <Stack direction="row" alignItems="center" spacing={0.75}>
+                            <ChannelIcon name={setup.name} size={22} />
+                            <Typography variant="subtitle2">{setup.name}</Typography>
+                          </Stack>
                           <Chip
                             size="small"
                             label={channelStatusLabel(setup.status, setup.enabled)}
@@ -3006,9 +3439,7 @@ export function IntegrationsPanel({
             </Grid2>
           </Stack>
         </Box>
-          </AccordionDetails>
-        </Accordion>
-      ) : null}
+      </Box>) : null}
 
       {showCatalog ? (
         <Accordion
@@ -3104,76 +3535,7 @@ export function IntegrationsPanel({
         </Accordion>
       ) : null}
 
-      {showIntegrations && showMessagingOnly ? (
-        <Box className="list-shell">
-          <Stack spacing={1.25}>
-            <Box>
-              <Typography variant="subtitle2">Messaging onboarding</Typography>
-              <Typography variant="caption" color="text.secondary">
-                 Connect each transport here using the same shared setup wizards used by Integrations. After saving, use ArkPulse if you need a diagnostics pass.
-              </Typography>
-            </Box>
-            {channelsQ.error ? (
-              <Alert severity="error">
-                Failed to load gateway channel health: {channelsQ.error instanceof Error ? channelsQ.error.message : "Unknown error"}
-              </Alert>
-            ) : null}
-            <Grid2 container spacing={1}>
-              {messagingSetups.map((setup) => {
-                const displayState = messagingDisplayState(setup.status, setup.enabled);
-                const accent = integrationCardAccent(
-                  displayState === "ready"
-                    ? "enabled"
-                    : displayState === "error"
-                      ? "error"
-                      : displayState === "needs_setup"
-                        ? "needs_auth"
-                        : "not_configured"
-                );
-                return (
-                  <Grid2 key={setup.id} size={{ xs: 12, sm: 6, lg: 4 }}>
-                    <Box
-                      sx={{
-                        border: `1px solid ${accent.border}`,
-                        background: accent.background,
-                        borderRadius: 1.5,
-                        p: 1.5,
-                        minHeight: 184,
-                        display: "flex",
-                        flexDirection: "column",
-                        justifyContent: "space-between"
-                      }}
-                    >
-                      <Stack spacing={1}>
-                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
-                          <Typography variant="subtitle2">{setup.name}</Typography>
-                          <Chip
-                            size="small"
-                            label={channelStatusLabel(setup.status, setup.enabled)}
-                            color={channelStatusColor(setup.status, setup.enabled)}
-                            variant="outlined"
-                          />
-                        </Stack>
-                        <Typography variant="body2" color="text.secondary">
-                          {setup.detail}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {messagingWizardHint(setup.status, setup.enabled)}
-                        </Typography>
-                      </Stack>
-                      <Stack direction="row" spacing={1} sx={{ mt: 1.25 }}>
-                        <Button size="small" variant="contained" onClick={setup.open}>
-                          {setup.actionLabel}
-                        </Button>
-                      </Stack>
-                    </Box>
-                  </Grid2>
-                );
-              })}
-            </Grid2>
-          </Stack>
-        </Box>
-      ) : null}
+      {/* Messaging onboarding section removed — duplicates Setup Wizards above */}
 
       {false && showCatalog ? (
         <Accordion
@@ -4207,20 +4569,28 @@ export function IntegrationsPanel({
                 ? active?.enabled
                   ? "Connected"
                   : "Connected but disabled"
+                : active?.status === "configured"
+                  ? active?.enabled
+                    ? "Configured and enabled"
+                    : "Configured but disabled"
                 : active?.status === "starting"
                   ? "Starting"
                 : active?.status === "needs_auth"
                   ? "Needs sign-in"
-                  : active?.status === "error"
-                    ? "Validation failed"
+                : active?.status === "error"
+                  ? "Validation failed"
                   : "Not configured"}
             </Typography>
-            {active?.status === "connected" && !editingConnected ? (
+            {activeHasSavedConfig && !editingConnected ? (
               <Stack spacing={1.5}>
-                <Alert severity={active?.enabled ? "success" : "info"}>
-                  {active?.enabled
-                    ? "This integration is connected and active."
-                    : "This integration has valid credentials but is currently disabled for agent use."}
+                <Alert severity={activeIsVerified && active?.enabled ? "success" : "info"}>
+                  {activeIsVerified
+                    ? active?.enabled
+                      ? "This integration is connected and active."
+                      : "This integration has valid credentials but is currently disabled for agent use."
+                    : active?.enabled
+                      ? "Credentials are saved and agent use is enabled, but live connectivity has not been confirmed yet."
+                      : "Credentials are saved, but this integration is currently disabled and still waiting for a live validation run."}
                 </Alert>
                 <Stack direction="row" spacing={1} alignItems="center">
                   <FormControlLabel
@@ -4246,9 +4616,11 @@ export function IntegrationsPanel({
                 </Stack>
               </Stack>
             ) : null}
-            {active?.status === "connected" && !active?.enabled && editingConnected ? (
+            {activeHasSavedConfig && !active?.enabled && editingConnected ? (
               <Alert severity="info">
-                This integration has valid credentials but is currently disabled for agent use.
+                {activeIsVerified
+                  ? "This integration has valid credentials but is currently disabled for agent use."
+                  : "Credentials are saved, but this integration is currently disabled and has not been live-validated yet."}
               </Alert>
             ) : null}
             {active?.status === "error" && active?.status_detail ? (
@@ -4264,14 +4636,14 @@ export function IntegrationsPanel({
                   : "No saved credentials were found for this integration in the running AgentArk instance."}
               </Alert>
             ) : null}
-            {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
+            {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
               <Alert severity="info">
                 {active?.id === "google_workspace"
                   ? "Enter the Google OAuth client ID and client secret, choose the Workspace bundles, then continue with Google."
                   : "Save your Google OAuth client credentials here, then click Connect to finish sign-in."}
               </Alert>
             ) : null}
-            {(active?.status !== "connected" || editingConnected) && active?.id === "google_workspace" ? (
+            {(!activeHasSavedConfig || editingConnected) && active?.id === "google_workspace" ? (
               <Box
                 sx={{
                   border: "1px solid rgba(112,153,201,0.12)",
@@ -4302,7 +4674,7 @@ export function IntegrationsPanel({
                 ) : null}
               </Box>
             ) : null}
-            {(active?.status !== "connected" || editingConnected)
+            {(!activeHasSavedConfig || editingConnected)
               ? (active?.config_fields || []).map(renderField)
               : null}
             {active?.config_help ? (
@@ -4310,7 +4682,7 @@ export function IntegrationsPanel({
                 {active.config_help}
               </Typography>
             ) : null}
-            {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
+            {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
               <Box
                 sx={{
                   border: "1px solid rgba(64, 196, 255, 0.24)",
@@ -4496,13 +4868,15 @@ export function IntegrationsPanel({
                   ? active?.id === "google_workspace"
                     ? "Workspace setup saved. Continue with Google to finish authorization."
                     : "Credentials saved. Click Connect to finish authorization."
-                  : "API keys validated and saved."}
+                  : activeIsConfigured
+                    ? "Credentials saved. AgentArk will confirm live connectivity when this connector is first used."
+                    : "API keys validated and saved."}
               </Alert>
             ) : null}
           </Stack>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
-          {active?.status === "connected" ? (
+          {activeHasSavedConfig ? (
             <Button
               color="warning"
               variant="outlined"
@@ -4515,7 +4889,7 @@ export function IntegrationsPanel({
           <Button onClick={closeConfig} disabled={saving} size="small" sx={dialogActionButtonSx}>
             Close
           </Button>
-          {(active?.status !== "connected" || editingConnected) && activeNeedsOauth ? (
+          {(!activeHasSavedConfig || editingConnected) && activeNeedsOauth ? (
             <Button
               variant="contained"
               onClick={() => {
@@ -4532,7 +4906,7 @@ export function IntegrationsPanel({
                   : "Save & Connect"}
             </Button>
           ) : null}
-          {(active?.status !== "connected" || editingConnected) && !(active?.id === "google_workspace" && activeNeedsOauth) ? (
+          {(!activeHasSavedConfig || editingConnected) && !(active?.id === "google_workspace" && activeNeedsOauth) ? (
             <Button
               variant={activeNeedsOauth ? "outlined" : "contained"}
               onClick={submitConfig}
@@ -4546,6 +4920,8 @@ export function IntegrationsPanel({
             >
               {saving
                 ? "Saving..."
+                : str(active?.configure_button, "").trim()
+                  ? str(active?.configure_button, "").trim()
                 : activeNeedsOauth
                   ? "Save Only"
                   : active?.id === "google_workspace"
@@ -4845,6 +5221,18 @@ export function IntegrationsPanel({
                       onChange={(e) => setMcpForm((p) => ({ ...p, working_dir: e.target.value }))}
                     />
                   </Grid2>
+                  <Grid2 size={{ xs: 12 }}>
+                    <TextField
+                      label="Environment Variables"
+                      fullWidth
+                      value={mcpForm.env_csv}
+                      onChange={(e) => setMcpForm((p) => ({ ...p, env_csv: e.target.value }))}
+                      placeholder="KEY1=value1, KEY2=value2"
+                      helperText="Comma-separated KEY=VALUE pairs. Values are stored encrypted."
+                      multiline
+                      minRows={2}
+                    />
+                  </Grid2>
                 </>
               )}
               <Grid2 size={{ xs: 12, md: 6 }}>
@@ -4950,6 +5338,16 @@ export function IntegrationsPanel({
                   label="Tool allowlist (comma separated)"
                   value={mcpForm.tool_allowlist_csv}
                   onChange={(e) => setMcpForm((p) => ({ ...p, tool_allowlist_csv: e.target.value }))}
+                />
+              </Grid2>
+              <Grid2 size={{ xs: 12, md: 6 }}>
+                <TextField
+                  label="Tool Blocklist"
+                  fullWidth
+                  value={mcpForm.tool_blocklist_csv}
+                  onChange={(e) => setMcpForm((p) => ({ ...p, tool_blocklist_csv: e.target.value }))}
+                  placeholder="tool_to_block1, tool_to_block2"
+                  helperText="Comma-separated tool names to exclude. Takes precedence over allowlist."
                 />
               </Grid2>
               <Grid2 size={{ xs: 12, md: 6 }}>

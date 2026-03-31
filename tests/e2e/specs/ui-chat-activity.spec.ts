@@ -298,4 +298,322 @@ test.describe("Chat Activity UI @smoke", () => {
     await expect(page.locator("body")).not.toContainText("Tool 'Http_get' Blocked By Safety Policy");
     await expect(page.locator("body")).not.toContainText("matched_app");
   });
+
+  test("shows a stopped run card and resumes in-thread without a duplicate pending user bubble", async ({ page }) => {
+    const conversationId = "conv-resume-inline";
+    const taskId = "task-resume-inline";
+    const userMessage = "please keep going";
+    const partialAssistant = "Partial answer before the run was stopped.";
+    const resumedAssistant = "Finished answer after resuming in chat.";
+    let resumed = false;
+
+    await page.addInitScript(
+      ({ conversationId, taskId, userMessage, partialAssistant }) => {
+        window.sessionStorage.setItem(
+          "agentark.chat.pendingRun",
+          JSON.stringify({
+            conversationId,
+            message: userMessage,
+            projectId: "",
+            startedAt: Date.now(),
+            mode: "fresh",
+            phase: "interrupted",
+            taskId,
+            streamingResponse: partialAssistant,
+            streamingSteps: [
+              {
+                title: "Tool started: file_read",
+                detail: "Reading the workspace before the stop.",
+                step_type: "tool_start"
+              }
+            ],
+            failedUserMessage: ""
+          })
+        );
+      },
+      { conversationId, taskId, userMessage, partialAssistant }
+    );
+
+    await page.route("**/projects", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ projects: [] })
+      });
+    });
+
+    await page.route("**/tasks?**", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ tasks: [] })
+      });
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations: [
+            {
+              id: conversationId,
+              title: "Stopped run chat",
+              channel: "web",
+              project_id: null,
+              created_at: "2026-03-31T01:00:00.000Z",
+              updated_at: "2026-03-31T01:02:00.000Z",
+              message_count: resumed ? 2 : 1,
+              archived: false
+            }
+          ],
+          total: 1,
+          limit: 30,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: conversationId,
+          title: "Stopped run chat",
+          channel: "web",
+          project_id: null,
+          created_at: "2026-03-31T01:00:00.000Z",
+          updated_at: "2026-03-31T01:02:00.000Z",
+          message_count: resumed ? 2 : 1
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${conversationId}/messages?**`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: resumed
+            ? [
+                {
+                  id: "msg-user-resume-inline",
+                  role: "user",
+                  content: userMessage,
+                  timestamp: "2026-03-31T01:00:01.000Z",
+                  model_used: null,
+                  trace_id: null
+                },
+                {
+                  id: "msg-assistant-resume-inline",
+                  role: "assistant",
+                  content: resumedAssistant,
+                  timestamp: "2026-03-31T01:02:10.000Z",
+                  model_used: "test-model",
+                  trace_id: null
+                }
+              ]
+            : [
+                {
+                  id: "msg-user-resume-inline",
+                  role: "user",
+                  content: userMessage,
+                  timestamp: "2026-03-31T01:00:01.000Z",
+                  model_used: null,
+                  trace_id: null
+                }
+              ]
+        })
+      });
+    });
+
+    await page.route(`**/tasks/${taskId}/resume-chat/stream`, async (route) => {
+      resumed = true;
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          `event: task_started\ndata: {"task_id":"${taskId}","description":"Resume stopped chat","status":"in_progress","work_type":"task","conversation_id":"${conversationId}"}\n\n`,
+          `event: content\ndata: {"conversation_id":"${conversationId}","content":"${resumedAssistant}"}\n\n`,
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    await expect(page.locator("text=AgentArk | stopped")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator(`text=${partialAssistant}`)).toBeVisible({ timeout: 10_000 });
+
+    await page.getByRole("button", { name: "Resume" }).click();
+
+    await expect(page.locator("text=You | sending...")).toHaveCount(0);
+    await expect(page.locator(`text=${resumedAssistant}`)).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("text=AgentArk | stopped")).toHaveCount(0);
+  });
+
+  test("shows live draft code and phase status in the workspace panel", async ({ page }) => {
+    let createdConversationId = "";
+    let userMessage = "";
+    const assistantMessage = "Built the first draft and kept streaming the file into the workspace.";
+
+    await page.setViewportSize({ width: 1440, height: 960 });
+
+    await page.route("**/projects", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ projects: [] })
+      });
+    });
+
+    await page.route("**/api/apps", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ apps: [] })
+      });
+    });
+
+    await page.route("**/tunnel/status", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({})
+      });
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      const conversations = createdConversationId
+        ? [
+            {
+              id: createdConversationId,
+              title: "Live draft stream chat",
+              channel: "web",
+              project_id: null,
+              created_at: "2026-03-31T12:00:00.000Z",
+              updated_at: "2026-03-31T12:00:12.000Z",
+              message_count: 2,
+              archived: false
+            }
+          ]
+        : [];
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations,
+          total: conversations.length,
+          limit: 20,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route("**/conversations/*/messages?**", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages:
+            conversationId && conversationId === createdConversationId
+              ? [
+                  {
+                    id: "msg-user-live-draft",
+                    role: "user",
+                    content: userMessage,
+                    timestamp: "2026-03-31T12:00:01.000Z",
+                    model_used: null,
+                    trace_id: null
+                  },
+                  {
+                    id: "msg-assistant-live-draft",
+                    role: "assistant",
+                    content: assistantMessage,
+                    timestamp: "2026-03-31T12:00:12.000Z",
+                    model_used: "test-model",
+                    trace_id: null
+                  }
+                ]
+              : []
+        })
+      });
+    });
+
+    await page.route("**/conversations/*", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      if (!conversationId || conversationId !== createdConversationId) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "not found" })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: createdConversationId,
+          title: "Live draft stream chat",
+          channel: "web",
+          project_id: null,
+          created_at: "2026-03-31T12:00:00.000Z",
+          updated_at: "2026-03-31T12:00:12.000Z",
+          message_count: 2
+        })
+      });
+    });
+
+    await page.route("**/chat/stream", async (route) => {
+      const payload = route.request().postDataJSON() as {
+        conversation_id?: string;
+        message?: string;
+      };
+      createdConversationId = payload.conversation_id || "conv-live-draft";
+      userMessage = payload.message || "build me a simple hello world app";
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"phase_status","phase":"generating_files","label":"Generating files","detail":"Drafting src/App.tsx","elapsed_secs":7,"stream_key":"phase-status:app_deploy:generating_files"}\n\n',
+          'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"draft_file","file":"src/App.tsx","phase":"generating_files","stream_key":"draft-file:app_deploy:src/App.tsx","content_snapshot":"export default function App() {\\n  return <main>Hello world</main>;\\n}\\n","line":3,"total_lines":3,"done":false}\n\n',
+          'event: tool_progress\ndata: {"name":"app_deploy","content":"Drafting src/App.tsx","kind":"draft_file","file":"src/App.tsx","phase":"generating_files","stream_key":"draft-file:app_deploy:src/App.tsx","content_snapshot":"export default function App() {\\n  return <main>Hello world</main>;\\n}\\n","line":3,"total_lines":3,"done":true}\n\n',
+          'event: content\ndata: {"conversation_id":"' +
+            createdConversationId +
+            '","content":"' +
+            assistantMessage +
+            '"}\n\n',
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    const input = page.locator("textarea[aria-label='Message']").first();
+    await expect(input).toBeVisible({ timeout: 10_000 });
+
+    await input.fill("build me a simple hello world app");
+    await input.press("Enter");
+
+    await expect(page.locator(".term-phase-pill")).toContainText("Generating files", { timeout: 10_000 });
+    await expect(
+      page.locator(".activity-signal-row").filter({ hasText: "Phase" }).first()
+    ).toContainText("Drafting src/App.tsx", { timeout: 10_000 });
+    await expect(page.locator(".deployed-file-row.is-selected").first()).toContainText("src/App.tsx", {
+      timeout: 10_000
+    });
+    await expect(page.locator(".chat-workspace-code-inline")).toContainText("Hello world", {
+      timeout: 10_000
+    });
+    await expect(
+      page.locator("text=Built the first draft and kept streaming the file into the workspace.")
+    ).toBeVisible({ timeout: 10_000 });
+  });
 });

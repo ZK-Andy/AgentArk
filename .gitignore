@@ -46,3 +46,6 @@ __pycache__/
 
 # Docs
 docs/
+
+# Local cargo build config
+.cargo/config.toml

@@ -363,9 +363,13 @@ function extractStreamErrorMessage(payloadValue: unknown): string {
   }
 }
 
-async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandlers = {}): Promise<void> {
+async function streamSseJson(
+  path: string,
+  payload: unknown,
+  handlers: ChatStreamHandlers = {}
+): Promise<void> {
   const doFetch = () =>
-    fetch("/chat/stream", {
+    fetch(path, {
       method: "POST",
       credentials: "include",
       signal: handlers.signal,
@@ -489,6 +493,10 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
       // ignore cleanup errors
     }
   }
+}
+
+async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandlers = {}): Promise<void> {
+  return streamSseJson("/chat/stream", payload, handlers);
 }
 
 export const api = {
@@ -849,6 +857,8 @@ export const api = {
       }
     ),
   chatStream: (payload: ChatStreamPayload, handlers?: ChatStreamHandlers) => streamChat(payload, handlers),
+  resumeChatTaskStream: (id: string, handlers?: ChatStreamHandlers) =>
+    streamSseJson(`/tasks/${encodeURIComponent(id)}/resume-chat/stream`, {}, handlers),
   approveTask: (id: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/approve`, {
       method: "POST",

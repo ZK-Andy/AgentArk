@@ -139,16 +139,25 @@ pub async fn analyze_user_style(
         sample_text
     );
 
-    let resp = llm
-        .chat(
-            "You analyze user communication patterns. Return JSON only, no markdown.",
-            &prompt,
-            &[],
-            &[],
-        )
-        .await;
-
-    let resp = match resp {
+    let supervisor = crate::core::ExecutionSupervisor::default();
+    let request = crate::core::ExecutionRequest {
+        kind: "self_tune_style_analysis".to_string(),
+        channel: Some("self_tune".to_string()),
+        message_preview: Some(prompt.chars().take(200).collect()),
+        ..Default::default()
+    };
+    let resp = match crate::core::execution::execute_supervised_transport_chat(
+        &supervisor,
+        llm,
+        &request,
+        "You analyze user communication patterns. Return JSON only, no markdown.",
+        &prompt,
+        &[],
+        &[],
+        Some(2_000),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("Self-tune: LLM style analysis failed: {}", e);

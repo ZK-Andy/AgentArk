@@ -1,0 +1,8 @@
+{
+  "action_name": "video-frames",
+  "bundle_hash": "55cfa9cee220114bb88f5a2423b10cd780c39702cdb007c4ca96791153255c32",
+  "publisher_did": "did:key:z6MktwS4jbR4hMa49jniuUJa1zs6Ds2YGjXqWPyvg6Ad9Dg1",
+  "signature": "1e879c27e9c77e99903b485260df232e9d410d2c80bbb1c6ae909e36c961a367b033cce727e8038e6fce06c616d58e0c04dbd8acb1f30523b6028812c0001e0c",
+  "signed_at": "2026-03-29T09:22:22.574196200Z",
+  "manifest_version": 1
+}

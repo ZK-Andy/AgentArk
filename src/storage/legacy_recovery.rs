@@ -259,7 +259,11 @@ mod tests {
     #[tokio::test]
     async fn load_json_vec_with_legacy_key_recovery_rehydrates_old_keyfile_payloads() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         let legacy_key =
             Arc::new(KeyManager::load_or_create(&temp_dir.path().join(".keyfile")).unwrap());
         let active_key = Arc::new(
@@ -296,7 +300,11 @@ mod tests {
     #[tokio::test]
     async fn load_json_vec_with_legacy_key_recovery_rehydrates_archived_storage_keys() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
         let old_key = Arc::new(
             KeyManager::from_password("old-password", &[1_u8; crate::crypto::SALT_LEN]).unwrap(),
         );

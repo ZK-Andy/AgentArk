@@ -9,11 +9,14 @@ pub mod browser_session;
 pub mod config;
 pub mod connect_flow;
 pub mod connector;
+pub mod data_lifecycle;
 pub(crate) mod document_search;
+pub mod execution;
 pub mod gateway;
 pub mod gateway_ops;
 pub mod integration_sync;
 pub mod intent;
+pub mod learning;
 mod llm;
 pub mod model_failover;
 pub mod net;
@@ -50,7 +53,16 @@ pub use browser_profiles::{
     BrowserProfileLockRequest, BrowserProfileRecord, BrowserProfileSessionRecord,
     BrowserProfileTargetKind, BrowserProfileUpsert,
 };
-pub use config::{AgentConfig, ModelRole, ModelSlot};
+pub use config::{
+    AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
+};
+pub use execution::{
+    execute_supervised_transport_chat, AttemptPolicy, AttemptRecord, DegradationNote,
+    DelegationStatus, ExecutionCandidateDescriptor, ExecutionCheckpoint, ExecutionOutcome,
+    ExecutionRequest, ExecutionRun, ExecutionRunStatus, ExecutionSupervisor, FailureClass,
+    FailureKind, ModelAttemptRecord, RecoveryAction, RequestState, ToolAttempt, ToolOutcome,
+    ToolOutcomeStatus, UserFacingOutcome, UserFacingOutcomeStatus,
+};
 pub use gateway::{
     create_broadcast_group as create_gateway_broadcast_group,
     delete_channel_account as delete_gateway_channel_account,

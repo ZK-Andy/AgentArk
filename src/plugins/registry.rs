@@ -262,14 +262,33 @@ impl PluginRegistry {
             anyhow::bail!("This auth mode requires a token.");
         }
 
-        let manifest = self
+        let manifest = match self
             .fetch_manifest(
                 &base_url,
                 auth_mode,
                 auth_header.as_deref(),
                 token.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if let Some(existing_plugin) = existing.as_ref() {
+                    let detail = error.to_string();
+                    self.set_plugin_last_error(&existing_plugin.id, Some(detail.clone()))
+                        .await?;
+                    self.append_log(
+                        existing_plugin,
+                        "manifest",
+                        "Manifest sync",
+                        "error",
+                        Some(detail),
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+        };
         let id = existing_id
             .clone()
             .filter(|value| !value.trim().is_empty())
@@ -381,18 +400,35 @@ impl PluginRegistry {
             .cloned()
             .ok_or_else(|| anyhow!("Plugin not found"))?;
         let token = self.load_plugin_secret(id)?;
-        let manifest = self
+        let manifest = match self
             .fetch_manifest(
                 &existing.base_url,
                 existing.auth_mode,
                 existing.auth_header.as_deref(),
                 token.as_deref(),
             )
-            .await?;
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let detail = error.to_string();
+                self.set_plugin_last_error(id, Some(detail.clone())).await?;
+                self.append_log(
+                    &existing,
+                    "manifest",
+                    "Manifest refresh",
+                    "error",
+                    Some(detail),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let mut next = existing.clone();
         next.manifest = manifest;
         next.updated_at = now_rfc3339();
         next.last_synced_at = Some(now_rfc3339());
+        next.last_error = None;
         next.subscribed_events = normalize_subscribed_events(
             Some(next.subscribed_events.as_slice()),
             None,
@@ -441,7 +477,7 @@ impl PluginRegistry {
             .find(|action| action.name == action_name)
             .cloned()
             .ok_or_else(|| anyhow!("Plugin action '{}' is not registered", action_name))?;
-        let response = self
+        let response = match self
             .http_client
             .post(plugin_endpoint(
                 &plugin.base_url,
@@ -462,11 +498,32 @@ impl PluginRegistry {
             }))
             .send()
             .await
-            .with_context(|| format!("failed to call plugin action '{}'", action_name))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let detail = clip_chars(
+                    &format!("failed to call plugin action '{}': {}", action_name, error),
+                    PLUGIN_MESSAGE_MAX_CHARS,
+                );
+                self.set_plugin_last_error(plugin_id, Some(detail.clone()))
+                    .await?;
+                self.append_log(
+                    &plugin,
+                    "action",
+                    action_name,
+                    "error",
+                    Some(detail.clone()),
+                )
+                .await?;
+                anyhow::bail!("{}", detail);
+            }
+        };
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             let message = clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS);
+            self.set_plugin_last_error(plugin_id, Some(message.clone()))
+                .await?;
             self.append_log(
                 &plugin,
                 "action",
@@ -477,6 +534,7 @@ impl PluginRegistry {
             .await?;
             anyhow::bail!("Plugin action '{}' failed: {}", action_name, message);
         }
+        self.set_plugin_last_error(plugin_id, None).await?;
         self.append_log(
             &plugin,
             "action",
@@ -502,6 +560,26 @@ impl PluginRegistry {
             .cloned()
             .collect::<Vec<_>>();
         for plugin in eligible {
+            let mut event_payload = serde_json::Map::new();
+            event_payload.insert(
+                "sdk_version".to_string(),
+                Value::String(PLUGIN_SDK_VERSION.to_string()),
+            );
+            event_payload.insert("plugin_id".to_string(), Value::String(plugin.id.clone()));
+            event_payload.insert(
+                "plugin_name".to_string(),
+                Value::String(plugin.name.clone()),
+            );
+            event_payload.insert("event".to_string(), Value::String(event_name.to_string()));
+            event_payload.insert("occurred_at".to_string(), Value::String(now_rfc3339()));
+            if let Some(object) = payload.as_object() {
+                for (key, value) in object {
+                    event_payload
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            event_payload.insert("payload".to_string(), payload.clone());
             let response = self
                 .http_client
                 .post(plugin_endpoint(
@@ -513,18 +591,12 @@ impl PluginRegistry {
                     plugin.auth_header.as_deref(),
                     self.load_plugin_secret(&plugin.id)?.as_deref(),
                 )?)
-                .json(&serde_json::json!({
-                    "sdk_version": PLUGIN_SDK_VERSION,
-                    "plugin_id": plugin.id,
-                    "plugin_name": plugin.name,
-                    "event": event_name,
-                    "occurred_at": now_rfc3339(),
-                    "payload": payload,
-                }))
+                .json(&Value::Object(event_payload))
                 .send()
                 .await;
             match response {
                 Ok(resp) if resp.status().is_success() => {
+                    self.set_plugin_last_error(&plugin.id, None).await?;
                     self.append_log(
                         &plugin,
                         "event",
@@ -536,24 +608,18 @@ impl PluginRegistry {
                 }
                 Ok(resp) => {
                     let body = resp.text().await.unwrap_or_default();
-                    self.append_log(
-                        &plugin,
-                        "event",
-                        event_name,
-                        "error",
-                        Some(clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS)),
-                    )
-                    .await?;
+                    let detail = clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS);
+                    self.set_plugin_last_error(&plugin.id, Some(detail.clone()))
+                        .await?;
+                    self.append_log(&plugin, "event", event_name, "error", Some(detail))
+                        .await?;
                 }
                 Err(error) => {
-                    self.append_log(
-                        &plugin,
-                        "event",
-                        event_name,
-                        "error",
-                        Some(clip_chars(&error.to_string(), PLUGIN_MESSAGE_MAX_CHARS)),
-                    )
-                    .await?;
+                    let detail = clip_chars(&error.to_string(), PLUGIN_MESSAGE_MAX_CHARS);
+                    self.set_plugin_last_error(&plugin.id, Some(detail.clone()))
+                        .await?;
+                    self.append_log(&plugin, "event", event_name, "error", Some(detail))
+                        .await?;
                 }
             }
         }
@@ -566,7 +632,7 @@ impl PluginRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("Plugin not found"))?;
-        let response = self
+        let response = match self
             .http_client
             .get(plugin_endpoint(&plugin.base_url, "/agentark/ping"))
             .headers(self.build_auth_headers(
@@ -576,17 +642,28 @@ impl PluginRegistry {
             )?)
             .send()
             .await
-            .with_context(|| format!("failed to ping plugin '{}'", id))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let detail = format!("failed to ping plugin '{}': {}", id, error);
+                self.set_plugin_last_error(id, Some(detail.clone())).await?;
+                self.append_log(&plugin, "ping", "Ping", "error", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+        };
         let status = response.status();
         let detail = clip_chars(
             &response.text().await.unwrap_or_default(),
             PLUGIN_MESSAGE_MAX_CHARS,
         );
         if !status.is_success() {
+            self.set_plugin_last_error(id, Some(detail.clone())).await?;
             self.append_log(&plugin, "ping", "Ping", "error", Some(detail.clone()))
                 .await?;
             anyhow::bail!("Plugin ping failed: {}", detail);
         }
+        self.set_plugin_last_error(id, None).await?;
         self.append_log(
             &plugin,
             "ping",
@@ -684,6 +761,23 @@ impl PluginRegistry {
     async fn persist_configs(&self) -> Result<()> {
         let configs = self.plugins.values().cloned().collect::<Vec<_>>();
         save_json(&self.storage, PLUGIN_CONFIGS_KEY, &configs).await
+    }
+
+    async fn set_plugin_last_error(
+        &mut self,
+        plugin_id: &str,
+        value: Option<String>,
+    ) -> Result<()> {
+        let mut changed = false;
+        if let Some(plugin) = self.plugins.get_mut(plugin_id) {
+            plugin.last_error = value;
+            plugin.updated_at = now_rfc3339();
+            changed = true;
+        }
+        if changed {
+            self.persist_configs().await?;
+        }
+        Ok(())
     }
 
     async fn append_log(

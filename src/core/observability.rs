@@ -178,6 +178,40 @@ fn otel_attribute_int(key: &str, value: i64) -> serde_json::Value {
     json!({ "key": key, "value": { "intValue": value.to_string() } })
 }
 
+fn parse_pipe_kv_metadata(value: &str) -> Vec<(String, String)> {
+    value
+        .split('|')
+        .filter_map(|segment| {
+            let (raw_key, raw_value) = segment.split_once('=')?;
+            let key = raw_key.trim();
+            let rendered_key = key
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('_')
+                .to_string();
+            if rendered_key.is_empty() {
+                return None;
+            }
+            let rendered_value = raw_value.trim().to_string();
+            if rendered_value.is_empty()
+                || rendered_value.contains('\n')
+                || rendered_value.contains('{')
+                || rendered_value.contains('[')
+            {
+                return None;
+            }
+            Some((rendered_key, rendered_value))
+        })
+        .collect()
+}
+
 fn datetime_to_unix_nanos(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.timestamp_nanos_opt()
         .unwrap_or_else(|| dt.timestamp_millis() * 1_000_000)
@@ -317,6 +351,16 @@ fn build_step_attributes(
             "agentark.duration_ms",
             duration_ms as i64,
         ));
+    }
+    if let Some(data) = step.data.as_ref() {
+        for (key, value) in parse_pipe_kv_metadata(data) {
+            let attr_key = format!("agentark.{}", key);
+            if let Ok(int_value) = value.parse::<i64>() {
+                attributes.push(otel_attribute_int(&attr_key, int_value));
+            } else {
+                attributes.push(otel_attribute_string(&attr_key, value));
+            }
+        }
     }
     // LangSmith: populate input/output on step spans so tool calls show data
     if let Some(detail) = redact_by_mode(mode, &step.detail, 2000) {

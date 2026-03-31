@@ -609,11 +609,74 @@ fn google_workspace_status_detail(
     None
 }
 
+fn google_workspace_test_payload_ok(payload: &serde_json::Value) -> bool {
+    payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("ok"))
+}
+
+fn google_workspace_test_issue_detail(payload: &serde_json::Value) -> Option<String> {
+    let checks = payload.get("checks")?.as_object()?;
+    let issues = checks
+        .iter()
+        .filter_map(|(key, value)| {
+            let text = value.as_str()?.trim();
+            let lowered = text.to_ascii_lowercase();
+            if lowered.contains("failed")
+                || lowered.contains("unavailable")
+                || lowered.contains("needs additional access")
+                || lowered.contains("reconnect")
+            {
+                Some(format!("{}: {}", key.replace('_', " "), text))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if issues.is_empty() {
+        None
+    } else {
+        Some(format!("Health checks: {}", issues.join(" | ")))
+    }
+}
+
 fn google_workspace_configured(config_dir: &std::path::Path) -> bool {
     crate::actions::google_workspace::load_workspace_client_config(config_dir)
         .ok()
         .flatten()
         .is_some()
+}
+
+fn integration_uses_config_only_status(id: &str) -> bool {
+    matches!(
+        id,
+        "twitter"
+            | "google_places"
+            | "twilio"
+            | "ordering"
+            | "garmin"
+            | "whoop"
+            | "ga4"
+            | "gsc"
+            | "social_analytics"
+            | "moltbook"
+    )
+}
+
+fn config_only_status_detail(id: &str, enabled: bool) -> String {
+    let name = id.replace('_', " ");
+    if enabled {
+        format!(
+            "{} credentials are saved and agent use is enabled, but AgentArk has not run a live health probe for this connector yet.",
+            name
+        )
+    } else {
+        format!(
+            "{} credentials are saved, but this connector is still waiting for explicit enablement and live use before AgentArk can confirm connectivity.",
+            name
+        )
+    }
 }
 
 fn format_gmail_auth_url(client_id: &str, state_token: &str) -> String {
@@ -1308,9 +1371,17 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
                     "error",
                     Some("Google Workspace status check timed out.".to_string()),
                 ),
-                Ok(Ok(_)) => (
+                Ok(Ok(payload)) if google_workspace_test_payload_ok(&payload) => (
                     "connected",
                     google_workspace_status_detail(&granted, &missing, &pending),
+                ),
+                Ok(Ok(payload)) => (
+                    "error",
+                    google_workspace_test_issue_detail(&payload)
+                        .or_else(|| google_workspace_status_detail(&granted, &missing, &pending))
+                        .or_else(|| {
+                            Some("Google Workspace health checks reported warnings.".to_string())
+                        }),
                 ),
                 Ok(Err(error)) => ("error", Some(error)),
             }
@@ -1321,7 +1392,7 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             id: "google_workspace".to_string(),
             name: "Google Workspace".to_string(),
             description:
-                "Connect Google Workspace once, then let AgentArk use Gmail, Calendar, Drive, Docs, Sheets, Chat, Admin, and the broader gws CLI surface from the same credential set."
+                "Connect Google Workspace once, then let AgentArk use Gmail, Calendar, read Drive/Docs/Sheets/Chat/Admin data, and access the broader gws CLI surface from the same credential set."
                     .to_string(),
             icon: "".to_string(),
             status: status.to_string(),
@@ -1336,10 +1407,7 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
     }
 
     for info in agent.integrations.list().await {
-        if info.id == "moltbook"
-            || info.id == "gmail"
-            || info.id == "google_calendar"
-        {
+        if info.id == "moltbook" || info.id == "gmail" || info.id == "google_calendar" {
             continue;
         }
 
@@ -1348,6 +1416,9 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             Some(m) => m,
             None => continue,
         };
+
+        let enabled = crate::integrations::effective_integration_enabled(&config_dir, &info.id);
+        let config_only = integration_uses_config_only_status(&info.id);
 
         let (status_str, status_detail) = if info.id == "google_calendar" {
             let configured = calendar_oauth_pair(manager.as_ref()).is_some();
@@ -1360,7 +1431,10 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
                 )
                 .await
                 {
-                    Err(_) => ("error", Some("Calendar status check timed out.".to_string())),
+                    Err(_) => (
+                        "error",
+                        Some("Calendar status check timed out.".to_string()),
+                    ),
                     Ok(Ok(())) => ("connected", None),
                     Ok(Err(error)) => ("error", Some(error)),
                 }
@@ -1376,12 +1450,14 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
             match &info.status {
                 crate::integrations::IntegrationStatus::NotConfigured => ("not_configured", None),
                 crate::integrations::IntegrationStatus::NeedsAuth => ("needs_auth", None),
+                crate::integrations::IntegrationStatus::Connected if config_only => (
+                    "configured",
+                    Some(config_only_status_detail(&info.id, enabled)),
+                ),
                 crate::integrations::IntegrationStatus::Connected => ("connected", None),
                 crate::integrations::IntegrationStatus::Error(e) => ("error", Some(e.clone())),
             }
         };
-
-        let enabled = crate::integrations::effective_integration_enabled(&config_dir, &info.id);
 
         let auth_url = None;
 
@@ -1914,9 +1990,9 @@ pub(super) async fn configure_integration(
             let agent = state.agent.read().await;
             if let Some(integration) = agent.integrations.get(&id) {
                 let status = integration.status().await;
+                let config_only = integration_uses_config_only_status(&id);
                 match status {
                     crate::integrations::IntegrationStatus::Connected => {
-                        // Mark enabled for agent use.
                         if let Ok(manager) =
                             crate::core::config::SecureConfigManager::new_with_data_dir(
                                 &agent.config_dir,
@@ -1925,7 +2001,7 @@ pub(super) async fn configure_integration(
                         {
                             let _ = manager.set_custom_secret(
                                 &integration_enabled_key(&id),
-                                Some("true".to_string()),
+                                Some((!config_only).to_string()),
                             );
                             let _ = manager.set_custom_secret(
                                 &integration_user_disabled_key(&id),
@@ -1934,7 +2010,13 @@ pub(super) async fn configure_integration(
                         }
                         (
                             StatusCode::OK,
-                            Json(serde_json::json!({"status": "ok", "enabled": true, "connected": true})),
+                            Json(serde_json::json!({
+                                "status": "ok",
+                                "enabled": !config_only,
+                                "connected": !config_only,
+                                "configured": config_only,
+                                "status_hint": if config_only { "configured" } else { "connected" },
+                            })),
                         )
                             .into_response()
                     }
@@ -2056,8 +2138,17 @@ pub(super) async fn enable_integration(
         } else if id == "google_workspace" {
             google_workspace_test_connection(&config_dir)
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .and_then(|payload| {
+                    if google_workspace_test_payload_ok(&payload) {
+                        Ok(())
+                    } else {
+                        Err(
+                            google_workspace_test_issue_detail(&payload).unwrap_or_else(|| {
+                                "Google Workspace health checks reported warnings.".to_string()
+                            }),
+                        )
+                    }
+                })
         } else {
             validate_calendar_oauth_connection(&config_dir).await
         };
@@ -2107,6 +2198,7 @@ pub(super) async fn enable_integration(
 
     match integration.status().await {
         crate::integrations::IntegrationStatus::Connected => {
+            let config_only = integration_uses_config_only_status(&id);
             if let Ok(manager) = crate::core::config::SecureConfigManager::new_with_data_dir(
                 &agent.config_dir,
                 Some(&agent.data_dir),
@@ -2120,7 +2212,13 @@ pub(super) async fn enable_integration(
             }
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
+                Json(serde_json::json!({
+                    "status":"ok",
+                    "enabled":true,
+                    "connected": !config_only,
+                    "configured": config_only,
+                    "status_hint": if config_only { "configured" } else { "connected" },
+                })),
             )
                 .into_response()
         }
@@ -2242,6 +2340,15 @@ pub(super) async fn test_integration(
             .into_response();
     };
     match integration.status().await {
+        crate::integrations::IntegrationStatus::Connected if integration_uses_config_only_status(&id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status":"configured",
+                "connected":false,
+                "detail": config_only_status_detail(&id, crate::integrations::effective_integration_enabled(&agent.config_dir, &id)),
+            })),
+        )
+            .into_response(),
         crate::integrations::IntegrationStatus::Connected => (
             StatusCode::OK,
             Json(serde_json::json!({"status":"ok","connected":true})),
@@ -2290,7 +2397,12 @@ async fn google_workspace_test_connection(
         .map_err(|e| e.to_string())?;
     let mut ok = true;
     for message in checks.values() {
-        if message.contains("failed") || message.contains("unavailable") {
+        let lowered = message.to_ascii_lowercase();
+        if lowered.contains("failed")
+            || lowered.contains("unavailable")
+            || lowered.contains("needs additional access")
+            || lowered.contains("reconnect")
+        {
             ok = false;
             break;
         }
@@ -2965,5 +3077,4 @@ mod tests {
             Some("true".to_string())
         );
     }
-
 }

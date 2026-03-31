@@ -1337,12 +1337,12 @@ pub async fn handle_activity(
     let response = {
         let guard = agent.read().await;
         guard
-            .process_message(&text, "teams", Some(&conversation_id), None)
+            .process_message_with_meta(&text, "teams", Some(&conversation_id), None)
             .await
     };
 
     let response_text = match response {
-        Ok(text) => text,
+        Ok(processed) => Agent::render_plain_channel_response(processed),
         Err(error) => format!("Error: {}", error),
     };
 

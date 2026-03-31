@@ -410,16 +410,28 @@ pub async fn test_custom_api(
     let config = configs[index].clone();
     let action_name = find_testable_action(&config)
         .ok_or_else(|| anyhow!("No safe test endpoint is available"))?;
-    let detail = runtime.execute_action(&action_name, &json!({})).await?;
-    let detail = clip_chars(&detail, 1_500);
+    let tested_at = chrono::Utc::now().to_rfc3339();
+    let execution = runtime.execute_action(&action_name, &json!({})).await;
+    let (ok, detail) = match execution {
+        Ok(detail) => (true, clip_chars(&detail, 1_500)),
+        Err(error) => (false, clip_chars(&error.to_string(), 1_500)),
+    };
 
-    configs[index].last_tested_at = Some(chrono::Utc::now().to_rfc3339());
-    configs[index].last_test_outcome = Some("success".to_string());
+    configs[index].last_tested_at = Some(tested_at);
+    configs[index].last_test_outcome = Some(if ok {
+        "success".to_string()
+    } else {
+        "failure".to_string()
+    });
     configs[index].last_test_message = Some(detail.clone());
     save_configs(storage, &configs).await?;
 
+    if !ok {
+        anyhow::bail!("{}", detail);
+    }
+
     Ok(CustomApiTestResult {
-        ok: true,
+        ok,
         action_name,
         detail,
     })
@@ -1121,6 +1133,8 @@ fn clip_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::ActionRuntime;
+    use crate::storage::Storage;
 
     #[tokio::test]
     async fn preview_openapi_discovers_operations() {
@@ -1165,5 +1179,74 @@ mod tests {
         assert_eq!(preview.auth_mode, CustomApiAuthMode::Bearer);
         assert_eq!(preview.operations[0].path, "/v1/incidents");
         assert!(preview.operations[0].body_required);
+    }
+
+    #[tokio::test]
+    async fn failed_custom_api_test_persists_failure_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .expect("storage");
+        let runtime = ActionRuntime::new(dir.path(), dir.path())
+            .await
+            .expect("runtime");
+
+        upsert_custom_api(
+            &storage,
+            dir.path(),
+            dir.path(),
+            &runtime,
+            CustomApiUpsertRequest {
+                id: Some("ops".to_string()),
+                name: "Ops".to_string(),
+                description: Some("Test API".to_string()),
+                base_url: "http://127.0.0.1:9".to_string(),
+                enabled: Some(true),
+                auth_mode: Some(CustomApiAuthMode::None),
+                auth_header: None,
+                auth_name: None,
+                auth_username: None,
+                secret: None,
+                clear_secret: None,
+                operations: vec![CustomApiOperationDraft {
+                    id: "health".to_string(),
+                    name: "Health".to_string(),
+                    method: "GET".to_string(),
+                    path: "/health".to_string(),
+                    description: "Health check".to_string(),
+                    read_only: true,
+                    enabled: true,
+                    default_headers: std::collections::BTreeMap::new(),
+                    default_query: std::collections::BTreeMap::new(),
+                    parameters: Vec::new(),
+                    body_required: false,
+                }],
+            },
+            None,
+        )
+        .await
+        .expect("custom API saved");
+
+        let error = test_custom_api(&storage, dir.path(), dir.path(), &runtime, "ops")
+            .await
+            .expect_err("test should fail against an unreachable endpoint");
+        assert!(!error.to_string().trim().is_empty());
+
+        let apis = list_custom_apis(&storage, dir.path(), dir.path())
+            .await
+            .expect("custom APIs listed");
+        let api = apis
+            .into_iter()
+            .find(|item| item.config.id == "ops")
+            .expect("saved API present");
+        assert_eq!(api.config.last_test_outcome.as_deref(), Some("failure"));
+        assert!(api
+            .config
+            .last_test_message
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()));
+        assert!(api.config.last_tested_at.is_some());
     }
 }

@@ -333,20 +333,29 @@ impl IntegrationManager {
 
     /// List all integrations with their status
     pub async fn list(&self) -> Vec<IntegrationInfo> {
-        join_all(self.integrations.iter().map(|(id, integration)| async move {
-            let status = match tokio::time::timeout(INTEGRATION_STATUS_TIMEOUT, integration.status()).await {
-                Ok(status) => status,
-                Err(_) => IntegrationStatus::Error("Status check timed out".to_string()),
-            };
-            IntegrationInfo {
-                id: id.clone(),
-                name: integration.name().to_string(),
-                description: integration.description().to_string(),
-                icon: integration.icon().to_string(),
-                capabilities: integration.capabilities(),
-                status,
-            }
-        }))
+        join_all(
+            self.integrations
+                .iter()
+                .map(|(id, integration)| async move {
+                    let status = match tokio::time::timeout(
+                        INTEGRATION_STATUS_TIMEOUT,
+                        integration.status(),
+                    )
+                    .await
+                    {
+                        Ok(status) => status,
+                        Err(_) => IntegrationStatus::Error("Status check timed out".to_string()),
+                    };
+                    IntegrationInfo {
+                        id: id.clone(),
+                        name: integration.name().to_string(),
+                        description: integration.description().to_string(),
+                        icon: integration.icon().to_string(),
+                        capabilities: integration.capabilities(),
+                        status,
+                    }
+                }),
+        )
         .await
     }
 

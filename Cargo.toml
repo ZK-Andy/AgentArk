@@ -83,8 +83,9 @@ serde_yaml = "0.9"
 toml = "0.8"
 bincode = "1"
 
-# Database ORM (SeaORM with SQLite)
-sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+# Database ORM (SeaORM with PostgreSQL)
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 
 
 # Time & scheduling

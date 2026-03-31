@@ -30,7 +30,7 @@ pub struct McpResource {
 /// MCP JSON-RPC request
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {
-    pub _jsonrpc: String,
+    pub jsonrpc: String,
     pub id: Option<serde_json::Value>,
     pub method: String,
     #[serde(default)]
@@ -149,9 +149,20 @@ impl McpServer {
 
     /// Handle an MCP JSON-RPC request
     pub fn handle_request(&self, request: &McpRequest) -> McpResponse {
+        if request.jsonrpc != "2.0" {
+            return McpResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id.clone(),
+                result: None,
+                error: Some(McpError {
+                    code: -32600,
+                    message: "Invalid JSON-RPC version. Expected \"2.0\".".to_string(),
+                }),
+            };
+        }
         let result = match request.method.as_str() {
             "initialize" => Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {
                     "tools": { "listChanged": false },
                     "resources": { "subscribe": false, "listChanged": false }
