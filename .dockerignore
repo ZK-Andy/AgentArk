@@ -4,6 +4,7 @@ target/
 .idea/
 .vscode/
 *.md
+!src/core/product_help_docs/*.md
 nul
 tests/
 install.sh

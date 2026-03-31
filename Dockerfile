@@ -74,9 +74,8 @@ FROM rust:1.92-bookworm AS builder
 
 WORKDIR /app
 
-# Copy manifests and vendored dependencies
+# Copy manifests for dependency resolution
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
 
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
