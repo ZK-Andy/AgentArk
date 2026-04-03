@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 /// Twitter/X API connector
 pub struct TwitterConnector {
     http: reqwest::Client,
-    #[allow(dead_code)]
     config_dir: PathBuf,
 }
 
@@ -26,7 +25,7 @@ impl TwitterConnector {
     }
 
     pub fn new() -> Self {
-        let config_dir = directories::ProjectDirs::from("com", "agentark", "AgentArk")
+        let config_dir = crate::branding::project_dirs()
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 

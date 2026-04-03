@@ -59,7 +59,6 @@ pub enum AgentStatus {
 pub trait SwarmAgent: Send + Sync {
     fn info(&self) -> AgentInfo;
     fn id(&self) -> &AgentId;
-    async fn handle_message(&self, message: SwarmMessage) -> Result<SwarmResponse>;
     /// Score how well this agent can handle a task (0.0 to 1.0)
     fn can_handle(&self, task_description: &str) -> f32;
 }
@@ -77,6 +76,7 @@ pub struct SwarmMessage {
 }
 
 impl SwarmMessage {
+    #[cfg(test)]
     pub fn new(from: AgentId, to: AgentId, content: String) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -88,14 +88,4 @@ impl SwarmMessage {
             timestamp: chrono::Utc::now(),
         }
     }
-}
-
-/// Response from an agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwarmResponse {
-    pub agent_id: AgentId,
-    pub content: String,
-    pub confidence: f32,
-    pub tool_calls_made: Vec<String>,
-    pub execution_time_ms: u64,
 }

@@ -127,14 +127,15 @@ pub fn load_observability_auth_token(
 
 pub async fn load_delivery_logs(
     storage: &Storage,
-    config_dir: &Path,
+    _config_dir: &Path,
 ) -> Vec<ObservabilityDeliveryLog> {
-    crate::storage::legacy_recovery::load_json_vec_with_legacy_key_recovery(
-        storage,
-        config_dir,
-        OBSERVABILITY_LOG_KEY,
-    )
-    .await
+    storage
+        .get_encrypted(OBSERVABILITY_LOG_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Vec<ObservabilityDeliveryLog>>(&bytes).ok())
+        .unwrap_or_default()
 }
 
 pub async fn append_delivery_log(
@@ -250,8 +251,10 @@ fn build_root_span_name(trace: &ExecutionTrace, mode: ObservabilityPrivacyMode) 
     let channel = display_channel_name(&trace.channel);
     let message_preview = redact_by_mode(mode, &collapse_whitespace(&trace.message), 72);
     match message_preview {
-        Some(preview) if !preview.is_empty() => format!("AgentArk {}: {}", channel, preview),
-        _ => format!("AgentArk {}", channel),
+        Some(preview) if !preview.is_empty() => {
+            format!("{} {}: {}", crate::branding::PRODUCT_NAME, channel, preview)
+        }
+        _ => format!("{} {}", crate::branding::PRODUCT_NAME, channel),
     }
 }
 

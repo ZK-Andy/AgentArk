@@ -61,6 +61,8 @@ pub struct PluginConfig {
     pub enabled: bool,
     pub auth_mode: PluginAuthMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
     #[serde(default)]
     pub subscribed_events: Vec<String>,
@@ -106,6 +108,8 @@ pub struct PluginUpsertRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub auth_mode: Option<PluginAuthMode>,
+    #[serde(default)]
+    pub auth_profile_id: Option<String>,
     #[serde(default)]
     pub auth_header: Option<String>,
     #[serde(default)]
@@ -166,39 +170,20 @@ impl PluginRegistry {
         .collect()
     }
 
-    pub fn list_plugins(&self) -> Vec<PluginView> {
-        let mut rows = self
-            .plugins
-            .values()
-            .cloned()
-            .map(|plugin| PluginView {
-                token_configured: self.plugin_secret_present(&plugin.id).unwrap_or(false),
-                available_events: plugin.manifest.events.clone(),
-                registered_actions: plugin
-                    .manifest
-                    .actions
-                    .iter()
-                    .map(|action| plugin_action_runtime_name(&plugin.id, &action.name))
-                    .collect(),
-                plugin,
-            })
-            .collect::<Vec<_>>();
+    pub async fn list_plugins(&self) -> Result<Vec<PluginView>> {
+        let mut rows = Vec::with_capacity(self.plugins.len());
+        for plugin in self.plugins.values() {
+            rows.push(self.plugin_view(plugin).await?);
+        }
         rows.sort_by(|left, right| right.plugin.updated_at.cmp(&left.plugin.updated_at));
-        rows
+        Ok(rows)
     }
 
-    pub fn get_plugin(&self, id: &str) -> Option<PluginView> {
-        self.plugins.get(id).cloned().map(|plugin| PluginView {
-            token_configured: self.plugin_secret_present(id).unwrap_or(false),
-            available_events: plugin.manifest.events.clone(),
-            registered_actions: plugin
-                .manifest
-                .actions
-                .iter()
-                .map(|action| plugin_action_runtime_name(&plugin.id, &action.name))
-                .collect(),
-            plugin,
-        })
+    pub async fn get_plugin(&self, id: &str) -> Result<Option<PluginView>> {
+        let Some(plugin) = self.plugins.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some(self.plugin_view(plugin).await?))
     }
 
     pub async fn sync_from_storage(&mut self, runtime: &ActionRuntime) -> Result<()> {
@@ -206,7 +191,12 @@ impl PluginRegistry {
         self.plugins.clear();
         for plugin in load_json::<Vec<PluginConfig>>(&self.storage, PLUGIN_CONFIGS_KEY).await? {
             if plugin.enabled {
-                register_plugin_actions(runtime, &plugin).await?;
+                register_plugin_actions(
+                    runtime,
+                    &plugin,
+                    self.plugin_auth_configured(&plugin).await?,
+                )
+                .await?;
             }
             self.plugins.insert(plugin.id.clone(), plugin);
         }
@@ -236,6 +226,17 @@ impl PluginRegistry {
                 .map(|item| item.auth_mode)
                 .unwrap_or_default()
         });
+        let auth_profile_id = request
+            .auth_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|item| item.auth_profile_id.clone())
+            });
         let auth_header = normalize_header_name(request.auth_header.as_deref()).or_else(|| {
             existing
                 .as_ref()
@@ -258,7 +259,18 @@ impl PluginRegistry {
                 .or(stored_token)
         };
 
-        if !matches!(auth_mode, PluginAuthMode::None) && token.as_deref().unwrap_or("").is_empty() {
+        if let Some(profile_id) = auth_profile_id.as_deref() {
+            if crate::core::auth_profiles::AuthProfileControlPlane::get(&self.storage, profile_id)
+                .await?
+                .is_none()
+            {
+                anyhow::bail!("Auth profile '{}' was not found.", profile_id);
+            }
+        }
+        if auth_profile_id.is_none()
+            && !matches!(auth_mode, PluginAuthMode::None)
+            && token.as_deref().unwrap_or("").is_empty()
+        {
             anyhow::bail!("This auth mode requires a token.");
         }
 
@@ -268,13 +280,14 @@ impl PluginRegistry {
                 auth_mode,
                 auth_header.as_deref(),
                 token.as_deref(),
+                auth_profile_id.as_deref(),
             )
             .await
         {
             Ok(manifest) => manifest,
             Err(error) => {
                 if let Some(existing_plugin) = existing.as_ref() {
-                    let detail = error.to_string();
+                    let detail = sanitize_plugin_message(&error.to_string());
                     self.set_plugin_last_error(&existing_plugin.id, Some(detail.clone()))
                         .await?;
                     self.append_log(
@@ -332,6 +345,7 @@ impl PluginRegistry {
                 .enabled
                 .unwrap_or_else(|| existing.as_ref().map(|item| item.enabled).unwrap_or(true)),
             auth_mode,
+            auth_profile_id,
             auth_header,
             subscribed_events,
             manifest,
@@ -349,7 +363,12 @@ impl PluginRegistry {
 
         runtime.unregister_plugin_actions_for_plugin(&id).await;
         if plugin.enabled {
-            register_plugin_actions(runtime, &plugin).await?;
+            register_plugin_actions(
+                runtime,
+                &plugin,
+                self.plugin_auth_configured(&plugin).await?,
+            )
+            .await?;
         }
         self.plugins.insert(id.clone(), plugin.clone());
         self.persist_configs().await?;
@@ -367,6 +386,7 @@ impl PluginRegistry {
         .await?;
 
         self.get_plugin(&id)
+            .await?
             .ok_or_else(|| anyhow!("Plugin saved but could not be read back"))
     }
 
@@ -406,12 +426,13 @@ impl PluginRegistry {
                 existing.auth_mode,
                 existing.auth_header.as_deref(),
                 token.as_deref(),
+                existing.auth_profile_id.as_deref(),
             )
             .await
         {
             Ok(manifest) => manifest,
             Err(error) => {
-                let detail = error.to_string();
+                let detail = sanitize_plugin_message(&error.to_string());
                 self.set_plugin_last_error(id, Some(detail.clone())).await?;
                 self.append_log(
                     &existing,
@@ -436,7 +457,8 @@ impl PluginRegistry {
         );
         runtime.unregister_plugin_actions_for_plugin(id).await;
         if next.enabled {
-            register_plugin_actions(runtime, &next).await?;
+            register_plugin_actions(runtime, &next, self.plugin_auth_configured(&next).await?)
+                .await?;
         }
         self.plugins.insert(id.to_string(), next.clone());
         self.persist_configs().await?;
@@ -453,6 +475,7 @@ impl PluginRegistry {
         )
         .await?;
         self.get_plugin(id)
+            .await?
             .ok_or_else(|| anyhow!("Plugin refreshed but could not be read back"))
     }
 
@@ -477,17 +500,41 @@ impl PluginRegistry {
             .find(|action| action.name == action_name)
             .cloned()
             .ok_or_else(|| anyhow!("Plugin action '{}' is not registered", action_name))?;
-        let response = match self
-            .http_client
-            .post(plugin_endpoint(
-                &plugin.base_url,
-                &format!("/agentark/actions/{}", action.name),
-            ))
-            .headers(self.build_auth_headers(
+        let token = self.load_plugin_secret(plugin_id)?;
+        let request = match self
+            .build_authorized_request(
+                reqwest::Method::POST,
+                &plugin_endpoint(
+                    &plugin.base_url,
+                    &format!("/agentark/actions/{}", action.name),
+                ),
                 plugin.auth_mode,
                 plugin.auth_header.as_deref(),
-                self.load_plugin_secret(plugin_id)?.as_deref(),
-            )?)
+                token.as_deref(),
+                plugin.auth_profile_id.as_deref(),
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                let detail = sanitize_plugin_message(&format!(
+                    "failed to call plugin action '{}': {}",
+                    action_name, error
+                ));
+                self.set_plugin_last_error(plugin_id, Some(detail.clone()))
+                    .await?;
+                self.append_log(
+                    &plugin,
+                    "action",
+                    action_name,
+                    "error",
+                    Some(detail.clone()),
+                )
+                .await?;
+                anyhow::bail!("{}", detail);
+            }
+        };
+        let response = match request
             .json(&serde_json::json!({
                 "sdk_version": PLUGIN_SDK_VERSION,
                 "plugin_id": plugin.id,
@@ -501,10 +548,10 @@ impl PluginRegistry {
         {
             Ok(response) => response,
             Err(error) => {
-                let detail = clip_chars(
-                    &format!("failed to call plugin action '{}': {}", action_name, error),
-                    PLUGIN_MESSAGE_MAX_CHARS,
-                );
+                let detail = sanitize_plugin_message(&format!(
+                    "failed to call plugin action '{}': {}",
+                    action_name, error
+                ));
                 self.set_plugin_last_error(plugin_id, Some(detail.clone()))
                     .await?;
                 self.append_log(
@@ -521,7 +568,7 @@ impl PluginRegistry {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            let message = clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS);
+            let message = sanitize_plugin_message(&body);
             self.set_plugin_last_error(plugin_id, Some(message.clone()))
                 .await?;
             self.append_log(
@@ -543,6 +590,13 @@ impl PluginRegistry {
             Some("Plugin action executed successfully.".to_string()),
         )
         .await?;
+        if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
+            let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                &self.storage,
+                auth_profile_id,
+            )
+            .await;
+        }
         Ok(format_plugin_result(&body))
     }
 
@@ -580,23 +634,38 @@ impl PluginRegistry {
                 }
             }
             event_payload.insert("payload".to_string(), payload.clone());
-            let response = self
-                .http_client
-                .post(plugin_endpoint(
-                    &plugin.base_url,
-                    &format!("/agentark/events/{}", event_name),
-                ))
-                .headers(self.build_auth_headers(
+            let token = self.load_plugin_secret(&plugin.id)?;
+            let response: Result<reqwest::Response> = match self
+                .build_authorized_request(
+                    reqwest::Method::POST,
+                    &plugin_endpoint(
+                        &plugin.base_url,
+                        &format!("/agentark/events/{}", event_name),
+                    ),
                     plugin.auth_mode,
                     plugin.auth_header.as_deref(),
-                    self.load_plugin_secret(&plugin.id)?.as_deref(),
-                )?)
-                .json(&Value::Object(event_payload))
-                .send()
-                .await;
+                    token.as_deref(),
+                    plugin.auth_profile_id.as_deref(),
+                )
+                .await
+            {
+                Ok(request) => request
+                    .json(&Value::Object(event_payload))
+                    .send()
+                    .await
+                    .map_err(Into::into),
+                Err(error) => Err(error),
+            };
             match response {
                 Ok(resp) if resp.status().is_success() => {
                     self.set_plugin_last_error(&plugin.id, None).await?;
+                    if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
+                        let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                            &self.storage,
+                            auth_profile_id,
+                        )
+                        .await;
+                    }
                     self.append_log(
                         &plugin,
                         "event",
@@ -608,14 +677,14 @@ impl PluginRegistry {
                 }
                 Ok(resp) => {
                     let body = resp.text().await.unwrap_or_default();
-                    let detail = clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS);
+                    let detail = sanitize_plugin_message(&body);
                     self.set_plugin_last_error(&plugin.id, Some(detail.clone()))
                         .await?;
                     self.append_log(&plugin, "event", event_name, "error", Some(detail))
                         .await?;
                 }
                 Err(error) => {
-                    let detail = clip_chars(&error.to_string(), PLUGIN_MESSAGE_MAX_CHARS);
+                    let detail = sanitize_plugin_message(&error.to_string());
                     self.set_plugin_last_error(&plugin.id, Some(detail.clone()))
                         .await?;
                     self.append_log(&plugin, "event", event_name, "error", Some(detail))
@@ -632,20 +701,33 @@ impl PluginRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("Plugin not found"))?;
-        let response = match self
-            .http_client
-            .get(plugin_endpoint(&plugin.base_url, "/agentark/ping"))
-            .headers(self.build_auth_headers(
+        let token = self.load_plugin_secret(id)?;
+        let request = match self
+            .build_authorized_request(
+                reqwest::Method::GET,
+                &plugin_endpoint(&plugin.base_url, "/agentark/ping"),
                 plugin.auth_mode,
                 plugin.auth_header.as_deref(),
-                self.load_plugin_secret(id)?.as_deref(),
-            )?)
-            .send()
+                token.as_deref(),
+                plugin.auth_profile_id.as_deref(),
+            )
             .await
         {
+            Ok(request) => request,
+            Err(error) => {
+                let detail =
+                    sanitize_plugin_message(&format!("failed to ping plugin '{}': {}", id, error));
+                self.set_plugin_last_error(id, Some(detail.clone())).await?;
+                self.append_log(&plugin, "ping", "Ping", "error", Some(detail.clone()))
+                    .await?;
+                return Err(anyhow!(detail));
+            }
+        };
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                let detail = format!("failed to ping plugin '{}': {}", id, error);
+                let detail =
+                    sanitize_plugin_message(&format!("failed to ping plugin '{}': {}", id, error));
                 self.set_plugin_last_error(id, Some(detail.clone())).await?;
                 self.append_log(&plugin, "ping", "Ping", "error", Some(detail.clone()))
                     .await?;
@@ -653,10 +735,7 @@ impl PluginRegistry {
             }
         };
         let status = response.status();
-        let detail = clip_chars(
-            &response.text().await.unwrap_or_default(),
-            PLUGIN_MESSAGE_MAX_CHARS,
-        );
+        let detail = sanitize_plugin_message(&response.text().await.unwrap_or_default());
         if !status.is_success() {
             self.set_plugin_last_error(id, Some(detail.clone())).await?;
             self.append_log(&plugin, "ping", "Ping", "error", Some(detail.clone()))
@@ -672,6 +751,13 @@ impl PluginRegistry {
             Some("Plugin responded.".to_string()),
         )
         .await?;
+        if let Some(auth_profile_id) = plugin.auth_profile_id.as_deref() {
+            let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                &self.storage,
+                auth_profile_id,
+            )
+            .await;
+        }
         Ok(PluginTestResult {
             ok: true,
             detail: (!detail.is_empty()).then_some(detail),
@@ -690,6 +776,80 @@ impl PluginRegistry {
         logs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         logs.truncate(limit.clamp(1, PLUGIN_LOG_HISTORY_LIMIT));
         Ok(logs)
+    }
+
+    async fn auth_profile_overlay(
+        &self,
+        auth_profile_id: Option<&str>,
+    ) -> Result<Option<crate::core::auth_profiles::HttpAuthOverlay>> {
+        let Some(auth_profile_id) = auth_profile_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                &self.storage,
+                auth_profile_id,
+            )
+            .await?
+            .overlay,
+        ))
+    }
+
+    async fn plugin_auth_configured(&self, plugin: &PluginConfig) -> Result<bool> {
+        if let Some(auth_profile_id) = plugin
+            .auth_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Ok(crate::core::auth_profiles::AuthProfileControlPlane::get(
+                &self.storage,
+                auth_profile_id,
+            )
+            .await?
+            .is_some_and(|profile| profile.ready))
+        } else {
+            self.plugin_secret_present(&plugin.id)
+        }
+    }
+
+    async fn plugin_view(&self, plugin: &PluginConfig) -> Result<PluginView> {
+        Ok(PluginView {
+            token_configured: self.plugin_auth_configured(plugin).await?,
+            available_events: plugin.manifest.events.clone(),
+            registered_actions: plugin
+                .manifest
+                .actions
+                .iter()
+                .map(|action| plugin_action_runtime_name(&plugin.id, &action.name))
+                .collect(),
+            plugin: plugin.clone(),
+        })
+    }
+
+    async fn build_authorized_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        auth_mode: PluginAuthMode,
+        auth_header: Option<&str>,
+        token: Option<&str>,
+        auth_profile_id: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder> {
+        let mut parsed = reqwest::Url::parse(url).context("invalid plugin endpoint URL")?;
+        if let Some(overlay) = self.auth_profile_overlay(auth_profile_id).await? {
+            overlay.apply_to_url(&mut parsed);
+            let request = self.http_client.request(method, parsed);
+            return overlay.apply_to_request_builder(request);
+        }
+
+        Ok(self
+            .http_client
+            .request(method, parsed)
+            .headers(self.build_auth_headers(auth_mode, auth_header, token)?))
     }
 
     fn build_auth_headers(
@@ -735,11 +895,20 @@ impl PluginRegistry {
         auth_mode: PluginAuthMode,
         auth_header: Option<&str>,
         token: Option<&str>,
+        auth_profile_id: Option<&str>,
     ) -> Result<PluginManifest> {
-        let response = self
-            .http_client
-            .get(plugin_endpoint(base_url, "/agentark/manifest"))
-            .headers(self.build_auth_headers(auth_mode, auth_header, token)?)
+        let request = self
+            .build_authorized_request(
+                reqwest::Method::GET,
+                &plugin_endpoint(base_url, "/agentark/manifest"),
+                auth_mode,
+                auth_header,
+                token,
+                auth_profile_id,
+            )
+            .await
+            .context("failed to build plugin manifest request")?;
+        let response = request
             .send()
             .await
             .context("failed to fetch plugin manifest")?;
@@ -749,7 +918,7 @@ impl PluginRegistry {
             anyhow::bail!(
                 "Plugin manifest request failed with {}: {}",
                 status,
-                clip_chars(&body, PLUGIN_MESSAGE_MAX_CHARS)
+                sanitize_plugin_message(&body)
             );
         }
         let manifest = serde_json::from_str::<PluginManifest>(&body)
@@ -770,7 +939,7 @@ impl PluginRegistry {
     ) -> Result<()> {
         let mut changed = false;
         if let Some(plugin) = self.plugins.get_mut(plugin_id) {
-            plugin.last_error = value;
+            plugin.last_error = value.map(|text| sanitize_plugin_message(&text));
             plugin.updated_at = now_rfc3339();
             changed = true;
         }
@@ -796,7 +965,7 @@ impl PluginRegistry {
             kind: kind.to_string(),
             subject: subject.to_string(),
             outcome: outcome.to_string(),
-            message,
+            message: message.map(|text| sanitize_plugin_message(&text)),
             created_at: now_rfc3339(),
         });
         if logs.len() > PLUGIN_LOG_HISTORY_LIMIT {
@@ -845,7 +1014,11 @@ fn plugin_secret_key(plugin_id: &str) -> String {
     format!("{}{}", PLUGIN_SECRET_PREFIX, plugin_id.trim())
 }
 
-async fn register_plugin_actions(runtime: &ActionRuntime, plugin: &PluginConfig) -> Result<()> {
+async fn register_plugin_actions(
+    runtime: &ActionRuntime,
+    plugin: &PluginConfig,
+    token_configured: bool,
+) -> Result<()> {
     for action in &plugin.manifest.actions {
         let name = plugin_action_runtime_name(&plugin.id, &action.name);
         let description = if action.description.trim().is_empty() {
@@ -866,6 +1039,7 @@ async fn register_plugin_actions(runtime: &ActionRuntime, plugin: &PluginConfig)
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         };
         runtime
             .register_plugin_action(
@@ -873,6 +1047,17 @@ async fn register_plugin_actions(runtime: &ActionRuntime, plugin: &PluginConfig)
                 PluginBinding {
                     plugin_id: plugin.id.clone(),
                     action_name: action.name.clone(),
+                    base_url: plugin.base_url.clone(),
+                    auth_profile_id: plugin.auth_profile_id.clone(),
+                    auth_required: plugin.auth_profile_id.is_some()
+                        || !matches!(plugin.auth_mode, PluginAuthMode::None),
+                    auth_configured: if plugin.auth_profile_id.is_some()
+                        || !matches!(plugin.auth_mode, PluginAuthMode::None)
+                    {
+                        token_configured
+                    } else {
+                        true
+                    },
                 },
             )
             .await;
@@ -981,6 +1166,13 @@ fn clip_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn sanitize_plugin_message(value: &str) -> String {
+    clip_chars(
+        &crate::security::redact_secret_input(value).text,
+        PLUGIN_MESSAGE_MAX_CHARS,
+    )
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -997,7 +1189,7 @@ fn format_plugin_result(body: &str) -> String {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            return text.to_string();
+            return crate::security::redact_secret_input(text).text;
         }
         if let Some(text) = value
             .get("result")
@@ -1005,11 +1197,17 @@ fn format_plugin_result(body: &str) -> String {
             .map(str::trim)
             .filter(|text| !text.is_empty())
         {
-            return text.to_string();
+            return crate::security::redact_secret_input(text).text;
         }
-        return serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string());
+        return clip_chars(
+            &crate::security::redact_secret_input(
+                &serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()),
+            )
+            .text,
+            2_000,
+        );
     }
-    trimmed.to_string()
+    clip_chars(&crate::security::redact_secret_input(trimmed).text, 2_000)
 }
 
 async fn load_json<T>(storage: &Storage, key: &str) -> Result<T>

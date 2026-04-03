@@ -11,6 +11,7 @@ use crate::core::config::{
 };
 use crate::runtime::{ActionRuntime, McpBinding, McpBindingKind};
 use crate::safety::{RuleAction, RuleTrigger, SafetyEngine, SafetyRule};
+use crate::storage::Storage;
 
 use super::client::{McpAuth, McpClient};
 use super::{McpResource, McpTool};
@@ -24,6 +25,8 @@ pub struct McpServerView {
     pub resources_enabled: bool,
     pub transport: McpTransportView,
     pub auth: McpAuthView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
     pub tool_allowlist: Vec<String>,
     pub tool_blocklist: Vec<String>,
     pub resource_allowlist: Vec<String>,
@@ -64,6 +67,7 @@ pub struct McpAuthView {
 }
 
 pub struct McpRegistry {
+    storage: Storage,
     servers: HashMap<String, McpServerState>,
 }
 
@@ -78,21 +82,35 @@ struct McpServerState {
 }
 
 impl McpRegistry {
-    pub fn new() -> Self {
+    pub fn new(storage: Storage) -> Self {
         Self {
+            storage,
             servers: HashMap::new(),
         }
     }
 
-    pub fn list_servers(&self, include_details: bool) -> Vec<McpServerView> {
-        self.servers
-            .values()
-            .map(|s| s.view(include_details))
-            .collect()
+    pub async fn list_servers(&self, include_details: bool) -> Result<Vec<McpServerView>> {
+        let mut views = Vec::with_capacity(self.servers.len());
+        for state in self.servers.values() {
+            views.push(
+                state.view_with_has_auth(include_details, self.server_has_auth(state).await?),
+            );
+        }
+        Ok(views)
     }
 
-    pub fn get_server(&self, id: &str, include_details: bool) -> Option<McpServerView> {
-        self.servers.get(id).map(|s| s.view(include_details))
+    pub async fn get_server(
+        &self,
+        id: &str,
+        include_details: bool,
+    ) -> Result<Option<McpServerView>> {
+        let Some(state) = self.servers.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some(state.view_with_has_auth(
+            include_details,
+            self.server_has_auth(state).await?,
+        )))
     }
 
     pub async fn sync_from_config(
@@ -146,8 +164,38 @@ impl McpRegistry {
         if !state.config.enabled {
             return Err(anyhow!("MCP server is disabled"));
         }
+        if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
+            if let Some(auth_profile_id) = state
+                .config
+                .auth_profile_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let resolved = crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                    &self.storage,
+                    auth_profile_id,
+                )
+                .await?;
+                let auth = auth_profile_to_mcp_auth(&resolved);
+                state.client = tokio::sync::Mutex::new(McpClient::new(
+                    &state.config,
+                    auth,
+                    std::collections::HashMap::new(),
+                )?);
+            }
+        }
         let mut client = state.client.lock().await;
         let result = client.call_tool(tool_name, arguments).await?;
+        if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
+            if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
+                let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                    &self.storage,
+                    auth_profile_id,
+                )
+                .await;
+            }
+        }
         Ok(format_mcp_result(&result))
     }
 
@@ -159,9 +207,59 @@ impl McpRegistry {
         if !state.config.enabled || !state.config.resources_enabled {
             return Err(anyhow!("MCP resources are disabled"));
         }
+        if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
+            if let Some(auth_profile_id) = state
+                .config
+                .auth_profile_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let resolved = crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                    &self.storage,
+                    auth_profile_id,
+                )
+                .await?;
+                let auth = auth_profile_to_mcp_auth(&resolved);
+                state.client = tokio::sync::Mutex::new(McpClient::new(
+                    &state.config,
+                    auth,
+                    std::collections::HashMap::new(),
+                )?);
+            }
+        }
         let mut client = state.client.lock().await;
         let result = client.read_resource(uri).await?;
+        if matches!(&state.config.transport, McpTransportConfig::Http { .. }) {
+            if let Some(auth_profile_id) = state.config.auth_profile_id.as_deref() {
+                let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                    &self.storage,
+                    auth_profile_id,
+                )
+                .await;
+            }
+        }
         Ok(format_mcp_result(&result))
+    }
+
+    async fn server_has_auth(&self, state: &McpServerState) -> Result<bool> {
+        let Some(auth_profile_id) = state
+            .config
+            .auth_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(state.has_auth);
+        };
+        Ok(
+            crate::core::auth_profiles::AuthProfileControlPlane::get(
+                &self.storage,
+                auth_profile_id,
+            )
+            .await?
+            .is_some_and(|profile| profile.ready),
+        )
     }
 }
 
@@ -173,7 +271,42 @@ async fn build_server_state(
     safety: &SafetyEngine,
 ) -> Result<McpServerState> {
     let auth_secret = secrets.mcp_auth.get(&server.id);
-    let (auth, auth_warnings, has_auth) = resolve_auth(&server.auth, auth_secret);
+    let (auth, auth_warnings, has_auth) = if let Some(auth_profile_id) = server
+        .auth_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !matches!(&server.transport, McpTransportConfig::Http { .. }) {
+            (
+                None,
+                vec!["HTTP auth profiles cannot be attached to stdio MCP transports.".to_string()],
+                false,
+            )
+        } else {
+            let storage = runtime.storage().ok_or_else(|| {
+                anyhow!("Storage is required for auth profile-backed MCP servers")
+            })?;
+            match crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(
+                &storage,
+                auth_profile_id,
+            )
+            .await
+            {
+                Ok(resolved) => (auth_profile_to_mcp_auth(&resolved), Vec::new(), true),
+                Err(error) => (
+                    None,
+                    vec![format!(
+                        "MCP auth profile '{}' is not ready: {}",
+                        auth_profile_id, error
+                    )],
+                    false,
+                ),
+            }
+        }
+    } else {
+        resolve_auth(&server.auth, auth_secret)
+    };
     let mut warnings = compute_mcp_warnings(server);
     warnings.extend(auth_warnings);
     let env = resolve_stdio_env(server, config, secrets);
@@ -198,7 +331,10 @@ async fn build_server_state(
     }
 
     if server.enabled && last_error.is_none() {
-        register_actions(runtime, safety, server, &tools, &resources).await?;
+        register_actions(
+            runtime, safety, server, &tools, &resources, &warnings, has_auth,
+        )
+        .await?;
     }
 
     Ok(McpServerState {
@@ -213,7 +349,7 @@ async fn build_server_state(
 }
 
 impl McpServerState {
-    fn view(&self, include_details: bool) -> McpServerView {
+    fn view_with_has_auth(&self, include_details: bool, has_auth: bool) -> McpServerView {
         McpServerView {
             id: self.config.id.clone(),
             name: self.config.name.clone(),
@@ -221,7 +357,17 @@ impl McpServerState {
             enabled: self.config.enabled,
             resources_enabled: self.config.resources_enabled,
             transport: transport_view(&self.config.transport),
-            auth: auth_view(&self.config.auth, self.has_auth),
+            auth: if self.config.auth_profile_id.is_some() {
+                McpAuthView {
+                    auth_type: "auth_profile".to_string(),
+                    has_auth,
+                    header: None,
+                    name: None,
+                }
+            } else {
+                auth_view(&self.config.auth, has_auth)
+            },
+            auth_profile_id: self.config.auth_profile_id.clone(),
             tool_allowlist: self.config.tool_allowlist.clone(),
             tool_blocklist: self.config.tool_blocklist.clone(),
             resource_allowlist: self.config.resource_allowlist.clone(),
@@ -294,6 +440,34 @@ fn auth_view(auth: &Option<McpAuthConfig>, has_auth: bool) -> McpAuthView {
             header: None,
             name: Some(name.clone()),
         },
+    }
+}
+
+fn auth_profile_to_mcp_auth(
+    resolved: &crate::core::auth_profiles::AuthProfileResolution,
+) -> Option<McpAuth> {
+    let headers = resolved
+        .overlay
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let query = resolved
+        .overlay
+        .query
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let basic = resolved.overlay.basic.clone();
+
+    if headers.is_empty() && query.is_empty() && basic.is_none() {
+        None
+    } else {
+        Some(McpAuth::Composite {
+            headers,
+            query,
+            basic,
+        })
     }
 }
 
@@ -464,6 +638,8 @@ async fn register_actions(
     server: &McpServerConfig,
     tools: &[McpTool],
     resources: &[McpResource],
+    warnings: &[String],
+    has_auth: bool,
 ) -> Result<()> {
     let mut used_names: HashMap<String, usize> = HashMap::new();
 
@@ -478,12 +654,22 @@ async fn register_actions(
             sandbox_mode: Some(crate::runtime::SandboxMode::Native),
             source: crate::actions::ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         };
         runtime
             .register_mcp_action(
                 def,
                 McpBinding {
                     server_id: server.id.clone(),
+                    server_name: server.name.clone(),
+                    warnings: warnings.to_vec(),
+                    auth_profile_id: server.auth_profile_id.clone(),
+                    auth_required: server.auth.is_some() || server.auth_profile_id.is_some(),
+                    auth_configured: if server.auth.is_some() || server.auth_profile_id.is_some() {
+                        has_auth
+                    } else {
+                        true
+                    },
                     kind: McpBindingKind::Tool {
                         name: tool.name.clone(),
                     },
@@ -516,12 +702,22 @@ async fn register_actions(
             sandbox_mode: Some(crate::runtime::SandboxMode::Native),
             source: crate::actions::ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         };
         runtime
             .register_mcp_action(
                 def,
                 McpBinding {
                     server_id: server.id.clone(),
+                    server_name: server.name.clone(),
+                    warnings: warnings.to_vec(),
+                    auth_profile_id: server.auth_profile_id.clone(),
+                    auth_required: server.auth.is_some() || server.auth_profile_id.is_some(),
+                    auth_configured: if server.auth.is_some() || server.auth_profile_id.is_some() {
+                        has_auth
+                    } else {
+                        true
+                    },
                     kind: McpBindingKind::Resource {
                         uri: resource.uri.clone(),
                     },

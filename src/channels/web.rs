@@ -9,7 +9,7 @@ const UNLOCK_PAGE_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgentArk - Unlock</title>
+    <title>__PRODUCT_NAME__ - Unlock</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -74,8 +74,8 @@ const UNLOCK_PAGE_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 </head>
 <body>
     <div class="unlock-card">
-        <img src="/logo.svg" alt="AgentArk">
-        <h1>AgentArk is Locked</h1>
+        <img src="/logo.svg" alt="__PRODUCT_NAME__">
+        <h1>__PRODUCT_NAME__ is Locked</h1>
         <p>Enter your master password to unlock the agent.</p>
         <form id="unlock-form">
             <input type="password" id="password" placeholder="Master password"
@@ -84,7 +84,7 @@ const UNLOCK_PAGE_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             <div id="msg" style="display:none"></div>
         </form>
         <div class="hint">
-            Enter your master password to unlock AgentArk.
+            Enter your master password to unlock __PRODUCT_NAME__.
         </div>
     </div>
     <script>
@@ -145,7 +145,7 @@ const UNLOCK_PAGE_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                 const data = await res.json();
                 if (res.ok) {
                     msg.className = 'success';
-                    msg.textContent = 'Unlocked! Waiting for AgentArk to finish starting...';
+                    msg.textContent = 'Unlocked! Waiting for __PRODUCT_NAME__ to finish starting...';
                     msg.style.display = 'block';
                     btn.textContent = 'Starting...';
                     const nextTarget = computeNextTarget();
@@ -155,7 +155,7 @@ const UNLOCK_PAGE_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
                         return;
                     }
                     msg.className = 'error';
-                    msg.textContent = 'Password accepted, but AgentArk is still starting. Refresh in a few seconds.';
+                    msg.textContent = 'Password accepted, but __PRODUCT_NAME__ is still starting. Refresh in a few seconds.';
                     btn.disabled = false;
                     btn.textContent = 'Unlock';
                 } else {
@@ -187,5 +187,6 @@ pub fn render_unlock_page_html(next_target: &str) -> String {
     };
     let next_target_json =
         serde_json::to_string(sanitized_target).unwrap_or_else(|_| "\"/\"".to_string());
-    UNLOCK_PAGE_HTML_TEMPLATE.replace("\"__AGENTARK_NEXT_TARGET__\"", &next_target_json)
+    crate::branding::render_template(UNLOCK_PAGE_HTML_TEMPLATE)
+        .replace("\"__AGENTARK_NEXT_TARGET__\"", &next_target_json)
 }

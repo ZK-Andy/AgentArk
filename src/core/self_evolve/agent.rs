@@ -87,9 +87,10 @@ impl SelfEvolveAgent {
 
         // Initial user message
         let initial_msg = format!(
-            "Implement the following change to AgentArk:\n\n{}\n\n\
+            "Implement the following change to {}:\n\n{}\n\n\
              Start by reading the relevant existing source files to understand patterns, \
              then implement the change. After writing code, run build_check to verify.",
+            crate::branding::PRODUCT_NAME,
             user_request
         );
 
@@ -378,8 +379,8 @@ impl SelfEvolveAgent {
     // -----------------------------------------------------------------------
 
     fn build_system_prompt(&self, user_request: &str) -> String {
-        format!(
-            r#"You are AgentArk's Self-Evolve Agent — a coding specialist that modifies AgentArk's own source code.
+        crate::branding::render_template(&format!(
+            r#"You are __PRODUCT_NAME__'s Self-Evolve Agent — a coding specialist that modifies __PRODUCT_NAME__'s own source code.
 
 ## Your Mission
 Implement the following change request:
@@ -421,7 +422,7 @@ Implement the following change request:
 {guidelines}"#,
             request = user_request,
             guidelines = coding_guidelines::coding_guidelines(),
-        )
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -448,6 +449,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "source_write".to_string(),
@@ -471,6 +473,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "source_edit".to_string(),
@@ -498,6 +501,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "source_list".to_string(),
@@ -521,6 +525,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "source_search".to_string(),
@@ -544,6 +549,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "build_check".to_string(),
@@ -554,6 +560,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "run_tests".to_string(),
@@ -564,6 +571,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "lint_check".to_string(),
@@ -574,6 +582,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "frontend_build".to_string(),
@@ -584,6 +593,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "web_search".to_string(),
@@ -603,6 +613,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
             ActionDef {
                 name: "task_complete".to_string(),
@@ -622,6 +633,7 @@ Implement the following change request:
                 sandbox_mode: None,
                 source: crate::actions::ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             },
         ]
     }

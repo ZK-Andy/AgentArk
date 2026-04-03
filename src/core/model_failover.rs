@@ -208,7 +208,6 @@ pub struct ProviderHealthUpsert {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ProviderHealthEvent {
     pub provider_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,13 +463,15 @@ fn pick_candidate<'a>(
     }
 
     for candidate in ordered {
-        let Some(state) = provider_map.get(&candidate.provider_id) else {
-            continue;
-        };
-        if !request.allow_disabled && (state.disabled || !state.enabled) {
+        let state = provider_map.get(&candidate.provider_id);
+        if !request.allow_disabled
+            && state
+                .map(|state| state.disabled || !state.enabled)
+                .unwrap_or(false)
+        {
             continue;
         }
-        if !request.allow_cooling && is_cooling(state) {
+        if !request.allow_cooling && state.map(is_cooling).unwrap_or(false) {
             continue;
         }
         return (
@@ -756,7 +757,6 @@ impl ModelFailoverControlPlane {
         Ok(Some(record))
     }
 
-    #[allow(dead_code)]
     pub async fn record_health(
         storage: &Storage,
         event: ProviderHealthEvent,

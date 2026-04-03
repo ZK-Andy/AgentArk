@@ -10,16 +10,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Deserialize)]
-struct TwilioConfigJson {
-    #[serde(default)]
-    account_sid: Option<String>,
-    #[serde(default)]
-    auth_token: Option<String>,
-    #[serde(default)]
-    from_number: Option<String>,
-}
-
 /// Twilio voice and SMS connector
 pub struct TwilioConnector {
     http: reqwest::Client,
@@ -29,12 +19,6 @@ pub struct TwilioConnector {
 impl TwilioConnector {
     const API_BASE: &'static str = "https://api.twilio.com/2010-04-01";
 
-    fn load_legacy_config_json(config_dir: &Path) -> Option<TwilioConfigJson> {
-        let mgr = crate::core::config::SecureConfigManager::new(config_dir).ok()?;
-        let json_str = mgr.get_custom_secret("twilio_config").ok().flatten()?;
-        serde_json::from_str::<TwilioConfigJson>(&json_str).ok()
-    }
-
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -43,7 +27,7 @@ impl TwilioConnector {
     }
 
     pub fn new() -> Self {
-        let config_dir = directories::ProjectDirs::from("com", "agentark", "AgentArk")
+        let config_dir = crate::branding::project_dirs()
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
@@ -60,8 +44,7 @@ impl TwilioConnector {
             Ok(manager) => manager
                 .get_custom_secret("twilio_account_sid")
                 .ok()
-                .flatten()
-                .or_else(|| Self::load_legacy_config_json(config_dir).and_then(|c| c.account_sid)),
+                .flatten(),
             Err(_) => None,
         }
     }
@@ -76,8 +59,7 @@ impl TwilioConnector {
             Ok(manager) => manager
                 .get_custom_secret("twilio_auth_token")
                 .ok()
-                .flatten()
-                .or_else(|| Self::load_legacy_config_json(config_dir).and_then(|c| c.auth_token)),
+                .flatten(),
             Err(_) => None,
         }
     }
@@ -92,8 +74,7 @@ impl TwilioConnector {
             Ok(manager) => manager
                 .get_custom_secret("twilio_from_number")
                 .ok()
-                .flatten()
-                .or_else(|| Self::load_legacy_config_json(config_dir).and_then(|c| c.from_number)),
+                .flatten(),
             Err(_) => None,
         }
     }
@@ -132,7 +113,8 @@ impl TwilioConnector {
         let message = params
             .get("message")
             .and_then(|v| v.as_str())
-            .unwrap_or("Hello from AgentArk");
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Hello from {}", crate::branding::PRODUCT_NAME));
 
         // Build the TwiML inline or use a URL
         let twiml_url = params.get("twiml_url").and_then(|v| v.as_str());

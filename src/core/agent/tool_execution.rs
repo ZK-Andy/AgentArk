@@ -1,21 +1,102 @@
 use super::*;
 
+fn build_executor_client() -> Option<crate::clients::ExecutorClient> {
+    let role = std::env::var("AGENTARK_STACK_ROLE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if !matches!(role.as_deref(), Some("control-plane" | "control")) {
+        return None;
+    }
+    let client =
+        crate::clients::ExecutorClient::new(crate::clients::ExecutorClientConfig::from_env())
+            .ok()?;
+    client.bearer_token()?;
+    Some(client)
+}
+
 #[derive(Default)]
 struct AppDeployProgressRelayState {
     announced_file_writes: bool,
     sent_messages: HashSet<String>,
 }
 
+fn normalize_progress_text(content: &str) -> String {
+    content
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn progress_contains_all(text: &str, needles: &[&str]) -> bool {
+    needles.iter().all(|needle| text.contains(needle))
+}
+
+fn app_deploy_progress_message_from_payload(payload: Option<&serde_json::Value>) -> Option<String> {
+    let payload = payload.and_then(|value| value.as_object())?;
+
+    let kind = payload.get("kind").and_then(|v| v.as_str())?;
+    if kind == "phase_status" {
+        let phase = payload
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let label = payload
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let detail = payload
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let phase_text = if !label.is_empty() { label } else { phase };
+
+        if phase_text.contains("prepare")
+            || phase_text.contains("readme")
+            || phase_text.contains("manifest")
+        {
+            return Some("I'm preparing the app deployment now.".to_string());
+        }
+        if phase_text.contains("deploy") && phase_text.contains("service") {
+            return Some("I'm standing up one of the detected repo services now.".to_string());
+        }
+        if phase_text.contains("validat") || phase_text.contains("verif") {
+            return Some(if detail.is_empty() {
+                "I'm validating the deployed app now.".to_string()
+            } else {
+                format!("I'm validating the deployed app now. {}", detail)
+            });
+        }
+        if phase_text.contains("tunnel") || phase_text.contains("share") {
+            return Some("I'm preparing public access for the app now.".to_string());
+        }
+    }
+
+    if kind == "file_write" {
+        return Some("I'm writing the generated app files now.".to_string());
+    }
+
+    None
+}
+
 fn app_deploy_chat_progress_message(
     ev: &crate::core::StreamEvent,
     state: &mut AppDeployProgressRelayState,
 ) -> Option<String> {
-    let content = match ev {
-        crate::core::StreamEvent::ToolProgress { name, content, .. }
-        | crate::core::StreamEvent::ToolResult { name, content }
-            if name == "app_deploy" =>
-        {
-            content.trim()
+    let (content, payload) = match ev {
+        crate::core::StreamEvent::ToolProgress {
+            name,
+            content,
+            payload,
+        } if name == "app_deploy" => (content.trim(), payload.as_ref()),
+        crate::core::StreamEvent::ToolResult { name, content } if name == "app_deploy" => {
+            (content.trim(), None)
         }
         _ => return None,
     };
@@ -23,81 +104,91 @@ fn app_deploy_chat_progress_message(
         return None;
     }
 
-    let lower = content.to_ascii_lowercase();
+    let lower = normalize_progress_text(content);
+    if let Some(message) = app_deploy_progress_message_from_payload(payload) {
+        let message = safe_truncate(&message, 220);
+        if state.sent_messages.insert(message.clone()) {
+            return Some(message);
+        }
+        return None;
+    }
     let mut message = if lower.starts_with("deploying '") {
         Some(format!("I'm deploying the app now. {}", content))
     } else if lower.starts_with("cloning repository ") {
         Some("I'm cloning the repository now.".to_string())
-    } else if lower == "reading repo readme and local manifests" {
+    } else if progress_contains_all(&lower, &["reading", "repo", "readme", "manifest"]) {
         Some("I cloned the repo and I'm reading the README plus local manifests now.".to_string())
     } else if lower.starts_with("detected ") && lower.contains("repo service") {
         Some(
             "I identified the repo services and I'm preparing the managed deploy plan.".to_string(),
         )
-    } else if lower.starts_with("deploying repo service ") {
+    } else if lower.contains("deploy") && lower.contains("repo service") {
         Some("I'm standing up one of the detected repo services now.".to_string())
-    } else if lower == "deploy payload is malformed. regenerating tool arguments." {
+    } else if lower.contains("deploy payload")
+        && lower.contains("malformed")
+        && (lower.contains("regenerat") || lower.contains("repair"))
+    {
         Some(
             "The first deploy payload was invalid. I'm repairing it automatically now.".to_string(),
         )
-    } else if lower.starts_with("still regenerating deploy payload") {
+    } else if lower.contains("still regenerating") && lower.contains("deploy payload") {
         Some("I'm still repairing the deploy payload automatically.".to_string())
-    } else if lower == "recovered a valid direct deploy plan."
-        || lower == "recovered valid deploy payload. continuing deployment."
-        || lower.starts_with("recovered deploy payload from ")
-        || lower.starts_with("recovered deployment from ")
-        || lower.starts_with("detected deployable app files after a read-only detour")
+    } else if (lower.contains("recovered")
+        && lower.contains("deploy")
+        && (lower.contains("payload") || lower.contains("deployment")))
+        || lower.contains("detected deployable app files after a read-only detour")
     {
         Some("Self-heal worked. I'm continuing with deployment now.".to_string())
-    } else if lower == "shell-first app plan detected. regenerating as direct deploy." {
+    } else if lower.contains("shell-first app plan") && lower.contains("regenerating") {
         Some(
             "I detected a shell detour and switched back to direct deploy automatically."
                 .to_string(),
         )
-    } else if lower.starts_with("writing ") || lower.contains(" line ") {
+    } else if lower.starts_with("writing ") || lower.contains(" file ") || lower.contains(" line ")
+    {
         if state.announced_file_writes {
             None
         } else {
             state.announced_file_writes = true;
             Some("I'm writing the generated app files now.".to_string())
         }
-    } else if lower.contains("files ready") {
+    } else if lower.contains("files ready")
+        || (lower.contains("app files") && lower.contains("ready"))
+    {
         Some("The app files are ready. I'm preparing the runtime now.".to_string())
-    } else if lower == "saved app metadata" {
+    } else if lower.contains("saved") && lower.contains("metadata") {
         Some("I saved the app metadata and deployment settings.".to_string())
-    } else if lower.starts_with("assigned port ") {
+    } else if lower.contains("assigned port")
+        || lower.contains("reserved") && lower.contains("port")
+    {
         Some(
             "I reserved the app runtime port. Next I'm checking whether any required setup is still missing."
                 .to_string(),
         )
-    } else if lower == "installing dependencies..." {
+    } else if lower.contains("installing dependencies") {
         Some("I'm installing the app dependencies now.".to_string())
-    } else if lower == "no dependencies to install" {
+    } else if lower.contains("no dependencies to install") {
         Some("No dependency install is needed. I'm starting the app now.".to_string())
-    } else if lower.starts_with("starting server on port ") {
+    } else if lower.contains("starting server") && lower.contains("port") {
         Some("I'm starting the app server now.".to_string())
-    } else if lower == "server container started" {
+    } else if lower.contains("server container") && lower.contains("started") {
         Some("The app container started. I'm checking that it comes up cleanly.".to_string())
-    } else if lower == "docker unavailable; started local app process" {
+    } else if lower.contains("docker unavailable") && lower.contains("local app") {
         Some(
             "Docker was unavailable, so I started the app locally instead. I'm checking it now."
                 .to_string(),
         )
-    } else if lower.starts_with("validating deployed app") {
-        Some("I'm validating the deployed app now.".to_string())
-    } else if lower.starts_with("starting remote access for app sharing")
-        || lower.starts_with("starting public tunnel for app access")
-        || lower.starts_with("starting cloudflare tunnel for public app access")
+    } else if (lower.contains("validat") && lower.contains("app"))
+        || lower.contains("starting remote access for app sharing")
+        || lower.contains("starting public tunnel for app access")
+        || lower.contains("starting cloudflare tunnel for public app access")
     {
-        Some(
-            "I'm preparing the remote access link so you can open the app from another device."
-                .to_string(),
-        )
+        None
     } else if lower.starts_with("app created but waiting for required inputs:") {
         Some(content.to_string())
     } else if lower.starts_with("static app ready at ") {
-        Some("The static app is ready. I'm preparing the access link now.".to_string())
-    } else if lower.starts_with("dynamic app ready at ") {
+        Some("The static app is ready locally.".to_string())
+    } else if lower.starts_with("dynamic app ready at ") || lower.contains("dynamic app ready") {
         Some(
             "The app process is up. I'm validating that it stays healthy before I share the final status."
                 .to_string(),
@@ -114,50 +205,12 @@ fn app_deploy_chat_progress_message(
 }
 
 async fn maybe_advance_app_deploy_plan_to_validation(
-    trace_ref: &Arc<RwLock<ExecutionTrace>>,
-    stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-    detail: &str,
+    _trace_ref: &Arc<RwLock<ExecutionTrace>>,
+    _stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    _detail: &str,
 ) {
-    let phase_ids = {
-        let trace = trace_ref.read().await;
-        trace.plan.as_ref().map(|plan| {
-            (
-                super::find_execution_plan_step_id(
-                    plan,
-                    super::APP_DEPLOY_PREPARE_TOOL_HINT,
-                    &[PlanStepStatus::Pending, PlanStepStatus::Running],
-                ),
-                super::find_execution_plan_step_id(
-                    plan,
-                    super::APP_DEPLOY_VALIDATE_TOOL_HINT,
-                    &[PlanStepStatus::Pending, PlanStepStatus::Running],
-                ),
-            )
-        })
-    };
-    let Some((prepare_id, validate_id)) = phase_ids else {
-        return;
-    };
-    if let Some(step_id) = prepare_id {
-        let _ = super::set_execution_plan_step_status_streaming(
-            trace_ref,
-            stream_tx,
-            step_id,
-            PlanStepStatus::Completed,
-            Some("Runtime preparation finished.".to_string()),
-        )
-        .await;
-    }
-    if let Some(step_id) = validate_id {
-        let _ = super::set_execution_plan_step_status_streaming(
-            trace_ref,
-            stream_tx,
-            step_id,
-            PlanStepStatus::Running,
-            Some(detail.to_string()),
-        )
-        .await;
-    }
+    // Canonical plans no longer synthesize app_deploy sub-phases.
+    // Plan status changes now come only from explicit planner steps and generic tool events.
 }
 
 async fn maybe_advance_app_deploy_plan_from_progress(
@@ -165,12 +218,14 @@ async fn maybe_advance_app_deploy_plan_from_progress(
     stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ev: &crate::core::StreamEvent,
 ) {
-    let content = match ev {
-        crate::core::StreamEvent::ToolProgress { name, content, .. }
-        | crate::core::StreamEvent::ToolResult { name, content }
-            if name == "app_deploy" =>
-        {
-            content.trim()
+    let (content, payload) = match ev {
+        crate::core::StreamEvent::ToolProgress {
+            name,
+            content,
+            payload,
+        } if name == "app_deploy" => (content.trim(), payload.as_ref()),
+        crate::core::StreamEvent::ToolResult { name, content } if name == "app_deploy" => {
+            (content.trim(), None)
         }
         _ => return,
     };
@@ -178,16 +233,41 @@ async fn maybe_advance_app_deploy_plan_from_progress(
         return;
     }
 
-    let lower = content.to_ascii_lowercase();
-    if lower.starts_with("validating deployed app")
-        || lower.starts_with("starting server on port ")
-        || lower == "server container started"
+    let lower = normalize_progress_text(content);
+    let payload_phase = payload
+        .and_then(|value| value.as_object())
+        .and_then(|obj| {
+            obj.get("kind")
+                .and_then(|v| v.as_str())
+                .filter(|kind| *kind == "phase_status")
+                .and_then(|_| {
+                    obj.get("phase")
+                        .or_else(|| obj.get("label"))
+                        .and_then(|v| v.as_str())
+                })
+        })
+        .map(|value| value.trim().to_ascii_lowercase());
+
+    let should_advance = payload_phase
+        .as_deref()
+        .map(|phase| {
+            phase.contains("validat")
+                || phase.contains("server")
+                || phase.contains("deploy")
+                || phase.contains("tunnel")
+                || phase.contains("share")
+        })
+        .unwrap_or(false)
+        || lower.contains("validat")
+        || (lower.contains("starting") && lower.contains("server"))
+        || (lower.contains("server") && lower.contains("started"))
         || lower.starts_with("static app ready at ")
-        || lower.starts_with("dynamic app ready at ")
-        || lower.starts_with("starting remote access for app sharing")
-        || lower.starts_with("starting public tunnel for app access")
-        || lower.starts_with("starting cloudflare tunnel for public app access")
-    {
+        || lower.contains("dynamic app ready")
+        || lower.contains("starting remote access for app sharing")
+        || lower.contains("starting public tunnel for app access")
+        || lower.contains("starting cloudflare tunnel for public app access");
+
+    if should_advance {
         maybe_advance_app_deploy_plan_to_validation(trace_ref, stream_tx, content).await;
     }
 }
@@ -361,7 +441,10 @@ pub(crate) struct ToolExecutionContext<'a> {
     pub strategy_version: Option<&'a str>,
     pub policy_version: Option<&'a str>,
     pub prompt_version: Option<&'a str>,
+    pub classifier_prompt_version: Option<&'a str>,
+    pub specialist_prompt_version: Option<&'a str>,
     pub model_slot: Option<&'a str>,
+    pub authorization: crate::actions::ActionAuthorizationContext,
 }
 
 #[derive(Debug, Clone)]
@@ -1056,6 +1139,8 @@ impl Agent {
         "install_command",
         "runtime_image",
         "runtime_preference",
+        "runtime_required",
+        "runtime_reason",
         "expose_public",
         "access_guard",
         "required_inputs",
@@ -1068,15 +1153,69 @@ impl Agent {
         "name",
     ];
 
+    fn looks_like_filename_like_key(key: &str) -> bool {
+        let key = key.trim();
+        !key.is_empty()
+            && (key.contains('.')
+                || key.contains('/')
+                || key.contains('\\')
+                || key.eq_ignore_ascii_case("index"))
+    }
+
+    fn looks_like_app_file_content(content: &str) -> bool {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("<!doctype html")
+            || lower.starts_with("<html")
+            || lower.starts_with("<head")
+            || lower.starts_with("<body")
+            || lower.contains("</")
+        {
+            return true;
+        }
+
+        if lower.starts_with("import ")
+            || lower.starts_with("from ")
+            || lower.starts_with("export ")
+            || lower.starts_with("const ")
+            || lower.starts_with("let ")
+            || lower.starts_with("var ")
+            || lower.starts_with("function ")
+            || lower.starts_with("class ")
+            || lower.starts_with("def ")
+            || lower.starts_with("package ")
+        {
+            return true;
+        }
+
+        if lower.contains("body {")
+            || lower.contains(":root")
+            || lower.contains("@media")
+            || lower.contains(".container")
+            || lower.contains("html {")
+        {
+            return true;
+        }
+
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+        }
+
+        false
+    }
+
     /// Recover files from a single content key like `content`, `code`, `html`, `source`.
-    /// Models sometimes send `{"content": "<html>...</html>", "title": "My App"}` instead
-    /// of wrapping it in a `files` object.
+    /// Only recover content that looks like actual source/markup, not generic prose.
     fn recover_files_from_single_content_key(
         obj: &serde_json::Map<String, serde_json::Value>,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
         for key in ["content", "code", "html", "source", "body", "text", "page"] {
             if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
-                if value.len() > 20 {
+                if value.len() > 20 && Self::looks_like_app_file_content(value) {
                     let filename = Self::infer_filename_from_content(value);
                     let mut files = serde_json::Map::new();
                     files.insert(filename, serde_json::Value::String(value.to_string()));
@@ -1116,7 +1255,10 @@ impl Agent {
                 continue;
             }
             if let Some(s) = value.as_str() {
-                if s.len() > 20 {
+                if s.len() > 20
+                    && Self::looks_like_app_file_content(s)
+                    && Self::looks_like_filename_like_key(key)
+                {
                     files.insert(key.clone(), serde_json::Value::String(s.to_string()));
                 }
             }
@@ -1201,6 +1343,8 @@ impl Agent {
             "install_command",
             "runtime_image",
             "runtime_preference",
+            "runtime_required",
+            "runtime_reason",
             "expose_public",
             "access_guard",
         ] {
@@ -1335,47 +1479,6 @@ impl Agent {
         anyhow::bail!("Unsupported video URL format for delivery")
     }
 
-    async fn extract_video_preview_from_bytes(&self, video_bytes: &[u8]) -> Result<Vec<u8>> {
-        let temp_dir = std::env::temp_dir().join(format!("video-preview-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&temp_dir).await?;
-        let input_path = temp_dir.join("input.mp4");
-        let output_path = temp_dir.join("preview.jpg");
-        tokio::fs::write(&input_path, video_bytes).await?;
-
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(45),
-            tokio::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-ss",
-                    "00:00:00.500",
-                    "-i",
-                    &input_path.to_string_lossy(),
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=960:-1",
-                    &output_path.to_string_lossy(),
-                ])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("ffmpeg preview extraction timed out"))??;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("ffmpeg preview extraction failed: {}", stderr);
-        }
-        let preview = tokio::fs::read(&output_path).await?;
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-        Ok(preview)
-    }
-
     async fn build_app_runtime_failure_hint(&self, app_id: &str) -> Option<String> {
         if self.app_registry.is_static(app_id).await {
             return None;
@@ -1405,7 +1508,7 @@ impl Agent {
     }
 
     fn detect_app_runtime_error_marker(content: &str) -> Option<&'static str> {
-        let needles: [(&str, &str); 13] = [
+        let needles: [(&str, &str); 12] = [
             ("error loading", "error loading"),
             ("failed to load", "failed to load"),
             ("failed to fetch", "failed to fetch"),
@@ -1414,11 +1517,13 @@ impl Agent {
             ("could not fetch", "could not fetch"),
             ("unable to fetch", "unable to fetch"),
             ("network error", "network error"),
-            ("cross-origin request blocked", "cross-origin request blocked"),
-            ("cors", "cors"),
-            ("please try again", "please try again"),
+            (
+                "cross-origin request blocked",
+                "cross-origin request blocked",
+            ),
             ("runtime error", "runtime error"),
-            ("exception", "exception"),
+            ("uncaught exception", "uncaught exception"),
+            ("exception:", "exception"),
         ];
         for (needle, label) in needles {
             if content.contains(needle) {
@@ -1428,9 +1533,6 @@ impl Agent {
         None
     }
 
-    // App deploy self-heal is currently parked, but keep its helpers available
-    // for the planned re-enable path without widening dead-code allowances.
-    #[allow(dead_code)]
     fn app_deploy_files_signature(arguments: &serde_json::Value) -> Option<String> {
         let files = arguments.get("files")?;
         let canonical = Self::canonicalize_json_value(files);
@@ -1465,10 +1567,38 @@ impl Agent {
             .await
             .unwrap_or_else(|| self.data_dir.join("apps").join(app_id));
 
-        self.app_registry.stop(app_id).await?;
+        let mut executor_deleted_files = false;
+        if let Some(executor) = build_executor_client() {
+            let response = executor
+                .request(
+                    reqwest::Method::DELETE,
+                    &format!("/internal/v1/apps/{}", app_id),
+                )
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let payload = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                anyhow::bail!(
+                    "{}",
+                    payload
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("executor refused app delete")
+                );
+            }
+            executor_deleted_files = true;
+            let _ = self.app_registry.stop(app_id).await;
+        } else {
+            self.app_registry.stop(app_id).await?;
+        }
 
         match tokio::fs::remove_dir_all(&app_dir).await {
             Ok(_) => {}
+            Err(error)
+                if executor_deleted_files && error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 anyhow::bail!(
@@ -1944,11 +2074,26 @@ impl Agent {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true)
         {
-            let tail = crate::actions::app::read_local_runtime_log_tail(&app_dir, 4096).await;
-            if tail.trim().is_empty() {
-                None
+            if let Some(executor) = build_executor_client() {
+                match executor.app_logs(app_id, 4096).await {
+                    Ok(logs) if !logs.logs.trim().is_empty() => Some(logs.logs),
+                    _ => {
+                        let tail =
+                            crate::actions::app::read_local_runtime_log_tail(&app_dir, 4096).await;
+                        if tail.trim().is_empty() {
+                            None
+                        } else {
+                            Some(tail)
+                        }
+                    }
+                }
             } else {
-                Some(tail)
+                let tail = crate::actions::app::read_local_runtime_log_tail(&app_dir, 4096).await;
+                if tail.trim().is_empty() {
+                    None
+                } else {
+                    Some(tail)
+                }
             }
         } else {
             None
@@ -1974,6 +2119,8 @@ impl Agent {
           "entry_command": meta.as_ref().and_then(|m| m.get("entry_command").and_then(|v| v.as_str())),
           "install_command": meta.as_ref().and_then(|m| m.get("install_command").and_then(|v| v.as_str())),
           "runtime_preference": meta.as_ref().and_then(|m| m.get("runtime_preference").and_then(|v| v.as_str())),
+          "runtime_required": meta.as_ref().and_then(|m| m.get("runtime_required").and_then(|v| v.as_bool())).unwrap_or(false),
+          "runtime_reason": meta.as_ref().and_then(|m| m.get("runtime_reason").and_then(|v| v.as_str())),
           "expose_public": meta.as_ref().and_then(|m| m.get("expose_public").and_then(|v| v.as_bool())).unwrap_or(false),
             "runtime_image": meta.as_ref().and_then(|m| m.get("runtime_image").and_then(|v| v.as_str())),
             "repo_url": meta.as_ref().and_then(|m| m.get("repo_url").and_then(|v| v.as_str())),
@@ -1989,6 +2136,34 @@ impl Agent {
             "suggested_actions": ["file_read", "file_write", "app_restart", "app_stop", "app_delete", "http_get"],
         });
         if let Some(obj) = out.as_object_mut() {
+            if !app
+                .get("is_static")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+            {
+                if let Some(executor) = build_executor_client() {
+                    if let Ok(status) = executor.app_status(app_id).await {
+                        obj.insert("running".to_string(), serde_json::json!(status.running));
+                        obj.insert(
+                            "runtime_mode".to_string(),
+                            serde_json::json!(status
+                                .runtime_mode
+                                .unwrap_or_else(|| "stopped".to_string())),
+                        );
+                        obj.insert(
+                            "port".to_string(),
+                            status
+                                .port
+                                .map(serde_json::Value::from)
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                        obj.insert(
+                            "is_isolated_runtime".to_string(),
+                            serde_json::json!(status.is_isolated_runtime),
+                        );
+                    }
+                }
+            }
             if include_files {
                 obj.insert("files".to_string(), serde_json::json!(files));
                 obj.insert(
@@ -2376,6 +2551,8 @@ impl Agent {
                 "install_command": normalized_obj.and_then(|obj| obj.get("install_command")).cloned(),
                 "runtime_image": normalized_obj.and_then(|obj| obj.get("runtime_image")).cloned(),
                 "runtime_preference": normalized_obj.and_then(|obj| obj.get("runtime_preference")).cloned(),
+                "runtime_required": normalized_obj.and_then(|obj| obj.get("runtime_required")).cloned(),
+                "runtime_reason": normalized_obj.and_then(|obj| obj.get("runtime_reason")).cloned(),
                 "required_inputs": normalized_obj.and_then(|obj| obj.get("required_inputs")).cloned(),
                 "config": normalized_obj.and_then(|obj| obj.get("config")).cloned(),
                 "files": normalized_obj.and_then(|obj| obj.get("files")).cloned(),
@@ -2383,6 +2560,7 @@ impl Agent {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn build_app_deploy_self_heal_arguments(
         &self,
         llm_client: &crate::core::llm::LlmClient,
@@ -2487,6 +2665,8 @@ Requirements:\n\
             "install_command",
             "runtime_image",
             "runtime_preference",
+            "runtime_required",
+            "runtime_reason",
             "required_inputs",
             "config",
         ] {
@@ -2539,17 +2719,20 @@ Requirements:\n\
                     "Validating deployed app (attempt {}/{})",
                     attempt, MAX_APP_VERIFY_ATTEMPTS
                 );
-                let _ = tx.try_send(StreamEvent::ToolProgress {
-                    name: "app_deploy".to_string(),
-                    content: detail.clone(),
-                    payload: Some(phase_status_payload(
-                        "app_deploy",
-                        "validating",
-                        "Validating",
-                        &detail,
-                        0,
-                    )),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolProgress {
+                        name: "app_deploy".to_string(),
+                        content: detail.clone(),
+                        payload: Some(phase_status_payload(
+                            "app_deploy",
+                            "validating",
+                            "Validating",
+                            &detail,
+                            0,
+                        )),
+                    },
+                );
             }
 
             // Primary readiness signal: direct HTTP probe to the deployed app URL.
@@ -2600,10 +2783,8 @@ Requirements:\n\
                             continue;
                         }
                         if let Some(marker) = Self::detect_app_runtime_error_marker(&lower) {
-                            last_error = format!(
-                                "HTTP probe body reports runtime error marker: {}",
-                                marker
-                            );
+                            last_error =
+                                format!("HTTP probe body reports runtime error marker: {}", marker);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
@@ -2615,8 +2796,7 @@ Requirements:\n\
                                         "HTTP probe passed on attempt {} (status {}), but browser validation could not start: {}",
                                         attempt, status, e
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_millis(500))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     continue;
                                 }
                             };
@@ -2672,8 +2852,7 @@ Requirements:\n\
                                         status,
                                         e
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_millis(500))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     continue;
                                 }
                             }
@@ -3078,17 +3257,20 @@ Requirements:\n\
         if start_accepted {
             if let Some(tx) = stream_tx {
                 let detail = "Starting remote access for app sharing...".to_string();
-                let _ = tx.try_send(StreamEvent::ToolProgress {
-                    name: "app_deploy".to_string(),
-                    content: detail.clone(),
-                    payload: Some(phase_status_payload(
-                        "app_deploy",
-                        "link_setup",
-                        "Link setup",
-                        &detail,
-                        0,
-                    )),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolProgress {
+                        name: "app_deploy".to_string(),
+                        content: detail.clone(),
+                        payload: Some(phase_status_payload(
+                            "app_deploy",
+                            "link_setup",
+                            "Link setup",
+                            &detail,
+                            0,
+                        )),
+                    },
+                );
             }
         } else {
             return self.load_public_base_url().await;
@@ -3366,10 +3548,13 @@ Requirements:\n\
                 )
                 .await;
                 if let Some(tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: self.sanitize_stream_preview(&formatted),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: self.sanitize_stream_preview(&formatted),
+                        },
+                    );
                 }
                 formatted
             }
@@ -3411,10 +3596,13 @@ Requirements:\n\
                 .await;
                 let formatted = format!("Error from {}: {}", call.name, e);
                 if let Some(tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: formatted.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: formatted.clone(),
+                        },
+                    );
                 }
                 formatted
             }
@@ -3463,6 +3651,7 @@ Requirements:\n\
             sandbox_mode: None,
             source: crate::actions::ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }
     }
 
@@ -3673,22 +3862,21 @@ Requirements:\n\
         let access_guard_enabled = meta
             .get("access_guard_enabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false);
         let access_key = if access_guard_enabled {
-            meta.get("access_key")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
+            self.app_registry
+                .access_key(app_id)
+                .await
                 .unwrap_or_else(crate::actions::app::generate_access_key)
         } else {
             String::new()
         };
 
-        if meta.get("access_guard_enabled").is_none()
-            || (access_guard_enabled && meta.get("access_key").is_none())
-        {
+        if meta.get("access_guard_enabled").is_none() || meta.get("access_key").is_some() {
             meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
-            meta["access_key"] = serde_json::Value::String(access_key.clone());
+            if let Some(obj) = meta.as_object_mut() {
+                obj.remove("access_key");
+            }
             meta_changed = true;
         }
         if meta.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
@@ -3703,19 +3891,76 @@ Requirements:\n\
             .await;
         }
         let _ = self.app_registry.set_enabled(app_id, true).await;
-
-        self.app_registry.stop_runtime(app_id).await?;
-
         let relative_url = format!("/apps/{}/", app_id);
         let local_base = Self::user_facing_local_base_url();
         let local_url = Self::absolutize_public_url(Some(local_base.as_str()), &relative_url);
         let relative_access_url = if access_guard_enabled {
-            format!("/apps/{}/?key={}", app_id, access_key)
+            self.app_registry
+                .issue_access_url(app_id)
+                .await
+                .unwrap_or_else(|| relative_url.clone())
         } else {
             relative_url.clone()
         };
         let local_access_url =
             Self::absolutize_public_url(Some(local_base.as_str()), &relative_access_url);
+
+        if let Some(executor) = build_executor_client() {
+            let response = executor
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/internal/v1/apps/{}/restart", app_id),
+                )
+                .json(&crate::clients::AppLifecycleRequest {
+                    title: override_title.clone(),
+                    query: None,
+                })
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let payload = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                anyhow::bail!(
+                    "{}",
+                    payload
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("executor restart failed")
+                );
+            }
+            let payload = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let raw = payload
+                .get("raw")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let mode = raw
+                .get("mode")
+                .and_then(|value| value.as_str())
+                .unwrap_or("dynamic");
+            return Ok(serde_json::json!({
+                "status": "restarted",
+                "type": mode,
+                "app_id": app_id,
+                "title": raw.get("title").and_then(|value| value.as_str()).unwrap_or(title.as_str()),
+                "url": relative_url,
+                "local_url": local_url,
+                "access_url": relative_access_url,
+                "local_access_url": local_access_url,
+                "access_guard_enabled": access_guard_enabled,
+                "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime_preference": raw
+                    .get("runtime_mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("executor"),
+            }));
+        }
+
+        self.app_registry.stop_runtime(app_id).await?;
 
         if let Some(entry_command) = entry_command {
             let Some(port) = self.app_registry.find_available_port().await else {
@@ -3804,6 +4049,7 @@ Requirements:\n\
                         access_key: access_key.clone(),
                         access_guard_enabled,
                         enabled: true,
+                        last_accessed: None,
                     },
                 )
                 .await;
@@ -3837,13 +4083,17 @@ Requirements:\n\
         }
 
         self.app_registry
-            .register_static(
+            .register_stored(
                 app_id.to_string(),
-                title.clone(),
-                app_dir,
-                access_key.clone(),
-                access_guard_enabled,
-                true,
+                crate::actions::app::StoredAppRegistration {
+                    title: title.clone(),
+                    app_dir,
+                    is_static: true,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed: None,
+                },
             )
             .await;
         Ok(serde_json::json!({
@@ -3901,10 +4151,13 @@ Requirements:\n\
                 });
                 let formatted = serde_json::to_string_pretty(&out)?;
                 if let Some(tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: formatted.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: formatted.clone(),
+                        },
+                    );
                 }
                 return Ok(formatted);
             }
@@ -3928,10 +4181,13 @@ Requirements:\n\
                 });
                 let formatted = serde_json::to_string_pretty(&out)?;
                 if let Some(tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: formatted.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: formatted.clone(),
+                        },
+                    );
                 }
                 return Ok(formatted);
             }
@@ -3968,10 +4224,13 @@ Requirements:\n\
 
         let formatted = serde_json::to_string_pretty(&out)?;
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: formatted.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                },
+            );
         }
         Ok(formatted)
     }
@@ -4025,10 +4284,13 @@ Requirements:\n\
             });
             let formatted = serde_json::to_string_pretty(&out)?;
             if let Some(tx) = stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
-                    name: call.name.clone(),
-                    content: formatted.clone(),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: formatted.clone(),
+                    },
+                );
             }
             return Ok(formatted);
         }
@@ -4062,10 +4324,13 @@ Requirements:\n\
             };
             let formatted = serde_json::to_string_pretty(&out)?;
             if let Some(tx) = stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
-                    name: call.name.clone(),
-                    content: formatted.clone(),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: formatted.clone(),
+                    },
+                );
             }
             return Ok(formatted);
         }
@@ -4156,10 +4421,13 @@ Requirements:\n\
         });
         let formatted = serde_json::to_string_pretty(&out)?;
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: formatted.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                },
+            );
         }
         Ok(formatted)
     }
@@ -4221,6 +4489,21 @@ Requirements:\n\
                         .unwrap_or(false)
                     {
                         Ok(())
+                    } else if let Some(executor) = build_executor_client() {
+                        executor
+                            .request(
+                                reqwest::Method::POST,
+                                &format!("/internal/v1/apps/{}/stop", app_id),
+                            )
+                            .json(&crate::clients::AppLifecycleRequest {
+                                title: None,
+                                query: None,
+                            })
+                            .send()
+                            .await
+                            .and_then(reqwest::Response::error_for_status)
+                            .map(|_| ())
+                            .map_err(anyhow::Error::from)
                     } else {
                         self.app_registry.stop_runtime(&app_id).await
                     };
@@ -4297,10 +4580,13 @@ Requirements:\n\
                         });
                         let formatted = serde_json::to_string_pretty(&out)?;
                         if let Some(tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         return Ok(formatted);
                     }
@@ -4316,6 +4602,21 @@ Requirements:\n\
                         .unwrap_or(false)
                     {
                         Ok(())
+                    } else if let Some(executor) = build_executor_client() {
+                        executor
+                            .request(
+                                reqwest::Method::POST,
+                                &format!("/internal/v1/apps/{}/stop", resolved_app_id),
+                            )
+                            .json(&crate::clients::AppLifecycleRequest {
+                                title: None,
+                                query: None,
+                            })
+                            .send()
+                            .await
+                            .and_then(reqwest::Response::error_for_status)
+                            .map(|_| ())
+                            .map_err(anyhow::Error::from)
                     } else {
                         self.app_registry.stop_runtime(&resolved_app_id).await
                     };
@@ -4356,10 +4657,13 @@ Requirements:\n\
 
         let formatted = serde_json::to_string_pretty(&out)?;
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: formatted.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                },
+            );
         }
         Ok(formatted)
     }
@@ -4483,10 +4787,13 @@ Requirements:\n\
                         });
                         let formatted = serde_json::to_string_pretty(&out)?;
                         if let Some(tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         return Ok(formatted);
                     }
@@ -4544,10 +4851,13 @@ Requirements:\n\
 
         let formatted = serde_json::to_string_pretty(&out)?;
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: formatted.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: formatted.clone(),
+                },
+            );
         }
         Ok(formatted)
     }
@@ -4637,15 +4947,18 @@ Requirements:\n\
         &self,
         call: &crate::core::llm::ToolCall,
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
-        request_channel: &str,
+        _request_channel: &str,
         conversation_id: Option<&str>,
         project_id: Option<&str>,
     ) -> Result<String> {
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: call.name.clone(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
         }
 
         let query = call
@@ -4704,49 +5017,28 @@ Requirements:\n\
         let mut learning_seed_ids: Vec<String> = Vec::new();
 
         if include_semantic {
-            let mem0_scope =
-                self.mem0_scope_for_request(request_channel, conversation_id, project_id);
-            let semantic_lines = if self.mem0.is_available() {
-                match self.mem0.search(query, &mem0_scope, limit).await {
-                    Ok(memories) => memories
-                        .into_iter()
-                        .take(limit)
-                        .map(|m| format!("- {}", safe_truncate(&m.memory, 220)))
-                        .collect::<Vec<_>>(),
-                    Err(e) => {
-                        tracing::warn!("memory_lookup mem0 search failed: {}", e);
-                        Vec::new()
-                    }
+            let semantic_lines = match self
+                .memory
+                .retrieve_relevant(query, limit.min(5), project_id)
+                .await
+            {
+                Ok(memories) => memories
+                    .into_iter()
+                    .filter(|memory| {
+                        include_moltbook_external
+                            || !matches!(
+                                &memory.memory_type,
+                                crate::memory::MemoryType::Episodic { context }
+                                    if context.channel.eq_ignore_ascii_case("moltbook")
+                            )
+                    })
+                    .take(limit)
+                    .map(|m| format!("- {}", safe_truncate(&m.content, 220)))
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    tracing::warn!("memory_lookup retrieval failed: {}", e);
+                    Vec::new()
                 }
-            } else {
-                Vec::new()
-            };
-            let semantic_lines = if semantic_lines.is_empty() {
-                match self
-                    .memory
-                    .retrieve_relevant(query, limit.min(5), project_id)
-                    .await
-                {
-                    Ok(memories) => memories
-                        .into_iter()
-                        .filter(|memory| {
-                            include_moltbook_external
-                                || !matches!(
-                                    &memory.memory_type,
-                                    crate::memory::MemoryType::Episodic { context }
-                                        if context.channel.eq_ignore_ascii_case("moltbook")
-                                )
-                        })
-                        .take(limit)
-                        .map(|m| format!("- {}", safe_truncate(&m.content, 220)))
-                        .collect::<Vec<_>>(),
-                    Err(e) => {
-                        tracing::warn!("memory_lookup built-in retrieval failed: {}", e);
-                        Vec::new()
-                    }
-                }
-            } else {
-                semantic_lines
             };
 
             if !semantic_lines.is_empty() {
@@ -4921,10 +5213,119 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: output.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: output.clone(),
+                },
+            );
+        }
+
+        Ok(output)
+    }
+
+    pub(crate) async fn handle_document_lookup_tool_call(
+        &self,
+        call: &crate::core::llm::ToolCall,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        project_id: Option<&str>,
+    ) -> Result<String> {
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
+        }
+
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("document_lookup requires a non-empty 'query'"))?;
+        let limit = call
+            .arguments
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|value| value.clamp(1, 12) as usize)
+            .unwrap_or(6);
+        let doc_ids = call
+            .arguments
+            .get("doc_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let scoped_query = if doc_ids.is_empty() {
+            query.to_string()
+        } else {
+            format!(
+                "{} {}",
+                query,
+                doc_ids
+                    .iter()
+                    .map(|id| format!("doc:{}", id))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+
+        let hits = self
+            .search_documents(&scoped_query, limit, project_id)
+            .await?;
+        let output = if hits.is_empty() {
+            format!(
+                "No relevant document excerpts were found for `{}`.",
+                safe_truncate(query, 120)
+            )
+        } else {
+            let lines = hits
+                .iter()
+                .enumerate()
+                .map(|(index, hit)| {
+                    let chunk_label = hit
+                        .chunk_index
+                        .map(|chunk_index| format!("chunk {}", chunk_index + 1))
+                        .unwrap_or_else(|| "metadata".to_string());
+                    format!(
+                        "{}. {} [doc:{} | {} | match {} | score {:.2}] {}",
+                        index + 1,
+                        safe_truncate(&hit.filename, 120),
+                        hit.document_id,
+                        chunk_label,
+                        hit.match_reason,
+                        hit.score,
+                        safe_truncate(&hit.content, 320)
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "Document lookup for `{}`.\n\n## Relevant Documents\n{}",
+                safe_truncate(query, 120),
+                lines.join("\n")
+            )
+        };
+
+        if let Some(tx) = stream_tx {
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: output.clone(),
+                },
+            );
         }
 
         Ok(output)
@@ -4937,10 +5338,13 @@ Requirements:\n\
         conversation_id: Option<&str>,
     ) -> Result<String> {
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: call.name.clone(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
         }
 
         let operation = call
@@ -5324,10 +5728,13 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: result.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: result.clone(),
+                },
+            );
         }
 
         Ok(result)
@@ -5339,10 +5746,13 @@ Requirements:\n\
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: call.name.clone(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
         }
 
         let include_disabled = call
@@ -5446,10 +5856,13 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: result.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: result.clone(),
+                },
+            );
         }
 
         Ok(result)
@@ -5461,10 +5874,13 @@ Requirements:\n\
         stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<String> {
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: call.name.clone(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
         }
 
         let filter = call
@@ -5535,10 +5951,13 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: call.name.clone(),
-                content: result.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: call.name.clone(),
+                    content: result.clone(),
+                },
+            );
         }
 
         Ok(result)
@@ -5564,10 +5983,13 @@ Requirements:\n\
                 .await
                 .unwrap_or_else(|| "Failed to schedule task.".to_string());
             if let Some(tx) = stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
-                    name: call.name.clone(),
-                    content: result.clone(),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: result.clone(),
+                    },
+                );
             }
             return Ok(result);
         }
@@ -5583,10 +6005,13 @@ Requirements:\n\
                 .await
                 .unwrap_or_else(|| "Failed to create watcher.".to_string());
             if let Some(tx) = stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
-                    name: call.name.clone(),
-                    content: result.clone(),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: result.clone(),
+                    },
+                );
             }
             return Ok(result);
         }
@@ -5622,10 +6047,13 @@ Requirements:\n\
             .unwrap_or(1500);
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: "page_screenshot".to_string(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: "page_screenshot".to_string(),
+                    payload: None,
+                },
+            );
         }
 
         if !self.browser_sessions.is_available().await {
@@ -5683,10 +6111,13 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: "page_screenshot".to_string(),
-                content: output.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: "page_screenshot".to_string(),
+                    content: output.clone(),
+                },
+            );
         }
 
         Ok(output)
@@ -5718,10 +6149,13 @@ Requirements:\n\
             .to_string();
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: "compose_report".to_string(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: "compose_report".to_string(),
+                    payload: None,
+                },
+            );
         }
 
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
@@ -5827,10 +6261,13 @@ Requirements:\n\
         };
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolResult {
-                name: "compose_report".to_string(),
-                content: output.clone(),
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: "compose_report".to_string(),
+                    content: output.clone(),
+                },
+            );
         }
 
         Ok(output)
@@ -5929,12 +6366,15 @@ Requirements:\n\
             "[evolve]",
             "Self-Evolve Request",
             format!(
-                "Requested {} evolution for AgentArk.",
+                "Requested {} evolution for {}.",
                 if mode == "code" || mode == "codebase" {
                     "code"
+                } else if mode == "prompt" {
+                    "prompt"
                 } else {
                     "policy"
-                }
+                },
+                crate::branding::PRODUCT_NAME
             ),
             "thinking",
             Some(serde_json::json!({
@@ -5954,10 +6394,13 @@ Requirements:\n\
         .await;
 
         if let Some(tx) = stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: "self_evolve".to_string(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: "self_evolve".to_string(),
+                    payload: None,
+                },
+            );
         }
 
         tracing::info!(
@@ -6123,10 +6566,13 @@ Requirements:\n\
                             result.promotion_gate
                         )
                     };
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: "self_evolve".to_string(),
-                        content: status_msg,
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: "self_evolve".to_string(),
+                            content: status_msg,
+                        },
+                    );
                 }
 
                 let changed_fields = result
@@ -6309,13 +6755,397 @@ Requirements:\n\
                 };
                 Ok(summary)
             }
+            "prompt" => {
+                let prompt_start = std::time::Instant::now();
+                let current_prompt_raw = self
+                    .storage
+                    .get(crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY)
+                    .await
+                    .ok()
+                    .flatten();
+                let config = crate::core::self_evolve::PromptEvolutionConfig {
+                    project_root,
+                    ..Default::default()
+                };
+                let evolve_engine =
+                    crate::core::self_evolve::PromptEvolutionEngine::new(config, llm);
+                let result = evolve_engine
+                    .evolve_prompt_bundle(&request, current_prompt_raw.as_deref())
+                    .await?;
+
+                let mut promotion_applied = false;
+                let mut canary_state: Option<
+                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                > = None;
+                let mut replay_result: Option<
+                    crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+                > = None;
+                let mut promoted_directly_to_baseline = false;
+                if result.promoted && apply_promotion {
+                    if let Some(bundle) = result.promoted_prompt_bundle.as_ref() {
+                        let candidate_serialized = serde_json::to_vec(bundle)?;
+                        if let Some(existing_baseline) = current_prompt_raw.as_ref() {
+                            let _ = self
+                                .storage
+                                .set(
+                                    crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                                    existing_baseline,
+                                )
+                                .await;
+                        }
+                        let baseline_bundle_version = current_prompt_raw
+                            .as_ref()
+                            .and_then(|raw| {
+                                crate::core::self_evolve::prompt_evolution::parse_prompt_bundle_profile(raw)
+                                    .map(|bundle| bundle.version)
+                            })
+                            .unwrap_or_else(|| result.baseline_version.clone());
+                        let baseline_version =
+                            crate::core::self_evolve::prompt_evolution::compose_prompt_version(
+                                &baseline_bundle_version,
+                            );
+                        let candidate_version =
+                            crate::core::self_evolve::prompt_evolution::compose_prompt_version(
+                                &result.candidate_version,
+                            );
+
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                                &candidate_serialized,
+                            )
+                            .await?;
+                        let state =
+                            crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                                enabled: true,
+                                baseline_version: baseline_version.clone(),
+                                candidate_version: candidate_version.clone(),
+                                rollout_percent: canary_rollout_percent,
+                                min_samples_per_version: canary_min_samples_per_version,
+                                min_success_gain: canary_min_success_gain,
+                                max_sign_test_p_value: canary_max_sign_test_p_value,
+                                activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                            };
+                        let state_bytes = serde_json::to_vec(&state)?;
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+                                &state_bytes,
+                            )
+                            .await?;
+                        canary_state = Some(state.clone());
+
+                        if let Ok(runs) = self
+                            .storage
+                            .list_recent_experience_runs_any_scope(replay_log_limit)
+                            .await
+                        {
+                            let replay_eval = crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_prompt_version(
+                                &runs,
+                                &state.baseline_version,
+                                &state.candidate_version,
+                                state.min_samples_per_version,
+                                state.min_success_gain,
+                                state.max_sign_test_p_value,
+                            );
+                            if replay_eval.promote {
+                                self.storage
+                                    .set(
+                                        crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY,
+                                        &candidate_serialized,
+                                    )
+                                    .await?;
+                                let mut disabled_state = state.clone();
+                                disabled_state.enabled = false;
+                                let disabled_bytes = serde_json::to_vec(&disabled_state)?;
+                                self.storage
+                                    .set(
+                                        crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+                                        &disabled_bytes,
+                                    )
+                                    .await?;
+                                promoted_directly_to_baseline = true;
+                                canary_state = Some(disabled_state);
+                            }
+                            replay_result = Some(replay_eval);
+                        }
+                        promotion_applied = true;
+                    }
+                }
+
+                if let Some(tx) = stream_tx {
+                    let status_msg = if result.promoted {
+                        if promotion_applied {
+                            if promoted_directly_to_baseline {
+                                format!(
+                                    "Prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}), replay gate passed, baseline updated immediately",
+                                    result.score_gain, result.p_value
+                                )
+                            } else {
+                                format!(
+                                    "Prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}) activated in canary mode ({}%)",
+                                    result.score_gain,
+                                    result.p_value,
+                                    canary_state
+                                        .as_ref()
+                                        .map(|s| s.rollout_percent)
+                                        .unwrap_or(canary_rollout_percent)
+                                )
+                            }
+                        } else {
+                            format!(
+                                "Prompt evolution complete: candidate passed promotion gate (gain {:.4}, p={:.4}) but not applied",
+                                result.score_gain, result.p_value
+                            )
+                        }
+                    } else {
+                        format!(
+                            "Prompt evolution complete: no promotion ({})",
+                            result.promotion_gate
+                        )
+                    };
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: "self_evolve".to_string(),
+                            content: status_msg,
+                        },
+                    );
+                }
+
+                push_trace_step(
+                    trace_ref,
+                    if result.success && result.promoted {
+                        "[evolve]"
+                    } else if result.success {
+                        "[info]"
+                    } else {
+                        "[error]"
+                    },
+                    "Prompt Evolution Evaluated",
+                    if result.success {
+                        format!(
+                            "Evaluated {} prompt candidates. Score {:.0}% -> {:.0}% with gate `{}`.",
+                            result.evaluated_candidates,
+                            result.baseline_score * 100.0,
+                            result.best_candidate_score * 100.0,
+                            result.promotion_gate
+                        )
+                    } else {
+                        format!(
+                            "Prompt evolution failed: {}",
+                            result.error.as_deref().unwrap_or("unknown error")
+                        )
+                    },
+                    if result.success && result.promoted {
+                        "success"
+                    } else if result.success {
+                        "info"
+                    } else {
+                        "error"
+                    },
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.prompt.result",
+                        "request": request.clone(),
+                        "mode": "prompt",
+                        "target_key": result.target_key.clone(),
+                        "success": result.success,
+                        "promoted": result.promoted,
+                        "evaluated_candidates": result.evaluated_candidates,
+                        "baseline_version": result.baseline_version.clone(),
+                        "candidate_version": result.candidate_version.clone(),
+                        "baseline_score": result.baseline_score,
+                        "best_candidate_score": result.best_candidate_score,
+                        "score_gain": result.score_gain,
+                        "baseline_router_score": result.baseline_router_score,
+                        "best_candidate_router_score": result.best_candidate_router_score,
+                        "baseline_synthesis_score": result.baseline_synthesis_score,
+                        "best_candidate_synthesis_score": result.best_candidate_synthesis_score,
+                        "baseline_router_invalid_json_rate": result.baseline_router_invalid_json_rate,
+                        "candidate_router_invalid_json_rate": result.candidate_router_invalid_json_rate,
+                        "wins": result.wins,
+                        "losses": result.losses,
+                        "p_value": result.p_value,
+                        "candidate_source": result.candidate_source.clone(),
+                        "optimized_surfaces": result.optimized_surfaces.clone(),
+                        "promotion_gate": result.promotion_gate.clone(),
+                        "lineage_entry_id": result.lineage_entry_id.clone(),
+                        "lineage_archive_path": result.lineage_archive_path.clone(),
+                        "notes": result.notes.clone(),
+                        "diff_summary": result.diff_summary.clone(),
+                        "promoted_prompt_bundle": result.promoted_prompt_bundle.clone(),
+                        "error": result.error.clone(),
+                    })),
+                    Some(prompt_start.elapsed().as_millis() as u64),
+                )
+                .await;
+
+                let promotion_mode = if promoted_directly_to_baseline {
+                    "baseline"
+                } else if promotion_applied {
+                    "canary"
+                } else {
+                    "none"
+                };
+                let promotion_detail = if promoted_directly_to_baseline {
+                    "Replay evaluation promoted the prompt bundle directly to baseline.".to_string()
+                } else if promotion_applied {
+                    format!(
+                        "Prompt candidate activated in canary mode at {}% rollout.",
+                        canary_state
+                            .as_ref()
+                            .map(|state| state.rollout_percent)
+                            .unwrap_or(canary_rollout_percent)
+                    )
+                } else if result.promoted {
+                    "Prompt candidate passed the promotion gate but was not applied.".to_string()
+                } else {
+                    format!(
+                        "No prompt promotion applied because `{}`.",
+                        result.promotion_gate
+                    )
+                };
+                push_trace_step(
+                    trace_ref,
+                    if promotion_applied { "[ok]" } else { "[info]" },
+                    "Prompt Promotion Decision",
+                    promotion_detail,
+                    if promotion_applied { "success" } else { "info" },
+                    Some(serde_json::json!({
+                        "trace_kind": "self_evolve.prompt.promotion",
+                        "request": request.clone(),
+                        "promotion_applied": promotion_applied,
+                        "apply_promotion_requested": apply_promotion,
+                        "promotion_mode": promotion_mode,
+                        "promoted_directly_to_baseline": promoted_directly_to_baseline,
+                        "baseline_version": result.baseline_version.clone(),
+                        "candidate_version": result.candidate_version.clone(),
+                        "optimized_surfaces": result.optimized_surfaces.clone(),
+                        "diff_summary": result.diff_summary.clone(),
+                        "canary_state": canary_state.clone(),
+                        "replay_evaluation": replay_result.clone(),
+                    })),
+                    None,
+                )
+                .await;
+
+                let mut value = serde_json::to_value(&result)?;
+                if let serde_json::Value::Object(obj) = &mut value {
+                    obj.insert("mode".to_string(), serde_json::json!("prompt"));
+                    obj.insert(
+                        "promotion_applied".to_string(),
+                        serde_json::json!(promotion_applied),
+                    );
+                    obj.insert(
+                        "apply_promotion_requested".to_string(),
+                        serde_json::json!(apply_promotion),
+                    );
+                    obj.insert(
+                        "promotion_mode".to_string(),
+                        serde_json::json!(promotion_mode),
+                    );
+                    obj.insert(
+                        "canary_state".to_string(),
+                        serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+                    );
+                    obj.insert(
+                        "replay_evaluation".to_string(),
+                        serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if let Ok(last_bytes) = serde_json::to_vec(&value) {
+                    let _ = self
+                        .storage
+                        .set(
+                            crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
+                            &last_bytes,
+                        )
+                        .await;
+                }
+
+                let summary = if result.success {
+                    if result.promoted {
+                        let mode_label = if promoted_directly_to_baseline {
+                            "applied immediately"
+                        } else if promotion_applied {
+                            "activated in canary mode for gradual rollout"
+                        } else {
+                            "ready but not yet applied"
+                        };
+                        format!(
+                            "Prompt evolution completed successfully.\n\n\
+                            I evaluated {} prompt bundles and found an improvement.\n\
+                            - Combined benchmark score improved from {:.0}% to {:.0}% ({} wins, {} losses)\n\
+                            - Router invalid JSON rate changed from {:.1}% to {:.1}%\n\
+                            - The improved prompt bundle has been {}\n\n\
+                            {} is now testing a better routing, primary response, and delegated synthesis prompt set.",
+                              result.evaluated_candidates,
+                              result.baseline_score * 100.0,
+                              result.best_candidate_score * 100.0,
+                              result.wins,
+                            result.losses,
+                            result.baseline_router_invalid_json_rate * 100.0,
+                            result.candidate_router_invalid_json_rate * 100.0,
+                            mode_label,
+                            crate::branding::PRODUCT_NAME
+                        )
+                    } else {
+                        format!(
+                            "Prompt evolution completed. I evaluated {} prompt bundles but none outperformed the current prompt bundle (score: {:.0}%). No changes were made.",
+                            result.evaluated_candidates,
+                            result.baseline_score * 100.0,
+                        )
+                    }
+                } else {
+                    format!(
+                        "Prompt evolution ran but encountered an issue: {}",
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
+                };
+                Ok(summary)
+            }
+            "classifier_prompt" => {
+                self.handle_classifier_prompt_evolution(
+                    &request,
+                    project_root,
+                    llm,
+                    trace_ref,
+                    stream_tx,
+                    apply_promotion,
+                    canary_rollout_percent,
+                    canary_min_samples_per_version,
+                    canary_min_success_gain,
+                    canary_max_sign_test_p_value,
+                    replay_log_limit,
+                )
+                .await
+            }
+            "specialist_prompt" => {
+                self.handle_specialist_prompt_evolution(
+                    &request,
+                    project_root,
+                    llm,
+                    trace_ref,
+                    stream_tx,
+                    apply_promotion,
+                    canary_rollout_percent,
+                    canary_min_samples_per_version,
+                    canary_min_success_gain,
+                    canary_max_sign_test_p_value,
+                    replay_log_limit,
+                )
+                .await
+            }
             "code" | "codebase" => {
                 if !allow_code_writes {
                     push_trace_step(
                         trace_ref,
                         "[warn]",
                         "Code Evolution Blocked",
-                        "Code evolution requires explicit `allow_code_writes=true` before AgentArk will modify its own code.",
+                        &format!(
+                            "Code evolution requires explicit `allow_code_writes=true` before {} will modify its own code.",
+                            crate::branding::PRODUCT_NAME
+                        ),
                         "warning",
                         Some(serde_json::json!({
                             "trace_kind": "self_evolve.code.blocked",
@@ -6362,10 +7192,13 @@ Requirements:\n\
                             result.error.as_deref().unwrap_or("unknown error")
                         )
                     };
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: "self_evolve".to_string(),
-                        content: status_msg,
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: "self_evolve".to_string(),
+                            content: status_msg,
+                        },
+                    );
                 }
 
                 push_trace_step(
@@ -6426,7 +7259,7 @@ Requirements:\n\
                 Ok(serde_json::json!({
                     "status": "error",
                     "message": format!(
-                        "Unsupported self_evolve mode '{}'. Use mode='policy' (default) or mode='code'.",
+                        "Unsupported self_evolve mode '{}'. Use mode='policy' (default), mode='prompt', mode='classifier_prompt', mode='specialist_prompt', or mode='code'.",
                         mode
                     ),
                 })
@@ -6434,6 +7267,713 @@ Requirements:\n\
             }
         }
     }
+
+    async fn handle_classifier_prompt_evolution(
+        &self,
+        request: &str,
+        project_root: std::path::PathBuf,
+        llm: crate::core::llm::LlmClient,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        apply_promotion: bool,
+        canary_rollout_percent: u8,
+        canary_min_samples_per_version: usize,
+        canary_min_success_gain: f64,
+        canary_max_sign_test_p_value: f64,
+        replay_log_limit: u64,
+    ) -> Result<String> {
+        let classifier_start = std::time::Instant::now();
+        let current_classifier_raw = self
+            .storage
+            .get(crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_KEY)
+            .await
+            .ok()
+            .flatten();
+        let config = crate::core::self_evolve::ClassifierPromptEvolutionConfig {
+            project_root,
+            ..Default::default()
+        };
+        let evolve_engine =
+            crate::core::self_evolve::ClassifierPromptEvolutionEngine::new(config, llm);
+        let result = evolve_engine
+            .evolve_classifier_prompt_bundle(request, current_classifier_raw.as_deref())
+            .await?;
+
+        let mut promotion_applied = false;
+        let mut canary_state: Option<
+            crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+        > = None;
+        let mut replay_result: Option<
+            crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+        > = None;
+        let mut promoted_directly_to_baseline = false;
+        if result.promoted && apply_promotion {
+            if let Some(bundle) = result.promoted_classifier_bundle.as_ref() {
+                let candidate_serialized = serde_json::to_vec(bundle)?;
+                if let Some(existing_baseline) = current_classifier_raw.as_ref() {
+                    let _ = self
+                        .storage
+                        .set(
+                            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                            existing_baseline,
+                        )
+                        .await;
+                }
+                let baseline_bundle_version = current_classifier_raw
+                    .as_ref()
+                    .and_then(|raw| {
+                        crate::core::self_evolve::classifier_prompt_evolution::parse_classifier_prompt_bundle_profile(raw)
+                            .map(|bundle| bundle.version)
+                    })
+                    .unwrap_or_else(|| result.baseline_version.clone());
+                let baseline_version =
+                    crate::core::self_evolve::classifier_prompt_evolution::compose_classifier_prompt_version(
+                        &baseline_bundle_version,
+                    );
+                let candidate_version =
+                    crate::core::self_evolve::classifier_prompt_evolution::compose_classifier_prompt_version(
+                        &result.candidate_version,
+                    );
+
+                self.storage
+                    .set(
+                        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        &candidate_serialized,
+                    )
+                    .await?;
+                let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                    enabled: true,
+                    baseline_version: baseline_version.clone(),
+                    candidate_version: candidate_version.clone(),
+                    rollout_percent: canary_rollout_percent,
+                    min_samples_per_version: canary_min_samples_per_version,
+                    min_success_gain: canary_min_success_gain,
+                    max_sign_test_p_value: canary_max_sign_test_p_value,
+                    activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                };
+                let state_bytes = serde_json::to_vec(&state)?;
+                self.storage
+                    .set(
+                        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+                        &state_bytes,
+                    )
+                    .await?;
+                canary_state = Some(state.clone());
+
+                if let Ok(runs) = self
+                    .storage
+                    .list_recent_experience_runs_any_scope(replay_log_limit)
+                    .await
+                {
+                    let replay_eval = crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(
+                        &runs,
+                        "classifier_prompt_version",
+                        &state.baseline_version,
+                        &state.candidate_version,
+                        state.min_samples_per_version,
+                        state.min_success_gain,
+                        state.max_sign_test_p_value,
+                    );
+                    if replay_eval.promote {
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_KEY,
+                                &candidate_serialized,
+                            )
+                            .await?;
+                        let mut disabled_state = state.clone();
+                        disabled_state.enabled = false;
+                        let disabled_bytes = serde_json::to_vec(&disabled_state)?;
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+                                &disabled_bytes,
+                            )
+                            .await?;
+                        promoted_directly_to_baseline = true;
+                        canary_state = Some(disabled_state);
+                    }
+                    replay_result = Some(replay_eval);
+                }
+                promotion_applied = true;
+            }
+        }
+
+        if let Some(tx) = stream_tx {
+            let status_msg = if result.promoted {
+                if promotion_applied {
+                    if promoted_directly_to_baseline {
+                        format!(
+                            "Classifier prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}), replay gate passed, baseline updated immediately",
+                            result.score_gain, result.p_value
+                        )
+                    } else {
+                        format!(
+                            "Classifier prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}) activated in canary mode ({}%)",
+                            result.score_gain,
+                            result.p_value,
+                            canary_state
+                                .as_ref()
+                                .map(|s| s.rollout_percent)
+                                .unwrap_or(canary_rollout_percent)
+                        )
+                    }
+                } else {
+                    format!(
+                        "Classifier prompt evolution complete: candidate passed promotion gate (gain {:.4}, p={:.4}) but not applied",
+                        result.score_gain, result.p_value
+                    )
+                }
+            } else {
+                format!(
+                    "Classifier prompt evolution complete: no promotion ({})",
+                    result.promotion_gate
+                )
+            };
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: "self_evolve".to_string(),
+                    content: status_msg,
+                },
+            );
+        }
+
+        push_trace_step(
+            trace_ref,
+            if result.success && result.promoted {
+                "[evolve]"
+            } else if result.success {
+                "[info]"
+            } else {
+                "[error]"
+            },
+            "Classifier Prompt Evolution Evaluated",
+            if result.success {
+                format!(
+                    "Evaluated {} classifier prompt candidates. Score {:.0}% -> {:.0}% with gate `{}`.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                    result.best_candidate_score * 100.0,
+                    result.promotion_gate
+                )
+            } else {
+                format!(
+                    "Classifier prompt evolution failed: {}",
+                    result.error.as_deref().unwrap_or("unknown error")
+                )
+            },
+            if result.success && result.promoted {
+                "success"
+            } else if result.success {
+                "info"
+            } else {
+                "error"
+            },
+            Some(serde_json::json!({
+                "trace_kind": "self_evolve.classifier_prompt.result",
+                "request": request,
+                "mode": "classifier_prompt",
+                "success": result.success,
+                "promoted": result.promoted,
+                "evaluated_candidates": result.evaluated_candidates,
+                "baseline_version": result.baseline_version.clone(),
+                "candidate_version": result.candidate_version.clone(),
+                "baseline_score": result.baseline_score,
+                "best_candidate_score": result.best_candidate_score,
+                "score_gain": result.score_gain,
+                "wins": result.wins,
+                "losses": result.losses,
+                "p_value": result.p_value,
+                "candidate_source": result.candidate_source.clone(),
+                "optimized_surfaces": result.optimized_surfaces.clone(),
+                "promotion_gate": result.promotion_gate.clone(),
+                "lineage_entry_id": result.lineage_entry_id.clone(),
+                "lineage_archive_path": result.lineage_archive_path.clone(),
+                "notes": result.notes.clone(),
+                "diff_summary": result.diff_summary.clone(),
+                "promoted_classifier_bundle": result.promoted_classifier_bundle.clone(),
+                "error": result.error.clone(),
+            })),
+            Some(classifier_start.elapsed().as_millis() as u64),
+        )
+        .await;
+
+        let promotion_mode = if promoted_directly_to_baseline {
+            "baseline"
+        } else if promotion_applied {
+            "canary"
+        } else {
+            "none"
+        };
+        push_trace_step(
+            trace_ref,
+            if promotion_applied { "[ok]" } else { "[info]" },
+            "Classifier Prompt Promotion Decision",
+            if promoted_directly_to_baseline {
+                "Replay evaluation promoted the classifier prompt bundle directly to baseline."
+                    .to_string()
+            } else if promotion_applied {
+                format!(
+                    "Classifier prompt candidate activated in canary mode at {}% rollout.",
+                    canary_state
+                        .as_ref()
+                        .map(|state| state.rollout_percent)
+                        .unwrap_or(canary_rollout_percent)
+                )
+            } else if result.promoted {
+                "Classifier prompt candidate passed the promotion gate but was not applied."
+                    .to_string()
+            } else {
+                format!(
+                    "No classifier prompt promotion applied because `{}`.",
+                    result.promotion_gate
+                )
+            },
+            if promotion_applied { "success" } else { "info" },
+            Some(serde_json::json!({
+                "trace_kind": "self_evolve.classifier_prompt.promotion",
+                "request": request,
+                "promotion_applied": promotion_applied,
+                "apply_promotion_requested": apply_promotion,
+                "promotion_mode": promotion_mode,
+                "promoted_directly_to_baseline": promoted_directly_to_baseline,
+                "baseline_version": result.baseline_version.clone(),
+                "candidate_version": result.candidate_version.clone(),
+                "optimized_surfaces": result.optimized_surfaces.clone(),
+                "diff_summary": result.diff_summary.clone(),
+                "canary_state": canary_state.clone(),
+                "replay_evaluation": replay_result.clone(),
+            })),
+            None,
+        )
+        .await;
+
+        let mut value = serde_json::to_value(&result)?;
+        if let serde_json::Value::Object(obj) = &mut value {
+            obj.insert("mode".to_string(), serde_json::json!("classifier_prompt"));
+            obj.insert(
+                "promotion_applied".to_string(),
+                serde_json::json!(promotion_applied),
+            );
+            obj.insert(
+                "apply_promotion_requested".to_string(),
+                serde_json::json!(apply_promotion),
+            );
+            obj.insert(
+                "promotion_mode".to_string(),
+                serde_json::json!(promotion_mode),
+            );
+            obj.insert(
+                "canary_state".to_string(),
+                serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "replay_evaluation".to_string(),
+                serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Ok(last_bytes) = serde_json::to_vec(&value) {
+            let _ = self
+                .storage
+                .set(
+                    crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
+                    &last_bytes,
+                )
+                .await;
+        }
+
+        if result.success {
+            if result.promoted {
+                let mode_label = if promoted_directly_to_baseline {
+                    "applied immediately"
+                } else if promotion_applied {
+                    "activated in canary mode for gradual rollout"
+                } else {
+                    "ready but not yet applied"
+                };
+                Ok(format!(
+                    "Classifier prompt evolution completed successfully.\n\n\
+                    I evaluated {} classifier prompt bundles and found an improvement.\n\
+                    - Combined benchmark score improved from {:.0}% to {:.0}% ({} wins, {} losses)\n\
+                    - The improved classifier/helper prompt bundle has been {}\n\n\
+                    {} is now testing a better request-interpretation bundle for helper classifiers and action selection.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                    result.best_candidate_score * 100.0,
+                    result.wins,
+                    result.losses,
+                    mode_label,
+                    crate::branding::PRODUCT_NAME
+                ))
+            } else {
+                Ok(format!(
+                    "Classifier prompt evolution completed. I evaluated {} classifier prompt bundles but none outperformed the current classifier bundle (score: {:.0}%). No changes were made.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                ))
+            }
+        } else {
+            Ok(format!(
+                "Classifier prompt evolution ran but encountered an issue: {}",
+                result.error.as_deref().unwrap_or("unknown error")
+            ))
+        }
+    }
+
+    async fn handle_specialist_prompt_evolution(
+        &self,
+        request: &str,
+        project_root: std::path::PathBuf,
+        llm: crate::core::llm::LlmClient,
+        trace_ref: &Arc<RwLock<ExecutionTrace>>,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        apply_promotion: bool,
+        canary_rollout_percent: u8,
+        canary_min_samples_per_version: usize,
+        canary_min_success_gain: f64,
+        canary_max_sign_test_p_value: f64,
+        replay_log_limit: u64,
+    ) -> Result<String> {
+        let specialist_start = std::time::Instant::now();
+        let current_specialist_raw = self
+            .storage
+            .get(crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY)
+            .await
+            .ok()
+            .flatten();
+        let config = crate::core::self_evolve::SpecialistPromptEvolutionConfig {
+            project_root,
+            ..Default::default()
+        };
+        let evolve_engine =
+            crate::core::self_evolve::SpecialistPromptEvolutionEngine::new(config, llm);
+        let result = evolve_engine
+            .evolve_specialist_prompt_bundle(request, current_specialist_raw.as_deref())
+            .await?;
+
+        let mut promotion_applied = false;
+        let mut canary_state: Option<
+            crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+        > = None;
+        let mut replay_result: Option<
+            crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+        > = None;
+        let mut promoted_directly_to_baseline = false;
+        if result.promoted && apply_promotion {
+            if let Some(bundle) = result.promoted_specialist_bundle.as_ref() {
+                let candidate_serialized = serde_json::to_vec(bundle)?;
+                if let Some(existing_baseline) = current_specialist_raw.as_ref() {
+                    let _ = self
+                        .storage
+                        .set(
+                            crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                            existing_baseline,
+                        )
+                        .await;
+                }
+                let baseline_bundle_version = current_specialist_raw
+                    .as_ref()
+                    .and_then(|raw| {
+                        crate::core::self_evolve::specialist_prompt_evolution::parse_specialist_prompt_bundle_profile(raw)
+                            .map(|bundle| bundle.version)
+                    })
+                    .unwrap_or_else(|| result.baseline_version.clone());
+                let baseline_version =
+                    crate::core::self_evolve::specialist_prompt_evolution::compose_specialist_prompt_version(
+                        &baseline_bundle_version,
+                    );
+                let candidate_version =
+                    crate::core::self_evolve::specialist_prompt_evolution::compose_specialist_prompt_version(
+                        &result.candidate_version,
+                    );
+
+                self.storage
+                    .set(
+                        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        &candidate_serialized,
+                    )
+                    .await?;
+                let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                    enabled: true,
+                    baseline_version: baseline_version.clone(),
+                    candidate_version: candidate_version.clone(),
+                    rollout_percent: canary_rollout_percent,
+                    min_samples_per_version: canary_min_samples_per_version,
+                    min_success_gain: canary_min_success_gain,
+                    max_sign_test_p_value: canary_max_sign_test_p_value,
+                    activated_at: Some(chrono::Utc::now().to_rfc3339()),
+                };
+                let state_bytes = serde_json::to_vec(&state)?;
+                self.storage
+                    .set(
+                        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+                        &state_bytes,
+                    )
+                    .await?;
+                canary_state = Some(state.clone());
+
+                if let Ok(runs) = self
+                    .storage
+                    .list_recent_experience_runs_any_scope(replay_log_limit)
+                    .await
+                {
+                    let replay_eval = crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(
+                        &runs,
+                        "specialist_prompt_version",
+                        &state.baseline_version,
+                        &state.candidate_version,
+                        state.min_samples_per_version,
+                        state.min_success_gain,
+                        state.max_sign_test_p_value,
+                    );
+                    if replay_eval.promote {
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+                                &candidate_serialized,
+                            )
+                            .await?;
+                        let mut disabled_state = state.clone();
+                        disabled_state.enabled = false;
+                        let disabled_bytes = serde_json::to_vec(&disabled_state)?;
+                        self.storage
+                            .set(
+                                crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+                                &disabled_bytes,
+                            )
+                            .await?;
+                        promoted_directly_to_baseline = true;
+                        canary_state = Some(disabled_state);
+                    }
+                    replay_result = Some(replay_eval);
+                }
+                promotion_applied = true;
+            }
+        }
+
+        if let Some(tx) = stream_tx {
+            let status_msg = if result.promoted {
+                if promotion_applied {
+                    if promoted_directly_to_baseline {
+                        format!(
+                            "Specialist prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}), replay gate passed, baseline updated immediately",
+                            result.score_gain, result.p_value
+                        )
+                    } else {
+                        format!(
+                            "Specialist prompt evolution complete: promoted candidate (gain {:.4}, p={:.4}) activated in canary mode ({}%)",
+                            result.score_gain,
+                            result.p_value,
+                            canary_state
+                                .as_ref()
+                                .map(|s| s.rollout_percent)
+                                .unwrap_or(canary_rollout_percent)
+                        )
+                    }
+                } else {
+                    format!(
+                        "Specialist prompt evolution complete: candidate passed promotion gate (gain {:.4}, p={:.4}) but not applied",
+                        result.score_gain, result.p_value
+                    )
+                }
+            } else {
+                format!(
+                    "Specialist prompt evolution complete: no promotion ({})",
+                    result.promotion_gate
+                )
+            };
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolResult {
+                    name: "self_evolve".to_string(),
+                    content: status_msg,
+                },
+            );
+        }
+
+        push_trace_step(
+            trace_ref,
+            if result.success && result.promoted {
+                "[evolve]"
+            } else if result.success {
+                "[info]"
+            } else {
+                "[error]"
+            },
+            "Specialist Prompt Evolution Evaluated",
+            if result.success {
+                format!(
+                    "Evaluated {} specialist prompt candidates. Score {:.0}% -> {:.0}% with gate `{}`.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                    result.best_candidate_score * 100.0,
+                    result.promotion_gate
+                )
+            } else {
+                format!(
+                    "Specialist prompt evolution failed: {}",
+                    result.error.as_deref().unwrap_or("unknown error")
+                )
+            },
+            if result.success && result.promoted {
+                "success"
+            } else if result.success {
+                "info"
+            } else {
+                "error"
+            },
+            Some(serde_json::json!({
+                "trace_kind": "self_evolve.specialist_prompt.result",
+                "request": request,
+                "mode": "specialist_prompt",
+                "success": result.success,
+                "promoted": result.promoted,
+                "evaluated_candidates": result.evaluated_candidates,
+                "baseline_version": result.baseline_version.clone(),
+                "candidate_version": result.candidate_version.clone(),
+                "baseline_score": result.baseline_score,
+                "best_candidate_score": result.best_candidate_score,
+                "score_gain": result.score_gain,
+                "wins": result.wins,
+                "losses": result.losses,
+                "p_value": result.p_value,
+                "candidate_source": result.candidate_source.clone(),
+                "optimized_surfaces": result.optimized_surfaces.clone(),
+                "promotion_gate": result.promotion_gate.clone(),
+                "lineage_entry_id": result.lineage_entry_id.clone(),
+                "lineage_archive_path": result.lineage_archive_path.clone(),
+                "notes": result.notes.clone(),
+                "diff_summary": result.diff_summary.clone(),
+                "promoted_specialist_bundle": result.promoted_specialist_bundle.clone(),
+                "error": result.error.clone(),
+            })),
+            Some(specialist_start.elapsed().as_millis() as u64),
+        )
+        .await;
+
+        let promotion_mode = if promoted_directly_to_baseline {
+            "baseline"
+        } else if promotion_applied {
+            "canary"
+        } else {
+            "none"
+        };
+        push_trace_step(
+            trace_ref,
+            if promotion_applied { "[ok]" } else { "[info]" },
+            "Specialist Prompt Promotion Decision",
+            if promoted_directly_to_baseline {
+                "Replay evaluation promoted the specialist prompt bundle directly to baseline."
+                    .to_string()
+            } else if promotion_applied {
+                format!(
+                    "Specialist prompt candidate activated in canary mode at {}% rollout.",
+                    canary_state
+                        .as_ref()
+                        .map(|state| state.rollout_percent)
+                        .unwrap_or(canary_rollout_percent)
+                )
+            } else if result.promoted {
+                "Specialist prompt candidate passed the promotion gate but was not applied."
+                    .to_string()
+            } else {
+                format!(
+                    "No specialist prompt promotion applied because `{}`.",
+                    result.promotion_gate
+                )
+            },
+            if promotion_applied { "success" } else { "info" },
+            Some(serde_json::json!({
+                "trace_kind": "self_evolve.specialist_prompt.promotion",
+                "request": request,
+                "promotion_applied": promotion_applied,
+                "apply_promotion_requested": apply_promotion,
+                "promotion_mode": promotion_mode,
+                "promoted_directly_to_baseline": promoted_directly_to_baseline,
+                "baseline_version": result.baseline_version.clone(),
+                "candidate_version": result.candidate_version.clone(),
+                "optimized_surfaces": result.optimized_surfaces.clone(),
+                "diff_summary": result.diff_summary.clone(),
+                "canary_state": canary_state.clone(),
+                "replay_evaluation": replay_result.clone(),
+            })),
+            None,
+        )
+        .await;
+
+        let mut value = serde_json::to_value(&result)?;
+        if let serde_json::Value::Object(obj) = &mut value {
+            obj.insert("mode".to_string(), serde_json::json!("specialist_prompt"));
+            obj.insert(
+                "promotion_applied".to_string(),
+                serde_json::json!(promotion_applied),
+            );
+            obj.insert(
+                "apply_promotion_requested".to_string(),
+                serde_json::json!(apply_promotion),
+            );
+            obj.insert(
+                "promotion_mode".to_string(),
+                serde_json::json!(promotion_mode),
+            );
+            obj.insert(
+                "canary_state".to_string(),
+                serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "replay_evaluation".to_string(),
+                serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Ok(last_bytes) = serde_json::to_vec(&value) {
+            let _ = self
+                .storage
+                .set(
+                    crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+                    &last_bytes,
+                )
+                .await;
+        }
+
+        if result.success {
+            if result.promoted {
+                let mode_label = if promoted_directly_to_baseline {
+                    "applied immediately"
+                } else if promotion_applied {
+                    "activated in canary mode for gradual rollout"
+                } else {
+                    "ready but not yet applied"
+                };
+                Ok(format!(
+                    "Specialist prompt evolution completed successfully.\n\n\
+                    I evaluated {} specialist-role prompt bundles and found an improvement.\n\
+                    - Combined benchmark score improved from {:.0}% to {:.0}% ({} wins, {} losses)\n\
+                    - The improved specialist-role prompt bundle has been {}\n\n\
+                    {} is now testing sharper specialist prompts for delegated agents.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                    result.best_candidate_score * 100.0,
+                    result.wins,
+                    result.losses,
+                    mode_label,
+                    crate::branding::PRODUCT_NAME
+                ))
+            } else {
+                Ok(format!(
+                    "Specialist prompt evolution completed. I evaluated {} specialist-role prompt bundles but none outperformed the current specialist bundle (score: {:.0}%). No changes were made.",
+                    result.evaluated_candidates,
+                    result.baseline_score * 100.0,
+                ))
+            }
+        } else {
+            Ok(format!(
+                "Specialist prompt evolution ran but encountered an issue: {}",
+                result.error.as_deref().unwrap_or("unknown error")
+            ))
+        }
+    }
+
     /// Determine the project root (where Cargo.toml lives).
     fn find_project_root(&self) -> std::path::PathBuf {
         // In Docker, the app is at /app
@@ -6477,16 +8017,17 @@ Requirements:\n\
         let strategy_version = ctx.strategy_version;
         let policy_version = ctx.policy_version;
         let prompt_version = ctx.prompt_version;
+        let classifier_prompt_version = ctx.classifier_prompt_version;
+        let specialist_prompt_version = ctx.specialist_prompt_version;
         let model_slot = ctx.model_slot;
+        let authorization = ctx.authorization;
 
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
         let handlers = default_tool_handlers();
-        let action_map = self
-            .runtime
-            .list_actions()
-            .await
-            .unwrap_or_default()
+        let mut actions = self.runtime.list_actions().await.unwrap_or_default();
+        self.append_dynamic_integration_actions(&mut actions).await;
+        let action_map = actions
             .into_iter()
             .map(|action| (action.name.to_ascii_lowercase(), action))
             .collect::<HashMap<_, _>>();
@@ -6558,14 +8099,19 @@ Requirements:\n\
                     strategy_version,
                     policy_version,
                     prompt_version,
+                    classifier_prompt_version,
+                    specialist_prompt_version,
                     model_slot,
                 })
                 .await;
                 if let Some(ref tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: msg.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: msg.clone(),
+                        },
+                    );
                 }
                 results.push(ToolCallOutput {
                     name: call.name.clone(),
@@ -6574,6 +8120,65 @@ Requirements:\n\
                 outcomes.push(crate::core::ToolOutcome {
                     name: call.name.clone(),
                     content: blocked_by_saved_rule_message(&user_execution_constraints),
+                    status: crate::core::ToolOutcomeStatus::Blocked,
+                    failure_class: Some(crate::core::FailureClass::SafetyBlocked),
+                    retryable: false,
+                    side_effect_level: side_effect_level.to_string(),
+                    error: None,
+                });
+                continue;
+            }
+
+            let authorization_decision = self
+                .runtime
+                .authorize_action_invocation(
+                    &call.name,
+                    action_def,
+                    &call.arguments,
+                    &authorization,
+                )
+                .await?;
+            if !authorization_decision.allowed {
+                let msg = authorization_decision.reason.clone();
+                let payload = serde_json::json!({
+                    "handler": "runtime_authorization",
+                    "output_preview": safe_truncate(&msg, 260),
+                });
+                self.log_operational_event(super::operational::OperationalEvent {
+                    event_type: "tool_call",
+                    channel: request_channel,
+                    success: false,
+                    outcome: "blocked_by_runtime_authorization",
+                    trace_id,
+                    conversation_id,
+                    tool_name: Some(&call.name),
+                    latency_ms: Some(call_started.elapsed().as_millis() as u64),
+                    arguments: Some(&call.arguments),
+                    payload: Some(&payload),
+                    strategy_version,
+                    policy_version,
+                    prompt_version,
+                    classifier_prompt_version,
+                    specialist_prompt_version,
+                    model_slot,
+                })
+                .await;
+                if let Some(ref tx) = stream_tx {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: msg.clone(),
+                        },
+                    );
+                }
+                results.push(ToolCallOutput {
+                    name: call.name.clone(),
+                    content: msg.clone(),
+                });
+                outcomes.push(crate::core::ToolOutcome {
+                    name: call.name.clone(),
+                    content: msg,
                     status: crate::core::ToolOutcomeStatus::Blocked,
                     failure_class: Some(crate::core::FailureClass::SafetyBlocked),
                     retryable: false,
@@ -6622,6 +8227,8 @@ Requirements:\n\
                             strategy_version,
                             policy_version,
                             prompt_version,
+                            classifier_prompt_version,
+                            specialist_prompt_version,
                             model_slot,
                         })
                         .await;
@@ -6679,6 +8286,8 @@ Requirements:\n\
                             strategy_version,
                             policy_version,
                             prompt_version,
+                            classifier_prompt_version,
+                            specialist_prompt_version,
                             model_slot,
                         })
                         .await;
@@ -6689,10 +8298,13 @@ Requirements:\n\
                             call.name, error_text
                         );
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: content.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: content.clone(),
+                                },
+                            );
                         }
                         results.push(ToolCallOutput {
                             name: call.name.clone(),
@@ -6734,16 +8346,21 @@ Requirements:\n\
                     strategy_version,
                     policy_version,
                     prompt_version,
+                    classifier_prompt_version,
+                    specialist_prompt_version,
                     model_slot,
                 })
                 .await;
                 self.record_self_tune_tool_outcome(&call.name, false, latency_ms)
                     .await;
                 if let Some(ref tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: msg.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: msg.clone(),
+                        },
+                    );
                 }
                 results.push(ToolCallOutput {
                     name: call.name.clone(),
@@ -6809,10 +8426,13 @@ Requirements:\n\
                 } else {
                     None
                 };
-                let _ = tx.try_send(StreamEvent::ToolStart {
-                    name: call.name.clone(),
-                    payload,
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolStart {
+                        name: call.name.clone(),
+                        payload,
+                    },
+                );
             }
 
             // Check safety policy
@@ -6820,10 +8440,13 @@ Requirements:\n\
             if !allowed {
                 let blocked = format!("Tool '{}' blocked by safety policy", call.name);
                 if let Some(ref tx) = stream_tx {
-                    let _ = tx.try_send(StreamEvent::ToolResult {
-                        name: call.name.clone(),
-                        content: blocked.clone(),
-                    });
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolResult {
+                            name: call.name.clone(),
+                            content: blocked.clone(),
+                        },
+                    );
                 }
                 results.push(blocked);
                 continue;
@@ -6858,22 +8481,28 @@ Requirements:\n\
                                 url, provider, time_ms
                             );
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: format!(
-                                        "Generated image via {} ({}ms)",
-                                        provider, time_ms
-                                    ),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: format!(
+                                            "Generated image via {} ({}ms)",
+                                            provider, time_ms
+                                        ),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         } else {
                             let formatted = format!("Image generated: {}", result);
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: sanitize_stream(&formatted),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: sanitize_stream(&formatted),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         }
@@ -6882,10 +8511,13 @@ Requirements:\n\
                         tracing::error!("Image generation error: {}", e);
                         let formatted = format!("Error generating image: {}", e);
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         results.push(formatted);
                     }
@@ -6939,50 +8571,6 @@ Requirements:\n\
                             }
 
                             let rendered_url = absolutize_url(&source_url);
-                            let mut preview_url: Option<String> = None;
-
-                            // Build preview screenshot for all provider videos.
-                            if video_bytes.is_none() {
-                                if let Ok(bytes) =
-                                    self.load_video_bytes(&source_url, 45 * 1024 * 1024).await
-                                {
-                                    video_bytes = Some(bytes);
-                                }
-                            }
-                            if let Some(bytes) = video_bytes.as_ref() {
-                                match self.extract_video_preview_from_bytes(bytes).await {
-                                    Ok(preview_bytes) => {
-                                        if let Ok(rel) = self
-                                            .persist_output_binary(
-                                                "provider_video_preview",
-                                                "jpg",
-                                                &preview_bytes,
-                                            )
-                                            .await
-                                        {
-                                            let abs = absolutize_url(&rel);
-                                            preview_url = Some(abs.clone());
-                                            if matches!(request_channel, "telegram" | "whatsapp") {
-                                                let _ = crate::channels::send_screenshot(
-                                                    self,
-                                                    request_channel,
-                                                    &preview_bytes,
-                                                    "Video preview",
-                                                    Some(&abs),
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to extract provider video preview: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
                             // Direct attachment where reliable: Telegram and WhatsApp(Baileys).
                             let mut delivered_to_channel = false;
                             let whatsapp_baileys = self
@@ -7025,34 +8613,15 @@ Requirements:\n\
                                 }
                             }
 
-                            let preview_text = preview_url
-                                .as_ref()
-                                .map(|u| format!("\nPreview: {}", u))
-                                .unwrap_or_default();
                             let formatted = if matches!(request_channel, "telegram" | "whatsapp") {
                                 if delivered_to_channel {
-                                    format!(
-                                        "Video sent to this chat.\nDownload: {}{}",
-                                        rendered_url, preview_text
-                                    )
+                                    format!("Video sent to this chat.\nDownload: {}", rendered_url)
                                 } else {
                                     format!(
-                                        "Video generated via {} ({}): {}\n{}",
-                                        provider,
-                                        model,
-                                        rendered_url,
-                                        if let Some(p) = preview_url.as_ref() {
-                                            format!("Preview: {}", p)
-                                        } else {
-                                            "Preview unavailable".to_string()
-                                        }
+                                        "Video generated via {} ({}): {}",
+                                        provider, model, rendered_url
                                     )
                                 }
-                            } else if let Some(preview) = preview_url.as_ref() {
-                                format!(
-                                    "[VIDEO_RESULT]{}\n[/VIDEO_RESULT]\n[IMAGE_RESULT]{}\n[/IMAGE_RESULT]\n*Generated by {} ({})*",
-                                    rendered_url, preview, provider, model
-                                )
                             } else {
                                 format!(
                                     "[VIDEO_RESULT]{}\n[/VIDEO_RESULT]\n*Generated by {} ({})*",
@@ -7060,19 +8629,25 @@ Requirements:\n\
                                 )
                             };
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: format!("Generated video via {}", provider),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: format!("Generated video via {}", provider),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         } else {
                             let formatted = format!("Video generated: {}", result);
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: sanitize_stream(&formatted),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: sanitize_stream(&formatted),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         }
@@ -7081,10 +8656,13 @@ Requirements:\n\
                         tracing::error!("Provider video generation error: {}", e);
                         let formatted = format!("Error generating video: {}", e);
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         results.push(formatted);
                     }
@@ -7118,10 +8696,13 @@ Requirements:\n\
                         );
                         let formatted = r#"{"error": "browser_unavailable", "detail": "Playwright sidecar is not running"}"#.to_string();
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         results.push(formatted);
                         continue;
@@ -7131,10 +8712,13 @@ Requirements:\n\
                         tracing::warn!("Browser session limit reached: 2 active sessions");
                         let formatted = r#"{"error": "session_limit", "detail": "Maximum 2 concurrent browser sessions"}"#.to_string();
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         results.push(formatted);
                         continue;
@@ -7158,6 +8742,7 @@ Requirements:\n\
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let notify_conversation_id_for_session = notify_conversation_id.clone();
                     let notify_fn: std::sync::Arc<dyn Fn(String, Option<Vec<u8>>) + Send + Sync> =
                         std::sync::Arc::new(move |msg: String, screenshot: Option<Vec<u8>>| {
                             let config = agent_config.clone();
@@ -7231,7 +8816,13 @@ Requirements:\n\
                     let llm_clone = self.llm.clone();
                     match self
                         .browser_sessions
-                        .start_session(task_desc, channel, "", llm_clone, notify_fn)
+                        .start_session(
+                            task_desc,
+                            channel,
+                            notify_conversation_id_for_session.as_deref().unwrap_or(""),
+                            llm_clone,
+                            notify_fn,
+                        )
                         .await
                     {
                         Ok(session_id) => {
@@ -7242,13 +8833,16 @@ Requirements:\n\
                             );
                             // Return structured data - let the LLM craft the user message
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: format!(
-                                        "Browser session started: {}",
-                                        &session_id[..8]
-                                    ),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: format!(
+                                            "Browser session started: {}",
+                                            &session_id[..8]
+                                        ),
+                                    },
+                                );
                             }
                             results.push(format!(
                                 r#"{{"status": "session_started", "session_id": "{}", "task": "{}"}}"#,
@@ -7258,10 +8852,13 @@ Requirements:\n\
                         Err(e) => {
                             tracing::error!("Browser session start failed: error={}", e);
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: format!("Browser session start failed: {}", e),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: format!("Browser session start failed: {}", e),
+                                    },
+                                );
                             }
                             results.push(format!(
                                 r#"{{"error": "session_start_failed", "detail": "{}"}}"#,
@@ -7285,10 +8882,13 @@ Requirements:\n\
                             let formatted = serde_json::to_string_pretty(&result)
                                 .unwrap_or_else(|_| result.to_string());
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: sanitize_stream(&formatted),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: sanitize_stream(&formatted),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         }
@@ -7297,10 +8897,13 @@ Requirements:\n\
                             let _ = integration; // used in future expansion
                             let formatted = format!("Browser action error: {}", e);
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: formatted.clone(),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: formatted.clone(),
+                                    },
+                                );
                             }
                             results.push(formatted);
                         }
@@ -7373,13 +8976,13 @@ Requirements:\n\
                     .is_none()
                 {
                     if let Some(obj) = resolved_args.as_object_mut() {
-                        obj.insert("expose_public".to_string(), serde_json::json!(true));
+                        obj.insert("expose_public".to_string(), serde_json::json!(false));
                     }
                 }
                 let expose_public_requested = resolved_args
                     .get("expose_public")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 let allow_duplicate_requested = resolved_args
                     .get("allow_duplicate")
                     .and_then(|v| v.as_bool())
@@ -7456,10 +9059,13 @@ Requirements:\n\
                                 );
                                 let duplicate_msg = duplicate_msg_lines.join("\n");
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: duplicate_msg.clone(),
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: duplicate_msg.clone(),
+                                        },
+                                    );
                                 }
                                 results.push(duplicate_msg);
                                 continue;
@@ -7499,10 +9105,13 @@ Requirements:\n\
                                 duplicate_msg_lines.push(cleanup_note);
                                 let duplicate_msg = duplicate_msg_lines.join("\n");
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: duplicate_msg,
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: duplicate_msg,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -7542,7 +9151,7 @@ Requirements:\n\
                         )
                         .await;
                         // Parse result to extract URL for a nice response
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&result) {
                             if parsed
                                 .get("deployment_kind")
                                 .and_then(|v| v.as_str())
@@ -7595,27 +9204,90 @@ Requirements:\n\
                                     lines.push("- No runnable services were returned.".to_string());
                                 } else {
                                     lines.push("- Services:".to_string());
-                                    for service in services {
+                                    for mut service in services {
                                         let title = service
                                             .get("title")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("Service");
+                                        let title = title.to_string();
                                         let kind = service
                                             .get("kind")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("service");
-                                        let service_status = service
+                                        let kind = kind.to_string();
+                                        let mut service_status = service
                                             .get("status")
                                             .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown");
+                                            .unwrap_or("unknown")
+                                            .to_string();
                                         let relative_dir = service
                                             .get("relative_dir")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
+                                        let relative_dir = relative_dir.to_string();
                                         let detection_reason = service
                                             .get("detection_reason")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
+                                        let detection_reason = detection_reason.to_string();
+                                        if service
+                                            .get("result")
+                                            .and_then(|result| result.get("runtime_delegated"))
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            let delegated_app_id = service
+                                                .get("result")
+                                                .and_then(|result| result.get("app_id"))
+                                                .and_then(|v| v.as_str())
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty());
+                                            match delegated_app_id {
+                                                Some(app_id) => match self
+                                                    .restart_deployed_app_from_metadata(
+                                                        app_id,
+                                                        Some(&title),
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(restarted) => {
+                                                        service_status = restarted
+                                                            .get("status")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("deployed")
+                                                            .to_string();
+                                                        service["status"] =
+                                                            serde_json::Value::String(
+                                                                service_status.clone(),
+                                                            );
+                                                        service["result"] = restarted;
+                                                    }
+                                                    Err(error) => {
+                                                        service_status = "failed".to_string();
+                                                        service["status"] =
+                                                            serde_json::Value::String(
+                                                                service_status.clone(),
+                                                            );
+                                                        service["error"] =
+                                                            serde_json::Value::String(
+                                                                error.to_string(),
+                                                            );
+                                                    }
+                                                },
+                                                None => {
+                                                    service_status = "failed".to_string();
+                                                    service["status"] = serde_json::Value::String(
+                                                        service_status.clone(),
+                                                    );
+                                                    service["error"] = serde_json::Value::String(
+                                                        format!(
+                                                            "Delegated repo service '{}' did not include an app_id.",
+                                                            title
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let result_obj = service.get("result");
                                         let local_url = result_obj
                                             .and_then(|result| result.get("url"))
@@ -7684,13 +9356,73 @@ Requirements:\n\
                                 }
                                 let msg = lines.join("\n");
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: msg.clone(),
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: msg.clone(),
+                                        },
+                                    );
                                 }
                                 results.push(msg);
                                 continue;
+                            }
+                            if parsed
+                                .get("runtime_delegated")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                let app_id = parsed
+                                    .get("app_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .unwrap_or("");
+                                let title = parsed
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("App");
+                                if app_id.is_empty() {
+                                    let msg = format!(
+                                        "App '{}' files were written, but runtime delegation failed because the deployment response did not include an app_id.",
+                                        title
+                                    );
+                                    if let Some(ref tx) = stream_tx {
+                                        queue_stream_event(
+                                            tx,
+                                            StreamEvent::ToolResult {
+                                                name: call.name.clone(),
+                                                content: msg.clone(),
+                                            },
+                                        );
+                                    }
+                                    results.push(msg);
+                                    continue;
+                                }
+                                match self
+                                    .restart_deployed_app_from_metadata(app_id, Some(title))
+                                    .await
+                                {
+                                    Ok(restarted) => {
+                                        parsed = restarted;
+                                    }
+                                    Err(error) => {
+                                        let msg = format!(
+                                            "App '{}' files were deployed and registered, but executor startup failed: {}",
+                                            title, error
+                                        );
+                                        if let Some(ref tx) = stream_tx {
+                                            queue_stream_event(
+                                                tx,
+                                                StreamEvent::ToolResult {
+                                                    name: call.name.clone(),
+                                                    content: msg.clone(),
+                                                },
+                                            );
+                                        }
+                                        results.push(msg);
+                                        continue;
+                                    }
+                                }
                             }
                             if parsed
                                 .get("status")
@@ -7801,10 +9533,13 @@ Requirements:\n\
                                     .await;
                                 }
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: msg.clone(),
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: msg.clone(),
+                                        },
+                                    );
                                 }
                                 results.push(msg);
                                 continue;
@@ -7850,21 +9585,14 @@ Requirements:\n\
                                             "/apps/".to_string()
                                         }
                                     });
-                                let mut url_with_key = parsed
+                                let url_with_key = parsed
                                     .get("access_url")
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| canonical_relative_url.clone());
-                                if access_guard_enabled
-                                    && !access_key.is_empty()
-                                    && !url_with_key.contains("key=")
-                                {
-                                    let separator =
-                                        if url_with_key.contains('?') { '&' } else { '?' };
-                                    url_with_key.push(separator);
-                                    url_with_key.push_str("key=");
-                                    url_with_key.push_str(&access_key);
-                                }
+                                let skip_blocking_validation = app_type
+                                    .eq_ignore_ascii_case("static")
+                                    && !expose_public_requested;
                                 let mut public_base_for_app = if expose_public_requested {
                                     self.ensure_public_tunnel_base_url(
                                         Some(app_id.as_str()),
@@ -7876,16 +9604,33 @@ Requirements:\n\
                                     None
                                 };
 
-                                let (preview_url, verified, verify_attempts, verify_detail) = self
-                                    .validate_and_capture_app_preview(
-                                        &url_with_key,
-                                        &app_id,
-                                        stream_tx.as_ref(),
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        (None, false, 0, format!("Validation helper error: {}", e))
-                                    });
+                                let (preview_url, verified, verify_attempts, verify_detail) =
+                                    if skip_blocking_validation {
+                                        (
+                                            None,
+                                            true,
+                                            0,
+                                            "Local static deploy is ready; blocking validation skipped."
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        self.validate_and_capture_app_preview(
+                                            &url_with_key,
+                                            &app_id,
+                                            stream_tx.as_ref(),
+                                        )
+                                        .await
+                                        .unwrap_or_else(
+                                            |e| {
+                                                (
+                                                    None,
+                                                    false,
+                                                    0,
+                                                    format!("Validation helper error: {}", e),
+                                                )
+                                            },
+                                        )
+                                    };
 
                                 // App self-heal retries intentionally disabled by user request.
                                 let had_public_base = public_base_for_app.is_some();
@@ -7948,7 +9693,8 @@ Requirements:\n\
                                         }
                                     } else {
                                         public_verify_detail = Some(
-                                            "tunnel setup is still pending for this app.".to_string(),
+                                            "tunnel setup is still pending for this app."
+                                                .to_string(),
                                         );
                                     }
                                 } else if expose_public_requested && !verified {
@@ -7979,27 +9725,40 @@ Requirements:\n\
                                     .await;
                                 }
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: if verified {
-                                            format!(
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: if skip_blocking_validation {
+                                                format!(
+                                                    "App deployed: {} ({}, local static deploy)",
+                                                    title, app_type
+                                                )
+                                            } else if verified {
+                                                format!(
                                                 "App deployed + validated: {} ({}) [{} attempt{}]",
                                                 title,
                                                 app_type,
                                                 verify_attempts,
                                                 if verify_attempts == 1 { "" } else { "s" }
                                             )
-                                        } else {
-                                            format!(
+                                            } else {
+                                                format!(
                                                 "App deployed, validation incomplete: {} ({}) - {}",
                                                 title, app_type, verify_detail
                                             )
+                                            },
                                         },
-                                    });
+                                    );
                                 }
 
                                 let mut app_message_lines: Vec<String> = Vec::new();
-                                if verified {
+                                if skip_blocking_validation {
+                                    app_message_lines.push(format!(
+                                        "I have deployed **{}** ({} app), and it is ready locally.",
+                                        title, app_type
+                                    ));
+                                } else if verified {
                                     app_message_lines.push(format!(
                                         "I have deployed **{}** ({} app), and I validated that it is running.",
                                         title, app_type
@@ -8028,20 +9787,16 @@ Requirements:\n\
                                         public_open_url
                                     ));
                                     if let Some(detail) = public_verify_detail.as_ref() {
-                                        app_message_lines.push(format!(
-                                            "- Public link status: {}",
-                                            detail
-                                        ));
+                                        app_message_lines
+                                            .push(format!("- Public link status: {}", detail));
                                     }
                                 } else if expose_public_requested {
-                                    app_message_lines.push(
-                                        format!(
-                                            "- Public link status: {}",
-                                            public_verify_detail.unwrap_or_else(|| {
-                                                "pending tunnel readiness for this app.".to_string()
-                                            })
-                                        ),
-                                    );
+                                    app_message_lines.push(format!(
+                                        "- Public link status: {}",
+                                        public_verify_detail.unwrap_or_else(|| {
+                                            "pending tunnel readiness for this app.".to_string()
+                                        })
+                                    ));
                                 }
 
                                 if access_guard_enabled {
@@ -8059,20 +9814,32 @@ Requirements:\n\
                                         .push("- Access guard: not enabled.".to_string());
                                 }
 
-                                app_message_lines.push(format!(
-                                    "- Webpage status: {}",
-                                    if verified {
-                                        "reachable and validated."
-                                    } else {
-                                        "deployed, but validation has not passed yet."
-                                    }
-                                ));
-                                app_message_lines.push(format!(
-                                    "- Deployment validation: {} (attempts: {}).",
-                                    if verified { "passed" } else { "failed" },
-                                    verify_attempts
-                                ));
-                                if !verified && !verify_detail.trim().is_empty() {
+                                if skip_blocking_validation {
+                                    app_message_lines
+                                        .push("- Webpage status: deployed locally.".to_string());
+                                    app_message_lines.push(
+                                        "- Deployment validation: skipped (local static app)."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    app_message_lines.push(format!(
+                                        "- Webpage status: {}",
+                                        if verified {
+                                            "reachable and validated."
+                                        } else {
+                                            "deployed, but validation has not passed yet."
+                                        }
+                                    ));
+                                    app_message_lines.push(format!(
+                                        "- Deployment validation: {} (attempts: {}).",
+                                        if verified { "passed" } else { "failed" },
+                                        verify_attempts
+                                    ));
+                                }
+                                if !verified
+                                    && !skip_blocking_validation
+                                    && !verify_detail.trim().is_empty()
+                                {
                                     app_message_lines.push(format!(
                                         "- Validation issue: {}",
                                         verify_detail.trim()
@@ -8088,10 +9855,13 @@ Requirements:\n\
                             }
                         }
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: sanitize_stream(&result),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: sanitize_stream(&result),
+                                },
+                            );
                         }
                         results.push(result);
                     }
@@ -8140,10 +9910,13 @@ Requirements:\n\
                             format!("Error deploying app: {}", error_text)
                         };
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: formatted.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: formatted.clone(),
+                                },
+                            );
                         }
                         results.push(formatted);
                     }
@@ -8168,16 +9941,21 @@ Requirements:\n\
                         result = self.sanitize_mcp_output(&result);
                     }
                     // Special handling for schedule_task - actually create the task
-                    if call.name == "schedule_task" && result.starts_with("Task scheduled:") {
+                    if call.name == "schedule_task"
+                        && crate::runtime::parse_schedule_task_completion(&result).is_some()
+                    {
                         if let Some(schedule_result) = self
                             .handle_schedule_task(&call.arguments, request_channel, None, None)
                             .await
                         {
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: sanitize_stream(&schedule_result),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: sanitize_stream(&schedule_result),
+                                    },
+                                );
                             }
                             results.push(schedule_result);
                             continue;
@@ -8185,16 +9963,21 @@ Requirements:\n\
                     }
 
                     // Special handling for watch - spawn background watcher
-                    if call.name == "watch" && result.starts_with("Watch created:") {
+                    if call.name == "watch"
+                        && crate::runtime::parse_watch_completion(&result).is_some()
+                    {
                         if let Some(watch_result) = self
                             .handle_watch(&call.arguments, request_channel, None, None)
                             .await
                         {
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: sanitize_stream(&watch_result),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: sanitize_stream(&watch_result),
+                                    },
+                                );
                             }
                             results.push(watch_result);
                             continue;
@@ -8592,116 +10375,6 @@ Requirements:\n\
                         continue;
                     }
 
-                    // Format video_generate results with inline player + download
-                    if call.name == "video_generate" {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
-                            if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                                let duration = parsed
-                                    .get("duration_seconds")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let resolution = parsed
-                                    .get("resolution")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let size = parsed
-                                    .get("file_size_bytes")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let output_id = parsed
-                                    .get("output_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let filename = parsed
-                                    .get("filename")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let size_mb = size as f64 / 1_048_576.0;
-                                let rendered_url = absolutize_url(url);
-                                let mut delivered_to_channel = false;
-                                let caption = format!(
-                                    "{}s video, {}, {:.1}MB",
-                                    duration, resolution, size_mb
-                                );
-
-                                if matches!(request_channel, "telegram" | "whatsapp")
-                                    && !output_id.is_empty()
-                                    && !filename.is_empty()
-                                {
-                                    let output_path = self
-                                        .data_dir
-                                        .join("outputs")
-                                        .join(output_id)
-                                        .join(filename);
-                                    match tokio::fs::read(&output_path).await {
-                                        Ok(video_bytes) => {
-                                            match crate::channels::send_video_to_channel(
-                                                self,
-                                                request_channel,
-                                                &video_bytes,
-                                                &caption,
-                                                Some(&rendered_url),
-                                            )
-                                            .await
-                                            {
-                                                Ok(_) => {
-                                                    delivered_to_channel = true;
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Failed to send generated video to {}: {}",
-                                                        request_channel,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed reading rendered video file {}: {}",
-                                                output_path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                let formatted = if delivered_to_channel {
-                                    format!("Video sent to this chat.\nDownload: {}", rendered_url)
-                                } else if matches!(request_channel, "telegram" | "whatsapp") {
-                                    format!(
-                                        "Video generated ({}s, {:.1}MB): {}",
-                                        duration, size_mb, rendered_url
-                                    )
-                                } else {
-                                    format!(
-                                        "[VIDEO_RESULT]{}\n[/VIDEO_RESULT]\n*{}s video, {}, {:.1}MB*",
-                                        rendered_url, duration, resolution, size_mb
-                                    )
-                                };
-                                if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: format!(
-                                            "Video generated ({}s, {:.1}MB)",
-                                            duration, size_mb
-                                        ),
-                                    });
-                                }
-                                results.push(formatted);
-                                continue;
-                            }
-                        }
-                        if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: sanitize_stream(&result),
-                            });
-                        }
-                        results.push(result);
-                        continue;
-                    }
-
                     // Format gmail_scan results with LLM classification + summary
                     if call.name == "gmail_scan" {
                         let scan_args = serde_json::from_value::<
@@ -8722,14 +10395,17 @@ Requirements:\n\
                             )
                         {
                             if let Some(ref tx) = stream_tx {
-                                let _ = tx.try_send(StreamEvent::ToolResult {
-                                    name: call.name.clone(),
-                                    content: format!(
-                                        "Gmail scan returned {} exact result{}",
-                                        parsed_messages.len(),
-                                        if parsed_messages.len() == 1 { "" } else { "s" }
-                                    ),
-                                });
+                                queue_stream_event(
+                                    tx,
+                                    StreamEvent::ToolResult {
+                                        name: call.name.clone(),
+                                        content: format!(
+                                            "Gmail scan returned {} exact result{}",
+                                            parsed_messages.len(),
+                                            if parsed_messages.len() == 1 { "" } else { "s" }
+                                        ),
+                                    },
+                                );
                             }
                             results.push(format_gmail_scan_exact_results(
                                 scan_mode,
@@ -8773,7 +10449,7 @@ Requirements:\n\
                             Ok(formatted) => {
                                 self.record_llm_usage(request_channel, "gmail_format", &formatted).await;
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
+                                    queue_stream_event(tx, StreamEvent::ToolResult {
                                         name: call.name.clone(),
                                         content: "Gmail scan summarized".to_string(),
                                     });
@@ -8783,7 +10459,7 @@ Requirements:\n\
                             Err(e) => {
                                 tracing::warn!("Gmail format LLM pass failed, using raw: {}", e);
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
+                                    queue_stream_event(tx, StreamEvent::ToolResult {
                                         name: call.name.clone(),
                                         content: "Gmail scan returned raw results".to_string(),
                                     });
@@ -8810,10 +10486,13 @@ Requirements:\n\
                         }
                         let prompt = Self::format_missing_inputs_prompt(&payload);
                         if let Some(ref tx) = stream_tx {
-                            let _ = tx.try_send(StreamEvent::ToolResult {
-                                name: call.name.clone(),
-                                content: prompt.clone(),
-                            });
+                            queue_stream_event(
+                                tx,
+                                StreamEvent::ToolResult {
+                                    name: call.name.clone(),
+                                    content: prompt.clone(),
+                                },
+                            );
                         }
                         results.push(prompt);
                         continue;
@@ -8827,10 +10506,16 @@ Requirements:\n\
                         {
                             Ok(llm_result) => {
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: format!("Workflow '{}' completed", action_name),
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: format!(
+                                                "Workflow '{}' completed",
+                                                action_name
+                                            ),
+                                        },
+                                    );
                                 }
                                 results.push(llm_result);
                             }
@@ -8839,10 +10524,13 @@ Requirements:\n\
                                 let formatted =
                                     format!("Error executing workflow '{}': {}", action_name, e);
                                 if let Some(ref tx) = stream_tx {
-                                    let _ = tx.try_send(StreamEvent::ToolResult {
-                                        name: call.name.clone(),
-                                        content: formatted.clone(),
-                                    });
+                                    queue_stream_event(
+                                        tx,
+                                        StreamEvent::ToolResult {
+                                            name: call.name.clone(),
+                                            content: formatted.clone(),
+                                        },
+                                    );
                                 }
                                 results.push(formatted);
                             }
@@ -8851,10 +10539,13 @@ Requirements:\n\
                     }
 
                     if let Some(ref tx) = stream_tx {
-                        let _ = tx.try_send(StreamEvent::ToolResult {
-                            name: call.name.clone(),
-                            content: sanitize_stream(&result),
-                        });
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: sanitize_stream(&result),
+                            },
+                        );
                     }
                     results.push(result);
                 }
@@ -8893,11 +10584,14 @@ Requirements:\n\
                                         e, search_out
                                     );
                                     if let Some(ref tx) = stream_tx {
-                                        let _ = tx.try_send(StreamEvent::ToolResult {
-                                            name: call.name.clone(),
-                                            content: "Browse failed; used search fallback"
-                                                .to_string(),
-                                        });
+                                        queue_stream_event(
+                                            tx,
+                                            StreamEvent::ToolResult {
+                                                name: call.name.clone(),
+                                                content: "Browse failed; used search fallback"
+                                                    .to_string(),
+                                            },
+                                        );
                                     }
                                     results.push(healed);
                                     continue;
@@ -8914,10 +10608,13 @@ Requirements:\n\
                     }
                     let formatted = format!("Error executing '{}': {}", call.name, e);
                     if let Some(ref tx) = stream_tx {
-                        let _ = tx.try_send(StreamEvent::ToolResult {
-                            name: call.name.clone(),
-                            content: formatted.clone(),
-                        });
+                        queue_stream_event(
+                            tx,
+                            StreamEvent::ToolResult {
+                                name: call.name.clone(),
+                                content: formatted.clone(),
+                            },
+                        );
                     }
                     results.push(formatted);
                 }
@@ -9138,6 +10835,57 @@ mod tests {
         )
         .expect("recovered deploy progress should produce a visible chat message");
         assert!(recovered_message.contains("Self-heal worked"));
+    }
+
+    #[test]
+    fn normalize_app_deploy_arguments_rejects_generic_prose_recovery() {
+        let input = json!({
+            "description": "Build a dashboard that shows live crypto prices",
+            "title": "Demo"
+        });
+
+        let normalized = Agent::normalize_app_deploy_arguments(&input);
+        assert!(normalized.get("files").is_none());
+        assert_eq!(
+            normalized.get("description").and_then(|v| v.as_str()),
+            Some("Build a dashboard that shows live crypto prices")
+        );
+    }
+
+    #[test]
+    fn app_deploy_chat_progress_message_uses_phase_payload() {
+        let mut state = AppDeployProgressRelayState::default();
+        let message = app_deploy_chat_progress_message(
+            &crate::core::StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: "progress update".to_string(),
+                payload: Some(json!({
+                    "kind": "phase_status",
+                    "phase": "validate",
+                    "label": "validating deployed app",
+                    "detail": "checking health endpoint"
+                })),
+            },
+            &mut state,
+        )
+        .expect("phase payload should produce a chat message");
+
+        assert!(message.contains("validating"));
+        assert!(message.contains("health endpoint"));
+    }
+
+    #[test]
+    fn app_runtime_error_marker_ignores_generic_retry_copy() {
+        assert!(
+            Agent::detect_app_runtime_error_marker("please try again to refresh data").is_none()
+        );
+        assert!(
+            Agent::detect_app_runtime_error_marker("this guide explains cors headers").is_none()
+        );
+        assert_eq!(
+            Agent::detect_app_runtime_error_marker("application error: failed to load"),
+            Some("failed to load")
+        );
     }
 
     #[test]

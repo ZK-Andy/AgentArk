@@ -1,14 +1,39 @@
 import { Button, Card, CardContent, Chip, Stack, Typography } from "@mui/material";
-import type { TraceSummary } from "../types";
+import type { TraceOperationalEvent, TraceSummary } from "../types";
 
 type Props = {
   history: TraceSummary[];
+  events?: TraceOperationalEvent[];
   compact?: boolean;
   onHideAdvanced?: () => void;
 };
 
-export function LiveEventConsole({ history, compact = false, onHideAdvanced }: Props) {
+function eventLabel(event: TraceOperationalEvent): string {
+  const parts = [
+    event.event_type.replace(/_/g, " "),
+    event.tool_name || "",
+    event.outcome || "",
+  ].filter(Boolean);
+  return parts.join(" • ");
+}
+
+function eventColor(event: TraceOperationalEvent): "success" | "error" | "warning" | "default" {
+  if (!event.success) return "error";
+  const normalized = `${event.event_type} ${event.outcome}`.toLowerCase();
+  if (normalized.includes("blocked") || normalized.includes("warning")) return "warning";
+  if (normalized.includes("complete") || normalized.includes("ok")) return "success";
+  return "default";
+}
+
+function shortTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "--";
+  return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+export function LiveEventConsole({ history, events = [], compact = false, onHideAdvanced }: Props) {
   const lines = history.slice(0, compact ? 4 : 7);
+  const eventLines = events.slice(0, compact ? 5 : 8);
   return (
     <Card sx={compact ? { minHeight: 0, height: "100%" } : { minHeight: 270 }}>
       <CardContent sx={compact ? { p: 1.25, height: "100%", overflow: "auto" } : undefined}>
@@ -36,7 +61,22 @@ export function LiveEventConsole({ history, compact = false, onHideAdvanced }: P
         </Stack>
 
         <Stack spacing={1} className="console-scroll" sx={compact ? { maxHeight: "none" } : undefined}>
-          {lines.length === 0 ? (
+          {eventLines.length > 0 ? (
+            eventLines.map((item) => (
+              <Stack key={item.id} direction="row" spacing={1.5} className="console-line" alignItems="center">
+                <Typography className="console-index">{shortTimestamp(item.created_at)}</Typography>
+                <Typography className="console-message" sx={{ flex: 1 }}>
+                  {eventLabel(item)}
+                </Typography>
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  color={eventColor(item)}
+                  label={item.success ? "ok" : "attention"}
+                />
+              </Stack>
+            ))
+          ) : lines.length === 0 ? (
             <Typography variant="body2" color="text.secondary">
               No recent traces yet.
             </Typography>

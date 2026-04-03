@@ -69,7 +69,6 @@ jobs:
               AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
               INSTALL_PLAYWRIGHT_RUNTIME=false
               INSTALL_MEM0=false
-              INSTALL_FFMPEG=false
               INSTALL_TAILSCALE=false
               INSTALL_CLOUDFLARED=false
               INSTALL_LIGHTPANDA=true
@@ -80,7 +79,6 @@ jobs:
               AGENTARK_DOCKER_FEATURES=telegram,docker,ssh
               INSTALL_PLAYWRIGHT_RUNTIME=true
               INSTALL_MEM0=true
-              INSTALL_FFMPEG=true
               INSTALL_TAILSCALE=true
               INSTALL_CLOUDFLARED=true
               INSTALL_LIGHTPANDA=true

@@ -17,6 +17,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -324,13 +325,15 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
           alignItems={{ xs: "flex-start", sm: "center" }}
           spacing={1}
         >
-          <Box>
-            <Typography variant={embedded ? "subtitle2" : "h6"}>Plugin SDK</Typography>
-            <Typography variant={embedded ? "caption" : "body2"} color="text.secondary">
-              Install third-party plugins and subscribe them to platform events like webhooks,
-              approvals, and task outcomes.
-            </Typography>
-          </Box>
+          {!embedded ? (
+            <Box>
+              <Typography variant="h6">Plugin SDK</Typography>
+              <Typography variant="body2" color="text.secondary">
+                Install third-party plugins and subscribe them to platform events like webhooks,
+                approvals, and task outcomes.
+              </Typography>
+            </Box>
+          ) : <Box sx={{ flex: 1 }} />}
           <Button variant="contained" onClick={openCreateDialog} disabled={busy} sx={{
               textTransform: "none",
               fontWeight: 600,
@@ -627,7 +630,8 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
       <Box className="list-shell">
         <Stack spacing={1.5}>
           <Typography variant="h6">Plugin Activity</Typography>
-          <Table size="small">
+          <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+          <Table size="small" sx={{ minWidth: 760 }}>
             <TableHead>
               <TableRow>
                 <TableCell>Time</TableCell>
@@ -665,6 +669,7 @@ export function PluginSdkPanel({ autoRefresh, embedded = false }: PluginSdkPanel
               )}
             </TableBody>
           </Table>
+          </TableContainer>
         </Stack>
       </Box>
     </Stack>

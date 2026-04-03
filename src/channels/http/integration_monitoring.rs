@@ -106,7 +106,10 @@ async fn build_recommendation_specs(state: &AppState) -> Vec<RecommendationSpec>
                     automation_kind: "watcher".to_string(),
                     title: "Watch for unread GitHub notifications".to_string(),
                     summary: "Poll GitHub notifications every 5 minutes and alert when a new unread item lands in your account.".to_string(),
-                    rationale: "This gives AgentArk a concrete ongoing monitoring job for GitHub without needing repo-specific setup first.".to_string(),
+                    rationale: format!(
+                        "This gives {} a concrete ongoing monitoring job for GitHub without needing repo-specific setup first.",
+                        crate::branding::PRODUCT_NAME
+                    ),
                     cadence_label: "Every 5 minutes".to_string(),
                 },
                 blueprint: RecommendationBlueprint::Watcher(serde_json::json!({
@@ -116,7 +119,7 @@ async fn build_recommendation_specs(state: &AppState) -> Vec<RecommendationSpec>
                         "url": "https://api.github.com/notifications?all=false&participating=false&per_page=20",
                         "headers": {
                             "Authorization": "Bearer {{secret:github_token}}",
-                            "User-Agent": "AgentArk/0.1.0",
+                            "User-Agent": crate::branding::versioned_user_agent(),
                             "Accept": "application/vnd.github+json"
                         }
                     },

@@ -6,13 +6,12 @@
 //! 3. When triggered: execute a chain of follow-up actions via the agent
 //! 4. Self-terminate after trigger or timeout
 //!
-//! Watchers are persisted to disk so they survive container restarts.
+//! Watchers are persisted in the database so they survive container restarts.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -160,10 +159,10 @@ pub struct Watcher {
 }
 
 /// Manages all active watchers with persistent storage
+#[derive(Clone)]
 pub struct WatcherManager {
     watchers: Arc<RwLock<HashMap<Uuid, Watcher>>>,
     storage: Option<crate::storage::Storage>,
-    storage_path: Option<PathBuf>,
 }
 
 fn strip_automation_meta(value: &serde_json::Value) -> serde_json::Value {
@@ -331,139 +330,44 @@ pub fn watcher_tool_call_signature_from_arguments(arguments: &serde_json::Value)
 
 impl WatcherManager {
     pub async fn new(
-        data_dir: Option<&std::path::Path>,
+        _data_dir: Option<&std::path::Path>,
         storage: Option<crate::storage::Storage>,
     ) -> Self {
-        let storage_path = data_dir.map(|d| d.join("watchers.json"));
-
-        // Load persisted watchers, preferring DB-backed state.
-        let mut restored_from_legacy_file = false;
         let watchers = if let Some(storage_ref) = storage.as_ref() {
             match storage_ref.list_watchers().await {
-                Ok(loaded) => {
-                    let restored = loaded
-                        .into_iter()
-                        .filter(|watcher| {
-                            matches!(
-                                watcher.status,
-                                WatcherStatus::Active | WatcherStatus::Paused
-                            )
-                        })
-                        .map(|watcher| (watcher.id, watcher))
-                        .collect::<HashMap<_, _>>();
-                    if !restored.is_empty() {
-                        restored
-                    } else if let Some(ref path) = storage_path {
-                        match std::fs::read_to_string(path) {
-                            Ok(contents) => {
-                                match serde_json::from_str::<HashMap<Uuid, Watcher>>(&contents) {
-                                    Ok(mut legacy) => {
-                                        let now = Utc::now();
-                                        legacy.retain(|_, watcher| {
-                                            if !matches!(
-                                                watcher.status,
-                                                WatcherStatus::Active | WatcherStatus::Paused
-                                            ) {
-                                                return false;
-                                            }
-                                            if watcher.status == WatcherStatus::Paused {
-                                                return true;
-                                            }
-                                            let elapsed =
-                                                (now - watcher.created_at).num_seconds() as u64;
-                                            elapsed < watcher.timeout_secs
-                                        });
-                                        restored_from_legacy_file = !legacy.is_empty();
-                                        legacy
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to parse watchers.json: {}", e);
-                                        HashMap::new()
-                                    }
-                                }
-                            }
-                            Err(_) => HashMap::new(),
-                        }
-                    } else {
-                        HashMap::new()
-                    }
-                }
+                Ok(loaded) => loaded
+                    .into_iter()
+                    .filter(|watcher| {
+                        matches!(
+                            watcher.status,
+                            WatcherStatus::Active | WatcherStatus::Paused
+                        )
+                    })
+                    .map(|watcher| (watcher.id, watcher))
+                    .collect::<HashMap<_, _>>(),
                 Err(e) => {
                     tracing::warn!("Failed to load watchers from DB: {}", e);
                     HashMap::new()
                 }
             }
-        } else if let Some(ref path) = storage_path {
-            match std::fs::read_to_string(path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<HashMap<Uuid, Watcher>>(&contents) {
-                        Ok(mut loaded) => {
-                            // Only restore watchers that can continue later.
-                            let now = Utc::now();
-                            loaded.retain(|_, w| {
-                                if !matches!(
-                                    w.status,
-                                    WatcherStatus::Active | WatcherStatus::Paused
-                                ) {
-                                    return false;
-                                }
-                                if w.status == WatcherStatus::Paused {
-                                    return true;
-                                }
-                                let elapsed = (now - w.created_at).num_seconds() as u64;
-                                elapsed < w.timeout_secs
-                            });
-                            let count = loaded.len();
-                            if count > 0 {
-                                tracing::info!("Restored {} active watcher(s) from disk", count);
-                            }
-                            restored_from_legacy_file = true;
-                            loaded
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse watchers.json: {}", e);
-                            HashMap::new()
-                        }
-                    }
-                }
-                Err(_) => HashMap::new(), // File doesn't exist yet
-            }
         } else {
             HashMap::new()
         };
 
-        let manager = Self {
+        Self {
             watchers: Arc::new(RwLock::new(watchers)),
             storage,
-            storage_path,
-        };
-
-        if restored_from_legacy_file {
-            manager.persist().await;
         }
-
-        manager
     }
 
-    /// Persist current watchers to disk
-    fn save_sync(path: &std::path::Path, watchers: &HashMap<Uuid, Watcher>) {
+    #[cfg(test)]
+    /// Legacy no-op file persistence helper retained only until fresh-install cleanup finishes.
+    fn save_sync(_path: &std::path::Path, _watchers: &HashMap<Uuid, Watcher>) {
         // Only persist Active watchers — completed ones get cleaned up
-        let active: HashMap<&Uuid, &Watcher> = watchers
-            .iter()
-            .filter(|(_, w)| matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused))
-            .collect();
-
-        if let Ok(json) = serde_json::to_string_pretty(&active) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(path, json) {
-                tracing::warn!("Failed to save watchers: {}", e);
-            }
-        }
+        // Fresh-install-only builds do not persist watcher state to files.
     }
 
-    /// Save watchers to disk (only Active ones)
+    /// Persist active watchers to the database.
     async fn persist(&self) {
         let watchers = self.watchers.read().await;
         if let Some(storage) = self.storage.as_ref() {
@@ -480,8 +384,6 @@ impl WatcherManager {
             if let Err(e) = storage.replace_active_watchers(&active).await {
                 tracing::warn!("Failed to persist watchers to DB: {}", e);
             }
-        } else if let Some(ref path) = self.storage_path {
-            Self::save_sync(path, &watchers);
         }
     }
 
@@ -642,7 +544,8 @@ impl WatcherManager {
             w.poll_count = poll_count;
             w.consecutive_failures = w.consecutive_failures.saturating_add(1);
             let mut error_text = truncate_for_storage(&error, MAX_STORED_RESULT_CHARS);
-            if w.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_PAUSE {
+            let transient_error = watcher_poll_error_is_transient(&error_text);
+            if w.consecutive_failures >= MAX_CONSECUTIVE_FAILURES_BEFORE_PAUSE && !transient_error {
                 w.status = WatcherStatus::Paused;
                 w.next_poll_not_before = None;
                 error_text = truncate_for_storage(
@@ -656,6 +559,15 @@ impl WatcherManager {
                 let backoff_secs =
                     watcher_failure_backoff_secs(w.interval_secs, w.consecutive_failures);
                 w.next_poll_not_before = Some(now + chrono::Duration::seconds(backoff_secs as i64));
+                if transient_error {
+                    error_text = truncate_for_storage(
+                        &format!(
+                            "{} Transient availability error detected; watcher will retry with backoff.",
+                            error_text
+                        ),
+                        MAX_STORED_RESULT_CHARS,
+                    );
+                }
             }
             w.last_error = Some(error_text);
             w.last_poll_outcome = Some(WatcherPollOutcome::Error);
@@ -929,6 +841,28 @@ fn watcher_failure_backoff_secs(interval_secs: u64, consecutive_failures: u32) -
         .min(60 * 60)
 }
 
+fn watcher_poll_error_is_transient(error: &str) -> bool {
+    let haystack = error.trim().to_ascii_lowercase();
+    !haystack.is_empty()
+        && [
+            "timeout",
+            "temporar",
+            "rate limit",
+            "429",
+            "unavailable",
+            "busy",
+            "pending",
+            "connection reset",
+            "connection refused",
+            "network",
+            "retry later",
+            "gateway",
+            "refused",
+        ]
+        .iter()
+        .any(|token| haystack.contains(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,5 +927,13 @@ mod tests {
         assert!(WatcherManager::watchers_are_semantically_similar(
             &existing, &candidate
         ));
+    }
+
+    #[test]
+    fn legacy_save_sync_noop_is_still_callable_in_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watchers.json");
+        WatcherManager::save_sync(&path, &HashMap::new());
+        assert!(!path.exists());
     }
 }

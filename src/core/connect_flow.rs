@@ -6,6 +6,7 @@
 //! - When secrets are saved, run a connectivity check and enable on success.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretRequirementKind {
@@ -28,13 +29,62 @@ pub struct IntegrationConnectSpec {
     pub optional: &'static [&'static str],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingIntegrationConnect {
     pub integration_id: String,
     pub started_at: DateTime<Utc>,
 }
 
 pub const CONNECT_FLOW_TTL_SECS: i64 = 20 * 60;
+
+fn normalize_phrase(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_space = false;
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn contains_normalized_phrase(haystack: &str, phrase: &str) -> bool {
+    let haystack = format!(" {} ", normalize_phrase(haystack));
+    let needle = format!(" {} ", normalize_phrase(phrase));
+    !needle.trim().is_empty() && haystack.contains(&needle)
+}
+
+fn message_contains_any_phrase(message: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|phrase| contains_normalized_phrase(message, phrase))
+}
+
+fn contains_normalized_token(haystack: &str, token: &str) -> bool {
+    let haystack_tokens = normalize_phrase(haystack)
+        .split_whitespace()
+        .map(|word| word.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    haystack_tokens.contains(&token.trim().to_ascii_lowercase())
+}
+
+fn message_contains_any_token(message: &str, tokens: &[&str]) -> bool {
+    tokens
+        .iter()
+        .any(|token| contains_normalized_token(message, token))
+}
+
+fn connect_trigger_matches(message: &str, trigger: &str) -> bool {
+    let normalized = normalize_phrase(trigger);
+    if normalized.split_whitespace().count() <= 1 {
+        return contains_normalized_token(message, trigger);
+    }
+    contains_normalized_phrase(message, trigger)
+}
 
 static SPECS: &[IntegrationConnectSpec] = &[
     IntegrationConnectSpec {
@@ -190,11 +240,38 @@ pub fn spec_by_id(id: &str) -> Option<&'static IntegrationConnectSpec> {
 }
 
 fn looks_like_connect_intent(message_lc: &str) -> bool {
-    message_lc.contains("connect")
-        || message_lc.contains("setup")
-        || message_lc.contains("configure")
-        || message_lc.contains("add integration")
-        || message_lc.contains("enable integration")
+    message_contains_any_phrase(
+        message_lc,
+        &[
+            "set up",
+            "setup",
+            "configure",
+            "add integration",
+            "enable integration",
+            "grant access",
+            "give access",
+            "request access",
+            "need access",
+            "sign in",
+            "log in",
+            "wire up",
+            "hook up",
+        ],
+    ) || message_contains_any_token(
+        message_lc,
+        &[
+            "connect",
+            "link",
+            "integrate",
+            "authorize",
+            "authenticate",
+            "token",
+            "credentials",
+            "secret",
+            "sync",
+            "pair",
+        ],
+    ) || message_contains_any_phrase(message_lc, &["api key"])
 }
 
 pub fn detect_connect_integration(message: &str) -> Option<&'static IntegrationConnectSpec> {
@@ -205,20 +282,23 @@ pub fn detect_connect_integration(message: &str) -> Option<&'static IntegrationC
     if !looks_like_connect_intent(&lc) {
         return None;
     }
-    SPECS
-        .iter()
-        .find(|spec| spec.triggers.iter().any(|t| lc.contains(t)))
+    SPECS.iter().find(|spec| {
+        spec.triggers
+            .iter()
+            .any(|t| connect_trigger_matches(&lc, t))
+    })
 }
 
 pub fn is_cancel_message(message: &str) -> bool {
     let lc = message.trim().to_ascii_lowercase();
-    lc == "cancel"
-        || lc == "/cancel"
-        || lc.contains("cancel setup")
-        || lc.contains("never mind")
-        || lc.contains("nevermind")
-        || lc.contains("stop setup")
-        || lc.contains("abort setup")
+    let normalized = normalize_phrase(&lc);
+    normalized == "cancel"
+        || lc.trim() == "/cancel"
+        || contains_normalized_phrase(&lc, "cancel setup")
+        || contains_normalized_phrase(&lc, "never mind")
+        || contains_normalized_phrase(&lc, "nevermind")
+        || contains_normalized_phrase(&lc, "stop setup")
+        || contains_normalized_phrase(&lc, "abort setup")
 }
 
 pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
@@ -256,4 +336,42 @@ pub fn connect_instructions(spec: &IntegrationConnectSpec) -> String {
     out.push_str("\nAfter you set the secret(s), I will run a connection test and enable it if successful.\n");
     out.push_str("To cancel: `cancel setup`.\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_connect_requests_with_normalized_paraphrases() {
+        let spec = detect_connect_integration("Please set-up GitHub for me").expect("github spec");
+        assert_eq!(spec.id, "github");
+
+        let spec = detect_connect_integration("I need GitHub access").expect("github spec");
+        assert_eq!(spec.id, "github");
+    }
+
+    #[test]
+    fn matches_hyphenated_integration_names() {
+        let spec =
+            detect_connect_integration("Connect Google-Places for me").expect("google places");
+        assert_eq!(spec.id, "google_places");
+    }
+
+    #[test]
+    fn does_not_treat_plain_mentions_as_connect_requests() {
+        assert!(detect_connect_integration("Summarize GitHub issues for me").is_none());
+    }
+
+    #[test]
+    fn does_not_match_connectivity_or_other_non_intents() {
+        assert!(detect_connect_integration("This is a connectivity report for GitHub").is_none());
+        assert!(detect_connect_integration("GitHub docs update").is_none());
+    }
+
+    #[test]
+    fn matches_single_word_triggers_via_token_boundaries() {
+        let spec = detect_connect_integration("Please connect GitHub").expect("github spec");
+        assert_eq!(spec.id, "github");
+    }
 }

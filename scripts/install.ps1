@@ -5,8 +5,9 @@
 
 $ErrorActionPreference = "Stop"
 
-$Image = "ghcr.io/agentark-ai/agentark:latest"
 $InstallDir = "$env:USERPROFILE\agentark"
+$SourceDir = Join-Path $InstallDir "source"
+$RepoUrl = "https://github.com/agentark-ai/AgentArk.git"
 
 Write-Host ""
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor White
@@ -41,128 +42,21 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 
-# ── Step 3: Generate docker-compose.yml ─────────────────────────────────────
+if (-not (Test-Path (Join-Path $SourceDir ".git"))) {
+    Write-Host "Cloning AgentArk source into $SourceDir..." -ForegroundColor Cyan
+    docker run --rm -v "${InstallDir}:/work" -w /work alpine/git clone --depth 1 $RepoUrl source
+} else {
+    Write-Host "Existing source checkout found at $SourceDir" -ForegroundColor Green
+}
 
-$composeContent = @'
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: agentark-postgres
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    environment:
-      - POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
-      - POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
-      - POSTGRES_PASSWORD=${AGENTARK_POSTGRES_PASSWORD:-agentark}
-    ports:
-      - "127.0.0.1:${AGENTARK_POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - agentark-postgres-data:/var/lib/postgresql/data
-    networks:
-      - agent-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${AGENTARK_POSTGRES_USER:-agentark} -d ${AGENTARK_POSTGRES_DB:-agentark}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
-          cpus: '0.25'
-          memory: 256M
+# ── Step 3: Verify source checkout ───────────────────────────────────────────
 
-  agentark:
-    image: ghcr.io/agentark-ai/agentark:latest
-    container_name: agentark
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8990:8990"
-    volumes:
-      - agentark-data:/app/data
-      - agentark-config:/app/config
-    depends_on:
-      postgres:
-        condition: service_healthy
-      docker-socket-proxy:
-        condition: service_started
-    environment:
-      - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
-      - AGENTARK_CONFIG=/app/config
-      - AGENTARK_DATA=/app/data
-      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
-      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
-      - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
-      - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
-      - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
-      - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
-      - AGENTARK_BIND=0.0.0.0:8990
-      - DOCKER_HOST=tcp://docker-socket-proxy:2375
-    networks:
-      - agent-network
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-
-  docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:0.4.2
-    container_name: agentark-docker-proxy
-    restart: unless-stopped
-    volumes:
-      - //var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - CONTAINERS=1
-      - IMAGES=1
-      - POST=1
-      - EXEC=0
-      - VOLUMES=0
-      - NETWORKS=0
-      - SWARM=0
-      - SECRETS=0
-      - NODES=0
-      - SERVICES=0
-      - TASKS=0
-      - BUILD=0
-      - COMMIT=0
-      - CONFIGS=0
-      - DISTRIBUTION=0
-      - PLUGINS=0
-      - SYSTEM=0
-    networks:
-      - agent-network
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 128M
-
-volumes:
-  agentark-data:
-    name: agentark-data
-  agentark-config:
-    name: agentark-config
-  agentark-postgres-data:
-    name: agentark-postgres-data
-
-networks:
-  agent-network:
-    driver: bridge
-'@
-
-Set-Content -Path "$InstallDir\docker-compose.yml" -Value $composeContent -Encoding UTF8
-Write-Host "[3/4] Configuration created at $InstallDir" -ForegroundColor Green
+$ComposeFile = Join-Path $SourceDir "docker-compose.yml"
+if (-not (Test-Path $ComposeFile)) {
+    Write-Host "Missing $ComposeFile after clone." -ForegroundColor Red
+    exit 1
+}
+Write-Host "[3/4] Source checkout ready at $SourceDir" -ForegroundColor Green
 
 # ── Step 4: Create agentark.cmd CLI wrapper ───────────────────────────────────
 
@@ -175,46 +69,47 @@ set "CMD=%~1"
 if "%CMD%"=="" set "CMD=help"
 
 if "%CMD%"=="chat" (
-    docker exec -it agentark /app/agentark --chat
+    docker exec -it agentark-control /app/agentark --chat
     goto :eof
 )
 if "%CMD%"=="pulse" (
-    docker exec agentark /app/agentark --pulse
+    docker exec agentark-control /app/agentark --pulse
     goto :eof
 )
 if "%CMD%"=="start" (
-    docker compose -f "%~dp0docker-compose.yml" up -d
+    docker compose -f "%~dp0source\docker-compose.yml" up -d --build
     echo.
     echo AgentArk is running!
     echo   Web UI: http://localhost:8990
     goto :eof
 )
 if "%CMD%"=="stop" (
-    docker compose -f "%~dp0docker-compose.yml" down
+    docker compose -f "%~dp0source\docker-compose.yml" down
     echo Stopped. Your data is preserved.
     goto :eof
 )
 if "%CMD%"=="restart" (
-    docker compose -f "%~dp0docker-compose.yml" down
-    docker compose -f "%~dp0docker-compose.yml" up -d
+    docker compose -f "%~dp0source\docker-compose.yml" down
+    docker compose -f "%~dp0source\docker-compose.yml" up -d --build
     goto :eof
 )
 if "%CMD%"=="logs" (
-    docker compose -f "%~dp0docker-compose.yml" logs -f --tail=100
+    docker compose -f "%~dp0source\docker-compose.yml" logs -f --tail=100
     goto :eof
 )
 if "%CMD%"=="status" (
-    docker compose -f "%~dp0docker-compose.yml" ps
+    docker compose -f "%~dp0source\docker-compose.yml" ps
     goto :eof
 )
 if "%CMD%"=="update" (
-    docker compose -f "%~dp0docker-compose.yml" pull agentark
-    docker compose -f "%~dp0docker-compose.yml" up -d agentark
+    docker run --rm -v "%~dp0:/work" -w /work alpine/git git -C /work/source pull --ff-only
+    docker compose -f "%~dp0source\docker-compose.yml" build
+    docker compose -f "%~dp0source\docker-compose.yml" up -d
     echo Update complete!
     goto :eof
 )
 if "%CMD%"=="setup" (
-    docker exec -it agentark /app/agentark --setup
+    docker exec -it agentark-control /app/agentark --setup
     goto :eof
 )
 
@@ -229,7 +124,7 @@ echo   stop       Stop AgentArk
 echo   restart    Restart AgentArk
 echo   logs       View live logs
 echo   status     Show running containers
-echo   update     Pull latest image and restart
+echo   update     Pull latest source and rebuild
 echo   setup      Run setup wizard
 '@
 
@@ -244,17 +139,43 @@ if ($userPath -notlike "*$InstallDir*") {
     Write-Host "  (Open a new terminal if 'agentark' isn't recognized immediately)" -ForegroundColor Yellow
 }
 
-Write-Host "[3/4] CLI installed." -ForegroundColor Green
+Write-Host "CLI installed." -ForegroundColor Green
 
-# ── Step 5: Pull image and start ────────────────────────────────────────────
+function Write-AgentArkPortWarning {
+    param(
+        [int]$Port,
+        [string]$ServiceName
+    )
 
-Write-Host "Pulling AgentArk image (this may take a minute)..." -ForegroundColor Cyan
+    try {
+        $listeners = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop
+    } catch {
+        $listeners = @()
+    }
+
+    if ($listeners.Count -gt 0) {
+        Write-Host "Warning: TCP port $Port is already in use. $ServiceName may fail to start unless you stop the existing listener or override the port." -ForegroundColor Yellow
+    }
+}
+
+# ── Step 5: Build and start ────────────────────────────────────────────────
+
+Write-Host "Building AgentArk from source (this may take a few minutes)..." -ForegroundColor Cyan
+$postgresPort = 5432
+if ($env:AGENTARK_POSTGRES_PORT -match '^\d+$') {
+    $postgresPort = [int]$env:AGENTARK_POSTGRES_PORT
+}
+Write-AgentArkPortWarning -Port $postgresPort -ServiceName "Postgres"
+Write-AgentArkPortWarning -Port 8990 -ServiceName "AgentArk Web UI"
 Push-Location $InstallDir
 try {
-    docker compose pull agentark 2>$null
-
     Write-Host "[4/4] Starting AgentArk..." -ForegroundColor Green
-    docker compose up -d
+    Push-Location $SourceDir
+    try {
+        docker compose up -d --build
+    } finally {
+        Pop-Location
+    }
 } finally {
     Pop-Location
 }
@@ -270,7 +191,7 @@ Write-Host "  Commands (run from anywhere):" -ForegroundColor White
 Write-Host "    agentark chat       Interactive CLI chat"
 Write-Host "    agentark pulse      Run ArkPulse health check"
 Write-Host "    agentark stop       Stop AgentArk"
-Write-Host "    agentark update     Pull latest and restart"
+Write-Host "    agentark update     Pull latest source and rebuild"
 Write-Host "    agentark logs       View logs"
 Write-Host "    agentark status     Show status"
 Write-Host ""

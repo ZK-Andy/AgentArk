@@ -198,16 +198,17 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
               const runtimeConfigCommand = supportsConfig
                 ? str(app.runtime_config_command) || `ollama launch ${id} --config`
                 : "";
-              const hostLaunchCommand = runtimeInDocker
-                ? modelValue.trim()
-                  ? `docker exec -it -e OLLAMA_HOST=${runtimeBaseUrl || "http://agentark-ollama:11434"} agentark ollama launch ${id} --model ${modelValue.trim()}`
-                  : str(app.host_launch_command) || runtimeLaunchCommand
-                : runtimeLaunchCommand;
-              const hostConfigCommand = supportsConfig
-                ? runtimeInDocker
-                  ? str(app.host_config_command) || `docker exec -it -e OLLAMA_HOST=${runtimeBaseUrl || "http://agentark-ollama:11434"} agentark ollama launch ${id} --config`
-                  : runtimeConfigCommand
-                : "";
+                const hostOllamaBaseUrl = runtimeBaseUrl || "http://host.docker.internal:11434";
+                const hostLaunchCommand = runtimeInDocker
+                  ? modelValue.trim()
+                    ? `docker exec -it -e OLLAMA_HOST=${hostOllamaBaseUrl} agentark ollama launch ${id} --model ${modelValue.trim()}`
+                    : str(app.host_launch_command) || runtimeLaunchCommand
+                  : runtimeLaunchCommand;
+                const hostConfigCommand = supportsConfig
+                  ? runtimeInDocker
+                    ? str(app.host_config_command) || `docker exec -it -e OLLAMA_HOST=${hostOllamaBaseUrl} agentark ollama launch ${id} --config`
+                    : runtimeConfigCommand
+                  : "";
               const appBusy =
                 (launchMutation.isPending && launchMutation.variables?.id === id) ||
                 (stopMutation.isPending && stopMutation.variables?.id === id);
@@ -383,8 +384,12 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                       </Stack>
                     ) : null}
 
-                    <Box className="metadata-box" sx={{ p: 1, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                      <Typography variant="caption" color="text.secondary">
+                    <Box className="metadata-box micro-surface" sx={{ p: 1.1, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                      <Typography className="micro-surface-kicker">Runtime</Typography>
+                      <Typography className="micro-surface-title">
+                        {runtimeInDocker ? "Launch commands" : "Launch command"}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
                         {runtimeInDocker ? "Docker host command" : "Launch command"}
                       </Typography>
                       <Typography variant="body2" sx={{ wordBreak: "break-all" }}>
@@ -426,29 +431,24 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                     </Box>
 
                     {currentMessage || currentCommand || currentLogs.length > 0 ? (
-                      <Box className="metadata-box" sx={{ p: 1 }}>
+                      <Box className="metadata-box micro-surface" sx={{ p: 1.1 }}>
                         <Stack spacing={0.6}>
+                          <Box className="micro-surface-head" sx={{ mb: 0.2 }}>
+                            <Typography className="micro-surface-kicker">Runtime</Typography>
+                            <Typography className="micro-surface-title">Live runtime detail</Typography>
+                          </Box>
                           {currentMessage ? (
-                            <Typography variant="caption" color="text.secondary">
+                            <Typography className="micro-surface-copy">
                               {currentMessage}
                             </Typography>
                           ) : null}
                           {currentCommand ? (
-                            <Typography variant="caption" sx={{ wordBreak: "break-all", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                            <Typography variant="caption" sx={{ wordBreak: "break-all", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", color: "rgba(191, 223, 255, 0.84)" }}>
                               {currentCommand}
                             </Typography>
                           ) : null}
                           {currentLogs.length > 0 ? (
-                            <Box
-                              sx={{
-                                maxHeight: 180,
-                                overflow: "auto",
-                                borderRadius: 1,
-                                border: "1px solid rgba(108, 156, 212, 0.12)",
-                                background: "rgba(6, 12, 24, 0.75)",
-                                p: 1
-                              }}
-                            >
+                            <Box className="micro-surface-scroll">
                               <Stack spacing={0.35}>
                                 {currentLogs.map((line, index) => (
                                   <Typography

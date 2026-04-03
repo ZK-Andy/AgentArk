@@ -22,7 +22,7 @@ impl SocialAnalyticsConnector {
     }
 
     pub fn new() -> Self {
-        let config_dir = directories::ProjectDirs::from("com", "agentark", "AgentArk")
+        let config_dir = crate::branding::project_dirs()
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         Self::new_with_config_dir(config_dir)

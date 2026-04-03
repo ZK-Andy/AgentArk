@@ -1,6 +1,16 @@
 use anyhow::Result;
-use clap::{Args as ClapArgs, Subcommand};
+use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use serde::Serialize;
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "kebab_case")]
+pub enum ServiceMode {
+    #[value(alias = "control-plane")]
+    #[default]
+    Control,
+    Executor,
+    Workspace,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -139,13 +149,136 @@ struct OnboardChecklist {
     steps: Vec<OnboardStep>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct OnboardStep {
     id: &'static str,
     title: &'static str,
     status: &'static str,
     detail: String,
     next_action: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OnboardSummary {
+    chat_ready: bool,
+    configured_model_count: usize,
+    channels_configured: usize,
+    channels_connected: usize,
+    routing_enabled_rules: usize,
+    routing_rules: usize,
+    nodes_total: usize,
+    nodes_online: usize,
+    browser_total: usize,
+    browser_logged_in: usize,
+    failover_auth_profiles: usize,
+    failover_chains: usize,
+    failover_cooling_providers: usize,
+}
+
+fn build_onboard_steps(summary: OnboardSummary) -> Vec<OnboardStep> {
+    let chat_detail = if summary.chat_ready {
+        format!(
+            "{} chat model route(s) configured.",
+            summary.configured_model_count
+        )
+    } else {
+        "No chat model is configured yet.".to_string()
+    };
+
+    vec![
+        OnboardStep {
+            id: "chat_model",
+            title: "Configure at least one chat model",
+            status: if summary.chat_ready { "ready" } else { "blocking" },
+            detail: chat_detail,
+            next_action: if summary.chat_ready {
+                "Run `agentark chat` to start using CLI chat.".to_string()
+            } else {
+                "Run `agentark setup`, or open http://localhost:8990 and go to Settings > Models."
+                    .to_string()
+            },
+        },
+        OnboardStep {
+            id: "channels",
+            title: "Configure at least one external channel",
+            status: if summary.channels_configured > 0 {
+                "ready"
+            } else {
+                "pending"
+            },
+            detail: format!(
+                "{} configured, {} connected.",
+                summary.channels_configured, summary.channels_connected
+            ),
+            next_action:
+                "Open Channels and connect Slack, Discord, Telegram, WhatsApp, or WebChat."
+                    .to_string(),
+        },
+        OnboardStep {
+            id: "routing",
+            title: "Enable deterministic routing",
+            status: if summary.routing_enabled_rules > 0 {
+                "ready"
+            } else {
+                "pending"
+            },
+            detail: format!(
+                "{} enabled rules across {} total.",
+                summary.routing_enabled_rules, summary.routing_rules
+            ),
+            next_action:
+                "Create at least one route rule in Routing so inbound traffic lands on a bound agent."
+                    .to_string(),
+        },
+        OnboardStep {
+            id: "devices",
+            title: "Pair a companion device",
+            status: if summary.nodes_total > 0 {
+                "ready"
+            } else {
+                "optional"
+            },
+            detail: format!(
+                "{} nodes tracked, {} online.",
+                summary.nodes_total, summary.nodes_online
+            ),
+            next_action:
+                "Use Devices to pair a mobile or desktop node if camera, notifications, or system.run are needed."
+                    .to_string(),
+        },
+        OnboardStep {
+            id: "browser",
+            title: "Provision a managed browser profile",
+            status: if summary.browser_total > 0 {
+                "ready"
+            } else {
+                "pending"
+            },
+            detail: format!(
+                "{} profiles, {} logged in.",
+                summary.browser_total, summary.browser_logged_in
+            ),
+            next_action: "Create a browser profile for login handoff and managed sessions."
+                .to_string(),
+        },
+        OnboardStep {
+            id: "failover",
+            title: "Set up model auth failover",
+            status: if summary.failover_auth_profiles > 0 && summary.failover_chains > 0 {
+                "ready"
+            } else {
+                "pending"
+            },
+            detail: format!(
+                "{} auth profiles, {} chains, {} cooling providers.",
+                summary.failover_auth_profiles,
+                summary.failover_chains,
+                summary.failover_cooling_providers
+            ),
+            next_action: "Create auth profiles and at least one fallback chain in Failover."
+                .to_string(),
+        },
+    ]
 }
 
 pub async fn run(agent: crate::core::Agent, command: Command) -> Result<()> {
@@ -516,89 +649,25 @@ async fn run_doctor(agent: crate::core::Agent, json: bool) -> Result<()> {
 
 async fn run_onboard(agent: crate::core::Agent, json: bool) -> Result<()> {
     let snapshot = build_gateway_snapshot(&agent).await?;
+    let readiness = crate::cli_chat_readiness(&agent.config);
+    let steps = build_onboard_steps(OnboardSummary {
+        chat_ready: readiness.chat_ready,
+        configured_model_count: readiness.configured_model_count,
+        channels_configured: snapshot.channels.summary.configured,
+        channels_connected: snapshot.channels.summary.connected,
+        routing_enabled_rules: snapshot.routing.summary.enabled_rules,
+        routing_rules: snapshot.routing.summary.rules,
+        nodes_total: snapshot.nodes.summary.total,
+        nodes_online: snapshot.nodes.summary.online,
+        browser_total: snapshot.browser.summary.total,
+        browser_logged_in: snapshot.browser.summary.logged_in,
+        failover_auth_profiles: snapshot.failover.summary.auth_profiles,
+        failover_chains: snapshot.failover.summary.chains,
+        failover_cooling_providers: snapshot.failover.summary.cooling_providers,
+    });
     let checklist = OnboardChecklist {
         generated_at: chrono::Utc::now().to_rfc3339(),
-        steps: vec![
-            OnboardStep {
-                id: "channels",
-                title: "Configure at least one external channel",
-                status: if snapshot.channels.summary.configured > 0 {
-                    "ready"
-                } else {
-                    "pending"
-                },
-                detail: format!(
-                    "{} configured, {} connected.",
-                    snapshot.channels.summary.configured, snapshot.channels.summary.connected
-                ),
-                next_action: "Open Channels and connect Slack, Discord, Telegram, WhatsApp, or WebChat."
-                    .to_string(),
-            },
-            OnboardStep {
-                id: "routing",
-                title: "Enable deterministic routing",
-                status: if snapshot.routing.summary.enabled_rules > 0 {
-                    "ready"
-                } else {
-                    "pending"
-                },
-                detail: format!(
-                    "{} enabled rules across {} total.",
-                    snapshot.routing.summary.enabled_rules, snapshot.routing.summary.rules
-                ),
-                next_action: "Create at least one route rule in Routing so inbound traffic lands on a bound agent."
-                    .to_string(),
-            },
-            OnboardStep {
-                id: "devices",
-                title: "Pair a companion device",
-                status: if snapshot.nodes.summary.total > 0 {
-                    "ready"
-                } else {
-                    "optional"
-                },
-                detail: format!(
-                    "{} nodes tracked, {} online.",
-                    snapshot.nodes.summary.total, snapshot.nodes.summary.online
-                ),
-                next_action: "Use Devices to pair a mobile or desktop node if camera, notifications, or system.run are needed."
-                    .to_string(),
-            },
-            OnboardStep {
-                id: "browser",
-                title: "Provision a managed browser profile",
-                status: if snapshot.browser.summary.total > 0 {
-                    "ready"
-                } else {
-                    "pending"
-                },
-                detail: format!(
-                    "{} profiles, {} logged in.",
-                    snapshot.browser.summary.total, snapshot.browser.summary.logged_in
-                ),
-                next_action: "Create a browser profile for login handoff and managed sessions."
-                    .to_string(),
-            },
-            OnboardStep {
-                id: "failover",
-                title: "Set up model auth failover",
-                status: if snapshot.failover.summary.auth_profiles > 0
-                    && snapshot.failover.summary.chains > 0
-                {
-                    "ready"
-                } else {
-                    "pending"
-                },
-                detail: format!(
-                    "{} auth profiles, {} chains, {} cooling providers.",
-                    snapshot.failover.summary.auth_profiles,
-                    snapshot.failover.summary.chains,
-                    snapshot.failover.summary.cooling_providers
-                ),
-                next_action: "Create auth profiles and at least one fallback chain in Failover."
-                    .to_string(),
-            },
-        ],
+        steps,
     };
 
     if json {
@@ -619,4 +688,57 @@ where
 {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_onboard_steps, OnboardSummary};
+
+    #[test]
+    fn onboard_checklist_reports_missing_chat_model_first() {
+        let steps = build_onboard_steps(OnboardSummary {
+            chat_ready: false,
+            configured_model_count: 0,
+            channels_configured: 0,
+            channels_connected: 0,
+            routing_enabled_rules: 0,
+            routing_rules: 0,
+            nodes_total: 0,
+            nodes_online: 0,
+            browser_total: 0,
+            browser_logged_in: 0,
+            failover_auth_profiles: 0,
+            failover_chains: 0,
+            failover_cooling_providers: 0,
+        });
+
+        assert_eq!(steps[0].id, "chat_model");
+        assert_eq!(steps[0].status, "blocking");
+        assert!(steps[0].detail.contains("No chat model"));
+        assert!(steps[0].next_action.contains("agentark setup"));
+    }
+
+    #[test]
+    fn onboard_checklist_marks_chat_model_ready_when_configured() {
+        let steps = build_onboard_steps(OnboardSummary {
+            chat_ready: true,
+            configured_model_count: 2,
+            channels_configured: 1,
+            channels_connected: 1,
+            routing_enabled_rules: 1,
+            routing_rules: 1,
+            nodes_total: 0,
+            nodes_online: 0,
+            browser_total: 0,
+            browser_logged_in: 0,
+            failover_auth_profiles: 0,
+            failover_chains: 0,
+            failover_cooling_providers: 0,
+        });
+
+        assert_eq!(steps[0].id, "chat_model");
+        assert_eq!(steps[0].status, "ready");
+        assert!(steps[0].detail.contains("2 chat model route(s)"));
+        assert!(steps[0].next_action.contains("agentark chat"));
+    }
 }

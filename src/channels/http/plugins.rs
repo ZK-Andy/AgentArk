@@ -17,13 +17,15 @@ pub(super) async fn list_plugins(State(state): State<AppState>) -> Response {
         agent.plugins.clone()
     };
     let registry = plugins.read().await;
-    let rows = registry.list_plugins();
-    Json(serde_json::json!({
-        "plugins": rows,
-        "count": rows.len(),
-        "platform_events": crate::plugins::registry::PluginRegistry::platform_events(),
-    }))
-    .into_response()
+    match registry.list_plugins().await {
+        Ok(rows) => Json(serde_json::json!({
+            "plugins": rows,
+            "count": rows.len(),
+            "platform_events": crate::plugins::registry::PluginRegistry::platform_events(),
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 pub(super) async fn create_plugin(
@@ -195,7 +197,7 @@ mod tests {
                 api_key: Arc::new(RwLock::new(None)),
                 api_key_expires_at: Arc::new(RwLock::new(None)),
                 allow_insecure_no_auth: true,
-                session_token: Arc::new(RwLock::new(None)),
+                ui_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 local_ui_bootstrap_enabled: true,
                 local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
                 cookie_secure_default: false,
@@ -205,6 +207,8 @@ mod tests {
                 whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
                 security_events,
                 app_registry,
+                executor_client: None,
+                workspace_client: None,
                 application_registry: applications::ApplicationLauncherRegistry::default(),
                 deployment_mode: DeploymentMode::TrustedLocal,
                 server_role: HttpServerRole::ControlPlane,
@@ -248,7 +252,10 @@ mod tests {
                 "actions": [{
                     "name": "echo",
                     "title": "Echo",
-                    "description": "Echo back text from AgentArk",
+                    "description": format!(
+                        "Echo back text from {}",
+                        crate::branding::PRODUCT_NAME
+                    ),
                     "input_schema": {
                         "type": "object",
                         "properties": {

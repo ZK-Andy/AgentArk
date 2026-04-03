@@ -3,11 +3,10 @@
 //! HTTP client that communicates with the local Playwright bridge
 //! to control a headless browser for web automation tasks.
 
+use super::{Capability, Integration, IntegrationStatus};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-
-use super::{Capability, Integration, IntegrationStatus};
 
 /// Browser integration — thin HTTP client over the Playwright bridge
 pub struct BrowserIntegration {
@@ -54,6 +53,53 @@ pub struct PageElement {
     pub y: i32,
 }
 
+fn browser_target_host_allowed(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => {
+            let lower = domain.trim().to_ascii_lowercase();
+            !(lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower.ends_with(".local")
+                || lower == "metadata.google.internal")
+        }
+        url::Host::Ipv4(ip) => {
+            !((*ip).is_loopback()
+                || (*ip).is_private()
+                || (*ip).is_link_local()
+                || (*ip).is_multicast()
+                || (*ip).is_unspecified()
+                || *ip == std::net::Ipv4Addr::new(169, 254, 169, 254))
+        }
+        url::Host::Ipv6(ip) => {
+            !((*ip).is_loopback()
+                || (*ip).is_unique_local()
+                || (*ip).is_unicast_link_local()
+                || (*ip).is_multicast()
+                || (*ip).is_unspecified())
+        }
+    }
+}
+
+fn validate_browser_url(url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(url).map_err(|e| anyhow!("Invalid browser URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(anyhow!(
+                "Browser only allows http/https URLs, got '{}'",
+                other
+            ))
+        }
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| anyhow!("Browser URL must include a host"))?;
+    if !browser_target_host_allowed(&host) {
+        return Err(anyhow!("Browser URL target is not allowed"));
+    }
+    Ok(parsed)
+}
+
 impl BrowserIntegration {
     pub fn new() -> Self {
         let bridge_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
@@ -88,10 +134,11 @@ impl BrowserIntegration {
 
     /// Navigate to a URL
     pub async fn navigate(&self, session_id: &str, url: &str) -> Result<(String, String)> {
+        let validated_url = validate_browser_url(url)?;
         tracing::debug!(
             "Browser navigate: session={}, url_len={}",
             &session_id[..8],
-            url.len()
+            validated_url.as_str().len()
         );
         let resp: NavigateResponse = self
             .client
@@ -99,7 +146,7 @@ impl BrowserIntegration {
                 "{}/session/{}/navigate",
                 self.bridge_url, session_id
             ))
-            .json(&serde_json::json!({ "url": url }))
+            .json(&serde_json::json!({ "url": validated_url.as_str() }))
             .send()
             .await?
             .error_for_status()?
@@ -262,6 +309,24 @@ impl BrowserIntegration {
             self.bridge_url
         );
         result
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::validate_browser_url;
+
+    #[test]
+    fn browser_rejects_local_targets() {
+        assert!(validate_browser_url("http://127.0.0.1:8080").is_err());
+        assert!(validate_browser_url("http://localhost:8080").is_err());
+        assert!(validate_browser_url("http://169.254.169.254/latest/meta-data").is_err());
+    }
+
+    #[test]
+    fn browser_accepts_public_https_target() {
+        assert!(validate_browser_url("https://example.com/path").is_ok());
     }
 }
 

@@ -2,20 +2,19 @@
 
 pub mod encrypted;
 pub mod entities;
-pub mod legacy_recovery;
 mod migrations;
 
 use crate::crypto::KeyManager;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use sea_orm::sea_query::Expr;
+use sea_orm::entity::prelude::PgVector;
+use sea_orm::sea_query::{Alias, Expr, Func, OnConflict, Order, Query};
 #[allow(unused_imports)]
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Schema, Set, Statement, TransactionTrait, TryGetable, Unchanged,
+    DatabaseConnection, DbBackend, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait, TryGetable, Unchanged,
 };
-use serde_json::Value as JsonValue;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -25,6 +24,47 @@ pub use entities::*;
 #[derive(Clone)]
 pub struct Storage {
     db: DatabaseConnection,
+}
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HousekeepingStatus {
+    pub housekeeping_last_run_at: Option<String>,
+    pub notification_last_run_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadManifest {
+    pub id: String,
+    pub original_name: String,
+    pub stored_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub size_bytes: u64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct ExecutionTraceSummaryRow {
+    pub id: String,
+    pub message: String,
+    pub channel: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<i32>,
+    pub step_count: i32,
+    pub steps_json: String,
+    pub model: Option<String>,
+    pub total_tokens: i32,
+    pub cost_usd: f64,
+    pub complexity: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct OperationalLogVersionMetricRow {
+    pub success: bool,
+    pub latency_ms: Option<i64>,
+    pub policy_version: Option<String>,
+    pub strategy_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,12 +130,7 @@ impl DatabaseConfig {
     pub fn for_tests() -> Result<Self> {
         let base = std::env::var("AGENTARK_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://agentark:agentark@127.0.0.1:5432/agentark".to_string());
-        let schema = format!(
-            "test_{}",
-            uuid::Uuid::new_v4().to_string().replace('-', "_")
-        );
         let mut config = Self::new(base);
-        config.schema = Some(schema);
         config.max_connections = 4;
         Ok(config)
     }
@@ -105,21 +140,12 @@ impl DatabaseConfig {
         if !lower.starts_with("postgres://") && !lower.starts_with("postgresql://") {
             anyhow::bail!("AGENTARK_DATABASE_URL must be a postgres:// or postgresql:// URL");
         }
-        if let Some(schema) = self.schema.as_deref() {
-            if !schema
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                anyhow::bail!(
-                    "Database schema names may only contain ASCII letters, digits, and underscores"
-                );
-            }
+        if self.schema.is_some() {
+            anyhow::bail!(
+                "Custom Postgres schemas are not supported by the fresh-install-only bootstrap"
+            );
         }
         Ok(())
-    }
-
-    fn quoted_schema_identifier(&self) -> Option<String> {
-        self.schema.as_ref().map(|schema| format!("\"{}\"", schema))
     }
 
     fn target_summary(&self) -> String {
@@ -129,7 +155,7 @@ impl DatabaseConfig {
                 let port = parsed.port_or_known_default().unwrap_or(5432);
                 let database = parsed
                     .path_segments()
-                    .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+                    .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
                     .unwrap_or("unknown-db");
                 format!("{host}:{port}/{database}")
             }
@@ -159,16 +185,11 @@ impl DatabaseConfig {
 }
 
 static STORAGE_KEY_MANAGER: OnceLock<RwLock<Option<Arc<KeyManager>>>> = OnceLock::new();
-static STORAGE_FALLBACK_KEY_MANAGERS: OnceLock<RwLock<Vec<Arc<KeyManager>>>> = OnceLock::new();
 
 pub(crate) const ENCRYPTED_STORAGE_UNAVAILABLE: &str = "[Encrypted content unavailable]";
 
 fn storage_key_manager_slot() -> &'static RwLock<Option<Arc<KeyManager>>> {
     STORAGE_KEY_MANAGER.get_or_init(|| RwLock::new(None))
-}
-
-fn storage_fallback_key_manager_slot() -> &'static RwLock<Vec<Arc<KeyManager>>> {
-    STORAGE_FALLBACK_KEY_MANAGERS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 pub fn install_storage_key_manager(key_manager: Arc<KeyManager>) {
@@ -177,24 +198,11 @@ pub fn install_storage_key_manager(key_manager: Arc<KeyManager>) {
     }
 }
 
-pub fn install_storage_fallback_key_managers(key_managers: Vec<Arc<KeyManager>>) {
-    if let Ok(mut guard) = storage_fallback_key_manager_slot().write() {
-        *guard = key_managers;
-    }
-}
-
 fn current_storage_key_manager() -> Option<Arc<KeyManager>> {
     storage_key_manager_slot()
         .read()
         .ok()
         .and_then(|guard| guard.clone())
-}
-
-fn current_storage_fallback_key_managers() -> Vec<Arc<KeyManager>> {
-    storage_fallback_key_manager_slot()
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
 }
 
 fn encrypt_storage_string(value: &str) -> Result<String> {
@@ -241,11 +249,6 @@ fn decrypt_storage_string(value: &str) -> String {
             return decrypted;
         }
     }
-    for key_manager in current_storage_fallback_key_managers() {
-        if let Ok(decrypted) = key_manager.decrypt_string(value) {
-            return decrypted;
-        }
-    }
     if looks_like_encrypted_storage_string(value) {
         ENCRYPTED_STORAGE_UNAVAILABLE.to_string()
     } else {
@@ -266,6 +269,11 @@ fn encrypt_optional_storage_string(value: Option<&str>) -> Result<Option<String>
 
 fn decrypt_optional_storage_string(value: Option<String>) -> Option<String> {
     value.map(|inner| decrypt_storage_string(&inner))
+}
+
+fn decrypt_swarm_delegation_model(model: &mut swarm_delegation::Model) {
+    model.task_description = decrypt_storage_string(&model.task_description);
+    model.result = decrypt_optional_storage_string(model.result.clone());
 }
 
 fn encrypt_storage_bytes(value: &[u8]) -> Result<Vec<u8>> {
@@ -292,137 +300,129 @@ fn decrypt_storage_bytes(value: &[u8]) -> Vec<u8> {
     }
 }
 
-fn json_text(value: &JsonValue) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+fn parse_execution_run_status(raw: &str) -> crate::core::ExecutionRunStatus {
+    serde_json::from_str(&format!("\"{raw}\""))
+        .unwrap_or(crate::core::ExecutionRunStatus::PlatformFailed)
 }
 
-fn parse_json_text(raw: Option<String>, fallback: JsonValue) -> JsonValue {
-    raw.and_then(|value| serde_json::from_str::<JsonValue>(&value).ok())
-        .unwrap_or(fallback)
+fn parse_tool_outcome_status(raw: &str) -> crate::core::ToolOutcomeStatus {
+    serde_json::from_str(&format!("\"{raw}\""))
+        .unwrap_or(crate::core::ToolOutcomeStatus::FatalError)
 }
 
-fn parse_experience_run_row(row: &sea_orm::QueryResult) -> Result<experience_run::Model> {
-    Ok(experience_run::Model {
-        id: row.try_get("", "id")?,
-        execution_run_id: row.try_get("", "execution_run_id").ok(),
-        trace_id: row.try_get("", "trace_id").ok(),
-        conversation_id: row.try_get("", "conversation_id").ok(),
-        project_id: row.try_get("", "project_id").ok(),
-        channel: row.try_get("", "channel")?,
-        scope: row.try_get("", "scope")?,
-        intent_key: row.try_get("", "intent_key")?,
-        task_type: row.try_get("", "task_type").ok(),
-        request_text: row.try_get("", "request_text").ok(),
-        tool_sequence_digest: row.try_get("", "tool_sequence_digest").ok(),
-        tool_sequence_json: parse_json_text(
-            row.try_get("", "tool_sequence_json").ok(),
-            JsonValue::Array(Vec::new()),
-        ),
-        strategy_version: row.try_get("", "strategy_version").ok(),
-        policy_version: row.try_get("", "policy_version").ok(),
-        prompt_version: row.try_get("", "prompt_version").ok(),
-        model_slot: row.try_get("", "model_slot").ok(),
-        success_state: row.try_get("", "success_state")?,
-        correction_state: row.try_get("", "correction_state")?,
-        outcome_summary: row.try_get("", "outcome_summary").ok(),
-        failure_reason: row.try_get("", "failure_reason").ok(),
-        metadata: parse_json_text(
-            row.try_get("", "metadata").ok(),
-            JsonValue::Object(serde_json::Map::new()),
-        ),
-        consolidated: row.try_get("", "consolidated")?,
-        accepted_at: row.try_get("", "accepted_at").ok(),
-        corrected_at: row.try_get("", "corrected_at").ok(),
-        created_at: row.try_get("", "created_at")?,
-        updated_at: row.try_get("", "updated_at")?,
-    })
+fn parse_failure_class(raw: Option<String>) -> Option<crate::core::FailureClass> {
+    raw.and_then(|value| serde_json::from_str(&format!("\"{value}\"")).ok())
 }
 
-fn parse_experience_item_row(row: &sea_orm::QueryResult) -> Result<experience_item::Model> {
-    Ok(experience_item::Model {
-        id: row.try_get("", "id")?,
-        kind: row.try_get("", "kind")?,
-        scope: row.try_get("", "scope")?,
-        project_id: row.try_get("", "project_id").ok(),
-        conversation_id: row.try_get("", "conversation_id").ok(),
-        title: row.try_get("", "title")?,
-        content: row.try_get("", "content")?,
-        normalized_key: row.try_get("", "normalized_key")?,
-        confidence: row.try_get("", "confidence")?,
-        support_count: row.try_get("", "support_count")?,
-        contradiction_count: row.try_get("", "contradiction_count")?,
-        status: row.try_get("", "status")?,
-        metadata: parse_json_text(
-            row.try_get("", "metadata").ok(),
-            JsonValue::Object(serde_json::Map::new()),
-        ),
-        last_supported_at: row.try_get("", "last_supported_at").ok(),
-        last_contradicted_at: row.try_get("", "last_contradicted_at").ok(),
-        created_at: row.try_get("", "created_at")?,
-        updated_at: row.try_get("", "updated_at")?,
-    })
+fn model_to_execution_run(model: execution_run::Model) -> crate::core::ExecutionRun {
+    let attempted_models = decrypt_storage_string(&model.attempted_models);
+    let degradation = decrypt_storage_string(&model.degradation);
+    crate::core::ExecutionRun {
+        id: model.id,
+        kind: model.kind,
+        request_id: model.request_id,
+        status: parse_execution_run_status(&model.status),
+        current_stage: model.current_stage,
+        lease_owner: model.lease_owner,
+        lease_expires_at: model.lease_expires_at,
+        attempt: model.attempt.max(0) as u32,
+        deadline_at: model.deadline_at,
+        cancellation_requested: model.cancellation_requested,
+        degradation: serde_json::from_str(&degradation).unwrap_or_default(),
+        last_error: decrypt_optional_storage_string(model.last_error),
+        result_summary: decrypt_optional_storage_string(model.result_summary),
+        trace_id: model.trace_id,
+        conversation_id: model.conversation_id,
+        channel: model.channel,
+        request_message: decrypt_optional_storage_string(model.request_message),
+        attempted_models: serde_json::from_str(&attempted_models).unwrap_or_default(),
+        created_at: model.created_at,
+        updated_at: model.updated_at,
+    }
 }
 
-fn parse_procedural_pattern_row(row: &sea_orm::QueryResult) -> Result<procedural_pattern::Model> {
-    Ok(procedural_pattern::Model {
-        id: row.try_get("", "id")?,
-        intent_key: row.try_get("", "intent_key")?,
-        scope: row.try_get("", "scope")?,
-        project_id: row.try_get("", "project_id").ok(),
-        conversation_id: row.try_get("", "conversation_id").ok(),
-        title: row.try_get("", "title")?,
-        trigger_summary: row.try_get("", "trigger_summary")?,
-        summary: row.try_get("", "summary")?,
-        tool_sequence_digest: row.try_get("", "tool_sequence_digest").ok(),
-        steps_json: parse_json_text(
-            row.try_get("", "steps_json").ok(),
-            JsonValue::Array(Vec::new()),
-        ),
-        tool_sequence_json: parse_json_text(
-            row.try_get("", "tool_sequence_json").ok(),
-            JsonValue::Array(Vec::new()),
-        ),
-        sample_count: row.try_get("", "sample_count")?,
-        success_count: row.try_get("", "success_count")?,
-        correction_count: row.try_get("", "correction_count")?,
-        success_rate: row.try_get("", "success_rate")?,
-        last_validated_at: row.try_get("", "last_validated_at").ok(),
-        status: row.try_get("", "status")?,
-        metadata: parse_json_text(
-            row.try_get("", "metadata").ok(),
-            JsonValue::Object(serde_json::Map::new()),
-        ),
-        created_at: row.try_get("", "created_at")?,
-        updated_at: row.try_get("", "updated_at")?,
-    })
+fn model_to_tool_attempt(model: tool_attempt::Model) -> crate::core::ToolAttempt {
+    crate::core::ToolAttempt {
+        id: model.id,
+        run_id: model.run_id,
+        sequence_no: model.sequence_no.max(0) as u32,
+        tool_name: model.tool_name,
+        status: parse_tool_outcome_status(&model.status),
+        failure_class: parse_failure_class(model.failure_class),
+        retryable: model.retryable,
+        side_effect_level: model.side_effect_level,
+        idempotency_key: model.idempotency_key,
+        arguments_json: decrypt_storage_string(&model.arguments_json),
+        output_json: decrypt_storage_string(&model.output_json),
+        started_at: model.started_at,
+        completed_at: model.completed_at,
+        error_text: decrypt_optional_storage_string(model.error_text),
+    }
 }
 
-fn parse_learning_candidate_row(row: &sea_orm::QueryResult) -> Result<learning_candidate::Model> {
-    Ok(learning_candidate::Model {
-        id: row.try_get("", "id")?,
-        candidate_type: row.try_get("", "candidate_type")?,
-        subject_key: row.try_get("", "subject_key")?,
-        title: row.try_get("", "title")?,
-        summary: row.try_get("", "summary").ok(),
-        project_id: row.try_get("", "project_id").ok(),
-        conversation_id: row.try_get("", "conversation_id").ok(),
-        pattern_id: row.try_get("", "pattern_id").ok(),
-        evidence_refs: parse_json_text(
-            row.try_get("", "evidence_refs").ok(),
-            JsonValue::Array(Vec::new()),
-        ),
-        proposed_content: parse_json_text(
-            row.try_get("", "proposed_content").ok(),
-            JsonValue::Object(serde_json::Map::new()),
-        ),
-        confidence: row.try_get("", "confidence")?,
-        approval_status: row.try_get("", "approval_status")?,
-        review_notes: row.try_get("", "review_notes").ok(),
-        reviewed_at: row.try_get("", "reviewed_at").ok(),
-        approved_ref: row.try_get("", "approved_ref").ok(),
-        created_at: row.try_get("", "created_at")?,
-        updated_at: row.try_get("", "updated_at")?,
-    })
+fn scope_match_rank(
+    record_project_id: Option<&str>,
+    record_conversation_id: Option<&str>,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> i32 {
+    if conversation_id.is_some() && record_conversation_id == conversation_id {
+        3
+    } else if project_id.is_some() && record_project_id == project_id {
+        2
+    } else if record_project_id.is_none() && record_conversation_id.is_none() {
+        1
+    } else {
+        0
+    }
+}
+
+fn experience_item_kind_rank(kind: &str) -> i32 {
+    match kind {
+        "constraint" => 0,
+        "personal_fact" => 1,
+        "lesson" => 2,
+        "procedure" => 3,
+        _ => 4,
+    }
+}
+
+fn procedural_pattern_status_rank(status: &str) -> i32 {
+    match status {
+        "active" => 2,
+        "draft" => 1,
+        _ => 0,
+    }
+}
+
+fn normalized_search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn matches_search_terms(terms: &[String], fields: &[&str]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let haystack = fields.join(" ").to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn search_score(terms: &[String], weighted_fields: &[(&str, f64)]) -> f64 {
+    let mut score = 0.0;
+    for (field, weight) in weighted_fields {
+        let lower = field.to_ascii_lowercase();
+        for term in terms {
+            let occurrences = lower.matches(term).count() as f64;
+            if occurrences > 0.0 {
+                score += occurrences * *weight;
+            }
+        }
+    }
+    score
 }
 
 #[derive(Debug, Clone)]
@@ -472,9 +472,20 @@ pub struct LeaseStatusSummary {
 impl Storage {
     const DATABASE_MAX_INTEGER: u64 = i64::MAX as u64;
     const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
+    const UPLOAD_MANIFEST_KEY_PREFIX: &'static str = "upload_manifest:";
     const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
     const MAX_DOCUMENTS_FOR_SEARCH: u64 = 5_000;
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
+    const MAX_LLM_USAGE_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_FACT_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_TASK_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_EXPENSE_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_SWARM_DELEGATION_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_PROJECT_ROWS_PER_QUERY: u64 = 1_000;
+    const MAX_EXPERIENCE_RUN_ROWS_PER_QUERY: u64 = 1_000;
+    const MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY: u64 = 2_000;
+    const MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY: u64 = 2_000;
+    const MAX_RELATED_EXPERIENCE_EDGE_ROWS_PER_QUERY: u64 = 5_000;
     const SENSITIVE_PAYLOAD_BACKFILL_MARKER_KEY: &'static str =
         "storage_sensitive_payload_backfill_v4";
 
@@ -488,57 +499,8 @@ impl Storage {
         offset.min(Self::DATABASE_MAX_INTEGER)
     }
 
-    #[inline]
-    fn db_bound_integer(value: u64) -> i64 {
-        value.min(Self::DATABASE_MAX_INTEGER) as i64
-    }
-
-    fn backend_bind_sql(backend: DbBackend, sql: &str) -> String {
-        if backend != DbBackend::Postgres {
-            return sql.to_string();
-        }
-
-        let mut out = String::with_capacity(sql.len() + 16);
-        let mut index = 1_u32;
-        let mut chars = sql.chars().peekable();
-        let mut in_single_quote = false;
-
-        while let Some(ch) = chars.next() {
-            if ch == '\'' {
-                out.push(ch);
-                if in_single_quote && chars.peek() == Some(&'\'') {
-                    out.push(chars.next().unwrap_or('\''));
-                    continue;
-                }
-                in_single_quote = !in_single_quote;
-                continue;
-            }
-
-            if ch == '?' && !in_single_quote {
-                out.push('$');
-                out.push_str(&index.to_string());
-                index += 1;
-            } else {
-                out.push(ch);
-            }
-        }
-
-        out
-    }
-
-    fn statement_with_values(
-        backend: DbBackend,
-        sql: impl Into<String>,
-        values: Vec<sea_orm::Value>,
-    ) -> Statement {
-        let sql = sql.into();
-        Statement::from_sql_and_values(backend, Self::backend_bind_sql(backend, &sql), values)
-    }
-
-    fn sql_placeholder_list(count: usize) -> String {
-        std::iter::repeat_n("?", count)
-            .collect::<Vec<_>>()
-            .join(", ")
+    fn upload_manifest_key(id: &str) -> String {
+        format!("{}{}", Self::UPLOAD_MANIFEST_KEY_PREFIX, id)
     }
 
     fn preference_row_id(key: &str, project_id: Option<&str>) -> String {
@@ -592,449 +554,9 @@ impl Storage {
         if db.get_database_backend() != DbBackend::Postgres {
             anyhow::bail!("Postgres storage requires the SeaORM Postgres backend");
         }
-        if let Some(schema_identifier) = config.quoted_schema_identifier() {
-            db.execute_unprepared(&format!(
-                "CREATE SCHEMA IF NOT EXISTS {};",
-                schema_identifier
-            ))
-            .await?;
-        }
         migrations::run(&db).await?;
         Ok(Self { db })
     }
-
-    #[allow(dead_code)]
-    /// Legacy schema bootstrap snapshot kept only until the remaining dead code is deleted.
-    async fn create_legacy_tables(db: &DatabaseConnection) -> Result<()> {
-        let backend = db.get_database_backend();
-        let _schema = Schema::new(backend);
-
-        // This path is intentionally unused; ordered Postgres migrations are authoritative.
-        db.execute_unprepared(
-            r#"
-            CREATE TABLE IF NOT EXISTS kv_store (
-                key TEXT PRIMARY KEY,
-                value BLOB NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS episodes (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                context TEXT NOT NULL,
-                embedding BLOB,
-                timestamp TEXT NOT NULL,
-                consolidated INTEGER DEFAULT 0,
-                importance REAL DEFAULT 0.5,
-                last_accessed TEXT,
-                access_count INTEGER DEFAULT 0,
-                project_id TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS semantic_facts (
-                id TEXT PRIMARY KEY,
-                fact TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                sources TEXT NOT NULL,
-                embedding BLOB,
-                created_at TEXT NOT NULL,
-                project_id TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS actions (
-                name TEXT PRIMARY KEY,
-                version TEXT NOT NULL,
-                wasm_hash TEXT,
-                source TEXT NOT NULL,
-                success_rate REAL DEFAULT 1.0,
-                execution_count INTEGER DEFAULT 0,
-                last_used TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS execution_proofs (
-                id TEXT PRIMARY KEY,
-                action_hash TEXT NOT NULL,
-                input_hash TEXT NOT NULL,
-                output_hash TEXT NOT NULL,
-                prev_hash TEXT,
-                timestamp TEXT NOT NULL,
-                signature TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS execution_traces (
-                id TEXT PRIMARY KEY,
-                message TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                duration_ms INTEGER,
-                step_count INTEGER NOT NULL DEFAULT 0,
-                steps_json TEXT NOT NULL,
-                response TEXT,
-                proof_id TEXT REFERENCES execution_proofs(id) ON DELETE SET NULL,
-                model TEXT,
-                input_tokens INTEGER NOT NULL DEFAULT 0,
-                output_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd REAL NOT NULL DEFAULT 0.0,
-                complexity TEXT,
-                created_at TEXT NOT NULL,
-                CHECK(step_count >= 0),
-                CHECK(input_tokens >= 0),
-                CHECK(output_tokens >= 0),
-                CHECK(total_tokens >= 0),
-                CHECK(cost_usd >= 0.0)
-            );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                action TEXT NOT NULL,
-                arguments TEXT NOT NULL,
-                approval TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                scheduled_for TEXT,
-                cron TEXT,
-                result TEXT,
-                proof_id TEXT REFERENCES execution_proofs(id) ON DELETE SET NULL,
-                priority REAL,
-                urgency REAL,
-                importance REAL,
-                eisenhower_quadrant INTEGER,
-                CHECK(length(trim(action)) > 0),
-                CHECK(eisenhower_quadrant IS NULL OR eisenhower_quadrant BETWEEN 1 AND 4)
-            );
-
-            CREATE TABLE IF NOT EXISTS swarm_agents (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                agent_type TEXT NOT NULL,
-                llm_provider TEXT NOT NULL,
-                capabilities TEXT NOT NULL,
-                system_prompt TEXT,
-                enabled INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL,
-                CHECK(enabled IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS swarm_delegations (
-                id TEXT PRIMARY KEY,
-                parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-                agent_id TEXT NOT NULL REFERENCES swarm_agents(id) ON DELETE CASCADE,
-                task_description TEXT NOT NULL,
-                result TEXT,
-                success INTEGER DEFAULT 0,
-                confidence REAL,
-                execution_time_ms INTEGER,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                CHECK(success IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                message_count INTEGER DEFAULT 0,
-                archived INTEGER DEFAULT 0,
-                starred INTEGER DEFAULT 0,
-                CHECK(message_count >= 0),
-                CHECK(archived IN (0, 1)),
-                CHECK(starred IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                model_used TEXT,
-                trace_id TEXT REFERENCES execution_traces(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                system_prompt TEXT,
-                personality TEXT,
-                tools_filter TEXT,
-                active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                CHECK(active IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS documents (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                chunk_count INTEGER DEFAULT 0,
-                file_size INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                CHECK(chunk_count >= 0),
-                CHECK(file_size >= 0)
-            );
-
-            CREATE TABLE IF NOT EXISTS document_chunks (
-                id TEXT PRIMARY KEY,
-                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                embedding BLOB,
-                CHECK(chunk_index >= 0)
-            );
-
-            CREATE TABLE IF NOT EXISTS notifications (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                level TEXT NOT NULL DEFAULT 'info',
-                source TEXT NOT NULL DEFAULT '',
-                read INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                CHECK(read IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS approval_log (
-                id TEXT PRIMARY KEY,
-                action_name TEXT NOT NULL,
-                arguments TEXT NOT NULL,
-                rule_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                requested_at TEXT NOT NULL,
-                resolved_at TEXT,
-                resolved_by TEXT,
-                CHECK(status IN ('pending', 'approved', 'denied', 'expired'))
-            );
-
-            CREATE TABLE IF NOT EXISTS automation_runs (
-                id TEXT PRIMARY KEY,
-                automation_id TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS automation_supervisor_states (
-                automation_id TEXT PRIMARY KEY,
-                updated_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS watchers (
-                id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_proofs_timestamp ON execution_proofs(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_execution_traces_created ON execution_traces(created_at);
-            CREATE INDEX IF NOT EXISTS idx_execution_traces_started ON execution_traces(started_at);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_for ON tasks(scheduled_for);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status_scheduled ON tasks(status, scheduled_for);
-            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
-            CREATE INDEX IF NOT EXISTS idx_swarm_delegations_agent ON swarm_delegations(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_messages_role_timestamp ON messages(role, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id);
-            CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
-            CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(document_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_document_chunks_doc_chunk ON document_chunks(document_id, chunk_index);
-            CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
-            CREATE INDEX IF NOT EXISTS idx_approval_log_status ON approval_log(status);
-            CREATE INDEX IF NOT EXISTS idx_approval_log_requested ON approval_log(requested_at);
-            CREATE INDEX IF NOT EXISTS idx_automation_runs_started ON automation_runs(started_at);
-            CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_id ON automation_runs(automation_id);
-            CREATE INDEX IF NOT EXISTS idx_watchers_status ON watchers(status);
-            CREATE INDEX IF NOT EXISTS idx_watchers_created ON watchers(created_at);
-            CREATE TABLE IF NOT EXISTS expenses (
-                id TEXT PRIMARY KEY,
-                amount REAL NOT NULL,
-                currency TEXT NOT NULL DEFAULT 'USD',
-                category TEXT NOT NULL,
-                description TEXT NOT NULL,
-                date TEXT NOT NULL,
-                payment_method TEXT,
-                vendor TEXT,
-                tags TEXT,
-                split_with TEXT,
-                receipt_path TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS security_logs (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                message TEXT NOT NULL,
-                source TEXT,
-                count INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS operational_logs (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                trace_id TEXT REFERENCES execution_traces(id) ON DELETE SET NULL,
-                conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
-                channel TEXT NOT NULL DEFAULT '',
-                event_type TEXT NOT NULL,
-                success INTEGER NOT NULL DEFAULT 0,
-                outcome TEXT NOT NULL DEFAULT '',
-                tool_name TEXT,
-                latency_ms INTEGER,
-                arguments TEXT,
-                payload TEXT,
-                strategy_version TEXT,
-                policy_version TEXT,
-                prompt_version TEXT,
-                model_slot TEXT,
-                CHECK(success IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS llm_usage (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                purpose TEXT NOT NULL DEFAULT '',
-                prompt_tokens INTEGER NOT NULL,
-                completion_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                estimated INTEGER NOT NULL DEFAULT 1,
-                CHECK(prompt_tokens >= 0),
-                CHECK(completion_tokens >= 0),
-                CHECK(total_tokens >= 0),
-                CHECK(estimated IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                id TEXT PRIMARY KEY,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                confidence REAL NOT NULL DEFAULT 0.8,
-                source TEXT,
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                CHECK(confidence >= 0.0 AND confidence <= 1.0)
-            );
-
-            CREATE TABLE IF NOT EXISTS user_data_items (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                url TEXT,
-                source_channel TEXT,
-                conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                pinned INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                CHECK(pinned IN (0, 1))
-            );
-
-            CREATE TABLE IF NOT EXISTS knowledge_items (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT,
-                url TEXT,
-                tags TEXT,
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_proofs_timestamp ON execution_proofs(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_swarm_delegations_agent ON swarm_delegations(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id);
-            CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id);
-            CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(document_id);
-            CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
-            CREATE INDEX IF NOT EXISTS idx_approval_log_status ON approval_log(status);
-            CREATE INDEX IF NOT EXISTS idx_approval_log_requested ON approval_log(requested_at);
-            CREATE INDEX IF NOT EXISTS idx_episodes_project_id ON episodes(project_id);
-            CREATE INDEX IF NOT EXISTS idx_facts_project_id ON semantic_facts(project_id);
-            CREATE INDEX IF NOT EXISTS idx_security_logs_created ON security_logs(created_at);
-            CREATE INDEX IF NOT EXISTS idx_security_logs_type ON security_logs(event_type);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_created ON operational_logs(created_at);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_event_type ON operational_logs(event_type);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_tool_name ON operational_logs(tool_name);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_success ON operational_logs(success);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_policy_version ON operational_logs(policy_version);
-            CREATE INDEX IF NOT EXISTS idx_operational_logs_strategy_version ON operational_logs(strategy_version);
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at);
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(model);
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage(provider);
-            CREATE INDEX IF NOT EXISTS idx_llm_usage_channel ON llm_usage(channel);
-            CREATE INDEX IF NOT EXISTS idx_user_preferences_key ON user_preferences(key);
-            CREATE INDEX IF NOT EXISTS idx_user_preferences_project ON user_preferences(project_id);
-            CREATE INDEX IF NOT EXISTS idx_user_data_kind ON user_data_items(kind);
-            CREATE INDEX IF NOT EXISTS idx_user_data_conversation ON user_data_items(conversation_id);
-            CREATE INDEX IF NOT EXISTS idx_user_data_url ON user_data_items(url);
-            CREATE INDEX IF NOT EXISTS idx_user_data_project ON user_data_items(project_id);
-            CREATE INDEX IF NOT EXISTS idx_user_data_updated ON user_data_items(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_items(project_id);
-            CREATE INDEX IF NOT EXISTS idx_knowledge_updated ON knowledge_items(updated_at);
-            "#,
-        )
-        .await?;
-
-        // ── Migrations for existing databases ──────────────────────────────
-        // Migrations for existing databases.
-        // Only "duplicate column name" is treated as safe/expected.
-        // Any other migration error now fails startup.
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_episodes_project;")
-            .await?;
-
-        let alter_stmts = vec![
-            "ALTER TABLE execution_traces ADD COLUMN model TEXT",
-            "ALTER TABLE execution_traces ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE execution_traces ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE execution_traces ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE execution_traces ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0.0",
-            "ALTER TABLE execution_traces ADD COLUMN complexity TEXT",
-            "ALTER TABLE conversations ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
-        ];
-        for stmt in alter_stmts {
-            Self::apply_legacy_add_column_migration(db, stmt).await?;
-        }
-
-        db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_conversations_starred_updated ON conversations(starred, updated_at);",
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn apply_legacy_add_column_migration(
-        _db: &DatabaseConnection,
-        _stmt: &str,
-    ) -> Result<()> {
-        anyhow::bail!("Legacy column migrations have been removed")
-    }
-
     // ==================== Key-Value Store ====================
 
     /// Get a value from the key-value store
@@ -1049,34 +571,19 @@ impl Storage {
     /// Set a value in the key-value store
     pub async fn set(&self, key: &str, value: &[u8]) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-
-        // Try to find existing
-        let existing = kv_store::Entity::find_by_id(key.to_string())
-            .one(&self.db)
-            .await?;
-
-        if existing.is_some() {
-            // Update
-            kv_store::ActiveModel {
-                key: Set(key.to_string()),
-                value: Set(value.to_vec()),
-                created_at: sea_orm::NotSet,
-                updated_at: Set(now),
-            }
-            .update(&self.db)
-            .await?;
-        } else {
-            // Insert
-            kv_store::ActiveModel {
-                key: Set(key.to_string()),
-                value: Set(value.to_vec()),
-                created_at: Set(now.clone()),
-                updated_at: Set(now),
-            }
-            .insert(&self.db)
-            .await?;
-        }
-
+        kv_store::Entity::insert(kv_store::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(value.to_vec()),
+            created_at: Set(now.clone()),
+            updated_at: Set(now),
+        })
+        .on_conflict(
+            OnConflict::column(kv_store::Column::Key)
+                .update_columns([kv_store::Column::Value, kv_store::Column::UpdatedAt])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -1098,6 +605,19 @@ impl Storage {
     pub async fn set_encrypted(&self, key: &str, value: &[u8]) -> Result<()> {
         let encrypted = encrypt_storage_bytes(value)?;
         self.set(key, &encrypted).await
+    }
+
+    pub async fn save_upload_manifest(&self, manifest: &UploadManifest) -> Result<()> {
+        let encoded = serde_json::to_vec(manifest)?;
+        self.set_encrypted(&Self::upload_manifest_key(&manifest.id), &encoded)
+            .await
+    }
+
+    pub async fn load_upload_manifest(&self, id: &str) -> Result<Option<UploadManifest>> {
+        let Some(raw) = self.get_encrypted(&Self::upload_manifest_key(id)).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice::<UploadManifest>(&raw)?))
     }
 
     pub async fn reencrypt_sensitive_payloads(
@@ -1417,47 +937,35 @@ impl Storage {
             .await?;
         }
 
-        let backend = txn.get_database_backend();
-        let automation_runs = txn
-            .query_all(Statement::from_string(
-                backend,
-                "SELECT id, payload FROM automation_runs".to_string(),
-            ))
-            .await?;
+        let automation_runs = automation_run::Entity::find().all(&txn).await?;
         for row in automation_runs {
-            let id: String = row.try_get("", "id")?;
-            let payload: String = row.try_get("", "payload")?;
             let plaintext = old_key
-                .decrypt_string(&payload)
-                .unwrap_or_else(|_| payload.clone());
+                .decrypt_string(&row.payload)
+                .unwrap_or_else(|_| row.payload.clone());
             let encrypted = new_key.encrypt_string(&plaintext)?;
-            txn.execute(Self::statement_with_values(
-                backend,
-                "UPDATE automation_runs SET payload = ? WHERE id = ?".to_string(),
-                vec![encrypted.into(), id.into()],
-            ))
+            automation_run::ActiveModel {
+                id: Unchanged(row.id),
+                payload: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
             .await?;
         }
 
-        let automation_states = txn
-            .query_all(Statement::from_string(
-                backend,
-                "SELECT automation_id, payload FROM automation_supervisor_states".to_string(),
-            ))
+        let automation_states = automation_supervisor_state::Entity::find()
+            .all(&txn)
             .await?;
         for row in automation_states {
-            let automation_id: String = row.try_get("", "automation_id")?;
-            let payload: String = row.try_get("", "payload")?;
             let plaintext = old_key
-                .decrypt_string(&payload)
-                .unwrap_or_else(|_| payload.clone());
+                .decrypt_string(&row.payload)
+                .unwrap_or_else(|_| row.payload.clone());
             let encrypted = new_key.encrypt_string(&plaintext)?;
-            txn.execute(Self::statement_with_values(
-                backend,
-                "UPDATE automation_supervisor_states SET payload = ? WHERE automation_id = ?"
-                    .to_string(),
-                vec![encrypted.into(), automation_id.into()],
-            ))
+            automation_supervisor_state::ActiveModel {
+                automation_id: Unchanged(row.automation_id),
+                payload: Set(encrypted),
+                ..Default::default()
+            }
+            .update(&txn)
             .await?;
         }
 
@@ -1544,6 +1052,7 @@ impl Storage {
         let rows = llm_usage::Entity::find()
             .filter(llm_usage::Column::CreatedAt.gte(since_rfc3339.to_string()))
             .order_by_asc(llm_usage::Column::CreatedAt)
+            .limit(Self::MAX_LLM_USAGE_ROWS_PER_QUERY)
             .all(&self.db)
             .await?;
         Ok(rows)
@@ -1557,7 +1066,7 @@ impl Storage {
         id: &str,
         content: &str,
         context: &str,
-        embedding: Option<Vec<u8>>,
+        embedding: Option<PgVector>,
         importance: f32,
         project_id: Option<&str>,
     ) -> Result<()> {
@@ -1691,7 +1200,7 @@ impl Storage {
         fact: &str,
         confidence: f32,
         sources: &str,
-        embedding: Option<Vec<u8>>,
+        embedding: Option<PgVector>,
         project_id: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -1713,7 +1222,11 @@ impl Storage {
 
     /// Get all semantic facts
     pub async fn get_facts(&self) -> Result<Vec<semantic_fact::Model>> {
-        let facts = semantic_fact::Entity::find().all(&self.db).await?;
+        let facts = semantic_fact::Entity::find()
+            .order_by_desc(semantic_fact::Column::CreatedAt)
+            .limit(Self::MAX_FACT_ROWS_PER_QUERY)
+            .all(&self.db)
+            .await?;
         Ok(facts)
     }
 
@@ -1765,6 +1278,22 @@ impl Storage {
         Ok(facts)
     }
 
+    /// Get only global-scope semantic facts.
+    pub async fn get_global_facts(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<semantic_fact::Model>> {
+        let facts = semantic_fact::Entity::find()
+            .filter(semantic_fact::Column::ProjectId.is_null())
+            .order_by_desc(semantic_fact::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        Ok(facts)
+    }
+
     /// Count facts
     pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
         let mut query = semantic_fact::Entity::find();
@@ -1772,6 +1301,14 @@ impl Storage {
             query = query.filter(semantic_fact::Column::ProjectId.eq(pid));
         }
         Ok(query.count(&self.db).await?)
+    }
+
+    /// Count only global-scope semantic facts.
+    pub async fn count_global_facts(&self) -> Result<u64> {
+        Ok(semantic_fact::Entity::find()
+            .filter(semantic_fact::Column::ProjectId.is_null())
+            .count(&self.db)
+            .await?)
     }
 
     /// Get episodes for scoring, scoped to project (includes global episodes too)
@@ -1866,6 +1403,25 @@ impl Storage {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
         let mut rows = query
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.value = decrypt_storage_string(&row.value);
+        }
+        Ok(rows)
+    }
+
+    /// List only global-scope user preferences.
+    pub async fn list_global_user_preferences(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<user_preference::Model>> {
+        let mut rows = user_preference::Entity::find()
+            .filter(user_preference::Column::ProjectId.is_null())
+            .order_by_desc(user_preference::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
@@ -2012,6 +1568,31 @@ impl Storage {
         Ok(rows)
     }
 
+    /// List only global-scope user data items.
+    pub async fn list_global_user_data_items(
+        &self,
+        limit: u64,
+        offset: u64,
+        kind: Option<&str>,
+    ) -> Result<Vec<user_data_item::Model>> {
+        let mut query = user_data_item::Entity::find()
+            .filter(user_data_item::Column::ProjectId.is_null())
+            .order_by_desc(user_data_item::Column::UpdatedAt);
+        if let Some(kind_value) = kind.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            query = query.filter(user_data_item::Column::Kind.eq(kind_value));
+        }
+        let mut rows = query
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.title = decrypt_storage_string(&row.title);
+            row.content = decrypt_storage_string(&row.content);
+        }
+        Ok(rows)
+    }
+
     /// Count user data items by scope and optional kind.
     pub async fn count_user_data_items(
         &self,
@@ -2083,6 +1664,26 @@ impl Storage {
             query = query.filter(knowledge_item::Column::ProjectId.eq(pid));
         }
         let mut rows = query
+            .limit(Self::db_limit(limit))
+            .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.title = decrypt_storage_string(&row.title);
+            row.content = decrypt_storage_string(&row.content);
+        }
+        Ok(rows)
+    }
+
+    /// List only global-scope knowledge items.
+    pub async fn list_global_knowledge_items(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<knowledge_item::Model>> {
+        let mut rows = knowledge_item::Entity::find()
+            .filter(knowledge_item::Column::ProjectId.is_null())
+            .order_by_desc(knowledge_item::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
@@ -2259,29 +1860,34 @@ impl Storage {
         lease_expires_at: &str,
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
-        let backend = self.db.get_database_backend();
-        let result = self
-            .db
-            .execute(Self::statement_with_values(
-                backend,
-                "UPDATE tasks
-                 SET status = ?, updated_at = ?, lease_owner = ?, lease_expires_at = ?, lease_version = lease_version + 1
-                 WHERE id = ?
-                   AND status = ?
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)"
-                    .to_string(),
-                vec![
-                    in_progress_status.to_string().into(),
-                    now.into(),
-                    lease_owner.to_string().into(),
-                    lease_expires_at.to_string().into(),
-                    id.to_string().into(),
-                    expected_status.to_string().into(),
-                    chrono::Utc::now().to_rfc3339().into(),
-                ],
-            ))
+        let result = task::Entity::update_many()
+            .col_expr(
+                task::Column::Status,
+                Expr::value(in_progress_status.to_string()),
+            )
+            .col_expr(task::Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                task::Column::LeaseOwner,
+                Expr::value(lease_owner.to_string()),
+            )
+            .col_expr(
+                task::Column::LeaseExpiresAt,
+                Expr::value(lease_expires_at.to_string()),
+            )
+            .col_expr(
+                task::Column::LeaseVersion,
+                Expr::col(task::Column::LeaseVersion).add(1),
+            )
+            .filter(task::Column::Id.eq(id))
+            .filter(task::Column::Status.eq(expected_status))
+            .filter(
+                Condition::any()
+                    .add(task::Column::LeaseExpiresAt.is_null())
+                    .add(task::Column::LeaseExpiresAt.lte(chrono::Utc::now().to_rfc3339())),
+            )
+            .exec(&self.db)
             .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn record_task_run_metadata(
@@ -2314,7 +1920,11 @@ impl Storage {
 
     /// Get all tasks
     pub async fn get_tasks(&self) -> Result<Vec<task::Model>> {
-        let mut tasks = task::Entity::find().all(&self.db).await?;
+        let mut tasks = task::Entity::find()
+            .order_by_desc(task::Column::CreatedAt)
+            .limit(Self::MAX_TASK_ROWS_PER_QUERY)
+            .all(&self.db)
+            .await?;
         for task in &mut tasks {
             task.description = decrypt_storage_string(&task.description);
             task.arguments = decrypt_storage_string(&task.arguments);
@@ -2328,18 +1938,14 @@ impl Storage {
         &self,
         limit: usize,
     ) -> Result<Vec<crate::core::automation::AutomationRunRecord>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT payload FROM automation_runs ORDER BY started_at DESC LIMIT ?".to_string(),
-                vec![(limit.max(1) as i64).into()],
-            ))
-            .await?;
         let mut runs = Vec::new();
-        for row in rows {
-            let payload = decrypt_storage_string(&row.try_get::<String>("", "payload")?);
+        for row in automation_run::Entity::find()
+            .order_by_desc(automation_run::Column::StartedAt)
+            .limit(limit.max(1) as u64)
+            .all(&self.db)
+            .await?
+        {
+            let payload = decrypt_storage_string(&row.payload);
             if let Ok(run) =
                 serde_json::from_str::<crate::core::automation::AutomationRunRecord>(&payload)
             {
@@ -2354,47 +1960,51 @@ impl Storage {
         run: &crate::core::automation::AutomationRunRecord,
         max_records: usize,
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO automation_runs (id, automation_id, started_at, payload) VALUES (?, ?, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET automation_id=excluded.automation_id, started_at=excluded.started_at, payload=excluded.payload"
-                    .to_string(),
-                vec![
-                    run.id.clone().into(),
-                    run.automation_id.clone().into(),
-                    run.started_at.clone().into(),
-                    encrypt_storage_string(&serde_json::to_string(run)?)?.into(),
-                ],
-            ))
-            .await?;
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "DELETE FROM automation_runs WHERE id NOT IN (SELECT id FROM automation_runs ORDER BY started_at DESC LIMIT ?)"
-                    .to_string(),
-                vec![(max_records.max(1) as i64).into()],
-            ))
-            .await?;
+        automation_run::Entity::insert(automation_run::ActiveModel {
+            id: Set(run.id.clone()),
+            automation_id: Set(run.automation_id.clone()),
+            started_at: Set(run.started_at.clone()),
+            payload: Set(encrypt_storage_string(&serde_json::to_string(run)?)?),
+        })
+        .on_conflict(
+            OnConflict::column(automation_run::Column::Id)
+                .update_columns([
+                    automation_run::Column::AutomationId,
+                    automation_run::Column::StartedAt,
+                    automation_run::Column::Payload,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+
+        let overflow_ids = automation_run::Entity::find()
+            .order_by_desc(automation_run::Column::StartedAt)
+            .offset(max_records.max(1) as u64)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        if !overflow_ids.is_empty() {
+            automation_run::Entity::delete_many()
+                .filter(automation_run::Column::Id.is_in(overflow_ids))
+                .exec(&self.db)
+                .await?;
+        }
         Ok(())
     }
 
     pub async fn list_automation_supervisor_states(
         &self,
     ) -> Result<Vec<crate::core::automation::AutomationSupervisorState>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Statement::from_string(
-                backend,
-                "SELECT payload FROM automation_supervisor_states ORDER BY updated_at DESC"
-                    .to_string(),
-            ))
-            .await?;
         let mut states = Vec::new();
-        for row in rows {
-            let payload = decrypt_storage_string(&row.try_get::<String>("", "payload")?);
+        for row in automation_supervisor_state::Entity::find()
+            .order_by_desc(automation_supervisor_state::Column::UpdatedAt)
+            .all(&self.db)
+            .await?
+        {
+            let payload = decrypt_storage_string(&row.payload);
             if let Ok(state) =
                 serde_json::from_str::<crate::core::automation::AutomationSupervisorState>(&payload)
             {
@@ -2408,71 +2018,58 @@ impl Storage {
         &self,
         automation_id: &str,
     ) -> Result<Option<crate::core::automation::AutomationSupervisorState>> {
-        let backend = self.db.get_database_backend();
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                backend,
-                "SELECT payload FROM automation_supervisor_states WHERE automation_id = ?"
-                    .to_string(),
-                vec![automation_id.to_string().into()],
-            ))
-            .await?;
-        Ok(row
-            .and_then(|row| row.try_get::<String>("", "payload").ok())
-            .map(|payload| decrypt_storage_string(&payload))
-            .and_then(|payload| {
-                serde_json::from_str::<crate::core::automation::AutomationSupervisorState>(&payload)
+        Ok(
+            automation_supervisor_state::Entity::find_by_id(automation_id.to_string())
+                .one(&self.db)
+                .await?
+                .map(|row| decrypt_storage_string(&row.payload))
+                .and_then(|payload| {
+                    serde_json::from_str::<crate::core::automation::AutomationSupervisorState>(
+                        &payload,
+                    )
                     .ok()
-            }))
+                }),
+        )
     }
 
     pub async fn upsert_automation_supervisor_state(
         &self,
         state: &crate::core::automation::AutomationSupervisorState,
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
         let updated_at = state
             .last_run_at
             .clone()
             .or_else(|| state.created_at.clone())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO automation_supervisor_states
-                    (automation_id, updated_at, payload, next_retry_at, last_run_id, consecutive_failures)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(automation_id) DO UPDATE
-                 SET updated_at=excluded.updated_at,
-                     payload=excluded.payload,
-                     next_retry_at=excluded.next_retry_at,
-                     last_run_id=excluded.last_run_id,
-                     consecutive_failures=excluded.consecutive_failures"
-                    .to_string(),
-                vec![
-                    state.automation_id.clone().into(),
-                    updated_at.into(),
-                    encrypt_storage_string(&serde_json::to_string(state)?)?.into(),
-                    state.next_retry_at.clone().into(),
-                    state.last_run_id.clone().into(),
-                    (state.consecutive_failures as i64).into(),
-                ],
-            ))
-            .await?;
+        automation_supervisor_state::Entity::insert(automation_supervisor_state::ActiveModel {
+            automation_id: Set(state.automation_id.clone()),
+            updated_at: Set(updated_at),
+            payload: Set(encrypt_storage_string(&serde_json::to_string(state)?)?),
+            next_retry_at: Set(state.next_retry_at.clone()),
+            last_run_id: Set(state.last_run_id.clone()),
+            consecutive_failures: Set(state.consecutive_failures as i32),
+        })
+        .on_conflict(
+            OnConflict::column(automation_supervisor_state::Column::AutomationId)
+                .update_columns([
+                    automation_supervisor_state::Column::UpdatedAt,
+                    automation_supervisor_state::Column::Payload,
+                    automation_supervisor_state::Column::NextRetryAt,
+                    automation_supervisor_state::Column::LastRunId,
+                    automation_supervisor_state::Column::ConsecutiveFailures,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
     pub async fn delete_automation_supervisor_state(&self, automation_id: &str) -> Result<bool> {
-        let result = self
-            .db
-            .execute(Self::statement_with_values(
-                self.db.get_database_backend(),
-                "DELETE FROM automation_supervisor_states WHERE automation_id = ?".to_string(),
-                vec![automation_id.to_string().into()],
-            ))
+        let result = automation_supervisor_state::Entity::delete_by_id(automation_id.to_string())
+            .exec(&self.db)
             .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(result.rows_affected > 0)
     }
 
     pub async fn list_watchers(&self) -> Result<Vec<crate::core::watcher::Watcher>> {
@@ -2494,7 +2091,6 @@ impl Storage {
         &self,
         watchers: &[crate::core::watcher::Watcher],
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
         let txn = self.db.begin().await?;
         if watchers.is_empty() {
             watcher::Entity::delete_many().exec(&txn).await?;
@@ -2517,287 +2113,345 @@ impl Storage {
                 crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
                 crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
             };
-            txn.execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO watchers
-                    (id, status, created_at, updated_at, payload, next_retry_at, last_run_id, consecutive_failures)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE
-                 SET status = excluded.status,
-                     updated_at = excluded.updated_at,
-                     payload = excluded.payload,
-                     next_retry_at = excluded.next_retry_at,
-                     last_run_id = excluded.last_run_id,
-                     consecutive_failures = excluded.consecutive_failures"
-                    .to_string(),
-                vec![
-                    watcher.id.to_string().into(),
-                    status.into(),
-                    watcher.created_at.to_rfc3339().into(),
-                    chrono::Utc::now().to_rfc3339().into(),
-                    serde_json::to_string(watcher)?.into(),
-                    watcher
-                        .next_poll_not_before
-                        .map(|value| value.to_rfc3339())
-                        .into(),
-                    Option::<String>::None.into(),
-                    (watcher.consecutive_failures as i64).into(),
-                ],
-            ))
+            watcher::Entity::insert(watcher::ActiveModel {
+                id: Set(watcher.id.to_string()),
+                status: Set(status.to_string()),
+                created_at: Set(watcher.created_at.to_rfc3339()),
+                updated_at: Set(chrono::Utc::now().to_rfc3339()),
+                payload: Set(serde_json::to_string(watcher)?),
+                lease_owner: Set(None),
+                lease_expires_at: sea_orm::NotSet,
+                lease_version: Set(0),
+                next_retry_at: Set(watcher.next_poll_not_before.map(|value| value.to_rfc3339())),
+                last_run_id: Set(None),
+                consecutive_failures: Set(watcher.consecutive_failures as i32),
+            })
+            .on_conflict(
+                OnConflict::column(watcher::Column::Id)
+                    .update_columns([
+                        watcher::Column::Status,
+                        watcher::Column::UpdatedAt,
+                        watcher::Column::Payload,
+                        watcher::Column::NextRetryAt,
+                        watcher::Column::LastRunId,
+                        watcher::Column::ConsecutiveFailures,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&txn)
             .await?;
         }
         txn.commit().await?;
         Ok(())
     }
 
-    pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO execution_runs
-                    (id, kind, request_id, status, current_stage, lease_owner, lease_expires_at, attempt,
-                     deadline_at, cancellation_requested, degradation, last_error, result_summary,
-                     trace_id, conversation_id, channel, request_message, attempted_models,
-                     created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     request_id = excluded.request_id,
-                     status = excluded.status,
-                     current_stage = excluded.current_stage,
-                     lease_owner = excluded.lease_owner,
-                     lease_expires_at = excluded.lease_expires_at,
-                     attempt = excluded.attempt,
-                     deadline_at = excluded.deadline_at,
-                     cancellation_requested = excluded.cancellation_requested,
-                     degradation = excluded.degradation,
-                     last_error = excluded.last_error,
-                     result_summary = excluded.result_summary,
-                     trace_id = excluded.trace_id,
-                     conversation_id = excluded.conversation_id,
-                     channel = excluded.channel,
-                     request_message = excluded.request_message,
-                     attempted_models = excluded.attempted_models,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    run.id.clone().into(),
-                    run.kind.clone().into(),
-                    run.request_id.clone().into(),
-                    run.status.as_str().to_string().into(),
-                    run.current_stage.clone().into(),
-                    run.lease_owner.clone().into(),
-                    run.lease_expires_at.clone().into(),
-                    (run.attempt as i64).into(),
-                    run.deadline_at.clone().into(),
-                    run.cancellation_requested.into(),
-                    encrypt_storage_string(&serde_json::to_string(&run.degradation)?)?.into(),
-                    encrypt_optional_storage_string(run.last_error.as_deref())?.into(),
-                    encrypt_optional_storage_string(run.result_summary.as_deref())?.into(),
-                    run.trace_id.clone().into(),
-                    run.conversation_id.clone().into(),
-                    run.channel.clone().into(),
-                    encrypt_optional_storage_string(run.request_message.as_deref())?.into(),
-                    encrypt_storage_string(&serde_json::to_string(&run.attempted_models)?)?.into(),
-                    run.created_at.clone().into(),
-                    run.updated_at.clone().into(),
-                ],
-            ))
+    pub async fn list_browser_sessions(
+        &self,
+    ) -> Result<Vec<crate::core::browser_session::PersistedBrowserSession>> {
+        let rows = browser_session::Entity::find()
+            .order_by_desc(browser_session::Column::UpdatedAt)
+            .all(&self.db)
             .await?;
+        rows.into_iter()
+            .map(|row| {
+                let task_description = decrypt_storage_string(&row.task_description);
+                let chat_id = row.chat_id.map(|value| decrypt_storage_string(&value));
+                let status_detail = row
+                    .status_detail
+                    .map(|value| decrypt_storage_string(&value));
+                let action_history_json = decrypt_storage_string(&row.action_history_json);
+                Ok(crate::core::browser_session::PersistedBrowserSession {
+                    id: row.id,
+                    status: row.status,
+                    task_description,
+                    channel: row.channel,
+                    chat_id,
+                    status_detail,
+                    action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn upsert_browser_session(
+        &self,
+        session: &crate::core::browser_session::PersistedBrowserSession,
+    ) -> Result<()> {
+        browser_session::Entity::insert(browser_session::ActiveModel {
+            id: Set(session.id.clone()),
+            status: Set(session.status.clone()),
+            task_description: Set(encrypt_storage_string(&session.task_description)?),
+            channel: Set(session.channel.clone()),
+            chat_id: Set(encrypt_optional_storage_string(session.chat_id.as_deref())?),
+            status_detail: Set(encrypt_optional_storage_string(
+                session.status_detail.as_deref(),
+            )?),
+            action_history_json: Set(encrypt_storage_string(&serde_json::to_string(
+                &session.action_history,
+            )?)?),
+            created_at: Set(session.created_at.clone()),
+            updated_at: Set(session.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(browser_session::Column::Id)
+                .update_columns([
+                    browser_session::Column::Status,
+                    browser_session::Column::TaskDescription,
+                    browser_session::Column::Channel,
+                    browser_session::Column::ChatId,
+                    browser_session::Column::StatusDetail,
+                    browser_session::Column::ActionHistoryJson,
+                    browser_session::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_execution_run(&self, run: &crate::core::ExecutionRun) -> Result<()> {
+        execution_run::Entity::insert(execution_run::ActiveModel {
+            id: Set(run.id.clone()),
+            kind: Set(run.kind.clone()),
+            request_id: Set(run.request_id.clone()),
+            status: Set(run.status.as_str().to_string()),
+            current_stage: Set(run.current_stage.clone()),
+            lease_owner: Set(run.lease_owner.clone()),
+            lease_expires_at: Set(run.lease_expires_at.clone()),
+            attempt: Set(run.attempt as i32),
+            deadline_at: Set(run.deadline_at.clone()),
+            cancellation_requested: Set(run.cancellation_requested),
+            degradation: Set(encrypt_storage_string(&serde_json::to_string(
+                &run.degradation,
+            )?)?),
+            last_error: Set(encrypt_optional_storage_string(run.last_error.as_deref())?),
+            result_summary: Set(encrypt_optional_storage_string(
+                run.result_summary.as_deref(),
+            )?),
+            trace_id: Set(run.trace_id.clone()),
+            conversation_id: Set(run.conversation_id.clone()),
+            channel: Set(run.channel.clone()),
+            request_message: Set(encrypt_optional_storage_string(
+                run.request_message.as_deref(),
+            )?),
+            attempted_models: Set(encrypt_storage_string(&serde_json::to_string(
+                &run.attempted_models,
+            )?)?),
+            created_at: Set(run.created_at.clone()),
+            updated_at: Set(run.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(execution_run::Column::Id)
+                .update_columns([
+                    execution_run::Column::RequestId,
+                    execution_run::Column::Status,
+                    execution_run::Column::CurrentStage,
+                    execution_run::Column::LeaseOwner,
+                    execution_run::Column::LeaseExpiresAt,
+                    execution_run::Column::Attempt,
+                    execution_run::Column::DeadlineAt,
+                    execution_run::Column::CancellationRequested,
+                    execution_run::Column::Degradation,
+                    execution_run::Column::LastError,
+                    execution_run::Column::ResultSummary,
+                    execution_run::Column::TraceId,
+                    execution_run::Column::ConversationId,
+                    execution_run::Column::Channel,
+                    execution_run::Column::RequestMessage,
+                    execution_run::Column::AttemptedModels,
+                    execution_run::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
     pub async fn load_execution_run(&self, id: &str) -> Result<Option<crate::core::ExecutionRun>> {
-        let backend = self.db.get_database_backend();
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                backend,
-                "SELECT * FROM execution_runs WHERE id = ?".to_string(),
-                vec![id.to_string().into()],
-            ))
-            .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let status: String = row.try_get("", "status")?;
-        let attempted_models =
-            decrypt_storage_string(&row.try_get::<String>("", "attempted_models")?);
-        let degradation = decrypt_storage_string(&row.try_get::<String>("", "degradation")?);
-        Ok(Some(crate::core::ExecutionRun {
-            id: row.try_get("", "id")?,
-            kind: row.try_get("", "kind")?,
-            request_id: row.try_get("", "request_id").ok(),
-            status: serde_json::from_str(&format!("\"{}\"", status))
-                .unwrap_or(crate::core::ExecutionRunStatus::PlatformFailed),
-            current_stage: row.try_get("", "current_stage")?,
-            lease_owner: row.try_get("", "lease_owner").ok(),
-            lease_expires_at: row.try_get("", "lease_expires_at").ok(),
-            attempt: row.try_get::<i32>("", "attempt").unwrap_or_default().max(0) as u32,
-            deadline_at: row.try_get("", "deadline_at").ok(),
-            cancellation_requested: row
-                .try_get::<bool>("", "cancellation_requested")
-                .unwrap_or(false),
-            degradation: serde_json::from_str(&degradation).unwrap_or_default(),
-            last_error: decrypt_optional_storage_string(row.try_get("", "last_error").ok()),
-            result_summary: decrypt_optional_storage_string(row.try_get("", "result_summary").ok()),
-            trace_id: row.try_get("", "trace_id").ok(),
-            conversation_id: row.try_get("", "conversation_id").ok(),
-            channel: row.try_get("", "channel").ok(),
-            request_message: decrypt_optional_storage_string(
-                row.try_get("", "request_message").ok(),
-            ),
-            attempted_models: serde_json::from_str(&attempted_models).unwrap_or_default(),
-            created_at: row.try_get("", "created_at")?,
-            updated_at: row.try_get("", "updated_at")?,
-        }))
+        Ok(execution_run::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+            .map(model_to_execution_run))
+    }
+
+    pub async fn list_execution_runs_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: u64,
+    ) -> Result<Vec<crate::core::ExecutionRun>> {
+        let capped_limit = limit.clamp(1, 50);
+        Ok(execution_run::Entity::find()
+            .filter(execution_run::Column::ConversationId.eq(conversation_id.to_string()))
+            .order_by_desc(execution_run::Column::UpdatedAt)
+            .limit(capped_limit)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(model_to_execution_run)
+            .collect())
     }
 
     pub async fn append_execution_checkpoint(
         &self,
         checkpoint: &crate::core::ExecutionCheckpoint,
     ) -> Result<()> {
-        self.db
-            .execute(Self::statement_with_values(
-                self.db.get_database_backend(),
-                "INSERT INTO run_checkpoints (run_id, sequence_no, stage, payload, created_at)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT(run_id, sequence_no) DO UPDATE
-                 SET stage = excluded.stage, payload = excluded.payload, created_at = excluded.created_at"
-                    .to_string(),
-                vec![
-                    checkpoint.run_id.clone().into(),
-                    (checkpoint.sequence_no as i64).into(),
-                    checkpoint.stage.clone().into(),
-                    encrypt_storage_string(&checkpoint.payload)?.into(),
-                    checkpoint.created_at.clone().into(),
-                ],
-            ))
-            .await?;
+        run_checkpoint::Entity::insert(run_checkpoint::ActiveModel {
+            id: sea_orm::NotSet,
+            run_id: Set(checkpoint.run_id.clone()),
+            sequence_no: Set(checkpoint.sequence_no as i32),
+            stage: Set(checkpoint.stage.clone()),
+            payload: Set(encrypt_storage_string(&checkpoint.payload)?),
+            created_at: Set(checkpoint.created_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::columns([
+                run_checkpoint::Column::RunId,
+                run_checkpoint::Column::SequenceNo,
+            ])
+            .update_columns([
+                run_checkpoint::Column::Stage,
+                run_checkpoint::Column::Payload,
+                run_checkpoint::Column::CreatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
+    pub async fn load_execution_checkpoints(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<crate::core::ExecutionCheckpoint>> {
+        Ok(run_checkpoint::Entity::find()
+            .filter(run_checkpoint::Column::RunId.eq(run_id.to_string()))
+            .order_by_asc(run_checkpoint::Column::SequenceNo)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|model| crate::core::ExecutionCheckpoint {
+                run_id: model.run_id,
+                sequence_no: model.sequence_no.max(0) as u32,
+                stage: model.stage,
+                payload: decrypt_storage_string(&model.payload),
+                created_at: model.created_at,
+            })
+            .collect())
+    }
+
     pub async fn append_tool_attempt(&self, attempt: &crate::core::ToolAttempt) -> Result<()> {
-        self.db
-            .execute(Self::statement_with_values(
-                self.db.get_database_backend(),
-                "INSERT INTO tool_attempts
-                    (id, run_id, sequence_no, tool_name, status, failure_class, retryable,
-                     side_effect_level, idempotency_key, arguments_json, output_json,
-                     started_at, completed_at, error_text)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     status = excluded.status,
-                     failure_class = excluded.failure_class,
-                     retryable = excluded.retryable,
-                     side_effect_level = excluded.side_effect_level,
-                     idempotency_key = excluded.idempotency_key,
-                     arguments_json = excluded.arguments_json,
-                     output_json = excluded.output_json,
-                     started_at = excluded.started_at,
-                     completed_at = excluded.completed_at,
-                     error_text = excluded.error_text"
-                    .to_string(),
-                vec![
-                    attempt.id.clone().into(),
-                    attempt.run_id.clone().into(),
-                    (attempt.sequence_no as i64).into(),
-                    attempt.tool_name.clone().into(),
-                    attempt.status.as_str().to_string().into(),
-                    attempt
-                        .failure_class
-                        .as_ref()
-                        .map(|value| {
-                            serde_json::to_string(value)
-                                .unwrap_or_else(|_| "\"platform_error\"".to_string())
-                                .trim_matches('"')
-                                .to_string()
-                        })
-                        .into(),
-                    attempt.retryable.into(),
-                    attempt.side_effect_level.clone().into(),
-                    attempt.idempotency_key.clone().into(),
-                    encrypt_storage_string(&attempt.arguments_json)?.into(),
-                    encrypt_storage_string(&attempt.output_json)?.into(),
-                    attempt.started_at.clone().into(),
-                    attempt.completed_at.clone().into(),
-                    encrypt_optional_storage_string(attempt.error_text.as_deref())?.into(),
-                ],
-            ))
-            .await?;
+        tool_attempt::Entity::insert(tool_attempt::ActiveModel {
+            id: Set(attempt.id.clone()),
+            run_id: Set(attempt.run_id.clone()),
+            sequence_no: Set(attempt.sequence_no as i32),
+            tool_name: Set(attempt.tool_name.clone()),
+            status: Set(attempt.status.as_str().to_string()),
+            failure_class: Set(attempt.failure_class.as_ref().map(|value| {
+                serde_json::to_string(value)
+                    .unwrap_or_else(|_| "\"platform_error\"".to_string())
+                    .trim_matches('"')
+                    .to_string()
+            })),
+            retryable: Set(attempt.retryable),
+            side_effect_level: Set(attempt.side_effect_level.clone()),
+            idempotency_key: Set(attempt.idempotency_key.clone()),
+            arguments_json: Set(encrypt_storage_string(&attempt.arguments_json)?),
+            output_json: Set(encrypt_storage_string(&attempt.output_json)?),
+            started_at: Set(attempt.started_at.clone()),
+            completed_at: Set(attempt.completed_at.clone()),
+            error_text: Set(encrypt_optional_storage_string(
+                attempt.error_text.as_deref(),
+            )?),
+        })
+        .on_conflict(
+            OnConflict::column(tool_attempt::Column::Id)
+                .update_columns([
+                    tool_attempt::Column::Status,
+                    tool_attempt::Column::FailureClass,
+                    tool_attempt::Column::Retryable,
+                    tool_attempt::Column::SideEffectLevel,
+                    tool_attempt::Column::IdempotencyKey,
+                    tool_attempt::Column::ArgumentsJson,
+                    tool_attempt::Column::OutputJson,
+                    tool_attempt::Column::StartedAt,
+                    tool_attempt::Column::CompletedAt,
+                    tool_attempt::Column::ErrorText,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
     // ==================== Experience Graph ====================
 
     pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO experience_runs
-                    (id, execution_run_id, trace_id, conversation_id, project_id, channel, scope,
-                     intent_key, task_type, request_text, tool_sequence_digest, tool_sequence_json,
-                     strategy_version, policy_version, prompt_version, model_slot, success_state,
-                     correction_state, outcome_summary, failure_reason, metadata, consolidated,
-                     accepted_at, corrected_at, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     execution_run_id = excluded.execution_run_id,
-                     trace_id = excluded.trace_id,
-                     conversation_id = excluded.conversation_id,
-                     project_id = excluded.project_id,
-                     channel = excluded.channel,
-                     scope = excluded.scope,
-                     intent_key = excluded.intent_key,
-                     task_type = excluded.task_type,
-                     request_text = excluded.request_text,
-                     tool_sequence_digest = excluded.tool_sequence_digest,
-                     tool_sequence_json = excluded.tool_sequence_json,
-                     strategy_version = excluded.strategy_version,
-                     policy_version = excluded.policy_version,
-                     prompt_version = excluded.prompt_version,
-                     model_slot = excluded.model_slot,
-                     success_state = excluded.success_state,
-                     correction_state = excluded.correction_state,
-                     outcome_summary = excluded.outcome_summary,
-                     failure_reason = excluded.failure_reason,
-                     metadata = excluded.metadata,
-                     consolidated = excluded.consolidated,
-                     accepted_at = excluded.accepted_at,
-                     corrected_at = excluded.corrected_at,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    run.id.clone().into(),
-                    run.execution_run_id.clone().into(),
-                    run.trace_id.clone().into(),
-                    run.conversation_id.clone().into(),
-                    run.project_id.clone().into(),
-                    run.channel.clone().into(),
-                    run.scope.clone().into(),
-                    run.intent_key.clone().into(),
-                    run.task_type.clone().into(),
-                    run.request_text.clone().into(),
-                    run.tool_sequence_digest.clone().into(),
-                    json_text(&run.tool_sequence_json).into(),
-                    run.strategy_version.clone().into(),
-                    run.policy_version.clone().into(),
-                    run.prompt_version.clone().into(),
-                    run.model_slot.clone().into(),
-                    run.success_state.clone().into(),
-                    run.correction_state.clone().into(),
-                    run.outcome_summary.clone().into(),
-                    run.failure_reason.clone().into(),
-                    json_text(&run.metadata).into(),
-                    run.consolidated.into(),
-                    run.accepted_at.clone().into(),
-                    run.corrected_at.clone().into(),
-                    run.created_at.clone().into(),
-                    run.updated_at.clone().into(),
-                ],
-            ))
-            .await?;
+        experience_run::Entity::insert(experience_run::ActiveModel {
+            id: Set(run.id.clone()),
+            execution_run_id: Set(run.execution_run_id.clone()),
+            trace_id: Set(run.trace_id.clone()),
+            conversation_id: Set(run.conversation_id.clone()),
+            project_id: Set(run.project_id.clone()),
+            channel: Set(run.channel.clone()),
+            scope: Set(run.scope.clone()),
+            intent_key: Set(run.intent_key.clone()),
+            task_type: Set(run.task_type.clone()),
+            request_text: Set(run.request_text.clone()),
+            tool_sequence_digest: Set(run.tool_sequence_digest.clone()),
+            tool_sequence_json: Set(run.tool_sequence_json.clone()),
+            strategy_version: Set(run.strategy_version.clone()),
+            policy_version: Set(run.policy_version.clone()),
+            prompt_version: Set(run.prompt_version.clone()),
+            model_slot: Set(run.model_slot.clone()),
+            success_state: Set(run.success_state.clone()),
+            correction_state: Set(run.correction_state.clone()),
+            outcome_summary: Set(run.outcome_summary.clone()),
+            failure_reason: Set(run.failure_reason.clone()),
+            metadata: Set(run.metadata.clone()),
+            consolidated: Set(run.consolidated),
+            accepted_at: Set(run.accepted_at.clone()),
+            corrected_at: Set(run.corrected_at.clone()),
+            created_at: Set(run.created_at.clone()),
+            updated_at: Set(run.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(experience_run::Column::Id)
+                .update_columns([
+                    experience_run::Column::ExecutionRunId,
+                    experience_run::Column::TraceId,
+                    experience_run::Column::ConversationId,
+                    experience_run::Column::ProjectId,
+                    experience_run::Column::Channel,
+                    experience_run::Column::Scope,
+                    experience_run::Column::IntentKey,
+                    experience_run::Column::TaskType,
+                    experience_run::Column::RequestText,
+                    experience_run::Column::ToolSequenceDigest,
+                    experience_run::Column::ToolSequenceJson,
+                    experience_run::Column::StrategyVersion,
+                    experience_run::Column::PolicyVersion,
+                    experience_run::Column::PromptVersion,
+                    experience_run::Column::ModelSlot,
+                    experience_run::Column::SuccessState,
+                    experience_run::Column::CorrectionState,
+                    experience_run::Column::OutcomeSummary,
+                    experience_run::Column::FailureReason,
+                    experience_run::Column::Metadata,
+                    experience_run::Column::Consolidated,
+                    experience_run::Column::AcceptedAt,
+                    experience_run::Column::CorrectedAt,
+                    experience_run::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -2805,53 +2459,14 @@ impl Storage {
         &self,
         run_id: &str,
     ) -> Result<Vec<crate::core::ToolAttempt>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT id, run_id, sequence_no, tool_name, status, failure_class, retryable,
-                        side_effect_level, idempotency_key, arguments_json, output_json,
-                        started_at, completed_at, error_text
-                 FROM tool_attempts
-                 WHERE run_id = ?
-                 ORDER BY sequence_no ASC"
-                    .to_string(),
-                vec![run_id.to_string().into()],
-            ))
-            .await?;
-        let mut attempts = Vec::with_capacity(rows.len());
-        for row in rows {
-            let status_raw: String = row.try_get("", "status")?;
-            let failure_class_raw: Option<String> = row.try_get("", "failure_class").ok();
-            let arguments_json =
-                decrypt_storage_string(&row.try_get::<String>("", "arguments_json")?);
-            let output_json = decrypt_storage_string(&row.try_get::<String>("", "output_json")?);
-            attempts.push(crate::core::ToolAttempt {
-                id: row.try_get("", "id")?,
-                run_id: row.try_get("", "run_id")?,
-                sequence_no: row
-                    .try_get::<i32>("", "sequence_no")
-                    .unwrap_or_default()
-                    .max(0) as u32,
-                tool_name: row.try_get("", "tool_name")?,
-                status: serde_json::from_str(&format!("\"{}\"", status_raw))
-                    .unwrap_or(crate::core::ToolOutcomeStatus::FatalError),
-                failure_class: failure_class_raw.and_then(|value| {
-                    serde_json::from_str::<crate::core::FailureClass>(&format!("\"{}\"", value))
-                        .ok()
-                }),
-                retryable: row.try_get::<bool>("", "retryable").unwrap_or(false),
-                side_effect_level: row.try_get("", "side_effect_level")?,
-                idempotency_key: row.try_get("", "idempotency_key").ok(),
-                arguments_json,
-                output_json,
-                started_at: row.try_get("", "started_at")?,
-                completed_at: row.try_get("", "completed_at").ok(),
-                error_text: decrypt_optional_storage_string(row.try_get("", "error_text").ok()),
-            });
-        }
-        Ok(attempts)
+        Ok(tool_attempt::Entity::find()
+            .filter(tool_attempt::Column::RunId.eq(run_id.to_string()))
+            .order_by_asc(tool_attempt::Column::SequenceNo)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(model_to_tool_attempt)
+            .collect())
     }
 
     pub async fn mark_latest_provisional_experience_run_corrected(
@@ -2860,7 +2475,6 @@ impl Storage {
         correction_signal: &str,
         within_minutes: i64,
     ) -> Result<Option<experience_run::Model>> {
-        let backend = self.db.get_database_backend();
         let now = chrono::Utc::now().to_rfc3339();
         let cutoff =
             (chrono::Utc::now() - chrono::Duration::minutes(within_minutes.max(1))).to_rfc3339();
@@ -2868,48 +2482,45 @@ impl Storage {
             "correction_signal": correction_signal,
             "correction_recorded_at": now,
         });
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                backend,
-                "WITH target AS (
-                    SELECT id
-                    FROM experience_runs
-                    WHERE conversation_id = ?
-                      AND success_state = 'provisional'
-                      AND correction_state = 'none'
-                      AND created_at >= ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                 )
-                 UPDATE experience_runs
-                 SET correction_state = 'corrected',
-                     success_state = CASE
-                         WHEN success_state = 'provisional' THEN 'failed'
-                         ELSE success_state
-                     END,
-                     corrected_at = ?,
-                     updated_at = ?,
-                     metadata = COALESCE(metadata, '{}'::jsonb) || CAST(? AS JSONB)
-                 WHERE id IN (SELECT id FROM target)
-                 RETURNING id, execution_run_id, trace_id, conversation_id, project_id, channel,
-                           scope, intent_key, task_type, request_text, tool_sequence_digest,
-                           tool_sequence_json::text AS tool_sequence_json, strategy_version,
-                           policy_version, prompt_version, model_slot, success_state,
-                           correction_state, outcome_summary, failure_reason,
-                           metadata::text AS metadata, consolidated, accepted_at, corrected_at,
-                           created_at, updated_at"
-                    .to_string(),
-                vec![
-                    conversation_id.to_string().into(),
-                    cutoff.into(),
-                    now.clone().into(),
-                    now.into(),
-                    json_text(&payload).into(),
-                ],
-            ))
-            .await?;
-        row.as_ref().map(parse_experience_run_row).transpose()
+        let Some(target) = experience_run::Entity::find()
+            .filter(experience_run::Column::ConversationId.eq(conversation_id.to_string()))
+            .filter(experience_run::Column::SuccessState.eq("provisional"))
+            .filter(experience_run::Column::CorrectionState.eq("none"))
+            .filter(experience_run::Column::CreatedAt.gte(cutoff))
+            .order_by_desc(experience_run::Column::CreatedAt)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let mut metadata = target.metadata.clone();
+        if let Some(existing) = metadata.as_object_mut() {
+            if let Some(payload_map) = payload.as_object() {
+                for (key, value) in payload_map {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            metadata = payload;
+        }
+
+        let updated = experience_run::ActiveModel {
+            id: Unchanged(target.id),
+            success_state: Set(if target.success_state == "provisional" {
+                "failed".to_string()
+            } else {
+                target.success_state
+            }),
+            correction_state: Set("corrected".to_string()),
+            corrected_at: Set(Some(now.clone())),
+            updated_at: Set(now),
+            metadata: Set(metadata),
+            ..Default::default()
+        }
+        .update(&self.db)
+        .await?;
+        Ok(Some(updated))
     }
 
     pub async fn finalize_stale_provisional_experience_runs(
@@ -2917,216 +2528,150 @@ impl Storage {
         older_than_minutes: i64,
         limit: u64,
     ) -> Result<u64> {
-        let backend = self.db.get_database_backend();
         let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(older_than_minutes.max(1)))
             .to_rfc3339();
         let now = chrono::Utc::now().to_rfc3339();
-        let result = self
-            .db
-            .execute(Self::statement_with_values(
-                backend,
-                "WITH target AS (
-                    SELECT id
-                    FROM experience_runs
-                    WHERE success_state = 'provisional'
-                      AND correction_state = 'none'
-                      AND created_at < ?
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                 )
-                 UPDATE experience_runs
-                 SET success_state = 'accepted',
-                     accepted_at = ?,
-                     updated_at = ?
-                 WHERE id IN (SELECT id FROM target)"
-                    .to_string(),
-                vec![
-                    cutoff.into(),
-                    Self::db_bound_integer(limit).into(),
-                    now.clone().into(),
-                    now.into(),
-                ],
+        let target_ids = experience_run::Entity::find()
+            .select_only()
+            .column(experience_run::Column::Id)
+            .filter(experience_run::Column::SuccessState.eq("provisional"))
+            .filter(experience_run::Column::CorrectionState.eq("none"))
+            .filter(experience_run::Column::CreatedAt.lt(cutoff))
+            .order_by_asc(experience_run::Column::CreatedAt)
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_EXPERIENCE_RUN_ROWS_PER_QUERY),
             ))
+            .into_tuple::<String>()
+            .all(&self.db)
             .await?;
-        Ok(result.rows_affected())
+        if target_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = experience_run::Entity::update_many()
+            .col_expr(
+                experience_run::Column::SuccessState,
+                Expr::value("accepted".to_string()),
+            )
+            .col_expr(
+                experience_run::Column::AcceptedAt,
+                Expr::value(Some(now.clone())),
+            )
+            .col_expr(experience_run::Column::UpdatedAt, Expr::value(now))
+            .filter(experience_run::Column::Id.is_in(target_ids))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
     }
 
     pub async fn list_experience_runs_for_consolidation(
         &self,
         limit: u64,
     ) -> Result<Vec<experience_run::Model>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT id, execution_run_id, trace_id, conversation_id, project_id, channel,
-                        scope, intent_key, task_type, request_text, tool_sequence_digest,
-                        tool_sequence_json::text AS tool_sequence_json, strategy_version,
-                        policy_version, prompt_version, model_slot, success_state,
-                        correction_state, outcome_summary, failure_reason,
-                        metadata::text AS metadata, consolidated, accepted_at, corrected_at,
-                        created_at, updated_at
-                 FROM experience_runs
-                 WHERE consolidated = FALSE
-                   AND (success_state <> 'provisional' OR correction_state = 'corrected')
-                 ORDER BY created_at ASC
-                 LIMIT ?"
-                    .to_string(),
-                vec![Self::db_bound_integer(limit).into()],
-            ))
-            .await?;
-        rows.iter().map(parse_experience_run_row).collect()
+        Ok(experience_run::Entity::find()
+            .filter(experience_run::Column::Consolidated.eq(false))
+            .filter(
+                Condition::any()
+                    .add(experience_run::Column::SuccessState.ne("provisional"))
+                    .add(experience_run::Column::CorrectionState.eq("corrected")),
+            )
+            .order_by_asc(experience_run::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
     }
 
-    pub async fn list_recent_experience_runs(
+    pub async fn list_recent_experience_runs_any_scope(
         &self,
-        project_id: Option<&str>,
-        conversation_id: Option<&str>,
         limit: u64,
     ) -> Result<Vec<experience_run::Model>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT id, execution_run_id, trace_id, conversation_id, project_id, channel,
-                        scope, intent_key, task_type, request_text, tool_sequence_digest,
-                        tool_sequence_json::text AS tool_sequence_json, strategy_version,
-                        policy_version, prompt_version, model_slot, success_state,
-                        correction_state, outcome_summary, failure_reason,
-                        metadata::text AS metadata, consolidated, accepted_at, corrected_at,
-                        created_at, updated_at
-                 FROM experience_runs
-                 WHERE (conversation_id IS NULL OR conversation_id = ?)
-                   AND (project_id IS NULL OR project_id = ?)
-                 ORDER BY
-                   CASE
-                       WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
-                       WHEN project_id IS NOT NULL AND project_id = ? THEN 2
-                       WHEN scope = 'global' THEN 1
-                       ELSE 0
-                   END DESC,
-                   updated_at DESC
-                 LIMIT ?"
-                    .to_string(),
-                vec![
-                    conversation_id.map(|v| v.to_string()).into(),
-                    project_id.map(|v| v.to_string()).into(),
-                    conversation_id.map(|v| v.to_string()).into(),
-                    project_id.map(|v| v.to_string()).into(),
-                    Self::db_bound_integer(limit).into(),
-                ],
-            ))
-            .await?;
-        rows.iter().map(parse_experience_run_row).collect()
+        let capped_limit = limit.min(Self::MAX_EXPERIENCE_RUN_ROWS_PER_QUERY);
+        experience_run::Entity::find()
+            .order_by_desc(experience_run::Column::UpdatedAt)
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn mark_experience_run_consolidated(&self, id: &str) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "UPDATE experience_runs
-                 SET consolidated = TRUE, updated_at = ?
-                 WHERE id = ?"
-                    .to_string(),
-                vec![
-                    chrono::Utc::now().to_rfc3339().into(),
-                    id.to_string().into(),
-                ],
-            ))
+        experience_run::Entity::update_many()
+            .col_expr(experience_run::Column::Consolidated, Expr::value(true))
+            .col_expr(
+                experience_run::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .filter(experience_run::Column::Id.eq(id))
+            .exec(&self.db)
             .await?;
         Ok(())
     }
 
     pub async fn upsert_experience_item(&self, item: &experience_item::Model) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO experience_items
-                    (id, kind, scope, project_id, conversation_id, title, content,
-                     normalized_key, confidence, support_count, contradiction_count, status,
-                     metadata, last_supported_at, last_contradicted_at, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     kind = excluded.kind,
-                     scope = excluded.scope,
-                     project_id = excluded.project_id,
-                     conversation_id = excluded.conversation_id,
-                     title = excluded.title,
-                     content = excluded.content,
-                     normalized_key = excluded.normalized_key,
-                     confidence = excluded.confidence,
-                     support_count = excluded.support_count,
-                     contradiction_count = excluded.contradiction_count,
-                     status = excluded.status,
-                     metadata = excluded.metadata,
-                     last_supported_at = excluded.last_supported_at,
-                     last_contradicted_at = excluded.last_contradicted_at,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    item.id.clone().into(),
-                    item.kind.clone().into(),
-                    item.scope.clone().into(),
-                    item.project_id.clone().into(),
-                    item.conversation_id.clone().into(),
-                    item.title.clone().into(),
-                    item.content.clone().into(),
-                    item.normalized_key.clone().into(),
-                    item.confidence.into(),
-                    item.support_count.into(),
-                    item.contradiction_count.into(),
-                    item.status.clone().into(),
-                    json_text(&item.metadata).into(),
-                    item.last_supported_at.clone().into(),
-                    item.last_contradicted_at.clone().into(),
-                    item.created_at.clone().into(),
-                    item.updated_at.clone().into(),
-                ],
-            ))
-            .await?;
+        experience_item::Entity::insert(experience_item::ActiveModel {
+            id: Set(item.id.clone()),
+            kind: Set(item.kind.clone()),
+            scope: Set(item.scope.clone()),
+            project_id: Set(item.project_id.clone()),
+            conversation_id: Set(item.conversation_id.clone()),
+            title: Set(item.title.clone()),
+            content: Set(item.content.clone()),
+            normalized_key: Set(item.normalized_key.clone()),
+            confidence: Set(item.confidence),
+            support_count: Set(item.support_count),
+            contradiction_count: Set(item.contradiction_count),
+            status: Set(item.status.clone()),
+            metadata: Set(item.metadata.clone()),
+            last_supported_at: Set(item.last_supported_at.clone()),
+            last_contradicted_at: Set(item.last_contradicted_at.clone()),
+            created_at: Set(item.created_at.clone()),
+            updated_at: Set(item.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(experience_item::Column::Id)
+                .update_columns([
+                    experience_item::Column::Kind,
+                    experience_item::Column::Scope,
+                    experience_item::Column::ProjectId,
+                    experience_item::Column::ConversationId,
+                    experience_item::Column::Title,
+                    experience_item::Column::Content,
+                    experience_item::Column::NormalizedKey,
+                    experience_item::Column::Confidence,
+                    experience_item::Column::SupportCount,
+                    experience_item::Column::ContradictionCount,
+                    experience_item::Column::Status,
+                    experience_item::Column::Metadata,
+                    experience_item::Column::LastSupportedAt,
+                    experience_item::Column::LastContradictedAt,
+                    experience_item::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
     pub async fn update_experience_item_status(&self, id: &str, status: &str) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "UPDATE experience_items
-                 SET status = ?, updated_at = ?
-                 WHERE id = ?"
-                    .to_string(),
-                vec![
-                    status.to_string().into(),
-                    chrono::Utc::now().to_rfc3339().into(),
-                    id.to_string().into(),
-                ],
-            ))
+        experience_item::Entity::update_many()
+            .col_expr(
+                experience_item::Column::Status,
+                Expr::value(status.to_string()),
+            )
+            .col_expr(
+                experience_item::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .filter(experience_item::Column::Id.eq(id))
+            .exec(&self.db)
             .await?;
         Ok(())
     }
 
     pub async fn get_experience_item(&self, id: &str) -> Result<Option<experience_item::Model>> {
-        let backend = self.db.get_database_backend();
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                backend,
-                "SELECT id, kind, scope, project_id, conversation_id, title, content,
-                        normalized_key, confidence, support_count, contradiction_count, status,
-                        metadata::text AS metadata, last_supported_at, last_contradicted_at,
-                        created_at, updated_at
-                 FROM experience_items
-                 WHERE id = ?"
-                    .to_string(),
-                vec![id.to_string().into()],
-            ))
-            .await?;
-        row.as_ref().map(parse_experience_item_row).transpose()
+        Ok(experience_item::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
     }
 
     pub async fn list_active_experience_items(
@@ -3136,56 +2681,61 @@ impl Storage {
         conversation_id: Option<&str>,
         limit: u64,
     ) -> Result<Vec<experience_item::Model>> {
-        let backend = self.db.get_database_backend();
-        let kind_clause = if kinds.is_empty() {
-            String::new()
-        } else {
-            format!(" AND kind IN ({})", Self::sql_placeholder_list(kinds.len()))
+        let mut query =
+            experience_item::Entity::find().filter(experience_item::Column::Status.eq("active"));
+        query = match conversation_id {
+            Some(value) => query.filter(
+                Condition::any()
+                    .add(experience_item::Column::ConversationId.is_null())
+                    .add(experience_item::Column::ConversationId.eq(value.to_string())),
+            ),
+            None => query.filter(experience_item::Column::ConversationId.is_null()),
         };
-        let sql = format!(
-            "SELECT id, kind, scope, project_id, conversation_id, title, content,
-                    normalized_key, confidence, support_count, contradiction_count, status,
-                    metadata::text AS metadata, last_supported_at, last_contradicted_at,
-                    created_at, updated_at
-             FROM experience_items
-             WHERE status = 'active'
-               AND (conversation_id IS NULL OR conversation_id = ?)
-               AND (project_id IS NULL OR project_id = ?)
-               {kind_clause}
-             ORDER BY
-               CASE
-                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
-                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
-                   WHEN scope = 'global' THEN 1
-                   ELSE 0
-               END DESC,
-               CASE kind
-                   WHEN 'constraint' THEN 0
-                   WHEN 'personal_fact' THEN 1
-                   WHEN 'lesson' THEN 2
-                   WHEN 'procedure' THEN 3
-                   ELSE 4
-               END ASC,
-               confidence DESC,
-               support_count DESC,
-               updated_at DESC
-             LIMIT ?"
-        );
-        let mut params: Vec<sea_orm::Value> = vec![
-            conversation_id.map(|v| v.to_string()).into(),
-            project_id.map(|v| v.to_string()).into(),
-        ];
-        for kind in kinds {
-            params.push((*kind).to_string().into());
+        query = match project_id {
+            Some(value) => query.filter(
+                Condition::any()
+                    .add(experience_item::Column::ProjectId.is_null())
+                    .add(experience_item::Column::ProjectId.eq(value.to_string())),
+            ),
+            None => query.filter(experience_item::Column::ProjectId.is_null()),
+        };
+        if !kinds.is_empty() {
+            query = query.filter(
+                experience_item::Column::Kind.is_in(
+                    kinds
+                        .iter()
+                        .map(|kind| (*kind).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
-        params.push(conversation_id.map(|v| v.to_string()).into());
-        params.push(project_id.map(|v| v.to_string()).into());
-        params.push(Self::db_bound_integer(limit).into());
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(backend, sql, params))
+        let capped_limit = limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY);
+        let mut items = query
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
             .await?;
-        rows.iter().map(parse_experience_item_row).collect()
+        items.sort_by(|left, right| {
+            scope_match_rank(
+                right.project_id.as_deref(),
+                right.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            )
+            .cmp(&scope_match_rank(
+                left.project_id.as_deref(),
+                left.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            ))
+            .then_with(|| {
+                experience_item_kind_rank(&left.kind).cmp(&experience_item_kind_rank(&right.kind))
+            })
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| right.support_count.cmp(&left.support_count))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        items.truncate(capped_limit as usize);
+        Ok(items)
     }
 
     pub async fn search_experience_items(
@@ -3196,109 +2746,77 @@ impl Storage {
         conversation_id: Option<&str>,
         limit: u64,
     ) -> Result<Vec<ExperienceItemSearchHit>> {
-        let backend = self.db.get_database_backend();
-        let kind_clause = if kinds.is_empty() {
-            String::new()
-        } else {
-            format!(" AND kind IN ({})", Self::sql_placeholder_list(kinds.len()))
-        };
-        let sql = format!(
-            "SELECT id, kind, scope, project_id, conversation_id, title, content,
-                    normalized_key, confidence, support_count, contradiction_count, status,
-                    metadata::text AS metadata, last_supported_at, last_contradicted_at,
-                    created_at, updated_at,
-                    ts_rank(
-                        to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(content, '')),
-                        plainto_tsquery('simple', ?)
-                    ) AS search_rank
-             FROM experience_items
-             WHERE status = 'active'
-               AND (conversation_id IS NULL OR conversation_id = ?)
-               AND (project_id IS NULL OR project_id = ?)
-               AND to_tsvector('simple', COALESCE(title, '') || ' ' || COALESCE(content, ''))
-                   @@ plainto_tsquery('simple', ?)
-               {kind_clause}
-             ORDER BY
-               CASE
-                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
-                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
-                   WHEN scope = 'global' THEN 1
-                   ELSE 0
-               END DESC,
-               CASE kind
-                   WHEN 'constraint' THEN 0
-                   WHEN 'personal_fact' THEN 1
-                   WHEN 'lesson' THEN 2
-                   WHEN 'procedure' THEN 3
-                   ELSE 4
-               END ASC,
-               search_rank DESC,
-               support_count DESC,
-               updated_at DESC
-             LIMIT ?"
-        );
-        let mut params: Vec<sea_orm::Value> = vec![
-            query.to_string().into(),
-            conversation_id.map(|v| v.to_string()).into(),
-            project_id.map(|v| v.to_string()).into(),
-            query.to_string().into(),
-        ];
-        for kind in kinds {
-            params.push((*kind).to_string().into());
+        let terms = normalized_search_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
         }
-        params.push(conversation_id.map(|v| v.to_string()).into());
-        params.push(project_id.map(|v| v.to_string()).into());
-        params.push(Self::db_bound_integer(limit).into());
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(backend, sql, params))
+        let mut items = self
+            .list_active_experience_items(kinds, project_id, conversation_id, limit)
             .await?;
-        let mut hits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let score = row.try_get::<f64>("", "search_rank").unwrap_or(0.0);
-            hits.push(ExperienceItemSearchHit {
-                item: parse_experience_item_row(&row)?,
-                score,
-            });
+        let mut hits = Vec::new();
+        for item in items.drain(..) {
+            if !matches_search_terms(&terms, &[&item.title, &item.content]) {
+                continue;
+            }
+            let score = search_score(&terms, &[(&item.title, 3.0), (&item.content, 1.0)]);
+            hits.push(ExperienceItemSearchHit { item, score });
         }
+        hits.sort_by(|left, right| {
+            scope_match_rank(
+                right.item.project_id.as_deref(),
+                right.item.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            )
+            .cmp(&scope_match_rank(
+                left.item.project_id.as_deref(),
+                left.item.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            ))
+            .then_with(|| {
+                experience_item_kind_rank(&left.item.kind)
+                    .cmp(&experience_item_kind_rank(&right.item.kind))
+            })
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| right.item.support_count.cmp(&left.item.support_count))
+            .then_with(|| right.item.updated_at.cmp(&left.item.updated_at))
+        });
+        hits.truncate(limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY) as usize);
         Ok(hits)
     }
 
     pub async fn upsert_experience_edge(&self, edge: &experience_edge::Model) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO experience_edges
-                    (id, source_ref, source_kind, target_ref, target_kind, edge_type,
-                     weight, source_run_id, metadata, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     source_ref = excluded.source_ref,
-                     source_kind = excluded.source_kind,
-                     target_ref = excluded.target_ref,
-                     target_kind = excluded.target_kind,
-                     edge_type = excluded.edge_type,
-                     weight = excluded.weight,
-                     source_run_id = excluded.source_run_id,
-                     metadata = excluded.metadata,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    edge.id.clone().into(),
-                    edge.source_ref.clone().into(),
-                    edge.source_kind.clone().into(),
-                    edge.target_ref.clone().into(),
-                    edge.target_kind.clone().into(),
-                    edge.edge_type.clone().into(),
-                    edge.weight.into(),
-                    edge.source_run_id.clone().into(),
-                    json_text(&edge.metadata).into(),
-                    edge.created_at.clone().into(),
-                    edge.updated_at.clone().into(),
-                ],
-            ))
-            .await?;
+        experience_edge::Entity::insert(experience_edge::ActiveModel {
+            id: Set(edge.id.clone()),
+            source_ref: Set(edge.source_ref.clone()),
+            source_kind: Set(edge.source_kind.clone()),
+            target_ref: Set(edge.target_ref.clone()),
+            target_kind: Set(edge.target_kind.clone()),
+            edge_type: Set(edge.edge_type.clone()),
+            weight: Set(edge.weight),
+            source_run_id: Set(edge.source_run_id.clone()),
+            metadata: Set(edge.metadata.clone()),
+            created_at: Set(edge.created_at.clone()),
+            updated_at: Set(edge.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(experience_edge::Column::Id)
+                .update_columns([
+                    experience_edge::Column::SourceRef,
+                    experience_edge::Column::SourceKind,
+                    experience_edge::Column::TargetRef,
+                    experience_edge::Column::TargetKind,
+                    experience_edge::Column::EdgeType,
+                    experience_edge::Column::Weight,
+                    experience_edge::Column::SourceRunId,
+                    experience_edge::Column::Metadata,
+                    experience_edge::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -3310,105 +2828,118 @@ impl Storage {
         if seed_refs.is_empty() {
             return Ok(Vec::new());
         }
-        let refs = Self::sql_placeholder_list(seed_refs.len());
-        let sql = format!(
-            "SELECT DISTINCT i.id, i.kind, i.scope, i.project_id, i.conversation_id, i.title,
-                    i.content, i.normalized_key, i.confidence, i.support_count,
-                    i.contradiction_count, i.status, i.metadata::text AS metadata,
-                    i.last_supported_at, i.last_contradicted_at, i.created_at, i.updated_at
-             FROM experience_edges e
-             JOIN experience_items i
-               ON (
-                    e.source_ref IN ({refs}) AND e.target_kind = 'experience_item' AND e.target_ref = i.id
-                  )
-               OR (
-                    e.target_ref IN ({refs}) AND e.source_kind = 'experience_item' AND e.source_ref = i.id
-                  )
-             WHERE i.status = 'active'
-               AND i.id NOT IN ({refs})
-             ORDER BY i.support_count DESC, i.confidence DESC, i.updated_at DESC
-             LIMIT ?"
-        );
-        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(seed_refs.len() * 3 + 1);
-        for seed_ref in seed_refs {
-            params.push(seed_ref.clone().into());
-        }
-        for seed_ref in seed_refs {
-            params.push(seed_ref.clone().into());
-        }
-        for seed_ref in seed_refs {
-            params.push(seed_ref.clone().into());
-        }
-        params.push(Self::db_bound_integer(limit).into());
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                self.db.get_database_backend(),
-                sql,
-                params,
+        let seed_refs_vec = seed_refs.to_vec();
+        let edges = experience_edge::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::SourceRef.is_in(seed_refs_vec.clone()))
+                            .add(experience_edge::Column::TargetKind.eq("experience_item")),
+                    )
+                    .add(
+                        Condition::all()
+                            .add(experience_edge::Column::TargetRef.is_in(seed_refs_vec.clone()))
+                            .add(experience_edge::Column::SourceKind.eq("experience_item")),
+                    ),
+            )
+            .limit(Self::db_limit(
+                Self::MAX_RELATED_EXPERIENCE_EDGE_ROWS_PER_QUERY.max(limit),
             ))
+            .all(&self.db)
             .await?;
-        rows.iter().map(parse_experience_item_row).collect()
+        let seed_set = seed_refs
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let related_ids = edges
+            .into_iter()
+            .filter_map(|edge| {
+                if seed_set.contains(&edge.source_ref) && edge.target_kind == "experience_item" {
+                    Some(edge.target_ref)
+                } else if seed_set.contains(&edge.target_ref)
+                    && edge.source_kind == "experience_item"
+                {
+                    Some(edge.source_ref)
+                } else {
+                    None
+                }
+            })
+            .filter(|id| !seed_set.contains(id))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if related_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut items = experience_item::Entity::find()
+            .filter(experience_item::Column::Id.is_in(related_ids))
+            .filter(experience_item::Column::Status.eq("active"))
+            .all(&self.db)
+            .await?;
+        items.sort_by(|left, right| {
+            right
+                .support_count
+                .cmp(&left.support_count)
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        items.truncate(limit.min(Self::MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY) as usize);
+        Ok(items)
     }
 
     pub async fn upsert_procedural_pattern(
         &self,
         pattern: &procedural_pattern::Model,
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO procedural_patterns
-                    (id, intent_key, scope, project_id, conversation_id, title, trigger_summary,
-                     summary, tool_sequence_digest, steps_json, tool_sequence_json, sample_count,
-                     success_count, correction_count, success_rate, last_validated_at, status,
-                     metadata, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     intent_key = excluded.intent_key,
-                     scope = excluded.scope,
-                     project_id = excluded.project_id,
-                     conversation_id = excluded.conversation_id,
-                     title = excluded.title,
-                     trigger_summary = excluded.trigger_summary,
-                     summary = excluded.summary,
-                     tool_sequence_digest = excluded.tool_sequence_digest,
-                     steps_json = excluded.steps_json,
-                     tool_sequence_json = excluded.tool_sequence_json,
-                     sample_count = excluded.sample_count,
-                     success_count = excluded.success_count,
-                     correction_count = excluded.correction_count,
-                     success_rate = excluded.success_rate,
-                     last_validated_at = excluded.last_validated_at,
-                     status = excluded.status,
-                     metadata = excluded.metadata,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    pattern.id.clone().into(),
-                    pattern.intent_key.clone().into(),
-                    pattern.scope.clone().into(),
-                    pattern.project_id.clone().into(),
-                    pattern.conversation_id.clone().into(),
-                    pattern.title.clone().into(),
-                    pattern.trigger_summary.clone().into(),
-                    pattern.summary.clone().into(),
-                    pattern.tool_sequence_digest.clone().into(),
-                    json_text(&pattern.steps_json).into(),
-                    json_text(&pattern.tool_sequence_json).into(),
-                    pattern.sample_count.into(),
-                    pattern.success_count.into(),
-                    pattern.correction_count.into(),
-                    pattern.success_rate.into(),
-                    pattern.last_validated_at.clone().into(),
-                    pattern.status.clone().into(),
-                    json_text(&pattern.metadata).into(),
-                    pattern.created_at.clone().into(),
-                    pattern.updated_at.clone().into(),
-                ],
-            ))
-            .await?;
+        procedural_pattern::Entity::insert(procedural_pattern::ActiveModel {
+            id: Set(pattern.id.clone()),
+            intent_key: Set(pattern.intent_key.clone()),
+            scope: Set(pattern.scope.clone()),
+            project_id: Set(pattern.project_id.clone()),
+            conversation_id: Set(pattern.conversation_id.clone()),
+            title: Set(pattern.title.clone()),
+            trigger_summary: Set(pattern.trigger_summary.clone()),
+            summary: Set(pattern.summary.clone()),
+            tool_sequence_digest: Set(pattern.tool_sequence_digest.clone()),
+            steps_json: Set(pattern.steps_json.clone()),
+            tool_sequence_json: Set(pattern.tool_sequence_json.clone()),
+            sample_count: Set(pattern.sample_count),
+            success_count: Set(pattern.success_count),
+            correction_count: Set(pattern.correction_count),
+            success_rate: Set(pattern.success_rate),
+            last_validated_at: Set(pattern.last_validated_at.clone()),
+            status: Set(pattern.status.clone()),
+            metadata: Set(pattern.metadata.clone()),
+            created_at: Set(pattern.created_at.clone()),
+            updated_at: Set(pattern.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(procedural_pattern::Column::Id)
+                .update_columns([
+                    procedural_pattern::Column::IntentKey,
+                    procedural_pattern::Column::Scope,
+                    procedural_pattern::Column::ProjectId,
+                    procedural_pattern::Column::ConversationId,
+                    procedural_pattern::Column::Title,
+                    procedural_pattern::Column::TriggerSummary,
+                    procedural_pattern::Column::Summary,
+                    procedural_pattern::Column::ToolSequenceDigest,
+                    procedural_pattern::Column::StepsJson,
+                    procedural_pattern::Column::ToolSequenceJson,
+                    procedural_pattern::Column::SampleCount,
+                    procedural_pattern::Column::SuccessCount,
+                    procedural_pattern::Column::CorrectionCount,
+                    procedural_pattern::Column::SuccessRate,
+                    procedural_pattern::Column::LastValidatedAt,
+                    procedural_pattern::Column::Status,
+                    procedural_pattern::Column::Metadata,
+                    procedural_pattern::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -3419,65 +2950,55 @@ impl Storage {
         conversation_id: Option<&str>,
         limit: u64,
     ) -> Result<Vec<ProceduralPatternSearchHit>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT id, intent_key, scope, project_id, conversation_id, title,
-                        trigger_summary, summary, tool_sequence_digest,
-                        steps_json::text AS steps_json,
-                        tool_sequence_json::text AS tool_sequence_json,
-                        sample_count, success_count, correction_count, success_rate,
-                        last_validated_at, status, metadata::text AS metadata,
-                        created_at, updated_at,
-                        ts_rank(
-                            to_tsvector(
-                                'simple',
-                                COALESCE(title, '') || ' ' || COALESCE(trigger_summary, '') || ' ' || COALESCE(summary, '')
-                            ),
-                            plainto_tsquery('simple', ?)
-                        ) AS search_rank
-                 FROM procedural_patterns
-                 WHERE status IN ('active', 'draft')
-                   AND (conversation_id IS NULL OR conversation_id = ?)
-                   AND (project_id IS NULL OR project_id = ?)
-                   AND to_tsvector(
-                        'simple',
-                        COALESCE(title, '') || ' ' || COALESCE(trigger_summary, '') || ' ' || COALESCE(summary, '')
-                   ) @@ plainto_tsquery('simple', ?)
-                 ORDER BY
-                   CASE
-                       WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
-                       WHEN project_id IS NOT NULL AND project_id = ? THEN 2
-                       WHEN scope = 'global' THEN 1
-                       ELSE 0
-                   END DESC,
-                   search_rank DESC,
-                   sample_count DESC,
-                   success_rate DESC,
-                   updated_at DESC
-                 LIMIT ?"
-                    .to_string(),
-                vec![
-                    query.to_string().into(),
-                    conversation_id.map(|v| v.to_string()).into(),
-                    project_id.map(|v| v.to_string()).into(),
-                    query.to_string().into(),
-                    conversation_id.map(|v| v.to_string()).into(),
-                    project_id.map(|v| v.to_string()).into(),
-                    Self::db_bound_integer(limit).into(),
-                ],
-            ))
-            .await?;
-        let mut hits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let score = row.try_get::<f64>("", "search_rank").unwrap_or(0.0);
-            hits.push(ProceduralPatternSearchHit {
-                pattern: parse_procedural_pattern_row(&row)?,
-                score,
-            });
+        let terms = normalized_search_terms(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
         }
+        let mut patterns = self
+            .list_procedural_patterns(project_id, conversation_id, &["active", "draft"], limit)
+            .await?;
+        let mut hits = Vec::new();
+        for pattern in patterns.drain(..) {
+            if !matches_search_terms(
+                &terms,
+                &[&pattern.title, &pattern.trigger_summary, &pattern.summary],
+            ) {
+                continue;
+            }
+            let score = search_score(
+                &terms,
+                &[
+                    (&pattern.title, 3.0),
+                    (&pattern.trigger_summary, 2.0),
+                    (&pattern.summary, 1.0),
+                ],
+            );
+            hits.push(ProceduralPatternSearchHit { pattern, score });
+        }
+        hits.sort_by(|left, right| {
+            scope_match_rank(
+                right.pattern.project_id.as_deref(),
+                right.pattern.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            )
+            .cmp(&scope_match_rank(
+                left.pattern.project_id.as_deref(),
+                left.pattern.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            ))
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| right.pattern.sample_count.cmp(&left.pattern.sample_count))
+            .then_with(|| {
+                right
+                    .pattern
+                    .success_rate
+                    .total_cmp(&left.pattern.success_rate)
+            })
+            .then_with(|| right.pattern.updated_at.cmp(&left.pattern.updated_at))
+        });
+        hits.truncate(limit.min(Self::MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY) as usize);
         Ok(hits)
     }
 
@@ -3487,33 +3008,18 @@ impl Storage {
         min_success_rate: f64,
         limit: u64,
     ) -> Result<Vec<procedural_pattern::Model>> {
-        let backend = self.db.get_database_backend();
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(
-                backend,
-                "SELECT id, intent_key, scope, project_id, conversation_id, title,
-                        trigger_summary, summary, tool_sequence_digest,
-                        steps_json::text AS steps_json,
-                        tool_sequence_json::text AS tool_sequence_json,
-                        sample_count, success_count, correction_count, success_rate,
-                        last_validated_at, status, metadata::text AS metadata,
-                        created_at, updated_at
-                 FROM procedural_patterns
-                 WHERE sample_count >= ?
-                   AND success_rate >= ?
-                   AND status IN ('active', 'draft')
-                 ORDER BY success_rate DESC, sample_count DESC, updated_at DESC
-                 LIMIT ?"
-                    .to_string(),
-                vec![
-                    min_samples.into(),
-                    min_success_rate.into(),
-                    Self::db_bound_integer(limit).into(),
-                ],
+        Ok(procedural_pattern::Entity::find()
+            .filter(procedural_pattern::Column::SampleCount.gte(min_samples))
+            .filter(procedural_pattern::Column::SuccessRate.gte(min_success_rate))
+            .filter(procedural_pattern::Column::Status.is_in(["active", "draft"]))
+            .order_by_desc(procedural_pattern::Column::SuccessRate)
+            .order_by_desc(procedural_pattern::Column::SampleCount)
+            .order_by_desc(procedural_pattern::Column::UpdatedAt)
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY),
             ))
-            .await?;
-        rows.iter().map(parse_procedural_pattern_row).collect()
+            .all(&self.db)
+            .await?)
     }
 
     pub async fn list_procedural_patterns(
@@ -3523,113 +3029,110 @@ impl Storage {
         statuses: &[&str],
         limit: u64,
     ) -> Result<Vec<procedural_pattern::Model>> {
-        let backend = self.db.get_database_backend();
-        let status_clause = if statuses.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " AND status IN ({})",
-                Self::sql_placeholder_list(statuses.len())
-            )
+        let mut query = procedural_pattern::Entity::find();
+        query = match conversation_id {
+            Some(value) => query.filter(
+                Condition::any()
+                    .add(procedural_pattern::Column::ConversationId.is_null())
+                    .add(procedural_pattern::Column::ConversationId.eq(value.to_string())),
+            ),
+            None => query.filter(procedural_pattern::Column::ConversationId.is_null()),
         };
-        let sql = format!(
-            "SELECT id, intent_key, scope, project_id, conversation_id, title,
-                    trigger_summary, summary, tool_sequence_digest,
-                    steps_json::text AS steps_json,
-                    tool_sequence_json::text AS tool_sequence_json,
-                    sample_count, success_count, correction_count, success_rate,
-                    last_validated_at, status, metadata::text AS metadata,
-                    created_at, updated_at
-             FROM procedural_patterns
-             WHERE (conversation_id IS NULL OR conversation_id = ?)
-               AND (project_id IS NULL OR project_id = ?)
-               {status_clause}
-             ORDER BY
-               CASE
-                   WHEN conversation_id IS NOT NULL AND conversation_id = ? THEN 3
-                   WHEN project_id IS NOT NULL AND project_id = ? THEN 2
-                   WHEN scope = 'global' THEN 1
-                   ELSE 0
-               END DESC,
-               CASE
-                   WHEN status = 'active' THEN 2
-                   WHEN status = 'draft' THEN 1
-                   ELSE 0
-               END DESC,
-               sample_count DESC,
-               success_rate DESC,
-               updated_at DESC
-             LIMIT ?"
-        );
-        let mut params: Vec<sea_orm::Value> = vec![
-            conversation_id.map(|v| v.to_string()).into(),
-            project_id.map(|v| v.to_string()).into(),
-        ];
-        for status in statuses {
-            params.push((*status).to_string().into());
+        query = match project_id {
+            Some(value) => query.filter(
+                Condition::any()
+                    .add(procedural_pattern::Column::ProjectId.is_null())
+                    .add(procedural_pattern::Column::ProjectId.eq(value.to_string())),
+            ),
+            None => query.filter(procedural_pattern::Column::ProjectId.is_null()),
+        };
+        if !statuses.is_empty() {
+            query = query.filter(
+                procedural_pattern::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
         }
-        params.push(conversation_id.map(|v| v.to_string()).into());
-        params.push(project_id.map(|v| v.to_string()).into());
-        params.push(Self::db_bound_integer(limit).into());
 
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(backend, sql, params))
+        let capped_limit = limit.min(Self::MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY);
+        let mut patterns = query
+            .limit(Self::db_limit(capped_limit))
+            .all(&self.db)
             .await?;
-        rows.iter().map(parse_procedural_pattern_row).collect()
+        patterns.sort_by(|left, right| {
+            scope_match_rank(
+                right.project_id.as_deref(),
+                right.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            )
+            .cmp(&scope_match_rank(
+                left.project_id.as_deref(),
+                left.conversation_id.as_deref(),
+                project_id,
+                conversation_id,
+            ))
+            .then_with(|| {
+                procedural_pattern_status_rank(&right.status)
+                    .cmp(&procedural_pattern_status_rank(&left.status))
+            })
+            .then_with(|| right.sample_count.cmp(&left.sample_count))
+            .then_with(|| right.success_rate.total_cmp(&left.success_rate))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        patterns.truncate(capped_limit as usize);
+        Ok(patterns)
     }
 
     pub async fn upsert_learning_candidate(
         &self,
         candidate: &learning_candidate::Model,
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "INSERT INTO learning_candidates
-                    (id, candidate_type, subject_key, title, summary, project_id,
-                     conversation_id, pattern_id, evidence_refs, proposed_content, confidence,
-                     approval_status, review_notes, reviewed_at, approved_ref, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSONB), CAST(? AS JSONB), ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     candidate_type = excluded.candidate_type,
-                     subject_key = excluded.subject_key,
-                     title = excluded.title,
-                     summary = excluded.summary,
-                     project_id = excluded.project_id,
-                     conversation_id = excluded.conversation_id,
-                     pattern_id = excluded.pattern_id,
-                     evidence_refs = excluded.evidence_refs,
-                     proposed_content = excluded.proposed_content,
-                     confidence = excluded.confidence,
-                     approval_status = excluded.approval_status,
-                     review_notes = excluded.review_notes,
-                     reviewed_at = excluded.reviewed_at,
-                     approved_ref = excluded.approved_ref,
-                     updated_at = excluded.updated_at"
-                    .to_string(),
-                vec![
-                    candidate.id.clone().into(),
-                    candidate.candidate_type.clone().into(),
-                    candidate.subject_key.clone().into(),
-                    candidate.title.clone().into(),
-                    candidate.summary.clone().into(),
-                    candidate.project_id.clone().into(),
-                    candidate.conversation_id.clone().into(),
-                    candidate.pattern_id.clone().into(),
-                    json_text(&candidate.evidence_refs).into(),
-                    json_text(&candidate.proposed_content).into(),
-                    candidate.confidence.into(),
-                    candidate.approval_status.clone().into(),
-                    candidate.review_notes.clone().into(),
-                    candidate.reviewed_at.clone().into(),
-                    candidate.approved_ref.clone().into(),
-                    candidate.created_at.clone().into(),
-                    candidate.updated_at.clone().into(),
-                ],
-            ))
-            .await?;
+        learning_candidate::Entity::insert(learning_candidate::ActiveModel {
+            id: Set(candidate.id.clone()),
+            candidate_type: Set(candidate.candidate_type.clone()),
+            subject_key: Set(candidate.subject_key.clone()),
+            title: Set(candidate.title.clone()),
+            summary: Set(candidate.summary.clone()),
+            project_id: Set(candidate.project_id.clone()),
+            conversation_id: Set(candidate.conversation_id.clone()),
+            pattern_id: Set(candidate.pattern_id.clone()),
+            evidence_refs: Set(candidate.evidence_refs.clone()),
+            proposed_content: Set(candidate.proposed_content.clone()),
+            confidence: Set(candidate.confidence),
+            approval_status: Set(candidate.approval_status.clone()),
+            review_notes: Set(candidate.review_notes.clone()),
+            reviewed_at: Set(candidate.reviewed_at.clone()),
+            approved_ref: Set(candidate.approved_ref.clone()),
+            created_at: Set(candidate.created_at.clone()),
+            updated_at: Set(candidate.updated_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(learning_candidate::Column::Id)
+                .update_columns([
+                    learning_candidate::Column::CandidateType,
+                    learning_candidate::Column::SubjectKey,
+                    learning_candidate::Column::Title,
+                    learning_candidate::Column::Summary,
+                    learning_candidate::Column::ProjectId,
+                    learning_candidate::Column::ConversationId,
+                    learning_candidate::Column::PatternId,
+                    learning_candidate::Column::EvidenceRefs,
+                    learning_candidate::Column::ProposedContent,
+                    learning_candidate::Column::Confidence,
+                    learning_candidate::Column::ApprovalStatus,
+                    learning_candidate::Column::ReviewNotes,
+                    learning_candidate::Column::ReviewedAt,
+                    learning_candidate::Column::ApprovedRef,
+                    learning_candidate::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -3637,23 +3140,9 @@ impl Storage {
         &self,
         id: &str,
     ) -> Result<Option<learning_candidate::Model>> {
-        let backend = self.db.get_database_backend();
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                backend,
-                "SELECT id, candidate_type, subject_key, title, summary, project_id,
-                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
-                        proposed_content::text AS proposed_content, confidence,
-                        approval_status, review_notes, reviewed_at, approved_ref,
-                        created_at, updated_at
-                 FROM learning_candidates
-                 WHERE id = ?"
-                    .to_string(),
-                vec![id.to_string().into()],
-            ))
-            .await?;
-        row.as_ref().map(parse_learning_candidate_row).transpose()
+        Ok(learning_candidate::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?)
     }
 
     pub async fn list_learning_candidates(
@@ -3661,43 +3150,15 @@ impl Storage {
         approval_status: Option<&str>,
         limit: u64,
     ) -> Result<Vec<learning_candidate::Model>> {
-        let backend = self.db.get_database_backend();
-        let (sql, params) = if let Some(status) = approval_status.filter(|v| !v.trim().is_empty()) {
-            (
-                "SELECT id, candidate_type, subject_key, title, summary, project_id,
-                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
-                        proposed_content::text AS proposed_content, confidence,
-                        approval_status, review_notes, reviewed_at, approved_ref,
-                        created_at, updated_at
-                 FROM learning_candidates
-                 WHERE approval_status = ?
-                 ORDER BY updated_at DESC
-                 LIMIT ?"
-                    .to_string(),
-                vec![
-                    status.to_string().into(),
-                    Self::db_bound_integer(limit).into(),
-                ],
-            )
-        } else {
-            (
-                "SELECT id, candidate_type, subject_key, title, summary, project_id,
-                        conversation_id, pattern_id, evidence_refs::text AS evidence_refs,
-                        proposed_content::text AS proposed_content, confidence,
-                        approval_status, review_notes, reviewed_at, approved_ref,
-                        created_at, updated_at
-                 FROM learning_candidates
-                 ORDER BY updated_at DESC
-                 LIMIT ?"
-                    .to_string(),
-                vec![Self::db_bound_integer(limit).into()],
-            )
-        };
-        let rows = self
-            .db
-            .query_all(Self::statement_with_values(backend, sql, params))
-            .await?;
-        rows.iter().map(parse_learning_candidate_row).collect()
+        let mut query = learning_candidate::Entity::find();
+        if let Some(status) = approval_status.filter(|v| !v.trim().is_empty()) {
+            query = query.filter(learning_candidate::Column::ApprovalStatus.eq(status));
+        }
+        Ok(query
+            .order_by_desc(learning_candidate::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
     }
 
     pub async fn update_learning_candidate_review(
@@ -3707,221 +3168,186 @@ impl Storage {
         review_notes: Option<&str>,
         approved_ref: Option<&str>,
     ) -> Result<()> {
-        let backend = self.db.get_database_backend();
-        self.db
-            .execute(Self::statement_with_values(
-                backend,
-                "UPDATE learning_candidates
-                 SET approval_status = ?,
-                     review_notes = ?,
-                     reviewed_at = ?,
-                     approved_ref = ?,
-                     updated_at = ?
-                 WHERE id = ?"
-                    .to_string(),
-                vec![
-                    approval_status.to_string().into(),
-                    review_notes.map(|value| value.to_string()).into(),
-                    chrono::Utc::now().to_rfc3339().into(),
-                    approved_ref.map(|value| value.to_string()).into(),
-                    chrono::Utc::now().to_rfc3339().into(),
-                    id.to_string().into(),
-                ],
-            ))
+        learning_candidate::Entity::update_many()
+            .col_expr(
+                learning_candidate::Column::ApprovalStatus,
+                Expr::value(approval_status.to_string()),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewNotes,
+                Expr::value(review_notes.map(|value| value.to_string())),
+            )
+            .col_expr(
+                learning_candidate::Column::ReviewedAt,
+                Expr::value(Some(chrono::Utc::now().to_rfc3339())),
+            )
+            .col_expr(
+                learning_candidate::Column::ApprovedRef,
+                Expr::value(approved_ref.map(|value| value.to_string())),
+            )
+            .col_expr(
+                learning_candidate::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .filter(learning_candidate::Column::Id.eq(id))
+            .exec(&self.db)
             .await?;
         Ok(())
     }
 
     pub async fn learning_queue_counts(&self) -> Result<LearningQueueCounts> {
-        let backend = self.db.get_database_backend();
-        let row = self
-            .db
-            .query_one(Statement::from_string(
-                backend,
-                "SELECT
-                    (SELECT COUNT(*)::BIGINT FROM experience_runs WHERE success_state = 'provisional') AS provisional_runs,
-                    (SELECT COUNT(*)::BIGINT FROM experience_runs WHERE consolidated = FALSE AND (success_state <> 'provisional' OR correction_state = 'corrected')) AS pending_consolidation,
-                    (SELECT COUNT(*)::BIGINT FROM learning_candidates WHERE approval_status = 'draft') AS draft_candidates,
-                    (SELECT COUNT(*)::BIGINT FROM procedural_patterns WHERE status = 'active') AS active_patterns"
-                    .to_string(),
-            ))
+        let provisional_runs = experience_run::Entity::find()
+            .filter(experience_run::Column::SuccessState.eq("provisional"))
+            .count(&self.db)
             .await?;
-        let Some(row) = row else {
-            return Ok(LearningQueueCounts::default());
-        };
+        let pending_consolidation = experience_run::Entity::find()
+            .filter(experience_run::Column::Consolidated.eq(false))
+            .filter(
+                Condition::any()
+                    .add(experience_run::Column::SuccessState.ne("provisional"))
+                    .add(experience_run::Column::CorrectionState.eq("corrected")),
+            )
+            .count(&self.db)
+            .await?;
+        let draft_candidates = learning_candidate::Entity::find()
+            .filter(learning_candidate::Column::ApprovalStatus.eq("draft"))
+            .count(&self.db)
+            .await?;
+        let active_patterns = procedural_pattern::Entity::find()
+            .filter(procedural_pattern::Column::Status.eq("active"))
+            .count(&self.db)
+            .await?;
         Ok(LearningQueueCounts {
-            provisional_runs: row
-                .try_get::<i64>("", "provisional_runs")
-                .unwrap_or_default()
-                .max(0) as u64,
-            pending_consolidation: row
-                .try_get::<i64>("", "pending_consolidation")
-                .unwrap_or_default()
-                .max(0) as u64,
-            draft_candidates: row
-                .try_get::<i64>("", "draft_candidates")
-                .unwrap_or_default()
-                .max(0) as u64,
-            active_patterns: row
-                .try_get::<i64>("", "active_patterns")
-                .unwrap_or_default()
-                .max(0) as u64,
+            provisional_runs,
+            pending_consolidation,
+            draft_candidates,
+            active_patterns,
         })
     }
 
-    pub async fn request_execution_run_cancel(&self, id: &str) -> Result<bool> {
-        let result = self
-            .db
-            .execute(Self::statement_with_values(
-                self.db.get_database_backend(),
-                "UPDATE execution_runs
-                 SET cancellation_requested = TRUE, updated_at = ?
-                 WHERE id = ?"
-                    .to_string(),
-                vec![
-                    chrono::Utc::now().to_rfc3339().into(),
-                    id.to_string().into(),
-                ],
-            ))
-            .await?;
-        Ok(result.rows_affected() > 0)
+    pub async fn latest_migration_version(&self) -> Result<Option<i64>> {
+        Ok(None)
     }
 
-    pub async fn latest_migration_version(&self) -> Result<Option<i64>> {
-        Ok(self
-            .db
-            .query_one(Statement::from_string(
-                self.db.get_database_backend(),
-                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1".to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "version").ok()))
+    pub fn expected_migration_version(&self) -> i64 {
+        migrations::latest_version()
     }
 
     pub async fn database_table_names(&self) -> Result<Vec<String>> {
-        let rows = self
-            .db
-            .query_all(Statement::from_string(
-                self.db.get_database_backend(),
-                "SELECT table_name
-                 FROM information_schema.tables
-                 WHERE table_schema = current_schema()
-                 ORDER BY table_name"
-                    .to_string(),
-            ))
-            .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| row.try_get::<String>("", "table_name").ok())
-            .collect())
+        let query = Query::select()
+            .column((Alias::new("tables"), Alias::new("table_name")))
+            .from((Alias::new("information_schema"), Alias::new("tables")))
+            .and_where(Expr::col((Alias::new("tables"), Alias::new("table_schema"))).eq("public"))
+            .and_where(Expr::col((Alias::new("tables"), Alias::new("table_type"))).eq("BASE TABLE"))
+            .order_by((Alias::new("tables"), Alias::new("table_name")), Order::Asc)
+            .to_owned();
+        let rows = self.db.query_all(DbBackend::Postgres.build(&query)).await?;
+        let mut table_names = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(name) = row.try_get::<String>("", "table_name") {
+                table_names.push(name);
+            }
+        }
+        Ok(table_names)
+    }
+
+    pub async fn housekeeping_status(&self) -> Result<HousekeepingStatus> {
+        let housekeeping_last_run_at = self
+            .get(Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY)
+            .await?
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let notification_last_run_at = self
+            .get(Self::NOTIFICATION_PURGE_LAST_RUN_KEY)
+            .await?
+            .and_then(|raw| String::from_utf8(raw).ok());
+        Ok(HousekeepingStatus {
+            housekeeping_last_run_at,
+            notification_last_run_at,
+        })
     }
 
     pub async fn database_size_bytes(&self) -> Result<Option<i64>> {
-        Ok(self
-            .db
-            .query_one(Statement::from_string(
-                self.db.get_database_backend(),
-                "SELECT pg_database_size(current_database()) AS size_bytes".to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "size_bytes").ok()))
+        let query = Query::select()
+            .expr_as(
+                Func::cust(Alias::new("pg_database_size"))
+                    .arg(Func::cust(Alias::new("current_database"))),
+                Alias::new("size_bytes"),
+            )
+            .to_owned();
+        let row = self.db.query_one(DbBackend::Postgres.build(&query)).await?;
+        Ok(row.and_then(|value| value.try_get::<i64>("", "size_bytes").ok()))
     }
 
     pub async fn lease_status_summary(&self) -> Result<LeaseStatusSummary> {
         let now = chrono::Utc::now().to_rfc3339();
         let pending_status = serde_json::to_string(&crate::core::TaskStatus::Pending)
             .unwrap_or_else(|_| "\"pending\"".to_string());
-        let row = self
-            .db
-            .query_one(Self::statement_with_values(
-                self.db.get_database_backend(),
-                "SELECT
-                    (SELECT COUNT(*)::BIGINT
-                     FROM tasks
-                     WHERE status = ?
-                       AND (scheduled_for IS NULL OR scheduled_for <= ?)
-                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS pending_task_backlog,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM tasks
-                     WHERE lease_expires_at IS NOT NULL
-                       AND lease_expires_at > ?) AS active_task_leases,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM tasks
-                     WHERE next_retry_at IS NOT NULL
-                       AND next_retry_at > ?) AS tasks_waiting_retry,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM watchers
-                     WHERE status = 'active'
-                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)) AS watcher_poll_backlog,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM watchers
-                     WHERE lease_expires_at IS NOT NULL
-                       AND lease_expires_at > ?) AS active_watcher_leases,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM watchers
-                     WHERE next_retry_at IS NOT NULL
-                       AND next_retry_at > ?) AS watchers_waiting_retry,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM execution_runs
-                     WHERE lease_expires_at IS NOT NULL
-                       AND lease_expires_at > ?) AS active_run_leases,
-                    (SELECT COUNT(*)::BIGINT
-                     FROM execution_runs
-                     WHERE cancellation_requested = TRUE
-                       AND status NOT IN ('completed', 'degraded', 'needs_input', 'blocked', 'platform_failed', 'cancelled')
-                    ) AS runs_pending_cancellation"
-                    .to_string(),
-                vec![
-                    pending_status.into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                    now.clone().into(),
-                ],
-            ))
-            .await?;
-        let Some(row) = row else {
-            return Ok(LeaseStatusSummary::default());
-        };
         Ok(LeaseStatusSummary {
-            pending_task_backlog: row
-                .try_get::<i64>("", "pending_task_backlog")
-                .unwrap_or_default()
-                .max(0) as u64,
-            active_task_leases: row
-                .try_get::<i64>("", "active_task_leases")
-                .unwrap_or_default()
-                .max(0) as u64,
-            tasks_waiting_retry: row
-                .try_get::<i64>("", "tasks_waiting_retry")
-                .unwrap_or_default()
-                .max(0) as u64,
-            watcher_poll_backlog: row
-                .try_get::<i64>("", "watcher_poll_backlog")
-                .unwrap_or_default()
-                .max(0) as u64,
-            active_watcher_leases: row
-                .try_get::<i64>("", "active_watcher_leases")
-                .unwrap_or_default()
-                .max(0) as u64,
-            watchers_waiting_retry: row
-                .try_get::<i64>("", "watchers_waiting_retry")
-                .unwrap_or_default()
-                .max(0) as u64,
-            active_run_leases: row
-                .try_get::<i64>("", "active_run_leases")
-                .unwrap_or_default()
-                .max(0) as u64,
-            runs_pending_cancellation: row
-                .try_get::<i64>("", "runs_pending_cancellation")
-                .unwrap_or_default()
-                .max(0) as u64,
+            pending_task_backlog: task::Entity::find()
+                .filter(task::Column::Status.eq(pending_status.clone()))
+                .filter(
+                    Condition::any()
+                        .add(task::Column::ScheduledFor.is_null())
+                        .add(task::Column::ScheduledFor.lte(now.clone())),
+                )
+                .filter(
+                    Condition::any()
+                        .add(task::Column::LeaseExpiresAt.is_null())
+                        .add(task::Column::LeaseExpiresAt.lte(now.clone())),
+                )
+                .count(&self.db)
+                .await?,
+            active_task_leases: task::Entity::find()
+                .filter(task::Column::LeaseExpiresAt.is_not_null())
+                .filter(task::Column::LeaseExpiresAt.gt(now.clone()))
+                .count(&self.db)
+                .await?,
+            tasks_waiting_retry: task::Entity::find()
+                .filter(task::Column::NextRetryAt.is_not_null())
+                .filter(task::Column::NextRetryAt.gt(now.clone()))
+                .count(&self.db)
+                .await?,
+            watcher_poll_backlog: watcher::Entity::find()
+                .filter(watcher::Column::Status.eq("active"))
+                .filter(
+                    Condition::any()
+                        .add(watcher::Column::NextRetryAt.is_null())
+                        .add(watcher::Column::NextRetryAt.lte(now.clone())),
+                )
+                .filter(
+                    Condition::any()
+                        .add(watcher::Column::LeaseExpiresAt.is_null())
+                        .add(watcher::Column::LeaseExpiresAt.lte(now.clone())),
+                )
+                .count(&self.db)
+                .await?,
+            active_watcher_leases: watcher::Entity::find()
+                .filter(watcher::Column::LeaseExpiresAt.is_not_null())
+                .filter(watcher::Column::LeaseExpiresAt.gt(now.clone()))
+                .count(&self.db)
+                .await?,
+            watchers_waiting_retry: watcher::Entity::find()
+                .filter(watcher::Column::NextRetryAt.is_not_null())
+                .filter(watcher::Column::NextRetryAt.gt(now.clone()))
+                .count(&self.db)
+                .await?,
+            active_run_leases: execution_run::Entity::find()
+                .filter(execution_run::Column::LeaseExpiresAt.is_not_null())
+                .filter(execution_run::Column::LeaseExpiresAt.gt(now.clone()))
+                .count(&self.db)
+                .await?,
+            runs_pending_cancellation: execution_run::Entity::find()
+                .filter(execution_run::Column::CancellationRequested.eq(true))
+                .filter(execution_run::Column::Status.is_not_in([
+                    "completed",
+                    "degraded",
+                    "needs_input",
+                    "blocked",
+                    "platform_failed",
+                    "cancelled",
+                ]))
+                .count(&self.db)
+                .await?,
         })
     }
 
@@ -3967,6 +3393,7 @@ impl Storage {
         }
         let results = query
             .order_by_desc(expense::Column::Date)
+            .limit(Self::MAX_EXPENSE_ROWS_PER_QUERY)
             .all(&self.db)
             .await?;
         Ok(results)
@@ -4119,12 +3546,13 @@ impl Storage {
     pub async fn get_recent_delegations(&self, limit: u64) -> Result<Vec<swarm_delegation::Model>> {
         let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
-            .limit(Self::db_limit(limit))
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_SWARM_DELEGATION_ROWS_PER_QUERY),
+            ))
             .all(&self.db)
             .await?;
         for delegation in &mut delegations {
-            delegation.task_description = decrypt_storage_string(&delegation.task_description);
-            delegation.result = decrypt_optional_storage_string(delegation.result.clone());
+            decrypt_swarm_delegation_model(delegation);
         }
         Ok(delegations)
     }
@@ -4133,11 +3561,45 @@ impl Storage {
     pub async fn get_all_delegations(&self) -> Result<Vec<swarm_delegation::Model>> {
         let mut delegations = swarm_delegation::Entity::find()
             .order_by_desc(swarm_delegation::Column::CreatedAt)
+            .limit(Self::MAX_SWARM_DELEGATION_ROWS_PER_QUERY)
             .all(&self.db)
             .await?;
         for delegation in &mut delegations {
-            delegation.task_description = decrypt_storage_string(&delegation.task_description);
-            delegation.result = decrypt_optional_storage_string(delegation.result.clone());
+            decrypt_swarm_delegation_model(delegation);
+        }
+        Ok(delegations)
+    }
+
+    pub async fn get_swarm_delegations_for_parent(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<swarm_delegation::Model>> {
+        let mut delegations = swarm_delegation::Entity::find()
+            .filter(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+            .order_by_asc(swarm_delegation::Column::CreatedAt)
+            .limit(Self::MAX_SWARM_DELEGATION_ROWS_PER_QUERY)
+            .all(&self.db)
+            .await?;
+        for delegation in &mut delegations {
+            decrypt_swarm_delegation_model(delegation);
+        }
+        Ok(delegations)
+    }
+
+    pub async fn get_active_swarm_delegations(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<swarm_delegation::Model>> {
+        let mut delegations = swarm_delegation::Entity::find()
+            .filter(swarm_delegation::Column::CompletedAt.is_null())
+            .order_by_desc(swarm_delegation::Column::CreatedAt)
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_SWARM_DELEGATION_ROWS_PER_QUERY),
+            ))
+            .all(&self.db)
+            .await?;
+        for delegation in &mut delegations {
+            decrypt_swarm_delegation_model(delegation);
         }
         Ok(delegations)
     }
@@ -4170,6 +3632,93 @@ impl Storage {
             );
         }
         Ok(())
+    }
+
+    pub async fn upsert_swarm_delegation(
+        &self,
+        delegation: &swarm_delegation::Model,
+    ) -> Result<()> {
+        swarm_delegation::Entity::insert(swarm_delegation::ActiveModel {
+            id: Set(delegation.id.clone()),
+            parent_task_id: Set(delegation.parent_task_id.clone()),
+            agent_id: Set(delegation.agent_id.clone()),
+            task_description: Set(encrypt_storage_string(&delegation.task_description)?),
+            result: Set(encrypt_optional_storage_string(
+                delegation.result.as_deref(),
+            )?),
+            success: Set(delegation.success),
+            confidence: Set(delegation.confidence),
+            execution_time_ms: Set(delegation.execution_time_ms),
+            created_at: Set(delegation.created_at.clone()),
+            completed_at: Set(delegation.completed_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::column(swarm_delegation::Column::Id)
+                .update_columns([
+                    swarm_delegation::Column::ParentTaskId,
+                    swarm_delegation::Column::AgentId,
+                    swarm_delegation::Column::TaskDescription,
+                    swarm_delegation::Column::Result,
+                    swarm_delegation::Column::Success,
+                    swarm_delegation::Column::Confidence,
+                    swarm_delegation::Column::ExecutionTimeMs,
+                    swarm_delegation::Column::CompletedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after delegation upsert: {}",
+                e
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn mark_swarm_run_interrupted(
+        &self,
+        parent_task_id: &str,
+        summary: &str,
+    ) -> Result<u64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = swarm_delegation::Entity::find()
+            .filter(swarm_delegation::Column::ParentTaskId.eq(parent_task_id.to_string()))
+            .filter(swarm_delegation::Column::CompletedAt.is_null())
+            .all(&self.db)
+            .await?;
+        let mut updated = 0_u64;
+        for row in rows {
+            let mut payload = row
+                .result
+                .clone()
+                .and_then(|raw| {
+                    serde_json::from_str::<serde_json::Value>(&decrypt_storage_string(&raw)).ok()
+                })
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            payload.insert("status".to_string(), serde_json::json!("interrupted"));
+            payload.insert("updated_at".to_string(), serde_json::json!(now.clone()));
+            if !summary.trim().is_empty() {
+                payload.insert("summary".to_string(), serde_json::json!(summary));
+                payload.insert("latest_update".to_string(), serde_json::json!(summary));
+            }
+            let payload_json = serde_json::Value::Object(payload).to_string();
+            swarm_delegation::ActiveModel {
+                id: Unchanged(row.id),
+                result: Set(encrypt_optional_storage_string(Some(
+                    payload_json.as_str(),
+                ))?),
+                success: Set(0),
+                completed_at: Set(Some(now.clone())),
+                ..Default::default()
+            }
+            .update(&self.db)
+            .await?;
+            updated = updated.saturating_add(1);
+        }
+        Ok(updated)
     }
 
     // ==================== Conversations ====================
@@ -4493,6 +4042,7 @@ impl Storage {
     pub async fn list_projects(&self) -> Result<Vec<project::Model>> {
         let projects = project::Entity::find()
             .order_by_desc(project::Column::UpdatedAt)
+            .limit(Self::MAX_PROJECT_ROWS_PER_QUERY)
             .all(&self.db)
             .await?;
         Ok(projects)
@@ -4603,8 +4153,14 @@ impl Storage {
 
     // ==================== Documents ====================
 
-    /// Insert a document record
-    pub async fn insert_document(&self, doc: &document::Model) -> Result<()> {
+    /// Insert a document and all chunks atomically so partial uploads do not leak
+    /// into the searchable document library.
+    pub async fn insert_document_with_chunks(
+        &self,
+        doc: &document::Model,
+        chunks: &[document_chunk::Model],
+    ) -> Result<()> {
+        let txn = self.db.begin().await?;
         let filename = encrypt_storage_string(&doc.filename)?;
         document::ActiveModel {
             id: Set(doc.id.clone()),
@@ -4615,23 +4171,23 @@ impl Storage {
             file_size: Set(doc.file_size),
             created_at: Set(doc.created_at.clone()),
         }
-        .insert(&self.db)
+        .insert(&txn)
         .await?;
-        Ok(())
-    }
 
-    /// Insert a document chunk
-    pub async fn insert_document_chunk(&self, chunk: &document_chunk::Model) -> Result<()> {
-        let content = encrypt_storage_string(&chunk.content)?;
-        document_chunk::ActiveModel {
-            id: Set(chunk.id.clone()),
-            document_id: Set(chunk.document_id.clone()),
-            chunk_index: Set(chunk.chunk_index),
-            content: Set(content),
-            embedding: Set(chunk.embedding.clone()),
+        for chunk in chunks {
+            let content = encrypt_storage_string(&chunk.content)?;
+            document_chunk::ActiveModel {
+                id: Set(chunk.id.clone()),
+                document_id: Set(chunk.document_id.clone()),
+                chunk_index: Set(chunk.chunk_index),
+                content: Set(content),
+                embedding: Set(chunk.embedding.clone()),
+            }
+            .insert(&txn)
+            .await?;
         }
-        .insert(&self.db)
-        .await?;
+
+        txn.commit().await?;
         Ok(())
     }
 
@@ -4673,7 +4229,11 @@ impl Storage {
     ) -> Result<Vec<document::Model>> {
         let mut query = document::Entity::find().order_by_desc(document::Column::CreatedAt);
         if let Some(pid) = project_id {
-            query = query.filter(document::Column::ProjectId.eq(pid));
+            query = query.filter(
+                Condition::any()
+                    .add(document::Column::ProjectId.eq(pid))
+                    .add(document::Column::ProjectId.is_null()),
+            );
         }
         let mut docs = query
             .limit(Self::MAX_DOCUMENTS_FOR_SEARCH)
@@ -4727,7 +4287,7 @@ impl Storage {
     pub async fn update_document_chunk_embedding(
         &self,
         chunk_id: &str,
-        embedding: Option<Vec<u8>>,
+        embedding: Option<PgVector>,
     ) -> Result<()> {
         if let Some(existing) = document_chunk::Entity::find_by_id(chunk_id.to_string())
             .one(&self.db)
@@ -4820,6 +4380,9 @@ impl Storage {
     async fn maybe_purge_old_notifications(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
+        if !lifecycle.cleanup_enabled || !lifecycle.notifications_cleanup_enabled {
+            return Ok(());
+        }
         let last_run = self
             .get(Self::NOTIFICATION_PURGE_LAST_RUN_KEY)
             .await?
@@ -4875,17 +4438,24 @@ impl Storage {
         let encrypted_body = encrypt_storage_string(&body_clean)?;
         let level_clean = notif.level.trim().to_string();
         let source_clean = notif.source.trim().to_string();
+        let body_sig = Self::notification_body_signature(&body_clean);
 
         if Self::is_arkpulse_notification(&source_clean) {
-            let existing_recent = notification::Entity::find()
+            let recent = notification::Entity::find()
                 .filter(notification::Column::Source.eq(source_clean.clone()))
                 .filter(notification::Column::CreatedAt.gte(Self::arkpulse_recent_cutoff_rfc3339()))
                 .order_by_desc(notification::Column::CreatedAt)
-                .limit(1)
-                .one(&self.db)
+                .limit(25)
+                .all(&self.db)
                 .await?;
-            if existing_recent.is_some() {
-                return Ok(());
+            for existing in recent {
+                let existing_title = decrypt_storage_string(&existing.title);
+                let existing_body = decrypt_storage_string(&existing.body);
+                if existing_title == title_clean
+                    && Self::notification_body_signature(&existing_body) == body_sig
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -4895,7 +4465,6 @@ impl Storage {
             let cutoff = (chrono::Utc::now()
                 - chrono::Duration::days(Self::NOTIFICATION_DEDUP_COOLDOWN_DAYS))
             .to_rfc3339();
-            let sig = Self::notification_body_signature(&body_clean);
             match notification::Entity::find()
                 .filter(notification::Column::CreatedAt.gte(cutoff))
                 .filter(notification::Column::Source.eq(source_clean.clone()))
@@ -4909,7 +4478,7 @@ impl Storage {
                         let existing_title = decrypt_storage_string(&existing.title);
                         let existing_body = decrypt_storage_string(&existing.body);
                         if existing_title == title_clean
-                            && Self::notification_body_signature(&existing_body) == sig
+                            && Self::notification_body_signature(&existing_body) == body_sig
                         {
                             // Suppress duplicates within the cooldown window.
                             return Ok(());
@@ -5003,8 +4572,9 @@ impl Storage {
 
     /// Mark all notifications as read
     pub async fn mark_all_notifications_read(&self) -> Result<()> {
-        self.db
-            .execute_unprepared("UPDATE notifications SET read = 1")
+        notification::Entity::update_many()
+            .col_expr(notification::Column::Read, Expr::value(true))
+            .exec(&self.db)
             .await?;
         Ok(())
     }
@@ -5153,36 +4723,31 @@ impl Storage {
         requested_at: &str,
     ) -> Result<()> {
         let arguments = encrypt_storage_string(arguments)?;
-        let existing = approval_log::Entity::find_by_id(id.to_string())
-            .one(&self.db)
-            .await?;
-        if existing.is_some() {
-            approval_log::ActiveModel {
-                id: Set(id.to_string()),
-                action_name: Set(action_name.to_string()),
-                arguments: Set(arguments.clone()),
-                rule_name: Set(rule_name.to_string()),
-                status: Set("pending".to_string()),
-                requested_at: Set(requested_at.to_string()),
-                resolved_at: Set(None),
-                resolved_by: Set(None),
-            }
-            .update(&self.db)
-            .await?;
-        } else {
-            approval_log::ActiveModel {
-                id: Set(id.to_string()),
-                action_name: Set(action_name.to_string()),
-                arguments: Set(arguments),
-                rule_name: Set(rule_name.to_string()),
-                status: Set("pending".to_string()),
-                requested_at: Set(requested_at.to_string()),
-                resolved_at: Set(None),
-                resolved_by: Set(None),
-            }
-            .insert(&self.db)
-            .await?;
-        }
+        approval_log::Entity::insert(approval_log::ActiveModel {
+            id: Set(id.to_string()),
+            action_name: Set(action_name.to_string()),
+            arguments: Set(arguments),
+            rule_name: Set(rule_name.to_string()),
+            status: Set("pending".to_string()),
+            requested_at: Set(requested_at.to_string()),
+            resolved_at: Set(None),
+            resolved_by: Set(None),
+        })
+        .on_conflict(
+            OnConflict::column(approval_log::Column::Id)
+                .update_columns([
+                    approval_log::Column::ActionName,
+                    approval_log::Column::Arguments,
+                    approval_log::Column::RuleName,
+                    approval_log::Column::Status,
+                    approval_log::Column::RequestedAt,
+                    approval_log::Column::ResolvedAt,
+                    approval_log::Column::ResolvedBy,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -5254,26 +4819,49 @@ impl Storage {
         let message = encrypt_storage_string(&trace.message)?;
         let steps_json = encrypt_storage_string(&serde_json::to_string(&trace.steps)?)?;
         let response = encrypt_optional_storage_string(trace.response.as_deref())?;
-        let insert_result = crate::storage::entities::execution_trace::ActiveModel {
-            id: Set(trace.id.clone()),
-            message: Set(message.clone()),
-            channel: Set(trace.channel.clone()),
-            started_at: Set(started_at.clone()),
-            completed_at: Set(completed_at.clone()),
-            duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
-            step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
-            steps_json: Set(steps_json.clone()),
-            response: Set(response.clone()),
-            proof_id: Set(trace.proof_id.clone()),
-            model: Set(trace.model.clone()),
-            input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
-            output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
-            total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
-            cost_usd: Set(trace.cost_usd),
-            complexity: Set(trace.complexity.clone()),
-            created_at: Set(created_at.clone()),
-        }
-        .insert(&self.db)
+        let insert_result = crate::storage::entities::execution_trace::Entity::insert(
+            crate::storage::entities::execution_trace::ActiveModel {
+                id: Set(trace.id.clone()),
+                message: Set(message.clone()),
+                channel: Set(trace.channel.clone()),
+                started_at: Set(started_at.clone()),
+                completed_at: Set(completed_at.clone()),
+                duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
+                step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
+                steps_json: Set(steps_json.clone()),
+                response: Set(response.clone()),
+                proof_id: Set(trace.proof_id.clone()),
+                model: Set(trace.model.clone()),
+                input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
+                output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
+                total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
+                cost_usd: Set(trace.cost_usd),
+                complexity: Set(trace.complexity.clone()),
+                created_at: Set(created_at.clone()),
+            },
+        )
+        .on_conflict(
+            OnConflict::column(crate::storage::entities::execution_trace::Column::Id)
+                .update_columns([
+                    crate::storage::entities::execution_trace::Column::Message,
+                    crate::storage::entities::execution_trace::Column::Channel,
+                    crate::storage::entities::execution_trace::Column::StartedAt,
+                    crate::storage::entities::execution_trace::Column::CompletedAt,
+                    crate::storage::entities::execution_trace::Column::DurationMs,
+                    crate::storage::entities::execution_trace::Column::StepCount,
+                    crate::storage::entities::execution_trace::Column::StepsJson,
+                    crate::storage::entities::execution_trace::Column::Response,
+                    crate::storage::entities::execution_trace::Column::ProofId,
+                    crate::storage::entities::execution_trace::Column::Model,
+                    crate::storage::entities::execution_trace::Column::InputTokens,
+                    crate::storage::entities::execution_trace::Column::OutputTokens,
+                    crate::storage::entities::execution_trace::Column::TotalTokens,
+                    crate::storage::entities::execution_trace::Column::CostUsd,
+                    crate::storage::entities::execution_trace::Column::Complexity,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
         .await;
         if let Err(error) = insert_result {
             if trace.proof_id.is_some() && is_foreign_key_constraint_error(&error) {
@@ -5282,26 +4870,49 @@ impl Storage {
                     trace.id,
                     error
                 );
-                crate::storage::entities::execution_trace::ActiveModel {
-                    id: Set(trace.id.clone()),
-                    message: Set(message),
-                    channel: Set(trace.channel.clone()),
-                    started_at: Set(started_at),
-                    completed_at: Set(completed_at),
-                    duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
-                    step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
-                    steps_json: Set(steps_json),
-                    response: Set(response),
-                    proof_id: Set(None),
-                    model: Set(trace.model.clone()),
-                    input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
-                    output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
-                    total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
-                    cost_usd: Set(trace.cost_usd),
-                    complexity: Set(trace.complexity.clone()),
-                    created_at: Set(created_at),
-                }
-                .insert(&self.db)
+                crate::storage::entities::execution_trace::Entity::insert(
+                    crate::storage::entities::execution_trace::ActiveModel {
+                        id: Set(trace.id.clone()),
+                        message: Set(message),
+                        channel: Set(trace.channel.clone()),
+                        started_at: Set(started_at),
+                        completed_at: Set(completed_at),
+                        duration_ms: Set(duration_ms.map(|v| v.min(i32::MAX as i64) as i32)),
+                        step_count: Set(trace.steps.len().min(i32::MAX as usize) as i32),
+                        steps_json: Set(steps_json),
+                        response: Set(response),
+                        proof_id: Set(None),
+                        model: Set(trace.model.clone()),
+                        input_tokens: Set(trace.input_tokens.min(i32::MAX as i64) as i32),
+                        output_tokens: Set(trace.output_tokens.min(i32::MAX as i64) as i32),
+                        total_tokens: Set(trace.total_tokens.min(i32::MAX as i64) as i32),
+                        cost_usd: Set(trace.cost_usd),
+                        complexity: Set(trace.complexity.clone()),
+                        created_at: Set(created_at),
+                    },
+                )
+                .on_conflict(
+                    OnConflict::column(crate::storage::entities::execution_trace::Column::Id)
+                        .update_columns([
+                            crate::storage::entities::execution_trace::Column::Message,
+                            crate::storage::entities::execution_trace::Column::Channel,
+                            crate::storage::entities::execution_trace::Column::StartedAt,
+                            crate::storage::entities::execution_trace::Column::CompletedAt,
+                            crate::storage::entities::execution_trace::Column::DurationMs,
+                            crate::storage::entities::execution_trace::Column::StepCount,
+                            crate::storage::entities::execution_trace::Column::StepsJson,
+                            crate::storage::entities::execution_trace::Column::Response,
+                            crate::storage::entities::execution_trace::Column::ProofId,
+                            crate::storage::entities::execution_trace::Column::Model,
+                            crate::storage::entities::execution_trace::Column::InputTokens,
+                            crate::storage::entities::execution_trace::Column::OutputTokens,
+                            crate::storage::entities::execution_trace::Column::TotalTokens,
+                            crate::storage::entities::execution_trace::Column::CostUsd,
+                            crate::storage::entities::execution_trace::Column::Complexity,
+                        ])
+                        .to_owned(),
+                )
+                .exec(&self.db)
                 .await?;
             } else {
                 return Err(error.into());
@@ -5316,24 +4927,76 @@ impl Storage {
         Ok(())
     }
 
-    /// List persisted execution traces (newest first).
-    pub async fn list_execution_traces(
+    /// List persisted execution trace summaries (newest first) without loading full responses.
+    pub async fn list_execution_trace_summaries(
         &self,
+        since: Option<&str>,
         limit: u64,
         offset: u64,
-    ) -> Result<Vec<crate::storage::entities::execution_trace::Model>> {
-        let mut traces = crate::storage::entities::execution_trace::Entity::find()
+    ) -> Result<Vec<ExecutionTraceSummaryRow>> {
+        let mut query = crate::storage::entities::execution_trace::Entity::find()
+            .select_only()
+            .columns([
+                crate::storage::entities::execution_trace::Column::Id,
+                crate::storage::entities::execution_trace::Column::Message,
+                crate::storage::entities::execution_trace::Column::Channel,
+                crate::storage::entities::execution_trace::Column::StartedAt,
+                crate::storage::entities::execution_trace::Column::CompletedAt,
+                crate::storage::entities::execution_trace::Column::DurationMs,
+                crate::storage::entities::execution_trace::Column::StepCount,
+                crate::storage::entities::execution_trace::Column::StepsJson,
+                crate::storage::entities::execution_trace::Column::Model,
+                crate::storage::entities::execution_trace::Column::TotalTokens,
+                crate::storage::entities::execution_trace::Column::CostUsd,
+                crate::storage::entities::execution_trace::Column::Complexity,
+                crate::storage::entities::execution_trace::Column::CreatedAt,
+            ])
             .order_by_desc(crate::storage::entities::execution_trace::Column::CreatedAt)
             .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
+            .offset(Self::db_offset(offset));
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(
+                crate::storage::entities::execution_trace::Column::CreatedAt.gte(since.to_string()),
+            );
+        }
+
+        let mut traces = query
+            .into_model::<ExecutionTraceSummaryRow>()
             .all(&self.db)
             .await?;
         for trace in &mut traces {
             trace.message = decrypt_storage_string(&trace.message);
             trace.steps_json = decrypt_storage_string(&trace.steps_json);
-            trace.response = decrypt_optional_storage_string(trace.response.take());
         }
         Ok(traces)
+    }
+
+    pub async fn count_execution_traces(&self, since: Option<&str>) -> Result<u64> {
+        let mut query = crate::storage::entities::execution_trace::Entity::find();
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(
+                crate::storage::entities::execution_trace::Column::CreatedAt.gte(since.to_string()),
+            );
+        }
+        Ok(query.count(&self.db).await?)
+    }
+
+    pub async fn count_execution_traces_by_ids(
+        &self,
+        since: Option<&str>,
+        ids: &[String],
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut query = crate::storage::entities::execution_trace::Entity::find()
+            .filter(crate::storage::entities::execution_trace::Column::Id.is_in(ids.to_vec()));
+        if let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) {
+            query = query.filter(
+                crate::storage::entities::execution_trace::Column::CreatedAt.gte(since.to_string()),
+            );
+        }
+        Ok(query.count(&self.db).await?)
     }
 
     /// Get a single persisted execution trace by id.
@@ -5371,6 +5034,36 @@ impl Storage {
         if let Err(e) = self.maybe_purge_housekeeping_tables().await {
             tracing::warn!(
                 "Storage housekeeping purge failed after security log insert: {}",
+                e
+            );
+        }
+        Ok(())
+    }
+
+    /// Insert multiple security log entries atomically.
+    pub async fn insert_security_logs(&self, logs: &[security_log::Model]) -> Result<()> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.db.begin().await?;
+        for log in logs {
+            security_log::ActiveModel {
+                id: Set(log.id.clone()),
+                event_type: Set(log.event_type.clone()),
+                severity: Set(log.severity.clone()),
+                message: Set(encrypt_storage_string(&log.message)?),
+                source: Set(encrypt_optional_storage_string(log.source.as_deref())?),
+                count: Set(log.count),
+                created_at: Set(log.created_at.clone()),
+            }
+            .insert(&txn)
+            .await?;
+        }
+        txn.commit().await?;
+        if let Err(e) = self.maybe_purge_housekeeping_tables().await {
+            tracing::warn!(
+                "Storage housekeeping purge failed after security log batch insert: {}",
                 e
             );
         }
@@ -5435,6 +5128,89 @@ impl Storage {
         Ok(result.rows_affected)
     }
 
+    // ==================== ArkPulse History ====================
+
+    /// Insert an ArkPulse history event row.
+    pub async fn insert_arkpulse_event(&self, event: &arkpulse_event::Model) -> Result<()> {
+        arkpulse_event::Entity::insert(arkpulse_event::ActiveModel {
+            id: Set(event.id.clone()),
+            timestamp: Set(event.timestamp.clone()),
+            status: Set(event.status.clone()),
+            message: Set(encrypt_storage_string(&event.message)?),
+            summary: Set(encrypt_storage_string(&event.summary)?),
+            flags_json: Set(encrypt_storage_string(&event.flags_json)?),
+            overdue_tasks: Set(event.overdue_tasks),
+            failed_tasks: Set(event.failed_tasks),
+            details_json: Set(encrypt_storage_string(&event.details_json)?),
+        })
+        .on_conflict(
+            OnConflict::column(arkpulse_event::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Count persisted ArkPulse history rows.
+    pub async fn count_arkpulse_events(&self) -> Result<u64> {
+        arkpulse_event::Entity::find()
+            .count(&self.db)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// List ArkPulse history rows (newest first).
+    pub async fn list_arkpulse_events(&self, limit: u64) -> Result<Vec<arkpulse_event::Model>> {
+        let mut rows = arkpulse_event::Entity::find()
+            .order_by_desc(arkpulse_event::Column::Timestamp)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.message = decrypt_storage_string(&row.message);
+            row.summary = decrypt_storage_string(&row.summary);
+            row.flags_json = decrypt_storage_string(&row.flags_json);
+            row.details_json = decrypt_storage_string(&row.details_json);
+        }
+        Ok(rows)
+    }
+
+    /// Delete ArkPulse history rows older than the provided cutoff.
+    pub async fn delete_arkpulse_events_before(&self, cutoff_rfc3339: &str) -> Result<u64> {
+        let result = arkpulse_event::Entity::delete_many()
+            .filter(arkpulse_event::Column::Timestamp.lt(cutoff_rfc3339.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Delete ArkPulse history rows by explicit IDs.
+    pub async fn delete_arkpulse_events_by_ids(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = arkpulse_event::Entity::delete_many()
+            .filter(arkpulse_event::Column::Id.is_in(ids.to_vec()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Return ArkPulse history IDs that exceed the latest retained window.
+    pub async fn list_arkpulse_event_ids_beyond_latest(
+        &self,
+        keep_latest: u64,
+    ) -> Result<Vec<String>> {
+        let rows = arkpulse_event::Entity::find()
+            .order_by_desc(arkpulse_event::Column::Timestamp)
+            .offset(Self::db_offset(keep_latest))
+            .all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
+    }
+
     // ==================== Operational Logs ====================
 
     /// Insert a structured operational telemetry entry.
@@ -5488,6 +5264,52 @@ impl Storage {
         Ok(rows)
     }
 
+    /// List recent operational logs for a set of trace ids (newest first).
+    pub async fn list_operational_logs_for_trace_ids(
+        &self,
+        trace_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<operational_log::Model>> {
+        if trace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = operational_log::Entity::find()
+            .filter(operational_log::Column::TraceId.is_in(trace_ids.to_vec()))
+            .order_by_desc(operational_log::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.outcome = decrypt_storage_string(&row.outcome);
+            row.arguments = decrypt_optional_storage_string(row.arguments.clone());
+            row.payload = decrypt_optional_storage_string(row.payload.clone());
+        }
+        Ok(rows)
+    }
+
+    pub async fn list_operational_log_version_metrics_by_event(
+        &self,
+        event_type: &str,
+        limit: u64,
+    ) -> Result<Vec<OperationalLogVersionMetricRow>> {
+        operational_log::Entity::find()
+            .select_only()
+            .columns([
+                operational_log::Column::Success,
+                operational_log::Column::LatencyMs,
+                operational_log::Column::PolicyVersion,
+                operational_log::Column::StrategyVersion,
+            ])
+            .filter(operational_log::Column::EventType.eq(event_type.to_string()))
+            .order_by_desc(operational_log::Column::CreatedAt)
+            .limit(Self::db_limit(limit))
+            .into_model::<OperationalLogVersionMetricRow>()
+            .all(&self.db)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Expire old pending approvals (older than max_age_secs)
     pub async fn expire_old_approvals(&self, max_age_secs: i64) -> Result<u64> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(max_age_secs)).to_rfc3339();
@@ -5509,6 +5331,9 @@ impl Storage {
     async fn maybe_purge_housekeeping_tables(&self) -> Result<()> {
         let now = chrono::Utc::now();
         let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
+        if !lifecycle.cleanup_enabled || !lifecycle.logs_cleanup_enabled {
+            return Ok(());
+        }
         if let Some(bytes) = self.get(Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY).await? {
             if let Ok(raw) = String::from_utf8(bytes) {
                 if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&raw) {
@@ -5529,7 +5354,10 @@ impl Storage {
             && lifecycle.swarm_delegation_retention_days == 0
             && lifecycle.llm_usage_retention_days == 0
             && lifecycle.terminal_task_retention_days == 0
-            && lifecycle.message_retention_days == 0;
+            && lifecycle.message_retention_days == 0
+            && lifecycle.experience_run_retention_days == 0
+            && lifecycle.experience_edge_retention_days == 0
+            && lifecycle.learning_candidate_retention_days == 0;
 
         if all_retention_disabled {
             self.set(
@@ -5550,11 +5378,20 @@ impl Storage {
                 .exec(&txn)
                 .await?;
             if message_delete.rows_affected > 0 {
-                txn.execute(Statement::from_string(
-                    self.db.get_database_backend(),
-                    "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.conversation_id = conversations.id);".to_string(),
-                ))
-                .await?;
+                let conversations = conversation::Entity::find().all(&txn).await?;
+                for row in conversations {
+                    let message_count = message::Entity::find()
+                        .filter(message::Column::ConversationId.eq(row.id.clone()))
+                        .count(&txn)
+                        .await? as i32;
+                    conversation::ActiveModel {
+                        id: Unchanged(row.id),
+                        message_count: Set(message_count.max(0)),
+                        ..Default::default()
+                    }
+                    .update(&txn)
+                    .await?;
+                }
                 conversation::Entity::delete_many()
                     .filter(conversation::Column::MessageCount.eq(0))
                     .filter(conversation::Column::UpdatedAt.lt(message_cutoff))
@@ -5628,6 +5465,36 @@ impl Storage {
             .to_rfc3339();
             llm_usage::Entity::delete_many()
                 .filter(llm_usage::Column::CreatedAt.lt(llm_usage_cutoff))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.experience_run_retention_days > 0 {
+            let experience_run_cutoff = (now
+                - chrono::Duration::days(lifecycle.experience_run_retention_days as i64))
+            .to_rfc3339();
+            experience_run::Entity::delete_many()
+                .filter(experience_run::Column::CreatedAt.lt(experience_run_cutoff))
+                .filter(experience_run::Column::Consolidated.eq(true))
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.experience_edge_retention_days > 0 {
+            let experience_edge_cutoff = (now
+                - chrono::Duration::days(lifecycle.experience_edge_retention_days as i64))
+            .to_rfc3339();
+            experience_edge::Entity::delete_many()
+                .filter(experience_edge::Column::CreatedAt.lt(experience_edge_cutoff))
+                .filter(experience_edge::Column::SourceRunId.is_not_null())
+                .exec(&txn)
+                .await?;
+        }
+        if lifecycle.learning_candidate_retention_days > 0 {
+            let learning_candidate_cutoff = (now
+                - chrono::Duration::days(lifecycle.learning_candidate_retention_days as i64))
+            .to_rfc3339();
+            learning_candidate::Entity::delete_many()
+                .filter(learning_candidate::Column::CreatedAt.lt(learning_candidate_cutoff))
+                .filter(learning_candidate::Column::ApprovalStatus.ne("pending"))
                 .exec(&txn)
                 .await?;
         }

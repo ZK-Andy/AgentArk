@@ -4,10 +4,11 @@
 //! can evolve without expanding `agent.rs`.
 
 use anyhow::Result;
+use sea_orm::entity::prelude::PgVector;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::integrations::mem0::Mem0Client;
+use crate::core::embeddings::EmbeddingClient;
 use crate::storage::{document, document_chunk, Storage};
 
 const MAX_EMBED_BATCH: usize = 64;
@@ -184,28 +185,6 @@ pub(crate) fn build_embedding_text(
     parts.join("\n")
 }
 
-/// Pack f32 embeddings into little-endian bytes for storage.
-pub(crate) fn pack_embedding(embedding: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(embedding.len() * 4);
-    for value in embedding {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
-/// Unpack little-endian f32 embeddings from storage bytes.
-pub(crate) fn unpack_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
-    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
-        return None;
-    }
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect(),
-    )
-}
-
 /// Compute a dot product for equally sized vectors.
 pub(crate) fn dot_product(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
@@ -321,9 +300,9 @@ fn lexical_chunk_score(
     (coverage + phrase_boost).min(1.0)
 }
 
-fn dense_chunk_score(query_embedding: &[f32], embedding_bytes: Option<&[u8]>) -> Option<f32> {
-    let candidate = unpack_embedding(embedding_bytes?)?;
-    normalized_embedding_similarity(query_embedding, &candidate).map(|score| score.clamp(0.0, 1.0))
+fn dense_chunk_score(query_embedding: &PgVector, embedding: Option<&PgVector>) -> Option<f32> {
+    normalized_embedding_similarity(query_embedding.as_slice(), embedding?.as_slice())
+        .map(|score| score.clamp(0.0, 1.0))
 }
 
 fn hit_key(hit: &DocumentSearchHit) -> String {
@@ -445,7 +424,7 @@ fn build_match_reason(
 }
 
 async fn embed_chunks_with_metadata(
-    mem0: &Mem0Client,
+    embedding_client: &EmbeddingClient,
     filename: &str,
     content_type: &str,
     project_id: Option<&str>,
@@ -460,7 +439,7 @@ async fn embed_chunks_with_metadata(
                 build_embedding_text(filename, content_type, &chunks[*index].content, project_id)
             })
             .collect();
-        let embeddings = mem0.embed_texts(&texts).await?;
+        let embeddings = embedding_client.embed_texts(&texts).await?;
         if embeddings.len() != batch.len() {
             tracing::warn!(
                 "Document embedding batch mismatch: expected {}, got {}",
@@ -472,7 +451,7 @@ async fn embed_chunks_with_metadata(
 
         for (offset, embedding) in embeddings.into_iter().enumerate() {
             let chunk_index = batch[offset];
-            chunks[chunk_index].embedding = Some(pack_embedding(&embedding));
+            chunks[chunk_index].embedding = Some(embedding);
             updated += 1;
         }
     }
@@ -481,12 +460,15 @@ async fn embed_chunks_with_metadata(
 
 /// Generate embeddings for newly created document chunks before they are stored.
 pub(crate) async fn embed_document_chunks(
-    mem0: &Mem0Client,
+    embedding_client: Option<&EmbeddingClient>,
     filename: &str,
     content_type: &str,
     project_id: Option<&str>,
     chunks: &mut [document_chunk::Model],
 ) -> Result<usize> {
+    let Some(embedding_client) = embedding_client else {
+        return Ok(0);
+    };
     let candidate_indices: Vec<usize> = chunks
         .iter()
         .enumerate()
@@ -496,7 +478,7 @@ pub(crate) async fn embed_document_chunks(
         return Ok(0);
     }
     embed_chunks_with_metadata(
-        mem0,
+        embedding_client,
         filename,
         content_type,
         project_id,
@@ -508,7 +490,7 @@ pub(crate) async fn embed_document_chunks(
 
 async fn backfill_missing_embeddings(
     storage: &Storage,
-    mem0: &Mem0Client,
+    embedding_client: &EmbeddingClient,
     documents_by_id: &HashMap<String, SearchableDocumentMeta>,
     chunks: &mut [document_chunk::Model],
     priority_doc_ids: &HashSet<String>,
@@ -564,7 +546,7 @@ async fn backfill_missing_embeddings(
             continue;
         }
 
-        let embeddings = match mem0.embed_texts(&texts).await {
+        let embeddings = match embedding_client.embed_texts(&texts).await {
             Ok(values) => values,
             Err(error) => {
                 tracing::debug!("Document embedding backfill unavailable: {}", error);
@@ -582,10 +564,9 @@ async fn backfill_missing_embeddings(
 
         for (offset, embedding) in embeddings.into_iter().enumerate() {
             let index = batch[offset];
-            let packed = pack_embedding(&embedding);
-            chunks[index].embedding = Some(packed.clone());
+            chunks[index].embedding = Some(embedding.clone());
             if storage
-                .update_document_chunk_embedding(&chunks[index].id, Some(packed))
+                .update_document_chunk_embedding(&chunks[index].id, Some(embedding))
                 .await
                 .is_ok()
             {
@@ -601,7 +582,7 @@ async fn backfill_missing_embeddings(
 /// lexical overlap, and dense similarity from the local embedding model.
 pub(crate) async fn search_documents(
     storage: &Storage,
-    mem0: &Mem0Client,
+    embedding_client: Option<&EmbeddingClient>,
     query: &str,
     limit: usize,
     project_id: Option<&str>,
@@ -715,16 +696,20 @@ pub(crate) async fn search_documents(
         .cloned()
         .chain(filename_boosts.keys().cloned())
         .collect();
-    let query_embedding = mem0
-        .embed_texts(std::slice::from_ref(&query_without_refs))
-        .await
-        .ok()
-        .and_then(|mut embeddings| embeddings.drain(..).next());
+    let query_embedding = if let Some(client) = embedding_client {
+        client
+            .embed_texts(std::slice::from_ref(&query_without_refs))
+            .await
+            .ok()
+            .and_then(|mut embeddings| embeddings.drain(..).next())
+    } else {
+        None
+    };
 
-    if query_embedding.is_some() {
+    if let (Some(client), true) = (embedding_client, query_embedding.is_some()) {
         let _ = backfill_missing_embeddings(
             storage,
-            mem0,
+            client,
             &documents_by_id,
             &mut chunks,
             &priority_doc_ids,
@@ -743,8 +728,8 @@ pub(crate) async fn search_documents(
             .unwrap_or(0.0);
         let lexical_score = lexical_chunk_score(&query_normalized, &query_tokens, &chunk.content);
         let dense_score = query_embedding
-            .as_deref()
-            .and_then(|embedding| dense_chunk_score(embedding, chunk.embedding.as_deref()));
+            .as_ref()
+            .and_then(|embedding| dense_chunk_score(embedding, chunk.embedding.as_ref()));
 
         if lexical_score < MIN_LEXICAL_SCORE && dense_score.unwrap_or(0.0) < MIN_DENSE_SCORE {
             continue;
@@ -832,14 +817,6 @@ mod tests {
         assert!(text.contains("content_type: application/pdf"));
         assert!(text.contains("project_id: project-123"));
         assert!(text.contains("content: rent is due on the first"));
-    }
-
-    #[test]
-    fn embedding_pack_unpack_roundtrips() {
-        let values = vec![0.0, 0.25, -1.5, 42.0];
-        let packed = pack_embedding(&values);
-        let unpacked = unpack_embedding(&packed).unwrap();
-        assert_eq!(values, unpacked);
     }
 
     #[test]

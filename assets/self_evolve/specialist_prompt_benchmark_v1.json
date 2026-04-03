@@ -1,0 +1,49 @@
+{
+  "target_key": "specialist_prompt_bundle_profile_v1",
+  "version": 1,
+  "cases": [
+    {
+      "role": "researcher",
+      "task": "Summarize the strongest evidence about whether the linked paper supports the user's claim.",
+      "context": "Dependency outputs:\n- validator: Found two supporting citations and one caveat.\nAllowed actions:\n- research\nExecution contract:\n- Use dependency outputs before redoing work.",
+      "allowed_actions": ["research"],
+      "required_phrases": ["evidence", "caveat"],
+      "forbidden_phrases": ["absolutely certain"]
+    },
+    {
+      "role": "coder",
+      "task": "Patch the failing login flow and explain the concrete change.",
+      "context": "Dependency outputs:\n- analyst: The login button submits but the handler returns early when email is blank.\nAllowed actions:\n- file_read\n- file_write\n- shell\nExecution contract:\n- Stay inside the assigned fix task.",
+      "required_phrases": ["change", "handler"],
+      "forbidden_phrases": ["I rewrote everything"]
+    },
+    {
+      "role": "analyst",
+      "task": "Identify the clearest trend from the last three weeks and flag any uncertainty.",
+      "context": "Dependency outputs:\n- researcher: Week 3 has incomplete data.\nAllowed actions:\n- none\nExecution contract:\n- Use the provided evidence and call out uncertainty.",
+      "required_phrases": ["trend", "uncert"],
+      "forbidden_phrases": ["no uncertainty"]
+    },
+    {
+      "role": "writer",
+      "task": "Draft a concise user-facing summary of the completed work and remaining follow-up.",
+      "context": "Dependency outputs:\n- coder: Fixed the login validation path.\n- validator: The happy path now passes.\nAllowed actions:\n- none\nExecution contract:\n- Keep the summary concise and user-facing.",
+      "required_phrases": ["completed", "follow-up"],
+      "forbidden_phrases": ["agent swarm"]
+    },
+    {
+      "role": "validator",
+      "task": "Verify the proposed fix and flag the main remaining risk.",
+      "context": "Dependency outputs:\n- coder: Added a guard for empty email.\nAllowed actions:\n- file_read\n- shell\nExecution contract:\n- Be skeptical and thorough.",
+      "required_phrases": ["risk"],
+      "forbidden_phrases": ["looks perfect"]
+    },
+    {
+      "role": "planner",
+      "task": "Break the remaining release work into a short ordered plan with dependencies.",
+      "context": "Dependency outputs:\n- validator: Need one more regression test before release.\nAllowed actions:\n- none\nExecution contract:\n- Create an actionable plan and call out dependencies.",
+      "required_phrases": ["plan", "depend"],
+      "forbidden_phrases": ["do whatever"]
+    }
+  ]
+}

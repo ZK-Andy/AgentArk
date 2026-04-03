@@ -2,11 +2,16 @@
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
 
 use crate::core::agent::{ConversationMessage, StreamEvent};
+use crate::core::llm_provider::{
+    display_openai_base_url, force_refresh_codex_cli_api_key, openai_provider_label,
+    resolve_openai_request_config,
+};
 
 // OpenRouter enforces request affordability against the declared output budget.
 // Cap only that provider by default so other OpenAI-compatible backends remain
@@ -15,7 +20,7 @@ use crate::core::agent::{ConversationMessage, StreamEvent};
 // Previously set to 1024, which truncated app_deploy payloads mid-JSON.
 
 /// Supported LLM providers
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum LlmProvider {
     Anthropic {
@@ -31,6 +36,31 @@ pub enum LlmProvider {
         base_url: String,
         model: String,
     },
+}
+
+impl std::fmt::Debug for LlmProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anthropic { model, .. } => f
+                .debug_struct("LlmProvider::Anthropic")
+                .field("api_key", &"[REDACTED]")
+                .field("model", model)
+                .finish(),
+            Self::OpenAI {
+                model, base_url, ..
+            } => f
+                .debug_struct("LlmProvider::OpenAI")
+                .field("api_key", &"[REDACTED]")
+                .field("model", model)
+                .field("base_url", base_url)
+                .finish(),
+            Self::Ollama { base_url, model } => f
+                .debug_struct("LlmProvider::Ollama")
+                .field("base_url", base_url)
+                .field("model", model)
+                .finish(),
+        }
+    }
 }
 
 /// Attempt to repair truncated JSON by closing unclosed braces, brackets, and strings.
@@ -105,18 +135,52 @@ fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&repaired).ok()
 }
 
-fn is_codex_cli_base_url(base_url: Option<&str>) -> bool {
-    base_url
-        .map(|v| v.trim().eq_ignore_ascii_case("codex://cli"))
-        .unwrap_or(false)
+const MAX_LLM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+async fn read_response_bytes_limited(
+    response: reqwest::Response,
+    provider: &str,
+) -> Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_LLM_RESPONSE_BYTES as u64 {
+            return Err(anyhow!(
+                "{} response exceeded {} byte limit (content-length={})",
+                provider,
+                MAX_LLM_RESPONSE_BYTES,
+                content_length
+            ));
+        }
+    }
+
+    let mut total = 0usize;
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        total = total.saturating_add(chunk.len());
+        if total > MAX_LLM_RESPONSE_BYTES {
+            return Err(anyhow!(
+                "{} response exceeded {} byte limit",
+                provider,
+                MAX_LLM_RESPONSE_BYTES
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
-fn effective_openai_base_url(base_url: Option<&str>) -> &str {
-    match base_url {
-        Some(url) if is_codex_cli_base_url(Some(url)) => "https://api.openai.com/v1",
-        Some(url) => url,
-        None => "https://api.openai.com/v1",
-    }
+async fn read_response_text_limited(response: reqwest::Response, provider: &str) -> Result<String> {
+    let bytes = read_response_bytes_limited(response, provider).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn read_response_json_limited<T: DeserializeOwned>(
+    response: reqwest::Response,
+    provider: &str,
+) -> Result<T> {
+    let bytes = read_response_bytes_limited(response, provider).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn tool_argument_progress_step(tool_name: &str) -> usize {
@@ -145,6 +209,18 @@ fn parse_partial_tool_arguments(raw: &str) -> Option<(serde_json::Value, bool)> 
         return Some((parsed, true));
     }
     repair_truncated_json(trimmed).map(|parsed| (parsed, false))
+}
+
+fn parse_tool_arguments_with_self_heal(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(parsed) => parsed,
+        Err(_) => repair_truncated_json(trimmed)
+            .unwrap_or_else(|| serde_json::Value::String(raw.to_string())),
+    }
 }
 
 fn collect_app_deploy_partial_files(
@@ -213,9 +289,7 @@ fn collect_file_write_partial_file(
     parsed: &serde_json::Value,
     done: bool,
 ) -> Option<DraftFilePreview> {
-    let Some(obj) = parsed.as_object() else {
-        return None;
-    };
+    let obj = parsed.as_object()?;
     let file = obj
         .get("path")
         .and_then(|value| value.as_str())
@@ -283,6 +357,19 @@ async fn emit_stream_tool_progress(
         .await;
 }
 
+fn queue_stream_event(token_tx: &Sender<StreamEvent>, event: StreamEvent) {
+    match token_tx.try_send(event) {
+        Ok(_) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            let fallback_tx = token_tx.clone();
+            tokio::spawn(async move {
+                let _ = fallback_tx.send(event).await;
+            });
+        }
+    }
+}
+
 async fn emit_argument_phase_status(
     token_tx: &Sender<StreamEvent>,
     tool_name: &str,
@@ -310,19 +397,27 @@ async fn emit_partial_draft_file_previews(
     token_tx: &Sender<StreamEvent>,
     tool_name: &str,
     raw_args: &str,
-    emitted_snapshots: &mut HashMap<String, (usize, bool)>,
+    emitted_snapshots: &mut HashMap<String, (String, bool)>,
 ) {
     for preview in extract_partial_draft_files(tool_name, raw_args) {
         let stream_key = format!("draft-file:{}:{}", tool_name, preview.file);
-        let snapshot_len = preview.content_snapshot.len();
         let previous = emitted_snapshots
             .get(&stream_key)
-            .copied()
-            .unwrap_or((0, false));
-        if snapshot_len <= previous.0 && (!preview.done || previous.1) {
+            .cloned()
+            .unwrap_or_else(|| (String::new(), false));
+        if preview.content_snapshot.len() <= previous.0.len() && (!preview.done || previous.1) {
             continue;
         }
-        emitted_snapshots.insert(stream_key.clone(), (snapshot_len, preview.done));
+        let delta = preview
+            .content_snapshot
+            .strip_prefix(&previous.0)
+            .map(str::to_string)
+            .unwrap_or_else(|| preview.content_snapshot.clone());
+        let emit_snapshot = previous.0.is_empty() || delta == preview.content_snapshot;
+        emitted_snapshots.insert(
+            stream_key.clone(),
+            (preview.content_snapshot.clone(), preview.done),
+        );
         let file_name = preview.file.clone();
 
         let mut payload = serde_json::Map::new();
@@ -334,8 +429,16 @@ async fn emit_partial_draft_file_previews(
         );
         payload.insert("stream_key".to_string(), serde_json::json!(stream_key));
         payload.insert(
-            "content_snapshot".to_string(),
-            serde_json::json!(preview.content_snapshot),
+            if emit_snapshot {
+                "content_snapshot".to_string()
+            } else {
+                "content_delta".to_string()
+            },
+            serde_json::json!(if emit_snapshot {
+                preview.content_snapshot
+            } else {
+                delta
+            }),
         );
         payload.insert("line".to_string(), serde_json::json!(preview.line_count));
         payload.insert("done".to_string(), serde_json::json!(preview.done));
@@ -350,16 +453,6 @@ async fn emit_partial_draft_file_previews(
             serde_json::Value::Object(payload),
         )
         .await;
-    }
-}
-
-fn openai_provider_label(base_url: Option<&str>) -> &'static str {
-    if is_codex_cli_base_url(base_url) {
-        "openai-subscription"
-    } else if base_url.unwrap_or("").is_empty() {
-        "openai"
-    } else {
-        "openai-compatible"
     }
 }
 
@@ -792,7 +885,8 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_partial_draft_files, normalize_openai_tool_schema, parse_partial_tool_arguments,
+        extract_partial_draft_files, json_contains_tool_call_indicators,
+        normalize_openai_tool_schema, parse_partial_tool_arguments,
     };
 
     #[test]
@@ -887,6 +981,23 @@ mod tests {
     }
 
     #[test]
+    fn json_contains_tool_call_indicators_detects_nested_tool_calls() {
+        let payload = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            { "id": "call-1", "type": "function" }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        assert!(json_contains_tool_call_indicators(&payload));
+    }
+
+    #[test]
     fn extract_partial_draft_files_reads_partial_app_deploy_files() {
         let previews = extract_partial_draft_files(
             "app_deploy",
@@ -955,10 +1066,8 @@ impl LlmProvider {
                 );
                 env.insert("OPENAI_API_KEY".into(), api_key.clone());
                 env.insert("LLM_MODEL".into(), model.clone());
-                if let Some(url) = base_url {
-                    if !is_codex_cli_base_url(Some(url.as_str())) {
-                        env.insert("OPENAI_BASE_URL".into(), url.clone());
-                    }
+                if let Some(url) = display_openai_base_url(base_url.as_ref()) {
+                    env.insert("OPENAI_BASE_URL".into(), url);
                 }
             }
             LlmProvider::Ollama { base_url, model } => {
@@ -977,8 +1086,8 @@ impl LlmProvider {
 impl Default for LlmProvider {
     fn default() -> Self {
         Self::Ollama {
-            base_url: "http://localhost:11434".to_string(),
-            model: "llama3.2".to_string(),
+            base_url: String::new(),
+            model: String::new(),
         }
     }
 }
@@ -1117,6 +1226,27 @@ fn extract_text_from_any_json(value: &serde_json::Value) -> Option<String> {
         return extract_text_from_any_json(data);
     }
     None
+}
+
+fn json_contains_tool_call_indicators(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "tool_calls",
+                "function_call",
+                "tool_use",
+                "tool_call",
+                "tool_outputs",
+            ] {
+                if map.contains_key(key) {
+                    return true;
+                }
+            }
+            map.values().any(json_contains_tool_call_indicators)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(json_contains_tool_call_indicators),
+        _ => false,
+    }
 }
 
 /// Check if an error is transient and worth retrying (timeouts, connection issues, decode errors).
@@ -1268,6 +1398,14 @@ impl LlmClient {
         let elapsed = start.elapsed();
         match &result {
             Ok(resp) => {
+                crate::metrics::observe_llm_call(
+                    provider_name,
+                    model_name,
+                    "ok",
+                    elapsed,
+                    resp.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    resp.usage.as_ref().map(|usage| usage.completion_tokens),
+                );
                 let preview: String = resp.content.chars().take(120).collect();
                 tracing::info!(
                     "LLM done ← {}ms, response={}chars, tool_calls={}, preview=\"{}{}\"",
@@ -1279,6 +1417,14 @@ impl LlmClient {
                 );
             }
             Err(e) => {
+                crate::metrics::observe_llm_call(
+                    provider_name,
+                    model_name,
+                    "error",
+                    elapsed,
+                    None,
+                    None,
+                );
                 tracing::error!("LLM failed ← {}ms, error: {}", elapsed.as_millis(), e);
             }
         }
@@ -1391,11 +1537,12 @@ impl LlmClient {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
+            let error = read_response_text_limited(response, "Anthropic API").await?;
             return Err(anyhow!("Anthropic API error: {}", error));
         }
 
-        let response: AnthropicResponse = response.json().await?;
+        let response: AnthropicResponse =
+            read_response_json_limited(response, "Anthropic API").await?;
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
@@ -1576,9 +1723,9 @@ impl LlmClient {
             content: user_message.to_string(),
         });
 
-        let url = effective_openai_base_url(base_url);
-        let endpoint = format!("{}/chat/completions", url);
-        let is_openrouter = url.contains("openrouter");
+        let mut request_config =
+            resolve_openai_request_config(&self.client, api_key, base_url).await?;
+        let endpoint = format!("{}/chat/completions", request_config.base_url);
         let request = OpenAIRequest {
             model: model.to_string(),
             max_tokens: None,
@@ -1587,6 +1734,7 @@ impl LlmClient {
         };
 
         let mut last_err: Option<anyhow::Error> = None;
+        let mut forced_oauth_refresh = false;
         for attempt in 0..MAX_RETRY_ATTEMPTS {
             if attempt > 0 {
                 let delay = RETRY_DELAYS_MS[attempt as usize - 1];
@@ -1603,13 +1751,19 @@ impl LlmClient {
             let mut req = self
                 .client
                 .post(&endpoint)
-                .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json");
 
-            if is_openrouter {
+            if !request_config.api_key.is_empty() {
+                req = req.header(
+                    "Authorization",
+                    format!("Bearer {}", request_config.api_key),
+                );
+            }
+
+            if request_config.is_openrouter {
                 req = req
-                    .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
-                    .header("X-Title", "AgentArk");
+                    .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                    .header("X-Title", crate::branding::PRODUCT_NAME);
             }
 
             let response = match req.json(&request).send().await {
@@ -1624,6 +1778,22 @@ impl LlmClient {
                 }
             };
             let status = response.status();
+
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && request_config.uses_codex_cli_oauth
+                && !forced_oauth_refresh
+            {
+                let refreshed_api_key = force_refresh_codex_cli_api_key(&self.client)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "OpenAI Subscription OAuth refresh did not return a usable access token"
+                        )
+                    })?;
+                request_config.api_key = refreshed_api_key;
+                forced_oauth_refresh = true;
+                continue;
+            }
 
             // Handle 429 Too Many Requests with Retry-After
             if status.as_u16() == 429 && attempt + 1 < MAX_RETRY_ATTEMPTS {
@@ -1645,17 +1815,18 @@ impl LlmClient {
             }
 
             if !status.is_success() {
-                let error = match response.bytes().await {
-                    Ok(bytes) => {
-                        let body = String::from_utf8_lossy(&bytes).trim().to_string();
-                        if body.is_empty() {
-                            "<empty body>".to_string()
-                        } else {
-                            body
+                let error =
+                    match read_response_bytes_limited(response, "OpenAI-compatible API").await {
+                        Ok(bytes) => {
+                            let body = String::from_utf8_lossy(&bytes).trim().to_string();
+                            if body.is_empty() {
+                                "<empty body>".to_string()
+                            } else {
+                                body
+                            }
                         }
-                    }
-                    Err(read_err) => format!("<failed to read error body: {}>", read_err),
-                };
+                        Err(read_err) => format!("<failed to read error body: {}>", read_err),
+                    };
                 let err = anyhow!("OpenAI API error ({}): {}", status, error);
                 if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
                     last_err = Some(err);
@@ -1664,26 +1835,38 @@ impl LlmClient {
                 return Err(err);
             }
 
-            let response_text = match response.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    let err = anyhow::Error::from(e);
-                    if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
-                        last_err = Some(err);
-                        continue;
+            let response_text =
+                match read_response_text_limited(response, "OpenAI-compatible API").await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let err = e;
+                        if attempt + 1 < MAX_RETRY_ATTEMPTS && is_retryable_error(&err) {
+                            last_err = Some(err);
+                            continue;
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
+                };
+            let response_json: serde_json::Value = match serde_json::from_str(&response_text) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    if let Some(repaired) = repair_truncated_json(&response_text) {
+                        tracing::warn!(
+                            "Repaired malformed JSON response from {} for model {}",
+                            request_config.provider_label,
+                            model
+                        );
+                        repaired
+                    } else {
+                        let preview: String = response_text.chars().take(380).collect();
+                        return Err(anyhow!(
+                            "OpenAI-compatible response was not valid JSON: {}. Body preview: {}",
+                            error,
+                            preview
+                        ));
+                    }
                 }
             };
-            let response_json: serde_json::Value =
-                serde_json::from_str(&response_text).map_err(|e| {
-                    let preview: String = response_text.chars().take(380).collect();
-                    anyhow!(
-                        "OpenAI-compatible response was not valid JSON: {}. Body preview: {}",
-                        e,
-                        preview
-                    )
-                })?;
             if response_json.get("choices").is_none() {
                 if let Some(err_payload) = response_json.get("error") {
                     return Err(anyhow!(
@@ -1700,7 +1883,17 @@ impl LlmClient {
                             .and_then(extract_openai_message_text)
                     })
                 {
-                    let provider_label = openai_provider_label(base_url);
+                    if json_contains_tool_call_indicators(&response_json) {
+                        let preview = serde_json::to_string(&response_json)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(380)
+                            .collect::<String>();
+                        return Err(anyhow!(
+                            "OpenAI-compatible response contained tool-call fields outside the normal schema; refusing to flatten to plain text. Body preview: {}",
+                            preview
+                        ));
+                    }
                     let prompt_chars = system_prompt.len()
                         + user_message.len()
                         + history.iter().map(|m| m.content.len()).sum::<usize>();
@@ -1716,7 +1909,7 @@ impl LlmClient {
                             total_tokens: prompt_tokens + completion_tokens,
                             estimated: true,
                         }),
-                        provider: provider_label.to_string(),
+                        provider: request_config.provider_label.to_string(),
                         model: model.to_string(),
                     });
                 }
@@ -1728,12 +1921,23 @@ impl LlmClient {
                     // This handles non-standard models (GLM-5, etc.) that return unexpected schemas
                     let fallback_text = extract_text_from_any_json(&response_json);
                     if let Some(text) = fallback_text {
+                        if json_contains_tool_call_indicators(&response_json) {
+                            let preview = serde_json::to_string(&response_json)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(380)
+                                .collect::<String>();
+                            return Err(anyhow!(
+                                "OpenAI-compatible response schema mismatch with tool-call fields present; refusing to flatten to plain text. {}. Body preview: {}",
+                                e,
+                                preview
+                            ));
+                        }
                         tracing::warn!(
                             "Schema mismatch but extracted fallback text ({}chars): {}",
                             text.len(),
                             e,
                         );
-                        let provider_label = openai_provider_label(base_url);
                         let prompt_chars = system_prompt.len()
                             + user_message.len()
                             + history.iter().map(|m| m.content.len()).sum::<usize>();
@@ -1749,7 +1953,7 @@ impl LlmClient {
                                 total_tokens: prompt_tokens + completion_tokens,
                                 estimated: true,
                             }),
-                            provider: provider_label.to_string(),
+                            provider: request_config.provider_label.to_string(),
                             model: model.to_string(),
                         });
                     }
@@ -1788,21 +1992,13 @@ impl LlmClient {
                     name: tc.function.name,
                     arguments: match tc.function.arguments {
                         Some(OpenAIFunctionArguments::String(raw)) => {
-                            let trimmed = raw.trim();
-                            if trimmed.is_empty() {
-                                serde_json::Value::Null
-                            } else {
-                                serde_json::from_str(trimmed)
-                                    .unwrap_or(serde_json::Value::String(raw))
-                            }
+                            parse_tool_arguments_with_self_heal(&raw)
                         }
                         Some(OpenAIFunctionArguments::Json(v)) => v,
                         None => serde_json::Value::Null,
                     },
                 })
                 .collect();
-
-            let provider_label = openai_provider_label(base_url);
 
             let prompt_chars = system_prompt.len()
                 + user_message.len()
@@ -1830,7 +2026,7 @@ impl LlmClient {
                 tool_calls,
                 reasoning,
                 usage,
-                provider: provider_label.to_string(),
+                provider: request_config.provider_label.to_string(),
                 model: model.to_string(),
             });
         }
@@ -1853,7 +2049,10 @@ impl LlmClient {
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
     ) -> Result<LlmResponse> {
-        match &self.provider {
+        let provider_name = self.provider_name().to_string();
+        let model_name = self.model_name().to_string();
+        let start = std::time::Instant::now();
+        let result = match &self.provider {
             LlmProvider::Anthropic { api_key, model } => {
                 self.chat_anthropic_with_history_stream(AnthropicStreamParams {
                     api_key,
@@ -1894,7 +2093,31 @@ impl LlmClient {
                 )
                 .await
             }
+        };
+        let elapsed = start.elapsed();
+        match &result {
+            Ok(resp) => {
+                crate::metrics::observe_llm_call(
+                    &provider_name,
+                    &model_name,
+                    "ok",
+                    elapsed,
+                    resp.usage.as_ref().map(|usage| usage.prompt_tokens),
+                    resp.usage.as_ref().map(|usage| usage.completion_tokens),
+                );
+            }
+            Err(_) => {
+                crate::metrics::observe_llm_call(
+                    &provider_name,
+                    &model_name,
+                    "error",
+                    elapsed,
+                    None,
+                    None,
+                );
+            }
         }
+        result
     }
 
     async fn chat_ollama_with_history(
@@ -1964,11 +2187,11 @@ impl LlmClient {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
+            let error = read_response_text_limited(response, "Ollama API").await?;
             return Err(anyhow!("Ollama API error: {}", error));
         }
 
-        let response: OllamaResponse = response.json().await?;
+        let response: OllamaResponse = read_response_json_limited(response, "Ollama API").await?;
 
         let content = response.message.content;
         let prompt_chars = system_prompt.len()
@@ -2077,7 +2300,7 @@ impl LlmClient {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
+            let error = read_response_text_limited(response, "Ollama API").await?;
             return Err(anyhow!("Ollama API error: {}", error));
         }
 
@@ -2108,7 +2331,7 @@ impl LlmClient {
                 if let Some(msg) = parsed.message {
                     if !msg.content.is_empty() {
                         content.push_str(&msg.content);
-                        let _ = token_tx.try_send(StreamEvent::Token(msg.content));
+                        queue_stream_event(&token_tx, StreamEvent::Token(msg.content));
                     }
                 }
                 if parsed.done {
@@ -2256,7 +2479,7 @@ impl LlmClient {
             args: String,
             last_progress_emit_chars: usize,
             last_progress_emit_at: Option<std::time::Instant>,
-            emitted_draft_snapshots: HashMap<String, (usize, bool)>,
+            emitted_draft_snapshots: HashMap<String, (String, bool)>,
         }
 
         let tools: Vec<OpenAITool> = actions
@@ -2294,7 +2517,9 @@ impl LlmClient {
             content: user_message.to_string(),
         });
 
-        let url = effective_openai_base_url(base_url);
+        let mut request_config =
+            resolve_openai_request_config(&self.client, api_key, base_url).await?;
+        let url = request_config.base_url.clone();
         tracing::info!(
             "LLM stream → {} model={} msgs={} tools={}",
             url,
@@ -2315,17 +2540,23 @@ impl LlmClient {
             .client
             .post(format!("{}/chat/completions", url))
             .timeout(std::time::Duration::from_secs(600))
-            .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json");
 
-        // OpenRouter app identification headers
-        if url.contains("openrouter") {
-            req = req
-                .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
-                .header("X-Title", "AgentArk");
+        if !request_config.api_key.is_empty() {
+            req = req.header(
+                "Authorization",
+                format!("Bearer {}", request_config.api_key),
+            );
         }
 
-        let response = match req.json(&request).send().await {
+        // OpenRouter app identification headers
+        if request_config.is_openrouter {
+            req = req
+                .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                .header("X-Title", crate::branding::PRODUCT_NAME);
+        }
+
+        let mut response = match req.json(&request).send().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -2337,7 +2568,34 @@ impl LlmClient {
             }
         };
 
-        let status = response.status();
+        let mut status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && request_config.uses_codex_cli_oauth {
+            let refreshed_api_key = force_refresh_codex_cli_api_key(&self.client)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "OpenAI Subscription OAuth refresh did not return a usable access token"
+                    )
+                })?;
+            request_config.api_key = refreshed_api_key;
+
+            let mut retry_req = self
+                .client
+                .post(format!("{}/chat/completions", request_config.base_url))
+                .timeout(std::time::Duration::from_secs(600))
+                .header("Content-Type", "application/json")
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", request_config.api_key),
+                );
+            if request_config.is_openrouter {
+                retry_req = retry_req
+                    .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                    .header("X-Title", crate::branding::PRODUCT_NAME);
+            }
+            response = retry_req.json(&request).send().await?;
+            status = response.status();
+        }
         tracing::info!(
             "LLM stream response status={} after {}ms",
             status,
@@ -2366,7 +2624,7 @@ impl LlmClient {
         }
 
         if !status.is_success() {
-            let error = match response.bytes().await {
+            let error = match read_response_bytes_limited(response, "OpenAI API").await {
                 Ok(bytes) => {
                     let body = String::from_utf8_lossy(&bytes).trim().to_string();
                     if body.is_empty() {
@@ -2406,9 +2664,7 @@ impl LlmClient {
                 }
                 let elapsed = hb_start.elapsed().as_secs();
                 let status = format!("Waiting for {} to respond ({}s)...", hb_model, elapsed);
-                if hb_tx.try_send(StreamEvent::Thinking(status)).is_err() {
-                    break;
-                }
+                queue_stream_event(&hb_tx, StreamEvent::Thinking(status));
             }
         });
 
@@ -2491,7 +2747,7 @@ impl LlmClient {
                                 heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             content.push_str(&tok);
-                            let _ = token_tx.try_send(StreamEvent::Token(tok));
+                            queue_stream_event(&token_tx, StreamEvent::Token(tok));
                         }
                     }
                     if let Some(tcs) = choice.delta.tool_calls {
@@ -2652,25 +2908,7 @@ impl LlmClient {
         let mut tool_calls: Vec<(usize, ToolCall)> = tool_builders
             .into_iter()
             .map(|(idx, tb)| {
-                let args = if tb.args.trim().is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::from_str(&tb.args).unwrap_or_else(|_| {
-                        // The model may have truncated its JSON output (hit token limit).
-                        // Try to repair by closing open braces/brackets.
-                        if let Some(repaired) = repair_truncated_json(&tb.args) {
-                            tracing::info!(
-                                "Repaired truncated tool arguments for '{}' ({}→{} chars)",
-                                tb.name,
-                                tb.args.len(),
-                                repaired.to_string().len()
-                            );
-                            repaired
-                        } else {
-                            serde_json::Value::String(tb.args.clone())
-                        }
-                    })
-                };
+                let args = parse_tool_arguments_with_self_heal(&tb.args);
                 (
                     idx,
                     ToolCall {
@@ -2687,8 +2925,6 @@ impl LlmClient {
             .collect();
         tool_calls.sort_by_key(|(idx, _)| *idx);
         let tool_calls: Vec<ToolCall> = tool_calls.into_iter().map(|(_, tc)| tc).collect();
-
-        let provider_label = openai_provider_label(base_url);
 
         let prompt_chars = system_prompt.len()
             + user_message.len()
@@ -2707,7 +2943,7 @@ impl LlmClient {
             tool_calls,
             reasoning,
             usage,
-            provider: provider_label.to_string(),
+            provider: request_config.provider_label.to_string(),
             model: model.to_string(),
         })
     }
@@ -2798,7 +3034,7 @@ impl LlmClient {
             input_value: Option<serde_json::Value>,
             last_progress_emit_chars: usize,
             last_progress_emit_at: Option<std::time::Instant>,
-            emitted_draft_snapshots: HashMap<String, (usize, bool)>,
+            emitted_draft_snapshots: HashMap<String, (String, bool)>,
         }
 
         let tools: Vec<AnthropicTool> = actions
@@ -2847,7 +3083,7 @@ impl LlmClient {
             .await?;
 
         if !response.status().is_success() {
-            let error = response.text().await?;
+            let error = read_response_text_limited(response, "Anthropic API").await?;
             return Err(anyhow!("Anthropic API error: {}", error));
         }
 
@@ -2890,7 +3126,7 @@ impl LlmClient {
                                     if let Some(text) = text {
                                         if !text.is_empty() {
                                             content.push_str(&text);
-                                            let _ = token_tx.try_send(StreamEvent::Token(text));
+                                            queue_stream_event(&token_tx, StreamEvent::Token(text));
                                         }
                                     }
                                 }
@@ -2909,7 +3145,7 @@ impl LlmClient {
                                 if let Some(text) = parsed.delta.text {
                                     if !text.is_empty() {
                                         content.push_str(&text);
-                                        let _ = token_tx.try_send(StreamEvent::Token(text));
+                                        queue_stream_event(&token_tx, StreamEvent::Token(text));
                                     }
                                 }
                             } else if parsed.delta.delta_type == "input_json_delta" {

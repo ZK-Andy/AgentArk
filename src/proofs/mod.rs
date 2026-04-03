@@ -119,15 +119,15 @@ pub struct ProofEngine {
     /// Storage path
     data_dir: std::path::PathBuf,
 
-    /// Optional encryption key for on-disk trace persistence.
-    trace_encryption_key: Option<Arc<crate::crypto::KeyManager>>,
+    /// Encryption key for on-disk trace persistence.
+    trace_encryption_key: Arc<crate::crypto::KeyManager>,
 }
 
 impl ProofEngine {
     pub fn new(
         data_dir: &Path,
         signing_key: &SigningKey,
-        trace_encryption_key: Option<Arc<crate::crypto::KeyManager>>,
+        trace_encryption_key: Arc<crate::crypto::KeyManager>,
     ) -> Result<Self> {
         let verifying_key = signing_key.verifying_key();
         let public_key_bytes = verifying_key.to_bytes();
@@ -138,7 +138,7 @@ impl ProofEngine {
         let agent_did = format!("did:key:z{}", bs58::encode(&multicodec_key).into_string());
 
         // Load existing trace if present
-        let trace = Self::load_trace(data_dir, trace_encryption_key.as_deref())?;
+        let trace = Self::load_trace(data_dir, trace_encryption_key.as_ref())?;
 
         Ok(Self {
             signing_key: signing_key.clone(),
@@ -222,48 +222,26 @@ impl ProofEngine {
             .lock()
             .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
         let content = serde_json::to_string_pretty(&*trace)?;
-        if let Some(key_manager) = self.trace_encryption_key.as_ref() {
-            let encrypted = key_manager.encrypt(content.as_bytes())?;
-            let encrypted_path = self.data_dir.join("execution_trace.enc");
-            std::fs::write(encrypted_path, encrypted)?;
-            let legacy_path = self.data_dir.join("execution_trace.json");
-            if legacy_path.exists() {
-                let _ = std::fs::remove_file(legacy_path);
-            }
-        } else {
-            let trace_path = self.data_dir.join("execution_trace.json");
-            std::fs::write(trace_path, content)?;
-        }
+        let encrypted = self.trace_encryption_key.encrypt(content.as_bytes())?;
+        let encrypted_path = self.data_dir.join("execution_trace.enc");
+        std::fs::write(encrypted_path, encrypted)?;
         Ok(())
     }
 
     fn load_trace(
         data_dir: &Path,
-        trace_encryption_key: Option<&crate::crypto::KeyManager>,
+        trace_encryption_key: &crate::crypto::KeyManager,
     ) -> Result<ExecutionTrace> {
         let encrypted_path = data_dir.join("execution_trace.enc");
         if encrypted_path.exists() {
             let payload = std::fs::read(&encrypted_path)?;
-            if let Some(key_manager) = trace_encryption_key {
-                match key_manager.decrypt(&payload) {
-                    Ok(decrypted) => match serde_json::from_slice(&decrypted) {
-                        Ok(trace) => return Ok(trace),
-                        Err(error) => {
-                            let backup_path = Self::quarantine_trace_file(&encrypted_path);
-                            tracing::error!(
-                                "Failed to parse encrypted execution trace at {}: {}. \
-                                 Starting with an empty trace and preserving the original at {}.",
-                                encrypted_path.display(),
-                                error,
-                                backup_path.display()
-                            );
-                            return Ok(ExecutionTrace::new());
-                        }
-                    },
+            match trace_encryption_key.decrypt(&payload) {
+                Ok(decrypted) => match serde_json::from_slice(&decrypted) {
+                    Ok(trace) => return Ok(trace),
                     Err(error) => {
                         let backup_path = Self::quarantine_trace_file(&encrypted_path);
                         tracing::error!(
-                            "Failed to decrypt execution trace at {}: {}. \
+                            "Failed to parse encrypted execution trace at {}: {}. \
                              Starting with an empty trace and preserving the original at {}.",
                             encrypted_path.display(),
                             error,
@@ -271,15 +249,19 @@ impl ProofEngine {
                         );
                         return Ok(ExecutionTrace::new());
                     }
+                },
+                Err(error) => {
+                    let backup_path = Self::quarantine_trace_file(&encrypted_path);
+                    tracing::error!(
+                        "Failed to decrypt execution trace at {}: {}. \
+                         Starting with an empty trace and preserving the original at {}.",
+                        encrypted_path.display(),
+                        error,
+                        backup_path.display()
+                    );
+                    return Ok(ExecutionTrace::new());
                 }
             }
-            anyhow::bail!("Encrypted proof trace exists but no trace encryption key is available");
-        }
-
-        let legacy_path = data_dir.join("execution_trace.json");
-        if legacy_path.exists() {
-            let content = std::fs::read_to_string(&legacy_path)?;
-            return Ok(serde_json::from_str(&content)?);
         }
 
         Ok(ExecutionTrace::new())

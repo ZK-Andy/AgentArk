@@ -13,10 +13,27 @@ use crate::core::config::{McpServerConfig, McpTransportConfig};
 
 #[derive(Debug, Clone)]
 pub enum McpAuth {
-    Bearer { header: String, token: String },
-    Basic { username: String, password: String },
-    Header { name: String, value: String },
-    Query { name: String, value: String },
+    Bearer {
+        header: String,
+        token: String,
+    },
+    Basic {
+        username: String,
+        password: String,
+    },
+    Header {
+        name: String,
+        value: String,
+    },
+    Query {
+        name: String,
+        value: String,
+    },
+    Composite {
+        headers: Vec<(String, String)>,
+        query: Vec<(String, String)>,
+        basic: Option<(String, String)>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -31,8 +48,7 @@ struct RpcRequest {
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
+    _jsonrpc: Option<String>,
     id: Option<Value>,
     #[serde(default)]
     result: Option<Value>,
@@ -300,6 +316,22 @@ impl HttpTransport {
                     url.query_pairs_mut().append_pair(name, value);
                     req = self.client.post(url.clone());
                 }
+                McpAuth::Composite {
+                    headers,
+                    query,
+                    basic,
+                } => {
+                    for (name, value) in query {
+                        url.query_pairs_mut().append_pair(name, value);
+                    }
+                    req = self.client.post(url.clone());
+                    if let Some((username, password)) = basic {
+                        req = req.basic_auth(username, Some(password));
+                    }
+                    for (name, value) in headers {
+                        req = req.header(name, value);
+                    }
+                }
             }
         }
 
@@ -357,6 +389,22 @@ impl HttpTransport {
                 McpAuth::Query { name, value } => {
                     url.query_pairs_mut().append_pair(name, value);
                     req = self.client.post(url.clone());
+                }
+                McpAuth::Composite {
+                    headers,
+                    query,
+                    basic,
+                } => {
+                    for (name, value) in query {
+                        url.query_pairs_mut().append_pair(name, value);
+                    }
+                    req = self.client.post(url.clone());
+                    if let Some((username, password)) = basic {
+                        req = req.basic_auth(username, Some(password));
+                    }
+                    for (name, value) in headers {
+                        req = req.header(name, value);
+                    }
                 }
             }
         }
@@ -531,7 +579,7 @@ fn try_parse_message(
         if line.is_empty() {
             return Ok(Some((
                 RpcResponse {
-                    jsonrpc: None,
+                    _jsonrpc: None,
                     id: None,
                     result: None,
                     error: None,

@@ -1,6 +1,6 @@
 @echo off
 REM AgentArk CLI wrapper for Windows
-REM Usage: agentark chat | pulse | start | stop | logs | status
+REM Usage: agentark chat | pulse | setup | start | stop | logs | status
 
 set "CMD=%~1"
 if "%CMD%"=="" set "CMD=help"
@@ -11,6 +11,10 @@ if "%CMD%"=="chat" (
 )
 if "%CMD%"=="pulse" (
     docker exec agentark /app/agentark --pulse
+    goto :eof
+)
+if "%CMD%"=="setup" (
+    docker exec -it agentark /app/agentark --setup
     goto :eof
 )
 if "%CMD%"=="start" (
@@ -50,6 +54,7 @@ echo Usage: agentark ^<command^>
 echo.
 echo   chat       Interactive CLI chat with your agent
 echo   pulse      Run ArkPulse health check
+echo   setup      Run setup wizard
 echo   start      Start AgentArk
 echo   stop       Stop AgentArk
 echo   restart    Restart AgentArk

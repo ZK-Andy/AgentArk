@@ -18,6 +18,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -406,7 +407,7 @@ export function IntegrationQuickstartPanel({
                 const isConfigured =
                   state === "connected" || state === "starting" || state === "configured";
                 return (
-                  <Grid2 key={integration.id} size={{ xs: 12, md: 6, lg: 4 }}>
+                  <Grid2 key={integration.id} size={{ xs: 12, md: 6, xl: 4 }}>
                     <Box sx={{ p: 1.5, borderRadius: 1.5, border: isConfigured ? "1px solid rgba(64,196,255,0.24)" : "1px solid rgba(112,153,201,0.16)", background: isConfigured ? "rgba(8,24,42,0.56)" : "rgba(7,17,32,0.6)", height: "100%" }}>
                       <Stack spacing={1.1} sx={{ height: "100%", justifyContent: "space-between" }}>
                         <Box>
@@ -468,7 +469,8 @@ export function IntegrationQuickstartPanel({
         <Box className="list-shell">
           <Stack spacing={1}>
             <Typography variant="subtitle2">Imported Custom APIs</Typography>
-            <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+            <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+            <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
               <TableHead>
                 <TableRow>
                   <TableCell>Name</TableCell>
@@ -508,6 +510,7 @@ export function IntegrationQuickstartPanel({
                 })}
               </TableBody>
             </Table>
+            </TableContainer>
           </Stack>
         </Box>
       ) : null}
@@ -560,7 +563,8 @@ export function IntegrationQuickstartPanel({
                   <TextField label="Username" fullWidth value={customApiForm.auth_username} onChange={(e) => setCustomApiForm((current) => ({ ...current, auth_username: e.target.value }))} />
                   <TextField label="Token / Secret" type="password" fullWidth value={customApiForm.secret} onChange={(e) => setCustomApiForm((current) => ({ ...current, secret: e.target.value }))} helperText="Stored encrypted and injected only into API requests." />
                 </Stack>
-                <Table size="small" sx={{ "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
+                <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto", maxHeight: "none" }}>
+                <Table size="small" sx={{ minWidth: 720, "& td, & th": { borderColor: "rgba(112,153,201,0.12)", py: 0.75 } }}>
                   <TableHead>
                     <TableRow>
                       <TableCell>Import</TableCell>
@@ -610,6 +614,7 @@ export function IntegrationQuickstartPanel({
                     ))}
                   </TableBody>
                 </Table>
+                </TableContainer>
                 <FormControlLabel control={<Switch checked={customApiForm.enabled} onChange={(e) => setCustomApiForm((current) => ({ ...current, enabled: e.target.checked }))} />} label="Enable imported actions immediately" />
               </>
             ) : null}

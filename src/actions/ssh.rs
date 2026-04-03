@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 const SSH_CONNECTIONS_KEY: &str = "ssh_connections";
 const SSH_KEYS_KEY: &str = "ssh_keys";
+const SSH_KNOWN_HOSTS_KEY: &str = "ssh_known_hosts";
+const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
+const SSH_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SshConnection {
@@ -23,6 +26,12 @@ pub struct SshConnection {
 pub struct SshKeyStore {
     /// Map of key_name -> PEM-encoded private key content
     pub keys: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct SshKnownHostStore {
+    /// Map of "host:port" -> SHA256 fingerprint
+    pub hosts: std::collections::HashMap<String, String>,
 }
 
 fn load_connections(config_dir: &Path) -> Result<Vec<SshConnection>> {
@@ -53,6 +62,98 @@ fn load_keys(config_dir: &Path) -> Result<SshKeyStore> {
 fn save_keys(config_dir: &Path, store: &SshKeyStore) -> Result<()> {
     let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
     manager.set_custom_secret(SSH_KEYS_KEY, Some(serde_json::to_string(store)?))?;
+    Ok(())
+}
+
+fn load_known_hosts(config_dir: &Path) -> Result<SshKnownHostStore> {
+    let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
+    match manager.get_custom_secret(SSH_KNOWN_HOSTS_KEY)? {
+        Some(payload) => Ok(serde_json::from_str(&payload)?),
+        None => Ok(SshKnownHostStore::default()),
+    }
+}
+
+fn save_known_hosts(config_dir: &Path, store: &SshKnownHostStore) -> Result<()> {
+    let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
+    manager.set_custom_secret(SSH_KNOWN_HOSTS_KEY, Some(serde_json::to_string(store)?))?;
+    Ok(())
+}
+
+fn known_host_store_key(host: &str, port: u16) -> String {
+    format!("{}:{}", host.trim().to_ascii_lowercase(), port)
+}
+
+fn server_key_fingerprint(server_public_key: &russh::keys::ssh_key::PublicKey) -> String {
+    format!(
+        "{}",
+        server_public_key.fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+    )
+}
+
+fn verify_or_learn_server_key(
+    config_dir: &Path,
+    host: &str,
+    port: u16,
+    server_public_key: &russh::keys::ssh_key::PublicKey,
+) -> Result<()> {
+    let key = known_host_store_key(host, port);
+    let fingerprint = server_key_fingerprint(server_public_key);
+    let mut store = load_known_hosts(config_dir)?;
+    match store.hosts.get(&key) {
+        Some(expected) if expected == &fingerprint => Ok(()),
+        Some(expected) => {
+            tracing::warn!(
+                "SSH host key mismatch for {}: expected {}, got {}",
+                key,
+                expected,
+                fingerprint
+            );
+            Err(anyhow!(
+                "SSH host key mismatch for {} (expected {}, got {})",
+                key,
+                expected,
+                fingerprint
+            ))
+        }
+        None => {
+            tracing::info!(
+                "Learning SSH host key for {} with fingerprint {}",
+                key,
+                fingerprint
+            );
+            store.hosts.insert(key, fingerprint);
+            save_known_hosts(config_dir, &store)
+        }
+    }
+}
+
+fn append_ssh_output(
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    data: &[u8],
+    stream_name: &str,
+) -> Result<()> {
+    let current = stdout.len().saturating_add(stderr.len());
+    let remaining = SSH_MAX_OUTPUT_BYTES.saturating_sub(current);
+    if data.len() > remaining {
+        if remaining > 0 {
+            if stream_name == "stderr" {
+                stderr.extend_from_slice(&data[..remaining]);
+            } else {
+                stdout.extend_from_slice(&data[..remaining]);
+            }
+        }
+        return Err(anyhow!(
+            "SSH command output exceeded {} bytes while reading {}",
+            SSH_MAX_OUTPUT_BYTES,
+            stream_name
+        ));
+    }
+    if stream_name == "stderr" {
+        stderr.extend_from_slice(data);
+    } else {
+        stdout.extend_from_slice(data);
+    }
     Ok(())
 }
 
@@ -118,22 +219,48 @@ pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Re
     let config = russh::client::Config::default();
     let config = Arc::new(config);
 
-    let mut session = russh::client::connect(config, (conn.host.as_str(), conn.port), Handler)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "SSH connection to {}:{} failed: {}",
-                conn.host,
-                conn.port,
-                e
-            )
-        })?;
+    let handler = Handler {
+        config_dir: config_dir.to_path_buf(),
+        host: conn.host.clone(),
+        port: conn.port,
+    };
+    let mut session = tokio::time::timeout(
+        std::time::Duration::from_secs(SSH_EXEC_TIMEOUT_SECS),
+        russh::client::connect(config, (conn.host.as_str(), conn.port), handler),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "SSH connection to {}:{} timed out after {}s",
+            conn.host,
+            conn.port,
+            SSH_EXEC_TIMEOUT_SECS
+        )
+    })?
+    .map_err(|e| {
+        anyhow!(
+            "SSH connection to {}:{} failed: {}",
+            conn.host,
+            conn.port,
+            e
+        )
+    })?;
 
     // Authenticate
-    let auth_result = session
-        .authenticate_publickey(&conn.username, key_pair)
-        .await
-        .map_err(|e| anyhow!("SSH auth failed for {}@{}: {}", conn.username, conn.host, e))?;
+    let auth_result = tokio::time::timeout(
+        std::time::Duration::from_secs(SSH_EXEC_TIMEOUT_SECS),
+        session.authenticate_publickey(&conn.username, key_pair),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "SSH auth timed out for {}@{} after {}s",
+            conn.username,
+            conn.host,
+            SSH_EXEC_TIMEOUT_SECS
+        )
+    })?
+    .map_err(|e| anyhow!("SSH auth failed for {}@{}: {}", conn.username, conn.host, e))?;
 
     if !auth_result.success() {
         return Err(anyhow!(
@@ -144,40 +271,58 @@ pub async fn ssh_execute(config_dir: &Path, arguments: &serde_json::Value) -> Re
     }
 
     // Open channel and execute
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| anyhow!("Failed to open SSH channel: {}", e))?;
+    let mut channel = tokio::time::timeout(
+        std::time::Duration::from_secs(SSH_EXEC_TIMEOUT_SECS),
+        session.channel_open_session(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Opening SSH channel timed out after {}s",
+            SSH_EXEC_TIMEOUT_SECS
+        )
+    })?
+    .map_err(|e| anyhow!("Failed to open SSH channel: {}", e))?;
 
-    channel
-        .exec(true, command)
-        .await
-        .map_err(|e| anyhow!("Failed to execute command: {}", e))?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(SSH_EXEC_TIMEOUT_SECS),
+        channel.exec(true, command),
+    )
+    .await
+    .map_err(|_| anyhow!("SSH exec timed out after {}s", SSH_EXEC_TIMEOUT_SECS))?
+    .map_err(|e| anyhow!("Failed to execute command: {}", e))?;
 
     // Collect output
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code = None;
 
-    loop {
-        let msg = channel.wait().await;
-        match msg {
-            Some(russh::ChannelMsg::Data { data }) => {
-                stdout.extend_from_slice(&data);
-            }
-            Some(russh::ChannelMsg::ExtendedData { data, ext }) => {
-                if ext == 1 {
-                    // stderr
-                    stderr.extend_from_slice(&data);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(SSH_EXEC_TIMEOUT_SECS),
+        async {
+            loop {
+                let msg = channel.wait().await;
+                match msg {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        append_ssh_output(&mut stdout, &mut stderr, &data, "stdout")?;
+                    }
+                    Some(russh::ChannelMsg::ExtendedData { data, ext }) => {
+                        if ext == 1 {
+                            append_ssh_output(&mut stdout, &mut stderr, &data, "stderr")?;
+                        }
+                    }
+                    Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status);
+                    }
+                    Some(russh::ChannelMsg::Eof) | None => break,
+                    _ => {}
                 }
             }
-            Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
-                exit_code = Some(exit_status);
-            }
-            Some(russh::ChannelMsg::Eof) | None => break,
-            _ => {}
-        }
-    }
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .await
+    .map_err(|_| anyhow!("SSH command timed out after {}s", SSH_EXEC_TIMEOUT_SECS))??;
 
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
@@ -240,17 +385,68 @@ pub fn list_key_names(config_dir: &Path) -> Result<Vec<String>> {
     Ok(store.keys.keys().cloned().collect())
 }
 
-/// Minimal SSH client handler (accepts all host keys - user manages trust via connection config)
-struct Handler;
+/// SSH client handler with trust-on-first-use host key verification.
+struct Handler {
+    config_dir: std::path::PathBuf,
+    host: String,
+    port: u16,
+}
 
 impl russh::client::Handler for Handler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> std::result::Result<bool, Self::Error> {
-        // Accept all host keys - trust is managed by the user configuring connections
+        verify_or_learn_server_key(&self.config_dir, &self.host, self.port, server_public_key)?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_or_learn_server_key_trusts_first_use_and_reuses_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ",
+        )
+        .unwrap();
+
+        verify_or_learn_server_key(temp.path(), "example.com", 22, &key).unwrap();
+        verify_or_learn_server_key(temp.path(), "example.com", 22, &key).unwrap();
+
+        let store = load_known_hosts(temp.path()).unwrap();
+        assert_eq!(
+            store
+                .hosts
+                .get(&known_host_store_key("example.com", 22))
+                .cloned(),
+            Some(server_key_fingerprint(&key))
+        );
+    }
+
+    #[test]
+    fn verify_or_learn_server_key_rejects_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ",
+        )
+        .unwrap();
+        let second = russh::keys::parse_public_key_base64(
+            "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMxBTpMIGvo7CnordO7wP0QQRqpBwUjOLl4eMhfucfE1sjTYyK5wmTl1UqoSDS1PtRVTBdl+0+9pquFb46U7fwg=",
+        )
+        .unwrap();
+
+        verify_or_learn_server_key(temp.path(), "example.com", 22, &first).unwrap();
+        let error = verify_or_learn_server_key(temp.path(), "example.com", 22, &second)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("mismatch"));
+        assert!(error.contains("example.com:22"));
     }
 }

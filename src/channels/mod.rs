@@ -2,11 +2,17 @@
 
 pub mod discord;
 pub mod gateway;
+pub mod google_chat;
 pub mod http;
+pub mod imessage;
+pub mod line;
 pub mod matrix;
+pub mod qq;
+pub mod signal;
 pub mod slack;
 pub mod teams;
 pub mod web;
+pub mod wechat;
 pub mod whatsapp;
 
 #[cfg(feature = "telegram")]

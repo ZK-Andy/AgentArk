@@ -1,12 +1,15 @@
-//! HTTP API integration tests for the Agent Swarm
+//! Live Agent Swarm smoke tests.
 //!
-//! These tests run against a live AgentArk server at localhost:8990.
+//! These are opt-in smoke checks against a live AgentArk server at localhost:8990.
+//! Set `AGENTARK_RUN_LIVE_SMOKES=1` to enable them.
 //! Start the server before running: docker compose up -d --build
 //!
 //! Auth: Set AGENTARK_TEST_API_KEY to a valid API key, or start the server
 //! with AGENTARK_INSECURE_NO_AUTH=true to bypass authentication.
 //!
-//! Run with: cargo test --test swarm_api_test
+//! Run with: AGENTARK_RUN_LIVE_SMOKES=1 cargo test --features live-smoke-tests --test swarm_api_test
+
+mod live_smoke;
 
 const BASE_URL: &str = "http://localhost:8990";
 
@@ -61,8 +64,15 @@ async fn server_allows_no_auth() -> bool {
 
 macro_rules! skip_if_no_server {
     () => {
+        if !live_smoke::live_smoke_enabled() {
+            eprintln!(
+                "SKIP: live smoke tests are disabled. Set {}=1 to enable.",
+                live_smoke::LIVE_SMOKE_ENV
+            );
+            return;
+        }
         if !server_available().await {
-            eprintln!("SKIP: Server not running at {}", BASE_URL);
+            eprintln!("SKIP: live smoke server not running at {}", BASE_URL);
             return;
         }
     };
@@ -86,7 +96,13 @@ async fn test_api_health() {
     skip_if_no_server!();
     let resp = reqwest::get(&format!("{}/health", BASE_URL)).await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "OK");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["mode"], "health");
+    assert!(
+        body["checks"].is_object(),
+        "health response should expose checks"
+    );
 }
 
 #[tokio::test]
@@ -184,12 +200,25 @@ async fn test_api_swarm_config_update() {
         .json()
         .await
         .unwrap();
-    let was_enabled = original["enabled"].as_bool().unwrap();
+    let original_max = original["max_specialists"].as_u64().unwrap();
+    let original_timeout = original["default_timeout_secs"].as_u64().unwrap();
+    let updated_max = if original_max >= 8 {
+        original_max - 1
+    } else {
+        original_max + 1
+    };
+    let updated_timeout = if original_timeout >= 900 {
+        original_timeout - 60
+    } else {
+        original_timeout + 60
+    };
 
-    // Toggle
     let resp = client
         .post(format!("{}/swarm/config", BASE_URL))
-        .json(&serde_json::json!({ "enabled": !was_enabled }))
+        .json(&serde_json::json!({
+            "max_specialists": updated_max,
+            "default_timeout_secs": updated_timeout
+        }))
         .send()
         .await
         .unwrap();
@@ -204,12 +233,18 @@ async fn test_api_swarm_config_update() {
         .json()
         .await
         .unwrap();
-    assert_eq!(updated["enabled"].as_bool().unwrap(), !was_enabled);
+    assert_eq!(updated["max_specialists"].as_u64().unwrap(), updated_max);
+    assert_eq!(
+        updated["default_timeout_secs"].as_u64().unwrap(),
+        updated_timeout
+    );
 
-    // Restore
     let _ = client
         .post(format!("{}/swarm/config", BASE_URL))
-        .json(&serde_json::json!({ "enabled": was_enabled }))
+        .json(&serde_json::json!({
+            "max_specialists": original_max,
+            "default_timeout_secs": original_timeout
+        }))
         .send()
         .await;
 }

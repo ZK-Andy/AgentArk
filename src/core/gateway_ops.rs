@@ -3,8 +3,6 @@
 //! This module is intentionally read-only and low-risk. It composes the
 //! existing control planes into one serializable overview without adding new
 //! storage formats or network behavior.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -118,37 +116,6 @@ impl GatewayOpsControlPlane {
             pulse_highlights,
             doctor_highlights,
         })
-    }
-
-    pub async fn service_summaries(
-        storage: &crate::storage::Storage,
-        config: &AgentConfig,
-    ) -> Result<Vec<GatewayOpsServiceSummary>> {
-        let channels = gateway::load_channels(storage, config).await?;
-        let routing = gateway::load_routing(storage).await?;
-        let nodes = NodeControlPlane::new(storage.clone()).status().await?;
-        let browsers = BrowserProfileControlPlane::list(storage).await?;
-        let model_failover = ModelFailoverControlPlane::list(storage).await?;
-
-        Ok(vec![
-            build_gateway_channels_summary(&channels.summary),
-            build_gateway_routing_summary(&routing.summary),
-            build_nodes_summary(&nodes.summary),
-            build_browser_summary(&browsers.summary),
-            build_model_failover_summary(&model_failover.summary),
-        ])
-    }
-
-    pub async fn pulse_highlights(agent: &Agent) -> Result<Vec<GatewayOpsHighlight>> {
-        let pulse_log = sentinel::get_pulse_log(agent).await;
-        Ok(build_pulse_highlights(latest_pulse_event(&pulse_log)))
-    }
-
-    pub async fn doctor_highlights(agent: &Agent) -> Result<Vec<GatewayOpsHighlight>> {
-        let pulse_log = sentinel::get_pulse_log(agent).await;
-        Ok(latest_pulse_event(&pulse_log)
-            .map(|event| build_doctor_highlights(&event.details.doctor_findings))
-            .unwrap_or_default())
     }
 }
 

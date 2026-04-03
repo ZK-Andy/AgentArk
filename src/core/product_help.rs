@@ -1,4 +1,5 @@
 use crate::actions::ActionDef;
+use crate::docs::product_help::{render_bundled_help_doc, BUNDLED_HELP_DOCS};
 use std::collections::BTreeSet;
 
 pub const CURATED_SOURCE: &str = "agentark_help";
@@ -13,11 +14,96 @@ pub struct SeedKnowledgeItem {
     pub tags: Option<String>,
 }
 
-struct BundledHelpDoc {
-    title: &'static str,
-    slug: &'static str,
-    tags: &'static [&'static str],
-    content: &'static str,
+fn branded_product_text(text: &str) -> String {
+    crate::branding::brand_text(text)
+}
+
+fn normalize_help_text(text: &str) -> String {
+    text.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+}
+
+fn normalized_help_tokens(text: &str) -> BTreeSet<String> {
+    normalize_help_text(text)
+        .split_whitespace()
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn contains_help_phrase(haystack: &str, phrase: &str) -> bool {
+    let haystack = format!(" {} ", normalize_help_text(haystack));
+    let needle = format!(" {} ", normalize_help_text(phrase));
+    !needle.trim().is_empty() && haystack.contains(&needle)
+}
+
+fn contains_any_help_phrase(haystack: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|phrase| contains_help_phrase(haystack, phrase))
+}
+
+fn contains_any_help_token(haystack: &str, tokens: &[&str]) -> bool {
+    let words = normalized_help_tokens(haystack);
+    tokens.iter().any(|token| {
+        let normalized = token.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        if normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            words.contains(&normalized)
+        } else {
+            contains_help_phrase(haystack, &normalized)
+        }
+    })
+}
+
+fn query_matches_help_intent(message: &str) -> bool {
+    const INTENT_PHRASES: &[&str] = &[
+        "how do i",
+        "how to",
+        "where do i",
+        "where is",
+        "what can",
+        "show me how",
+        "walk me through",
+        "steps to",
+        "i am new",
+        "i'm new",
+        "new user",
+        "set up",
+        "setup",
+        "configure",
+        "connect",
+        "enable",
+        "add access",
+        "how can i",
+        "help me",
+        "how does",
+        "what is",
+        "what's",
+        "explain",
+        "tell me about",
+    ];
+    const INTENT_TOKENS: &[&str] = &[
+        "status", "state", "current", "enabled", "disabled", "working",
+    ];
+
+    contains_any_help_phrase(message, INTENT_PHRASES)
+        || contains_any_help_token(message, INTENT_TOKENS)
+        || matches!(
+            normalize_help_text(message).split_whitespace().next(),
+            Some("is" | "are" | "does" | "can")
+        )
+}
+
+fn topic_matches(message: &str, phrases: &[&str], tokens: &[&str]) -> bool {
+    contains_any_help_phrase(message, phrases) || contains_any_help_token(message, tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,176 +123,6 @@ impl ProductHelpMode {
     }
 }
 
-const BUNDLED_DOCS: &[BundledHelpDoc] = &[
-    BundledHelpDoc {
-        title: "Install and first run",
-        slug: "install-and-first-run",
-        tags: &["install", "first_run", "new_user", "models", "setup"],
-        content: include_str!("product_help_docs/install-and-first-run.md"),
-    },
-    BundledHelpDoc {
-        title: "Settings and navigation map",
-        slug: "settings-and-navigation",
-        tags: &["settings", "navigation", "ui", "paths"],
-        content: include_str!("product_help_docs/settings-and-navigation.md"),
-    },
-    BundledHelpDoc {
-        title: "Mission Control, chat, and approvals",
-        slug: "mission-control-chat-and-approvals",
-        tags: &["mission_control", "chat", "inbox", "approvals", "navigation"],
-        content: include_str!("product_help_docs/mission-control-chat-and-inbox.md"),
-    },
-    BundledHelpDoc {
-        title: "Models and provider setup",
-        slug: "models-and-provider-setup",
-        tags: &["models", "providers", "llm", "setup", "routing", "research"],
-        content: include_str!("product_help_docs/models-and-provider-setup.md"),
-    },
-    BundledHelpDoc {
-        title: "Media generation providers",
-        slug: "media-generation-providers",
-        tags: &["media", "images", "video", "providers", "settings", "api_keys"],
-        content: include_str!("product_help_docs/media-generation-providers.md"),
-    },
-    BundledHelpDoc {
-        title: "Messaging channels and daily brief",
-        slug: "messaging-channels-and-daily-brief",
-        tags: &[
-            "channels",
-            "telegram",
-            "slack",
-            "discord",
-            "matrix",
-            "teams",
-            "whatsapp",
-            "daily_brief",
-            "setup",
-        ],
-        content: include_str!("product_help_docs/messaging-channels-and-daily-brief.md"),
-    },
-    BundledHelpDoc {
-        title: "Prebuilt connectors and integration quickstarts",
-        slug: "prebuilt-connectors-and-integration-quickstarts",
-        tags: &["integrations", "connectors", "oauth", "setup", "status"],
-        content: include_str!("product_help_docs/prebuilt-connectors-and-integration-quickstarts.md"),
-    },
-    BundledHelpDoc {
-        title: "Add Gmail access through Google Workspace",
-        slug: "gmail-google-workspace",
-        tags: &[
-            "gmail",
-            "google_workspace",
-            "google_cloud",
-            "oauth",
-            "integrations",
-            "setup",
-        ],
-        content: include_str!("product_help_docs/gmail-google-workspace.md"),
-    },
-    BundledHelpDoc {
-        title: "Run Moltbook for the first time",
-        slug: "moltbook-first-run",
-        tags: &["moltbook", "social", "integrations", "setup", "run"],
-        content: include_str!("product_help_docs/moltbook.md"),
-    },
-    BundledHelpDoc {
-        title: "Library, memory, documents, and MCP",
-        slug: "library-memory-documents-and-mcp",
-        tags: &[
-            "library",
-            "documents",
-            "memory",
-            "knowledge",
-            "mcp",
-            "facts",
-            "preferences",
-            "user_data",
-        ],
-        content: include_str!("product_help_docs/library-memory-documents-and-mcp.md"),
-    },
-    BundledHelpDoc {
-        title: "Tasks, watchers, goals, and apps",
-        slug: "tasks-watchers-goals-and-apps",
-        tags: &["tasks", "watchers", "goals", "apps", "automation", "deploy"],
-        content: include_str!("product_help_docs/tasks-watchers-goals-and-apps.md"),
-    },
-    BundledHelpDoc {
-        title: "App deploy and access guard",
-        slug: "app-deploy-and-access-guard",
-        tags: &[
-            "apps",
-            "deploy",
-            "app_deploy",
-            "access_guard",
-            "public_apps",
-            "security",
-        ],
-        content: include_str!("product_help_docs/app-deploy-and-access-guard.md"),
-    },
-    BundledHelpDoc {
-        title: "Trace, analytics, and ArkPulse",
-        slug: "trace-analytics-and-arkpulse",
-        tags: &["trace", "analytics", "arkpulse", "observability", "operations"],
-        content: include_str!("product_help_docs/trace-analytics-and-arkpulse.md"),
-    },
-    BundledHelpDoc {
-        title: "Self-learning and evolution",
-        slug: "self-learning-and-evolution",
-        tags: &[
-            "self_learning",
-            "evolution",
-            "learning",
-            "memory",
-            "canary",
-            "settings",
-        ],
-        content: include_str!("product_help_docs/self-learning-and-evolution.md"),
-    },
-    BundledHelpDoc {
-        title: "Plugins, webhooks, and custom APIs",
-        slug: "plugins-webhooks-and-custom-apis",
-        tags: &[
-            "plugins",
-            "webhooks",
-            "custom_api",
-            "integrations",
-            "mcp",
-            "events",
-        ],
-        content: include_str!("product_help_docs/plugins-webhooks-and-custom-apis.md"),
-    },
-    BundledHelpDoc {
-        title: "Security, advanced settings, and secrets",
-        slug: "security-advanced-and-secrets",
-        tags: &[
-            "security",
-            "advanced",
-            "secrets",
-            "master_password",
-            "sender_verification",
-        ],
-        content: include_str!("product_help_docs/security-advanced-and-secrets.md"),
-    },
-    BundledHelpDoc {
-        title: "Swarm, agents, and delegation",
-        slug: "swarm-agents-and-delegation",
-        tags: &["swarm", "agents", "delegation", "specialists", "multi_agent"],
-        content: include_str!("product_help_docs/swarm-agents-and-delegation.md"),
-    },
-    BundledHelpDoc {
-        title: "Browser automation, search, and research",
-        slug: "browser-search-and-research",
-        tags: &["browser", "search", "research", "web_search", "browser_auto", "chat"],
-        content: include_str!("product_help_docs/browser-search-and-research.md"),
-    },
-    BundledHelpDoc {
-        title: "AgentArk capabilities overview",
-        slug: "capabilities-overview",
-        tags: &["capabilities", "features", "overview", "general"],
-        content: include_str!("product_help_docs/capabilities-overview.md"),
-    },
-];
-
 pub fn is_product_help_source(source: Option<&str>) -> bool {
     matches!(source, Some(CURATED_SOURCE | RUNTIME_SOURCE))
 }
@@ -216,92 +132,73 @@ pub fn looks_like_agentark_help_query(message: &str) -> bool {
     if lc.is_empty() {
         return false;
     }
+    let help_intent = query_matches_help_intent(message);
+    let inferred_topics = infer_help_topics(message);
+    let high_signal_topic = inferred_topics.iter().any(|topic| {
+        matches!(
+            *topic,
+            "gmail"
+                | "google_workspace"
+                | "moltbook"
+                | "self_learning"
+                | "sentinel"
+                | "install"
+                | "new_user"
+                | "capabilities"
+                | "integrations"
+                | "plugins"
+                | "webhooks"
+                | "swarm"
+                | "trace"
+                | "arkpulse"
+                | "environment"
+                | "browser"
+                | "research"
+                | "security"
+        )
+    });
+    let explicit_product_signal = contains_any_help_phrase(
+        message,
+        &[
+            crate::branding::PRODUCT_NAME,
+            "agentark",
+            "agent ark",
+            "mission control",
+            "approval inbox",
+            "background learning",
+            "reflection pass",
+            "daily brief",
+            "plugin sdk",
+            "google workspace",
+            "bundled skills",
+            "skill import",
+            "embedding provider",
+            "local embeddings",
+            "external embeddings",
+            "input needed",
+            "set secret",
+            "/delegate",
+            "/rollback",
+            "public apps",
+            "access guard",
+            "browser automation",
+            "runtime access summary",
+            "deployment topology",
+            "connected systems",
+            "workspace root",
+            "default sandbox",
+            "action permissions",
+            "approval grants",
+            "sandbox mode",
+        ],
+    ) || contains_any_help_token(
+        message,
+        &[
+            "sentinel", "arkpulse", "moltbook", "watchers", "swarm", "mcp", "executor",
+        ],
+    );
 
-    let help_intent = [
-        "how do i",
-        "how to",
-        "where do i",
-        "where is",
-        "what can",
-        "show me how",
-        "walk me through",
-        "steps to",
-        "i am new",
-        "i'm new",
-        "new user",
-        "setup",
-        "set up",
-        "configure",
-        "connect",
-        "enable",
-        "add access",
-        "how can i",
-        "help me",
-        "how does",
-        "what is",
-        "what's",
-        "explain",
-        "tell me about",
-        "status",
-        "state",
-        "current",
-        "enabled",
-        "disabled",
-        "working",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle));
-    let help_intent = help_intent
-        || lc.starts_with("is ")
-        || lc.starts_with("are ")
-        || lc.starts_with("does ")
-        || lc.starts_with("can ");
-
-    let product_topic = [
-        "agentark",
-        "gmail",
-        "google workspace",
-        "gws",
-        "google cloud",
-        "moltbook",
-        "settings",
-        "integrations",
-        "models",
-        "watcher",
-        "watchers",
-        "tasks",
-        "apps",
-        "channels",
-        "telegram",
-        "whatsapp",
-        "github",
-        "notion",
-        "twilio",
-        "self learning",
-        "self-learning",
-        "learning",
-        "evolution",
-        "memory",
-        "knowledge",
-        "documents",
-        "library",
-        "skills",
-        "swarm",
-        "agents",
-        "goals",
-        "trace",
-        "analytics",
-        "arkpulse",
-        "security",
-        "advanced",
-        "browser",
-        "mcp",
-        "webhooks",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle));
-
-    help_intent && product_topic
+    help_intent && (high_signal_topic || explicit_product_signal)
 }
 
 pub fn infer_help_mode(message: &str) -> ProductHelpMode {
@@ -310,45 +207,45 @@ pub fn infer_help_mode(message: &str) -> ProductHelpMode {
         return ProductHelpMode::Setup;
     }
 
-    if [
-        "how do i",
-        "how to",
-        "where do i",
-        "set up",
-        "setup",
-        "configure",
-        "connect",
-        "add access",
-        "walk me through",
-        "steps to",
-        "new user",
-        "i am new",
-        "i'm new",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle))
-    {
+    if contains_any_help_phrase(
+        message,
+        &[
+            "how do i",
+            "how to",
+            "where do i",
+            "set up",
+            "setup",
+            "configure",
+            "connect",
+            "add access",
+            "walk me through",
+            "steps to",
+            "new user",
+            "i am new",
+            "i'm new",
+        ],
+    ) {
         return ProductHelpMode::Setup;
     }
 
-    if [
-        "status",
-        "state",
-        "enabled",
-        "disabled",
-        "connected",
-        "configured",
-        "current",
-        "right now",
-        "last run",
-        "queue",
-        "how many",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle))
-        || lc.starts_with("is ")
-        || lc.starts_with("are ")
-        || lc.starts_with("does ")
+    if contains_any_help_phrase(message, &["right now", "last run", "how many", "currently"])
+        || contains_any_help_token(
+            message,
+            &[
+                "status",
+                "state",
+                "enabled",
+                "disabled",
+                "connected",
+                "configured",
+                "current",
+                "queue",
+            ],
+        )
+        || matches!(
+            normalize_help_text(message).split_whitespace().next(),
+            Some("is" | "are" | "does")
+        )
     {
         return ProductHelpMode::Status;
     }
@@ -357,189 +254,309 @@ pub fn infer_help_mode(message: &str) -> ProductHelpMode {
 }
 
 pub fn infer_help_topics(message: &str) -> Vec<&'static str> {
-    let lc = message.trim().to_ascii_lowercase();
     let mut topics = Vec::new();
+    let explicit_environment_phrase = contains_any_help_phrase(
+        message,
+        &[
+            "where is it deployed",
+            "where is this deployed",
+            "what permissions does it have",
+            "what can it access",
+            "what is connected",
+            "connected systems",
+            "runtime access summary",
+            "deployment topology",
+            "investigate this instance",
+            "workspace root",
+            "default sandbox",
+            "sandbox mode",
+            "docker socket",
+        ],
+    );
+    let environment_instance_signal = explicit_environment_phrase
+        || contains_any_help_phrase(
+            message,
+            &[
+                crate::branding::PRODUCT_NAME,
+                "agentark",
+                "agent ark",
+                "this instance",
+            ],
+        );
+    let environment_token_match = contains_any_help_token(
+        message,
+        &[
+            "environment",
+            "deployment",
+            "deployed",
+            "runtime",
+            "sandbox",
+            "docker",
+            "executor",
+            "workspace",
+            "permissions",
+            "approval",
+            "approvals",
+            "cpu",
+            "cpus",
+            "memory",
+            "ram",
+        ],
+    );
 
-    if lc.contains("gmail") {
+    if contains_any_help_token(message, &["gmail"]) {
         topics.push("gmail");
     }
-    if [
-        "google workspace",
-        "gws",
-        "google cloud",
-        "oauth",
-        "calendar",
-        "drive",
-        "docs",
-        "sheets",
-        "chat",
-        "admin sdk",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle))
-    {
+    if explicit_environment_phrase || (environment_token_match && environment_instance_signal) {
+        topics.push("environment");
+    }
+    if topic_matches(
+        message,
+        &[
+            "google workspace",
+            "google cloud",
+            "admin sdk",
+            "google chat",
+        ],
+        &["gws", "oauth", "calendar", "drive", "docs", "sheets"],
+    ) {
         topics.push("google_workspace");
     }
-    if lc.contains("moltbook") {
+    if contains_any_help_token(message, &["moltbook"]) {
         topics.push("moltbook");
     }
-    if [
-        "self learning",
-        "self-learning",
-        "learning",
-        "evolution",
-        "canary",
-        "replay gate",
-        "learning candidate",
-        "learned memory",
-        "learned procedure",
-    ]
-    .iter()
-    .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &[
+            "self learning",
+            "self-learning",
+            "background learning",
+            "reflection pass",
+            "memory consolidation",
+            "experience consolidation",
+            "pattern induction",
+            "candidate generation",
+            "replay gate",
+            "learning candidate",
+            "learned memory",
+            "learned procedure",
+        ],
+        &["evolution", "canary"],
+    ) {
         topics.push("self_learning");
     }
-    if ["install", "first run", "start", "docker", "build from source"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["sentinel", "background learning", "ambient engine"],
+        &[],
+    ) {
+        topics.push("sentinel");
+    }
+    if topic_matches(
+        message,
+        &["first run", "build from source"],
+        &["install", "start", "docker"],
+    ) {
         topics.push("install");
     }
-    if ["new user", "i am new", "i'm new"].iter().any(|needle| lc.contains(needle)) {
+    if topic_matches(message, &["new user", "i am new", "i'm new"], &[]) {
         topics.push("new_user");
     }
-    if ["what can", "capabilities", "features", "what does"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["what can", "what does"],
+        &["capabilities", "features"],
+    ) {
         topics.push("capabilities");
     }
-    if ["mission control", "chat", "inbox", "approval inbox"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["mission control", "approval inbox"],
+        &["chat", "inbox"],
+    ) {
         topics.push("chat");
     }
-    if ["settings", "where do i", "where is", "navigation"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["where do i", "where is", "navigation"],
+        &["settings"],
+    ) {
         topics.push("settings");
     }
-    if ["models", "provider", "llm"].iter().any(|needle| lc.contains(needle)) {
+    if contains_any_help_token(message, &["models", "provider", "llm"]) {
         topics.push("models");
     }
-    if ["media", "image", "video", "dall-e", "gemini", "veo", "replicate", "runway", "luma"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &[
+            "embedding provider",
+            "local embeddings",
+            "external embeddings",
+            "semantic search",
+        ],
+        &["embedding", "embeddings", "retrieval", "vector"],
+    ) {
+        topics.push("embeddings");
+    }
+    if contains_any_help_token(
+        message,
+        &[
+            "media",
+            "image",
+            "video",
+            "dall-e",
+            "gemini",
+            "veo",
+            "replicate",
+            "runway",
+            "luma",
+        ],
+    ) {
         topics.push("media");
     }
-    if ["daily brief", "telegram", "slack", "discord", "matrix", "teams", "whatsapp"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["daily brief"],
+        &[
+            "telegram", "slack", "discord", "matrix", "teams", "whatsapp",
+        ],
+    ) {
         topics.push("channels");
     }
-    if ["memory", "knowledge", "facts", "preferences", "user data"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if contains_any_help_token(
+        message,
+        &["memory", "knowledge", "facts", "preferences", "user data"],
+    ) {
         topics.push("memory");
     }
-    if ["document", "documents", "upload", "file", "files", "library"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if contains_any_help_token(
+        message,
+        &[
+            "document",
+            "documents",
+            "upload",
+            "file",
+            "files",
+            "library",
+        ],
+    ) {
         topics.push("documents");
     }
-    if ["watcher", "watchers", "monitor"].iter().any(|needle| lc.contains(needle)) {
+    if contains_any_help_token(message, &["watcher", "watchers", "monitor"]) {
         topics.push("watchers");
     }
-    if ["task", "tasks", "schedule"].iter().any(|needle| lc.contains(needle)) {
+    if contains_any_help_token(message, &["task", "tasks", "schedule"]) {
         topics.push("tasks");
     }
-    if ["app", "apps", "deploy"].iter().any(|needle| lc.contains(needle)) {
+    if topic_matches(
+        message,
+        &[
+            "input needed",
+            "waiting on you",
+            "missing input",
+            "missing inputs",
+        ],
+        &[],
+    ) {
+        topics.push("input_needed");
+        topics.push("tasks");
+    }
+    if contains_any_help_token(message, &["app", "apps", "deploy"]) {
         topics.push("apps");
     }
-    if ["channel", "telegram", "whatsapp", "slack", "discord", "teams"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if contains_any_help_token(
+        message,
+        &[
+            "channel", "telegram", "whatsapp", "slack", "discord", "teams",
+        ],
+    ) {
         topics.push("channels");
     }
-    if ["integrations", "integration", "connectors"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if contains_any_help_token(message, &["integrations", "integration", "connectors"]) {
         topics.push("integrations");
     }
-    if ["plugin", "plugins", "plugin sdk"]
-        .iter()
-        .any(|needle| lc.contains(needle))
+    if contains_any_help_phrase(message, &["plugin sdk"])
+        || contains_any_help_token(message, &["plugin", "plugins"])
     {
         topics.push("plugins");
     }
-    if ["webhook", "webhooks", "custom api", "custom apis", "incoming webhook"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["custom api", "custom apis", "incoming webhook"],
+        &["webhook", "webhooks"],
+    ) {
         topics.push("webhooks");
     }
-    if ["skills", "skill import", "capability"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["skill import", "bundled skills"],
+        &["skills", "skill", "capability"],
+    ) {
         topics.push("skills");
     }
-    if ["swarm", "specialist agent", "specialist agents", "agents page"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &[
+            "chat shortcuts",
+            "set secret",
+            "/setsecret",
+            "pause notifications",
+            "resume notifications",
+            "notification status",
+            "/delegate",
+            "/rollback",
+        ],
+        &[],
+    ) {
+        topics.push("chat_shortcuts");
+    }
+    if topic_matches(
+        message,
+        &["specialist agent", "specialist agents", "agents page"],
+        &["swarm"],
+    ) {
         topics.push("swarm");
     }
-    if ["goal", "goals"].iter().any(|needle| lc.contains(needle)) {
+    if contains_any_help_token(message, &["goal", "goals"]) {
         topics.push("goals");
     }
-    if ["trace", "execution trace", "logs", "what did it do"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["execution trace", "what did it do"],
+        &["trace", "logs"],
+    ) {
         topics.push("trace");
     }
-    if ["arkpulse", "pulse", "health check", "operational pulse"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["health check", "operational pulse"],
+        &["arkpulse", "pulse"],
+    ) {
         topics.push("arkpulse");
     }
-    if ["analytics", "usage metrics", "llm analytics"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(message, &["usage metrics", "llm analytics"], &["analytics"]) {
         topics.push("analytics");
     }
-    if ["browser", "website", "form fill", "browser automation"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["website", "form fill", "browser automation"],
+        &["browser"],
+    ) {
         topics.push("browser");
     }
-    if ["research", "web search", "deep research", "search the web"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["web search", "deep research", "search the web"],
+        &["research"],
+    ) {
         topics.push("research");
     }
-    if ["security", "advanced", "api key", "mcp", "observability", "webhook"]
-        .iter()
-        .any(|needle| lc.contains(needle))
-    {
+    if topic_matches(
+        message,
+        &["api key"],
+        &["security", "advanced", "mcp", "observability", "webhook"],
+    ) {
         topics.push("security");
-    }
-
-    if topics.is_empty() {
-        topics.push("general");
     }
 
     topics.sort_unstable();
@@ -556,21 +573,22 @@ pub fn build_seed_knowledge_items(actions: &[ActionDef]) -> Vec<SeedKnowledgeIte
 }
 
 fn bundled_docs() -> Vec<SeedKnowledgeItem> {
-    BUNDLED_DOCS
+    BUNDLED_HELP_DOCS
         .iter()
         .map(|doc| SeedKnowledgeItem {
-            title: doc.title.to_string(),
-            content: doc.content.trim().to_string(),
+            title: branded_product_text(doc.title),
+            content: branded_product_text(&render_bundled_help_doc(doc)),
             source: CURATED_SOURCE,
-            url: Some(format!("agentark://help/{}", doc.slug)),
+            url: Some(crate::branding::help_uri(&format!("help/{}", doc.slug))),
             tags: Some(doc.tags.join(", ")),
         })
         .collect()
 }
 
 fn build_connect_flow_docs() -> Vec<SeedKnowledgeItem> {
-    let mut content = String::from(
-        "Live integration connect flow snapshot. These are the chat-native integration setups AgentArk can walk a user through without custom docs.\n\n",
+    let mut content = format!(
+        "Live integration connect flow snapshot. These are the chat-native integration setups {} can walk a user through without custom docs.\n\n",
+        crate::branding::PRODUCT_NAME,
     );
     for spec in crate::core::connect_flow::all_specs() {
         let required = match spec.required.kind {
@@ -578,10 +596,7 @@ fn build_connect_flow_docs() -> Vec<SeedKnowledgeItem> {
                 format!("required secrets: {}", spec.required.keys.join(", "))
             }
             crate::core::connect_flow::SecretRequirementKind::Any => {
-                format!(
-                    "provide at least one of: {}",
-                    spec.required.keys.join(", ")
-                )
+                format!("provide at least one of: {}", spec.required.keys.join(", "))
             }
         };
         let optional = if spec.optional.is_empty() {
@@ -603,10 +618,8 @@ fn build_connect_flow_docs() -> Vec<SeedKnowledgeItem> {
         title: "Live integration connect flows".to_string(),
         content,
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/connect-flows".to_string()),
-        tags: Some(
-            "integrations, setup, secrets, gmail, google_workspace, moltbook".to_string(),
-        ),
+        url: Some(crate::branding::help_uri("help/runtime/connect-flows")),
+        tags: Some("integrations, setup, secrets, gmail, google_workspace, moltbook".to_string()),
     }]
 }
 
@@ -614,24 +627,67 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     let mut items = Vec::new();
 
     let main_nav = [
-        ("Mission Control", "/home", "Landing overview and control center."),
+        (
+            "Mission Control",
+            "/home",
+            "Landing overview and control center.",
+        ),
         ("Chat", "/chat", "Primary chat and execution workspace."),
-        ("Library", "/library", "Reusable surfaces grouping Skills, Documents, and Apps."),
+        (
+            "Library",
+            "/library",
+            "Reusable surfaces grouping Skills, Documents, and Apps.",
+        ),
         ("Skills", "/skills", "Reusable skills and imports."),
-        ("Apps", "/apps", "Built artifacts, deployments, and public links."),
-        ("Agents", "/swarm", "Specialist agent roster and swarm controls."),
-        ("Goals", "/goals", "Long-running intent and outcome tracking."),
+        (
+            "Apps",
+            "/apps",
+            "Built artifacts, deployments, and public links.",
+        ),
+        (
+            "Agents",
+            "/swarm",
+            "Specialist agent roster and swarm controls.",
+        ),
+        (
+            "Goals",
+            "/goals",
+            "Long-running intent and outcome tracking.",
+        ),
         ("Moltbook", "/moltbook", "Top-level Moltbook control page."),
-        ("Tasks", "/tasks", "Durable queue, schedules, and approvals."),
-        ("Watchers", "/watchers", "Background poll-until-condition monitors."),
+        (
+            "Tasks",
+            "/tasks",
+            "Durable queue, schedules, and approvals.",
+        ),
+        (
+            "Sentinel",
+            "/sentinel",
+            "Ambient engine view with proposals, observations, and Background learning status.",
+        ),
+        (
+            "Watchers",
+            "/watchers",
+            "Background poll-until-condition monitors.",
+        ),
         ("ArkPulse", "/arkpulse", "Operational pulse and guidance."),
         ("Trace", "/trace", "Execution history and tool telemetry."),
-        ("Documents", "/documents", "Uploaded files and indexed document context."),
+        (
+            "Documents",
+            "/documents",
+            "Uploaded files and indexed document context.",
+        ),
         ("Analytics", "/analytics", "Usage and analytics dashboards."),
-        ("Settings", "/settings", "Modal settings surface for setup and admin controls."),
+        (
+            "Settings",
+            "/settings",
+            "Modal settings surface for setup and admin controls.",
+        ),
     ];
-    let mut nav_content =
-        String::from("Current AgentArk main navigation and top-level product surfaces.\n\n");
+    let mut nav_content = format!(
+        "Current {} main navigation and top-level product surfaces.\n\n",
+        crate::branding::PRODUCT_NAME,
+    );
     for (label, route, detail) in main_nav {
         nav_content.push_str(&format!("- {} (`{}`) | {}\n", label, route, detail));
     }
@@ -639,7 +695,7 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         title: "Main navigation and top-level pages".to_string(),
         content: nav_content,
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/main-navigation".to_string()),
+        url: Some(crate::branding::help_uri("help/runtime/main-navigation")),
         tags: Some(
             "navigation, ui, routes, capabilities, chat, library, documents, tasks, watchers, apps, goals, moltbook, trace, analytics, settings, swarm, skills"
                 .to_string(),
@@ -679,13 +735,12 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
                 "Settings > Evolution",
             ],
         ),
-        (
-            "Security",
-            &["Settings > Security", "Settings > Advanced"],
-        ),
+        ("Security", &["Settings > Security", "Settings > Advanced"]),
     ];
-    let mut settings_content =
-        String::from("Current Settings navigation groups and tabs in AgentArk.\n\n");
+    let mut settings_content = format!(
+        "Current Settings navigation groups and tabs in {}.\n\n",
+        crate::branding::PRODUCT_NAME,
+    );
     for (group, tabs) in settings_groups {
         settings_content.push_str(&format!("- {} | {}\n", group, tabs.join(" | ")));
     }
@@ -693,9 +748,70 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         title: "Settings groups and tabs".to_string(),
         content: settings_content,
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/settings-navigation".to_string()),
+        url: Some(crate::branding::help_uri("help/runtime/settings-navigation")),
         tags: Some(
             "settings, navigation, models, integrations, channels, connectors, knowledge, memory, evolution, security, advanced, observability, mcp"
+                .to_string(),
+        ),
+    });
+
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let cpu_count = std::thread::available_parallelism()
+        .map(|value| value.get().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let docker_host = std::env::var("DOCKER_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let container_runtime_available =
+        docker_host.is_some() || std::path::Path::new("/var/run/docker.sock").exists();
+    let mut environment_content = format!(
+        "Runtime environment and investigation snapshot for this {} process.\n\n\
+- Host view | {} / {}\n\
+- Current workspace | `{}`\n\
+- Visible logical CPUs | {}\n\
+- Container runtime configured | {}\n",
+        crate::branding::PRODUCT_NAME,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cwd,
+        cpu_count,
+        if container_runtime_available {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if let Some(host) = docker_host {
+        environment_content.push_str(&format!("- Docker routing clue | `{}`\n", host));
+    }
+    if std::path::Path::new("/app/data/apps").exists() {
+        environment_content.push_str(
+            "- Managed app root clue | `/app/data/apps/<id>` is present in this process view.\n",
+        );
+    } else {
+        environment_content.push_str(
+            "- Managed app root clue | `/app/data/apps/<id>` is not present in this process view.\n",
+        );
+    }
+    environment_content.push_str(
+        "\nInvestigation guidance.\n\n\
+- Use the request-scoped runtime access summary and action catalog as the live source of truth for what this instance can do right now.\n\
+- Use integration inventory for connected channels and connectors.\n\
+- Use MCP Servers and Plugins settings when the user asks about external capability extensions.\n\
+- Use Tasks, Watchers, Goals, Apps, Trace, Analytics, and ArkPulse to inspect durable work and operational state.\n\
+- Use Security and approval-related surfaces to understand what still needs approval.\n\
+- If exact host RAM or orchestrator memory ceilings matter, verify from the live deployment/runtime layer rather than guessing from static docs.",
+    );
+    items.push(SeedKnowledgeItem {
+        title: "Runtime environment and investigation".to_string(),
+        content: branded_product_text(&environment_content),
+        source: RUNTIME_SOURCE,
+        url: Some(crate::branding::help_uri("help/runtime/environment")),
+        tags: Some(
+            "environment, deployment, runtime, workspace, cpu, memory, permissions, approvals, integrations, mcp, plugins, observability, sandbox, docker"
                 .to_string(),
         ),
     });
@@ -710,16 +826,16 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 - Settings > Knowledge > MCP Servers | External MCP server configuration.";
     items.push(SeedKnowledgeItem {
         title: "Library, documents, and memory surfaces".to_string(),
-        content: library_content.to_string(),
+        content: branded_product_text(library_content),
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/library-memory".to_string()),
+        url: Some(crate::branding::help_uri("help/runtime/library-memory")),
         tags: Some(
             "library, documents, memory, knowledge, files, uploads, facts, preferences, user_data, mcp"
                 .to_string(),
         ),
     });
 
-    let automation_content = "Automation-oriented surfaces in AgentArk.\n\n\
+    let automation_content = "Automation-oriented surfaces in __PRODUCT_NAME__.\n\n\
 - Tasks (`/tasks`) | One-off and recurring work, approvals, and queue state.\n\
 - Watchers (`/watchers`) | Bounded poll-until-condition workflows with timeout and trigger state.\n\
 - Goals (`/goals`) | Longer-running intent and outcome loops.\n\
@@ -728,17 +844,19 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 - Analytics (`/analytics`) | Aggregated usage and performance dashboards.";
     items.push(SeedKnowledgeItem {
         title: "Automation surfaces: tasks, watchers, goals, apps, trace, analytics".to_string(),
-        content: automation_content.to_string(),
+        content: branded_product_text(automation_content),
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/automation-surfaces".to_string()),
+        url: Some(crate::branding::help_uri(
+            "help/runtime/automation-surfaces",
+        )),
         tags: Some(
-            "tasks, watchers, goals, apps, trace, analytics, automation, operations"
-                .to_string(),
+            "tasks, watchers, goals, apps, trace, analytics, automation, operations".to_string(),
         ),
     });
 
     let evolution_content = "Self-learning and evolution surfaces in the current UI.\n\n\
 - Settings > Admin > Evolution | Main self-learning and evolution control center.\n\
+- Sentinel > Background learning | Live status for reflection pass, memory consolidation, experience consolidation, pattern induction, and candidate generation.\n\
 - Evolution Status | Self-evolve toggle, learning toggle, local-only mode, canary state, promotion mode, replay gate, queue metrics.\n\
 - Deploy Guard Default | Default access-guard behavior for app deployments.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
@@ -750,9 +868,9 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         title: "Evolution and self-learning surfaces".to_string(),
         content: evolution_content.to_string(),
         source: RUNTIME_SOURCE,
-        url: Some("agentark://help/runtime/evolution".to_string()),
+        url: Some(crate::branding::help_uri("help/runtime/evolution")),
         tags: Some(
-            "self_learning, evolution, learning, canary, replay_gate, memory, procedures, candidates, settings"
+            "self_learning, evolution, learning, background_learning, sentinel, canary, replay_gate, memory, procedures, candidates, settings"
                 .to_string(),
         ),
     });
@@ -767,8 +885,9 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
     let mut items = Vec::new();
     let chunk_size = 16;
     for (idx, chunk) in sorted.chunks(chunk_size).enumerate() {
-        let mut content = String::from(
-            "Live action snapshot. If an action appears here, this AgentArk instance can use it when the request matches and required credentials/config are present.\n\n",
+        let mut content = format!(
+            "Live action snapshot. If an action appears here, this {} instance can use it when the request matches and required credentials/config are present.\n\n",
+            crate::branding::PRODUCT_NAME,
         );
         for action in chunk {
             let caps = if action.capabilities.is_empty() {
@@ -785,7 +904,10 @@ fn build_runtime_action_catalog_docs(actions: &[ActionDef]) -> Vec<SeedKnowledge
             title: format!("Live action catalog {}", idx + 1),
             content,
             source: RUNTIME_SOURCE,
-            url: Some(format!("agentark://help/runtime/actions-{}", idx + 1)),
+            url: Some(crate::branding::help_uri(&format!(
+                "help/runtime/actions-{}",
+                idx + 1
+            ))),
             tags: Some(action_chunk_tags(chunk).join(", ")),
         });
     }
@@ -843,19 +965,28 @@ mod tests {
             sandbox_mode: None,
             source: crate::actions::ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         }
     }
 
     #[test]
     fn detects_agentark_help_queries() {
-        assert!(looks_like_agentark_help_query(
-            "How do I add Gmail access in AgentArk?"
-        ));
+        assert!(looks_like_agentark_help_query(&format!(
+            "How do I add Gmail access in {}?",
+            crate::branding::PRODUCT_NAME
+        )));
         assert!(looks_like_agentark_help_query(
             "I am new, how do I run Moltbook?"
         ));
         assert!(!looks_like_agentark_help_query(
             "Post on Moltbook about this release"
+        ));
+        assert!(looks_like_agentark_help_query(&format!(
+            "How do I use {}?",
+            crate::branding::PRODUCT_NAME
+        )));
+        assert!(!looks_like_agentark_help_query(
+            "How do I debug Python tasks?"
         ));
     }
 
@@ -867,14 +998,91 @@ mod tests {
     }
 
     #[test]
-    fn detects_self_learning_help_queries() {
+    fn recognizes_google_calendar_help_queries() {
         assert!(looks_like_agentark_help_query(
-            "How does self-learning work in AgentArk?"
+            "How do I connect Google Calendar?"
         ));
+        let topics = infer_help_topics("How do I connect Google Calendar?");
+        assert!(topics.contains(&"google_workspace"));
+    }
+
+    #[test]
+    fn recognizes_google_chat_help_queries_without_broadening_to_chatgpt() {
+        assert!(looks_like_agentark_help_query(
+            "How do I set up Google Chat?"
+        ));
+        let topics = infer_help_topics("How do I set up Google Chat?");
+        assert!(topics.contains(&"google_workspace"));
+        assert!(!infer_help_topics("What is ChatGPT?").contains(&"google_workspace"));
+    }
+
+    #[test]
+    fn detects_self_learning_help_queries() {
+        assert!(looks_like_agentark_help_query(&format!(
+            "How does self-learning work in {}?",
+            crate::branding::PRODUCT_NAME
+        )));
         assert!(matches!(
             infer_help_mode("Is self-learning enabled right now?"),
             ProductHelpMode::Status
         ));
+    }
+
+    #[test]
+    fn detects_background_learning_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "Check background learning status in Sentinel"
+        ));
+        let topics = infer_help_topics("Why is background learning in Sentinel not running?");
+        assert!(topics.contains(&"self_learning"));
+        assert!(topics.contains(&"sentinel"));
+        assert!(matches!(
+            infer_help_mode("What is the current background learning status?"),
+            ProductHelpMode::Status
+        ));
+    }
+
+    #[test]
+    fn detects_embeddings_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "Where do I change the embedding provider in AgentArk?"
+        ));
+        let topics = infer_help_topics("How do local embeddings work?");
+        assert!(topics.contains(&"embeddings"));
+    }
+
+    #[test]
+    fn detects_environment_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "What environment is AgentArk running in right now?"
+        ));
+        let topics = infer_help_topics(
+            "Where is this AgentArk instance deployed, what CPUs are visible, and what permissions does it have?",
+        );
+        assert!(topics.contains(&"environment"));
+        assert!(matches!(
+            infer_help_mode("What environment is AgentArk running in right now?"),
+            ProductHelpMode::Status
+        ));
+    }
+
+    #[test]
+    fn detects_input_needed_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "What does Input needed mean?"
+        ));
+        let topics = infer_help_topics("Why is this task waiting on you with Input needed?");
+        assert!(topics.contains(&"input_needed"));
+        assert!(topics.contains(&"tasks"));
+    }
+
+    #[test]
+    fn detects_chat_shortcuts_help_queries() {
+        assert!(looks_like_agentark_help_query(
+            "How do I use set secret in AgentArk?"
+        ));
+        let topics = infer_help_topics("What does /rollback do?");
+        assert!(topics.contains(&"chat_shortcuts"));
     }
 
     #[test]
@@ -893,6 +1101,21 @@ mod tests {
             .any(|item| item.title == "Models and provider setup"));
         assert!(items
             .iter()
+            .any(|item| item.title == "Embeddings and retrieval"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Input needed and unattended runs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Environment, deployment, and investigation"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Chat shortcuts and safe command phrases"));
+        assert!(items
+            .iter()
             .any(|item| item.title == "Plugins, webhooks, and custom APIs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Runtime environment and investigation"));
     }
 }

@@ -110,6 +110,48 @@ fn action_tokens(action: &ActionDef) -> HashSet<String> {
     tokens
 }
 
+pub fn looks_like_action_discussion_context(message: &str) -> bool {
+    let lc = message.trim().to_ascii_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+
+    [
+        "explain",
+        "explanation",
+        "compare",
+        "comparison",
+        "difference",
+        "differences",
+        "versus",
+        "vs ",
+        "why ",
+        "when ",
+        "what is ",
+        "what's ",
+        "how does ",
+        "how should ",
+        "help me understand",
+        "help me choose",
+        "routing",
+        "route ",
+        "intent",
+        "score",
+        "analysis",
+        "analyze",
+        "discuss",
+        "mention",
+        "example",
+        "documentation",
+        "docs",
+        "should ",
+        "could ",
+        "would ",
+    ]
+    .iter()
+    .any(|needle| lc.contains(needle))
+}
+
 pub fn action_intent_score(message: &str, action: &ActionDef) -> f32 {
     let msg_tokens = tokenize(message);
     if msg_tokens.is_empty() {
@@ -127,14 +169,16 @@ pub fn action_intent_score(message: &str, action: &ActionDef) -> f32 {
     // Coverage dominates because action descriptions are often long.
     let mut score = (0.8 * coverage) + (0.2 * (precision * 6.0).min(1.0));
 
-    let message_lc = message.to_lowercase();
-    let exact_name = action.name.to_lowercase();
-    if message_lc.contains(&exact_name) {
-        score = score.max(0.95);
-    } else {
-        let spaced_name = exact_name.replace('_', " ");
-        if message_lc.contains(&spaced_name) {
-            score = score.max(0.90);
+    if !looks_like_action_discussion_context(message) {
+        let message_lc = message.to_lowercase();
+        let exact_name = action.name.to_lowercase();
+        if message_lc.contains(&exact_name) {
+            score = score.max(0.95);
+        } else {
+            let spaced_name = exact_name.replace('_', " ");
+            if message_lc.contains(&spaced_name) {
+                score = score.max(0.90);
+            }
         }
     }
 
@@ -219,5 +263,52 @@ pub fn preferred_direct_action_name(message: &str, actions: &[ActionDef]) -> Opt
         Some(top.action_name)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action(name: &str, description: &str) -> ActionDef {
+        ActionDef {
+            name: name.to_string(),
+            description: description.to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({}),
+            capabilities: vec![],
+            sandbox_mode: None,
+            source: crate::actions::ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        }
+    }
+
+    #[test]
+    fn exact_action_mentions_do_not_force_help_discussion_contexts() {
+        let action = action("app_deploy", "Deploy an app");
+        let discussion = "Explain when app_deploy should win over file_write in routing.";
+        let direct = "Please app_deploy this repo now.";
+
+        assert!(looks_like_action_discussion_context(discussion));
+        assert!(action_intent_score(direct, &action) > action_intent_score(discussion, &action));
+        assert!(action_intent_score(direct, &action) >= DEFAULT_ACTION_INTENT_THRESHOLD);
+        assert!(action_intent_score(discussion, &action) < DEFAULT_ACTION_INTENT_THRESHOLD);
+    }
+
+    #[test]
+    fn preferred_direct_action_stays_none_for_action_discussion() {
+        let actions = vec![
+            action("app_deploy", "Deploy an app"),
+            action("file_write", "Write files"),
+        ];
+
+        assert_eq!(
+            preferred_direct_action_name(
+                "Explain when app_deploy should win over file_write in routing.",
+                &actions
+            ),
+            None
+        );
     }
 }

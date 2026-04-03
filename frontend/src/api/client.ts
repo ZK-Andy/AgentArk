@@ -1,6 +1,7 @@
 import type {
   BackgroundSessionDetail,
   BackgroundSessionsResponse,
+  AutonomyActionExecutionResponse,
   SkillImportRequest,
   SkillImportResponse,
   SkillSecretsResponse,
@@ -21,10 +22,11 @@ import type {
   NodeCommandsResponse,
   NodesResponse,
   Notification,
-  PredictiveNudgesResponse,
   StatusResponse,
   Task,
   RecommendedSkill,
+  SentinelFeedResponse,
+  SentinelSettingsResponse,
   TraceResponse
 } from "../types";
 
@@ -501,6 +503,127 @@ async function streamChat(payload: ChatStreamPayload, handlers: ChatStreamHandle
   return streamSseJson("/chat/stream", payload, handlers);
 }
 
+async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandlers = {}): Promise<void> {
+  const query = sinceSeq > 0 ? `?since_seq=${encodeURIComponent(String(sinceSeq))}` : "";
+  const path = `/runs/${encodeURIComponent(runId)}/stream${query}`;
+  const doFetch = () =>
+    fetch(path, {
+      method: "GET",
+      credentials: "include",
+      signal: handlers.signal,
+      headers: buildHeaders({
+        Accept: "text/event-stream"
+      }, { json: false })
+    });
+  let res = await doFetch();
+
+  if (!res.ok) {
+    let text = extractErrorMessage(await res.text());
+    if (isMissingAuthError(res.status, text)) {
+      await refreshUiSessionCookie();
+      res = await doFetch();
+      if (!res.ok) {
+        text = extractErrorMessage(await res.text());
+        throw new Error(text || `Request failed (${res.status})`);
+      }
+    } else {
+      throw new Error(text || `Request failed (${res.status})`);
+    }
+  }
+
+  if (!res.body) throw new Error("Streaming is not available in this browser session.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let doneReceived = false;
+
+  const processBlock = (block: string) => {
+    const lines = block.split("\n");
+    let eventName = "message";
+    const dataLines: string[] = [];
+
+    for (const line of lines) {
+      if (!line || line.startsWith(":")) continue;
+      const splitIdx = line.indexOf(":");
+      if (splitIdx < 0) continue;
+      const field = line.slice(0, splitIdx).trim();
+      const value = line.slice(splitIdx + 1).trimStart();
+      if (field === "event") eventName = value;
+      if (field === "data") dataLines.push(value);
+    }
+
+    const payloadValue = parseMaybeJson(dataLines.join("\n"));
+    handlers.onEvent?.(eventName, payloadValue);
+
+    if (eventName === "token") {
+      const content = asText(asObject(payloadValue).content);
+      if (content) handlers.onToken?.(content);
+      return;
+    }
+    if (eventName === "thinking") {
+      handlers.onThinking?.(asObject(payloadValue));
+      return;
+    }
+    if (eventName === "tool_start") {
+      const obj = asObject(payloadValue);
+      const name = asText(obj.name);
+      if (name) handlers.onToolStart?.(name, obj);
+      return;
+    }
+    if (eventName === "tool_result") {
+      const obj = asObject(payloadValue);
+      const name = asText(obj.name);
+      const content = asText(obj.content);
+      handlers.onToolResult?.(name, content, obj);
+      return;
+    }
+    if (eventName === "tool_progress") {
+      const obj = asObject(payloadValue);
+      const name = asText(obj.name);
+      const content = asText(obj.content);
+      handlers.onToolProgress?.(name, content, obj);
+      return;
+    }
+    if (eventName === "content") {
+      handlers.onContent?.(asObject(payloadValue));
+      return;
+    }
+    if (eventName === "error") {
+      const message = extractStreamErrorMessage(payloadValue) || "Stream failed.";
+      handlers.onError?.(message, payloadValue);
+      return;
+    }
+    if (eventName === "done") {
+      doneReceived = true;
+      handlers.onDone?.();
+    }
+  };
+
+  try {
+    while (!doneReceived) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, "\n");
+      let splitAt = buffer.indexOf("\n\n");
+      while (splitAt >= 0) {
+        const rawEvent = buffer.slice(0, splitAt);
+        buffer = buffer.slice(splitAt + 2);
+        if (rawEvent.trim()) processBlock(rawEvent);
+        if (doneReceived) break;
+        splitAt = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
 export const api = {
   rawGet: (path: string) => request<unknown>(path),
   rawPost: (path: string, payload?: unknown) =>
@@ -590,26 +713,35 @@ export const api = {
     return [];
   },
   getTrace: () => request<TraceResponse>("/trace"),
+  getSentinelSettings: () => request<SentinelSettingsResponse>("/autonomy/sentinel/settings"),
+  updateSentinelSettings: (payload: Record<string, unknown>) =>
+    request<SentinelSettingsResponse>("/autonomy/sentinel/settings", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  getSentinelFeed: () => request<SentinelFeedResponse>("/autonomy/sentinel/feed"),
+  approveSentinelProposal: (id: string) =>
+    request<{ status: string; message?: string; trace_id?: string; proposal?: Record<string, unknown> }>(
+      `/autonomy/sentinel/proposals/${encodeURIComponent(id)}/approve`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
+  dismissSentinelProposal: (id: string) =>
+    request<{ status: string }>(`/autonomy/sentinel/proposals/${encodeURIComponent(id)}/dismiss`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  snoozeSentinelProposal: (id: string) =>
+    request<{ status: string; snoozed_until?: string }>(
+      `/autonomy/sentinel/proposals/${encodeURIComponent(id)}/snooze`,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
+    ),
   getBriefing: () => request<BriefingResponse>("/autonomy/briefing"),
-  getNudges: () => request<PredictiveNudgesResponse>("/autonomy/nudges"),
-  feedbackNudge: (
-    id: string,
-    payload: { action: "dismiss" | "snooze" | "interested" | "reset"; note?: string; snooze_minutes?: number }
-  ) =>
-    request<{ status: string }>(`/autonomy/nudges/${encodeURIComponent(id)}/feedback`, {
-      method: "POST",
-      body: JSON.stringify(payload)
-    }),
-  planNudges: (payload: { max_items?: number; dry_run?: boolean }) =>
-    request<{
-      status: string;
-      dry_run: boolean;
-      planned: Array<Record<string, unknown>>;
-      skipped: Array<Record<string, unknown>>;
-    }>("/autonomy/nudges/plan", {
-      method: "POST",
-      body: JSON.stringify(payload)
-    }),
   getIntegrations: () => request<{ integrations: IntegrationItem[] }>("/integrations"),
   getIntegrationSyncStatus: () => request<{ statuses: IntegrationSyncStatus[] }>("/integrations/sync/status"),
   getIntegrationSyncFeed: (params?: { integration_id?: string; limit?: number }) => {
@@ -888,10 +1020,10 @@ export const api = {
     return request<LlmAnalyticsResponse>(`/analytics/llm?range=${range}&bucket=${bucket}${from}${to}`);
   },
   executeRecommendedSkill: (action: RecommendedSkill) =>
-    request<{ status: string; message?: string; queued?: boolean }>("/autonomy/skills/execute", {
-      method: "POST",
-      body: JSON.stringify({ action, dry_run: false })
-    }),
+      request<AutonomyActionExecutionResponse>("/autonomy/skills/execute", {
+        method: "POST",
+        body: JSON.stringify({ action, dry_run: false })
+      }),
   chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean; execution_mode?: string }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
@@ -903,6 +1035,8 @@ export const api = {
   chatStream: (payload: ChatStreamPayload, handlers?: ChatStreamHandlers) => streamChat(payload, handlers),
   resumeChatTaskStream: (id: string, handlers?: ChatStreamHandlers) =>
     streamSseJson(`/tasks/${encodeURIComponent(id)}/resume-chat/stream`, {}, handlers),
+  runStream: (runId: string, sinceSeq?: number, handlers?: ChatStreamHandlers) =>
+    streamRun(runId, sinceSeq, handlers),
   approveTask: (id: string) =>
     request<{ status: string }>(`/tasks/${encodeURIComponent(id)}/approve`, {
       method: "POST",

@@ -11,7 +11,6 @@ pub mod github;
 pub mod gsc;
 pub mod lightpanda;
 pub mod media_gen;
-pub mod mem0;
 pub mod moltbook;
 pub mod notion;
 pub mod oauth;
@@ -65,34 +64,18 @@ fn stored_bool_secret(
         .and_then(|value| parse_boolish(&value))
 }
 
-fn legacy_google_refresh_token_present(
-    manager: &crate::core::config::SecureConfigManager,
-    key: &str,
-) -> bool {
-    manager
-        .get_custom_secret(key)
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|parsed| {
-            parsed
-                .get("refresh_token")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-        .is_some()
-}
-
 fn builtin_integration_is_connected(
     config_dir: &Path,
-    manager: &crate::core::config::SecureConfigManager,
+    _manager: &crate::core::config::SecureConfigManager,
     integration_id: &str,
 ) -> bool {
     match integration_id {
-        "gmail" => legacy_google_refresh_token_present(manager, "gmail_tokens"),
-        "google_calendar" => legacy_google_refresh_token_present(manager, "calendar_tokens"),
+        "gmail" => crate::actions::google_workspace::granted_bundles(config_dir)
+            .map(|granted| granted.iter().any(|bundle| bundle == "gmail"))
+            .unwrap_or(false),
+        "google_calendar" => crate::actions::google_workspace::granted_bundles(config_dir)
+            .map(|granted| granted.iter().any(|bundle| bundle == "calendar"))
+            .unwrap_or(false),
         "google_workspace" => {
             crate::actions::google_workspace::summarize_connection_status(config_dir)
                 .map(|(connected, granted, missing)| {
@@ -169,7 +152,6 @@ pub enum IntegrationStatus {
 
 /// Base trait for all integrations
 #[async_trait]
-#[allow(dead_code)]
 pub trait Integration: Send + Sync {
     /// Unique identifier for this integration
     fn id(&self) -> &str;
@@ -196,11 +178,6 @@ pub trait Integration: Send + Sync {
 
     /// Execute an action
     async fn execute(&self, action: &str, params: &serde_json::Value) -> Result<serde_json::Value>;
-
-    /// Handle incoming webhook (if supported)
-    async fn handle_webhook(&self, _payload: &serde_json::Value) -> Result<()> {
-        Ok(()) // Default: no-op
-    }
 }
 
 /// Integration manager - holds all configured integrations
@@ -221,89 +198,81 @@ impl IntegrationManager {
         manager
     }
 
+    fn register(&mut self, integration: impl Integration + 'static) {
+        let id = integration.id().to_string();
+        self.integrations.insert(id, Box::new(integration));
+    }
+
     /// Register default integrations (Google Calendar, WhatsApp, Media Gen)
     fn register_default_integrations(&mut self) {
         let config_dir = self._config_dir.clone();
 
         // Register Google Calendar
-        let calendar = calendar::GoogleCalendarConnector::new();
-        self.integrations
-            .insert("google_calendar".to_string(), Box::new(calendar));
+        self.register(calendar::GoogleCalendarConnector::new());
 
         // Register WhatsApp
-        let whatsapp = whatsapp::WhatsAppConnector::new();
-        self.integrations
-            .insert("whatsapp".to_string(), Box::new(whatsapp));
+        self.register(whatsapp::WhatsAppConnector::new());
 
         // Register AI Media Generation (Image/Video)
-        let media_gen = media_gen::MediaGenConnector::new();
-        self.integrations
-            .insert("media_gen".to_string(), Box::new(media_gen));
+        self.register(media_gen::MediaGenConnector::new());
 
         // Register GitHub
-        let github = github::GitHubConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("github".to_string(), Box::new(github));
+        self.register(github::GitHubConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Notion
-        let notion = notion::NotionConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("notion".to_string(), Box::new(notion));
+        self.register(notion::NotionConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Twitter/X
-        let twitter = twitter::TwitterConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("twitter".to_string(), Box::new(twitter));
+        self.register(twitter::TwitterConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register 1Password
-        let onepassword =
-            onepassword::OnePasswordConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("onepassword".to_string(), Box::new(onepassword));
+        self.register(onepassword::OnePasswordConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Google Places
-        let places = places::GooglePlacesConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("google_places".to_string(), Box::new(places));
+        self.register(places::GooglePlacesConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Twilio Voice & SMS
-        let twilio = twilio::TwilioConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("twilio".to_string(), Box::new(twilio));
+        self.register(twilio::TwilioConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Ordering & Purchasing
-        let ordering = ordering::OrderingConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("ordering".to_string(), Box::new(ordering));
+        self.register(ordering::OrderingConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
         // Register Browser Automation (Playwright sidecar)
-        let browser = browser::BrowserIntegration::new();
-        self.integrations
-            .insert("browser".to_string(), Box::new(browser));
+        self.register(browser::BrowserIntegration::new());
 
         // Curated health + analytics connectors
-        let garmin = garmin::GarminConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("garmin".to_string(), Box::new(garmin));
+        self.register(garmin::GarminConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
-        let whoop = whoop::WhoopConnector::new_with_config_dir(config_dir.clone());
-        self.integrations
-            .insert("whoop".to_string(), Box::new(whoop));
+        self.register(whoop::WhoopConnector::new_with_config_dir(
+            config_dir.clone(),
+        ));
 
-        let ga4 = ga4::Ga4Connector::new_with_config_dir(config_dir.clone());
-        self.integrations.insert("ga4".to_string(), Box::new(ga4));
+        self.register(ga4::Ga4Connector::new_with_config_dir(config_dir.clone()));
 
-        let gsc = gsc::GscConnector::new_with_config_dir(config_dir.clone());
-        self.integrations.insert("gsc".to_string(), Box::new(gsc));
+        self.register(gsc::GscConnector::new_with_config_dir(config_dir.clone()));
 
-        let social = social_analytics::SocialAnalyticsConnector::new_with_config_dir(config_dir);
-        self.integrations
-            .insert("social_analytics".to_string(), Box::new(social));
+        self.register(social_analytics::SocialAnalyticsConnector::new_with_config_dir(config_dir));
 
         // Register Moltbook
-        let moltbook = moltbook::MoltbookConnector::new_with_config_dir(self._config_dir.clone());
-        self.integrations
-            .insert("moltbook".to_string(), Box::new(moltbook));
+        self.register(moltbook::MoltbookConnector::new_with_config_dir(
+            self._config_dir.clone(),
+        ));
     }
 
     /// Get an integration by ID

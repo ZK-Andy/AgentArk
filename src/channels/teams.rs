@@ -4,8 +4,6 @@
 //! configuration, Bot Framework / Graph-friendly outbound payload builders, and
 //! inbound activity handling that persists reply destinations before handing
 //! the message to the agent core.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use once_cell::sync::Lazy;
@@ -39,7 +37,8 @@ static TEAMS_BOT_FRAMEWORK_AUTH_CACHE: Lazy<RwLock<Option<BotFrameworkAuthCache>
 
 fn teams_sender_verification_notice(sender_label: &str) -> String {
     format!(
-        "Sender approval required before AgentArk can respond here.\n\nSender: {}\nOpen `Settings -> Connected Systems -> Sender Verification` to approve this sender.",
+        "Sender approval required before {} can respond here.\n\nSender: {}\nOpen `Settings -> Connected Systems -> Sender Verification` to approve this sender.",
+        crate::branding::PRODUCT_NAME,
         sender_label.trim()
     )
 }
@@ -64,7 +63,8 @@ fn teams_sender_verification_notification(
         )
     };
     format!(
-        "A new Teams sender needs approval before AgentArk will act.\nSender: {}{}{}\nApprove it in Settings -> Connected Systems -> Sender Verification.",
+        "A new Teams sender needs approval before {} will act.\nSender: {}{}{}\nApprove it in Settings -> Connected Systems -> Sender Verification.",
+        crate::branding::PRODUCT_NAME,
         sender_label.trim(),
         scope,
         preview
@@ -760,12 +760,6 @@ async fn save_state(
     save_json(storage, key, state).await
 }
 
-pub async fn save_config(agent: &Agent, config: &TeamsTransportConfig) -> Result<()> {
-    let raw = serde_json::to_vec(config)?;
-    agent.storage.set(CONFIG_STORAGE_KEY, &raw).await?;
-    Ok(())
-}
-
 pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<TeamsTransportConfig>> {
     if let Ok(Some(raw)) = storage.get(CONFIG_STORAGE_KEY).await {
         if let Ok(config) = serde_json::from_slice::<TeamsTransportConfig>(&raw) {
@@ -816,10 +810,6 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<TeamsT
     }))
 }
 
-pub async fn has_configuration(storage: &Storage) -> Result<bool> {
-    Ok(load_config_from_storage(storage).await?.is_some())
-}
-
 async fn load_config(agent: &Agent) -> Result<Option<TeamsTransportConfig>> {
     if let Some(config) = agent.config.teams.clone() {
         return Ok(Some(config));
@@ -857,7 +847,10 @@ fn build_bot_framework_payload(
         "text": message.text,
         "from": {
             "id": config.bot_app_id.as_deref().unwrap_or("agentark"),
-            "name": config.bot_name.as_deref().unwrap_or("AgentArk")
+            "name": config
+                .bot_name
+                .as_deref()
+                .unwrap_or(crate::branding::PRODUCT_NAME)
         },
         "conversation": {
             "id": destination.conversation_id,
@@ -1377,31 +1370,6 @@ pub async fn handle_activity(
         processed: true,
         response_preview: Some(response_text.chars().take(120).collect()),
     })
-}
-
-pub async fn load_reply_destination(
-    storage: &Storage,
-    conversation_id: &str,
-) -> Result<Option<TeamsReplyDestination>> {
-    let state: TeamsReplyDestinationState =
-        load_json(storage, &destination_key(conversation_id)).await?;
-    Ok(state.conversations.get(conversation_id).cloned())
-}
-
-pub async fn record_reply_destination(
-    storage: &Storage,
-    destination: TeamsReplyDestination,
-) -> Result<()> {
-    let key = destination_key(&destination.conversation_id);
-    let latest = destination.clone();
-    let mut state = load_state(storage, &key).await?;
-    state
-        .conversations
-        .insert(destination.conversation_id.clone(), destination);
-    save_state(storage, &key, &state).await?;
-    let raw = serde_json::to_vec(&latest)?;
-    storage.set(LAST_DESTINATION_STORAGE_KEY, &raw).await?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 #!/bin/bash
 # AgentArk CLI — simple commands for your AI agent
-# Usage: agentark chat | pulse | start | stop | logs | status
+# Usage: agentark chat | pulse | setup | start | stop | logs | status
 
 set -e
 
@@ -10,6 +10,9 @@ case "${1:-help}" in
         ;;
     pulse)
         docker exec -it agentark /app/agentark --pulse
+        ;;
+    setup)
+        docker exec -it agentark /app/agentark --setup
         ;;
     start)
         shift
@@ -40,6 +43,7 @@ case "${1:-help}" in
         echo ""
         echo "  chat       Interactive CLI chat with your agent"
         echo "  pulse      Run ArkPulse health check"
+        echo "  setup      Run setup wizard"
         echo "  start      Start AgentArk (add 'tunnel' for remote access)"
         echo "  stop       Stop AgentArk"
         echo "  restart    Restart AgentArk"

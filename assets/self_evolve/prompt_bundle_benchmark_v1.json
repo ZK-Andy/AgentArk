@@ -1,0 +1,104 @@
+{
+  "target_key": "prompt_bundle_profile_v1",
+  "version": 2,
+  "router_cases": [
+    {
+      "message": "Fix the broken API handler in this workspace and update the failing test.",
+      "expected_needs_delegation": false,
+      "expected_complexity": "simple",
+      "expected_should_clarify": false,
+      "preferred_direct_action": "file_write"
+    },
+    {
+      "message": "Compare the top 3 Rust web frameworks, summarize tradeoffs, and recommend one for AgentArk.",
+      "expected_needs_delegation": true,
+      "expected_complexity": "complex",
+      "expected_should_clarify": false,
+      "min_sub_agents": 2
+    },
+    {
+      "message": "Schedule the weekly deployment review every Friday at 5pm for the team.",
+      "expected_needs_delegation": false,
+      "expected_complexity": "simple",
+      "expected_should_clarify": false,
+      "preferred_direct_action": "schedule_task"
+    },
+    {
+      "message": "Can you help with the bug?",
+      "expected_needs_delegation": false,
+      "expected_complexity": "simple",
+      "expected_should_clarify": true
+    }
+  ],
+  "primary_response_cases": [
+    {
+      "message": "Summarize this status update in one concise answer: the deployment completed successfully, but the final health check is still pending.",
+      "allowed_actions": [],
+      "expected_tool_names": [],
+      "required_phrases": ["completed", "pending"],
+      "forbidden_phrases": ["prompt", "routing", "as an ai"]
+    },
+    {
+      "message": "Search the web for recent Rust async runtime updates and summarize the top 2 findings.",
+      "allowed_actions": ["research"],
+      "expected_tool_names": ["research"],
+      "required_phrases": [],
+      "forbidden_phrases": ["cannot", "i can't"]
+    },
+    {
+      "message": "Write the final user-facing update: the parser fix shipped, tests now pass, and rollout is still in canary.",
+      "allowed_actions": [],
+      "expected_tool_names": [],
+      "required_phrases": ["tests", "canary"],
+      "forbidden_phrases": ["agent", "internal", "system prompt"]
+    }
+  ],
+  "synthesis_cases": [
+    {
+      "original_task": "Implement the fix in the current workspace and write the patch.",
+      "agent_results": [
+        {
+          "agent_type": "Planner",
+          "task": "Identify the smallest safe patch.",
+          "content": "Patch the request parser and keep the change local to src/core/router.rs.",
+          "status": "completed"
+        },
+        {
+          "agent_type": "Coder",
+          "task": "Write the patch.",
+          "content": "I updated the parser and prepared the file write action.",
+          "status": "completed",
+          "tool_calls": ["file_write"]
+        }
+      ],
+      "allowed_actions": ["file_write"],
+      "expected_tool_names": ["file_write"],
+      "required_phrases": ["updated"],
+      "forbidden_phrases": ["agent", "synthesis"],
+      "expect_followup_note": false
+    },
+    {
+      "original_task": "Summarize what completed and what still needs follow-up after a degraded delegated run.",
+      "agent_results": [
+        {
+          "agent_type": "Researcher",
+          "task": "Collect the current deployment status.",
+          "content": "Deployment logs were collected successfully.",
+          "status": "completed"
+        },
+        {
+          "agent_type": "Validator",
+          "task": "Verify the live app.",
+          "content": "Validation timed out before the final health check finished.",
+          "status": "timed_out",
+          "next_action_hint": "Retry the health check once the app is stable."
+        }
+      ],
+      "allowed_actions": [],
+      "expected_tool_names": [],
+      "required_phrases": ["completed", "follow-up"],
+      "forbidden_phrases": ["agent", "synthesis"],
+      "expect_followup_note": true
+    }
+  ]
+}

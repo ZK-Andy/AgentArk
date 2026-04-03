@@ -67,6 +67,7 @@ export function AgentStatusBar({
     (automationCounts?.watchers || 0) +
     (automationCounts?.apps || 0) +
     (automationCounts?.integrations || 0);
+  const pendingCount = status?.tasks_pending ?? 0;
   const postureItems = [
     {
       label: "Autonomy",
@@ -81,28 +82,25 @@ export function AgentStatusBar({
       tone: hasLlmConfigured ? "#84d8ff" : "#ff8f8f",
     },
     {
-      label: "Queue",
-      value: String(status?.tasks_pending ?? 0),
-      detail: `${status?.tasks_pending ?? 0} pending task${(status?.tasks_pending ?? 0) === 1 ? "" : "s"}`,
-      tone: (status?.tasks_pending ?? 0) > 0 ? "#ffd27c" : "#9fb6cf",
-    },
-    {
       label: "Runtime",
       value: String(runtimeCount),
-      detail: summarizeRuntime(automationCounts),
-      tone: runtimeCount > 0 ? "#84d8ff" : "#9fb6cf",
+      detail:
+        pendingCount > 0
+          ? `${summarizeRuntime(automationCounts)} \u2022 ${pendingCount} pending`
+          : summarizeRuntime(automationCounts),
+      tone: runtimeCount > 0 || pendingCount > 0 ? "#84d8ff" : "#9fb6cf",
     },
   ];
 
   return (
     <Box
-      className="status-bar mission-panel mission-panel--adaptive"
+      className="status-bar mission-panel mission-panel--adaptive mission-side-panel"
       sx={{
         display: "flex",
         flexDirection: "column",
-        gap: 1.05,
-        px: { xs: 1.35, md: 1.5 },
-        py: { xs: 1.2, md: 1.35 },
+        gap: 0.9,
+        px: { xs: 1.15, md: 1.25 },
+        py: { xs: 1.0, md: 1.1 },
       }}
     >
       <Stack direction="row" justifyContent="space-between" spacing={1} alignItems="flex-start">
@@ -129,11 +127,11 @@ export function AgentStatusBar({
                 },
               }}
             />
-            <Typography variant="subtitle1" sx={{ color: "rgba(232, 243, 255, 0.96)", fontWeight: 700 }}>
+            <Typography variant="subtitle2" sx={{ color: "rgba(232, 243, 255, 0.96)", fontWeight: 700 }}>
               {label}
             </Typography>
           </Stack>
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="caption" color="text.secondary" sx={{ lineHeight: 1.45 }}>
             Live reasoning posture, queue pressure, model readiness, and runtime health.
           </Typography>
         </Stack>
@@ -145,7 +143,7 @@ export function AgentStatusBar({
             border: "1px solid rgba(108, 156, 212, 0.18)",
             background: "rgba(8, 18, 34, 0.54)",
             color: agentPaused ? "#ffbc7c" : "#82f7c1",
-            fontSize: "0.72rem",
+            fontSize: "0.66rem",
             fontWeight: 700,
             letterSpacing: "0.08em",
             textTransform: "uppercase",
@@ -167,7 +165,7 @@ export function AgentStatusBar({
             className="mission-metric-card mission-metric-card--rail"
             sx={{
               px: 1.1,
-              py: 0.9,
+              py: 0.75,
             }}
           >
             <Box sx={{ minWidth: 0, flex: 1 }}>
@@ -181,7 +179,11 @@ export function AgentStatusBar({
                 {item.detail}
               </Typography>
             </Box>
-            <Typography variant="subtitle2" className="mission-metric-card__value" sx={{ color: item.tone, textAlign: "right" }}>
+            <Typography
+              variant="caption"
+              className="mission-metric-card__value"
+              sx={{ color: item.tone, textAlign: "right", fontSize: "0.84rem" }}
+            >
               {item.value}
             </Typography>
           </Stack>
@@ -189,24 +191,6 @@ export function AgentStatusBar({
       </Stack>
 
       <Stack spacing={0.7} sx={{ pt: 0.2 }}>
-        {currentTaskDesc ? (
-          <Box
-            sx={{
-              borderRadius: 2.5,
-              border: "1px solid rgba(74, 195, 255, 0.18)",
-              background: "rgba(9, 22, 40, 0.62)",
-              px: 1.1,
-              py: 0.95,
-            }}
-          >
-            <Typography variant="caption" sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              Active Objective
-            </Typography>
-            <Typography variant="body2" sx={{ mt: 0.35, color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
-              {currentTaskDesc}
-            </Typography>
-          </Box>
-        ) : null}
         <Stack direction="row" spacing={1.2} useFlexGap flexWrap="wrap">
           {status ? (
             <>

@@ -7,12 +7,15 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use sea_orm::entity::prelude::PgVector;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::core::embeddings::EmbeddingClient;
 use crate::storage::Storage;
 
 /// Memory decay configuration
@@ -92,6 +95,7 @@ pub struct CognitiveMemory {
     storage: Arc<Storage>,
     /// Encrypted storage for sensitive content (episodes, facts)
     encrypted_storage: crate::storage::encrypted::EncryptedStorage,
+    embedding_client: RwLock<Option<Arc<EmbeddingClient>>>,
     episode_count: AtomicUsize,
     /// Configuration for memory decay and scoring
     decay_config: MemoryDecayConfig,
@@ -112,11 +116,13 @@ impl CognitiveMemory {
         _data_dir: &Path,
         storage: Storage,
         encrypted_storage: crate::storage::encrypted::EncryptedStorage,
+        embedding_client: Option<Arc<EmbeddingClient>>,
     ) -> Result<Self> {
         Self::with_config(
             _data_dir,
             storage,
             encrypted_storage,
+            embedding_client,
             MemoryDecayConfig::default(),
         )
         .await
@@ -126,6 +132,7 @@ impl CognitiveMemory {
         _data_dir: &Path,
         storage: Storage,
         encrypted_storage: crate::storage::encrypted::EncryptedStorage,
+        embedding_client: Option<Arc<EmbeddingClient>>,
         decay_config: MemoryDecayConfig,
     ) -> Result<Self> {
         let storage = Arc::new(storage);
@@ -136,9 +143,14 @@ impl CognitiveMemory {
         Ok(Self {
             storage,
             encrypted_storage,
+            embedding_client: RwLock::new(embedding_client),
             episode_count: AtomicUsize::new(episode_count),
             decay_config,
         })
+    }
+
+    pub fn set_embedding_client(&self, embedding_client: Option<Arc<EmbeddingClient>>) {
+        *self.embedding_client.write() = embedding_client;
     }
 
     /// Calculate recency score using exponential decay
@@ -220,6 +232,23 @@ impl CognitiveMemory {
         (query_coverage + phrase_boost).min(1.0)
     }
 
+    async fn embed_text(&self, text: &str) -> Option<PgVector> {
+        let client = self.embedding_client.read().clone()?;
+        let values = client.embed_texts(&[text.to_string()]).await.ok()?;
+        values.into_iter().next()
+    }
+
+    fn dense_similarity(
+        query_embedding: Option<&PgVector>,
+        candidate_embedding: Option<&PgVector>,
+    ) -> Option<f32> {
+        crate::core::document_search::normalized_embedding_similarity(
+            query_embedding?.as_slice(),
+            candidate_embedding?.as_slice(),
+        )
+        .map(|score| score.clamp(0.0, 1.0))
+    }
+
     /// Add an episodic memory (encrypted at rest).
     pub async fn add_episode(
         &self,
@@ -231,13 +260,14 @@ impl CognitiveMemory {
         let id = Uuid::new_v4();
         let context_json = serde_json::to_string(&context)?;
         let bounded_importance = importance.clamp(0.0, 1.0);
+        let embedding = self.embed_text(&content).await;
 
         self.encrypted_storage
             .insert_episode_encrypted(
                 &id.to_string(),
                 &content,
                 &context_json,
-                None,
+                embedding,
                 bounded_importance,
                 project_id,
             )
@@ -256,7 +286,7 @@ impl CognitiveMemory {
         project_id: Option<&str>,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        let embedding: Option<Vec<u8>> = None;
+        let embedding = self.embed_text(&fact).await;
         let sources_json = serde_json::to_string(&sources)?;
 
         self.encrypted_storage
@@ -273,6 +303,49 @@ impl CognitiveMemory {
         Ok(id)
     }
 
+    async fn load_semantic_facts_for_scope(
+        &self,
+        project_id: Option<&str>,
+    ) -> Vec<crate::storage::entities::semantic_fact::Model> {
+        if let Some(project_id) = project_id {
+            let scoped_count = self
+                .encrypted_storage
+                .count_facts(Some(project_id))
+                .await
+                .unwrap_or(0);
+            let mut merged = self
+                .encrypted_storage
+                .get_facts_by_project_decrypted(scoped_count, 0, Some(project_id))
+                .await
+                .unwrap_or_default();
+            let global_count = self
+                .encrypted_storage
+                .count_global_facts()
+                .await
+                .unwrap_or(0);
+            let global = self
+                .encrypted_storage
+                .get_global_facts_decrypted(global_count, 0)
+                .await
+                .unwrap_or_default();
+            let mut seen_ids = merged
+                .iter()
+                .map(|fact| fact.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for fact in global {
+                if seen_ids.insert(fact.id.clone()) {
+                    merged.push(fact);
+                }
+            }
+            merged
+        } else {
+            self.encrypted_storage
+                .get_facts_decrypted()
+                .await
+                .unwrap_or_default()
+        }
+    }
+
     /// Retrieve relevant memories for a query using decay-based scoring
     /// Implements: final_score = α*relevance + β*recency + γ*importance
     pub async fn retrieve_relevant(
@@ -281,6 +354,8 @@ impl CognitiveMemory {
         limit: usize,
         project_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
+        let query_embedding = self.embed_text(query).await;
+
         // Get all episodes for scoring (decrypted content for relevance matching)
         let episodes = if project_id.is_some() {
             self.encrypted_storage
@@ -291,6 +366,8 @@ impl CognitiveMemory {
                 .get_all_episodes_for_scoring_decrypted()
                 .await?
         };
+
+        let facts = self.load_semantic_facts_for_scope(project_id).await;
 
         let mut entries: Vec<MemoryEntry> = episodes
             .into_iter()
@@ -315,7 +392,11 @@ impl CognitiveMemory {
                 });
 
                 // Calculate scores
-                let relevance_score = self.calculate_relevance(query, &e.content);
+                let lexical_relevance = self.calculate_relevance(query, &e.content);
+                let dense_relevance =
+                    Self::dense_similarity(query_embedding.as_ref(), e.embedding.as_ref())
+                        .unwrap_or(0.0);
+                let relevance_score = lexical_relevance.max(dense_relevance);
                 let recency_score = self.calculate_recency_score(timestamp, last_accessed);
                 let importance = e.importance;
 
@@ -336,6 +417,36 @@ impl CognitiveMemory {
                 }
             })
             .collect();
+
+        entries.extend(facts.into_iter().map(|fact| {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&fact.created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let lexical_relevance = self.calculate_relevance(query, &fact.fact);
+            let dense_relevance =
+                Self::dense_similarity(query_embedding.as_ref(), fact.embedding.as_ref())
+                    .unwrap_or(0.0);
+            let relevance_score = lexical_relevance.max(dense_relevance);
+            let recency_score = self.calculate_recency_score(timestamp, None);
+            let importance = fact.confidence.clamp(0.0, 1.0);
+            let final_score =
+                self.calculate_final_score(relevance_score, recency_score, importance);
+
+            MemoryEntry {
+                id: Uuid::parse_str(&fact.id).unwrap_or_else(|_| Uuid::new_v4()),
+                content: fact.fact,
+                memory_type: MemoryType::Semantic {
+                    confidence: fact.confidence,
+                    sources: serde_json::from_str(&fact.sources).unwrap_or_default(),
+                },
+                timestamp,
+                relevance_score,
+                importance,
+                recency_score,
+                final_score,
+                access_count: 0,
+            }
+        }));
 
         // Sort by final score (highest first)
         entries.sort_by(|a, b| {
@@ -363,18 +474,10 @@ impl CognitiveMemory {
     /// Check if a new fact is too similar to any existing fact (deduplication)
     /// Returns true if a duplicate/near-duplicate exists
     async fn is_duplicate_fact(&self, new_fact: &str, project_id: Option<&str>) -> bool {
-        let fact_count = match self.encrypted_storage.count_facts(project_id).await {
-            Ok(count) => count,
-            Err(_) => return false,
-        };
-        let existing = match self
-            .encrypted_storage
-            .get_facts_by_project_decrypted(fact_count, 0, project_id)
-            .await
-        {
-            Ok(facts) => facts,
-            Err(_) => return false,
-        };
+        let existing = self.load_semantic_facts_for_scope(project_id).await;
+        if existing.is_empty() {
+            return false;
+        }
 
         let new_lower = new_fact.to_lowercase();
         let new_words: std::collections::HashSet<&str> = new_lower

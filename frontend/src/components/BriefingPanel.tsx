@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
   Button,
@@ -8,11 +8,11 @@ import {
   Divider,
   Grid2,
   Stack,
-  Typography
+  Typography,
 } from "@mui/material";
 import type { BriefingResponse, RecommendedSkill } from "../types";
 import { api } from "../api/client";
-import { useState, useCallback } from "react";
+import { useCallback, useState } from "react";
 import IconButton from "@mui/material/IconButton";
 import CloseIcon from "@mui/icons-material/Close";
 
@@ -23,7 +23,10 @@ type Props = {
 
 export function BriefingPanel({ briefing, compact = false }: Props) {
   const queryClient = useQueryClient();
-  const [execNotice, setExecNotice] = useState<{ kind: "success" | "error" | "info"; text: string } | null>(null);
+  const [execNotice, setExecNotice] = useState<{
+    kind: "success" | "error" | "info";
+    text: string;
+  } | null>(null);
   const [dismissedSkills, setDismissedSkills] = useState<Set<string>>(new Set());
   const dismissSkill = useCallback((id: string) => {
     setDismissedSkills((prev) => new Set(prev).add(id));
@@ -37,8 +40,10 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
   const visibleOpportunities = briefing?.top_opportunities || [];
   const visibleSkills: RecommendedSkill[] =
     briefing?.recommended_skills ||
-    (((briefing as unknown as { recommended_actions?: RecommendedSkill[] })?.recommended_actions || []) as RecommendedSkill[]);
-  const showSignalRow = actionableRisks.length > 0 || visibleOpportunities.length > 0;
+    (((briefing as unknown as { recommended_actions?: RecommendedSkill[] })
+      ?.recommended_actions || []) as RecommendedSkill[]);
+  const showSignalRow =
+    actionableRisks.length > 0 || visibleOpportunities.length > 0;
 
   function asErrorMessage(err: unknown): string {
     if (!(err instanceof Error)) return "Request failed";
@@ -54,13 +59,22 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
   }
 
   function summarizeExecResult(payload: unknown): string {
-    const obj = (payload && typeof payload === "object") ? (payload as Record<string, unknown>) : {};
-    const result = (obj.result && typeof obj.result === "object") ? (obj.result as Record<string, unknown>) : obj;
+    const obj =
+      payload && typeof payload === "object"
+        ? (payload as Record<string, unknown>)
+        : {};
+    const result =
+      obj.result && typeof obj.result === "object"
+        ? (obj.result as Record<string, unknown>)
+        : obj;
     const kind = String(result.kind || "");
-    if (kind === "daily_brief_now") return "Daily Command Brief generated and pushed to your preferred channel.";
-    if (kind === "create_task") return `Task queued: ${String(result.task_id || "") || "created"}.`;
+    if (kind === "daily_brief_now")
+      return "Daily Command Brief generated and pushed to your preferred channel.";
+    if (kind === "create_task")
+      return `Task queued: ${String(result.task_id || "") || "created"}.`;
     if (kind === "delegate") return "Delegation completed. Check Swarm for details.";
-    if (String(result.status || "").includes("queued_for_approval")) return "Queued for approval. Review it in Tasks.";
+    if (String(result.status || "").includes("queued_for_approval"))
+      return "Queued for approval. Review it in Tasks.";
     return "Executed.";
   }
 
@@ -68,7 +82,6 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
     mutationFn: api.executeRecommendedSkill,
     onSuccess: async (out) => {
       setExecNotice({ kind: "success", text: summarizeExecResult(out) });
-      await queryClient.invalidateQueries({ queryKey: ["nudges"] });
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
       await queryClient.invalidateQueries({ queryKey: ["status"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -76,36 +89,7 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
     },
     onError: (err) => {
       setExecNotice({ kind: "error", text: asErrorMessage(err) });
-    }
-  });
-  const nudgesQ = useQuery({
-    queryKey: ["nudges"],
-    queryFn: api.getNudges
-  });
-  const nudgeFeedback = useMutation({
-    mutationFn: ({
-      id,
-      action,
-      snoozeMinutes
-    }: {
-      id: string;
-      action: "dismiss" | "snooze" | "interested" | "reset";
-      snoozeMinutes?: number;
-    }) =>
-      api.feedbackNudge(id, {
-        action,
-        snooze_minutes: snoozeMinutes
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["nudges"] });
-    }
-  });
-  const planNudges = useMutation({
-    mutationFn: api.planNudges,
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["nudges"] });
-      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
-    }
+    },
   });
 
   if (!briefing) {
@@ -128,42 +112,55 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
           compact
             ? {
                 p: 1.25,
-                overflow: "auto"
+                overflow: "auto",
               }
             : undefined
         }
       >
-        <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.5}>
+        <Stack
+          direction="row"
+          justifyContent="space-between"
+          alignItems="center"
+          mb={1.5}
+        >
           <Typography variant="h6">Daily Command Brief</Typography>
           <Chip size="small" label={briefing.scope.toUpperCase()} />
         </Stack>
         {showSignalRow ? (
           <Grid2 container spacing={2}>
             {actionableRisks.length > 0 ? (
-              <Grid2 size={{ xs: 12, md: visibleOpportunities.length > 0 ? 6 : 12 }}>
+              <Grid2
+                size={{ xs: 12, md: visibleOpportunities.length > 0 ? 6 : 12 }}
+              >
                 <Typography variant="subtitle2" color="warning.main" mb={1}>
                   Top Risks
                 </Typography>
                 <Stack spacing={1}>
                   {actionableRisks.slice(0, compact ? 2 : 3).map((risk, idx) => (
                     <Alert key={idx} severity="warning" variant="outlined">
-                      {risk.title || "Risk"}: {risk.summary || risk.detail || "No summary"}
+                      {risk.title || "Risk"}:{" "}
+                      {risk.summary || risk.detail || "No summary"}
                     </Alert>
                   ))}
                 </Stack>
               </Grid2>
             ) : null}
             {visibleOpportunities.length > 0 ? (
-              <Grid2 size={{ xs: 12, md: actionableRisks.length > 0 ? 6 : 12 }}>
+              <Grid2
+                size={{ xs: 12, md: actionableRisks.length > 0 ? 6 : 12 }}
+              >
                 <Typography variant="subtitle2" color="success.main" mb={1}>
                   Top Opportunities
                 </Typography>
                 <Stack spacing={1}>
-                  {visibleOpportunities.slice(0, compact ? 2 : 3).map((opp, idx) => (
-                    <Alert key={idx} severity="success" variant="outlined">
-                      {opp.title || "Opportunity"}: {opp.summary || opp.detail || "No summary"}
-                    </Alert>
-                  ))}
+                  {visibleOpportunities
+                    .slice(0, compact ? 2 : 3)
+                    .map((opp, idx) => (
+                      <Alert key={idx} severity="success" variant="outlined">
+                        {opp.title || "Opportunity"}:{" "}
+                        {opp.summary || opp.detail || "No summary"}
+                      </Alert>
+                    ))}
                 </Stack>
               </Grid2>
             ) : null}
@@ -179,139 +176,46 @@ export function BriefingPanel({ briefing, compact = false }: Props) {
         ) : null}
         {execNotice ? <Alert severity={execNotice.kind}>{execNotice.text}</Alert> : null}
         <Stack spacing={1}>
-          {visibleSkills.filter((s) => !dismissedSkills.has(s.id)).slice(0, compact ? 2 : 3).map((skill) => (
-            <Stack
-              key={skill.id}
-              direction={{ xs: "column", md: "row" }}
-              spacing={1}
-              justifyContent="space-between"
-              alignItems={{ xs: "flex-start", md: "center" }}
-              className="action-row"
-            >
-              <Stack spacing={0.3} sx={{ flex: 1, minWidth: 0 }}>
-                <Typography variant="body2" fontWeight={700}>
-                  {skill.title}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {skill.summary || skill.description || "No description"}
-                </Typography>
-              </Stack>
-              <Stack direction="row" spacing={0.5} alignItems="center">
-                <Button
-                  variant="contained"
-                  size="small"
-                  disabled={executeSkill.isPending}
-                  onClick={() => executeSkill.mutate(skill)}
-                >
-                  {executeSkill.isPending ? "Executing..." : "Execute"}
-                </Button>
-                <IconButton size="small" onClick={() => dismissSkill(skill.id)} title="Dismiss">
-                  <CloseIcon fontSize="small" />
-                </IconButton>
-              </Stack>
-            </Stack>
-          ))}
-        </Stack>
-        {!compact ? (
-          <>
-            <Divider sx={{ my: 2 }} />
-            <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
-              <Typography variant="subtitle2">What To Improve Now</Typography>
-              <Button
-                variant="outlined"
-                size="small"
-                disabled={planNudges.isPending}
-                onClick={() => planNudges.mutate({ max_items: 3, dry_run: false })}
+          {visibleSkills
+            .filter((s) => !dismissedSkills.has(s.id))
+            .slice(0, compact ? 2 : 3)
+            .map((skill) => (
+              <Stack
+                key={skill.id}
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                justifyContent="space-between"
+                alignItems={{ xs: "flex-start", md: "center" }}
+                className="action-row"
               >
-                {planNudges.isPending ? "Planning..." : "Plan Top 3"}
-              </Button>
-            </Stack>
-            {nudgesQ.error ? (
-              <Alert severity="error">
-                Failed to load predictive nudges.
-              </Alert>
-            ) : null}
-            <Stack spacing={1}>
-              {(nudgesQ.data?.nudges || []).slice(0, 6).map((nudge) => (
-                <Stack
-                  key={nudge.id}
-                  direction={{ xs: "column", md: "row" }}
-                  spacing={1}
-                  justifyContent="space-between"
-                  alignItems={{ xs: "flex-start", md: "center" }}
-                  className="action-row"
-                >
-              <Stack spacing={0.3}>
-                <Stack direction="row" spacing={0.8} alignItems="center" flexWrap="wrap">
+                <Stack spacing={0.3} sx={{ flex: 1, minWidth: 0 }}>
                   <Typography variant="body2" fontWeight={700}>
-                    {nudge.title}
+                    {skill.title}
                   </Typography>
-                  <Chip size="small" label={`P${nudge.priority}`} color={nudge.priority >= 4 ? "warning" : "default"} />
-                  <Chip size="small" label={`${Math.round((nudge.confidence || 0) * 100)}%`} />
+                  <Typography variant="caption" color="text.secondary">
+                    {skill.summary || skill.description || "No description"}
+                  </Typography>
                 </Stack>
-                <Typography variant="caption" color="text.secondary">
-                  {nudge.detail}
-                </Typography>
-                {nudge.memory_clues && nudge.memory_clues.length > 0 ? (
-                  <Stack spacing={0.4} mt={0.5}>
-                    {nudge.memory_clues.map((clue) => (
-                      <Typography key={clue.id} variant="caption" color="text.secondary">
-                        {clue.memory_type} memory
-                        {clue.channel ? ` from ${clue.channel}` : ""}
-                        {" "}
-                        at {new Date(clue.timestamp).toLocaleString()} - {clue.summary}
-                        {" "}
-                        ({Math.round((clue.importance || 0) * 100)}%)
-                      </Typography>
-                    ))}
-                  </Stack>
-                ) : null}
+                <Stack direction="row" spacing={0.5} alignItems="center">
+                  <Button
+                    variant="contained"
+                    size="small"
+                    disabled={executeSkill.isPending}
+                    onClick={() => executeSkill.mutate(skill)}
+                  >
+                    {executeSkill.isPending ? "Executing..." : "Execute"}
+                  </Button>
+                  <IconButton
+                    size="small"
+                    onClick={() => dismissSkill(skill.id)}
+                    title="Dismiss"
+                  >
+                    <CloseIcon fontSize="small" />
+                  </IconButton>
+                </Stack>
               </Stack>
-                  <Stack direction="row" spacing={0.8}>
-                    <Button
-                      size="small"
-                      variant="contained"
-                      disabled={executeSkill.isPending || !(nudge.recommended_skill || (nudge as unknown as { recommended_action?: unknown }).recommended_action)}
-                      onClick={() => {
-                        const skill =
-                          nudge.recommended_skill ||
-                          ((nudge as unknown as { recommended_action?: unknown }).recommended_action as Record<string, unknown> | undefined);
-                        if (!skill) return;
-                        executeSkill.mutate(skill as never);
-                      }}
-                    >
-                      Run
-                    </Button>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      disabled={nudgeFeedback.isPending}
-                      onClick={() =>
-                        nudgeFeedback.mutate({ id: nudge.id, action: "snooze", snoozeMinutes: 24 * 60 })
-                      }
-                    >
-                      Snooze
-                    </Button>
-                    <Button
-                      size="small"
-                      variant="text"
-                      color="warning"
-                      disabled={nudgeFeedback.isPending}
-                      onClick={() => nudgeFeedback.mutate({ id: nudge.id, action: "dismiss" })}
-                    >
-                      Dismiss
-                    </Button>
-                  </Stack>
-                </Stack>
-              ))}
-              {(nudgesQ.data?.nudges || []).length === 0 ? (
-                <Typography variant="body2" color="text.secondary">
-                  No immediate improvements detected.
-                </Typography>
-              ) : null}
-            </Stack>
-          </>
-        ) : null}
+            ))}
+        </Stack>
       </CardContent>
     </Card>
   );

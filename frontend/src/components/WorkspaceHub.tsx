@@ -193,11 +193,11 @@ export function WorkspaceHub({
               Active Workspace
             </Typography>
             <Typography variant="h5" sx={{ fontWeight: 700, letterSpacing: "-0.03em", mb: 0.35 }}>
-              Chat stays primary. Durable work stays one click away.
+              Ask naturally. Deeper work stays one click away.
             </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 860 }}>
               Ask quick questions directly. When the work needs files, tools, approvals, apps, or repeatability, the run
-              remains visible as a task without sending you to a different product surface.
+              stays visible as a task without sending you to a different product surface.
             </Typography>
           </Box>
           <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
@@ -274,7 +274,7 @@ export function WorkspaceHub({
                 )}
                 <Stack direction="row" spacing={1}>
                   <Button size="small" variant="outlined" onClick={() => setDrawerView("tasks")} sx={{ textTransform: "none" }}>
-                    Open Task Queue
+                    Review Tasks
                   </Button>
                   <Button size="small" variant="text" onClick={() => onNavigateToView("overview")} sx={{ textTransform: "none" }}>
                     Mission Control
@@ -360,7 +360,7 @@ export function WorkspaceHub({
                   ))}
                 </Stack>
                 <Typography variant="body2" color="text.secondary">
-                  This keeps the first screen focused while still exposing the full operator surface behind one action.
+                  This keeps the first screen focused while still exposing the full assistant workspace behind one action.
                 </Typography>
                 <Stack direction="row" spacing={1}>
                   <Button size="small" variant="outlined" onClick={() => onNavigateToView("library")} sx={{ textTransform: "none" }}>
@@ -402,7 +402,7 @@ export function WorkspaceHub({
                 {drawerMeta?.label || "Workspace panel"}
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                {drawerMeta?.detail || "Operational surface"}
+                {drawerMeta?.detail || "Assistant workspace"}
               </Typography>
             </Box>
             <IconButton size="small" onClick={() => setDrawerView(null)} aria-label="Close workspace drawer">

@@ -3,16 +3,14 @@ import { test, expect } from "@playwright/test";
 test.describe("Dashboard UI @smoke", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
-    // Wait for the app to load
-    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+    await page.waitForSelector('img[alt="AgentArk"]', { timeout: 15_000 });
   });
 
   test("renders welcome hero with logo and typewriter", async ({ page }) => {
     const logo = page.locator('img[alt="AgentArk"]').nth(1);
     await expect(logo).toBeVisible();
 
-    // Welcome hero card should be present
-    const hero = page.locator("text=AGENTARK").first();
+    const hero = page.locator(".MuiCard-root").first();
     await expect(hero).toBeVisible();
   });
 
@@ -48,6 +46,17 @@ test.describe("Dashboard UI @smoke", () => {
   test("notification bell icon exists", async ({ page }) => {
     const bell = page.locator('button[aria-label="Open notifications"]');
     await expect(bell).toBeVisible();
+  });
+
+  test("singular workspace aliases canonicalize to real pages", async ({ page }) => {
+    await page.goto("/ui/task");
+    await expect(page).toHaveURL(/\/ui\/tasks$/);
+
+    await page.goto("/ui/app");
+    await expect(page).toHaveURL(/\/ui\/apps$/);
+
+    await page.goto("/ui/watcher");
+    await expect(page).toHaveURL(/\/ui\/watchers$/);
   });
 
   test("clicking notification bell opens popover", async ({ page }) => {

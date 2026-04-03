@@ -1,7 +1,5 @@
 //! Extension hook system - pre/post processing hooks for agent events
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -85,14 +83,6 @@ pub struct HookManager {
 }
 
 impl HookManager {
-    pub fn new() -> Self {
-        Self {
-            hooks: Vec::new(),
-            client: reqwest::Client::new(),
-            runs: Arc::new(RwLock::new(VecDeque::new())),
-        }
-    }
-
     pub fn from_hooks(hooks: Vec<Hook>) -> Self {
         Self {
             hooks,

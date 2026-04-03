@@ -38,6 +38,7 @@ type ObservabilityPanelProps = {
   logsLoading: boolean;
   logsError: string | null;
   testing: boolean;
+  embedded?: boolean;
   onValueChange: (next: Partial<ObservabilityValues>) => void;
   onTest: () => void;
 };
@@ -64,6 +65,7 @@ export function ObservabilityPanel({
   logsLoading,
   logsError,
   testing,
+  embedded = false,
   onValueChange,
   onTest
 }: ObservabilityPanelProps) {
@@ -83,17 +85,28 @@ export function ObservabilityPanel({
 
   return (
     <Stack spacing={1.5}>
-      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-        <Typography variant="h6">Observability Export</Typography>
-        <Chip size="small" label={statusChip.label} color={statusChip.color} />
-        {values.authTokenConfigured ? (
-          <Chip size="small" variant="outlined" label="Token saved" color="success" />
-        ) : null}
-      </Stack>
+      {!embedded ? (
+        <>
+          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+            <Typography variant="h6">Observability Export</Typography>
+            <Chip size="small" label={statusChip.label} color={statusChip.color} />
+            {values.authTokenConfigured ? (
+              <Chip size="small" variant="outlined" label="Token saved" color="success" />
+            ) : null}
+          </Stack>
 
-      <Typography variant="caption" color="text.secondary">
-        Optional. When enabled and configured, AgentArk exports completed run traces to Langtrace, LangSmith, or any OTLP-compatible backend.
-      </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Optional. When enabled and configured, AgentArk exports completed run traces to Langtrace, LangSmith, or any OTLP-compatible backend.
+          </Typography>
+        </>
+      ) : (
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Chip size="small" label={statusChip.label} color={statusChip.color} />
+          {values.authTokenConfigured ? (
+            <Chip size="small" variant="outlined" label="Token saved" color="success" />
+          ) : null}
+        </Stack>
+      )}
 
       <FormControlLabel
         control={

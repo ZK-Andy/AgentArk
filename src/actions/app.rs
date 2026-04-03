@@ -13,16 +13,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 
+use crate::core::runtime_image;
 use crate::core::StreamEvent;
 
 /// Port range for dynamic apps (localhost only)
 const PORT_RANGE_START: u16 = 9100;
 const PORT_RANGE_END: u16 = 9200;
-const DEFAULT_APP_RUNTIME_IMAGE: &str = "agentark-sandbox:latest";
+const DEFAULT_FALLBACK_APP_RUNTIME_IMAGE: &str = runtime_image::DEFAULT_RUNTIME_IMAGE;
 const APP_CONTAINER_PREFIX: &str = "agentark-app-";
 const MAX_APP_COMMAND_LEN: usize = 1024;
 const LOCAL_RUNTIME_STDOUT_LOG_FILE: &str = ".agentark_runtime_stdout.log";
@@ -31,6 +32,10 @@ const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
 const DYNAMIC_RUNTIME_READY_TIMEOUT_SECS: u64 = 30;
 const DYNAMIC_RUNTIME_READY_POLL_MS: u64 = 500;
 const DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS: u64 = 5;
+const APP_ACCESS_BOOTSTRAP_TTL_SECS: i64 = 10 * 60;
+const APP_ACCESS_SESSION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+const APP_ACCESS_BOOTSTRAP_MAX_TOKENS: usize = 4096;
+const APP_ACCESS_SESSION_MAX_TOKENS: usize = 8192;
 const MAX_REPO_CLONE_TIMEOUT_SECS: u64 = 240;
 const MAX_REPO_COMMAND_COUNT: usize = 120;
 const MAX_REPO_TEXT_FILE_BYTES: usize = 512 * 1024;
@@ -44,10 +49,93 @@ fn startup_restore_parallelism() -> usize {
         .unwrap_or(4)
 }
 
-fn default_runtime_image() -> String {
-    std::env::var("AGENTARK_APP_IMAGE")
-        .or_else(|_| std::env::var("APP_DEPLOY_IMAGE"))
-        .unwrap_or_else(|_| DEFAULT_APP_RUNTIME_IMAGE.to_string())
+fn configured_runtime_image() -> Option<String> {
+    runtime_image::configured_runtime_image_from_env()
+}
+
+fn control_plane_catalog_mode() -> bool {
+    std::env::var("AGENTARK_STACK_ROLE")
+        .ok()
+        .is_some_and(|value| {
+            let role = value.trim();
+            role.eq_ignore_ascii_case("control-plane") || role.eq_ignore_ascii_case("control")
+        })
+}
+
+fn control_plane_executor_client() -> Option<crate::clients::ExecutorClient> {
+    if !control_plane_catalog_mode() {
+        return None;
+    }
+    let client =
+        crate::clients::ExecutorClient::new(crate::clients::ExecutorClientConfig::from_env())
+            .ok()?;
+    client.bearer_token()?;
+    Some(client)
+}
+
+async fn restart_delegated_runtime(
+    app_id: &str,
+    title: &str,
+    access_guard_enabled: bool,
+    access_key: &str,
+) -> Result<serde_json::Value> {
+    let executor = control_plane_executor_client()
+        .ok_or_else(|| anyhow::anyhow!("Executor service is not configured"))?;
+    let response = executor
+        .request(
+            reqwest::Method::POST,
+            &format!("/internal/v1/apps/{}/restart", app_id),
+        )
+        .json(&crate::clients::AppLifecycleRequest {
+            title: Some(title.to_string()),
+            query: None,
+        })
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        anyhow::bail!(
+            "{}",
+            payload
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("executor restart failed")
+        );
+    }
+
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let raw = payload
+        .get("raw")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mode = raw
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("dynamic");
+    let url = format!("/apps/{}/", app_id);
+    let access_url = url.clone();
+    Ok(serde_json::json!({
+        "status": "deployed",
+        "type": mode,
+        "app_id": app_id,
+        "title": raw.get("title").and_then(|value| value.as_str()).unwrap_or(title),
+        "url": url,
+        "access_url": access_url,
+        "access_key": access_key,
+        "access_guard_enabled": access_guard_enabled,
+        "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
+        "runtime_preference": raw
+            .get("runtime_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("executor"),
+        "enabled": true
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1272,13 +1360,79 @@ async fn deploy_repo_bundle(
         .await
         {
             Ok(result) => {
-                let parsed = serde_json::from_str::<serde_json::Value>(&result)
+                let mut parsed = serde_json::from_str::<serde_json::Value>(&result)
                     .unwrap_or_else(|_| serde_json::json!({ "status": "deployed", "raw": result }));
+                if parsed
+                    .get("runtime_delegated")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    let Some(app_id) = parsed
+                        .get("app_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        failure_count += 1;
+                        deployed_services.push(serde_json::json!({
+                            "title": plan.title,
+                            "relative_dir": plan.relative_dir,
+                            "kind": plan.kind.as_str(),
+                            "status": "failed",
+                            "detection_reason": plan.detection_reason,
+                            "error": format!(
+                                "Delegated repo service '{}' did not return an app_id",
+                                plan.title
+                            ),
+                            "result": parsed,
+                        }));
+                        continue;
+                    };
+                    let delegated_title = parsed
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(plan.title.as_str());
+                    let delegated_access_guard_enabled = parsed
+                        .get("access_guard_enabled")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(access_guard_enabled);
+                    let delegated_access_key = parsed
+                        .get("access_key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    match restart_delegated_runtime(
+                        app_id,
+                        delegated_title,
+                        delegated_access_guard_enabled,
+                        delegated_access_key,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Executor startup failed for repo service '{}'", plan.title)
+                    }) {
+                        Ok(restarted) => {
+                            parsed = restarted;
+                        }
+                        Err(error) => {
+                            failure_count += 1;
+                            deployed_services.push(serde_json::json!({
+                                "title": plan.title,
+                                "relative_dir": plan.relative_dir,
+                                "kind": plan.kind.as_str(),
+                                "status": "failed",
+                                "detection_reason": plan.detection_reason,
+                                "error": error.to_string(),
+                                "result": parsed,
+                            }));
+                            continue;
+                        }
+                    }
+                }
                 let status = parsed
                     .get("status")
                     .and_then(|value| value.as_str())
                     .unwrap_or("deployed");
-                if matches!(status, "deployed" | "needs_secrets") {
+                if matches!(status, "deployed" | "needs_secrets" | "restarted") {
                     success_like_count += 1;
                 }
                 if status == "needs_secrets" {
@@ -1481,7 +1635,7 @@ pub fn parse_config_values(arguments: &serde_json::Value) -> HashMap<String, Str
 
 fn resolve_secret_value(
     custom: &std::collections::HashMap<String, String>,
-    llm_env: &HashMap<String, String>,
+    _llm_env: &HashMap<String, String>,
     env: &str,
 ) -> Option<String> {
     if let Some(v) = custom
@@ -1502,70 +1656,7 @@ fn resolve_secret_value(
         }
     }
 
-    let allow_llm_env_passthrough = std::env::var("AGENTARK_ALLOW_LLM_ENV_TO_APPS")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    let normalized_env = env.trim().to_ascii_uppercase();
-    let auto_llm_passthrough = matches!(
-        normalized_env.as_str(),
-        "OPENAI_API_KEY"
-            | "OPENROUTER_API_KEY"
-            | "ANTHROPIC_API_KEY"
-            | "OPENAI_BASE_URL"
-            | "OLLAMA_BASE_URL"
-            | "LLM_MODEL"
-            | "LLM_PROVIDER"
-            | "API_KEY"
-            | "LLM_API_KEY"
-            | "MODEL_API_KEY"
-            | "OPENAI_KEY"
-            | "OPENAI_TOKEN"
-            | "OPENROUTER_KEY"
-            | "ANTHROPIC_KEY"
-            | "CLAUDE_API_KEY"
-    );
-    if allow_llm_env_passthrough || auto_llm_passthrough {
-        if let Some(v) = llm_env.get(env) {
-            if !v.trim().is_empty() {
-                return Some(v.clone());
-            }
-        }
-        if let Some(v) = llm_env.get(normalized_env.as_str()) {
-            if !v.trim().is_empty() {
-                return Some(v.clone());
-            }
-        }
-        // Common aliases should map to the active model key.
-        match normalized_env.as_str() {
-            "API_KEY" | "LLM_API_KEY" | "MODEL_API_KEY" | "OPENAI_KEY" | "OPENAI_TOKEN" => llm_env
-                .get("OPENAI_API_KEY")
-                .filter(|v| !v.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    llm_env
-                        .get("ANTHROPIC_API_KEY")
-                        .filter(|v| !v.trim().is_empty())
-                        .cloned()
-                })
-                .or_else(|| {
-                    llm_env
-                        .get("OPENROUTER_API_KEY")
-                        .filter(|v| !v.trim().is_empty())
-                        .cloned()
-                }),
-            "OPENROUTER_KEY" => llm_env
-                .get("OPENROUTER_API_KEY")
-                .filter(|v| !v.trim().is_empty())
-                .cloned(),
-            "ANTHROPIC_KEY" | "CLAUDE_API_KEY" => llm_env
-                .get("ANTHROPIC_API_KEY")
-                .filter(|v| !v.trim().is_empty())
-                .cloned(),
-            _ => None,
-        }
-    } else {
-        None
-    }
+    None
 }
 
 pub async fn resolve_required_env_values(
@@ -1630,6 +1721,64 @@ fn command_looks_python_related(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn build_dynamic_container_run_args(
+    app_id: &str,
+    app_dir: &Path,
+    port: u16,
+    image: &str,
+    container_name: String,
+    env_file_path: Option<&Path>,
+    launch_script: String,
+) -> Vec<String> {
+    let mount = normalize_mount_path(app_dir);
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--rm".to_string(),
+        "--memory".to_string(),
+        "512m".to_string(),
+        "--memory-swap".to_string(),
+        "512m".to_string(),
+        "--cpus".to_string(),
+        "0.5".to_string(),
+        "--pids-limit".to_string(),
+        "128".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges=true".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--user".to_string(),
+        "65532:65532".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp:size=64m,noexec,nosuid,nodev".to_string(),
+        "--name".to_string(),
+        container_name,
+        "-p".to_string(),
+        format!("127.0.0.1:{0}:{0}", port),
+        "-v".to_string(),
+        format!("{}:/workspace", mount),
+        "-w".to_string(),
+        "/workspace".to_string(),
+        "--label".to_string(),
+        "agentark.managed=true".to_string(),
+        "--label".to_string(),
+        format!("agentark.app_id={}", app_id),
+        "-e".to_string(),
+        format!("PORT={}", port),
+        "-e".to_string(),
+        "HOST=0.0.0.0".to_string(),
+    ];
+    if let Some(path) = env_file_path {
+        args.push("--env-file".to_string());
+        args.push(path.to_string_lossy().to_string());
+    }
+    args.push(image.to_string());
+    args.push("sh".to_string());
+    args.push("-lc".to_string());
+    args.push(launch_script);
+    args
 }
 
 fn local_runtime_stdout_log_path(app_dir: &Path) -> PathBuf {
@@ -1887,6 +2036,45 @@ async fn run_docker(
         .await
         .map_err(|_| anyhow::anyhow!("docker command timed out"))?
         .map_err(|e| anyhow::anyhow!("failed to execute docker: {}", e))
+}
+
+async fn discover_current_agent_image() -> Option<String> {
+    let container_ref = std::env::var("HOSTNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let args = vec![
+        "inspect".to_string(),
+        "-f".to_string(),
+        "{{.Config.Image}}".to_string(),
+        container_ref,
+    ];
+    let output = run_docker(&args, None, 20).await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if image.is_empty() {
+        None
+    } else {
+        Some(image)
+    }
+}
+
+async fn resolve_runtime_image(runtime_image: Option<&str>) -> String {
+    if let Some(image) = runtime_image
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return image.to_string();
+    }
+    if let Some(configured) = configured_runtime_image() {
+        return configured;
+    }
+    if let Some(current_image) = discover_current_agent_image().await {
+        return current_image;
+    }
+    DEFAULT_FALLBACK_APP_RUNTIME_IMAGE.to_string()
 }
 
 /// Rewrite absolute `/app/` paths in entry commands to be relative to `app_dir`.
@@ -2209,6 +2397,91 @@ fn compact_progress_line(line: &str, max_chars: usize) -> String {
     format!("{}...", trimmed.chars().take(head).collect::<String>())
 }
 
+async fn read_command_output_chunks<R>(
+    reader: Option<R>,
+    stream_tx: Option<Sender<StreamEvent>>,
+    tool_name: &str,
+    stage: &str,
+    stream_name: &str,
+) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut collected = Vec::new();
+    let Some(mut reader) = reader else {
+        return collected;
+    };
+
+    let mut buf = [0u8; 2048];
+    let mut pending = String::new();
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(read) => {
+                collected.extend_from_slice(&buf[..read]);
+                pending.push_str(&String::from_utf8_lossy(&buf[..read]));
+
+                if pending.len() >= 512 || pending.contains('\n') || pending.contains('\r') {
+                    let normalized = pending.replace('\r', "\n");
+                    let chunk = normalized
+                        .lines()
+                        .map(|line| compact_progress_line(line, 220))
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !chunk.is_empty() {
+                        if let Some(tx) = stream_tx.as_ref() {
+                            let _ = tx
+                                .send(StreamEvent::ToolProgress {
+                                    name: tool_name.to_string(),
+                                    content: format!("{} {}: {}", stage, stream_name, chunk),
+                                    payload: Some(serde_json::json!({
+                                        "kind": "console_chunk",
+                                        "stage": stage,
+                                        "stream": stream_name,
+                                        "text": chunk,
+                                        "stream_key": format!("console:{}:{}:{}", tool_name, stage, stream_name),
+                                    })),
+                                })
+                                .await;
+                        }
+                    }
+                    pending.clear();
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let final_chunk = pending.replace('\r', "\n");
+    let final_chunk = final_chunk
+        .lines()
+        .map(|line| compact_progress_line(line, 220))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !final_chunk.is_empty() {
+        if let Some(tx) = stream_tx.as_ref() {
+            let _ = tx
+                .send(StreamEvent::ToolProgress {
+                    name: tool_name.to_string(),
+                    content: format!("{} {}: {}", stage, stream_name, final_chunk),
+                    payload: Some(serde_json::json!({
+                        "kind": "console_chunk",
+                        "stage": stage,
+                        "stream": stream_name,
+                        "text": final_chunk,
+                        "stream_key": format!("console:{}:{}:{}", tool_name, stage, stream_name),
+                    })),
+                })
+                .await;
+        }
+    }
+
+    collected
+}
+
 async fn run_local_command_with_progress(
     command: &str,
     label: &str,
@@ -2248,59 +2521,13 @@ async fn run_local_command_with_progress(
         let stage_stderr = stage.to_string();
 
         let stdout_task = tokio::spawn(async move {
-            let mut collected = Vec::new();
-            if let Some(stdout) = stdout {
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    collected.extend_from_slice(line.as_bytes());
-                    collected.push(b'\n');
-                    if let Some(tx) = stdout_tx.as_ref() {
-                        let _ = tx
-                            .send(StreamEvent::ToolProgress {
-                                name: "app_deploy".to_string(),
-                                content: format!(
-                                    "{}: {}",
-                                    stage_stdout,
-                                    compact_progress_line(&line, 220)
-                                ),
-                                payload: None,
-                            })
-                            .await;
-                    }
-                }
-            }
-            collected
+            read_command_output_chunks(stdout, stdout_tx, "app_deploy", &stage_stdout, "stdout")
+                .await
         });
 
         let stderr_task = tokio::spawn(async move {
-            let mut collected = Vec::new();
-            if let Some(stderr) = stderr {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    collected.extend_from_slice(line.as_bytes());
-                    collected.push(b'\n');
-                    if let Some(tx) = stderr_tx.as_ref() {
-                        let _ = tx
-                            .send(StreamEvent::ToolProgress {
-                                name: "app_deploy".to_string(),
-                                content: format!(
-                                    "{}: {}",
-                                    stage_stderr,
-                                    compact_progress_line(&line, 220)
-                                ),
-                                payload: None,
-                            })
-                            .await;
-                    }
-                }
-            }
-            collected
+            read_command_output_chunks(stderr, stderr_tx, "app_deploy", &stage_stderr, "stderr")
+                .await
         });
 
         let status =
@@ -2455,36 +2682,17 @@ pub async fn launch_dynamic_container(
         .join(" && ")
         .replace("{PORT}", &port.to_string());
 
-    let image = runtime_image
-        .map(|s| s.to_string())
-        .unwrap_or_else(default_runtime_image);
-    let mount = normalize_mount_path(app_dir);
-    let mut args = vec![
-        "run".to_string(),
-        "-d".to_string(),
-        "--rm".to_string(),
-        "--name".to_string(),
-        container_name,
-        "-p".to_string(),
-        format!("127.0.0.1:{0}:{0}", port),
-        "-v".to_string(),
-        format!("{}:/workspace", mount),
-        "-w".to_string(),
-        "/workspace".to_string(),
-        "-e".to_string(),
-        format!("PORT={}", port),
-        "-e".to_string(),
-        "HOST=0.0.0.0".to_string(),
-    ];
+    let image = resolve_runtime_image(runtime_image).await;
     let env_file_path = write_runtime_env_file(app_dir, extra_env).await?;
-    if let Some(path) = env_file_path.as_ref() {
-        args.push("--env-file".to_string());
-        args.push(path.to_string_lossy().to_string());
-    }
-    args.push(image);
-    args.push("sh".to_string());
-    args.push("-lc".to_string());
-    args.push(launch_script);
+    let args = build_dynamic_container_run_args(
+        app_id,
+        app_dir,
+        port,
+        &image,
+        container_name,
+        env_file_path.as_deref(),
+        launch_script,
+    );
 
     let output = run_docker(&args, None, 90).await;
     if let Some(path) = env_file_path {
@@ -2997,9 +3205,64 @@ impl AppRestoreTracker {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AppAccessBootstrapGrant {
+    app_id: String,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AppAccessSession {
+    app_id: String,
+    #[allow(dead_code)]
+    issued_at: i64,
+    expires_at: i64,
+    last_seen_at: i64,
+}
+
 /// Generate a random access key for app authentication
 pub fn generate_access_key() -> String {
     format!("ak_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn app_unix_now_ts() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn app_access_secret_name(app_id: &str) -> String {
+    format!("app_access_key:{}", app_id)
+}
+
+fn relative_app_root_url(app_id: &str) -> String {
+    format!("/apps/{}/", app_id)
+}
+
+fn relative_app_bootstrap_url(app_id: &str, grant: &str) -> String {
+    format!("/apps/{}/?grant={}", app_id, urlencoding::encode(grant))
+}
+
+fn load_persisted_access_key_sync(
+    config_dir: &Path,
+    data_dir: &Path,
+    app_id: &str,
+) -> Result<Option<String>> {
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
+    manager.get_custom_secret(&app_access_secret_name(app_id))
+}
+
+fn persist_access_key_sync(
+    config_dir: &Path,
+    data_dir: &Path,
+    app_id: &str,
+    access_key: Option<&str>,
+) -> Result<()> {
+    let manager =
+        crate::core::config::SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
+    manager.set_custom_secret(
+        &app_access_secret_name(app_id),
+        access_key.map(|value| value.to_string()),
+    )
 }
 
 async fn load_app_meta_json(app_dir: &Path) -> serde_json::Value {
@@ -3021,14 +3284,12 @@ async fn write_app_meta_json(app_dir: &Path, meta: &serde_json::Value) -> Result
     Ok(())
 }
 
-async fn persist_app_access_guard_meta(
-    app_dir: &Path,
-    access_guard_enabled: bool,
-    access_key: &str,
-) -> Result<()> {
+async fn persist_app_access_guard_meta(app_dir: &Path, access_guard_enabled: bool) -> Result<()> {
     let mut meta = load_app_meta_json(app_dir).await;
     meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
-    meta["access_key"] = serde_json::Value::String(access_key.to_string());
+    if let Some(obj) = meta.as_object_mut() {
+        obj.remove("access_key");
+    }
     write_app_meta_json(app_dir, &meta).await?;
     Ok(())
 }
@@ -3038,6 +3299,26 @@ async fn persist_app_enabled_meta(app_dir: &Path, enabled: bool) -> Result<()> {
     meta["enabled"] = serde_json::Value::Bool(enabled);
     write_app_meta_json(app_dir, &meta).await?;
     Ok(())
+}
+
+async fn persist_app_last_accessed_meta(
+    app_dir: &Path,
+    last_accessed: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let mut meta = load_app_meta_json(app_dir).await;
+    meta["last_accessed"] = serde_json::Value::String(last_accessed.to_rfc3339());
+    write_app_meta_json(app_dir, &meta).await?;
+    Ok(())
+}
+
+fn parse_app_meta_datetime(
+    meta: &Option<serde_json::Value>,
+    key: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    meta.as_ref()
+        .and_then(|m| m.get(key).and_then(|value| value.as_str()))
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
 }
 
 /// Snapshot of an app's health for ArkPulse reporting
@@ -3055,6 +3336,10 @@ pub struct AppHealthSnapshot {
 pub struct AppRegistry {
     apps: Arc<RwLock<HashMap<String, Arc<RwLock<RunningApp>>>>>,
     restore_tracker: Arc<RwLock<AppRestoreTracker>>,
+    config_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    access_bootstrap_grants: Arc<RwLock<HashMap<String, AppAccessBootstrapGrant>>>,
+    access_sessions: Arc<RwLock<HashMap<String, AppAccessSession>>>,
 }
 
 pub struct DynamicAppRegistration {
@@ -3066,6 +3351,17 @@ pub struct DynamicAppRegistration {
     pub access_key: String,
     pub access_guard_enabled: bool,
     pub enabled: bool,
+    pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub struct StoredAppRegistration {
+    pub title: String,
+    pub app_dir: PathBuf,
+    pub is_static: bool,
+    pub access_key: String,
+    pub access_guard_enabled: bool,
+    pub enabled: bool,
+    pub last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3082,13 +3378,27 @@ struct RestoreAppCandidate {
     access_guard_enabled: bool,
     access_key: String,
     enabled: bool,
+    last_accessed: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AppRegistry {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
+        Self::with_optional_paths(None, None)
+    }
+
+    pub fn with_paths(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+        Self::with_optional_paths(Some(config_dir), Some(data_dir))
+    }
+
+    fn with_optional_paths(config_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Self {
         Self {
             apps: Arc::new(RwLock::new(HashMap::new())),
             restore_tracker: Arc::new(RwLock::new(AppRestoreTracker::default())),
+            config_dir,
+            data_dir,
+            access_bootstrap_grants: Arc::new(RwLock::new(HashMap::new())),
+            access_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -3118,6 +3428,154 @@ impl AppRegistry {
         });
     }
 
+    fn secure_config_paths(&self) -> Option<(&Path, &Path)> {
+        match (self.config_dir.as_deref(), self.data_dir.as_deref()) {
+            (Some(config_dir), Some(data_dir)) => Some((config_dir, data_dir)),
+            _ => None,
+        }
+    }
+
+    async fn persist_access_key_secret(
+        &self,
+        app_id: &str,
+        access_key: Option<&str>,
+    ) -> Result<()> {
+        let Some((config_dir, data_dir)) = self.secure_config_paths() else {
+            return Ok(());
+        };
+        persist_access_key_sync(config_dir, data_dir, app_id, access_key)
+    }
+
+    fn load_persisted_access_key(&self, app_id: &str) -> Option<String> {
+        let (config_dir, data_dir) = self.secure_config_paths()?;
+        load_persisted_access_key_sync(config_dir, data_dir, app_id)
+            .ok()
+            .flatten()
+    }
+
+    async fn clear_access_tokens_for_app(&self, app_id: &str) {
+        self.access_bootstrap_grants
+            .write()
+            .await
+            .retain(|_, grant| grant.app_id != app_id);
+        self.access_sessions
+            .write()
+            .await
+            .retain(|_, session| session.app_id != app_id);
+    }
+
+    async fn issue_access_bootstrap_grant(&self, app_id: &str) -> Option<String> {
+        if !self.access_guard_enabled(app_id).await || !self.is_enabled(app_id).await {
+            return None;
+        }
+        let now = app_unix_now_ts();
+        let mut grants = self.access_bootstrap_grants.write().await;
+        grants.retain(|_, grant| grant.expires_at > now);
+        while grants.len() >= APP_ACCESS_BOOTSTRAP_MAX_TOKENS {
+            let Some(oldest_token) = grants
+                .iter()
+                .min_by_key(|(_, grant)| grant.expires_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            grants.remove(&oldest_token);
+        }
+        let token = format!("ag_{}", uuid::Uuid::new_v4().simple());
+        grants.insert(
+            token.clone(),
+            AppAccessBootstrapGrant {
+                app_id: app_id.to_string(),
+                expires_at: now + APP_ACCESS_BOOTSTRAP_TTL_SECS,
+            },
+        );
+        Some(token)
+    }
+
+    pub async fn issue_access_url(&self, app_id: &str) -> Option<String> {
+        if self.access_guard_enabled(app_id).await {
+            let grant = self.issue_access_bootstrap_grant(app_id).await?;
+            Some(relative_app_bootstrap_url(app_id, &grant))
+        } else if self.get_dir(app_id).await.is_some() {
+            Some(relative_app_root_url(app_id))
+        } else {
+            None
+        }
+    }
+
+    pub async fn consume_access_bootstrap_grant(&self, app_id: &str, token: &str) -> bool {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let now = app_unix_now_ts();
+        let mut grants = self.access_bootstrap_grants.write().await;
+        grants.retain(|_, grant| grant.expires_at > now);
+        matches!(
+            grants.remove(trimmed),
+            Some(grant) if grant.app_id == app_id && grant.expires_at > now
+        )
+    }
+
+    pub async fn create_access_session(&self, app_id: &str) -> Option<String> {
+        if !self.access_guard_enabled(app_id).await || !self.is_enabled(app_id).await {
+            return None;
+        }
+        let now = app_unix_now_ts();
+        let mut sessions = self.access_sessions.write().await;
+        sessions.retain(|_, session| session.expires_at > now);
+        while sessions.len() >= APP_ACCESS_SESSION_MAX_TOKENS {
+            let Some(oldest_token) = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_seen_at)
+                .map(|(token, _)| token.clone())
+            else {
+                break;
+            };
+            sessions.remove(&oldest_token);
+        }
+        let token = format!("as_{}", uuid::Uuid::new_v4().simple());
+        sessions.insert(
+            token.clone(),
+            AppAccessSession {
+                app_id: app_id.to_string(),
+                issued_at: now,
+                expires_at: now + APP_ACCESS_SESSION_TTL_SECS,
+                last_seen_at: now,
+            },
+        );
+        Some(token)
+    }
+
+    pub async fn validate_access_session(&self, app_id: &str, token: &str) -> bool {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let now = app_unix_now_ts();
+        let mut sessions = self.access_sessions.write().await;
+        sessions.retain(|_, session| session.expires_at > now);
+        if let Some(session) = sessions.get_mut(trimmed) {
+            if session.app_id == app_id && session.expires_at > now {
+                session.last_seen_at = now;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn access_key(&self, app_id: &str) -> Option<String> {
+        let app_handle = {
+            let apps = self.apps.read().await;
+            apps.get(app_id).cloned()
+        }?;
+        let app = app_handle.read().await;
+        if !app.access_guard_enabled {
+            return Some(String::new());
+        }
+        Some(app.access_key.clone())
+    }
+
     /// List all deployed apps
     pub async fn list(&self) -> Vec<serde_json::Value> {
         let app_entries: Vec<(String, Arc<RwLock<RunningApp>>)> = {
@@ -3130,9 +3588,7 @@ impl AppRegistry {
         for (id, app) in app_entries {
             let mut app = app.write().await;
             let mut mark_stopped = false;
-            let running = if !app.enabled {
-                false
-            } else if app.restoring {
+            let running = if !app.enabled || app.restoring {
                 false
             } else if app.is_static {
                 true
@@ -3172,35 +3628,46 @@ impl AppRegistry {
             } else {
                 "stopped"
             };
+            let title = app.title.clone();
+            let port = app.port;
+            let is_static = app.is_static;
+            let is_isolated_runtime = app.container_id.is_some();
+            let created_at = app.created_at.to_rfc3339();
+            let access_key = if app.access_guard_enabled {
+                app.access_key.clone()
+            } else {
+                String::new()
+            };
+            let access_guard_enabled = app.access_guard_enabled;
+            let enabled = app.enabled;
+            let restoring = app.restoring;
+            let restore_error = app.restore_error.clone();
+            drop(app);
+            let access_url = self
+                .issue_access_url(&id)
+                .await
+                .unwrap_or_else(|| relative_app_root_url(&id));
             result.push(serde_json::json!({
                 "id": id,
-                "title": app.title,
-                "port": app.port,
-                "is_static": app.is_static,
+                "title": title,
+                "port": port,
+                "is_static": is_static,
                 "running": running,
                 "runtime_mode": runtime_mode,
-                "is_isolated_runtime": app.container_id.is_some(),
-                "created_at": app.created_at.to_rfc3339(),
-                "url": format!("/apps/{}/", id),
-                "access_url": if app.access_guard_enabled {
-                    format!("/apps/{}/?key={}", id, app.access_key)
-                } else {
-                    format!("/apps/{}/", id)
-                },
-                "access_key": if app.access_guard_enabled {
-                    app.access_key.clone()
-                } else {
-                    String::new()
-                },
-                "access_guard_enabled": app.access_guard_enabled,
-                "enabled": app.enabled,
-                "restoring": app.restoring,
-                "restore_error": app.restore_error.clone(),
-                "restore_status": if app.restoring {
+                "is_isolated_runtime": is_isolated_runtime,
+                "created_at": created_at,
+                "url": relative_app_root_url(&id),
+                "access_url": access_url,
+                "access_key": access_key,
+                "access_guard_enabled": access_guard_enabled,
+                "enabled": enabled,
+                "restoring": restoring,
+                "restore_error": restore_error,
+                "restore_status": if restoring {
                     "restoring"
-                } else if !app.enabled {
+                } else if !enabled {
                     "disabled"
-                } else if app.restore_error.is_some() {
+                } else if restore_error.is_some() {
                     "degraded"
                 } else {
                     "ready"
@@ -3289,40 +3756,14 @@ impl AppRegistry {
         alive
     }
 
-    /// Register a static app
-    pub async fn register_static(
-        &self,
-        id: String,
-        title: String,
-        app_dir: PathBuf,
-        access_key: String,
-        access_guard_enabled: bool,
-        enabled: bool,
-    ) {
-        let app = RunningApp {
-            title,
-            port: None,
-            process: None,
-            container_id: None,
-            app_dir,
-            is_static: true,
-            created_at: chrono::Utc::now(),
-            last_accessed: chrono::Utc::now(),
-            request_count: 0,
-            access_key,
-            access_guard_enabled,
-            enabled,
-            restoring: false,
-            restore_error: None,
-        };
-        self.apps
-            .write()
-            .await
-            .insert(id, Arc::new(RwLock::new(app)));
-    }
-
     /// Register and start a dynamic app
     pub async fn register_dynamic(&self, id: String, registration: DynamicAppRegistration) {
+        let now = chrono::Utc::now();
+        let access_key_to_persist = if registration.access_guard_enabled {
+            Some(registration.access_key.clone())
+        } else {
+            None
+        };
         let app = RunningApp {
             title: registration.title,
             port: Some(registration.port),
@@ -3330,8 +3771,8 @@ impl AppRegistry {
             container_id: registration.container_id,
             app_dir: registration.app_dir,
             is_static: false,
-            created_at: chrono::Utc::now(),
-            last_accessed: chrono::Utc::now(),
+            created_at: now,
+            last_accessed: registration.last_accessed.unwrap_or(now),
             request_count: 0,
             access_key: registration.access_key,
             access_guard_enabled: registration.access_guard_enabled,
@@ -3342,38 +3783,58 @@ impl AppRegistry {
         self.apps
             .write()
             .await
-            .insert(id, Arc::new(RwLock::new(app)));
+            .insert(id.clone(), Arc::new(RwLock::new(app)));
+        if let Err(error) = self
+            .persist_access_key_secret(&id, access_key_to_persist.as_deref())
+            .await
+        {
+            tracing::warn!(
+                "Failed to persist encrypted app access key for '{}': {}",
+                id,
+                error
+            );
+        }
+        self.clear_access_tokens_for_app(&id).await;
     }
 
-    pub async fn register_disabled(
-        &self,
-        id: String,
-        title: String,
-        app_dir: PathBuf,
-        is_static: bool,
-        access_key: String,
-        access_guard_enabled: bool,
-    ) {
+    pub async fn register_stored(&self, id: String, registration: StoredAppRegistration) {
+        let now = chrono::Utc::now();
+        let access_key_to_persist = if registration.access_guard_enabled {
+            Some(registration.access_key.clone())
+        } else {
+            None
+        };
         let app = RunningApp {
-            title,
+            title: registration.title,
             port: None,
             process: None,
             container_id: None,
-            app_dir,
-            is_static,
-            created_at: chrono::Utc::now(),
-            last_accessed: chrono::Utc::now(),
+            app_dir: registration.app_dir,
+            is_static: registration.is_static,
+            created_at: now,
+            last_accessed: registration.last_accessed.unwrap_or(now),
             request_count: 0,
-            access_key,
-            access_guard_enabled,
-            enabled: false,
+            access_key: registration.access_key,
+            access_guard_enabled: registration.access_guard_enabled,
+            enabled: registration.enabled,
             restoring: false,
             restore_error: None,
         };
         self.apps
             .write()
             .await
-            .insert(id, Arc::new(RwLock::new(app)));
+            .insert(id.clone(), Arc::new(RwLock::new(app)));
+        if let Err(error) = self
+            .persist_access_key_secret(&id, access_key_to_persist.as_deref())
+            .await
+        {
+            tracing::warn!(
+                "Failed to persist encrypted app access key for '{}': {}",
+                id,
+                error
+            );
+        }
+        self.clear_access_tokens_for_app(&id).await;
     }
 
     pub async fn reserve_restoring_dynamic(
@@ -3493,6 +3954,9 @@ impl AppRegistry {
         };
 
         persist_app_enabled_meta(&app_dir, enabled).await?;
+        if !enabled {
+            self.clear_access_tokens_for_app(app_id).await;
+        }
         Ok(())
     }
 
@@ -3522,7 +3986,10 @@ impl AppRegistry {
             (app.app_dir.clone(), next_key)
         };
 
-        persist_app_access_guard_meta(&app_dir, enabled, &access_key).await?;
+        persist_app_access_guard_meta(&app_dir, enabled).await?;
+        self.persist_access_key_secret(app_id, enabled.then_some(access_key.as_str()))
+            .await?;
+        self.clear_access_tokens_for_app(app_id).await;
         Ok(access_key)
     }
 
@@ -3533,9 +4000,27 @@ impl AppRegistry {
             apps.get(app_id).cloned()
         };
         if let Some(app) = app_handle {
-            let mut app = app.write().await;
-            app.last_accessed = chrono::Utc::now();
-            app.request_count += 1;
+            let persist_target = {
+                let mut app = app.write().await;
+                let previous = app.last_accessed;
+                let now = chrono::Utc::now();
+                app.last_accessed = now;
+                app.request_count += 1;
+                ((now - previous).num_seconds() >= 30).then(|| (app.app_dir.clone(), now))
+            };
+            if let Some((app_dir, last_accessed)) = persist_target {
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        persist_app_last_accessed_meta(&app_dir, last_accessed).await
+                    {
+                        tracing::warn!(
+                            "Failed to persist app last_accessed for '{}': {}",
+                            app_dir.display(),
+                            error
+                        );
+                    }
+                });
+            }
         }
     }
 
@@ -3718,6 +4203,7 @@ impl AppRegistry {
             access_guard_enabled,
             access_key,
             enabled: _enabled,
+            last_accessed,
         } = candidate;
         let Some(entry_cmd) = entry_command else {
             return false;
@@ -3736,13 +4222,17 @@ impl AppRegistry {
             Err(e) => {
                 let detail = format!("Restore failed while resolving config: {}", e);
                 tracing::warn!("{} (app={})", detail, id);
-                self.register_static(
+                self.register_stored(
                     id.clone(),
-                    title,
-                    app_dir,
-                    access_key.clone(),
-                    access_guard_enabled,
-                    true,
+                    StoredAppRegistration {
+                        title,
+                        app_dir,
+                        is_static: true,
+                        access_key: access_key.clone(),
+                        access_guard_enabled,
+                        enabled: true,
+                        last_accessed,
+                    },
                 )
                 .await;
                 self.mark_restore_error(&id, detail).await;
@@ -3756,13 +4246,17 @@ impl AppRegistry {
                 missing_sensitive, missing_config
             );
             tracing::warn!("{} (app={})", detail, id);
-            self.register_static(
+            self.register_stored(
                 id.clone(),
-                title,
-                app_dir,
-                access_key.clone(),
-                access_guard_enabled,
-                true,
+                StoredAppRegistration {
+                    title,
+                    app_dir,
+                    is_static: true,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed,
+                },
             )
             .await;
             self.mark_restore_error(&id, detail).await;
@@ -3798,6 +4292,7 @@ impl AppRegistry {
                         access_key: access_key.clone(),
                         access_guard_enabled,
                         enabled: true,
+                        last_accessed,
                     },
                 )
                 .await;
@@ -3806,13 +4301,17 @@ impl AppRegistry {
                     let detail = format!("Runtime did not become ready: {}", e);
                     tracing::warn!("{} (app={})", detail, id);
                     let _ = self.stop_runtime(&id).await;
-                    self.register_static(
+                    self.register_stored(
                         id.clone(),
-                        title,
-                        app_dir,
-                        access_key.clone(),
-                        access_guard_enabled,
-                        true,
+                        StoredAppRegistration {
+                            title,
+                            app_dir,
+                            is_static: true,
+                            access_key: access_key.clone(),
+                            access_guard_enabled,
+                            enabled: true,
+                            last_accessed,
+                        },
                     )
                     .await;
                     self.mark_restore_error(&id, detail).await;
@@ -3824,13 +4323,17 @@ impl AppRegistry {
             Err(e) => {
                 let detail = format!("Runtime launch failed: {}", e);
                 tracing::warn!("{} (app={})", detail, id);
-                self.register_static(
+                self.register_stored(
                     id.clone(),
-                    title,
-                    app_dir,
-                    access_key.clone(),
-                    access_guard_enabled,
-                    true,
+                    StoredAppRegistration {
+                        title,
+                        app_dir,
+                        is_static: true,
+                        access_key: access_key.clone(),
+                        access_guard_enabled,
+                        enabled: true,
+                        last_accessed,
+                    },
                 )
                 .await;
                 self.mark_restore_error(&id, detail).await;
@@ -3865,7 +4368,7 @@ impl AppRegistry {
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_string();
-                if id.is_empty() {
+                if id.is_empty() || id.eq_ignore_ascii_case("new") {
                     continue;
                 }
 
@@ -3917,23 +4420,18 @@ impl AppRegistry {
                 let access_guard_enabled = meta
                     .as_ref()
                     .and_then(|m| m.get("access_guard_enabled").and_then(|v| v.as_bool()))
-                    .unwrap_or(true);
-                let access_key = meta
-                    .as_ref()
-                    .and_then(|m| m.get("access_key").and_then(|k| k.as_str()))
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        if access_guard_enabled {
-                            generate_access_key()
-                        } else {
-                            String::new()
-                        }
-                    });
+                    .unwrap_or(false);
+                let access_key = if access_guard_enabled {
+                    self.load_persisted_access_key(&id)
+                        .unwrap_or_else(generate_access_key)
+                } else {
+                    String::new()
+                };
                 let enabled = meta
                     .as_ref()
                     .and_then(|m| m.get("enabled").and_then(|v| v.as_bool()))
                     .unwrap_or(true);
+                let last_accessed = parse_app_meta_datetime(&meta, "last_accessed");
 
                 candidates.push(RestoreAppCandidate {
                     id,
@@ -3948,12 +4446,54 @@ impl AppRegistry {
                     access_guard_enabled,
                     access_key,
                     enabled,
+                    last_accessed,
                 });
             }
         }
 
         self.begin_restore_batch(candidates.len()).await;
         if candidates.is_empty() {
+            return;
+        }
+
+        if control_plane_catalog_mode() {
+            for candidate in candidates {
+                if !candidate.enabled {
+                    self.register_stored(
+                        candidate.id.clone(),
+                        StoredAppRegistration {
+                            title: candidate.title.clone(),
+                            app_dir: candidate.app_dir.clone(),
+                            is_static: candidate.entry_command.is_none(),
+                            access_key: candidate.access_key.clone(),
+                            access_guard_enabled: candidate.access_guard_enabled,
+                            enabled: false,
+                            last_accessed: candidate.last_accessed,
+                        },
+                    )
+                    .await;
+                    tracing::info!("Restored disabled app metadata: {}", candidate.id);
+                } else {
+                    self.register_stored(
+                        candidate.id.clone(),
+                        StoredAppRegistration {
+                            title: candidate.title.clone(),
+                            app_dir: candidate.app_dir.clone(),
+                            is_static: candidate.entry_command.is_none(),
+                            access_key: candidate.access_key.clone(),
+                            access_guard_enabled: candidate.access_guard_enabled,
+                            enabled: true,
+                            last_accessed: candidate.last_accessed,
+                        },
+                    )
+                    .await;
+                    tracing::info!(
+                        "Restored app catalog entry without local runtime: {}",
+                        candidate.id
+                    );
+                }
+                self.finish_restore_item(false).await;
+            }
             return;
         }
 
@@ -3965,13 +4505,17 @@ impl AppRegistry {
 
         for candidate in candidates {
             if !candidate.enabled {
-                self.register_disabled(
+                self.register_stored(
                     candidate.id.clone(),
-                    candidate.title.clone(),
-                    candidate.app_dir.clone(),
-                    candidate.entry_command.is_none(),
-                    candidate.access_key.clone(),
-                    candidate.access_guard_enabled,
+                    StoredAppRegistration {
+                        title: candidate.title.clone(),
+                        app_dir: candidate.app_dir.clone(),
+                        is_static: candidate.entry_command.is_none(),
+                        access_key: candidate.access_key.clone(),
+                        access_guard_enabled: candidate.access_guard_enabled,
+                        enabled: false,
+                        last_accessed: candidate.last_accessed,
+                    },
                 )
                 .await;
                 self.finish_restore_item(false).await;
@@ -3980,13 +4524,17 @@ impl AppRegistry {
             }
 
             if candidate.entry_command.is_none() {
-                self.register_static(
+                self.register_stored(
                     candidate.id.clone(),
-                    candidate.title.clone(),
-                    candidate.app_dir.clone(),
-                    candidate.access_key.clone(),
-                    candidate.access_guard_enabled,
-                    true,
+                    StoredAppRegistration {
+                        title: candidate.title.clone(),
+                        app_dir: candidate.app_dir.clone(),
+                        is_static: true,
+                        access_key: candidate.access_key.clone(),
+                        access_guard_enabled: candidate.access_guard_enabled,
+                        enabled: true,
+                        last_accessed: candidate.last_accessed,
+                    },
                 )
                 .await;
                 self.finish_restore_item(false).await;
@@ -4006,13 +4554,17 @@ impl AppRegistry {
             else {
                 let detail = "No available runtime port for background restore.".to_string();
                 tracing::warn!("{} (app={})", detail, candidate.id);
-                self.register_static(
+                self.register_stored(
                     candidate.id.clone(),
-                    candidate.title.clone(),
-                    candidate.app_dir.clone(),
-                    candidate.access_key.clone(),
-                    candidate.access_guard_enabled,
-                    true,
+                    StoredAppRegistration {
+                        title: candidate.title.clone(),
+                        app_dir: candidate.app_dir.clone(),
+                        is_static: true,
+                        access_key: candidate.access_key.clone(),
+                        access_guard_enabled: candidate.access_guard_enabled,
+                        enabled: true,
+                        last_accessed: candidate.last_accessed,
+                    },
                 )
                 .await;
                 self.mark_restore_error(&candidate.id, detail).await;
@@ -4076,14 +4628,13 @@ async fn wait_for_dynamic_runtime_ready(
             anyhow::bail!("App {} stopped before it opened port {}", app_id, port);
         }
 
-        match tokio::time::timeout(
+        if let Ok(Ok(_stream)) = tokio::time::timeout(
             std::time::Duration::from_millis(1200),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
         {
-            Ok(Ok(_stream)) => return Ok(()),
-            Ok(Err(_)) | Err(_) => {}
+            return Ok(());
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -4158,14 +4709,30 @@ pub async fn app_deploy(
         .get("title")
         .and_then(|v| v.as_str())
         .unwrap_or("App");
-    let entry_command = arguments.get("entry_command").and_then(|v| v.as_str());
-    let install_command = arguments.get("install_command").and_then(|v| v.as_str());
+    let mut entry_command = arguments
+        .get("entry_command")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let mut install_command = arguments
+        .get("install_command")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
     let runtime_image = arguments
         .get("runtime_image")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let runtime_preference =
         runtime_preference_from_opt(arguments.get("runtime_preference").and_then(|v| v.as_str()));
+    let mut runtime_required = arguments
+        .get("runtime_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let runtime_reason = arguments
+        .get("runtime_reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     let expose_public = arguments
         .get("expose_public")
         .and_then(|v| v.as_bool())
@@ -4176,6 +4743,17 @@ pub async fn app_deploy(
         .unwrap_or(false);
     let required_inputs = parse_required_inputs(arguments);
     let config_values = parse_config_values(arguments);
+    if entry_command.is_none() {
+        runtime_required = false;
+    } else if !runtime_required {
+        emit_progress(
+            &stream_tx,
+            "No runtime_required flag was provided; treating this generated bundle as a static/local deploy",
+        )
+        .await;
+        install_command = None;
+        entry_command = None;
+    }
     let is_static = entry_command.is_none();
 
     // Generate app ID and optional access key.
@@ -4261,13 +4839,34 @@ pub async fn app_deploy(
         .map(|r| r.key.clone())
         .collect();
 
+    let requirements_path = app_dir.join("requirements.txt");
+    let has_requirements = requirements_path.exists()
+        && tokio::fs::metadata(&requirements_path)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    let has_package_json = app_dir.join("package.json").exists();
+
+    // Each Python app gets its own venv for isolation. Node apps use local node_modules.
+    let effective_install_cmd = if let Some(cmd) = install_command.as_ref() {
+        Some(cmd.to_string())
+    } else if has_requirements {
+        Some("python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q".to_string())
+    } else if has_package_json {
+        Some("npm install --omit=dev".to_string())
+    } else {
+        None
+    };
+
     // Save metadata for restore on restart
     let meta = serde_json::json!({
         "title": title,
-        "entry_command": entry_command,
-        "install_command": install_command,
+        "entry_command": entry_command.clone(),
+        "install_command": effective_install_cmd.clone(),
         "runtime_image": runtime_image.clone(),
         "runtime_preference": runtime_preference.as_str(),
+        "runtime_required": runtime_required,
+        "runtime_reason": runtime_reason.clone(),
         "expose_public": expose_public,
         "repo_url": arguments.get("repo_url").cloned(),
         "repo_ref": arguments.get("repo_ref").cloned(),
@@ -4281,9 +4880,9 @@ pub async fn app_deploy(
         "required_config": required_config_keys.clone(),
         "config_values": config_values.clone(),
         "access_guard_enabled": access_guard_enabled,
-        "access_key": access_key,
         "enabled": true,
         "created_at": chrono::Utc::now().to_rfc3339(),
+        "last_accessed": chrono::Utc::now().to_rfc3339(),
     });
     tokio::fs::write(
         app_dir.join(".app_meta.json"),
@@ -4295,13 +4894,17 @@ pub async fn app_deploy(
     if is_static {
         // Static app — just register, served directly by HTTP server
         registry
-            .register_static(
+            .register_stored(
                 app_id.clone(),
-                title.to_string(),
-                app_dir,
-                access_key.clone(),
-                access_guard_enabled,
-                true,
+                StoredAppRegistration {
+                    title: title.to_string(),
+                    app_dir,
+                    is_static: true,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed: None,
+                },
             )
             .await;
         let url = format!("/apps/{}/", app_id);
@@ -4321,24 +4924,6 @@ pub async fn app_deploy(
         .to_string());
     }
 
-    // Dynamic app — start server in isolated container runtime
-    let port = arguments
-        .get("port")
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16);
-
-    let port = match port {
-        Some(p) => p,
-        None => registry.find_available_port().await.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No available ports in range {}-{}",
-                PORT_RANGE_START,
-                PORT_RANGE_END
-            )
-        })?,
-    };
-    emit_progress(&stream_tx, &format!("Assigned port {}", port)).await;
-
     if !missing_sensitive.is_empty() || !missing_config.is_empty() {
         let mut missing_all = missing_sensitive.clone();
         for m in &missing_config {
@@ -4352,13 +4937,17 @@ pub async fn app_deploy(
             .cloned()
             .collect();
         registry
-            .register_static(
+            .register_stored(
                 app_id.clone(),
-                title.to_string(),
-                app_dir,
-                access_key.clone(),
-                access_guard_enabled,
-                true,
+                StoredAppRegistration {
+                    title: title.to_string(),
+                    app_dir,
+                    is_static: true,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed: None,
+                },
             )
             .await;
         emit_progress(
@@ -4391,24 +4980,59 @@ pub async fn app_deploy(
         .to_string());
     }
 
-    let requirements_path = app_dir.join("requirements.txt");
-    let has_requirements = requirements_path.exists()
-        && tokio::fs::metadata(&requirements_path)
-            .await
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-    let has_package_json = app_dir.join("package.json").exists();
+    if control_plane_catalog_mode() {
+        registry
+            .register_stored(
+                app_id.clone(),
+                StoredAppRegistration {
+                    title: title.to_string(),
+                    app_dir,
+                    is_static: false,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed: None,
+                },
+            )
+            .await;
+        emit_progress(
+            &stream_tx,
+            "Dynamic app files are ready on the control plane; runtime start will be delegated to the executor",
+        )
+        .await;
+        return Ok(serde_json::json!({
+            "status": "deployed",
+            "type": "dynamic",
+            "runtime": "delegated",
+            "runtime_delegated": true,
+            "app_id": app_id,
+            "url": format!("/apps/{}/", app_id),
+            "title": title,
+            "runtime_preference": runtime_preference.as_str(),
+            "expose_public": expose_public,
+            "access_key": access_key,
+            "access_guard_enabled": access_guard_enabled,
+        })
+        .to_string());
+    }
 
-    // Each Python app gets its own venv for isolation. Node apps use local node_modules.
-    let effective_install_cmd = if let Some(cmd) = install_command {
-        Some(cmd.to_string())
-    } else if has_requirements {
-        Some("python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -q".to_string())
-    } else if has_package_json {
-        Some("npm install --omit=dev".to_string())
-    } else {
-        None
+    // Dynamic app — start server in isolated container runtime
+    let port = arguments
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16);
+
+    let port = match port {
+        Some(p) => p,
+        None => registry.find_available_port().await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No available ports in range {}-{}",
+                PORT_RANGE_START,
+                PORT_RANGE_END
+            )
+        })?,
     };
+    emit_progress(&stream_tx, &format!("Assigned port {}", port)).await;
 
     if effective_install_cmd.is_some() {
         emit_progress(&stream_tx, "Installing dependencies...").await;
@@ -4417,7 +5041,7 @@ pub async fn app_deploy(
     }
 
     // Start the server process in isolated container
-    let entry = entry_command.unwrap();
+    let entry = entry_command.as_deref().unwrap_or_default();
     tracing::info!(
         "Starting app {} on port {} in isolated runtime",
         app_id,
@@ -4461,6 +5085,7 @@ pub async fn app_deploy(
                 access_key: access_key.clone(),
                 access_guard_enabled,
                 enabled: true,
+                last_accessed: None,
             },
         )
         .await;
@@ -4501,6 +5126,56 @@ pub async fn app_deploy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_secret_value_requires_explicit_secret_mapping() {
+        let custom = HashMap::new();
+        let llm_env = HashMap::from([("OPENAI_API_KEY".to_string(), "sk-live-secret".to_string())]);
+
+        assert_eq!(
+            resolve_secret_value(&custom, &llm_env, "OPENAI_API_KEY"),
+            None
+        );
+    }
+
+    #[test]
+    fn dynamic_container_run_args_include_hardening_flags() {
+        let app_dir = Path::new("/tmp/agentark-demo");
+        let args = build_dynamic_container_run_args(
+            "demo",
+            app_dir,
+            9123,
+            DEFAULT_FALLBACK_APP_RUNTIME_IMAGE,
+            "agentark-app-demo".to_string(),
+            Some(Path::new("/tmp/agentark-demo/.agentark.env")),
+            "npm run start".to_string(),
+        );
+
+        for expected in [
+            "--memory",
+            "512m",
+            "--memory-swap",
+            "--cpus",
+            "0.5",
+            "--pids-limit",
+            "128",
+            "--security-opt",
+            "no-new-privileges=true",
+            "--cap-drop",
+            "ALL",
+            "--user",
+            "65532:65532",
+            "--tmpfs",
+            "/tmp:size=64m,noexec,nosuid,nodev",
+        ] {
+            assert!(
+                args.iter().any(|value| value == expected),
+                "missing hardening arg {} in {:?}",
+                expected,
+                args
+            );
+        }
+    }
 
     #[test]
     fn extract_readme_hints_detects_install_and_start_commands() {
@@ -4587,13 +5262,17 @@ $ npm run dev
         let app_dir = tempfile::tempdir().expect("app dir");
         let registry = AppRegistry::new();
         registry
-            .register_disabled(
+            .register_stored(
                 "demo".to_string(),
-                "Demo".to_string(),
-                app_dir.path().to_path_buf(),
-                false,
-                "ak_demo".to_string(),
-                false,
+                StoredAppRegistration {
+                    title: "Demo".to_string(),
+                    app_dir: app_dir.path().to_path_buf(),
+                    is_static: false,
+                    access_key: "ak_demo".to_string(),
+                    access_guard_enabled: false,
+                    enabled: false,
+                    last_accessed: None,
+                },
             )
             .await;
 
@@ -4620,13 +5299,17 @@ $ npm run dev
 
         let registry = AppRegistry::new();
         registry
-            .register_static(
+            .register_stored(
                 "demo".to_string(),
-                "Demo".to_string(),
-                app_dir.path().to_path_buf(),
-                "ak_demo".to_string(),
-                false,
-                true,
+                StoredAppRegistration {
+                    title: "Demo".to_string(),
+                    app_dir: app_dir.path().to_path_buf(),
+                    is_static: true,
+                    access_key: "ak_demo".to_string(),
+                    access_guard_enabled: false,
+                    enabled: true,
+                    last_accessed: None,
+                },
             )
             .await;
 

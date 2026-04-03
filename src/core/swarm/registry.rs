@@ -29,10 +29,12 @@ impl AgentRegistry {
         self.agents.read().await.values().cloned().collect()
     }
 
+    #[cfg(test)]
     pub async fn get(&self, id: &AgentId) -> Option<AgentInfo> {
         self.agents.read().await.get(id).cloned()
     }
 
+    #[cfg(test)]
     pub async fn find_by_capability(&self, capability: &str) -> Vec<AgentInfo> {
         let cap_lower = capability.to_lowercase();
         self.agents
@@ -57,10 +59,12 @@ impl AgentRegistry {
         }
     }
 
+    #[cfg(test)]
     pub async fn count(&self) -> usize {
         self.agents.read().await.len()
     }
 
+    #[cfg(test)]
     pub async fn active_count(&self) -> usize {
         self.agents
             .read()

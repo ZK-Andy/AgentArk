@@ -729,6 +729,7 @@ impl ExecutionSupervisor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_supervised_transport_chat(
     supervisor: &ExecutionSupervisor,
     llm: &LlmClient,

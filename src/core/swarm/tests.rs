@@ -458,7 +458,7 @@ mod swarm_tests {
     async fn test_manager_delegate_no_agents() {
         let m = SwarmManager::new(SwarmConfig::default()).await.unwrap();
         let llm = crate::core::llm::LlmClient::new(&ollama_provider()).unwrap();
-        let result = m.delegate("test", "ctx", &llm, &[], &[]).await;
+        let result = m.delegate("test", "ctx", &llm, &[], &[], None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No specialist"));
     }

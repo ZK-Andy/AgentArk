@@ -4,10 +4,13 @@
 //! Sensitive data (API keys, tokens) is stored encrypted in secrets.enc
 
 use super::llm::LlmProvider;
+use super::runtime_image;
 use super::swarm::SwarmConfig;
 use crate::channels::{
-    discord::DiscordChannelConfig, matrix::MatrixTransportConfig, slack::SlackChannelConfig,
-    teams::TeamsTransportConfig, whatsapp::WhatsAppChannelConfig,
+    discord::DiscordChannelConfig, google_chat::GoogleChatChannelConfig,
+    imessage::IMessageChannelConfig, line::LineChannelConfig, matrix::MatrixTransportConfig,
+    qq::QqChannelConfig, signal::SignalChannelConfig, slack::SlackChannelConfig,
+    teams::TeamsTransportConfig, wechat::WeChatChannelConfig, whatsapp::WhatsAppChannelConfig,
 };
 use crate::crypto::KeyManager;
 use anyhow::{anyhow, Result};
@@ -310,6 +313,42 @@ pub struct PublicAppsConfig {
     pub base_url: Option<String>,
 }
 
+fn default_local_embeddings_model() -> String {
+    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingsProviderKind {
+    #[default]
+    LocalHf,
+    Ollama,
+    OpenaiCompatible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default)]
+    pub provider: EmbeddingsProviderKind,
+    #[serde(default = "default_local_embeddings_model")]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            provider: EmbeddingsProviderKind::LocalHf,
+            model: default_local_embeddings_model(),
+            base_url: None,
+            api_key: String::new(),
+        }
+    }
+}
+
 /// Main agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -337,9 +376,25 @@ pub struct AgentConfig {
     #[serde(default)]
     pub whatsapp: Option<WhatsAppChannelConfig>,
     #[serde(default)]
+    pub google_chat: Option<GoogleChatChannelConfig>,
+    #[serde(default)]
+    pub signal: Option<SignalChannelConfig>,
+    #[serde(default)]
+    pub imessage: Option<IMessageChannelConfig>,
+    #[serde(default)]
+    pub line: Option<LineChannelConfig>,
+    #[serde(default)]
+    pub wechat: Option<WeChatChannelConfig>,
+    #[serde(default)]
+    pub qq: Option<QqChannelConfig>,
+    #[serde(default)]
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Embeddings backend configuration.
+    /// Stored separately from chat models so dense retrieval does not inherit chat provider defaults.
+    #[serde(default)]
+    pub embeddings: Option<EmbeddingsConfig>,
     #[serde(default)]
     pub auto_approve: Vec<String>,
     /// Media generation settings
@@ -363,9 +418,6 @@ pub struct AgentConfig {
     /// Dedicated public-app exposure settings.
     #[serde(default)]
     pub public_apps: PublicAppsConfig,
-    /// Mem0 memory layer configuration
-    #[serde(default)]
-    pub mem0: Mem0Config,
     /// MCP (Model Context Protocol) external servers
     #[serde(default)]
     pub mcp: McpConfig,
@@ -384,7 +436,7 @@ fn default_personality() -> String {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            name: "AgentArk".to_string(),
+            name: crate::branding::default_agent_name(),
             personality: default_personality(),
             llm: LlmProvider::default(),
             llm_fallback: None,
@@ -395,8 +447,15 @@ impl Default for AgentConfig {
             matrix: None,
             teams: None,
             whatsapp: None,
+            google_chat: None,
+            signal: None,
+            imessage: None,
+            line: None,
+            wechat: None,
+            qq: None,
             sandbox: SandboxConfig::default(),
             memory: MemoryConfig::default(),
+            embeddings: Some(EmbeddingsConfig::default()),
             auto_approve: vec![],
             media_gen: MediaGenConfig::default(),
             swarm: SwarmConfig::default(),
@@ -405,11 +464,16 @@ impl Default for AgentConfig {
             observability: ObservabilityConfig::default(),
             deployment_mode: DeploymentMode::default(),
             public_apps: PublicAppsConfig::default(),
-            mem0: Mem0Config::default(),
             mcp: McpConfig::default(),
             tls_cert_path: None,
             tls_key_path: None,
         }
+    }
+}
+
+impl AgentConfig {
+    pub fn embeddings_config(&self) -> EmbeddingsConfig {
+        self.embeddings.clone().unwrap_or_default()
     }
 }
 
@@ -521,30 +585,6 @@ impl Default for BrowserConfig {
     }
 }
 
-/// Mem0 memory layer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mem0Config {
-    /// URL of the Mem0 sidecar bridge
-    #[serde(default = "default_mem0_bridge_url")]
-    pub bridge_url: String,
-    /// Enable Mem0 memory layer (disable to fall back to built-in word-overlap)
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_mem0_bridge_url() -> String {
-    "http://127.0.0.1:8991".to_string()
-}
-
-impl Default for Mem0Config {
-    fn default() -> Self {
-        Self {
-            bridge_url: default_mem0_bridge_url(),
-            enabled: true,
-        }
-    }
-}
-
 /// MCP (Model Context Protocol) configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -574,6 +614,9 @@ pub struct McpServerConfig {
     /// Optional auth configuration (secrets stored separately)
     #[serde(default)]
     pub auth: Option<McpAuthConfig>,
+    /// Optional generic auth profile binding used instead of inline MCP secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
     /// Allowlist of tool names (empty = all tools allowed)
     #[serde(default)]
     pub tool_allowlist: Vec<String>,
@@ -654,11 +697,35 @@ pub const AUTO_APPROVE_BLOCKED: &[&str] = &[
                   // gmail_reply is intentionally NOT blocked — user can enable auto-reply in settings
 ];
 
+/// Filter the user-facing auto-approve list down to effective action-name overrides.
+///
+/// This trims whitespace, drops empty entries, removes blocked actions, and deduplicates
+/// while preserving the first-seen order.
+pub fn sanitize_auto_approve_actions(list: &[String]) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for action in list {
+        let trimmed = action.trim();
+        if trimmed.is_empty() || AUTO_APPROVE_BLOCKED.contains(&trimmed) {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            sanitized.push(trimmed.to_string());
+        }
+    }
+
+    sanitized
+}
+
 /// Encrypted secrets storage
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Secrets {
     /// Primary LLM API key
     pub llm_api_key: Option<String>,
+    /// External embeddings API key
+    #[serde(default)]
+    pub embeddings_api_key: Option<String>,
     /// Fallback LLM API key
     pub llm_fallback_api_key: Option<String>,
     /// Telegram bot token
@@ -676,6 +743,36 @@ pub struct Secrets {
     /// WhatsApp access token
     #[serde(default)]
     pub whatsapp_access_token: Option<String>,
+    /// WhatsApp Cloud API app secret
+    #[serde(default)]
+    pub whatsapp_app_secret: Option<String>,
+    /// WhatsApp bridge access token
+    #[serde(default)]
+    pub whatsapp_bridge_token: Option<String>,
+    /// Google Chat access token
+    #[serde(default)]
+    pub google_chat_access_token: Option<String>,
+    /// Google Chat verification token
+    #[serde(default)]
+    pub google_chat_verify_token: Option<String>,
+    /// Signal bridge access token
+    #[serde(default)]
+    pub signal_bridge_token: Option<String>,
+    /// iMessage bridge access token
+    #[serde(default)]
+    pub imessage_bridge_token: Option<String>,
+    /// LINE access token
+    #[serde(default)]
+    pub line_channel_access_token: Option<String>,
+    /// LINE channel secret
+    #[serde(default)]
+    pub line_channel_secret: Option<String>,
+    /// WeChat bridge access token
+    #[serde(default)]
+    pub wechat_bridge_token: Option<String>,
+    /// QQ bridge access token
+    #[serde(default)]
+    pub qq_bridge_token: Option<String>,
     /// Tunnel provider auth tokens/keys
     #[serde(default)]
     pub tunnel_ngrok_authtoken: Option<String>,
@@ -856,12 +953,12 @@ impl SecureConfigManager {
     {
         self.with_secrets_lock(|manager| {
             let (mut secrets, degraded) = manager.load_secrets_runtime_state_unlocked()?;
-            let out = update(&mut secrets)?;
             if degraded {
-                tracing::warn!(
-                    "Rewriting secrets.enc from degraded state with the currently available secrets. The unreadable prior file remains backed up for recovery."
+                anyhow::bail!(
+                    "Refusing to update encrypted secrets because secrets.enc could not be decrypted with the active key. Restore the correct key material before mutating secrets."
                 );
             }
+            let out = update(&mut secrets)?;
             manager.save_secrets_unlocked(&secrets)?;
             Ok(out)
         })
@@ -869,6 +966,10 @@ impl SecureConfigManager {
 
     fn has_real_secrets(secrets: &Secrets) -> bool {
         secrets.llm_api_key.as_ref().is_some_and(|k| !k.is_empty())
+            || secrets
+                .embeddings_api_key
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
             || secrets
                 .llm_fallback_api_key
                 .as_ref()
@@ -879,6 +980,42 @@ impl SecureConfigManager {
                 .is_some_and(|k| !k.is_empty())
             || secrets
                 .whatsapp_access_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .whatsapp_app_secret
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .google_chat_access_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .google_chat_verify_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .signal_bridge_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .imessage_bridge_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .line_channel_access_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .line_channel_secret
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .wechat_bridge_token
+                .as_ref()
+                .is_some_and(|k| !k.is_empty())
+            || secrets
+                .qq_bridge_token
                 .as_ref()
                 .is_some_and(|k| !k.is_empty())
             || secrets
@@ -897,6 +1034,67 @@ impl SecureConfigManager {
             || !secrets.custom.is_empty()
     }
 
+    fn infer_legacy_embeddings_config(config: &AgentConfig) -> EmbeddingsConfig {
+        let legacy_model = config.memory.embedding_model.trim();
+        if legacy_model.is_empty() {
+            return EmbeddingsConfig::default();
+        }
+
+        let infer_from_provider = |provider: &LlmProvider| match provider {
+            LlmProvider::Ollama { base_url, .. } if !base_url.trim().is_empty() => {
+                Some(EmbeddingsConfig {
+                    provider: EmbeddingsProviderKind::Ollama,
+                    model: legacy_model.to_string(),
+                    base_url: Some(base_url.trim().trim_end_matches('/').to_string()),
+                    api_key: String::new(),
+                })
+            }
+            LlmProvider::OpenAI {
+                api_key, base_url, ..
+            } => Some(EmbeddingsConfig {
+                provider: EmbeddingsProviderKind::OpenaiCompatible,
+                model: legacy_model.to_string(),
+                base_url: base_url
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.trim_end_matches('/').to_string()),
+                api_key: api_key.clone(),
+            }),
+            LlmProvider::Ollama { .. } => None,
+            LlmProvider::Anthropic { .. } => None,
+        };
+
+        config
+            .model_pool
+            .slots
+            .iter()
+            .filter(|slot| slot.enabled)
+            .find(|slot| slot.role == ModelRole::Primary)
+            .and_then(|slot| infer_from_provider(&slot.provider))
+            .or_else(|| {
+                config
+                    .model_pool
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.enabled)
+                    .find_map(|slot| infer_from_provider(&slot.provider))
+            })
+            .or_else(|| infer_from_provider(&config.llm))
+            .unwrap_or_default()
+    }
+
+    fn migrate_embeddings_config(config: &mut AgentConfig) {
+        if config.embeddings.is_none() {
+            config.embeddings = Some(Self::infer_legacy_embeddings_config(config));
+        }
+
+        // Clear the legacy field once migrated so future saves only use the dedicated embeddings config.
+        if !config.memory.embedding_model.is_empty() {
+            config.memory.embedding_model.clear();
+        }
+    }
+
     /// Load configuration with decrypted secrets
     pub fn load(&self) -> Result<AgentConfig> {
         let config_path = self.config_dir.join("config.toml");
@@ -907,7 +1105,10 @@ impl SecureConfigManager {
             let content = std::fs::read_to_string(&config_path)?;
             toml::from_str(&content)?
         } else {
-            let config = AgentConfig::default();
+            let mut config = AgentConfig::default();
+            // Fresh installs should start with conservative episode retention enabled.
+            // Existing installs keep whatever is already persisted in config.toml.
+            config.memory.retention_enabled = true;
             self.save_config_only(&config)?;
             config
         };
@@ -957,12 +1158,29 @@ impl SecureConfigManager {
             }
         }
 
-        // Auto-migrate legacy llm/llm_fallback to model_pool if slots is empty
-        // Only migrate if the user actually configured a non-default provider (not fresh install defaults)
+        // Auto-migrate legacy llm/llm_fallback to model_pool if slots is empty.
+        // Fresh installs now start with an unconfigured placeholder, so only
+        // migrate when the legacy provider contains usable settings.
         if config.model_pool.slots.is_empty() {
-            let is_default =
-                matches!(&config.llm, LlmProvider::Ollama { model, .. } if model == "llama3.2");
-            if !is_default || config.llm_fallback.is_some() {
+            let legacy_llm_configured = match &config.llm {
+                LlmProvider::Ollama { base_url, model } => {
+                    !base_url.trim().is_empty() && !model.trim().is_empty()
+                }
+                LlmProvider::Anthropic { api_key, model } => {
+                    !api_key.trim().is_empty() && !model.trim().is_empty()
+                }
+                LlmProvider::OpenAI {
+                    api_key,
+                    model,
+                    base_url,
+                } => {
+                    !api_key.trim().is_empty()
+                        && !model.trim().is_empty()
+                        && (base_url.is_none()
+                            || base_url.as_ref().is_some_and(|url| !url.trim().is_empty()))
+                }
+            };
+            if legacy_llm_configured || config.llm_fallback.is_some() {
                 let primary_slot = ModelSlot {
                     id: "primary".to_string(),
                     label: "Primary".to_string(),
@@ -999,11 +1217,23 @@ impl SecureConfigManager {
             }
         }
 
+        Self::migrate_embeddings_config(&mut config);
+
         Ok(config)
     }
 
     /// Save configuration with encrypted secrets
     pub fn save(&self, config: &AgentConfig) -> Result<()> {
+        self.with_secrets_lock(|manager| {
+            let (_existing, degraded) = manager.load_secrets_runtime_state_unlocked()?;
+            if degraded {
+                anyhow::bail!(
+                    "Refusing to save configuration while encrypted secrets are unreadable. Restore the correct key material before saving."
+                );
+            }
+            Ok(())
+        })?;
+
         // Create sanitized config (without secrets)
         let sanitized = self.sanitize_config(config);
 
@@ -1016,6 +1246,11 @@ impl SecureConfigManager {
         self.with_secrets_lock(|manager| {
             let secrets_path = manager.secrets_path();
             let (existing, degraded) = manager.load_secrets_runtime_state_unlocked()?;
+            if degraded {
+                anyhow::bail!(
+                    "Refusing to save encrypted secrets because secrets.enc could not be decrypted with the active key."
+                );
+            }
             let secrets = manager.extract_secrets_from_base(existing, config);
             if !Self::has_real_secrets(&secrets) && secrets_path.exists() {
                 tracing::warn!(
@@ -1023,11 +1258,6 @@ impl SecureConfigManager {
                  This likely means decryption failed — preserving existing encrypted secrets."
                 );
             } else {
-                if degraded {
-                    tracing::warn!(
-                        "Rewriting secrets.enc from the current runtime config because the prior file could not be decrypted with the active key. The unreadable copy remains backed up."
-                    );
-                }
                 manager.save_secrets_unlocked(&secrets)?;
             }
             Ok(())
@@ -1124,6 +1354,13 @@ impl SecureConfigManager {
 
     /// Extract secrets from config
     fn extract_secrets_from_base(&self, mut secrets: Secrets, config: &AgentConfig) -> Secrets {
+        // Model-related secrets are derived entirely from the current config/runtime state.
+        // Clear them first so deleted slots and removed legacy keys do not persist forever.
+        secrets.llm_api_key = None;
+        secrets.embeddings_api_key = None;
+        secrets.llm_fallback_api_key = None;
+        secrets.model_pool_keys.clear();
+
         // Extract primary LLM API key
         match &config.llm {
             LlmProvider::Anthropic { api_key, .. }
@@ -1137,6 +1374,17 @@ impl SecureConfigManager {
                 secrets.llm_api_key = Some(api_key.clone());
             }
             _ => {}
+        }
+
+        if let Some(embeddings) = &config.embeddings {
+            if matches!(
+                embeddings.provider,
+                EmbeddingsProviderKind::OpenaiCompatible
+            ) && !embeddings.api_key.is_empty()
+                && embeddings.api_key != "[ENCRYPTED]"
+            {
+                secrets.embeddings_api_key = Some(embeddings.api_key.clone());
+            }
         }
 
         // Extract fallback LLM API key
@@ -1198,6 +1446,48 @@ impl SecureConfigManager {
         if let Some(wa) = &config.whatsapp {
             if !wa.access_token.is_empty() && wa.access_token != "[ENCRYPTED]" {
                 secrets.whatsapp_access_token = Some(wa.access_token.clone());
+            }
+            if !wa.app_secret.is_empty() && wa.app_secret != "[ENCRYPTED]" {
+                secrets.whatsapp_app_secret = Some(wa.app_secret.clone());
+            }
+            if !wa.bridge_token.is_empty() && wa.bridge_token != "[ENCRYPTED]" {
+                secrets.whatsapp_bridge_token = Some(wa.bridge_token.clone());
+            }
+        }
+        if let Some(google_chat) = &config.google_chat {
+            if !google_chat.access_token.is_empty() && google_chat.access_token != "[ENCRYPTED]" {
+                secrets.google_chat_access_token = Some(google_chat.access_token.clone());
+            }
+            if !google_chat.verify_token.is_empty() && google_chat.verify_token != "[ENCRYPTED]" {
+                secrets.google_chat_verify_token = Some(google_chat.verify_token.clone());
+            }
+        }
+        if let Some(signal) = &config.signal {
+            if !signal.bridge_token.is_empty() && signal.bridge_token != "[ENCRYPTED]" {
+                secrets.signal_bridge_token = Some(signal.bridge_token.clone());
+            }
+        }
+        if let Some(imessage) = &config.imessage {
+            if !imessage.bridge_token.is_empty() && imessage.bridge_token != "[ENCRYPTED]" {
+                secrets.imessage_bridge_token = Some(imessage.bridge_token.clone());
+            }
+        }
+        if let Some(line) = &config.line {
+            if !line.channel_access_token.is_empty() && line.channel_access_token != "[ENCRYPTED]" {
+                secrets.line_channel_access_token = Some(line.channel_access_token.clone());
+            }
+            if !line.channel_secret.is_empty() && line.channel_secret != "[ENCRYPTED]" {
+                secrets.line_channel_secret = Some(line.channel_secret.clone());
+            }
+        }
+        if let Some(wechat) = &config.wechat {
+            if !wechat.bridge_token.is_empty() && wechat.bridge_token != "[ENCRYPTED]" {
+                secrets.wechat_bridge_token = Some(wechat.bridge_token.clone());
+            }
+        }
+        if let Some(qq) = &config.qq {
+            if !qq.bridge_token.is_empty() && qq.bridge_token != "[ENCRYPTED]" {
+                secrets.qq_bridge_token = Some(qq.bridge_token.clone());
             }
         }
 
@@ -1265,6 +1555,16 @@ impl SecureConfigManager {
             _ => {}
         }
 
+        if let Some(embeddings) = &mut sanitized.embeddings {
+            if matches!(
+                embeddings.provider,
+                EmbeddingsProviderKind::OpenaiCompatible
+            ) && !embeddings.api_key.is_empty()
+            {
+                embeddings.api_key = "[ENCRYPTED]".to_string();
+            }
+        }
+
         // Replace fallback API key with placeholder
         if let Some(fallback) = &mut sanitized.llm_fallback {
             match fallback {
@@ -1325,6 +1625,48 @@ impl SecureConfigManager {
             if !wa.access_token.is_empty() {
                 wa.access_token = "[ENCRYPTED]".to_string();
             }
+            if !wa.app_secret.is_empty() {
+                wa.app_secret = "[ENCRYPTED]".to_string();
+            }
+            if !wa.bridge_token.is_empty() {
+                wa.bridge_token = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(google_chat) = &mut sanitized.google_chat {
+            if !google_chat.access_token.is_empty() {
+                google_chat.access_token = "[ENCRYPTED]".to_string();
+            }
+            if !google_chat.verify_token.is_empty() {
+                google_chat.verify_token = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(signal) = &mut sanitized.signal {
+            if !signal.bridge_token.is_empty() {
+                signal.bridge_token = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(imessage) = &mut sanitized.imessage {
+            if !imessage.bridge_token.is_empty() {
+                imessage.bridge_token = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(line) = &mut sanitized.line {
+            if !line.channel_access_token.is_empty() {
+                line.channel_access_token = "[ENCRYPTED]".to_string();
+            }
+            if !line.channel_secret.is_empty() {
+                line.channel_secret = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(wechat) = &mut sanitized.wechat {
+            if !wechat.bridge_token.is_empty() {
+                wechat.bridge_token = "[ENCRYPTED]".to_string();
+            }
+        }
+        if let Some(qq) = &mut sanitized.qq {
+            if !qq.bridge_token.is_empty() {
+                qq.bridge_token = "[ENCRYPTED]".to_string();
+            }
         }
 
         if !sanitized.tunnel.ngrok.authtoken.is_empty() {
@@ -1374,6 +1716,19 @@ impl SecureConfigManager {
                         *key = api_key.clone();
                     }
                     _ => {}
+                }
+            }
+        }
+
+        if let Some(api_key) = &secrets.embeddings_api_key {
+            if !api_key.is_empty() && api_key != "[ENCRYPTED]" {
+                if let Some(embeddings) = &mut config.embeddings {
+                    if matches!(
+                        embeddings.provider,
+                        EmbeddingsProviderKind::OpenaiCompatible
+                    ) {
+                        embeddings.api_key = api_key.clone();
+                    }
                 }
             }
         }
@@ -1508,11 +1863,165 @@ impl SecureConfigManager {
                     config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
                         mode: Default::default(),
                         access_token: token.clone(),
+                        app_secret: secrets.whatsapp_app_secret.clone().unwrap_or_default(),
                         phone_number_id: String::new(),
                         verify_token: "agentark_verify".to_string(),
-                        bridge_url: "http://127.0.0.1:8999".to_string(),
+                        bridge_runtime: Some(
+                            crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded,
+                        ),
+                        bridge_url: crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string(),
+                        bridge_token: secrets.whatsapp_bridge_token.clone().unwrap_or_default(),
                         allowed_numbers: vec![],
                         dm_policy: "pairing".to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(secret) = &secrets.whatsapp_app_secret {
+            if !secret.is_empty() && secret != "[ENCRYPTED]" {
+                if let Some(wa) = &mut config.whatsapp {
+                    wa.app_secret = secret.clone();
+                } else {
+                    tracing::info!("Recovered WhatsApp config from encrypted secrets");
+                    config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                        mode: Default::default(),
+                        access_token: secrets.whatsapp_access_token.clone().unwrap_or_default(),
+                        app_secret: secret.clone(),
+                        phone_number_id: String::new(),
+                        verify_token: "agentark_verify".to_string(),
+                        bridge_runtime: Some(
+                            crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded,
+                        ),
+                        bridge_url: crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string(),
+                        bridge_token: secrets.whatsapp_bridge_token.clone().unwrap_or_default(),
+                        allowed_numbers: vec![],
+                        dm_policy: "pairing".to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.whatsapp_bridge_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(wa) = &mut config.whatsapp {
+                    wa.bridge_token = token.clone();
+                } else {
+                    tracing::info!("Recovered WhatsApp bridge token from encrypted secrets");
+                    config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                        mode: Default::default(),
+                        access_token: secrets.whatsapp_access_token.clone().unwrap_or_default(),
+                        app_secret: secrets.whatsapp_app_secret.clone().unwrap_or_default(),
+                        phone_number_id: String::new(),
+                        verify_token: "agentark_verify".to_string(),
+                        bridge_runtime: Some(
+                            crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded,
+                        ),
+                        bridge_url: crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string(),
+                        bridge_token: token.clone(),
+                        allowed_numbers: vec![],
+                        dm_policy: "pairing".to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.google_chat_access_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(google_chat) = &mut config.google_chat {
+                    google_chat.access_token = token.clone();
+                } else {
+                    config.google_chat = Some(GoogleChatChannelConfig {
+                        access_token: token.clone(),
+                        verify_token: secrets.google_chat_verify_token.clone().unwrap_or_default(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.google_chat_verify_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(google_chat) = &mut config.google_chat {
+                    google_chat.verify_token = token.clone();
+                } else {
+                    config.google_chat = Some(GoogleChatChannelConfig {
+                        access_token: secrets.google_chat_access_token.clone().unwrap_or_default(),
+                        verify_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.signal_bridge_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(signal) = &mut config.signal {
+                    signal.bridge_token = token.clone();
+                } else {
+                    config.signal = Some(SignalChannelConfig {
+                        bridge_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.imessage_bridge_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(imessage) = &mut config.imessage {
+                    imessage.bridge_token = token.clone();
+                } else {
+                    config.imessage = Some(IMessageChannelConfig {
+                        bridge_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.line_channel_access_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(line) = &mut config.line {
+                    line.channel_access_token = token.clone();
+                } else {
+                    config.line = Some(LineChannelConfig {
+                        channel_access_token: token.clone(),
+                        channel_secret: secrets.line_channel_secret.clone().unwrap_or_default(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.line_channel_secret {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(line) = &mut config.line {
+                    line.channel_secret = token.clone();
+                } else {
+                    config.line = Some(LineChannelConfig {
+                        channel_access_token: secrets
+                            .line_channel_access_token
+                            .clone()
+                            .unwrap_or_default(),
+                        channel_secret: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.wechat_bridge_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(wechat) = &mut config.wechat {
+                    wechat.bridge_token = token.clone();
+                } else {
+                    config.wechat = Some(WeChatChannelConfig {
+                        bridge_token: token.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(token) = &secrets.qq_bridge_token {
+            if !token.is_empty() && token != "[ENCRYPTED]" {
+                if let Some(qq) = &mut config.qq {
+                    qq.bridge_token = token.clone();
+                } else {
+                    config.qq = Some(QqChannelConfig {
+                        bridge_token: token.clone(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1568,6 +2077,11 @@ impl SecureConfigManager {
             .map(|k| !k.is_empty() && k != "[ENCRYPTED]")
             .unwrap_or(false)
             || secrets
+                .embeddings_api_key
+                .as_ref()
+                .map(|k| !k.is_empty() && k != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
                 .llm_fallback_api_key
                 .as_ref()
                 .map(|k| !k.is_empty() && k != "[ENCRYPTED]")
@@ -1579,6 +2093,56 @@ impl SecureConfigManager {
                 .unwrap_or(false)
             || secrets
                 .whatsapp_access_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .whatsapp_app_secret
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .whatsapp_bridge_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .google_chat_access_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .google_chat_verify_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .signal_bridge_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .imessage_bridge_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .line_channel_access_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .line_channel_secret
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .wechat_bridge_token
+                .as_ref()
+                .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                .unwrap_or(false)
+            || secrets
+                .qq_bridge_token
                 .as_ref()
                 .map(|t| !t.is_empty() && t != "[ENCRYPTED]")
                 .unwrap_or(false)
@@ -1630,12 +2194,6 @@ impl SecureConfigManager {
             }
             Ok((Self::api_key_info_from_secrets(&secrets), rotated))
         })
-    }
-
-    /// Regenerate the HTTP API key and return the new one
-    #[allow(dead_code)]
-    pub fn regenerate_api_key(&self) -> Result<String> {
-        Ok(self.regenerate_api_key_info()?.key)
     }
 
     /// Regenerate the HTTP API key and return key + TTL metadata
@@ -1743,15 +2301,23 @@ impl AgentConfig {
     pub fn validate_auto_approve(list: &[String]) -> (Vec<String>, Vec<String>) {
         let mut allowed = Vec::new();
         let mut rejected = Vec::new();
+        let mut seen_allowed = std::collections::HashSet::new();
+        let mut seen_rejected = std::collections::HashSet::new();
         for action in list {
-            if AUTO_APPROVE_BLOCKED.contains(&action.as_str()) {
+            let trimmed = action.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if AUTO_APPROVE_BLOCKED.contains(&trimmed) {
                 tracing::warn!(
                     "Cannot auto-approve '{}': action is in the blocked list",
-                    action
+                    trimmed
                 );
-                rejected.push(action.clone());
-            } else {
-                allowed.push(action.clone());
+                if seen_rejected.insert(trimmed.to_string()) {
+                    rejected.push(trimmed.to_string());
+                }
+            } else if seen_allowed.insert(trimmed.to_string()) {
+                allowed.push(trimmed.to_string());
             }
         }
         (allowed, rejected)
@@ -1797,7 +2363,7 @@ fn default_sandbox_mode() -> String {
 }
 
 fn default_docker_image() -> String {
-    "agentark-sandbox:latest".to_string()
+    runtime_image::default_runtime_image()
 }
 
 fn default_true() -> bool {
@@ -1821,10 +2387,10 @@ pub struct MemoryConfig {
     pub max_episodes: usize,
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
-    #[serde(default = "default_embedding_model")]
+    #[serde(default)]
     pub embedding_model: String,
-    /// Optional retention pruning (disabled by default).
-    /// Only applies to episodic episodes (not semantic facts).
+    /// Optional retention pruning for episodic episodes (not semantic facts).
+    /// Fresh installs enable it conservatively; legacy configs without this field deserialize as false.
     #[serde(default = "default_false")]
     pub retention_enabled: bool,
     /// Minimum age (days) before an episode is eligible for pruning.
@@ -1864,10 +2430,6 @@ fn default_consolidation_interval() -> u64 {
     24
 }
 
-fn default_embedding_model() -> String {
-    "BAAI/bge-small-en-v1.5".to_string()
-}
-
 fn default_false() -> bool {
     false
 }
@@ -1905,7 +2467,7 @@ impl Default for MemoryConfig {
         Self {
             max_episodes: default_max_episodes(),
             consolidation_interval_hours: default_consolidation_interval(),
-            embedding_model: default_embedding_model(),
+            embedding_model: String::new(),
             retention_enabled: default_false(),
             retention_min_age_days: default_retention_min_age_days(),
             retention_keep_last: default_retention_keep_last(),

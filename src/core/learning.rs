@@ -392,6 +392,7 @@ fn build_pattern_id(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_execution_experience(
     storage: &Storage,
     execution_run: &ExecutionRun,
@@ -400,6 +401,8 @@ pub async fn record_execution_experience(
     conversation_id: Option<&str>,
     project_id: Option<&str>,
     prompt_version: Option<&str>,
+    classifier_prompt_version: Option<&str>,
+    specialist_prompt_version: Option<&str>,
     strategy_version: Option<&str>,
     policy_version: Option<&str>,
     model_slot: Option<&str>,
@@ -424,7 +427,7 @@ pub async fn record_execution_experience(
     } else {
         "failed"
     };
-    let metadata = json!({
+    let mut metadata = json!({
         "execution_status": execution_run.status.as_str(),
         "degradation": execution_run.degradation,
         "attempted_models": execution_run.attempted_models,
@@ -432,6 +435,20 @@ pub async fn record_execution_experience(
         "tool_count": tool_attempts.len(),
         "degraded": matches!(execution_run.status, ExecutionRunStatus::Degraded),
     });
+    if let Some(obj) = metadata.as_object_mut() {
+        if let Some(version) = classifier_prompt_version.filter(|value| !value.trim().is_empty()) {
+            obj.insert(
+                "classifier_prompt_version".to_string(),
+                Value::String(version.to_string()),
+            );
+        }
+        if let Some(version) = specialist_prompt_version.filter(|value| !value.trim().is_empty()) {
+            obj.insert(
+                "specialist_prompt_version".to_string(),
+                Value::String(version.to_string()),
+            );
+        }
+    }
     let experience_id = build_experience_run_id(&execution_run.id);
     let now = chrono::Utc::now().to_rfc3339();
     storage
@@ -638,8 +655,8 @@ pub async fn sync_user_preference_to_experience_item(
         .unwrap_or(1);
     let merged_confidence = existing
         .as_ref()
-        .map(|item| item.confidence.max(confidence as f64).min(0.99))
-        .unwrap_or(confidence as f64);
+        .map(|item| item.confidence.max(confidence).min(0.99))
+        .unwrap_or(confidence);
 
     storage
         .upsert_experience_item(&experience_item::Model {
@@ -1160,7 +1177,7 @@ pub async fn run_candidate_generation(storage: &Storage) -> Result<usize> {
             continue;
         }
         let mut sorted = group;
-        sorted.sort_by(|a, b| memory_merge_sort_key(b).cmp(&memory_merge_sort_key(a)));
+        sorted.sort_by_key(|item| std::cmp::Reverse(memory_merge_sort_key(item)));
         let target = sorted[0].clone();
         for source in sorted.into_iter().skip(1) {
             if source.id == target.id {

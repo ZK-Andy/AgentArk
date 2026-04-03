@@ -38,7 +38,6 @@ tests/e2e/test-results/
 *.db
 /remotion_video*
 nul
-asda
 
 # Python cache
 __pycache__/
@@ -46,6 +45,8 @@ __pycache__/
 
 # Docs
 docs/
+!src/docs/
+!src/docs/**
 
 # Local cargo build config
 .cargo/config.toml

@@ -76,9 +76,16 @@ function suggestionOutcomeStatusColor(status: string): ChipColor {
 
 function workspaceLabel(view: string): string {
   const normalized = view.toLowerCase();
-  if (normalized === "watchers") return "Open Watchers";
-  if (normalized === "tasks") return "Open Tasks";
-  if (normalized === "apps") return "Open Apps";
+  if (normalized === "watcher" || normalized === "watchers" || normalized === "status") return "Open Watchers";
+  if (normalized === "task" || normalized === "tasks") return "Open Tasks";
+  if (normalized === "app" || normalized === "apps") return "Open Apps";
+  if (normalized === "session" || normalized === "sessions") return "Open Sessions";
+  if (normalized === "project" || normalized === "projects") return "Open Projects";
+  if (normalized === "document" || normalized === "documents" || normalized === "file" || normalized === "files") {
+    return "Open Documents";
+  }
+  if (normalized === "skill" || normalized === "skills") return "Open Skills";
+  if (normalized === "goal" || normalized === "goals") return "Open Goals";
   return `Open ${view}`;
 }
 
@@ -108,13 +115,18 @@ export function SuggestionRunDialog({
           <Box>
             <Typography variant="h6">{run?.title || "Suggestion Run"}</Typography>
             <Typography variant="caption" color="text.secondary">
-              Live execution trace for accepted automation
+              Live execution trace for this run
             </Typography>
           </Box>
-          <Stack direction="row" spacing={1}>
-            <Button size="small" onClick={onMinimize}>
-              Minimize
-            </Button>
+            <Stack direction="row" spacing={1}>
+              {run?.traceId ? (
+                <Button size="small" onClick={() => onOpenWorkspacePanel("trace")}>
+                  Open Trace
+                </Button>
+              ) : null}
+              <Button size="small" onClick={onMinimize}>
+                Minimize
+              </Button>
             <IconButton size="small" onClick={onClose}>
               <CloseIcon fontSize="small" />
             </IconButton>
@@ -191,8 +203,12 @@ export function SuggestionRunDialog({
               </Box>
             ) : null}
             <Box className="list-shell">
-              <Typography variant="subtitle2" mb={1}>Execution Log</Typography>
-              <Box className="metadata-box" sx={{ maxHeight: 360 }}>
+              <Box className="micro-surface-head">
+                <Typography className="micro-surface-kicker">Diagnostics</Typography>
+                <Typography className="micro-surface-title">Execution log</Typography>
+                <Typography className="micro-surface-copy">Step-by-step activity captured while this run was in progress.</Typography>
+              </Box>
+              <Box className="metadata-box micro-surface" sx={{ maxHeight: 360 }}>
                 {traceLoading && !traceSteps.length ? (
                   <Typography variant="body2" color="text.secondary">Waiting for trace...</Typography>
                 ) : traceSteps.length === 0 ? (
@@ -216,16 +232,13 @@ export function SuggestionRunDialog({
                             {consoleView.dataText ? (
                               <Box
                                 component="pre"
+                                className="micro-surface-scroll"
                                 sx={{
                                   m: 0,
-                                  p: 1.25,
                                   whiteSpace: "pre-wrap",
                                   wordBreak: "break-word",
                                   overflowX: "auto",
-                                  fontSize: 12,
-                                  borderRadius: 1,
-                                  bgcolor: "rgba(255,255,255,0.03)",
-                                  border: "1px solid rgba(255,255,255,0.08)"
+                                  fontSize: 12
                                 }}
                               >
                                 {consoleView.dataText}
@@ -241,19 +254,20 @@ export function SuggestionRunDialog({
             </Box>
             {str(trace.response, "").trim() ? (
               <Box className="list-shell">
-                <Typography variant="subtitle2" mb={1}>Agent Response</Typography>
+                <Box className="micro-surface-head">
+                  <Typography className="micro-surface-kicker">Diagnostics</Typography>
+                  <Typography className="micro-surface-title">Agent response</Typography>
+                  <Typography className="micro-surface-copy">The final response captured for this run.</Typography>
+                </Box>
                 <Box
                   component="pre"
+                  className="micro-surface-scroll"
                   sx={{
                     m: 0,
-                    p: 1.25,
                     whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
                     overflowX: "auto",
-                    fontSize: 12,
-                    borderRadius: 1,
-                    bgcolor: "rgba(255,255,255,0.03)",
-                    border: "1px solid rgba(255,255,255,0.08)"
+                    fontSize: 12
                   }}
                 >
                   {str(trace.response, "")}

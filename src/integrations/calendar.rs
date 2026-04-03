@@ -423,6 +423,23 @@ impl GoogleCalendarConnector {
         let end = start + Duration::days(7);
         self.list_events(start, end).await
     }
+
+    async fn verify_primary_calendar_access(&self) -> Result<()> {
+        let token = self.get_access_token().await?;
+        let response = self
+            .http
+            .get(format!("{}/calendars/primary?fields=id", Self::API_BASE))
+            .header("Authorization", format!("Bearer {}", token))
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        Err(anyhow!("Calendar API returned {}", response.status()))
+    }
 }
 
 #[async_trait]
@@ -456,9 +473,15 @@ impl Integration for GoogleCalendarConnector {
         if tokens.is_none() {
             return IntegrationStatus::NeedsAuth;
         }
+        drop(tokens);
 
-        // TODO: Could do a quick API check here
-        IntegrationStatus::Connected
+        match self.verify_primary_calendar_access().await {
+            Ok(()) => IntegrationStatus::Connected,
+            Err(error) => {
+                tracing::warn!("Google Calendar connectivity check failed: {}", error);
+                IntegrationStatus::Error(format!("Connection failed: {}", error))
+            }
+        }
     }
 
     async fn execute(&self, action: &str, params: &serde_json::Value) -> Result<serde_json::Value> {

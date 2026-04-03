@@ -15,22 +15,19 @@
 # BUILD VARIANTS
 # =============================================================================
 #
-# SLIM BUILD (~900MB) — core agent, no heavy optional runtimes:
+# SLIM BUILD (~900MB) - core agent, no heavy optional runtimes:
 #
 #   docker build -t agentark:slim .
 #
-# FULL BUILD (~5-6GB) — everything including Playwright, Ollama, mem0, etc:
+# FULL BUILD (~5-6GB) - everything including Playwright and bundled services:
 #
 #   docker build -t agentark:full \
 #     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true \
-#     --build-arg INSTALL_MEM0=true \
-#     --build-arg INSTALL_FFMPEG=true \
 #     --build-arg INSTALL_TAILSCALE=true \
 #     --build-arg INSTALL_CLOUDFLARED=true \
 #     --build-arg INSTALL_LIGHTPANDA=true \
 #     --build-arg INSTALL_GWS=true \
-#     # INSTALL_OLLAMA_CLI removed — 4GB, use external Ollama via API instead
-#     --build-arg INSTALL_REMOTION_TEMPLATE=true \
+#     # INSTALL_OLLAMA_CLI removed - 4GB, use external Ollama via API instead
 #     --build-arg INSTALL_WHATSAPP_BRIDGE=true \
 #     .
 #
@@ -38,21 +35,17 @@
 #
 #   docker build -t agentark:full `
 #     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=true `
-#     --build-arg INSTALL_MEM0=true `
-#     --build-arg INSTALL_FFMPEG=true `
 #     --build-arg INSTALL_TAILSCALE=true `
 #     --build-arg INSTALL_CLOUDFLARED=true `
 #     --build-arg INSTALL_LIGHTPANDA=true `
 #     --build-arg INSTALL_GWS=true `
-#     # INSTALL_OLLAMA_CLI removed — 4GB, use external Ollama via API instead
-#     --build-arg INSTALL_REMOTION_TEMPLATE=true `
+#     # INSTALL_OLLAMA_CLI removed - 4GB, use external Ollama via API instead
 #     --build-arg INSTALL_WHATSAPP_BRIDGE=true `
 #     .
 #
-# CUSTOM BUILD — pick only what you need:
+# CUSTOM BUILD - pick only what you need:
 #
 #   docker build -t agentark:custom \
-#     --build-arg INSTALL_MEM0=true \
 #     --build-arg INSTALL_CLOUDFLARED=true \
 #     .
 #
@@ -69,8 +62,11 @@
 # WARNING: Running without -v volumes will LOSE YOUR APP DATA on container removal!
 # =============================================================================
 
-# ── Stage 1: Rust build (with BuildKit cache for fast rebuilds) ─────────────
-FROM rust:1.92-bookworm AS builder
+# -- Stage 1: Rust build (with BuildKit cache for fast rebuilds) --
+# Use Debian trixie here because fastembed -> ort-sys currently links against
+# ONNX Runtime binaries that require glibc 2.38 (__isoc23_* symbols). Bookworm
+# ships glibc 2.36, which causes the release link to fail in Docker builds.
+FROM rust:1.92-trixie AS builder
 
 WORKDIR /app
 
@@ -80,17 +76,23 @@ COPY Cargo.toml Cargo.lock ./
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Low-memory build: thin LTO + single-job cargo to reduce peak RAM in Docker
-# This is slower, but it rebuilds reliably on 2GB-class Docker Desktop setups.
-ENV CARGO_BUILD_JOBS=1
+# Balanced default: use 2 cargo jobs for better build speed without assuming
+# high-memory Docker Desktop setups. Pass AGENTARK_BUILD_JOBS=0 to let Cargo
+# choose its default parallelism, or a higher number on stronger machines.
 ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+ARG AGENTARK_BUILD_JOBS=2
 ARG AGENTARK_DOCKER_FEATURES="telegram,docker,ssh"
 
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j 1 && rm -rf src
+    if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
+    else \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j "${AGENTARK_BUILD_JOBS}"; \
+    fi && \
+    rm -rf src
 
 # Copy source + assets (logo.svg is included at compile time via include_str!)
 # CACHEBUST invalidates the layer when source changes aren't detected by Docker
@@ -102,87 +104,73 @@ COPY assets ./assets
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     rm -f target/release/agentark target/release/deps/agentark-* && \
-    touch src/main.rs && cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j 1 && \
+    touch src/main.rs && \
+    if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
+    else \
+        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j "${AGENTARK_BUILD_JOBS}"; \
+    fi && \
     cp target/release/agentark /app/agentark-bin
 
-# ── Stage 2: Frontend build ──────────────────────────────────────────────────
+# -- Stage 2: Frontend build --
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
+RUN --mount=type=cache,target=/root/.npm \
+    npm pkg delete devDependencies.@rollup/rollup-win32-x64-msvc 2>/dev/null; npm ci
 ARG FRONTEND_CACHEBUST=0
 COPY frontend/src ./src
 COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts ./
 RUN npm run build
 
-# ── Stage 3: Node.js bridges build ───────────────────────────────────────────
+# -- Stage 3: Node.js bridges build --
 # Build node_modules here (git available), then copy only the result to runtime
 FROM node:20-slim AS node-builder
 
 ARG INSTALL_WHATSAPP_BRIDGE=true
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
-# ARG INSTALL_REMOTION_TEMPLATE — removed, see Remotion notes above
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /bridge/whatsapp-bridge
-COPY services/whatsapp-bridge/package.json services/whatsapp-bridge/package-lock.json ./
-RUN if [ "${INSTALL_WHATSAPP_BRIDGE}" = "true" ]; then \
+WORKDIR /bridges/whatsapp-bridge
+COPY bridges/whatsapp-bridge/package.json bridges/whatsapp-bridge/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    if [ "${INSTALL_WHATSAPP_BRIDGE}" = "true" ]; then \
         printf '[url "https://github.com/"]\n\tinsteadOf = ssh://git@github.com/\n\tinsteadOf = git@github.com:\n' > /root/.gitconfig && \
         npm ci --omit=dev && \
-        npm cache clean --force && \
-        rm -rf /root/.npm /root/.gitconfig /tmp/*; \
+        rm -rf /root/.gitconfig /tmp/*; \
     fi
-COPY services/whatsapp-bridge/index.js ./
+COPY bridges/whatsapp-bridge/index.js ./
 
 # Playwright bridge (skip browser download; runtime image provides browsers)
-WORKDIR /bridge/playwright-bridge
+WORKDIR /bridges/playwright-bridge
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-COPY services/playwright-bridge/package.json services/playwright-bridge/package-lock.json ./
-RUN if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
+COPY bridges/playwright-bridge/package.json bridges/playwright-bridge/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         npm ci --omit=dev && \
-        npm cache clean --force && \
-        rm -rf /root/.npm /tmp/*; \
+        rm -rf /tmp/*; \
     fi
-COPY services/playwright-bridge/index.js ./
+COPY bridges/playwright-bridge/index.js ./
 
-# NOTE: Remotion video template removed from default build.
-# The code lives at services/remotion-template/ but is not shipped.
-# To re-enable: uncomment the lines below, add INSTALL_REMOTION_TEMPLATE=true,
-# and copy the template in the runtime stage.
-# Current limitations:
-#   - No TTS/speech — videos are visual-only (motion graphics, text, data viz)
-#   - No video player in chat UI — only produces a download link
-#   - LLM must generate valid React/Remotion JSX — no validation
-#   - 141MB added to image size
-# WORKDIR /bridge/remotion-template
-# COPY services/remotion-template/package.json services/remotion-template/package-lock.json ./
-# RUN npm ci --omit=dev 2>/dev/null && npm cache clean --force && rm -rf /root/.npm /tmp/*
-# COPY services/remotion-template/src ./src
-# COPY services/remotion-template/tsconfig.json services/remotion-template/remotion.config.ts ./
-
-# ── Stage 4: Minimal runtime ────────────────────────────────────────────────
-FROM node:20-bookworm-slim
+# -- Stage 4: Minimal runtime --
+# Keep runtime on the same Debian family so the final binary sees the same
+# glibc generation it was linked against in the builder stage.
+FROM node:20-trixie-slim
 
 ARG INSTALL_PLAYWRIGHT_RUNTIME=false
-ARG INSTALL_MEM0=false
-ARG INSTALL_FFMPEG=false
 ARG INSTALL_TAILSCALE=false
 ARG INSTALL_CLOUDFLARED=false
 ARG INSTALL_LIGHTPANDA=true
 ARG INSTALL_GWS=false
 ARG INSTALL_DOCKER_CLI=true
 ARG INSTALL_OLLAMA_CLI=false
-# ARG INSTALL_REMOTION_TEMPLATE — removed, see Remotion notes above
 
 RUN set -eux; \
     apt_packages="ca-certificates curl gosu git python3 python3-pip python3-venv"; \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         apt_packages="${apt_packages} chromium"; \
-    fi; \
-    if [ "${INSTALL_FFMPEG}" = "true" ]; then \
-        apt_packages="${apt_packages} ffmpeg"; \
     fi; \
     if [ "${INSTALL_DOCKER_CLI}" = "true" ]; then \
         apt_packages="${apt_packages} docker.io"; \
@@ -197,9 +185,9 @@ RUN set -eux; \
 RUN if [ "${INSTALL_TAILSCALE}" = "true" ]; then \
         set -eux; \
         mkdir -p --mode=0755 /usr/share/keyrings; \
-        curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
+        curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
             -o /usr/share/keyrings/tailscale-archive-keyring.gpg; \
-        curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list \
+        curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
             -o /etc/apt/sources.list.d/tailscale.list; \
         apt-get update; \
         apt-get install -y --no-install-recommends tailscale; \
@@ -210,31 +198,18 @@ WORKDIR /app
 
 # Create non-root user + all directories in one layer
 RUN useradd --create-home --shell /usr/sbin/nologin agent && \
-    mkdir -p /app/data /app/data/skills /app/data/whatsapp-auth /app/data/tailscale /app/config /app/whatsapp-bridge /app/playwright-bridge /app/mem0-bridge && \
+    mkdir -p /app/data /app/data/skills /app/data/whatsapp-auth /app/data/tailscale /app/config /app/bridges/whatsapp-bridge /app/bridges/playwright-bridge && \
     chown -R agent:agent /app
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MEM0_VENV=/opt/mem0-venv \
-    MEM0_PYTHON=/opt/mem0-venv/bin/python \
     PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/chromium
-
-# Install Mem0 Python dependencies in an isolated virtualenv.
-COPY services/mem0-bridge/requirements.txt /app/mem0-bridge/
-RUN if [ "${INSTALL_MEM0}" = "true" ]; then \
-        python3 -m venv "${MEM0_VENV}" && \
-        "${MEM0_VENV}/bin/pip" install --upgrade pip setuptools wheel && \
-        "${MEM0_VENV}/bin/pip" install -r /app/mem0-bridge/requirements.txt; \
-    fi
-
-# Copy Mem0 bridge app
-COPY --chown=agent:agent services/mem0-bridge/app.py /app/mem0-bridge/
 
 
 # Download cloudflared for built-in tunnel support (zero-friction remote access)
-# Pinned version for reproducible builds — update deliberately after testing.
+# Pinned version for reproducible builds - update deliberately after testing.
 ARG CLOUDFLARED_VERSION=2026.2.0
 RUN if [ "${INSTALL_CLOUDFLARED}" = "true" ]; then \
         curl -fsSL --retry 3 \
@@ -256,12 +231,12 @@ RUN if [ "${INSTALL_LIGHTPANDA}" = "true" ]; then \
 
 # Install Google Workspace CLI so AgentArk can use gws as a Workspace execution backend.
 ARG GOOGLE_WORKSPACE_CLI_VERSION=latest
-RUN if [ "${INSTALL_GWS}" = "true" ]; then \
+RUN --mount=type=cache,target=/root/.npm \
+    if [ "${INSTALL_GWS}" = "true" ]; then \
         npm install -g "@googleworkspace/cli@${GOOGLE_WORKSPACE_CLI_VERSION}" && \
         mkdir -p /app/gws-skills && \
         cd /app/gws-skills && \
-        (gws generate-skills >/dev/null 2>&1 || true) && \
-        npm cache clean --force; \
+        (gws generate-skills >/dev/null 2>&1 || true); \
     fi
 
 # Install the Ollama CLI so AgentArk can expose `ollama launch` application registry actions.
@@ -281,12 +256,11 @@ RUN if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
 
 RUN rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built bridges with node_modules (owned by agent)
-COPY --from=node-builder --chown=agent:agent /bridge/whatsapp-bridge /app/whatsapp-bridge
-COPY --from=node-builder --chown=agent:agent /bridge/playwright-bridge /app/playwright-bridge
+# Copy pre-built bridges with node_modules (owned by agent).
+# The WhatsApp bridge is bundled in the full image and started on demand by AgentArk.
+COPY --from=node-builder --chown=agent:agent /bridges/whatsapp-bridge /app/bridges/whatsapp-bridge
+COPY --from=node-builder --chown=agent:agent /bridges/playwright-bridge /app/bridges/playwright-bridge
 
-# Remotion template disabled — see note in Stage 3 above
-# COPY --from=node-builder --chown=agent:agent /bridge/remotion-template /app/services/remotion-template
 
 # Copy AgentArk binary from builder
 COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
@@ -295,6 +269,7 @@ COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
 COPY --chown=agent:agent config /app/config
 COPY --chown=agent:agent skills /app/skills
 COPY --chown=agent:agent assets /app/assets
+RUN test -d /app/skills && find /app/skills -mindepth 2 -maxdepth 2 -name SKILL.md | grep -q .
 # Copy frontend assets (built in Docker, not from host)
 COPY --from=frontend-builder --chown=agent:agent /app/frontend/dist /app/frontend/dist
 # frontend/legacy is optional (static fallback assets)
@@ -304,7 +279,7 @@ RUN mkdir -p /app/frontend/legacy && chown agent:agent /app/frontend/legacy
 COPY --chown=agent:agent docker-entrypoint.sh /app/
 RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoint.sh
 
-# Start as root — entrypoint will fix docker socket perms then drop to agent
+# Start as root - entrypoint will fix docker socket perms then drop to agent
 
 # Environment
 ENV AGENTARK_CONFIG=/app/config

@@ -7,8 +7,6 @@ use tokio::sync::{Mutex, RwLock};
 
 const APPLICATION_LOG_LIMIT: usize = 200;
 const APPLICATION_LOG_TAIL: usize = 40;
-const DEFAULT_OLLAMA_BASE_URL: &str = "http://agentark-ollama:11434";
-
 #[derive(Clone, Default)]
 pub(super) struct ApplicationLauncherRegistry {
     runtimes: Arc<RwLock<HashMap<String, Arc<ApplicationLauncherRuntime>>>>,
@@ -133,7 +131,7 @@ const APPLICATION_LAUNCHERS: &[ApplicationLauncherDefinition] = &[
         launch_slug: "claude",
         label: "Claude Code",
         tagline: "Terminal-first coding assistant via Ollama Launch.",
-        description: "Best for interactive coding sessions in a terminal. AgentArk can prepare and launch it against your configured Ollama runtime.",
+        description: "Best for interactive coding sessions in a terminal. {PRODUCT_NAME} can prepare and launch it against your configured Ollama runtime.",
         docs_url: "https://ollama.com/blog/launch",
         supports_config: true,
         terminal_first: true,
@@ -151,12 +149,12 @@ const APPLICATION_LAUNCHERS: &[ApplicationLauncherDefinition] = &[
         launch_slug: "codex",
         label: "Codex",
         tagline: "OpenAI Codex CLI through Ollama Launch.",
-        description: "Good for terminal-centric code edits and reviews. AgentArk can run it on the server or generate the exact command for your own terminal.",
+        description: "Good for terminal-centric code edits and reviews. {PRODUCT_NAME} can run it on the server or generate the exact command for your own terminal.",
         docs_url: "https://ollama.com/blog/launch",
         supports_config: true,
         terminal_first: true,
         model_hint: "Optional model override, e.g. gpt-oss:120b or minimax-m2.5:cloud",
-        aliases: &["codex-cli"],
+        aliases: &[],
         recommended_models: &["gpt-oss:120b", "minimax-m2.5:cloud"],
     },
     ApplicationLauncherDefinition {
@@ -164,26 +162,13 @@ const APPLICATION_LAUNCHERS: &[ApplicationLauncherDefinition] = &[
         launch_slug: "opencode",
         label: "OpenCode",
         tagline: "Open-source coding assistant with wide model support.",
-        description: "A terminal agent that works especially well with larger-context models. AgentArk can launch it with the same Ollama runtime you already configured.",
+        description: "A terminal agent that works especially well with larger-context models. {PRODUCT_NAME} can launch it with the same Ollama runtime you already configured.",
         docs_url: "https://ollama.com/blog/launch",
         supports_config: true,
         terminal_first: true,
         model_hint: "Use a model with 64K context or more when possible.",
         aliases: &[],
         recommended_models: &["qwen3.5:cloud", "kimi-k2.5:cloud", "glm-5:cloud"],
-    },
-    ApplicationLauncherDefinition {
-        id: "openclaw",
-        launch_slug: "openclaw",
-        label: "OpenClaw",
-        tagline: "Open-source agentic coding assistant with local-first workflows.",
-        description: "Launches the OpenClaw terminal experience through Ollama. Best used with models that support at least 64K context.",
-        docs_url: "https://docs.ollama.com/integrations/openclaw",
-        supports_config: false,
-        terminal_first: true,
-        model_hint: "Use a model with 64K context or more when possible.",
-        aliases: &["clawdbot"],
-        recommended_models: &["qwen3.5:cloud", "kimi-k2.5:cloud", "minimax-m2.5:cloud"],
     },
 ];
 
@@ -217,8 +202,15 @@ impl ApplicationLauncherRegistry {
             let mut status = runtime.status.write().await;
             status.state = "stopped".to_string();
             status.ended_at = Some(ended_at);
-            status.message = Some("Stopped by AgentArk.".to_string());
-            push_application_log(&mut status.logs, "[agentark] Stopped by AgentArk.");
+            status.message = Some(format!("Stopped by {}.", crate::branding::PRODUCT_NAME));
+            push_application_log(
+                &mut status.logs,
+                format!(
+                    "[{}] Stopped by {}.",
+                    crate::branding::PRODUCT_SLUG,
+                    crate::branding::PRODUCT_NAME
+                ),
+            );
         }
         *child_guard = None;
         Ok(())
@@ -257,7 +249,9 @@ pub(super) async fn list_application_launchers(
             id: launcher.id.to_string(),
             label: launcher.label.to_string(),
             tagline: launcher.tagline.to_string(),
-            description: launcher.description.to_string(),
+            description: launcher
+                .description
+                .replace("{PRODUCT_NAME}", crate::branding::PRODUCT_NAME),
             docs_url: launcher.docs_url.to_string(),
             runtime_launch_command,
             runtime_config_command,
@@ -315,7 +309,10 @@ pub(super) async fn launch_application(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Ollama CLI is not installed in this AgentArk runtime.",
+                "error": format!(
+                    "Ollama CLI is not installed in this {} runtime.",
+                    crate::branding::PRODUCT_NAME
+                ),
                 "detail": runtime_summary.detail
             })),
         )
@@ -325,7 +322,10 @@ pub(super) async fn launch_application(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Ollama is not reachable from this AgentArk runtime.",
+                "error": format!(
+                    "Ollama is not reachable from this {} runtime.",
+                    crate::branding::PRODUCT_NAME
+                ),
                 "detail": runtime_summary.detail
             })),
         )
@@ -341,7 +341,11 @@ pub(super) async fn launch_application(
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": format!("{} is already running in this AgentArk runtime.", definition.label)
+                    "error": format!(
+                        "{} is already running in this {} runtime.",
+                        definition.label,
+                        crate::branding::PRODUCT_NAME
+                    )
                 })),
             )
                 .into_response();
@@ -412,8 +416,10 @@ pub(super) async fn launch_application(
                     ended_at: None,
                     exit_code: None,
                     message: Some(
-                        "Launched from AgentArk. These tools are terminal-first, so copy the command to your own terminal if you need the full interactive UI."
-                            .to_string(),
+                        format!(
+                            "Launched from {}. These tools are terminal-first, so copy the command to your own terminal if you need the full interactive UI.",
+                            crate::branding::PRODUCT_NAME
+                        ),
                     ),
                     logs: VecDeque::new(),
                 };
@@ -619,14 +625,16 @@ async fn gather_application_runtime_summary(state: &AppState) -> ApplicationRunt
     };
     let docker_runtime = std::path::Path::new("/.dockerenv").exists();
     let detail = if !cli_available {
-        "Install the Ollama CLI in this AgentArk runtime before using application launchers."
-            .to_string()
+        format!(
+            "Install the Ollama CLI in this {} runtime before using application launchers.",
+            crate::branding::PRODUCT_NAME
+        )
     } else if let Some(url) = base_url.as_deref() {
         if reachable {
             format!("Ollama is reachable at {}.", url)
         } else if docker_runtime && is_local_ollama_url(url) {
             format!(
-                "Ollama CLI is installed, but {} points at container localhost. In Docker, use an Ollama URL reachable from the container such as http://host.docker.internal:11434 or the optional agentark-ollama service.",
+                "Ollama CLI is installed, but {} points at container localhost. In Docker, use an Ollama URL reachable from the container such as http://host.docker.internal:11434.",
                 url
             )
         } else {
@@ -636,7 +644,8 @@ async fn gather_application_runtime_summary(state: &AppState) -> ApplicationRunt
             )
         }
     } else {
-        "No Ollama base URL is configured yet. Set an Ollama model in Settings first.".to_string()
+        "No Ollama base URL is configured yet. Add an Ollama model in Settings or set OLLAMA_HOST."
+            .to_string()
     };
 
     ApplicationRuntimeSummary {
@@ -674,10 +683,7 @@ fn derive_ollama_base_url(config: &crate::core::config::AgentConfig) -> (Option<
             return (Some(normalize_base_url(trimmed)), "environment".to_string());
         }
     }
-    (
-        Some(DEFAULT_OLLAMA_BASE_URL.to_string()),
-        "compose default".to_string(),
-    )
+    (None, String::new())
 }
 
 fn normalize_base_url(value: &str) -> String {

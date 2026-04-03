@@ -4,6 +4,83 @@ const ROUTING_COMPLEXITY_POLICY_KEY: &str = "routing_complexity_policy_v1";
 const ROUTING_COMPLEXITY_POLICY_DEFAULT_VERSION: &str = "routing-policy-default-v2";
 const ROUTER_CALL_TIMEOUT_MS: u64 = 3500;
 
+fn message_contains_any(lower: &str, tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| lower.contains(token))
+}
+
+fn extract_first_json_object(raw: &str) -> Option<String> {
+    let mut start_idx: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in raw.char_indices() {
+        if start_idx.is_none() {
+            if ch == '{' {
+                start_idx = Some(idx);
+                depth = 1;
+                in_string = false;
+                escape = false;
+            }
+            continue;
+        }
+
+        if escape {
+            escape = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => {
+                escape = true;
+            }
+            '"' => {
+                in_string = !in_string;
+            }
+            '{' if !in_string => {
+                depth += 1;
+            }
+            '}' if !in_string => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(start) = start_idx {
+                        return raw.get(start..=idx).map(|s| s.to_string());
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_routing_decision_from_text(
+    raw: &str,
+) -> Option<crate::core::task_router::RoutingDecision> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(decision) = serde_json::from_str::<crate::core::task_router::RoutingDecision>(trimmed)
+    {
+        return Some(decision);
+    }
+
+    extract_first_json_object(trimmed).and_then(|json| {
+        serde_json::from_str::<crate::core::task_router::RoutingDecision>(&json).ok()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwarmDirective {
+    Auto,
+    Force,
+    Disable,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RoutingComplexityPolicy {
     long_question_word_threshold: usize,
@@ -238,6 +315,7 @@ impl Agent {
         &self,
         message: &str,
         actions: &[crate::actions::ActionDef],
+        prompt_bundle: &crate::core::self_evolve::PromptBundleProfile,
     ) -> crate::core::task_router::RoutingDecision {
         let router_candidates = self.llm_candidates_for_role(&ModelRole::Fast);
 
@@ -299,9 +377,14 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let preferred_direct_action =
+        let action_discussion_context =
+            crate::core::intent::looks_like_action_discussion_context(message);
+        let preferred_direct_action = if action_discussion_context {
+            "none".to_string()
+        } else {
             crate::core::intent::preferred_direct_action_name(message, actions)
-                .unwrap_or_else(|| "none".to_string());
+                .unwrap_or_else(|| "none".to_string())
+        };
         let policy_hint_block = format!(
             "Active routing policy version: {}\n\
 Routing fallback signals are structure-first (not keyword lists).\n\
@@ -315,43 +398,18 @@ Thresholds: long_question_word_threshold={}, long_message_word_threshold={}, mul
             routing_policy_hint.complex_score_threshold,
         );
 
-        let routing_prompt = format!(
-            r#"Analyze this task and decide the execution strategy. Respond with ONLY valid JSON.
-
-Available agent types for sub-agents: Researcher, Coder, Analyst, Writer, Validator, Planner
-Available model roles: Primary, Fast, Code, Research
-Custom specialists: {specialists}
-{router_policy}
-{policy_hint}
-Top semantic action candidates:
-{action_hints}
-Preferred direct action candidate: {preferred_action}
-
-Rules:
-- "needs_delegation": true ONLY for pure analysis/research tasks that truly need multiple independent agents.
-- For executable tasks that map clearly to available actions, prefer direct execution:
-  needs_delegation=false unless there is explicit parallel decomposition.
-- Set should_clarify=true only when the request is ambiguous or missing critical details.
-- Any retry/repair strategy MUST define a hard maximum attempts cap.
-- confidence is a number in [0,1]. Use >=0.90 only when intent is very clear.
-- depends_on: index of a sub-agent whose result this one needs (use [] if independent/parallel)
-
-JSON format:
-{{"needs_delegation": false, "complexity": "simple", "sub_agents": [], "reasoning": "brief why", "confidence": 0.90, "should_clarify": false, "clarification_question": null}}
-
-OR for delegation:
-{{"needs_delegation": true, "complexity": "complex", "sub_agents": [{{"agent_type": "Researcher", "task": "specific task", "preferred_model_role": null, "depends_on": []}}], "reasoning": "brief why", "confidence": 0.78, "should_clarify": false, "clarification_question": null}}
-
-If should_clarify=true, provide a short concrete question in clarification_question.
-
-Task: {message}"#,
-            specialists = specialist_desc,
-            router_policy = crate::core::prompt_policy::router_policy_v2_block(),
-            policy_hint = policy_hint_block,
-            action_hints = action_hint_block,
-            preferred_action = preferred_direct_action,
-            message = message
+        let routing_prompt = crate::core::self_evolve::prompt_evolution::render_router_user_prompt(
+            prompt_bundle,
+            &crate::core::self_evolve::prompt_evolution::RouterPromptRenderInputs {
+                specialists: &specialist_desc,
+                policy_hint: &policy_hint_block,
+                action_hints: &action_hint_block,
+                preferred_action: &preferred_direct_action,
+                message,
+            },
         );
+        let router_system_prompt =
+            crate::core::self_evolve::prompt_evolution::render_router_system_prompt(prompt_bundle);
 
         let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
         let mut router_response: Option<crate::core::llm::LlmResponse> = None;
@@ -369,12 +427,10 @@ Task: {message}"#,
                     candidate.client.model_name()
                 );
             }
-            let route_call = candidate.client.chat(
-                "You are a task router. Follow Router Policy v2. Output only valid JSON. No markdown, no explanation.",
-                &routing_prompt,
-                &[],
-                &empty_actions,
-            );
+            let route_call =
+                candidate
+                    .client
+                    .chat(&router_system_prompt, &routing_prompt, &[], &empty_actions);
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), route_call)
                 .await
             {
@@ -408,19 +464,8 @@ Task: {message}"#,
         match router_response {
             Some(response) => {
                 let content = response.content.trim();
-                let json_str = if content.starts_with("```") {
-                    content
-                        .lines()
-                        .skip(1)
-                        .take_while(|l| !l.starts_with("```"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    content.to_string()
-                };
-
-                match serde_json::from_str::<crate::core::task_router::RoutingDecision>(&json_str) {
-                    Ok(mut decision) => {
+                match parse_routing_decision_from_text(content) {
+                    Some(mut decision) => {
                         if !(0.0..=1.0).contains(&decision.confidence) || decision.confidence <= 0.0
                         {
                             decision.confidence = if decision.needs_delegation {
@@ -432,7 +477,8 @@ Task: {message}"#,
 
                         let preferred_direct_action =
                             crate::core::intent::preferred_direct_action_name(message, actions);
-                        if has_execution_intent(message, actions)
+                        if !action_discussion_context
+                            && has_execution_intent(message, actions)
                             && preferred_direct_action.is_some()
                         {
                             decision.needs_delegation = false;
@@ -446,7 +492,8 @@ Task: {message}"#,
                             decision.confidence = decision.confidence.max(0.90);
                         }
 
-                        if has_execution_intent(message, actions)
+                        if !action_discussion_context
+                            && has_execution_intent(message, actions)
                             && decision.needs_delegation
                             && decision.confidence < 0.90
                         {
@@ -462,7 +509,10 @@ Task: {message}"#,
                         // When the LLM router succeeds, trust its judgment about clarification.
                         // Only boost confidence when keyword heuristics confirm clear intent —
                         // never override the LLM to FORCE clarification via keyword scoring.
-                        if has_execution_intent(message, actions) && decision.confidence < 0.90 {
+                        if !action_discussion_context
+                            && has_execution_intent(message, actions)
+                            && decision.confidence < 0.90
+                        {
                             let best_score = best_execution_intent_score(message, actions);
                             let ambiguous = is_ambiguous_user_request(message, actions);
                             let detailed_brief = is_detailed_execution_brief(message, actions);
@@ -479,10 +529,9 @@ Task: {message}"#,
 
                         decision
                     }
-                    Err(e) => {
+                    None => {
                         tracing::warn!(
-                            "Failed to parse routing JSON, falling back to structural classifier: {}",
-                            e
+                            "Failed to parse routing JSON, falling back to structural classifier"
                         );
                         self.classify_complexity_fallback(message, actions).await
                     }
@@ -521,6 +570,199 @@ Task: {message}"#,
             confidence: 0.60,
             should_clarify: false,
             clarification_question: None,
+        }
+    }
+
+    pub(crate) fn detect_swarm_directive(&self, message: &str) -> SwarmDirective {
+        let lower = message.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return SwarmDirective::Auto;
+        }
+
+        if message_contains_any(
+            &lower,
+            &[
+                "single agent only",
+                "single-agent only",
+                "do this yourself",
+                "handle this yourself",
+                "no swarm",
+                "no sub-agent",
+                "no subagent",
+                "no multiple agents",
+                "without swarm",
+            ],
+        ) {
+            return SwarmDirective::Disable;
+        }
+
+        if message_contains_any(
+            &lower,
+            &[
+                "use swarm",
+                "use multiple agents",
+                "use a few agents",
+                "use specialist agents",
+                "spin up sub-agents",
+                "spin up subagents",
+                "delegate this",
+                "split this across agents",
+                "have multiple agents",
+                "fan this out",
+            ],
+        ) {
+            return SwarmDirective::Force;
+        }
+
+        SwarmDirective::Auto
+    }
+
+    pub(crate) fn forced_swarm_specs(
+        &self,
+        message: &str,
+        actions: &[crate::actions::ActionDef],
+    ) -> Vec<crate::core::task_router::SubAgentSpec> {
+        let lower = message.trim().to_ascii_lowercase();
+        let code_or_execution = has_execution_intent(message, actions)
+            || message_contains_any(
+                &lower,
+                &[
+                    "code",
+                    "implement",
+                    "fix",
+                    "build",
+                    "refactor",
+                    "debug",
+                    "review",
+                ],
+            );
+        let research_heavy = message_contains_any(
+            &lower,
+            &[
+                "research",
+                "compare",
+                "investigate",
+                "find sources",
+                "look up",
+                "analyze",
+            ],
+        );
+
+        if code_or_execution {
+            return vec![
+                crate::core::task_router::SubAgentSpec {
+                    agent_type: "Planner".to_string(),
+                    task: format!(
+                        "Break this request into an execution plan with dependencies, risks, and acceptance criteria: {}",
+                        message.trim()
+                    ),
+                    preferred_model_role: None,
+                    depends_on: vec![],
+                },
+                crate::core::task_router::SubAgentSpec {
+                    agent_type: "Coder".to_string(),
+                    task: format!(
+                        "Drive the implementation or technical solution for this request: {}",
+                        message.trim()
+                    ),
+                    preferred_model_role: Some("Code".to_string()),
+                    depends_on: vec![],
+                },
+                crate::core::task_router::SubAgentSpec {
+                    agent_type: "Validator".to_string(),
+                    task: format!(
+                        "Review the plan and solution, checking correctness, risks, and missing tests for: {}",
+                        message.trim()
+                    ),
+                    preferred_model_role: None,
+                    depends_on: vec![0, 1],
+                },
+            ];
+        }
+
+        if research_heavy {
+            return vec![
+                crate::core::task_router::SubAgentSpec {
+                    agent_type: "Researcher".to_string(),
+                    task: format!(
+                        "Gather the key facts, sources, and relevant context for: {}",
+                        message.trim()
+                    ),
+                    preferred_model_role: Some("Research".to_string()),
+                    depends_on: vec![],
+                },
+                crate::core::task_router::SubAgentSpec {
+                    agent_type: "Analyst".to_string(),
+                    task: format!(
+                        "Synthesize the strongest findings, tradeoffs, and recommendations for: {}",
+                        message.trim()
+                    ),
+                    preferred_model_role: None,
+                    depends_on: vec![0],
+                },
+            ];
+        }
+
+        vec![
+            crate::core::task_router::SubAgentSpec {
+                agent_type: "Planner".to_string(),
+                task: format!(
+                    "Decompose this request into a few execution tracks with dependencies and next actions: {}",
+                    message.trim()
+                ),
+                preferred_model_role: None,
+                depends_on: vec![],
+            },
+            crate::core::task_router::SubAgentSpec {
+                agent_type: "Analyst".to_string(),
+                task: format!(
+                    "Evaluate tradeoffs, risks, and the strongest recommendation for: {}",
+                    message.trim()
+                ),
+                preferred_model_role: None,
+                depends_on: vec![0],
+            },
+        ]
+    }
+
+    pub(crate) fn apply_swarm_directive(
+        &self,
+        message: &str,
+        actions: &[crate::actions::ActionDef],
+        decision: &mut crate::core::task_router::RoutingDecision,
+        directive: SwarmDirective,
+    ) {
+        match directive {
+            SwarmDirective::Disable => {
+                decision.needs_delegation = false;
+                decision.sub_agents.clear();
+                decision.reasoning = format!(
+                    "{} | Explicit user preference: single-agent execution.",
+                    decision.reasoning
+                );
+            }
+            SwarmDirective::Force => {
+                decision.needs_delegation = true;
+                decision.complexity = QueryComplexity::Complex;
+                if decision.sub_agents.len() < 2 {
+                    decision.sub_agents = self.forced_swarm_specs(message, actions);
+                }
+                decision.confidence = decision.confidence.max(0.96);
+                decision.reasoning = format!(
+                    "{} | Explicit user preference: use multiple agents.",
+                    decision.reasoning
+                );
+            }
+            SwarmDirective::Auto => {
+                if decision.needs_delegation && decision.sub_agents.len() < 2 {
+                    decision.needs_delegation = false;
+                    decision.sub_agents.clear();
+                    decision.reasoning = format!(
+                        "{} | Delegation suppressed because the task did not decompose into 2+ usable agents.",
+                        decision.reasoning
+                    );
+                }
+            }
         }
     }
 
@@ -592,5 +834,26 @@ Task: {message}"#,
             return QueryComplexity::Medium;
         }
         QueryComplexity::Simple
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_routing_json_from_wrapper_prose() {
+        let content = "Routing decision: {\"needs_delegation\":false,\"complexity\":\"simple\",\"sub_agents\":[],\"reasoning\":\"brief\",\"confidence\":0.8,\"should_clarify\":false,\"clarification_question\":null}";
+        let parsed =
+            parse_routing_decision_from_text(content).expect("wrapped JSON should still parse");
+        assert!(!parsed.needs_delegation);
+        assert!(matches!(parsed.complexity, QueryComplexity::Simple));
+    }
+
+    #[test]
+    fn extracts_first_json_object_from_mixed_text() {
+        let content = "ignore this {\"needs_delegation\":true,\"complexity\":\"complex\",\"sub_agents\":[{\"agent_type\":\"Planner\",\"task\":\"x\",\"preferred_model_role\":null,\"depends_on\":[]}],\"reasoning\":\"brief\",\"confidence\":0.9,\"should_clarify\":false,\"clarification_question\":null} trailing prose";
+        let extracted = extract_first_json_object(content).expect("json object should be found");
+        assert!(extracted.contains("\"needs_delegation\":true"));
     }
 }

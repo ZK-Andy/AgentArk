@@ -10,7 +10,6 @@ pub mod research;
 pub mod search;
 #[cfg(feature = "ssh")]
 pub mod ssh;
-pub mod video;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +66,131 @@ pub enum PlannerSideEffectLevel {
     None,
     Notify,
     Write,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionRiskLevel {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionRateLimit {
+    pub max_calls: u32,
+    pub window_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionHumanApproval {
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionAuthorization {
+    #[serde(default)]
+    pub risk_level: ActionRiskLevel,
+    #[serde(default)]
+    pub requires_auth: bool,
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<ActionRateLimit>,
+    #[serde(default)]
+    pub human_approval: ActionHumanApproval,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionCallerPrincipal {
+    pub user_id: String,
+    pub role: String,
+    pub auth_source: String,
+    #[serde(default)]
+    pub trusted: bool,
+}
+
+impl ActionCallerPrincipal {
+    pub fn local_admin(auth_source: &str) -> Self {
+        Self {
+            user_id: "local_user".to_string(),
+            role: "admin".to_string(),
+            auth_source: auth_source.trim().to_string(),
+            trusted: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionExecutionSurface {
+    Chat,
+    Api,
+    Automation,
+    Background,
+    Test,
+    #[default]
+    Internal,
+}
+
+impl ActionExecutionSurface {
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            ActionExecutionSurface::Chat => "chat",
+            ActionExecutionSurface::Api => "api",
+            ActionExecutionSurface::Automation => "automation",
+            ActionExecutionSurface::Background => "background",
+            ActionExecutionSurface::Test => "test",
+            ActionExecutionSurface::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActionAuthorizationContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ActionCallerPrincipal>,
+    #[serde(default)]
+    pub surface: ActionExecutionSurface,
+    #[serde(default)]
+    pub direct_user_intent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionAuthorizationDecision {
+    pub allowed: bool,
+    pub requires_explicit_approval: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_key: Option<String>,
+}
+
+impl ActionAuthorizationDecision {
+    pub fn allow(reason: impl Into<String>) -> Self {
+        Self {
+            allowed: true,
+            requires_explicit_approval: false,
+            reason: reason.into(),
+            matched_role: None,
+            rate_limit_key: None,
+        }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self {
+            allowed: false,
+            requires_explicit_approval: false,
+            reason: reason.into(),
+            matched_role: None,
+            rate_limit_key: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,7 +330,10 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         _ => {}
     }
 
-    if capabilities.iter().any(|cap| cap == "watcher" || cap == "scheduler") {
+    if capabilities
+        .iter()
+        .any(|cap| cap == "watcher" || cap == "scheduler")
+    {
         meta.role = PlannerActionRole::Orchestration;
         meta.integration_class = PlannerIntegrationClass::Internal;
         meta.cost = PlannerCostTier::Low;
@@ -258,7 +385,10 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         return meta;
     }
 
-    if capabilities.iter().any(|cap| cap == "search" || cap == "research") {
+    if capabilities
+        .iter()
+        .any(|cap| cap == "search" || cap == "research")
+    {
         meta.role = PlannerActionRole::DataSource;
         meta.integration_class = PlannerIntegrationClass::Search;
         return meta;
@@ -321,6 +451,10 @@ pub struct ActionDef {
     /// Path to action file (for editable actions)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+
+    /// Normalized authorization metadata used by the runtime permission layer.
+    #[serde(default)]
+    pub authorization: ActionAuthorization,
 }
 
 impl Default for ActionDef {
@@ -334,6 +468,7 @@ impl Default for ActionDef {
             sandbox_mode: None,
             source: ActionSource::System,
             file_path: None,
+            authorization: ActionAuthorization::default(),
         }
     }
 }

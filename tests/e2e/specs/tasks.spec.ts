@@ -13,15 +13,15 @@ test.describe("Tasks API @api", () => {
   test("POST /tasks creates a task", async ({ request }) => {
     const res = await request.post("/tasks", {
       data: {
-        action: "e2e-test",
+        action: "notes_log",
         description: "E2E test task - safe to delete",
-        schedule: "manual",
         arguments: {},
       },
     });
     expect(res.ok()).toBeTruthy();
     const body = await res.json();
     expect(body).toHaveProperty("status");
+    expect(body).toHaveProperty("id");
   });
 });
 

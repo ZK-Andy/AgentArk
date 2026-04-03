@@ -14,9 +14,26 @@ type Props = {
   palette: string[];
   className?: string;
   chartHeight?: number;
+  compact?: boolean;
+  rowsLimit?: number;
 };
 
-export function MetricBarCard({ title, value, values, rows, palette, className = "", chartHeight = 84 }: Props) {
+export function MetricBarCard({
+  title,
+  value,
+  values,
+  rows,
+  palette,
+  className = "",
+  chartHeight = 84,
+  compact = false,
+  rowsLimit
+}: Props) {
+  const visibleRows =
+    typeof rowsLimit === "number" && rowsLimit > 0 && rows.length > rowsLimit
+      ? rows.slice(Math.max(0, rows.length - rowsLimit))
+      : rows;
+  const hasMeaningfulData = values.some((entry) => entry > 0) || rows.length > 0;
   const option = {
     backgroundColor: "transparent",
     animation: true,
@@ -82,10 +99,10 @@ export function MetricBarCard({ title, value, values, rows, palette, className =
 
   return (
     <Box
-      className={`list-shell metric-bar-card stat-card rise-in ${className}`.trim()}
+      className={`list-shell metric-bar-card stat-card rise-in${hasMeaningfulData ? "" : " metric-bar-card-empty"}${compact ? " metric-bar-card-compact" : ""} ${className}`.trim()}
       sx={{
-        p: 1.6,
-        borderRadius: "12px",
+        p: compact ? 1.15 : 1.6,
+        borderRadius: compact ? "14px" : "12px",
         border: "1px solid rgba(108,156,212,0.18)",
         background: "linear-gradient(170deg, rgba(6,15,29,0.95), rgba(3,9,21,0.9))",
       }}
@@ -96,36 +113,44 @@ export function MetricBarCard({ title, value, values, rows, palette, className =
       <Typography variant="h4" className="metric-bar-card-value">
         {value}
       </Typography>
-      <ReactECharts option={option} style={{ height: chartHeight }} className="metric-bar-card-chart" />
-      <Stack spacing={0.5} sx={{ mt: 0.8 }}>
-        {rows.map((row, index) => (
-          <Stack
-            key={`${title}-${row.label}-${index}`}
-            className="metric-bar-card-row"
-            direction="row"
-            justifyContent="space-between"
-            alignItems="center"
-          >
-            <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
-              <Box
-                sx={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  bgcolor: palette[index % palette.length],
-                  flex: "0 0 auto",
-                }}
-              />
-              <Typography variant="body2" className="metric-bar-card-row-label" noWrap title={row.label}>
-                {row.label}
-              </Typography>
-            </Stack>
-            <Typography variant="body2" className="metric-bar-card-row-value">
-              {row.value}
-            </Typography>
+      {hasMeaningfulData ? (
+        <>
+          <ReactECharts option={option} style={{ height: chartHeight }} className="metric-bar-card-chart" />
+          <Stack spacing={compact ? 0.2 : 0.5} sx={{ mt: compact ? 0.5 : 0.8 }}>
+            {visibleRows.map((row, index) => (
+              <Stack
+                key={`${title}-${row.label}-${index}`}
+                className="metric-bar-card-row"
+                direction="row"
+                justifyContent="space-between"
+                alignItems="center"
+              >
+                <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+                  <Box
+                    sx={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      bgcolor: palette[index % palette.length],
+                      flex: "0 0 auto",
+                    }}
+                  />
+                  <Typography variant="body2" className="metric-bar-card-row-label" noWrap title={row.label}>
+                    {row.label}
+                  </Typography>
+                </Stack>
+                <Typography variant="body2" className="metric-bar-card-row-value">
+                  {row.value}
+                </Typography>
+              </Stack>
+            ))}
           </Stack>
-        ))}
-      </Stack>
+        </>
+      ) : (
+        <Typography variant="body2" className="metric-bar-card-empty-copy">
+          No usage in the selected range yet.
+        </Typography>
+      )}
     </Box>
   );
 }

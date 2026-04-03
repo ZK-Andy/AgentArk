@@ -1087,6 +1087,7 @@ fn short_error_summary(error: &str) -> String {
     short_text(error, 160)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_run_record(
     runs: &mut Vec<IntegrationSyncRunItem>,
     config: &IntegrationSyncConfig,
@@ -1138,6 +1139,7 @@ fn push_run_record(
     runs.truncate(MAX_RUN_ITEMS);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_integration(
     ctx: &IntegrationSyncContext,
     manager: &crate::integrations::IntegrationManager,
@@ -2214,7 +2216,7 @@ async fn fetch_github_items(
     let response = client
         .get(url)
         .header("Authorization", format!("Bearer {}", token))
-        .header("User-Agent", "AgentArk/0.1.0")
+        .header("User-Agent", crate::branding::versioned_user_agent())
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?;

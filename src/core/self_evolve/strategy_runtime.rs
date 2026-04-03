@@ -225,6 +225,224 @@ pub fn evaluate_canary_by_policy_version(
     )
 }
 
+pub fn evaluate_experience_canary_by_prompt_version(
+    runs: &[crate::storage::entities::experience_run::Model],
+    baseline_version: &str,
+    candidate_version: &str,
+    min_samples_per_version: usize,
+    min_success_gain: f64,
+    max_sign_test_p_value: f64,
+) -> ReplayEvaluationResult {
+    let baseline_rows = runs
+        .iter()
+        .filter(|run| {
+            run.prompt_version.as_deref() == Some(baseline_version) && experience_run_resolved(run)
+        })
+        .collect::<Vec<_>>();
+    let candidate_rows = runs
+        .iter()
+        .filter(|run| {
+            run.prompt_version.as_deref() == Some(candidate_version) && experience_run_resolved(run)
+        })
+        .collect::<Vec<_>>();
+
+    let baseline = compute_experience_metrics(&baseline_rows);
+    let candidate = compute_experience_metrics(&candidate_rows);
+
+    let mut paired_deltas: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    for row in &baseline_rows {
+        let key = (row.channel.clone(), row.intent_key.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.0 += if experience_run_success(row) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    for row in &candidate_rows {
+        let key = (row.channel.clone(), row.intent_key.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.1 += if experience_run_success(row) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    for ((_channel, _intent), (baseline_score, candidate_score)) in paired_deltas {
+        if baseline_score == 0.0 && candidate_score == 0.0 {
+            continue;
+        }
+        if candidate_score > baseline_score {
+            wins += 1;
+        } else if candidate_score < baseline_score {
+            losses += 1;
+        }
+    }
+
+    let p_value = one_sided_sign_test_p_value(wins, losses);
+    let success_gain = candidate.success_rate - baseline.success_rate;
+    let eligible =
+        baseline.samples >= min_samples_per_version && candidate.samples >= min_samples_per_version;
+    let promote = eligible
+        && success_gain >= min_success_gain
+        && wins > losses
+        && p_value <= max_sign_test_p_value;
+
+    let reason = if !eligible {
+        format!(
+            "insufficient experience samples (baseline={}, candidate={}, min={})",
+            baseline.samples, candidate.samples, min_samples_per_version
+        )
+    } else if success_gain < min_success_gain {
+        format!(
+            "experience success gain {:.4} below threshold {:.4}",
+            success_gain, min_success_gain
+        )
+    } else if wins <= losses {
+        format!("wins={} not greater than losses={}", wins, losses)
+    } else if p_value > max_sign_test_p_value {
+        format!(
+            "p-value {:.4} above threshold {:.4}",
+            p_value, max_sign_test_p_value
+        )
+    } else {
+        "passed".to_string()
+    };
+
+    ReplayEvaluationResult {
+        eligible,
+        promote,
+        baseline_version: baseline_version.to_string(),
+        candidate_version: candidate_version.to_string(),
+        baseline,
+        candidate,
+        success_gain,
+        wins,
+        losses,
+        p_value,
+        reason,
+    }
+}
+
+pub fn experience_run_metadata_version<'a>(
+    row: &'a crate::storage::entities::experience_run::Model,
+    key: &str,
+) -> Option<&'a str> {
+    row.metadata
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub fn evaluate_experience_canary_by_metadata_version(
+    runs: &[crate::storage::entities::experience_run::Model],
+    metadata_key: &str,
+    baseline_version: &str,
+    candidate_version: &str,
+    min_samples_per_version: usize,
+    min_success_gain: f64,
+    max_sign_test_p_value: f64,
+) -> ReplayEvaluationResult {
+    let baseline_rows = runs
+        .iter()
+        .filter(|run| {
+            experience_run_metadata_version(run, metadata_key) == Some(baseline_version)
+                && experience_run_resolved(run)
+        })
+        .collect::<Vec<_>>();
+    let candidate_rows = runs
+        .iter()
+        .filter(|run| {
+            experience_run_metadata_version(run, metadata_key) == Some(candidate_version)
+                && experience_run_resolved(run)
+        })
+        .collect::<Vec<_>>();
+
+    let baseline = compute_experience_metrics(&baseline_rows);
+    let candidate = compute_experience_metrics(&candidate_rows);
+
+    let mut paired_deltas: HashMap<(String, String), (f64, f64)> = HashMap::new();
+    for row in &baseline_rows {
+        let key = (row.channel.clone(), row.intent_key.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.0 += if experience_run_success(row) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    for row in &candidate_rows {
+        let key = (row.channel.clone(), row.intent_key.clone());
+        let entry = paired_deltas.entry(key).or_insert((0.0, 0.0));
+        entry.1 += if experience_run_success(row) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    for ((_channel, _intent), (baseline_score, candidate_score)) in paired_deltas {
+        if baseline_score == 0.0 && candidate_score == 0.0 {
+            continue;
+        }
+        if candidate_score > baseline_score {
+            wins += 1;
+        } else if candidate_score < baseline_score {
+            losses += 1;
+        }
+    }
+
+    let p_value = one_sided_sign_test_p_value(wins, losses);
+    let success_gain = candidate.success_rate - baseline.success_rate;
+    let eligible =
+        baseline.samples >= min_samples_per_version && candidate.samples >= min_samples_per_version;
+    let promote = eligible
+        && success_gain >= min_success_gain
+        && wins > losses
+        && p_value <= max_sign_test_p_value;
+
+    let reason = if !eligible {
+        format!(
+            "insufficient experience samples (baseline={}, candidate={}, min={})",
+            baseline.samples, candidate.samples, min_samples_per_version
+        )
+    } else if success_gain < min_success_gain {
+        format!(
+            "experience success gain {:.4} below threshold {:.4}",
+            success_gain, min_success_gain
+        )
+    } else if wins <= losses {
+        format!("wins={} not greater than losses={}", wins, losses)
+    } else if p_value > max_sign_test_p_value {
+        format!(
+            "p-value {:.4} above threshold {:.4}",
+            p_value, max_sign_test_p_value
+        )
+    } else {
+        "passed".to_string()
+    };
+
+    ReplayEvaluationResult {
+        eligible,
+        promote,
+        baseline_version: baseline_version.to_string(),
+        candidate_version: candidate_version.to_string(),
+        baseline,
+        candidate,
+        success_gain,
+        wins,
+        losses,
+        p_value,
+        reason,
+    }
+}
+
 fn evaluate_two_sets(
     baseline_rows: &[&crate::storage::entities::operational_log::Model],
     candidate_rows: &[&crate::storage::entities::operational_log::Model],
@@ -349,6 +567,37 @@ fn compute_metrics(
     }
 }
 
+fn compute_experience_metrics(
+    rows: &[&crate::storage::entities::experience_run::Model],
+) -> ReplayVersionMetrics {
+    let samples = rows.len();
+    let successes = rows
+        .iter()
+        .filter(|row| experience_run_success(row))
+        .count();
+    let success_rate = if samples == 0 {
+        0.0
+    } else {
+        successes as f64 / samples as f64
+    };
+    ReplayVersionMetrics {
+        samples,
+        successes,
+        success_rate: round4(success_rate),
+        p95_latency_ms: None,
+    }
+}
+
+fn experience_run_resolved(row: &crate::storage::entities::experience_run::Model) -> bool {
+    row.correction_state == "corrected"
+        || row.success_state == "accepted"
+        || row.success_state == "failed"
+}
+
+fn experience_run_success(row: &crate::storage::entities::experience_run::Model) -> bool {
+    row.correction_state != "corrected" && row.success_state == "accepted"
+}
+
 fn one_sided_sign_test_p_value(wins: usize, losses: usize) -> f64 {
     let n = wins + losses;
     if n == 0 || wins <= losses {
@@ -379,4 +628,86 @@ fn combination(n: usize, k: usize) -> f64 {
 
 fn round4(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_experience_run(
+        id: &str,
+        prompt_version: &str,
+        intent_key: &str,
+        success_state: &str,
+        correction_state: &str,
+    ) -> crate::storage::entities::experience_run::Model {
+        crate::storage::entities::experience_run::Model {
+            id: id.to_string(),
+            execution_run_id: None,
+            trace_id: Some(format!("trace-{id}")),
+            conversation_id: None,
+            project_id: None,
+            channel: "chat".to_string(),
+            scope: "global".to_string(),
+            intent_key: intent_key.to_string(),
+            task_type: Some("task".to_string()),
+            request_text: None,
+            tool_sequence_digest: None,
+            tool_sequence_json: serde_json::json!([]),
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: Some(prompt_version.to_string()),
+            model_slot: None,
+            success_state: success_state.to_string(),
+            correction_state: correction_state.to_string(),
+            outcome_summary: None,
+            failure_reason: None,
+            metadata: serde_json::json!({}),
+            consolidated: false,
+            accepted_at: None,
+            corrected_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn prompt_experience_gate_ignores_provisional_runs() {
+        let runs = vec![
+            test_experience_run(
+                "baseline-accepted",
+                "prompt+baseline",
+                "fix_bug",
+                "accepted",
+                "none",
+            ),
+            test_experience_run(
+                "candidate-provisional",
+                "prompt+candidate",
+                "fix_bug",
+                "provisional",
+                "none",
+            ),
+            test_experience_run(
+                "candidate-accepted",
+                "prompt+candidate",
+                "fix_bug",
+                "accepted",
+                "none",
+            ),
+        ];
+
+        let evaluation = evaluate_experience_canary_by_prompt_version(
+            &runs,
+            "prompt+baseline",
+            "prompt+candidate",
+            1,
+            0.01,
+            0.10,
+        );
+
+        assert_eq!(evaluation.baseline.samples, 1);
+        assert_eq!(evaluation.candidate.samples, 1);
+        assert_eq!(evaluation.candidate.successes, 1);
+    }
 }

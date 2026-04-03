@@ -11,8 +11,7 @@ pub struct Model {
     pub fact: String,
     pub confidence: f32,
     pub sources: String,
-    #[sea_orm(column_type = "Blob", nullable)]
-    pub embedding: Option<Vec<u8>>,
+    pub embedding: Option<PgVector>,
     pub created_at: String,
     /// Optional project scope
     #[sea_orm(nullable)]

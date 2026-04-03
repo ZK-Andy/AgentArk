@@ -3,11 +3,12 @@ name = "agentark"
 version = "0.1.0"
 edition = "2021"
 authors = ["AgentArk Contributors"]
-description = "A secure, self-improving AI agent with cognitive memory, parallel thinking, and sub-agent orchestration"
+description = "A secure private AI assistant for daily use with memory, self-improving autonomy, and safe automation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/agentark-ai/AgentArk"
-keywords = ["ai", "agent", "llm", "autonomous", "cognitive"]
+keywords = ["ai", "assistant", "autonomous", "automation", "self-improving"]
 categories = ["development-tools", "command-line-utilities"]
+autotests = false
 
 [features]
 default = ["gui", "telegram", "docker", "ssh"]
@@ -17,6 +18,7 @@ docker = ["bollard"]
 ssh = ["russh"]
 local-llm = ["llama-cpp-2"]
 tls = ["axum-server", "rcgen"]
+live-smoke-tests = []
 
 [dependencies]
 # Async runtime
@@ -50,6 +52,7 @@ teloxide = { version = "0.13", optional = true, features = ["macros"] }
 
 # LLM clients
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+fastembed = "5"
 
 # Local LLM (optional)
 llama-cpp-2 = { version = "0.1", optional = true }
@@ -84,7 +87,7 @@ toml = "0.8"
 bincode = "1"
 
 # Database ORM (SeaORM with PostgreSQL)
-sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "postgres-vector"] }
 sea-orm-migration = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 
 
@@ -126,7 +129,7 @@ once_cell = "1"
 url = "2"
 
 # SSH (remote server execution)
-russh = { version = "0.54.5", optional = true, default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.55.0", optional = true, default-features = false, features = ["flate2", "ring", "rsa"] }
 
 # Clipboard support
 arboard = "3"
@@ -143,6 +146,18 @@ tokio-test = "0.4"
 [[bin]]
 name = "agentark"
 path = "src/main.rs"
+test = false
+bench = false
+
+[[test]]
+name = "api_core_test"
+path = "tests/api_core_test.rs"
+required-features = ["live-smoke-tests"]
+
+[[test]]
+name = "swarm_api_test"
+path = "tests/swarm_api_test.rs"
+required-features = ["live-smoke-tests"]
 
 [profile.release]
 lto = true

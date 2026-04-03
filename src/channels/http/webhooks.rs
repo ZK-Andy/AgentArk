@@ -354,8 +354,7 @@ async fn available_completion_channels(state: &AppState) -> Result<HashSet<Strin
         .into_iter()
         .filter(|info| {
             info.capabilities
-                .iter()
-                .any(|capability| *capability == crate::integrations::Capability::Notify)
+                .contains(&crate::integrations::Capability::Notify)
                 && matches!(
                     info.status,
                     crate::integrations::IntegrationStatus::Connected
@@ -428,11 +427,11 @@ fn default_secret_header_for_provider(
         WebhookAuthMode::BearerToken => Some("Authorization".to_string()),
         WebhookAuthMode::HmacSha256 => Some(match provider {
             "github" => "X-Hub-Signature-256".to_string(),
-            _ => "X-AgentArk-Signature".to_string(),
+            _ => crate::branding::WEBHOOK_SIGNATURE_HEADER.to_string(),
         }),
         WebhookAuthMode::HeaderToken => Some(match provider {
             "gitlab" => "X-Gitlab-Token".to_string(),
-            _ => "X-AgentArk-Webhook-Secret".to_string(),
+            _ => crate::branding::WEBHOOK_SECRET_HEADER.to_string(),
         }),
     }
 }
@@ -2007,7 +2006,7 @@ mod tests {
                 api_key: Arc::new(RwLock::new(None)),
                 api_key_expires_at: Arc::new(RwLock::new(None)),
                 allow_insecure_no_auth: true,
-                session_token: Arc::new(RwLock::new(None)),
+                ui_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 local_ui_bootstrap_enabled: true,
                 local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
                 cookie_secure_default: false,
@@ -2017,6 +2016,8 @@ mod tests {
                 whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
                 security_events,
                 app_registry,
+                executor_client: None,
+                workspace_client: None,
                 application_registry: applications::ApplicationLauncherRegistry::default(),
                 deployment_mode: DeploymentMode::TrustedLocal,
                 server_role: HttpServerRole::ControlPlane,
@@ -2147,7 +2148,7 @@ mod tests {
                     "name": "Build Alerts",
                     "provider": "generic",
                     "auth_mode": "header_token",
-                    "secret_header": "X-AgentArk-Webhook-Secret",
+                    "secret_header": crate::branding::WEBHOOK_SECRET_HEADER,
                     "secret": "abc123",
                     "notify_on_queued": true,
                     "notify_on_success": true,
@@ -2169,7 +2170,7 @@ mod tests {
         let inbound_request = Request::builder()
             .method("POST")
             .uri(format!("/webhook/inbound/{}", source_id))
-            .header("X-AgentArk-Webhook-Secret", "abc123")
+            .header(crate::branding::WEBHOOK_SECRET_HEADER, "abc123")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 serde_json::json!({

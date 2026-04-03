@@ -13,6 +13,12 @@ const MIN_SECURITY_IDLE_THRESHOLD_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataLifecycleSettings {
+    #[serde(default = "default_cleanup_enabled")]
+    pub cleanup_enabled: bool,
+    #[serde(default = "default_cleanup_enabled")]
+    pub notifications_cleanup_enabled: bool,
+    #[serde(default = "default_cleanup_enabled")]
+    pub logs_cleanup_enabled: bool,
     #[serde(default = "default_notifications_retention_days")]
     pub notifications_retention_days: u64,
     #[serde(default = "default_notification_cleanup_interval_secs")]
@@ -35,12 +41,22 @@ pub struct DataLifecycleSettings {
     pub terminal_task_retention_days: u64,
     #[serde(default = "default_message_retention_days")]
     pub message_retention_days: u64,
+    #[serde(default = "default_experience_run_retention_days")]
+    pub experience_run_retention_days: u64,
+    #[serde(default = "default_experience_edge_retention_days")]
+    pub experience_edge_retention_days: u64,
+    #[serde(default = "default_learning_candidate_retention_days")]
+    pub learning_candidate_retention_days: u64,
     #[serde(default = "default_housekeeping_interval_secs")]
     pub housekeeping_interval_secs: u64,
     #[serde(default = "default_security_cleanup_interval_days")]
     pub security_cleanup_interval_days: u64,
     #[serde(default = "default_security_cleanup_idle_threshold_secs")]
     pub security_cleanup_idle_threshold_secs: u64,
+}
+
+fn default_cleanup_enabled() -> bool {
+    true
 }
 
 fn default_notifications_retention_days() -> u64 {
@@ -87,6 +103,18 @@ fn default_message_retention_days() -> u64 {
     365
 }
 
+fn default_experience_run_retention_days() -> u64 {
+    90
+}
+
+fn default_experience_edge_retention_days() -> u64 {
+    90
+}
+
+fn default_learning_candidate_retention_days() -> u64 {
+    30
+}
+
 fn default_housekeeping_interval_secs() -> u64 {
     3600
 }
@@ -102,6 +130,9 @@ fn default_security_cleanup_idle_threshold_secs() -> u64 {
 impl Default for DataLifecycleSettings {
     fn default() -> Self {
         Self {
+            cleanup_enabled: default_cleanup_enabled(),
+            notifications_cleanup_enabled: default_cleanup_enabled(),
+            logs_cleanup_enabled: default_cleanup_enabled(),
             notifications_retention_days: default_notifications_retention_days(),
             notification_cleanup_interval_secs: default_notification_cleanup_interval_secs(),
             execution_trace_retention_days: default_execution_trace_retention_days(),
@@ -113,6 +144,9 @@ impl Default for DataLifecycleSettings {
             llm_usage_retention_days: default_llm_usage_retention_days(),
             terminal_task_retention_days: default_terminal_task_retention_days(),
             message_retention_days: default_message_retention_days(),
+            experience_run_retention_days: default_experience_run_retention_days(),
+            experience_edge_retention_days: default_experience_edge_retention_days(),
+            learning_candidate_retention_days: default_learning_candidate_retention_days(),
             housekeeping_interval_secs: default_housekeeping_interval_secs(),
             security_cleanup_interval_days: default_security_cleanup_interval_days(),
             security_cleanup_idle_threshold_secs: default_security_cleanup_idle_threshold_secs(),
@@ -138,6 +172,13 @@ impl DataLifecycleSettings {
         self.terminal_task_retention_days =
             self.terminal_task_retention_days.min(MAX_RETENTION_DAYS);
         self.message_retention_days = self.message_retention_days.min(MAX_RETENTION_DAYS);
+        self.experience_run_retention_days =
+            self.experience_run_retention_days.min(MAX_RETENTION_DAYS);
+        self.experience_edge_retention_days =
+            self.experience_edge_retention_days.min(MAX_RETENTION_DAYS);
+        self.learning_candidate_retention_days = self
+            .learning_candidate_retention_days
+            .min(MAX_RETENTION_DAYS);
         self.notification_cleanup_interval_secs = self
             .notification_cleanup_interval_secs
             .clamp(MIN_NOTIFICATION_INTERVAL_SECS, MAX_INTERVAL_SECS);

@@ -23,7 +23,7 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: agentark-postgres
     restart: unless-stopped
     security_opt:
@@ -57,40 +57,42 @@ services:
           cpus: "0.25"
           memory: 256M
 
-  agentark:
+  agentark-control:
     build:
       context: .
       args:
         AGENTARK_DOCKER_FEATURES: ${AGENTARK_DOCKER_FEATURES:-telegram,docker,ssh}
         INSTALL_PLAYWRIGHT_RUNTIME: ${AGENTARK_INSTALL_PLAYWRIGHT_RUNTIME:-true}
-        INSTALL_MEM0: ${AGENTARK_INSTALL_MEM0:-true}
-        INSTALL_FFMPEG: ${AGENTARK_INSTALL_FFMPEG:-true}
         INSTALL_TAILSCALE: ${AGENTARK_INSTALL_TAILSCALE:-true}
         INSTALL_CLOUDFLARED: ${AGENTARK_INSTALL_CLOUDFLARED:-true}
         INSTALL_LIGHTPANDA: ${AGENTARK_INSTALL_LIGHTPANDA:-true}
         INSTALL_GWS: ${AGENTARK_INSTALL_GWS:-true}
         INSTALL_DOCKER_CLI: ${AGENTARK_INSTALL_DOCKER_CLI:-true}
         INSTALL_WHATSAPP_BRIDGE: ${AGENTARK_INSTALL_WHATSAPP_BRIDGE:-true}
-    image: agentark:local-full
-    container_name: agentark
+    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    container_name: agentark-control
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     ports:
       - "127.0.0.1:8990:8990"
+      - "127.0.0.1:8992:8992"
     volumes:
       - agentark-data:/app/data
       - agentark-config:/app/config
-      - .:/workspace/agentark
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
     depends_on:
       postgres:
         condition: service_healthy
-      docker-socket-proxy:
-        condition: service_started
+      agentark-executor:
+        condition: service_healthy
+      agentark-workspace:
+        condition: service_healthy
     environment:
       - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
+      - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
       - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
       - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
@@ -98,8 +100,11 @@ services:
       - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
       - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
       - AGENTARK_BIND=0.0.0.0:8990
-      - PLAYWRIGHT_BRIDGE_URL=http://127.0.0.1:3100
-      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      - AGENTARK_PUBLIC_APP_BIND=${AGENTARK_PUBLIC_APP_BIND:-0.0.0.0:8992}
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local-full}
+      - AGENTARK_STACK_ROLE=control
+      - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
+      - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
       - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
       - AGENTARK_TUNNEL=${AGENTARK_TUNNEL:-false}
       - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
@@ -117,85 +122,89 @@ services:
       timeout: 10s
       retries: 3
       start_period: 5s
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
-        reservations:
-          cpus: "0.5"
-          memory: 512M
 
-  docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
-    container_name: agentark-docker-proxy
+  agentark-executor:
+    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    container_name: agentark-executor
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - agentark-data:/app/data
+      - agentark-config:/app/config
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agentark-workspace:
+        condition: service_healthy
     environment:
-      - CONTAINERS=1
-      - IMAGES=1
-      - POST=1
-      - EXEC=0
-      - VOLUMES=0
-      - NETWORKS=0
-      - SWARM=0
-      - SECRETS=0
-      - NODES=0
-      - SERVICES=0
-      - TASKS=0
-      - BUILD=0
-      - COMMIT=0
-      - CONFIGS=0
-      - DISTRIBUTION=0
-      - PLUGINS=0
-      - SYSTEM=0
+      - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
+      - AGENTARK_CONFIG=/app/config
+      - AGENTARK_DATA=/app/data
+      - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
+      - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
+      - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
+      - AGENTARK_DB_IDLE_TIMEOUT_SECS=${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
+      - AGENTARK_DB_SCHEMA=${AGENTARK_DB_SCHEMA:-}
+      - AGENTARK_BIND=0.0.0.0:8990
+      - AGENTARK_EXECUTOR_BIND=0.0.0.0:8991
+      - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-agentark:local-full}
+      - AGENTARK_STACK_ROLE=executor
+      - AGENTARK_CONTROL_URL=http://agentark-control:8990
+      - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AGENTARK_DEBUG=${AGENTARK_DEBUG:-false}
+      - AGENTARK_MASTER_PASSWORD=${AGENTARK_MASTER_PASSWORD:-}
     networks:
       - agent-network
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 128M
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8991/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
-  ollama:
-    image: ollama/ollama:0.13.5
-    container_name: agentark-ollama
+  agentark-workspace:
+    image: ${AGENTARK_IMAGE:-agentark:local-full}
+    container_name: agentark-workspace
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
-    ports:
-      - "11434:11434"
     volumes:
-      - ollama-data:/root/.ollama
-    networks:
-      - agent-network
-    profiles:
-      - with-ollama
-    deploy:
-      resources:
-        limits:
-          cpus: "4"
-          memory: 8G
-
-  searxng:
-    image: searxng/searxng:latest
-    container_name: agentark-searxng
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    ports:
-      - "8080:8080"
-    volumes:
-      - searxng-data:/etc/searxng
-    networks:
-      - agent-network
-    profiles:
-      - with-search
+      - agentark-data:/app/data
+      - agentark-config:/app/config
+      - ${AGENTARK_WORKSPACE_HOST_DIR:-.}:${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
     environment:
-      - SEARXNG_BASE_URL=http://localhost:8080
+      - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
+      - AGENTARK_CONFIG=/app/config
+      - AGENTARK_DATA=/app/data
+      - AGENTARK_STACK_ROLE=workspace
+      - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
+      - AGENTARK_WORKSPACE_BIND=0.0.0.0:8992
+    networks:
+      - agent-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8992/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
 volumes:
   agentark-data:
@@ -204,9 +213,6 @@ volumes:
     name: agentark-config
   agentark-postgres-data:
     name: agentark-postgres-data
-  ollama-data:
-  searxng-data:
-
 networks:
   agent-network:
     driver: bridge

@@ -16,6 +16,7 @@ pub struct GitHubConnector {
 
 impl GitHubConnector {
     const API_BASE: &'static str = "https://api.github.com";
+    const MAX_RETRY_ATTEMPTS: usize = 3;
 
     pub fn new_with_config_dir(config_dir: PathBuf) -> Self {
         Self {
@@ -25,7 +26,7 @@ impl GitHubConnector {
     }
 
     pub fn new() -> Self {
-        let config_dir = directories::ProjectDirs::from("com", "agentark", "AgentArk")
+        let config_dir = crate::branding::project_dirs()
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
@@ -59,8 +60,73 @@ impl GitHubConnector {
             .http
             .request(method, url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", "AgentArk/0.1.0")
+            .header("User-Agent", crate::branding::versioned_user_agent())
             .header("Accept", "application/vnd.github+json"))
+    }
+
+    fn build_url(&self, path_segments: &[&str], query: &[(&str, String)]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(Self::API_BASE)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Failed to build GitHub API URL"))?;
+            for segment in path_segments {
+                segments.push(segment);
+            }
+        }
+        if !query.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn send_with_retry(
+        &self,
+        request: reqwest::RequestBuilder,
+        allow_retry: bool,
+    ) -> Result<reqwest::Response> {
+        let mut last_error = None;
+        for attempt in 0..Self::MAX_RETRY_ATTEMPTS {
+            let response = request
+                .try_clone()
+                .ok_or_else(|| anyhow!("Failed to clone GitHub request"))?
+                .send()
+                .await;
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if allow_retry
+                        && attempt + 1 < Self::MAX_RETRY_ATTEMPTS
+                        && (status.as_u16() == 429 || status.is_server_error())
+                    {
+                        let retry_after = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(2)
+                            .min(30);
+                        tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(err) => {
+                    if allow_retry && attempt + 1 < Self::MAX_RETRY_ATTEMPTS {
+                        last_error = Some(err);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+        Err(last_error
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow!("GitHub request failed after retries")))
     }
 
     // === Action implementations ===
@@ -77,16 +143,19 @@ impl GitHubConnector {
             .and_then(|v| v.as_str())
             .unwrap_or("updated");
 
-        let url = format!(
-            "{}/user/repos?per_page={}&sort={}",
-            Self::API_BASE,
-            per_page,
-            sort
-        );
+        let url = self.build_url(
+            &["user", "repos"],
+            &[
+                ("per_page", per_page.to_string()),
+                ("sort", sort.to_string()),
+            ],
+        )?;
 
         let response = self
-            .authed_request(reqwest::Method::GET, &url)?
-            .send()
+            .send_with_retry(
+                self.authed_request(reqwest::Method::GET, url.as_str())?,
+                true,
+            )
             .await?;
 
         if !response.status().is_success() {
@@ -141,7 +210,7 @@ impl GitHubConnector {
             })
             .unwrap_or_default();
 
-        let url = format!("{}/repos/{}/{}/issues", Self::API_BASE, owner, repo);
+        let url = self.build_url(&["repos", owner, repo, "issues"], &[])?;
 
         let request_body = serde_json::json!({
             "title": title,
@@ -150,7 +219,7 @@ impl GitHubConnector {
         });
 
         let response = self
-            .authed_request(reqwest::Method::POST, &url)?
+            .authed_request(reqwest::Method::POST, url.as_str())?
             .json(&request_body)
             .send()
             .await?;
@@ -194,18 +263,19 @@ impl GitHubConnector {
             .and_then(|v| v.as_u64())
             .unwrap_or(20);
 
-        let url = format!(
-            "{}/repos/{}/{}/issues?state={}&per_page={}",
-            Self::API_BASE,
-            owner,
-            repo,
-            state,
-            per_page
-        );
+        let url = self.build_url(
+            &["repos", owner, repo, "issues"],
+            &[
+                ("state", state.to_string()),
+                ("per_page", per_page.to_string()),
+            ],
+        )?;
 
         let response = self
-            .authed_request(reqwest::Method::GET, &url)?
-            .send()
+            .send_with_retry(
+                self.authed_request(reqwest::Method::GET, url.as_str())?,
+                true,
+            )
             .await?;
 
         if !response.status().is_success() {
@@ -261,18 +331,19 @@ impl GitHubConnector {
             .and_then(|v| v.as_u64())
             .unwrap_or(20);
 
-        let url = format!(
-            "{}/repos/{}/{}/pulls?state={}&per_page={}",
-            Self::API_BASE,
-            owner,
-            repo,
-            state,
-            per_page
-        );
+        let url = self.build_url(
+            &["repos", owner, repo, "pulls"],
+            &[
+                ("state", state.to_string()),
+                ("per_page", per_page.to_string()),
+            ],
+        )?;
 
         let response = self
-            .authed_request(reqwest::Method::GET, &url)?
-            .send()
+            .send_with_retry(
+                self.authed_request(reqwest::Method::GET, url.as_str())?,
+                true,
+            )
             .await?;
 
         if !response.status().is_success() {
@@ -325,7 +396,7 @@ impl GitHubConnector {
 
         let body_text = params.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
-        let url = format!("{}/repos/{}/{}/pulls", Self::API_BASE, owner, repo);
+        let url = self.build_url(&["repos", owner, repo, "pulls"], &[])?;
 
         let request_body = serde_json::json!({
             "title": title,
@@ -335,7 +406,7 @@ impl GitHubConnector {
         });
 
         let response = self
-            .authed_request(reqwest::Method::POST, &url)?
+            .authed_request(reqwest::Method::POST, url.as_str())?
             .json(&request_body)
             .send()
             .await?;
@@ -378,16 +449,13 @@ impl GitHubConnector {
             }
         };
 
-        let url = format!(
-            "{}/search/{}?q={}",
-            Self::API_BASE,
-            endpoint,
-            urlencoding::encode(query)
-        );
+        let url = self.build_url(&["search", endpoint], &[("q", query.to_string())])?;
 
         let response = self
-            .authed_request(reqwest::Method::GET, &url)?
-            .send()
+            .send_with_retry(
+                self.authed_request(reqwest::Method::GET, url.as_str())?,
+                true,
+            )
             .await?;
 
         if !response.status().is_success() {
@@ -474,9 +542,14 @@ impl Integration for GitHubConnector {
 
     async fn status(&self) -> IntegrationStatus {
         // Verify the token works with a lightweight API call
-        let url = format!("{}/user", Self::API_BASE);
-        match self.authed_request(reqwest::Method::GET, &url) {
-            Ok(req) => match req.send().await {
+        let url = match self.build_url(&["user"], &[]) {
+            Ok(url) => url,
+            Err(error) => {
+                return IntegrationStatus::Error(format!("Invalid GitHub URL: {}", error))
+            }
+        };
+        match self.authed_request(reqwest::Method::GET, url.as_str()) {
+            Ok(req) => match self.send_with_retry(req, true).await {
                 Ok(resp) if resp.status().is_success() => IntegrationStatus::Connected,
                 Ok(resp) => {
                     let status = resp.status();

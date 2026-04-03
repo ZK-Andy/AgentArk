@@ -171,9 +171,142 @@ export type TraceSummary = {
   duration_ms?: number;
 };
 
+export type TraceOperationalEvent = {
+  id: string;
+  trace_id?: string | null;
+  created_at: string;
+  channel: string;
+  event_type: string;
+  success: boolean;
+  outcome: string;
+  tool_name?: string | null;
+  latency_ms?: number | null;
+};
+
 export type TraceResponse = {
   history: TraceSummary[];
   history_total?: number;
+  recent_events?: TraceOperationalEvent[];
+};
+
+export type AutonomyActionExecutionResponse = {
+  status: string;
+  message?: string;
+  queued?: boolean;
+  trace_id?: string;
+  result?: Record<string, unknown>;
+};
+
+export type SentinelSettings = {
+  enabled: boolean;
+  watch_in_app: boolean;
+  watch_connected_services: boolean;
+  infer_new_automations: boolean;
+  confidence_threshold: number;
+  max_proposals_per_scan: number;
+};
+
+export type SentinelSettingsResponse = {
+  settings: SentinelSettings;
+  autonomy_mode: "off" | "assist" | "auto" | string;
+  daily_run_limit?: number | null;
+  quiet_hours_start?: string | null;
+  quiet_hours_end?: string | null;
+  agent_paused?: boolean;
+};
+
+export type SentinelObservation = {
+  id: string;
+  fingerprint: string;
+  kind: string;
+  title: string;
+  detail: string;
+  source_kind: string;
+  source_id?: string | null;
+  source_label?: string | null;
+  confidence: number;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type SentinelProposal = {
+  id: string;
+  fingerprint: string;
+  proposal_kind: string;
+  status: string;
+  title: string;
+  detail: string;
+  rationale: string;
+  source_kind: string;
+  source_id?: string | null;
+  source_label?: string | null;
+  confidence: number;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+  snoozed_until?: string | null;
+  approved_at?: string | null;
+  dismissed_at?: string | null;
+  trace_id?: string | null;
+  run_status?: string | null;
+  last_run_summary?: string | null;
+  action?: RecommendedSkill | null;
+  chat_suggestion_id?: string | null;
+};
+
+export type SentinelScanState = {
+  last_started_at?: string | null;
+  last_completed_at?: string | null;
+  last_status?: string | null;
+  last_error?: string | null;
+  last_trigger?: string | null;
+  last_created_observations?: number;
+  last_created_proposals?: number;
+  last_auto_executed?: number;
+  open_proposals?: number;
+};
+
+export type SentinelBackgroundLearningJob = {
+  status: string;
+  last_started_at?: string | null;
+  last_completed_at?: string | null;
+  summary?: string | null;
+  changed?: boolean;
+  runs?: number;
+  stats?: Record<string, unknown>;
+  last_error?: string | null;
+};
+
+export type SentinelBackgroundLearning = {
+  status: string;
+  last_started_at?: string | null;
+  last_completed_at?: string | null;
+  summary?: string | null;
+  changed?: boolean;
+  jobs?: Partial<
+    Record<
+      "reflection_pass" | "memory_consolidation" | "experience_consolidation" | "pattern_induction" | "candidate_generation",
+      SentinelBackgroundLearningJob
+    >
+  > & Record<string, SentinelBackgroundLearningJob>;
+};
+
+export type SentinelFeedResponse = {
+  generated_at: string;
+  scan: SentinelScanState;
+  observations: SentinelObservation[];
+  proposals: SentinelProposal[];
+  background_learning?: SentinelBackgroundLearning | null;
+  stats: {
+    open_proposals: number;
+    completed_recently: number;
+    connected_services: number;
+    important_service_events: number;
+    recent_runs: number;
+    auto_mode_enabled: boolean;
+  };
 };
 
 export type RecommendedSkill = {
@@ -199,33 +332,6 @@ export type BriefingResponse = {
   top_opportunities: Array<{ title?: string; summary?: string; detail?: string; score?: number }>;
   recommended_skills: RecommendedSkill[];
   trust_summary: Record<string, unknown>;
-};
-
-export type MemoryContextSummary = {
-  id: string;
-  summary: string;
-  memory_type: string;
-  timestamp: string;
-  channel?: string;
-  importance: number;
-};
-
-export type PredictiveNudge = {
-  id: string;
-  type: string;
-  title: string;
-  detail: string;
-  confidence: number;
-  priority: number;
-  source?: string;
-  recommended_skill?: RecommendedSkill;
-  memory_clues?: MemoryContextSummary[];
-};
-
-export type PredictiveNudgesResponse = {
-  generated_at: string;
-  nudges: PredictiveNudge[];
-  hidden_count?: number;
 };
 
 export type LlmAnalyticsTotals = {

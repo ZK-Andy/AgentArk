@@ -10,6 +10,7 @@ use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
 use parking_lot::RwLock;
+use sea_orm::entity::prelude::PgVector;
 use std::sync::Arc;
 
 /// Encrypted storage that wraps the base storage
@@ -48,7 +49,6 @@ impl EncryptedStorage {
             "user_profile",
             crate::core::observability::OBSERVABILITY_LOG_KEY,
             crate::sentinel::PULSE_LOG_KEY,
-            crate::storage::legacy_recovery::LEGACY_STORAGE_KEYS_KEY,
         ];
 
         self.storage
@@ -94,7 +94,7 @@ impl EncryptedStorage {
         id: &str,
         content: &str,
         context: &str,
-        embedding: Option<Vec<u8>>,
+        embedding: Option<PgVector>,
         importance: f32,
         project_id: Option<&str>,
     ) -> Result<()> {
@@ -161,7 +161,7 @@ impl EncryptedStorage {
         fact: &str,
         confidence: f32,
         sources: &str,
-        embedding: Option<Vec<u8>>,
+        embedding: Option<PgVector>,
         project_id: Option<&str>,
     ) -> Result<()> {
         let encrypted_fact = self.current_key_manager().encrypt_string(fact)?;
@@ -197,8 +197,22 @@ impl EncryptedStorage {
         Ok(self.decrypt_fact_content(facts))
     }
 
+    /// Get only global-scope facts and decrypt their content.
+    pub async fn get_global_facts_decrypted(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<semantic_fact::Model>> {
+        let facts = self.storage.get_global_facts(limit, offset).await?;
+        Ok(self.decrypt_fact_content(facts))
+    }
+
     pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
         self.storage.count_facts(project_id).await
+    }
+
+    pub async fn count_global_facts(&self) -> Result<u64> {
+        self.storage.count_global_facts().await
     }
 
     // ==================== Encrypted KV Store ====================
@@ -289,14 +303,6 @@ impl EncryptedStorage {
         self.storage.insert_execution_trace(trace).await
     }
 
-    pub async fn list_execution_traces_decrypted(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<execution_trace::Model>> {
-        self.storage.list_execution_traces(limit, offset).await
-    }
-
     pub async fn get_execution_trace_decrypted(
         &self,
         id: &str,
@@ -311,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn reencrypt_all_sensitive_data_updates_rows_and_live_key() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let _temp_dir = tempfile::tempdir().unwrap();
         let storage = Storage::connect(
             crate::storage::DatabaseConfig::for_tests().expect("test database config"),
         )

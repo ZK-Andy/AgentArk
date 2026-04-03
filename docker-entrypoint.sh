@@ -10,6 +10,23 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
+CHILD_PIDS=""
+
+track_child() {
+    if [ -n "${1:-}" ]; then
+        CHILD_PIDS="$CHILD_PIDS $1"
+    fi
+}
+
+cleanup_children() {
+    for pid in $CHILD_PIDS; do
+        if kill -0 "$pid" >/dev/null 2>&1; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+trap cleanup_children EXIT INT TERM
 
 # Ensure directories exist with proper permissions
 ensure_directories() {
@@ -17,6 +34,68 @@ ensure_directories() {
     mkdir -p /app/data/tailscale 2>/dev/null || true
     mkdir -p /app/config 2>/dev/null || true
     chown -R agent:agent /app/data /app/config 2>/dev/null || true
+}
+
+load_internal_service_tokens() {
+    TOKENS_FILE=${AGENTARK_INTERNAL_TOKENS_FILE:-/app/config/internal-service-tokens.env}
+    LOCK_DIR="${TOKENS_FILE}.lock"
+    LOCK_WAIT_TICKS=0
+
+    if [ -f "$TOKENS_FILE" ]; then
+        set -a
+        . "$TOKENS_FILE"
+        set +a
+        chmod 600 "$TOKENS_FILE" 2>/dev/null || true
+        chown root:root "$TOKENS_FILE" 2>/dev/null || true
+    fi
+
+    if [ -n "${AGENTARK_EXECUTOR_TOKEN:-}" ] && [ -n "${AGENTARK_WORKSPACE_TOKEN:-}" ]; then
+        return
+    fi
+
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        LOCK_WAIT_TICKS=$((LOCK_WAIT_TICKS + 1))
+        if [ "$LOCK_WAIT_TICKS" -ge 300 ]; then
+            echo -e "${RED}Timed out waiting for the internal token bootstrap lock.${NC}"
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    if [ -f "$TOKENS_FILE" ]; then
+        set -a
+        . "$TOKENS_FILE"
+        set +a
+        chmod 600 "$TOKENS_FILE" 2>/dev/null || true
+        chown root:root "$TOKENS_FILE" 2>/dev/null || true
+    fi
+
+    if [ -z "${AGENTARK_EXECUTOR_TOKEN:-}" ] || [ -z "${AGENTARK_WORKSPACE_TOKEN:-}" ]; then
+        umask 077
+        EXECUTOR_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+        WORKSPACE_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+        TMP_FILE="${TOKENS_FILE}.tmp.$$"
+        cat > "$TMP_FILE" <<EOF
+AGENTARK_EXECUTOR_TOKEN=$EXECUTOR_TOKEN
+AGENTARK_WORKSPACE_TOKEN=$WORKSPACE_TOKEN
+EOF
+        chmod 600 "$TMP_FILE"
+        mv "$TMP_FILE" "$TOKENS_FILE"
+        chown root:root "$TOKENS_FILE" 2>/dev/null || true
+        export AGENTARK_EXECUTOR_TOKEN="$EXECUTOR_TOKEN"
+        export AGENTARK_WORKSPACE_TOKEN="$WORKSPACE_TOKEN"
+        echo -e "${GREEN}Generated internal service tokens for this install.${NC}"
+    fi
+
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+
+    if [ -f "$TOKENS_FILE" ]; then
+        set -a
+        . "$TOKENS_FILE"
+        set +a
+        chmod 600 "$TOKENS_FILE" 2>/dev/null || true
+        chown root:root "$TOKENS_FILE" 2>/dev/null || true
+    fi
 }
 
 # Fix Docker socket permissions so 'agent' can spawn sandboxed containers
@@ -34,7 +113,7 @@ setup_docker_socket() {
         # TCP proxy (docker-socket-proxy) — no socket permissions needed
         echo -e "${GREEN}Docker available via proxy ($DOCKER_HOST) — sandboxed code execution enabled${NC}"
     else
-        echo -e "${YELLOW}Docker not available — code execution will use native fallback${NC}"
+        echo -e "${YELLOW}Docker not available — sandboxed code execution is unavailable${NC}"
     fi
 }
 
@@ -62,16 +141,36 @@ check_volume_mount() {
     fi
 }
 
+check_bundled_skills() {
+    if [ ! -d /app/skills ]; then
+        echo -e "${RED}Bundled skills directory /app/skills is missing. This image is incomplete.${NC}"
+        return
+    fi
+
+    BUNDLED_SKILL_COUNT=$(find /app/skills -mindepth 2 -maxdepth 2 -name SKILL.md 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${BUNDLED_SKILL_COUNT:-0}" -eq 0 ]; then
+        if [ -f /app/data/removed_bundled_actions.json ]; then
+            echo -e "${YELLOW}No bundled SKILL.md files are currently present under /app/skills. They may have been deleted for this install.${NC}"
+        else
+            echo -e "${RED}No bundled SKILL.md files found under /app/skills. Bundled skills will not appear in the UI.${NC}"
+        fi
+    else
+        echo -e "${GREEN}Bundled skills available - ${BUNDLED_SKILL_COUNT} SKILL.md files found under /app/skills${NC}"
+    fi
+}
+
 # Run setup as root
 setup_docker_socket
 check_volume_mount
+check_bundled_skills
+load_internal_service_tokens
 
-# WhatsApp bridge is managed by the AgentArk backend (started/stopped via Settings UI)
+# WhatsApp bridge is bundled in the full image and managed by the AgentArk backend on demand
+# when WhatsApp Baileys runs in bundled bridge mode. Cloud API mode does not start it.
 
-# Forward Docker secret as env var (if present)
+# Confirm Docker secret is available for direct app reads (if present)
 if [ -f /run/secrets/agentark_master_key ]; then
-    export AGENTARK_MASTER_PASSWORD=$(cat /run/secrets/agentark_master_key)
-    echo -e "${GREEN}Docker secret found — master password will be used for encryption${NC}"
+    echo -e "${GREEN}Docker secret found — application will read the encryption secret directly from /run/secrets${NC}"
 fi
 
 # Print startup banner
@@ -97,6 +196,7 @@ start_tailscale_daemon() {
             --socket="$TS_SOCKET" \
             --tun=userspace-networking &
         TAILSCALE_PID=$!
+        track_child "$TAILSCALE_PID"
 
         for _ in $(seq 1 20); do
             if [ -S "$TS_SOCKET" ]; then
@@ -114,27 +214,9 @@ start_tailscale_daemon() {
 
 start_tailscale_daemon
 
-# Start Mem0 memory bridge in background (localhost-only)
-start_mem0_bridge() {
-    MEM0_PYTHON_BIN=${MEM0_PYTHON:-/opt/mem0-venv/bin/python}
-    if [ -x "$MEM0_PYTHON_BIN" ] && [ -f /app/mem0-bridge/app.py ]; then
-        echo -e "${GREEN}Starting Mem0 memory bridge (localhost:8991)...${NC}"
-        QDRANT_PATH=/app/data/qdrant \
-        MODEL_CACHE=/app/data/models \
-        gosu agent "$MEM0_PYTHON_BIN" -m uvicorn app:app --host 127.0.0.1 --port 8991 --app-dir /app/mem0-bridge &
-        MEM0_PID=$!
-        echo -e "${GREEN}Mem0 bridge started (PID: $MEM0_PID)${NC}"
-    else
-        echo -e "${YELLOW}Mem0 bridge not available (Mem0 Python runtime or bridge files missing)${NC}"
-    fi
-}
-
-# Start Mem0 bridge in background before main app
-start_mem0_bridge
-
 # Start Playwright bridge in background (localhost-only)
 start_playwright_bridge() {
-    if ! command -v node >/dev/null 2>&1 || [ ! -f /app/playwright-bridge/index.js ] || [ ! -d /app/playwright-bridge/node_modules ]; then
+    if ! command -v node >/dev/null 2>&1 || [ ! -f /app/bridges/playwright-bridge/index.js ] || [ ! -d /app/bridges/playwright-bridge/node_modules ]; then
         echo -e "${YELLOW}Playwright bridge not available (Node.js or bridge dependencies missing)${NC}"
         return
     fi
@@ -146,21 +228,42 @@ start_playwright_bridge() {
         fi
     fi
 
-    if command -v node >/dev/null 2>&1 && [ -f /app/playwright-bridge/index.js ]; then
+    if command -v node >/dev/null 2>&1 && [ -f /app/bridges/playwright-bridge/index.js ]; then
         echo -e "${GREEN}Starting Playwright bridge (localhost:3100)...${NC}"
         PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright-browsers} \
         PLAYWRIGHT_EXECUTABLE_PATH=${PLAYWRIGHT_EXECUTABLE_PATH:-} \
         PORT=${PLAYWRIGHT_BRIDGE_PORT:-3100} \
         PLAYWRIGHT_BRIDGE_HOST=${PLAYWRIGHT_BRIDGE_HOST:-127.0.0.1} \
-        gosu agent node /app/playwright-bridge/index.js &
+        gosu agent node /app/bridges/playwright-bridge/index.js &
         PLAYWRIGHT_PID=$!
+        track_child "$PLAYWRIGHT_PID"
         echo -e "${GREEN}Playwright bridge started (PID: $PLAYWRIGHT_PID)${NC}"
     fi
 }
 
 start_playwright_bridge
 
-# WhatsApp bridge: started by AgentArk when user enables WhatsApp in Settings UI
+# WhatsApp bridge: started by AgentArk on demand for Baileys bundled bridge mode only
 
-# Drop privileges to 'agent' user and exec the app
-exec gosu agent /app/agentark "$@"
+# Drop privileges to 'agent' user and start the app under supervision
+gosu agent /app/agentark "$@" &
+MAIN_PID=$!
+track_child "$MAIN_PID"
+
+while true; do
+    if ! kill -0 "$MAIN_PID" >/dev/null 2>&1; then
+        wait "$MAIN_PID"
+        exit $?
+    fi
+
+    for pid in ${TAILSCALE_PID:-} ${PLAYWRIGHT_PID:-}; do
+        if [ -n "$pid" ] && ! kill -0 "$pid" >/dev/null 2>&1; then
+            echo -e "${RED}Background service exited unexpectedly (PID: $pid); stopping AgentArk${NC}"
+            kill "$MAIN_PID" >/dev/null 2>&1 || true
+            wait "$MAIN_PID" || true
+            exit 1
+        fi
+    done
+
+    sleep 5
+done

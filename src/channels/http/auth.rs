@@ -1,4 +1,6 @@
 use super::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
@@ -37,10 +39,6 @@ pub(super) async fn sync_http_api_key_state(
         let cached_exp = *state.api_key_expires_at.read().await;
         if let (Some(key), Some(expires_at)) = (cached_key, cached_exp) {
             if expires_at > now {
-                let mut session_guard = state.session_token.write().await;
-                if session_guard.is_none() {
-                    *session_guard = Some(generate_ephemeral_token());
-                }
                 return Ok((
                     Some(crate::core::config::HttpApiKeyInfo {
                         key,
@@ -76,24 +74,12 @@ pub(super) async fn sync_http_api_key_state(
         let mut agent = state.agent.write().await;
         agent.api_key = info.as_ref().map(|k| k.key.clone());
     }
+    if info.is_none() && state.deployment_mode != crate::core::config::DeploymentMode::TrustedLocal
     {
-        let mut session_guard = state.session_token.write().await;
-        if info.is_some()
-            || state.deployment_mode == crate::core::config::DeploymentMode::TrustedLocal
-        {
-            if session_guard.is_none() {
-                *session_guard = Some(generate_ephemeral_token());
-            }
-        } else {
-            *session_guard = None;
-        }
+        state.ui_sessions.write().await.clear();
     }
 
     Ok((info, rotated))
-}
-
-pub(super) async fn current_ui_session_token(state: &AppState) -> Option<String> {
-    state.session_token.read().await.clone()
 }
 
 async fn create_local_ui_bootstrap_token(
@@ -101,7 +87,7 @@ async fn create_local_ui_bootstrap_token(
     headers: &HeaderMap,
     addr: SocketAddr,
 ) -> Option<String> {
-    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(headers, addr) {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_api_request(headers, addr) {
         return None;
     }
     let (info, _rotated) = sync_http_api_key_state(state, false).await.ok()?;
@@ -146,34 +132,102 @@ pub(super) fn extract_bearer_api_key(headers: &HeaderMap) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 pub(super) fn has_valid_bearer_api_key(headers: &HeaderMap, expected_key: Option<&str>) -> bool {
     let Some(expected_key) = expected_key else {
         return false;
     };
     extract_bearer_api_key(headers)
         .as_deref()
-        .is_some_and(|provided| provided == expected_key)
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected_key.as_bytes()))
 }
 
-pub(super) fn has_valid_ui_session_cookie(
-    headers: &HeaderMap,
-    session_token: Option<&str>,
-) -> bool {
-    let Some(session_token) = session_token else {
-        return false;
-    };
+fn extract_ui_session_cookie(headers: &HeaderMap) -> Option<String> {
     let cookies = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     for part in cookies.split(';') {
-        if let Some(value) = part.trim().strip_prefix("agentark_session=") {
-            if value == session_token {
-                return true;
+        if let Some(value) = part
+            .trim()
+            .strip_prefix(&format!("{}=", crate::branding::SESSION_COOKIE_NAME))
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
             }
         }
     }
+    None
+}
+
+fn session_client_hint(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect())
+}
+
+async fn create_ui_session(state: &AppState, headers: &HeaderMap, source: &str) -> String {
+    let now = unix_now_ts();
+    let mut sessions = state.ui_sessions.write().await;
+    sessions.retain(|_, record| record.expires_at > now);
+    while sessions.len() >= crate::channels::http::UI_SESSION_MAX_TRACKED {
+        let Some(oldest_token) = sessions
+            .iter()
+            .min_by_key(|(_, record)| record.last_seen_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest_token);
+    }
+
+    let token = generate_ephemeral_token();
+    sessions.insert(
+        token.clone(),
+        crate::channels::http::UiSessionRecord {
+            issued_at: now,
+            expires_at: now + crate::channels::http::UI_SESSION_TTL_SECS,
+            last_seen_at: now,
+            source: source.to_string(),
+            client_hint: session_client_hint(headers),
+        },
+    );
+    token
+}
+
+pub(super) async fn has_valid_ui_session_cookie(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = extract_ui_session_cookie(headers) else {
+        return false;
+    };
+    let now = unix_now_ts();
+    let mut sessions = state.ui_sessions.write().await;
+    sessions.retain(|_, record| record.expires_at > now);
+    if let Some(record) = sessions.get_mut(&token) {
+        record.last_seen_at = now;
+        return true;
+    }
     false
+}
+
+pub(super) async fn revoke_ui_session(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = extract_ui_session_cookie(headers) else {
+        return false;
+    };
+    state.ui_sessions.write().await.remove(&token).is_some()
 }
 
 pub(super) fn is_local_request_host(headers: &HeaderMap) -> bool {
@@ -188,6 +242,80 @@ pub(super) fn is_trusted_local_ui_request(headers: &HeaderMap, addr: SocketAddr)
     }
     let ip = addr.ip();
     ip.is_loopback() || is_container_host_gateway_ip(ip)
+}
+
+fn parsed_same_origin_referer_path(headers: &HeaderMap) -> Option<String> {
+    let referer = headers.get(header::REFERER)?.to_str().ok()?.trim();
+    if referer.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(referer).ok()?;
+    let referer_host = normalize_host_for_compare(url.host_str()?);
+    let request_host = extract_request_host(headers)?;
+    if referer_host != request_host {
+        return None;
+    }
+    Some(url.path().to_string())
+}
+
+fn is_ui_shell_path(path: &str) -> bool {
+    path == "/" || path == "/ui" || path == "/ui/" || path.starts_with("/ui/")
+}
+
+fn is_app_shell_path(path: &str) -> bool {
+    path == "/apps" || path == "/apps/" || path.starts_with("/apps/")
+}
+
+fn request_has_ui_referer(headers: &HeaderMap) -> bool {
+    parsed_same_origin_referer_path(headers)
+        .as_deref()
+        .is_some_and(is_ui_shell_path)
+}
+
+fn request_has_app_referer(headers: &HeaderMap) -> bool {
+    parsed_same_origin_referer_path(headers)
+        .as_deref()
+        .is_some_and(is_app_shell_path)
+}
+
+fn is_browser_navigation_request(headers: &HeaderMap) -> bool {
+    let mode_is_navigate = headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("navigate"));
+    let dest_is_document = headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("document"));
+    mode_is_navigate || dest_is_document
+}
+
+fn is_trusted_local_ui_navigation_request(headers: &HeaderMap, addr: SocketAddr) -> bool {
+    is_trusted_local_ui_request(headers, addr)
+        && !request_has_app_referer(headers)
+        && (is_browser_navigation_request(headers) || headers.get(header::REFERER).is_none())
+}
+
+fn is_trusted_local_ui_api_request(headers: &HeaderMap, addr: SocketAddr) -> bool {
+    is_trusted_local_ui_request(headers, addr)
+        && request_has_ui_referer(headers)
+        && !request_has_app_referer(headers)
+}
+
+fn valid_ui_session_request_context(
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    deployment_mode: crate::core::config::DeploymentMode,
+) -> bool {
+    if deployment_mode == crate::core::config::DeploymentMode::TrustedLocal {
+        return is_trusted_local_ui_api_request(headers, addr);
+    }
+
+    if request_has_app_referer(headers) {
+        return false;
+    }
+
+    request_has_ui_referer(headers)
 }
 
 fn is_container_host_gateway_ip(ip: IpAddr) -> bool {
@@ -222,7 +350,10 @@ pub(super) async fn should_issue_ui_session_cookie(
     headers: &HeaderMap,
     addr: SocketAddr,
 ) -> bool {
-    if is_trusted_local_ui_request(headers, addr) {
+    if has_valid_ui_session_cookie(state, headers).await {
+        return false;
+    }
+    if is_trusted_local_ui_navigation_request(headers, addr) {
         return true;
     }
 
@@ -233,7 +364,77 @@ pub(super) async fn should_issue_ui_session_cookie(
     has_valid_bearer_api_key(headers, expected_key.as_deref())
 }
 
-pub(super) async fn issue_oauth_state(state: &AppState, service_id: &str) -> String {
+async fn apply_new_ui_session_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    response: &mut Response,
+    secure: bool,
+    source: &str,
+) {
+    let token = create_ui_session(state, headers, source).await;
+    apply_session_cookie(response, Some(token.as_str()), secure);
+}
+
+pub(super) async fn issue_oauth_state(
+    state: &AppState,
+    service_id: &str,
+    redirect_uri: Option<String>,
+) -> String {
+    store_oauth_state(
+        state,
+        PendingOAuthTarget::Integration {
+            service_id: service_id.to_string(),
+        },
+        None,
+        redirect_uri,
+    )
+    .await
+}
+
+pub(super) async fn issue_oauth_state_with_pkce(
+    state: &AppState,
+    service_id: &str,
+    redirect_uri: Option<String>,
+) -> (String, String) {
+    let verifier = generate_ephemeral_token();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let token = store_oauth_state(
+        state,
+        PendingOAuthTarget::Integration {
+            service_id: service_id.to_string(),
+        },
+        Some(verifier),
+        redirect_uri,
+    )
+    .await;
+    (token, challenge)
+}
+
+pub(super) async fn issue_auth_profile_oauth_state_with_pkce(
+    state: &AppState,
+    profile_id: &str,
+    redirect_uri: Option<String>,
+) -> (String, String) {
+    let verifier = generate_ephemeral_token();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let token = store_oauth_state(
+        state,
+        PendingOAuthTarget::AuthProfile {
+            profile_id: profile_id.to_string(),
+        },
+        Some(verifier),
+        redirect_uri,
+    )
+    .await;
+    (token, challenge)
+}
+
+async fn store_oauth_state(
+    state: &AppState,
+    target: PendingOAuthTarget,
+    pkce_verifier: Option<String>,
+    redirect_uri: Option<String>,
+) -> String {
     let token = generate_ephemeral_token();
     let now = unix_now_ts();
     let mut oauth_states = state.oauth_states.write().await;
@@ -244,26 +445,31 @@ pub(super) async fn issue_oauth_state(state: &AppState, service_id: &str) -> Str
     oauth_states.insert(
         token.clone(),
         PendingOAuthState {
-            service_id: service_id.to_string(),
+            target,
             expires_at: now + OAUTH_STATE_TTL_SECS,
+            pkce_verifier,
+            redirect_uri,
         },
     );
     token
 }
 
-pub(super) async fn consume_oauth_state(state: &AppState, state_token: &str) -> Option<String> {
+pub(super) async fn consume_oauth_state(
+    state: &AppState,
+    state_token: &str,
+) -> Option<PendingOAuthState> {
     let now = unix_now_ts();
     let mut oauth_states = state.oauth_states.write().await;
     oauth_states.retain(|_, entry| entry.expires_at > now);
     oauth_states
         .remove(state_token)
-        .and_then(|entry| (entry.expires_at > now).then_some(entry.service_id))
+        .and_then(|entry| (entry.expires_at > now).then_some(entry))
 }
 
 pub(super) async fn auth_middleware(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: axum::http::Request<axum::body::Body>,
+    mut request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let ip = addr.ip().to_string();
@@ -273,10 +479,7 @@ pub(super) async fn auth_middleware(
     let expected_key = match sync_http_api_key_state(&state, false).await {
         Ok((info, _rotated)) => info.map(|k| k.key),
         Err(e) => {
-            state
-                .security_events
-                .auth_failures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.security_events.record_auth_failure();
             spawn_security_log(
                 state.agent.clone(),
                 "auth_failure",
@@ -297,32 +500,24 @@ pub(super) async fn auth_middleware(
         }
     };
 
-    // If API key is missing, fail closed unless explicitly overridden.
+    // If API key is missing, fail closed.
     let Some(expected_key) = expected_key else {
-        let session_token = current_ui_session_token(&state).await;
         if state.deployment_mode == crate::core::config::DeploymentMode::TrustedLocal
-            && is_trusted_local_ui_request(request.headers(), addr)
-            && has_valid_ui_session_cookie(request.headers(), session_token.as_deref())
+            && valid_ui_session_request_context(request.headers(), addr, state.deployment_mode)
+            && has_valid_ui_session_cookie(&state, request.headers()).await
         {
-            return next.run(request).await;
-        }
-
-        if state.allow_insecure_no_auth {
-            if !MISSING_API_KEY_WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "Protected routes are running without API auth because AGENTARK_INSECURE_NO_AUTH=true"
-                );
-            }
+            request
+                .extensions_mut()
+                .insert(crate::actions::ActionCallerPrincipal::local_admin(
+                    "trusted_local_ui_session",
+                ));
             return next.run(request).await;
         }
 
         if !MISSING_API_KEY_WARNED.swap(true, Ordering::Relaxed) {
             tracing::error!("Blocking protected routes because HTTP API key is not configured");
         }
-        state
-            .security_events
-            .auth_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.security_events.record_auth_failure();
         spawn_security_log(
             state.agent.clone(),
             "auth_failure",
@@ -336,29 +531,24 @@ pub(super) async fn auth_middleware(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
-                error: if state.deployment_mode
-                    == crate::core::config::DeploymentMode::TrustedLocal
-                {
-                    "API authentication is not configured. Regenerate an API key from a trusted session, or set AGENTARK_INSECURE_NO_AUTH=true temporarily."
-                        .to_string()
-                } else {
-                    "API authentication is not configured. Regenerate an API key from a trusted session."
-                        .to_string()
-                },
+                error: "API authentication is not configured. Regenerate an API key from a trusted session."
+                    .to_string(),
             }),
         )
             .into_response();
     };
 
     if has_valid_bearer_api_key(request.headers(), Some(expected_key.as_str())) {
+        request
+            .extensions_mut()
+            .insert(crate::actions::ActionCallerPrincipal::local_admin(
+                "api_key",
+            ));
         return next.run(request).await;
     }
 
     if extract_bearer_api_key(request.headers()).is_some() {
-        state
-            .security_events
-            .auth_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.security_events.record_auth_failure();
         spawn_security_log(
             state.agent.clone(),
             "auth_failure",
@@ -375,15 +565,18 @@ pub(super) async fn auth_middleware(
             .into_response();
     }
 
-    let session_token = current_ui_session_token(&state).await;
-    if has_valid_ui_session_cookie(request.headers(), session_token.as_deref()) {
+    if has_valid_ui_session_cookie(&state, request.headers()).await
+        && valid_ui_session_request_context(request.headers(), addr, state.deployment_mode)
+    {
+        request
+            .extensions_mut()
+            .insert(crate::actions::ActionCallerPrincipal::local_admin(
+                "ui_session",
+            ));
         return next.run(request).await;
     }
 
-    state
-        .security_events
-        .auth_failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.security_events.record_auth_failure();
     spawn_security_log(
         state.agent.clone(),
         "auth_failure",
@@ -444,12 +637,14 @@ pub(super) async fn bootstrap_ui_session(
 
     let mut response =
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response();
-    let session_token = current_ui_session_token(&state).await;
-    apply_session_cookie(
+    apply_new_ui_session_cookie(
+        &state,
+        &headers,
         &mut response,
-        session_token.as_ref(),
         state.cookie_secure_default || is_https_forwarded(&headers),
-    );
+        "api_bootstrap",
+    )
+    .await;
     response
 }
 
@@ -458,7 +653,7 @@ pub(super) async fn issue_local_ui_bootstrap_token(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(&headers, addr) {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_api_request(&headers, addr) {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -495,7 +690,7 @@ pub(super) async fn bootstrap_local_ui_session(
     headers: HeaderMap,
     Json(request): Json<LocalUiBootstrapRequest>,
 ) -> Response {
-    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_request(&headers, addr) {
+    if !state.local_ui_bootstrap_enabled || !is_trusted_local_ui_api_request(&headers, addr) {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -541,12 +736,14 @@ pub(super) async fn bootstrap_local_ui_session(
 
     let mut response =
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response();
-    let session_token = current_ui_session_token(&state).await;
-    apply_session_cookie(
+    apply_new_ui_session_cookie(
+        &state,
+        &headers,
         &mut response,
-        session_token.as_ref(),
         state.cookie_secure_default || is_https_forwarded(&headers),
-    );
+        "local_bootstrap",
+    )
+    .await;
     response
 }
 
@@ -558,15 +755,41 @@ pub(super) fn is_https_forwarded(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn apply_session_cookie(response: &mut Response, token: Option<&String>, secure: bool) {
+pub(super) fn apply_session_cookie(response: &mut Response, token: Option<&str>, secure: bool) {
     if let Some(token) = token {
         let secure_attr = if secure { "; Secure" } else { "" };
         let cookie = format!(
-            "agentark_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400{}",
-            token, secure_attr
+            "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400{}",
+            crate::branding::SESSION_COOKIE_NAME,
+            token,
+            secure_attr
         );
         if let Ok(val) = cookie.parse() {
             response.headers_mut().insert(header::SET_COOKIE, val);
         }
     }
+}
+
+pub(super) fn clear_session_cookie(response: &mut Response, secure: bool) {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        crate::branding::SESSION_COOKIE_NAME,
+        secure_attr
+    );
+    if let Ok(val) = cookie.parse() {
+        response.headers_mut().insert(header::SET_COOKIE, val);
+    }
+}
+
+pub(super) async fn logout_ui_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let secure = state.cookie_secure_default || is_https_forwarded(&headers);
+    let _ = revoke_ui_session(&state, &headers).await;
+    let mut response =
+        (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response();
+    clear_session_cookie(&mut response, secure);
+    response
 }

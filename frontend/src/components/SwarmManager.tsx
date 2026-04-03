@@ -1,23 +1,9 @@
-import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogTitle,
-  IconButton,
-  Stack,
-  Typography
-} from "@mui/material";
-import CloseIcon from "@mui/icons-material/Close";
+import { Alert, Box, Chip, Grid2, Stack, Typography } from "@mui/material";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import type { ReactNode } from "react";
 import { api } from "../api/client";
 
 const REFRESH_MS = 8000;
-const HISTORY_LIMIT = 200;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -28,21 +14,45 @@ type Props = {
 type ProvisionedAgent = {
   id: string;
   name: string;
+  displayName: string;
+  agentType: string;
   provider: string;
   model: string;
   capabilities: string[];
   createdAt: string;
   status: string;
+  enabled: boolean;
+  lastTask: string;
+  lastSummary: string;
+  lastUpdate: string;
+  lastActivityAt: string;
 };
 
-type HistoryItem = {
+type SwarmRunAgent = {
   id: string;
   agentName: string;
-  triggerText: string;
-  workText: string;
+  agentRole: string;
+  modelName: string;
+  task: string;
   status: string;
-  timestamp: string;
-  detail: string;
+  summary: string;
+  latestUpdate: string;
+  isSpecialist: boolean;
+  elapsedMs?: number;
+};
+
+type SwarmRun = {
+  id: string;
+  conversationId: string;
+  channel: string;
+  request: string;
+  status: string;
+  summary: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt: string;
+  agentCount: number;
+  agents: SwarmRunAgent[];
 };
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -78,56 +88,19 @@ function num(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function boolText(value: unknown): string {
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (typeof value === "number") return value === 0 ? "false" : "true";
-  if (typeof value === "string" && value.trim()) return value;
-  return "false";
+function bool(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+  }
+  return false;
 }
 
 function errMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   return "Request failed.";
-}
-
-function statusChipColor(status: string): "default" | "success" | "warning" | "error" {
-  const normalized = status.trim().toLowerCase();
-  if (normalized === "provisioned" || normalized === "idle" || normalized === "completed") return "success";
-  if (normalized === "busy" || normalized === "running") return "warning";
-  if (normalized === "offline" || normalized === "failed" || normalized === "cancelled") return "error";
-  return "default";
-}
-
-function normalizeLifecycleStatus(status: unknown): string {
-  const normalized = str(status, "").trim().toLowerCase();
-  if (normalized === "busy" || normalized === "running") return "running";
-  if (normalized === "completed" || normalized === "success") return "completed";
-  if (normalized === "failed" || normalized === "error") return "failed";
-  if (normalized === "cancelled" || normalized === "canceled") return "cancelled";
-  if (normalized === "offline") return "offline";
-  if (normalized === "disabled") return "disabled";
-  if (normalized === "idle" || normalized === "provisioned") return "provisioned";
-  return normalized || "provisioned";
-}
-
-function statusChipLabel(status: unknown): string {
-  switch (normalizeLifecycleStatus(status)) {
-    case "running":
-      return "Running";
-    case "completed":
-      return "Completed";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    case "offline":
-      return "Offline";
-    case "disabled":
-      return "Disabled";
-    default:
-      return "Provisioned";
-  }
 }
 
 function formatTimestamp(value: unknown): string {
@@ -138,19 +111,18 @@ function formatTimestamp(value: unknown): string {
   return parsed.toLocaleString();
 }
 
-function compactChatId(value: string): string {
-  const trimmed = value.trim();
-  return trimmed ? trimmed.slice(0, 8) : "";
+function formatElapsedMs(value: unknown): string {
+  const ms = Math.max(0, num(value, 0));
+  if (!ms) return "";
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(secs >= 10 ? 0 : 1)}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = Math.round(secs % 60);
+  return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
 }
 
-function parseCsv(value: string): string[] {
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function formatCapabilities(value: unknown): string[] {
+function parseCapabilities(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value
       .map((item) => {
@@ -164,16 +136,296 @@ function formatCapabilities(value: unknown): string[] {
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed)) return formatCapabilities(parsed);
+    return parseCapabilities(parsed);
   } catch {
-    return parseCsv(raw);
+    return raw
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
   }
-  return [];
+}
+
+function normalizeLifecycleStatus(status: unknown): string {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return "idle";
+  if (normalized === "busy") return "running";
+  if (normalized === "success") return "completed";
+  if (normalized === "cancelled" || normalized === "canceled") return "interrupted";
+  if (normalized === "degraded") return "partial";
+  return normalized;
+}
+
+function statusChipColor(status: unknown): "default" | "success" | "warning" | "error" {
+  switch (normalizeLifecycleStatus(status)) {
+    case "completed":
+    case "provisioned":
+    case "idle":
+      return "success";
+    case "running":
+    case "assigned":
+    case "synthesizing":
+    case "partial":
+      return "warning";
+    case "failed":
+    case "timed_out":
+    case "panicked":
+    case "interrupted":
+    case "offline":
+    case "disabled":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function statusChipLabel(status: unknown): string {
+  switch (normalizeLifecycleStatus(status)) {
+    case "assigned":
+      return "Assigned";
+    case "running":
+      return "Running";
+    case "synthesizing":
+      return "Synthesizing";
+    case "completed":
+      return "Completed";
+    case "partial":
+      return "Partial";
+    case "failed":
+      return "Failed";
+    case "timed_out":
+      return "Timed out";
+    case "panicked":
+      return "Panicked";
+    case "interrupted":
+      return "Stopped";
+    case "offline":
+      return "Offline";
+    case "disabled":
+      return "Disabled";
+    case "provisioned":
+      return "Provisioned";
+    default:
+      return "Idle";
+  }
+}
+
+function toProvisionedAgents(data: unknown): ProvisionedAgent[] {
+  return pickRecords(data, "agents")
+    .map((agent) => ({
+      id: str(agent.id, ""),
+      name: str(agent.name, "Agent"),
+      displayName: str(agent.display_name, str(agent.name, "Agent")),
+      agentType: str(agent.agent_type, "Agent"),
+      provider: str(agent.llm_provider, "-"),
+      model: str(agent.llm_model, "-"),
+      capabilities: parseCapabilities(agent.capabilities),
+      createdAt: str(agent.created_at, ""),
+      status: normalizeLifecycleStatus(agent.status),
+      enabled: bool(agent.enabled),
+      lastTask: str(agent.last_task, ""),
+      lastSummary: str(agent.last_summary, ""),
+      lastUpdate: str(agent.last_update, ""),
+      lastActivityAt: str(agent.last_activity_at, "")
+    }))
+    .sort((left, right) => {
+      const leftTs = Date.parse(left.lastActivityAt || left.createdAt || "");
+      const rightTs = Date.parse(right.lastActivityAt || right.createdAt || "");
+      return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0);
+    });
+}
+
+function toSwarmRuns(data: unknown): SwarmRun[] {
+  return pickRecords(data, "runs")
+    .map((run) => ({
+      id: str(run.id, ""),
+      conversationId: str(run.conversation_id, ""),
+      channel: str(run.channel, ""),
+      request: str(run.request, "Delegated run"),
+      status: normalizeLifecycleStatus(run.status),
+      summary: str(run.summary, ""),
+      startedAt: str(run.started_at, ""),
+      updatedAt: str(run.updated_at, ""),
+      completedAt: str(run.completed_at, ""),
+      agentCount: Math.max(0, num(run.agent_count, 0)),
+      agents: pickRecords(run.agents, "agents").map((agent) => ({
+        id: str(agent.id, ""),
+        agentName: str(agent.agent_name, "Agent"),
+        agentRole: str(agent.agent_role, ""),
+        modelName: str(agent.model_name, ""),
+        task: str(agent.task, ""),
+        status: normalizeLifecycleStatus(agent.status),
+        summary: str(agent.summary, ""),
+        latestUpdate: str(agent.latest_update, ""),
+        isSpecialist: bool(agent.is_specialist),
+        elapsedMs: num(agent.elapsed_ms, 0) || undefined
+      }))
+    }))
+    .filter((run) => run.id)
+    .sort((left, right) => {
+      const leftTs = Date.parse(left.updatedAt || left.startedAt || "");
+      const rightTs = Date.parse(right.updatedAt || right.startedAt || "");
+      return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0);
+    });
+}
+
+function SectionShell({
+  eyebrow,
+  title,
+  detail,
+  children
+}: {
+  eyebrow: string;
+  title: string;
+  detail: string;
+  children: ReactNode;
+}) {
+  return (
+    <Box
+      sx={{
+        p: { xs: 2, md: 2.35 },
+        borderRadius: "18px",
+        border: "1px solid rgba(255,255,255,0.07)",
+        background:
+          "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.025) 100%)",
+        boxShadow: "0 18px 40px rgba(7, 16, 32, 0.22)"
+      }}
+    >
+      <Stack spacing={1.4}>
+        <Box>
+          <Typography variant="overline" sx={{ letterSpacing: "0.16em", color: "info.light" }}>
+            {eyebrow}
+          </Typography>
+          <Typography variant="h6" sx={{ fontWeight: 800 }}>
+            {title}
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.35, maxWidth: 860 }}>
+            {detail}
+          </Typography>
+        </Box>
+        {children}
+      </Stack>
+    </Box>
+  );
+}
+
+function RunCard({ run, live = false }: { run: SwarmRun; live?: boolean }) {
+  const trackedAgents = Math.max(run.agentCount, run.agents.length);
+  return (
+    <Box
+      sx={{
+        p: 1.5,
+        borderRadius: "16px",
+        border: live
+          ? "1px solid rgba(88, 174, 255, 0.18)"
+          : "1px solid rgba(255,255,255,0.07)",
+        background: live
+          ? "linear-gradient(180deg, rgba(88, 174, 255, 0.10) 0%, rgba(255,255,255,0.03) 100%)"
+          : "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+      }}
+    >
+      <Stack spacing={1.2}>
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          alignItems={{ xs: "flex-start", md: "center" }}
+          justifyContent="space-between"
+          gap={1}
+        >
+          <Box sx={{ minWidth: 0 }}>
+            <Typography variant="body1" sx={{ fontWeight: 700 }}>
+              {run.request}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+              {run.summary || "Delegated run details available below."}
+            </Typography>
+          </Box>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            <Chip size="small" color={statusChipColor(run.status)} label={statusChipLabel(run.status)} />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`${trackedAgents} agent${trackedAgents === 1 ? "" : "s"}`}
+            />
+            {run.channel ? <Chip size="small" variant="outlined" label={run.channel} /> : null}
+          </Stack>
+        </Stack>
+
+        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+          {run.startedAt ? (
+            <Chip size="small" variant="outlined" label={`Started ${formatTimestamp(run.startedAt)}`} />
+          ) : null}
+          {run.completedAt ? (
+            <Chip size="small" variant="outlined" label={`Finished ${formatTimestamp(run.completedAt)}`} />
+          ) : null}
+          {run.conversationId ? (
+            <Chip size="small" variant="outlined" label={`Chat ${run.conversationId.slice(0, 8)}`} />
+          ) : null}
+        </Stack>
+
+        <Grid2 container spacing={1}>
+          {run.agents.map((agent) => (
+            <Grid2 key={`${run.id}-${agent.id}`} size={{ xs: 12, xl: 6 }}>
+              <Box
+                sx={{
+                  height: "100%",
+                  p: 1.1,
+                  borderRadius: "12px",
+                  border: "1px solid rgba(255,255,255,0.06)",
+                  background: "rgba(7, 12, 24, 0.58)"
+                }}
+              >
+                <Stack spacing={0.75}>
+                  <Stack
+                    direction={{ xs: "column", sm: "row" }}
+                    alignItems={{ xs: "flex-start", sm: "center" }}
+                    justifyContent="space-between"
+                    gap={0.75}
+                  >
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                        {agent.agentRole
+                          ? `${agent.agentName} · ${agent.agentRole}`
+                          : agent.agentName}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {agent.modelName || (agent.isSpecialist ? "Specialist model" : "Auto agent")}
+                      </Typography>
+                    </Box>
+                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      <Chip
+                        size="small"
+                        color={statusChipColor(agent.status)}
+                        label={statusChipLabel(agent.status)}
+                        sx={{ height: 22 }}
+                      />
+                      {agent.elapsedMs ? (
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={formatElapsedMs(agent.elapsedMs)}
+                          sx={{ height: 22 }}
+                        />
+                      ) : null}
+                    </Stack>
+                  </Stack>
+                  {agent.task ? (
+                    <Typography variant="body2" sx={{ color: "rgba(231, 239, 251, 0.94)" }}>
+                      {agent.task}
+                    </Typography>
+                  ) : null}
+                  <Typography variant="caption" color="text.secondary">
+                    {agent.latestUpdate || agent.summary || "No extra detail recorded."}
+                  </Typography>
+                </Stack>
+              </Box>
+            </Grid2>
+          ))}
+        </Grid2>
+      </Stack>
+    </Box>
+  );
 }
 
 export function SwarmManager({ autoRefresh }: Props) {
-  const [historyOpen, setHistoryOpen] = useState(false);
-
   const statusQ = useQuery({
     queryKey: ["swarm-status"],
     queryFn: () => api.rawGet("/swarm/status"),
@@ -197,324 +449,249 @@ export function SwarmManager({ autoRefresh }: Props) {
 
   const status = asRecord(statusQ.data);
   const config = asRecord(configQ.data);
-  const agents = pickRecords(agentsQ.data, "agents");
-  const delegations = pickRecords(delegationsQ.data, "delegations");
-  const liveAgents = pickRecords(status.agents, "agents");
-  const liveById = new Map(
-    liveAgents.map((agent) => [str(agent.id, ""), normalizeLifecycleStatus(agent.status)])
+  const agents = toProvisionedAgents(agentsQ.data);
+  const activeRuns = toSwarmRuns({ runs: pickRecords(status.active_runs, "active_runs") });
+  const recentRuns = toSwarmRuns(delegationsQ.data).filter(
+    (run) => !activeRuns.some((active) => active.id === run.id)
   );
-  const agentNameById = new Map(agents.map((agent) => [str(agent.id, ""), str(agent.name, "Agent")]));
-  const swarmEnabled = boolText(status.enabled || config.enabled) === "true";
-
-  const provisionedAgents: ProvisionedAgent[] = agents
-    .map((agent) => {
-      const id = str(agent.id, "");
-      const enabled = boolText(agent.enabled) === "true";
-      return {
-        id,
-        name: str(agent.name, "Agent"),
-        provider: str(agent.llm_provider, "ollama"),
-        model: str(agent.llm_model, "-"),
-        capabilities: formatCapabilities(agent.capabilities),
-        createdAt: str(agent.created_at, ""),
-        status: enabled
-          ? liveById.get(id) || normalizeLifecycleStatus(agent.status)
-          : "disabled"
-      };
-    })
-    .sort((left, right) => {
-      const leftTs = Date.parse(left.createdAt || "");
-      const rightTs = Date.parse(right.createdAt || "");
-      return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0);
-    });
-
-  const runningAgents = provisionedAgents.filter((agent) => agent.status === "running");
-  const delegationHistoryItems: HistoryItem[] = delegations
-    .map((row) => {
-      const completedAt = str(row.completed_at, "");
-      const createdAt = str(row.created_at, "");
-      const success = boolText(row.success) === "true";
-      const resultText = str(row.result, "").toLowerCase();
-      const agentId = str(row.agent_id, "");
-      const duration = num(row.execution_time_ms, 0);
-      const channel = str(row.channel, str(row.source, "")).trim();
-      const chatId = str(row.chat_id, str(row.conversation_id, "")).trim();
-      const historicalStatus = !completedAt
-        ? "running"
-        : success
-          ? "completed"
-          : resultText.includes("cancel")
-            ? "cancelled"
-            : "failed";
-      const triggerParts: string[] = [];
-      if (channel) triggerParts.push(channel);
-      if (chatId) triggerParts.push(`chat ${compactChatId(chatId)}`);
-      const detailParts: string[] = [];
-      if (duration > 0) detailParts.push(`${duration}ms`);
-      if (createdAt && completedAt) detailParts.push(`finished ${formatTimestamp(completedAt)}`);
-      return {
-        id: `delegation-${str(row.id, agentId || "history")}`,
-        agentName: agentNameById.get(agentId) || agentId || "Agent",
-        triggerText: triggerParts.length > 0 ? `Triggered by ${triggerParts.join(" | ")}` : "Triggered internally",
-        workText: str(row.task, "Delegated task"),
-        status: historicalStatus,
-        timestamp: completedAt || createdAt,
-        detail: detailParts.length > 0 ? detailParts.join(" | ") : "Delegation run"
-      };
-    })
-    .sort((left, right) => {
-      const leftTs = Date.parse(left.timestamp || "");
-      const rightTs = Date.parse(right.timestamp || "");
-      return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0);
-    })
-    .slice(0, HISTORY_LIMIT);
-
-  const historyItems = delegationHistoryItems;
-
-  const runningCount = runningAgents.length;
-  const completedCount = historyItems.filter((item) => item.status === "completed").length;
-  const failedCount = historyItems.filter((item) => item.status === "failed").length;
-  const cancelledCount = historyItems.filter((item) => item.status === "cancelled").length;
+  const swarmEnabled = bool(status.enabled) || bool(config.enabled);
+  const activeAgentCount = Math.max(0, num(status.active_agents, 0));
+  const totalAgentCount = Math.max(agents.length, num(status.total_agents, 0));
+  const interruptedRuns = recentRuns.filter((run) => run.status === "interrupted").length;
+  const failedRuns = recentRuns.filter((run) =>
+    ["failed", "timed_out", "panicked"].includes(run.status)
+  ).length;
   const queryError = statusQ.error || configQ.error || agentsQ.error || delegationsQ.error;
 
   return (
-    <Stack spacing={2.5}>
-      <Stack
-        direction={{ xs: "column", sm: "row" }}
-        justifyContent="space-between"
-        alignItems={{ xs: "flex-start", sm: "center" }}
-        gap={1.5}
+    <Stack spacing={2.25}>
+      <Box
+        sx={{
+          p: { xs: 2, md: 2.5 },
+          borderRadius: "22px",
+          border: "1px solid rgba(85, 177, 255, 0.18)",
+          background:
+            "radial-gradient(circle at top right, rgba(82, 180, 255, 0.16), transparent 38%), linear-gradient(180deg, rgba(13, 21, 40, 0.96) 0%, rgba(8, 14, 28, 0.98) 100%)",
+          boxShadow: "0 28px 60px rgba(4, 10, 22, 0.34)"
+        }}
       >
-        <Stack direction="row" spacing={1.5} alignItems="center">
-          <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            Agents
-          </Typography>
-          <Chip
-            size="small"
-            color={swarmEnabled ? "success" : "default"}
-            variant={swarmEnabled ? "filled" : "outlined"}
-            label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
-          />
-        </Stack>
-        <Stack direction="row" spacing={1} alignItems="center">
-          <Chip
-            size="small"
-            variant="outlined"
-            label={`${runningCount} running`}
-            color={runningCount > 0 ? "warning" : "default"}
-          />
-          <Button
-            size="small"
-            variant="outlined"
-            onClick={() => setHistoryOpen(true)}
-            sx={{ textTransform: "none" }}
+        <Stack spacing={2}>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            justifyContent="space-between"
+            alignItems={{ xs: "flex-start", md: "center" }}
+            gap={1.5}
           >
-            History ({historyItems.length})
-          </Button>
-        </Stack>
-      </Stack>
-
-      {queryError ? (
-        <Alert severity="error">{errMessage(queryError)}</Alert>
-      ) : null}
-
-      {runningAgents.length === 0 ? (
-        <Box
-          sx={{
-            p: { xs: 2, md: 2.5 },
-            borderRadius: "14px",
-            background:
-              "linear-gradient(180deg, rgba(255,255,255,0.028) 0%, rgba(255,255,255,0.016) 100%)",
-            border: "1px solid rgba(255,255,255,0.06)"
-          }}
-        >
-          <Stack spacing={1.5}>
-            <Stack
-              direction={{ xs: "column", md: "row" }}
-              alignItems={{ xs: "flex-start", md: "center" }}
-              gap={1}
-            >
-              <Box>
-                <Typography variant="h6" sx={{ fontWeight: 700 }}>
-                  No running agents
-                </Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, maxWidth: 720 }}>
-                  AgentArk only shows live agents here while they are actively running. Finished work moves into history,
-                  and idle specialists stay hidden from this page.
-                </Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-                  This page only tracks specialist agent delegations. Regular chat runs stay in Activity and Trace.
-                </Typography>
-              </Box>
-            </Stack>
-
+            <Box>
+              <Typography variant="overline" sx={{ letterSpacing: "0.16em", color: "info.light" }}>
+                Multi-agent control
+              </Typography>
+              <Typography variant="h5" sx={{ fontWeight: 800 }}>
+                Agents
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, maxWidth: 820 }}>
+                Live delegated runs, specialist roster, and recent swarm history stay visible here.
+                Chat and this view now share the same execution state instead of splitting live work
+                from history.
+              </Typography>
+            </Box>
             <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
               <Chip
                 size="small"
-                variant="outlined"
-                label={`${completedCount} completed`}
-                color={completedCount > 0 ? "success" : "default"}
+                color={swarmEnabled ? "success" : "default"}
+                variant={swarmEnabled ? "filled" : "outlined"}
+                label={swarmEnabled ? "Swarm enabled" : "Swarm disabled"}
               />
-              <Chip
-                size="small"
-                variant="outlined"
-                label={`${failedCount} failed`}
-                color={failedCount > 0 ? "error" : "default"}
-              />
-              <Chip
-                size="small"
-                variant="outlined"
-                label={`${cancelledCount} cancelled`}
-                color={cancelledCount > 0 ? "warning" : "default"}
-              />
+              <Chip size="small" variant="outlined" label={`${activeRuns.length} live run${activeRuns.length === 1 ? "" : "s"}`} />
             </Stack>
-
-            <Box
-              sx={{
-                px: 1.25,
-                py: 1,
-                borderRadius: "10px",
-                background: "rgba(47, 212, 255, 0.05)",
-                border: "1px solid rgba(47, 212, 255, 0.12)"
-              }}
-            >
-              <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
-                Ask in chat for monitoring, escalation, deep research, or multi-step execution. AgentArk decides when
-                specialist agents are actually needed instead of keeping idle workers around.
-              </Typography>
-            </Box>
           </Stack>
-        </Box>
-      ) : (
-        <Stack spacing={1}>
-          {runningAgents.map((agent) => (
-            <Box
-              key={agent.id}
-              sx={{
-                p: 1.5,
-                borderRadius: "10px",
-                background: "rgba(255,255,255,0.02)",
-                border: "1px solid rgba(255,255,255,0.05)"
-              }}
-            >
-              <Stack
-                direction={{ xs: "column", md: "row" }}
-                justifyContent="space-between"
-                alignItems={{ xs: "flex-start", md: "center" }}
-                gap={1}
-              >
-                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
-                    {agent.name}
-                  </Typography>
-                  <Chip
-                    size="small"
-                    color={statusChipColor(agent.status)}
-                    label={statusChipLabel(agent.status)}
-                  />
+
+          <Grid2 container spacing={1}>
+            {[
+              {
+                label: "Active agents",
+                value: String(activeAgentCount),
+                tone: activeAgentCount > 0 ? "warning.main" : "text.primary"
+              },
+              {
+                label: "Specialists",
+                value: String(totalAgentCount),
+                tone: "text.primary"
+              },
+              {
+                label: "Interrupted runs",
+                value: String(interruptedRuns),
+                tone: interruptedRuns > 0 ? "warning.light" : "text.primary"
+              },
+              {
+                label: "Failed runs",
+                value: String(failedRuns),
+                tone: failedRuns > 0 ? "error.light" : "text.primary"
+              }
+            ].map((item) => (
+              <Grid2 key={item.label} size={{ xs: 6, lg: 3 }}>
+                <Box
+                  sx={{
+                    p: 1.35,
+                    borderRadius: "14px",
+                    border: "1px solid rgba(255,255,255,0.07)",
+                    background: "rgba(255,255,255,0.035)"
+                  }}
+                >
                   <Typography variant="caption" color="text.secondary">
-                    {agent.provider} / {agent.model}
+                    {item.label}
                   </Typography>
-                </Stack>
-                <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">
-                  {agent.capabilities.slice(0, 5).map((capability) => (
-                    <Chip
-                      key={`${agent.id}-${capability}`}
-                      size="small"
-                      variant="outlined"
-                      label={capability}
-                      sx={{ height: 20, fontSize: "0.65rem" }}
-                    />
-                  ))}
-                </Stack>
-              </Stack>
-            </Box>
-          ))}
-        </Stack>
-      )}
-
-      <Dialog
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
-        maxWidth="md"
-        fullWidth
-        PaperProps={{
-          sx: {
-            background: "rgba(10, 15, 28, 0.97)",
-            border: "1px solid rgba(47, 212, 255, 0.18)",
-            backdropFilter: "blur(20px)"
-          }
-        }}
-      >
-        <DialogTitle>
-          <Stack direction="row" justifyContent="space-between" alignItems="center">
-            <Typography variant="h6" sx={{ fontWeight: 600 }}>
-              Agent History
-            </Typography>
-            <IconButton size="small" onClick={() => setHistoryOpen(false)}>
-              <CloseIcon fontSize="small" />
-            </IconButton>
-          </Stack>
-        </DialogTitle>
-        <DialogContent dividers>
-          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: historyItems.length > 0 ? 1.25 : 0 }}>
-            <Chip
-              size="small"
-              variant="outlined"
-              label={`${completedCount} completed`}
-              color={completedCount > 0 ? "success" : "default"}
-            />
-            <Chip
-              size="small"
-              variant="outlined"
-              label={`${failedCount} failed`}
-              color={failedCount > 0 ? "error" : "default"}
-            />
-            <Chip
-              size="small"
-              variant="outlined"
-              label={`${cancelledCount} cancelled`}
-              color={cancelledCount > 0 ? "warning" : "default"}
-            />
-          </Stack>
-
-          {historyItems.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: "center" }}>
-              No specialist agent history recorded yet.
-            </Typography>
-          ) : (
-            <Stack spacing={0} divider={<Box sx={{ borderBottom: "1px solid rgba(62,143,214,0.10)" }} />}>
-              {historyItems.map((item) => (
-                <Box key={item.id} sx={{ py: 1 }}>
-                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                    <Chip
-                      size="small"
-                      color={statusChipColor(item.status)}
-                      label={statusChipLabel(item.status)}
-                      sx={{ height: 20, fontSize: "0.65rem" }}
-                    />
-                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                      {item.agentName}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      {item.triggerText} | {item.workText}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary" sx={{ ml: "auto !important" }}>
-                      {formatTimestamp(item.timestamp)}
-                    </Typography>
-                  </Stack>
-                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.25 }}>
-                    {item.detail}
+                  <Typography variant="h5" sx={{ fontWeight: 800, color: item.tone }}>
+                    {item.value}
                   </Typography>
                 </Box>
-              ))}
-            </Stack>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setHistoryOpen(false)}>Close</Button>
-        </DialogActions>
-      </Dialog>
+              </Grid2>
+            ))}
+          </Grid2>
+        </Stack>
+      </Box>
+
+      {queryError ? <Alert severity="error">{errMessage(queryError)}</Alert> : null}
+
+      <SectionShell
+        eyebrow="Live now"
+        title="Delegated runs in progress"
+        detail="Every active multi-agent run appears here with the same per-agent state shown in chat."
+      >
+        {activeRuns.length === 0 ? (
+          <Box
+            sx={{
+              p: 1.5,
+              borderRadius: "14px",
+              border: "1px dashed rgba(255,255,255,0.12)",
+              background: "rgba(255,255,255,0.02)"
+            }}
+          >
+            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+              No live delegated runs
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.45 }}>
+              Ask for swarm explicitly in chat or let the router delegate a genuinely parallel task.
+              Live runs will appear here immediately and update as agents work.
+            </Typography>
+          </Box>
+        ) : (
+          <Stack spacing={1.2}>
+            {activeRuns.map((run) => (
+              <RunCard key={run.id} run={run} live />
+            ))}
+          </Stack>
+        )}
+      </SectionShell>
+
+      <SectionShell
+        eyebrow="Roster"
+        title="All specialist agents"
+        detail="Configured specialists stay visible even while idle, with their latest task and status nearby."
+      >
+        {agents.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No specialist agents have been provisioned yet.
+          </Typography>
+        ) : (
+          <Grid2 container spacing={1.15}>
+            {agents.map((agent) => (
+              <Grid2 key={agent.id} size={{ xs: 12, md: 6, xl: 4 }}>
+                <Box
+                  sx={{
+                    height: "100%",
+                    p: 1.4,
+                    borderRadius: "16px",
+                    border: "1px solid rgba(255,255,255,0.07)",
+                    background: "linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%)"
+                  }}
+                >
+                  <Stack spacing={1}>
+                    <Stack
+                      direction={{ xs: "column", sm: "row" }}
+                      alignItems={{ xs: "flex-start", sm: "center" }}
+                      justifyContent="space-between"
+                      gap={0.9}
+                    >
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="body1" sx={{ fontWeight: 700 }}>
+                          {agent.agentType
+                            ? `${agent.displayName} · ${agent.agentType}`
+                            : agent.displayName}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {agent.provider} / {agent.model}
+                        </Typography>
+                      </Box>
+                      <Chip
+                        size="small"
+                        color={statusChipColor(agent.enabled ? agent.status : "disabled")}
+                        label={statusChipLabel(agent.enabled ? agent.status : "disabled")}
+                      />
+                    </Stack>
+
+                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      {agent.capabilities.slice(0, 5).map((capability) => (
+                        <Chip
+                          key={`${agent.id}-${capability}`}
+                          size="small"
+                          variant="outlined"
+                          label={capability}
+                          sx={{ height: 22 }}
+                        />
+                      ))}
+                    </Stack>
+
+                    <Box
+                      sx={{
+                        p: 1,
+                        borderRadius: "12px",
+                        background: "rgba(6, 11, 23, 0.48)",
+                        border: "1px solid rgba(255,255,255,0.05)"
+                      }}
+                    >
+                      <Typography variant="caption" color="text.secondary">
+                        Latest task
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.25, color: "rgba(231, 239, 251, 0.94)" }}>
+                        {agent.lastTask || "No delegated task recorded yet."}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.45 }}>
+                        {agent.lastUpdate || agent.lastSummary || "This specialist is ready for new work."}
+                      </Typography>
+                    </Box>
+
+                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                      {agent.lastActivityAt ? (
+                        <Chip size="small" variant="outlined" label={`Last active ${formatTimestamp(agent.lastActivityAt)}`} />
+                      ) : null}
+                      <Chip size="small" variant="outlined" label={`Created ${formatTimestamp(agent.createdAt)}`} />
+                    </Stack>
+                  </Stack>
+                </Box>
+              </Grid2>
+            ))}
+          </Grid2>
+        )}
+      </SectionShell>
+
+      <SectionShell
+        eyebrow="History"
+        title="Recent swarm runs"
+        detail="Completed, interrupted, and failed runs stay here so you can review exactly which agents worked on each request."
+      >
+        {recentRuns.length === 0 ? (
+          <Typography variant="body2" color="text.secondary">
+            No completed swarm history has been recorded yet.
+          </Typography>
+        ) : (
+          <Stack spacing={1.2}>
+            {recentRuns.slice(0, 18).map((run) => (
+              <RunCard key={run.id} run={run} />
+            ))}
+          </Stack>
+        )}
+      </SectionShell>
     </Stack>
   );
 }

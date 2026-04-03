@@ -113,15 +113,15 @@ case "${1:-start}" in
         ;;
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
-        docker compose restart agentark
+        docker compose restart
         ;;
     logs)
         docker compose logs -f
         ;;
     update)
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
-        docker compose build agentark
-        docker compose up -d agentark
+        docker compose build
+        docker compose up -d
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     backup)
@@ -137,11 +137,11 @@ case "${1:-start}" in
         docker compose ps
         ;;
     chat)
-        docker exec -it agentark /app/agentark --chat
+        docker exec -it agentark-control /app/agentark --chat
         ;;
     pulse)
         echo -e "${CYAN}Running ArkPulse health check...${NC}"
-        docker exec -it agentark /app/agentark --chat <<< "run arkpulse now"
+        docker exec -it agentark-control /app/agentark --chat <<< "run arkpulse now"
         ;;
     *)
         echo "Usage: ./scripts/start.sh [start|tunnel|stop|restart|logs|update|backup|status|chat|pulse]"

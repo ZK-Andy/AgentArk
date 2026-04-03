@@ -109,132 +109,12 @@ else
     echo -e "${GREEN}Existing source checkout found at $SOURCE_DIR${NC}"
 fi
 
-cat > "$INSTALL_DIR/docker-compose.yml" <<COMPOSE_EOF
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: agentark-postgres
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    environment:
-      - POSTGRES_DB=\${AGENTARK_POSTGRES_DB:-agentark}
-      - POSTGRES_USER=\${AGENTARK_POSTGRES_USER:-agentark}
-      - POSTGRES_PASSWORD=\${AGENTARK_POSTGRES_PASSWORD:-agentark}
-    ports:
-      - "127.0.0.1:\${AGENTARK_POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - agentark-postgres-data:/var/lib/postgresql/data
-    networks:
-      - agent-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \${AGENTARK_POSTGRES_USER:-agentark} -d \${AGENTARK_POSTGRES_DB:-agentark}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 1G
-        reservations:
-          cpus: '0.25'
-          memory: 256M
+if [ ! -f "$SOURCE_DIR/docker-compose.yml" ]; then
+    echo -e "${RED}Missing $SOURCE_DIR/docker-compose.yml after clone.${NC}"
+    exit 1
+fi
 
-  agentark:
-    build: "$SOURCE_DIR"
-    image: agentark:latest
-    container_name: agentark
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8990:8990"
-    volumes:
-      - agentark-data:/app/data
-      - agentark-config:/app/config
-      - "${SOURCE_DIR}:/workspace/agentark"
-      - "${INSTALL_DIR}:${INSTALL_DIR}"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      docker-socket-proxy:
-        condition: service_started
-    environment:
-      - RUST_LOG=info,sqlx::query=warn,sea_orm=warn,hyper=warn,reqwest=warn
-      - AGENTARK_CONFIG=/app/config
-      - AGENTARK_DATA=/app/data
-      - AGENTARK_DATABASE_URL=postgres://\${AGENTARK_POSTGRES_USER:-agentark}:\${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/\${AGENTARK_POSTGRES_DB:-agentark}
-      - AGENTARK_DB_MAX_CONNECTIONS=\${AGENTARK_DB_MAX_CONNECTIONS:-20}
-      - AGENTARK_DB_CONNECT_TIMEOUT_SECS=\${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
-      - AGENTARK_DB_STATEMENT_TIMEOUT_MS=\${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
-      - AGENTARK_DB_IDLE_TIMEOUT_SECS=\${AGENTARK_DB_IDLE_TIMEOUT_SECS:-300}
-      - AGENTARK_DB_SCHEMA=\${AGENTARK_DB_SCHEMA:-}
-      - AGENTARK_BIND=0.0.0.0:8990
-      - DOCKER_HOST=tcp://docker-socket-proxy:2375
-      - AGENTARK_DEBUG=\${AGENTARK_DEBUG:-false}
-      - AGENTARK_TUNNEL=\${AGENTARK_TUNNEL:-false}
-      - AGENTARK_MASTER_PASSWORD=\${AGENTARK_MASTER_PASSWORD:-}
-      - TUNNEL_TOKEN=\${TUNNEL_TOKEN:-}
-    networks:
-      - agent-network
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8990/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-
-  docker-socket-proxy:
-    image: tecnativa/docker-socket-proxy:0.4.2
-    container_name: agentark-docker-proxy
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - CONTAINERS=1
-      - IMAGES=1
-      - POST=1
-      - EXEC=0
-      - VOLUMES=0
-      - NETWORKS=0
-      - SWARM=0
-      - SECRETS=0
-      - NODES=0
-      - SERVICES=0
-      - TASKS=0
-      - BUILD=0
-      - COMMIT=0
-      - CONFIGS=0
-      - DISTRIBUTION=0
-      - PLUGINS=0
-      - SYSTEM=0
-    networks:
-      - agent-network
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 128M
-
-volumes:
-  agentark-data:
-    name: agentark-data
-  agentark-config:
-    name: agentark-config
-  agentark-postgres-data:
-    name: agentark-postgres-data
-
-networks:
-  agent-network:
-    driver: bridge
-COMPOSE_EOF
-
-echo -e "${GREEN}[3/4] Configuration created at $INSTALL_DIR${NC}"
+echo -e "${GREEN}[3/4] Source checkout ready at $SOURCE_DIR${NC}"
 
 cat > "$INSTALL_DIR/agentark" << 'SCRIPT_EOF'
 #!/bin/bash
@@ -254,16 +134,16 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 compose() {
-    docker compose -f "$AGENTARK_DIR/docker-compose.yml" "$@"
+    docker compose -f "$AGENTARK_DIR/source/docker-compose.yml" "$@"
 }
 
 case "${1:-help}" in
     chat)
-        docker exec -it agentark /app/agentark --chat
+        docker exec -it agentark-control /app/agentark --chat
         ;;
     pulse)
         echo -e "${CYAN}Running ArkPulse health check...${NC}"
-        docker exec agentark /app/agentark --pulse
+        docker exec agentark-control /app/agentark --pulse
         ;;
     start)
         echo -e "${GREEN}Starting AgentArk...${NC}"
@@ -291,8 +171,8 @@ case "${1:-help}" in
     update)
         echo -e "${YELLOW}Updating AgentArk source and rebuilding...${NC}"
         docker run --rm -v "$AGENTARK_DIR:/work" -w /work alpine/git git -C /work/source pull --ff-only || true
-        compose build agentark
-        compose up -d agentark
+        compose build
+        compose up -d
         echo -e "${GREEN}Updated! Your data is intact.${NC}"
         ;;
     logs)
@@ -302,7 +182,7 @@ case "${1:-help}" in
         compose ps
         ;;
     setup)
-        docker exec -it agentark /app/agentark --setup
+        docker exec -it agentark-control /app/agentark --setup
         ;;
     uninstall)
         echo -e "${YELLOW}This will stop AgentArk and remove containers.${NC}"
@@ -348,7 +228,32 @@ else
 fi
 
 echo -e "${CYAN}Building AgentArk image from local source (this may take a few minutes)...${NC}"
-cd "$INSTALL_DIR"
+cd "$SOURCE_DIR"
+
+port_in_use() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -ltn "( sport = :$port )" 2>/dev/null | tail -n +2 | grep -q .
+        return $?
+    fi
+    if command -v lsof &>/dev/null; then
+        lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+warn_if_port_in_use() {
+    local port="$1"
+    local service="$2"
+    if port_in_use "$port"; then
+        echo -e "${YELLOW}Warning: TCP port ${port} is already in use. ${service} may fail to start unless you stop the existing listener or override the port.${NC}"
+    fi
+}
+
+POSTGRES_PORT="${AGENTARK_POSTGRES_PORT:-5432}"
+warn_if_port_in_use "$POSTGRES_PORT" "Postgres"
+warn_if_port_in_use "8990" "AgentArk Web UI"
 
 echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
 $COMPOSE up -d --build

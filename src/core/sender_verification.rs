@@ -14,8 +14,14 @@ static SENDER_VERIFICATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SenderChannel {
+    GoogleChat,
+    Signal,
+    IMessage,
+    Line,
     Slack,
     Teams,
+    WeChat,
+    Qq,
     #[default]
     Whatsapp,
 }
@@ -23,8 +29,14 @@ pub enum SenderChannel {
 impl SenderChannel {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::GoogleChat => "google_chat",
+            Self::Signal => "signal",
+            Self::IMessage => "imessage",
+            Self::Line => "line",
             Self::Slack => "slack",
             Self::Teams => "teams",
+            Self::WeChat => "wechat",
+            Self::Qq => "qq",
             Self::Whatsapp => "whatsapp",
         }
     }
@@ -58,9 +70,21 @@ impl Default for ChannelSenderVerificationSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SenderVerificationSettings {
     #[serde(default)]
+    pub google_chat: ChannelSenderVerificationSettings,
+    #[serde(default)]
+    pub signal: ChannelSenderVerificationSettings,
+    #[serde(default)]
+    pub imessage: ChannelSenderVerificationSettings,
+    #[serde(default)]
+    pub line: ChannelSenderVerificationSettings,
+    #[serde(default)]
     pub slack: ChannelSenderVerificationSettings,
     #[serde(default)]
     pub teams: ChannelSenderVerificationSettings,
+    #[serde(default)]
+    pub wechat: ChannelSenderVerificationSettings,
+    #[serde(default)]
+    pub qq: ChannelSenderVerificationSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +186,14 @@ fn normalize_sender_value(channel: SenderChannel, value: &str) -> String {
                 digits
             }
         }
-        SenderChannel::Slack | SenderChannel::Teams => trimmed.to_ascii_lowercase(),
+        SenderChannel::Slack
+        | SenderChannel::Teams
+        | SenderChannel::GoogleChat
+        | SenderChannel::Signal
+        | SenderChannel::IMessage
+        | SenderChannel::Line
+        | SenderChannel::WeChat
+        | SenderChannel::Qq => trimmed.to_ascii_lowercase(),
     }
 }
 
@@ -405,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_policy_requires_approval_then_allows_sender() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let storage = Storage::connect(
             crate::storage::DatabaseConfig::for_tests().expect("test database config"),
         )
@@ -443,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_unknown_sender_updates_pending_without_duplication() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let storage = Storage::connect(
             crate::storage::DatabaseConfig::for_tests().expect("test database config"),
         )

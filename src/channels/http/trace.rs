@@ -63,6 +63,7 @@ pub(super) struct TraceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_total: Option<usize>,
     pub history: Vec<TraceSummary>,
+    pub recent_events: Vec<TraceOperationalEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +79,19 @@ pub(super) struct TraceSummary {
     pub total_tokens: i64,
     pub cost_usd: f64,
     pub complexity: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct TraceOperationalEvent {
+    pub id: String,
+    pub trace_id: Option<String>,
+    pub created_at: String,
+    pub channel: String,
+    pub event_type: String,
+    pub success: bool,
+    pub outcome: String,
+    pub tool_name: Option<String>,
+    pub latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +123,34 @@ fn trace_message_preview(message: &str) -> String {
         format!("{}...", &message[..120])
     } else {
         message.to_string()
+    }
+}
+
+fn normalize_trace_since_param(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+}
+
+fn trace_history_anchor_from_memory(
+    trace: &ExecutionTrace,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    trace.completed_at.or(trace.started_at)
+}
+
+fn trace_matches_since_memory(
+    trace: &ExecutionTrace,
+    since: Option<&chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match since {
+        Some(since) => trace_history_anchor_from_memory(trace)
+            .map(|value| value >= *since)
+            .unwrap_or(false),
+        None => true,
     }
 }
 
@@ -241,9 +283,10 @@ fn parse_rfc3339_to_time_display(value: &Option<String>) -> String {
 }
 
 fn format_trace_summary_from_persisted(
-    t: &crate::storage::entities::execution_trace::Model,
+    t: &crate::storage::ExecutionTraceSummaryRow,
 ) -> TraceSummary {
-    let parsed_steps = parse_persisted_trace_steps(t);
+    let parsed_steps: Vec<crate::core::ExecutionStep> =
+        serde_json::from_str(&t.steps_json).unwrap_or_default();
     let status = trace_status_from_steps(&parsed_steps, t.completed_at.is_some());
     TraceSummary {
         id: t.id.clone(),
@@ -260,6 +303,22 @@ fn format_trace_summary_from_persisted(
     }
 }
 
+fn format_operational_event(
+    row: &crate::storage::entities::operational_log::Model,
+) -> TraceOperationalEvent {
+    TraceOperationalEvent {
+        id: row.id.clone(),
+        trace_id: row.trace_id.clone(),
+        created_at: row.created_at.clone(),
+        channel: row.channel.clone(),
+        event_type: row.event_type.clone(),
+        success: row.success,
+        outcome: row.outcome.clone(),
+        tool_name: row.tool_name.clone(),
+        latency_ms: row.latency_ms,
+    }
+}
+
 fn trace_sort_key_from_memory(t: &ExecutionTrace) -> String {
     t.started_at
         .or(t.completed_at)
@@ -267,7 +326,7 @@ fn trace_sort_key_from_memory(t: &ExecutionTrace) -> String {
         .to_rfc3339()
 }
 
-fn trace_sort_key_from_persisted(t: &crate::storage::entities::execution_trace::Model) -> String {
+fn trace_sort_key_from_persisted(t: &crate::storage::ExecutionTraceSummaryRow) -> String {
     t.started_at
         .clone()
         .or(t.completed_at.clone())
@@ -334,20 +393,48 @@ pub(super) async fn get_trace(
         .get("offset")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0usize);
+    let normalized_since =
+        normalize_trace_since_param(params.get("since").map(|value| value.as_str()));
+    let parsed_since = normalized_since
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc));
 
-    let agent = state.agent.read().await;
+    let filtered_memory_history: Vec<ExecutionTrace> = {
+        let trace_history = state.trace_history.read().await;
+        trace_history
+            .iter()
+            .filter(|item| trace_matches_since_memory(item, parsed_since.as_ref()))
+            .cloned()
+            .collect()
+    };
+    let history_fetch_buffer = (filtered_memory_history.len() as u64).max(TRACE_HISTORY_BUFFER);
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
     let persisted_fetch_limit = (history_limit as u64)
         .saturating_add(history_offset as u64)
-        .saturating_add(TRACE_HISTORY_BUFFER)
+        .saturating_add(history_fetch_buffer)
         .min(SQLITE_MAX_INTEGER);
-    let persisted_history = agent
-        .encrypted_storage
-        .list_execution_traces_decrypted(persisted_fetch_limit, 0)
+    let persisted_history = storage
+        .list_execution_trace_summaries(normalized_since.as_deref(), persisted_fetch_limit, 0)
         .await
         .unwrap_or_default();
+    let persisted_total = storage
+        .count_execution_traces(normalized_since.as_deref())
+        .await
+        .unwrap_or(0) as usize;
+    let memory_trace_ids: Vec<String> = filtered_memory_history
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    let persisted_memory_overlap = storage
+        .count_execution_traces_by_ids(normalized_since.as_deref(), &memory_trace_ids)
+        .await
+        .unwrap_or(0) as usize;
 
     let last_trace = state.last_trace.read().await;
-    let trace_history = state.trace_history.read().await;
 
     let trace: Vec<TraceStep> = last_trace
         .steps
@@ -389,7 +476,7 @@ pub(super) async fn get_trace(
             ),
         );
     }
-    for item in trace_history.iter() {
+    for item in &filtered_memory_history {
         history_by_id.insert(
             item.id.clone(),
             (
@@ -400,12 +487,22 @@ pub(super) async fn get_trace(
     }
     let mut history_all: Vec<(String, TraceSummary)> = history_by_id.into_values().collect();
     history_all.sort_by(|a, b| b.0.cmp(&a.0));
-    let history_total = history_all.len();
+    let history_total = persisted_total
+        .saturating_add(memory_trace_ids.len())
+        .saturating_sub(persisted_memory_overlap);
     let history: Vec<TraceSummary> = history_all
         .into_iter()
         .skip(history_offset)
         .take(history_limit)
         .map(|(_, summary)| summary)
+        .collect();
+    let history_trace_ids: Vec<String> = history.iter().map(|summary| summary.id.clone()).collect();
+    let recent_events = storage
+        .list_operational_logs_for_trace_ids(&history_trace_ids, 40)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| format_operational_event(&row))
         .collect();
 
     Json(TraceResponse {
@@ -413,6 +510,7 @@ pub(super) async fn get_trace(
         proofs,
         history,
         history_total: Some(history_total),
+        recent_events,
     })
 }
 
@@ -452,5 +550,75 @@ pub(super) async fn get_trace_detail(
                     .into_response(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_trace(
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ExecutionTrace {
+        ExecutionTrace {
+            id: "trace-1".to_string(),
+            message: "hello".to_string(),
+            channel: "chat".to_string(),
+            started_at,
+            completed_at,
+            steps: Vec::new(),
+            proof_id: None,
+            response: None,
+            model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+            complexity: None,
+            plan: None,
+        }
+    }
+
+    #[test]
+    fn normalize_trace_since_param_converts_to_utc_rfc3339() {
+        let normalized = normalize_trace_since_param(Some("2026-04-03T01:00:00+05:30"));
+        assert_eq!(normalized.as_deref(), Some("2026-04-02T19:30:00Z"));
+    }
+
+    #[test]
+    fn trace_matches_since_memory_prefers_completed_at() {
+        let trace = sample_trace(
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-02T19:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-02T20:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        );
+        let since = chrono::DateTime::parse_from_rfc3339("2026-04-02T19:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(trace_matches_since_memory(&trace, Some(&since)));
+    }
+
+    #[test]
+    fn trace_matches_since_memory_rejects_older_started_trace() {
+        let trace = sample_trace(
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-02T18:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            None,
+        );
+        let since = chrono::DateTime::parse_from_rfc3339("2026-04-02T19:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!trace_matches_since_memory(&trace, Some(&since)));
     }
 }

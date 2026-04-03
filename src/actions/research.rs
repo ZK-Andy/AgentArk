@@ -285,11 +285,6 @@ impl ResearchClient {
     ) -> Result<Vec<SearchResult>> {
         if let Some(explicit) = backend_preference.as_deref() {
             let backend = match explicit {
-                "searxng" => self
-                    .search_config
-                    .searxng
-                    .clone()
-                    .ok_or_else(|| anyhow!("SearXNG not configured"))?,
                 "serper" => self
                     .search_config
                     .serper

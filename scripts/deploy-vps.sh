@@ -23,8 +23,6 @@ usage() {
     echo "  -u, --user USER     SSH user (default: root)"
     echo "  -p, --port PORT     SSH port (default: 22)"
     echo "  -d, --dir DIR       Deploy directory (default: /opt/agentark)"
-    echo "  --with-ollama       Include Ollama for local LLM"
-    echo "  --with-search       Include SearXNG for private search"
     echo "  --help              Show this help"
     echo ""
     echo "Environment variables:"
@@ -32,12 +30,9 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $0 --host 192.168.1.100"
-    echo "  $0 --host myserver.com --user deploy --with-ollama"
+    echo "  $0 --host myserver.com --user deploy"
     exit 1
 }
-
-WITH_OLLAMA=""
-WITH_SEARCH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -46,8 +41,6 @@ while [[ $# -gt 0 ]]; do
         -u|--user) VPS_USER="$2"; shift 2 ;;
         -p|--port) VPS_PORT="$2"; shift 2 ;;
         -d|--dir) DEPLOY_DIR="$2"; shift 2 ;;
-        --with-ollama) WITH_OLLAMA="--profile with-ollama"; shift ;;
-        --with-search) WITH_SEARCH="--profile with-search"; shift ;;
         --help) usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -95,10 +88,16 @@ $SSH_CMD "mkdir -p $DEPLOY_DIR"
 # Create deployment package
 echo "Creating deployment package..."
 DEPLOY_FILES=(
+    ".dockerignore"
+    ".env.example"
     "Dockerfile"
     "docker-compose.yml"
     "Cargo.toml"
     "Cargo.lock"
+    "assets"
+    "docker-entrypoint.sh"
+    "frontend"
+    "services"
     "src"
     "config"
     "skills"
@@ -131,7 +130,7 @@ docker compose down 2>/dev/null || true
 
 # Build and start
 docker compose build
-docker compose up -d $WITH_OLLAMA $WITH_SEARCH
+docker compose up -d
 
 # Show status
 echo ""

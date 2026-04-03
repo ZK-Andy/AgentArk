@@ -3,9 +3,8 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const TOKEN_FILE: &str = "gmail.json";
 const GMAIL_SECRET_KEY: &str = "gmail_tokens";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -23,10 +22,6 @@ struct TokenResponse {
     expires_in: i64,
     #[serde(default)]
     refresh_token: Option<String>,
-}
-
-fn token_path(config_dir: &Path) -> PathBuf {
-    config_dir.join(TOKEN_FILE)
 }
 
 fn get_oauth_client_with_config(config_dir: &Path) -> Result<(String, String)> {
@@ -71,16 +66,6 @@ async fn load_tokens(config_dir: &Path) -> Result<GmailTokens> {
         return Ok(tokens);
     }
 
-    let legacy_path = token_path(config_dir);
-    if legacy_path.exists() {
-        let content = tokio::fs::read_to_string(&legacy_path).await?;
-        let tokens: GmailTokens = serde_json::from_str(&content)?;
-        let payload = serde_json::to_string(&tokens)?;
-        let _ = manager.set_custom_secret(GMAIL_SECRET_KEY, Some(payload));
-        let _ = tokio::fs::remove_file(&legacy_path).await;
-        return Ok(tokens);
-    }
-
     Err(anyhow!("Gmail tokens not found"))
 }
 
@@ -88,10 +73,6 @@ async fn save_tokens(config_dir: &Path, tokens: &GmailTokens) -> Result<()> {
     let manager = crate::core::config::SecureConfigManager::new(config_dir)?;
     let payload = serde_json::to_string(tokens)?;
     manager.set_custom_secret(GMAIL_SECRET_KEY, Some(payload))?;
-    let legacy_path = token_path(config_dir);
-    if legacy_path.exists() {
-        let _ = tokio::fs::remove_file(&legacy_path).await;
-    }
     Ok(())
 }
 

@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 
 mod agent;
+pub mod auth_profiles;
 pub mod automation;
 pub mod autonomy;
 pub mod background_session;
@@ -12,13 +13,16 @@ pub mod connect_flow;
 pub mod connector;
 pub mod data_lifecycle;
 pub(crate) mod document_search;
+pub mod embeddings;
 pub mod execution;
 pub mod gateway;
 pub mod gateway_ops;
 pub mod integration_sync;
 pub mod intent;
 pub mod learning;
+pub mod live_run;
 mod llm;
+pub(crate) mod llm_provider;
 pub mod model_failover;
 pub mod net;
 pub mod nodes;
@@ -26,8 +30,10 @@ pub mod observability;
 pub mod orchestra;
 pub mod parallel;
 pub mod pipeline;
-pub mod prompt_policy;
+pub mod planner;
 pub mod product_help;
+pub mod prompt_policy;
+pub mod runtime_image;
 pub mod secrets;
 pub mod self_evolve;
 pub mod self_tune;
@@ -38,6 +44,9 @@ pub mod task_router;
 mod tool_handlers;
 pub mod watcher;
 
+pub(crate) use agent::chat_model_is_configured;
+pub(crate) use agent::queue_stream_event;
+pub(crate) use agent::ChatExecutionIntentDecision;
 pub use agent::{
     Agent, ConversationMessage, ExecutionStep, ExecutionTrace, RequestExecutionHints,
     SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
@@ -46,14 +55,14 @@ pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
     AutomationRunStatus, AutomationSupervisorState,
 };
+pub use autonomy::{
+    score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,
+    RiskEnvelope, RiskLevel, TrustPolicy,
+};
 pub use background_session::{
     background_session_id_from_automation, set_background_session_id_in_automation,
     BackgroundSession, BackgroundSessionCreate, BackgroundSessionEvent, BackgroundSessionManager,
     BackgroundSessionStatus, BackgroundSessionUpdate,
-};
-pub use autonomy::{
-    score_action_risk, AutonomySettings, AutopilotMode, ConversationScope, RecommendedAction,
-    RiskEnvelope, RiskLevel, TrustPolicy,
 };
 pub use browser_profiles::{
     BrowserLoginState, BrowserProfileControlPlane, BrowserProfileListResponse,
@@ -63,6 +72,7 @@ pub use browser_profiles::{
 pub use config::{
     AgentConfig, ModelCapabilityTier, ModelCostTier, ModelHealthScope, ModelRole, ModelSlot,
 };
+pub use embeddings::EmbeddingClient;
 pub use execution::{
     execute_supervised_transport_chat, AttemptPolicy, AttemptRecord, DegradationNote,
     DelegationStatus, ExecutionCandidateDescriptor, ExecutionCheckpoint, ExecutionOutcome,
@@ -86,6 +96,7 @@ pub use gateway_ops::{
     GatewayOpsControlPlane, GatewayOpsHighlight, GatewayOpsOperatorCheck, GatewayOpsOverview,
     GatewayOpsServiceSummary,
 };
+pub use live_run::{LiveRunRegistry, RunEvent, RunEventPriority};
 pub use llm::{LlmClient, LlmProvider, ToolCall};
 pub use model_failover::{
     AuthProfileRecord, AuthProfileUpsert, CooldownClearResult, FallbackCandidate,
@@ -95,7 +106,8 @@ pub use model_failover::{
 };
 pub use nodes::{
     NodeCapability, NodeCommandLogEntry, NodeCommandLogRequest, NodeControlPlane,
-    NodeControlPlaneStatus, NodeGrant, NodeHeartbeat, NodeHeartbeatRequest,
-    NodePermissionGrantRequest, NodeState, NodeTransportKind, NodeUpsertRequest, PairedNode,
+    NodeControlPlaneStatus, NodeHeartbeat, NodeHeartbeatRequest, NodeState, NodeTransportKind,
+    NodeUpsertRequest, PairedNode,
 };
+pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus};
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};

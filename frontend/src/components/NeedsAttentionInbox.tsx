@@ -181,14 +181,14 @@ export function NeedsAttentionInbox({
 
   return (
     <Card className="attention-card mission-panel mission-panel--adaptive" data-tour-target="overview-attention">
-      <CardContent sx={{ p: 1.55, display: "flex", flexDirection: "column" }}>
+      <CardContent sx={{ p: 1.3, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
           <Box>
             <Stack direction="row" alignItems="center" spacing={1} mb={0.45}>
               <WarningAmberRoundedIcon
                 sx={{ color: count > 0 ? "rgba(255, 167, 38, 0.9)" : "rgba(155, 180, 214, 0.4)", fontSize: 20 }}
               />
-              <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
+              <Typography variant="body1" sx={{ flex: 1, fontWeight: 700 }}>
                 Needs Attention
               </Typography>
               {count > 0 ? <Badge badgeContent={count} color="warning" /> : null}

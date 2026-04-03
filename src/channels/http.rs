@@ -4,9 +4,10 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
-        ConnectInfo, FromRequestParts, Multipart, Path, Query, Request, State,
+        ConnectInfo, Extension, FromRequestParts, MatchedPath, Multipart, Path, Query, Request,
+        State,
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -35,6 +36,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 mod actions;
 mod applications;
 mod auth;
+mod auth_profiles_control;
 mod browser_profiles_control;
 mod custom_apis;
 mod gateway_control;
@@ -47,31 +49,50 @@ mod nodes_control;
 mod observability;
 mod plugins;
 mod sender_verification;
+mod sentinel_panel;
 mod suggestions;
 mod trace;
 mod tunnel;
 mod tunnel_auth;
 mod webhooks;
 
-pub(crate) use self::actions::{
-    fetch_skill_markdown_from_url_shared, import_action_from_content_with_agent,
-};
 #[cfg(test)]
 pub(crate) use self::actions::{
     clear_test_skill_fetch_override, register_test_skill_fetch_override,
 };
+pub(crate) use self::actions::{
+    fetch_skill_markdown_from_url_shared, import_action_from_content_with_agent,
+};
 use self::moltbook::MoltbookSettings;
+pub(crate) use self::sentinel_panel::{
+    load_background_learning_feed, record_background_learning_job_result,
+    BackgroundLearningJobUpdate,
+};
 
 use crate::channels::{
-    discord::DiscordChannelConfig, matrix::MatrixTransportConfig, slack::SlackChannelConfig,
-    teams::TeamsTransportConfig,
+    discord::DiscordChannelConfig, google_chat::GoogleChatChannelConfig,
+    imessage::IMessageChannelConfig, line::LineChannelConfig, matrix::MatrixTransportConfig,
+    qq::QqChannelConfig, signal::SignalChannelConfig, slack::SlackChannelConfig,
+    teams::TeamsTransportConfig, wechat::WeChatChannelConfig,
+};
+use crate::clients::{
+    ExecutorClient, ExecutorClientConfig, WorkspaceClient, WorkspaceClientConfig,
 };
 use crate::core::config::{
-    DeploymentMode, TelegramConfig, TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig,
-    TunnelProviderKind, TunnelTailscaleConfig,
+    DeploymentMode, EmbeddingsConfig, EmbeddingsProviderKind, TelegramConfig,
+    TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig, TunnelProviderKind,
+    TunnelTailscaleConfig,
 };
 use crate::core::data_lifecycle::{
     load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
+};
+use crate::core::llm_provider::{
+    canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
+    is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
+    persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
+    resolve_openai_request_config, CODEX_CLI_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
+    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
+    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
 };
 use crate::core::{
     score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
@@ -79,13 +100,21 @@ use crate::core::{
     TaskApproval, TaskQueue, TaskStatus, TrustPolicy, UserProfile,
 };
 use crate::hooks;
-use crate::memory::MemoryType;
 
 type SharedAgent = Arc<RwLock<Agent>>;
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
 const DEFAULT_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
 const SERVER_BUSY_TRACE_WINDOW_SECS: i64 = 20 * 60;
 const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
+const MAX_CHAT_MESSAGE_BYTES: usize = 100_000;
+const UI_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
+const UI_SESSION_MAX_TRACKED: usize = 4096;
+const HEADER_X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
+const HEADER_X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const HEADER_CONTENT_SECURITY_POLICY: HeaderName =
+    HeaderName::from_static("content-security-policy");
+const HEADER_STRICT_TRANSPORT_SECURITY: HeaderName =
+    HeaderName::from_static("strict-transport-security");
 static MISSING_API_KEY_WARNED: AtomicBool = AtomicBool::new(false);
 static CHAT_SUGGESTION_SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODEX_OAUTH_RUNTIME: OnceLock<Arc<RwLock<CodexOAuthRuntimeState>>> = OnceLock::new();
@@ -194,6 +223,8 @@ struct McpServerRequest {
     #[serde(default)]
     auth: Option<McpAuthRequest>,
     #[serde(default)]
+    auth_profile_id: Option<String>,
+    #[serde(default)]
     tool_allowlist: Vec<String>,
     #[serde(default)]
     tool_blocklist: Vec<String>,
@@ -216,12 +247,6 @@ struct CodexOAuthRuntimeState {
     last_output: String,
     last_error: Option<String>,
 }
-const OPENAI_DEVICE_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
-const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
-const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const OPENAI_DEVICE_VERIFY_URL: &str = "https://auth.openai.com/codex/device";
-const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 
 fn codex_oauth_runtime() -> Arc<RwLock<CodexOAuthRuntimeState>> {
     CODEX_OAUTH_RUNTIME
@@ -442,10 +467,10 @@ pub struct AppState {
     pub api_key: Arc<RwLock<Option<String>>>,
     /// HTTP API key expiry (unix timestamp seconds)
     pub api_key_expires_at: Arc<RwLock<Option<i64>>>,
-    /// Explicitly allow protected routes without auth when API key is missing (dangerous).
+    /// Legacy flag retained for state compatibility; protected routes always require auth.
     pub allow_insecure_no_auth: bool,
-    /// Session token for web UI cookie-based auth. Created lazily once API auth exists.
-    pub session_token: Arc<RwLock<Option<String>>>,
+    /// Per-browser UI sessions tracked server-side.
+    pub ui_sessions: Arc<RwLock<HashMap<String, UiSessionRecord>>>,
     /// Whether public local UI bootstrap is allowed without an API key prompt.
     pub local_ui_bootstrap_enabled: bool,
     /// One-time bootstrap tokens for local UI session creation.
@@ -463,6 +488,10 @@ pub struct AppState {
     pub security_events: Arc<crate::core::SecurityEvents>,
     /// App registry for deployed apps (static + dynamic)
     pub app_registry: crate::actions::app::AppRegistry,
+    /// Optional internal executor client used when runtime ownership is split out.
+    executor_client: Option<Arc<ExecutorClient>>,
+    /// Optional internal workspace client used when file authority is split out.
+    workspace_client: Option<Arc<WorkspaceClient>>,
     /// Registry of terminal-first external application launchers.
     application_registry: applications::ApplicationLauncherRegistry,
     /// Deployment posture of the control plane.
@@ -475,10 +504,56 @@ pub struct AppState {
     pub public_app_base_url: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct UiSessionRecord {
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub last_seen_at: i64,
+    pub source: String,
+    pub client_hint: Option<String>,
+}
+
+fn stack_role() -> Option<String> {
+    std::env::var("AGENTARK_STACK_ROLE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+}
+
+fn build_executor_client() -> Result<Option<Arc<ExecutorClient>>> {
+    if !matches!(stack_role().as_deref(), Some("control-plane" | "control")) {
+        return Ok(None);
+    }
+    let client = ExecutorClient::new(ExecutorClientConfig::from_env())?;
+    if client.bearer_token().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(client)))
+}
+
+fn build_workspace_client() -> Result<Option<Arc<WorkspaceClient>>> {
+    if !matches!(stack_role().as_deref(), Some("control-plane" | "control")) {
+        return Ok(None);
+    }
+    let client = WorkspaceClient::new(WorkspaceClientConfig::from_env())?;
+    if client.bearer_token().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(client)))
+}
+
+#[derive(Clone, Debug)]
+enum PendingOAuthTarget {
+    Integration { service_id: String },
+    AuthProfile { profile_id: String },
+}
+
 #[derive(Clone, Debug)]
 struct PendingOAuthState {
-    service_id: String,
+    target: PendingOAuthTarget,
     expires_at: i64,
+    pkce_verifier: Option<String>,
+    redirect_uri: Option<String>,
 }
 
 /// Chat request
@@ -530,72 +605,6 @@ async fn signal_chat_task_cancellation(state: &AppState, task_id: &str) {
 
 async fn unregister_chat_task_cancellation(state: &AppState, task_id: &str) {
     state.chat_task_cancellations.write().await.remove(task_id);
-}
-
-fn is_openrouter_base_url(url: &str) -> bool {
-    url.to_ascii_lowercase().contains("openrouter")
-}
-
-fn is_codex_cli_base_url(url: &str) -> bool {
-    url.trim().eq_ignore_ascii_case("codex://cli")
-}
-
-fn effective_openai_base_url(base_url: Option<&str>) -> &str {
-    match base_url {
-        Some(url) if is_codex_cli_base_url(url) => "https://api.openai.com/v1",
-        Some(url) => url,
-        None => "https://api.openai.com/v1",
-    }
-}
-
-fn codex_auth_file_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            std::env::var("USERPROFILE")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })?;
-    Some(PathBuf::from(home).join(".codex").join("auth.json"))
-}
-
-fn read_codex_cli_api_key() -> Option<String> {
-    let path = codex_auth_file_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-
-    // Native format: {"openai": {"type": "oauth", "access": "eyJ..."}}
-    if let Some(openai) = parsed.get("openai") {
-        if let Some(access) = openai.get("access").and_then(|v| v.as_str()) {
-            if !access.is_empty() {
-                // Check expiry if present
-                if let Some(expires) = openai.get("expires").and_then(|v| v.as_u64()) {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    if now_ms >= expires {
-                        // Token expired - try refresh
-                        return None;
-                    }
-                }
-                return Some(access.to_string());
-            }
-        }
-    }
-
-    // Legacy Codex CLI format: {"OPENAI_API_KEY": "sk-..."}
-    let key = parsed
-        .get("OPENAI_API_KEY")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
-    }
 }
 
 /// Request a device code from OpenAI and start background polling for authorization.
@@ -740,24 +749,16 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
                                             as u64
                                             + (expires_in * 1000);
 
-                                        // Save to ~/.codex/auth.json
-                                        if let Some(path) = codex_auth_file_path() {
-                                            if let Some(parent) = path.parent() {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
-                                            let auth_json = serde_json::json!({
-                                                "openai": {
-                                                    "type": "oauth",
-                                                    "access": access,
-                                                    "refresh": refresh,
-                                                    "expires": expires_ms
-                                                }
-                                            });
-                                            let _ = std::fs::write(
-                                                &path,
-                                                serde_json::to_string_pretty(&auth_json)
-                                                    .unwrap_or_default(),
-                                            );
+                                        if let Err(error) = persist_codex_cli_oauth_tokens(
+                                            access, refresh, expires_ms,
+                                        ) {
+                                            let mut state = runtime_bg.write().await;
+                                            state.active = false;
+                                            state.last_error = Some(format!(
+                                                "Failed to save OpenAI OAuth tokens: {}",
+                                                error
+                                            ));
+                                            return;
                                         }
 
                                         let mut state = runtime_bg.write().await;
@@ -850,50 +851,16 @@ async fn open_url_in_default_browser(url: &str) -> std::result::Result<(), Strin
     }
 }
 
-fn provider_label_for_openai(base_url: &Option<String>) -> &'static str {
-    match base_url.as_deref() {
-        Some(url) if is_codex_cli_base_url(url) => "openai-subscription",
-        Some(url) if is_openrouter_base_url(url) => "openrouter",
-        Some(_) => "openai-compatible",
-        None => "openai",
-    }
-}
-
-fn normalize_openai_base_url(
-    provider: &str,
-    base_url: Option<String>,
-) -> std::result::Result<Option<String>, String> {
-    let normalized = base_url.and_then(|u| {
-        let trimmed = u.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
-
-    match provider {
-        "codex-cli" | "openai-subscription" => Ok(Some("codex://cli".to_string())),
-        "openrouter" => {
-            Ok(Some(normalized.unwrap_or_else(|| {
-                "https://openrouter.ai/api/v1".to_string()
-            })))
-        }
-        "openai-compatible" => {
-            if normalized.is_none() {
-                Err("Base URL is required for OpenAI-Compatible providers".to_string())
-            } else {
-                Ok(normalized)
-            }
-        }
-        _ => Ok(normalized),
-    }
-}
-
-fn provider_from_model_slot_request(
+async fn provider_from_model_slot_request(
     request: &ModelSlotRequest,
     existing_api_key: Option<String>,
 ) -> std::result::Result<LlmProvider, String> {
+    if request.provider.trim().is_empty() {
+        return Err("Provider is required".to_string());
+    }
+    let Some(provider_id) = canonical_provider_id(request.provider.as_str()) else {
+        return Err(format!("Unknown provider: {}", request.provider));
+    };
     let base_url = request.base_url.clone().and_then(|u| {
         let trimmed = u.trim();
         if trimmed.is_empty() {
@@ -902,22 +869,30 @@ fn provider_from_model_slot_request(
             Some(trimmed.to_string())
         }
     });
-    let compat_base_url = normalize_openai_base_url(request.provider.as_str(), base_url.clone())?;
+    let compat_base_url = normalize_openai_base_url(provider_id, base_url.clone())?;
     let mut api_key = request
         .api_key
         .clone()
         .filter(|k| !k.is_empty() && k != "[ENCRYPTED]")
         .or(existing_api_key.filter(|k| !k.is_empty() && k != "[ENCRYPTED]"))
         .unwrap_or_default();
-    if (request.provider == "codex-cli" || request.provider == "openai-subscription")
-        && api_key.is_empty()
-    {
-        api_key = read_codex_cli_api_key().unwrap_or_default();
+    if provider_id == "openai-subscription" && api_key.is_empty() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        api_key = resolve_codex_cli_api_key(&client, false)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+    }
+    if provider_id == "ollama" && base_url.is_none() {
+        return Err("Ollama base URL is required".to_string());
     }
 
-    let provider = match request.provider.as_str() {
+    let provider = match provider_id {
         "ollama" => LlmProvider::Ollama {
-            base_url: base_url.unwrap_or("http://localhost:11434".to_string()),
+            base_url: base_url.unwrap_or_default(),
             model: request.model.clone(),
         },
         "anthropic" => LlmProvider::Anthropic {
@@ -934,7 +909,7 @@ fn provider_from_model_slot_request(
             model: request.model.clone(),
             base_url: compat_base_url,
         },
-        "codex-cli" | "openai-subscription" => {
+        "openai-subscription" => {
             if api_key.trim().is_empty() {
                 return Err(
                     "OpenAI Subscription is not connected yet. Click 'Connect via Browser' and complete OAuth first.".to_string(),
@@ -947,7 +922,7 @@ fn provider_from_model_slot_request(
             }
         }
         _ => {
-            return Err(format!("Unknown provider: {}", request.provider));
+            return Err(format!("Unknown provider: {}", provider_id));
         }
     };
 
@@ -968,11 +943,32 @@ fn parse_set_secret_command(message: &str) -> Option<(String, String)> {
     // - "set secret KEY=VALUE"
     // - "set secret KEY VALUE"
     let trimmed = message.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !lower.starts_with("set secret ") {
-        return None;
-    }
-    let rest = trimmed[10..].trim(); // len("set secret ") == 10
+    let prefixes: &[&[&str]] = &[
+        &["set", "secret"],
+        &["set", "the", "secret"],
+        &["set", "my", "secret"],
+        &["save", "secret"],
+        &["save", "the", "secret"],
+        &["save", "my", "secret"],
+        &["store", "secret"],
+        &["store", "the", "secret"],
+        &["store", "my", "secret"],
+        &["add", "secret"],
+        &["add", "the", "secret"],
+        &["add", "my", "secret"],
+        &["update", "secret"],
+        &["update", "the", "secret"],
+        &["update", "my", "secret"],
+        &["remember", "secret"],
+        &["remember", "the", "secret"],
+        &["remember", "my", "secret"],
+        &["secret", "set"],
+        &["secret", "save"],
+    ];
+    let prefix_end = command_prefix_end(trimmed, prefixes)?;
+    let rest = trimmed[prefix_end..]
+        .trim_start_matches(|c: char| c.is_whitespace() || ":,-".contains(c))
+        .trim();
     if rest.is_empty() {
         return None;
     }
@@ -1122,6 +1118,76 @@ fn default_base_url_for_bind_addr(bind_addr: &str) -> Option<String> {
     Some(format!("http://{}", normalized.trim_end_matches('/')))
 }
 
+fn bind_addr_host(bind_addr: &str) -> Option<String> {
+    let trimmed = bind_addr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    reqwest::Url::parse(&candidate)
+        .ok()?
+        .host_str()
+        .map(|value| value.trim().to_ascii_lowercase())
+}
+
+fn bind_addr_is_loopback(bind_addr: &str) -> bool {
+    bind_addr_host(bind_addr)
+        .as_deref()
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+}
+
+fn validate_public_app_listener_posture(
+    deployment_mode: DeploymentMode,
+    public_app_bind_addr: Option<&str>,
+    configured_public_app_base_url: Option<&str>,
+    direct_tls_enabled: bool,
+) -> Result<()> {
+    if !internet_facing_apps_should_be_isolated(deployment_mode, public_app_bind_addr) {
+        return Ok(());
+    }
+
+    let bind_addr = public_app_bind_addr
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Internet-facing public apps require a bind address"))?;
+    let base_url = configured_public_app_base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Internet-facing public apps require AGENTARK_PUBLIC_APP_BASE_URL or [public_apps].base_url to be set to the external HTTPS origin"
+            )
+        })?;
+    let parsed_base_url = reqwest::Url::parse(base_url).map_err(|error| {
+        anyhow::anyhow!("Public app base URL '{}' is invalid: {}", base_url, error)
+    })?;
+    if !parsed_base_url.scheme().eq_ignore_ascii_case("https") {
+        anyhow::bail!("Internet-facing public app base URL must use HTTPS");
+    }
+
+    if !bind_addr_is_loopback(bind_addr) {
+        if !direct_tls_enabled {
+            anyhow::bail!(
+                "Internet-facing public app listener '{}' is non-loopback but TLS is not configured. Either bind public apps to loopback behind an HTTPS reverse proxy, or configure tls_cert_path/tls_key_path for direct HTTPS.",
+                bind_addr
+            );
+        }
+        bind_addr.parse::<SocketAddr>().map_err(|error| {
+            anyhow::anyhow!(
+                "Direct HTTPS public app listener '{}' must be a concrete socket address: {}",
+                bind_addr,
+                error
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn internet_facing_apps_should_be_isolated(
     deployment_mode: DeploymentMode,
     public_app_bind_addr: Option<&str>,
@@ -1139,14 +1205,186 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
 }
+
+#[derive(Debug, Clone)]
+struct CommandToken {
+    text: String,
+    end: usize,
+}
+
+fn tokenize_command_text(text: &str) -> Vec<CommandToken> {
+    let mut tokens = Vec::new();
+    let mut token_start: Option<usize> = None;
+
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            if token_start.is_none() {
+                token_start = Some(idx);
+            }
+        } else if let Some(start) = token_start.take() {
+            tokens.push(CommandToken {
+                text: text[start..idx].to_ascii_lowercase(),
+                end: idx,
+            });
+        }
+    }
+
+    if let Some(start) = token_start {
+        tokens.push(CommandToken {
+            text: text[start..].to_ascii_lowercase(),
+            end: text.len(),
+        });
+    }
+
+    tokens
+}
+
+fn token_is_one_edit_away(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let (short, long) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut edits = 0usize;
+    while i < short.len() && j < long.len() {
+        if short[i] == long[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        edits += 1;
+        if edits > 1 {
+            return false;
+        }
+        if short.len() == long.len() {
+            i += 1;
+            j += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    edits + (short.len() - i) + (long.len() - j) <= 1
+}
+
+fn token_matches_command(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    let actual = actual.trim().to_ascii_lowercase();
+    if expected == actual {
+        return true;
+    }
+    if expected.strip_suffix('s') == Some(actual.as_str())
+        || actual.strip_suffix('s') == Some(expected.as_str())
+    {
+        return true;
+    }
+    if token_is_one_edit_away(&expected, &actual) {
+        return true;
+    }
+    let expected_compact = expected.replace(' ', "");
+    let actual_compact = actual.replace(' ', "");
+    expected_compact == actual_compact || token_is_one_edit_away(&expected_compact, &actual_compact)
+}
+
+fn command_opener_span(tokens: &[CommandToken]) -> usize {
+    const OPENERS: &[&[&str]] = &[
+        &["please", "can", "you"],
+        &["please", "could", "you"],
+        &["please", "would", "you"],
+        &["can", "you", "please"],
+        &["could", "you", "please"],
+        &["would", "you", "please"],
+        &["can", "you"],
+        &["could", "you"],
+        &["would", "you"],
+        &["agent", "ark"],
+        &["please"],
+        &["hey"],
+        &["hi"],
+        &["agentark"],
+    ];
+
+    for opener in OPENERS {
+        if tokens.len() < opener.len() {
+            continue;
+        }
+        if tokens
+            .iter()
+            .take(opener.len())
+            .zip(opener.iter())
+            .all(|(token, expected)| token_matches_command(expected, &token.text))
+        {
+            return opener.len();
+        }
+    }
+
+    0
+}
+
+fn command_prefix_end(message: &str, phrases: &[&[&str]]) -> Option<usize> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens = tokenize_command_text(trimmed);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let start = command_opener_span(&tokens);
+    let tokens = &tokens[start..];
+    for phrase in phrases {
+        if tokens.len() < phrase.len() {
+            continue;
+        }
+        if tokens
+            .iter()
+            .take(phrase.len())
+            .zip(phrase.iter())
+            .all(|(token, expected)| token_matches_command(expected, &token.text))
+        {
+            return Some(tokens[phrase.len() - 1].end);
+        }
+    }
+
+    None
+}
+
 fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
     let trimmed = message.trim();
-    let normalized = trimmed.to_ascii_lowercase();
-    if normalized == "/triage" || normalized == "/triage inbox" || normalized == "/inbox triage" {
+    let normalized = trimmed.to_ascii_lowercase().replace(['_', '-'], " ");
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized
+        .strip_prefix('/')
+        .unwrap_or(&normalized)
+        .to_string();
+    if normalized == "triage" || normalized == "triage inbox" || normalized == "inbox triage" {
         return Some(AutonomyQuickCommand::TriageInbox);
     }
-    if normalized.starts_with("/delegate ") {
-        let task = trimmed[10..].trim();
+    let delegate_prefixes: &[&[&str]] = &[
+        &["delegate"],
+        &["delegate", "task"],
+        &["delegate", "this"],
+        &["delegate", "the", "task"],
+    ];
+    if let Some(prefix_end) = command_prefix_end(trimmed, delegate_prefixes) {
+        let task = trimmed[prefix_end..]
+            .trim_start_matches(|c: char| c.is_whitespace() || ",:-".contains(c))
+            .trim();
         if task.is_empty() {
             return None;
         }
@@ -1155,8 +1393,11 @@ fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
             require_approval: false,
         });
     }
-    if normalized.starts_with("/rollback ") {
-        let rest = trimmed[10..].trim();
+    let rollback_prefixes: &[&[&str]] = &[&["rollback"], &["roll", "back"], &["revert"], &["undo"]];
+    if let Some(prefix_end) = command_prefix_end(trimmed, rollback_prefixes) {
+        let rest = trimmed[prefix_end..]
+            .trim_start_matches(|c: char| c.is_whitespace() || ",:-".contains(c))
+            .trim();
         if rest.is_empty() {
             return None;
         }
@@ -1165,14 +1406,27 @@ fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
         if event_id.is_empty() {
             return None;
         }
-        let operation = parts.next().map(|raw| {
+        let operation = if let Some(raw) = parts.next() {
             let op = raw.trim().to_ascii_lowercase();
-            match op.as_str() {
-                "read" => "mark_read".to_string(),
-                "unread" => "mark_unread".to_string(),
-                _ => op,
+            if op == "mark" {
+                parts.next().map(|next| {
+                    let next = next.trim().to_ascii_lowercase();
+                    match next.as_str() {
+                        "read" => "mark_read".to_string(),
+                        "unread" => "mark_unread".to_string(),
+                        other => format!("mark {}", other),
+                    }
+                })
+            } else {
+                Some(match op.as_str() {
+                    "read" => "mark_read".to_string(),
+                    "unread" => "mark_unread".to_string(),
+                    _ => op,
+                })
             }
-        });
+        } else {
+            None
+        };
         return Some(AutonomyQuickCommand::Rollback {
             event_id: event_id.to_string(),
             operation,
@@ -1182,29 +1436,54 @@ fn parse_autonomy_quick_command(message: &str) -> Option<AutonomyQuickCommand> {
 }
 
 fn parse_notification_control_command(message: &str) -> Option<NotificationControlCommand> {
-    let normalized = message.trim().to_ascii_lowercase().replace(['_', '-'], " ");
-    let text = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    match text.as_str() {
-        "pause notifications"
-        | "pause notification"
-        | "mute notifications"
-        | "mute notification"
-        | "/notifications pause"
-        | "/pause notifications" => Some(NotificationControlCommand::Pause24h),
-        "resume notifications"
-        | "resume notification"
-        | "unmute notifications"
-        | "unmute notification"
-        | "/notifications resume"
-        | "/resume notifications" => Some(NotificationControlCommand::Resume),
-        "notification status"
-        | "notifications status"
-        | "status notifications"
-        | "status notification"
-        | "/notifications"
-        | "/notifications status" => Some(NotificationControlCommand::Status),
-        _ => None,
+    let pause_variants: &[&[&str]] = &[
+        &["pause", "notifications"],
+        &["pause", "notification"],
+        &["pause", "push", "notifications"],
+        &["pause", "push", "notification"],
+        &["mute", "notifications"],
+        &["mute", "notification"],
+        &["disable", "notifications"],
+        &["turn", "off", "notifications"],
+        &["turn", "notifications", "off"],
+        &["notifications", "pause"],
+        &["notifications", "mute"],
+        &["notifications", "off"],
+        &["stop", "notifications"],
+    ];
+    let resume_variants: &[&[&str]] = &[
+        &["resume", "notifications"],
+        &["resume", "notification"],
+        &["resume", "push", "notifications"],
+        &["resume", "push", "notification"],
+        &["unmute", "notifications"],
+        &["unmute", "notification"],
+        &["enable", "notifications"],
+        &["turn", "on", "notifications"],
+        &["turn", "notifications", "on"],
+        &["notifications", "resume"],
+        &["notifications", "unmute"],
+        &["notifications", "on"],
+        &["start", "notifications"],
+    ];
+    let status_variants: &[&[&str]] = &[
+        &["notification", "status"],
+        &["notifications", "status"],
+        &["status", "notifications"],
+        &["status", "notification"],
+        &["push", "notifications", "status"],
+    ];
+
+    if command_prefix_end(message, pause_variants).is_some() {
+        return Some(NotificationControlCommand::Pause24h);
     }
+    if command_prefix_end(message, resume_variants).is_some() {
+        return Some(NotificationControlCommand::Resume);
+    }
+    if command_prefix_end(message, status_variants).is_some() {
+        return Some(NotificationControlCommand::Status);
+    }
+    None
 }
 
 async fn handle_notification_control_command(
@@ -1453,36 +1732,97 @@ async fn handle_autonomy_quick_command(
                 ));
             }
 
-            let Some(ref swarm) = agent.swarm else {
-                return Err("Swarm is not enabled, so delegation is unavailable.".to_string());
-            };
             let actions = agent.runtime.list_actions().await.unwrap_or_default();
-            match swarm.delegate(&task, "", &agent.llm, &[], &actions).await {
-                Ok(result) => {
-                    let delegation = crate::storage::entities::swarm_delegation::Model {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        parent_task_id: None,
-                        agent_id: result.agents_used.join(","),
-                        task_description: task.clone(),
-                        result: Some(result.final_result.clone()),
-                        success: 1,
-                        confidence: Some(0.82),
-                        execution_time_ms: Some(result.total_time_ms.min(i32::MAX as u64) as i32),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        completed_at: Some(chrono::Utc::now().to_rfc3339()),
-                    };
-                    let _ = agent.storage.insert_swarm_delegation(&delegation).await;
-                    let final_result = crate::security::redact_pii(&result.final_result);
+            let active_prompt_bundle = agent.active_prompt_bundle_for_message(&task).await;
+            let active_specialist_prompt_bundle = agent
+                .active_specialist_prompt_bundle_for_message(&task)
+                .await;
+            let mut decision = agent
+                .route_query(&task, &actions, &active_prompt_bundle)
+                .await;
+            decision.needs_delegation = true;
+            if decision.sub_agents.len() < 2 {
+                decision.sub_agents = agent.forced_swarm_specs(&task, &actions);
+            }
+            decision.confidence = decision.confidence.max(0.96);
+            decision.reasoning = format!(
+                "{} | Explicit /delegate command forced multi-agent execution.",
+                decision.reasoning
+            );
+            let system_prompt = match agent
+                .build_system_prompt(&[], Some(&active_prompt_bundle))
+                .await
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    return Err(format!("Failed to build delegation prompt: {}", error));
+                }
+            };
+            let delegation_id = uuid::Uuid::new_v4().to_string();
+            let empty_memories: Vec<crate::memory::MemoryEntry> = Vec::new();
+            let specialists = agent
+                .swarm
+                .as_ref()
+                .map(|manager| manager.specialists.clone());
+            let trace = Arc::new(RwLock::new(crate::core::ExecutionTrace {
+                id: uuid::Uuid::new_v4().to_string(),
+                message: task.clone(),
+                channel: "http".to_string(),
+                started_at: Some(chrono::Utc::now()),
+                ..Default::default()
+            }));
+            match agent
+                .task_router
+                .execute(
+                    &decision,
+                    crate::core::task_router::TaskRouterExecuteContext {
+                        delegation_id: &delegation_id,
+                        conversation_id: None,
+                        channel: Some("http"),
+                        message: &task,
+                        system_prompt: &system_prompt,
+                        prompt_bundle: &active_prompt_bundle,
+                        specialist_prompt_bundle: &active_specialist_prompt_bundle,
+                        model_pool: &agent.model_pool,
+                        primary_llm: &agent.llm,
+                        specialists: &specialists,
+                        memories: &empty_memories,
+                        actions: &actions,
+                        trace: &trace,
+                        token_tx: None,
+                        swarm_activity: Some(&agent.swarm_activity),
+                        storage: Some(&agent.storage),
+                    },
+                )
+                .await
+            {
+                Ok(crate::core::task_router::TaskRouterResult::Delegated(result)) => {
+                    let final_result = crate::security::redact_pii(&result.final_response.content);
                     Ok(format!(
-                        "Delegation complete.\nAgents used: {}\nTime: {} ms\nResult:\n{}",
-                        if result.agents_used.is_empty() {
+                        "Delegation complete.\nAgents used: {}\nStatus: {}\nResult:\n{}",
+                        if result.agent_results.is_empty() {
                             "-".to_string()
                         } else {
-                            result.agents_used.join(", ")
+                            result
+                                .agent_results
+                                .iter()
+                                .map(|item| {
+                                    item.agent_name
+                                        .clone()
+                                        .unwrap_or_else(|| item.agent_type.clone())
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         },
-                        result.total_time_ms,
+                        result.delegation_status.as_str(),
                         final_result
                     ))
+                }
+                Ok(crate::core::task_router::TaskRouterResult::Direct) => {
+                    Err("Delegation unexpectedly routed to a direct path.".to_string())
+                }
+                Ok(crate::core::task_router::TaskRouterResult::UseParallelThinking) => {
+                    Err("Delegation unexpectedly routed to parallel thinking.".to_string())
                 }
                 Err(e) => Err(format!("Delegation failed: {}", e)),
             }
@@ -1752,7 +2092,7 @@ pub struct PlanTaskRequest {
 /// Plan task response
 #[derive(Debug, Serialize)]
 pub struct PlanTaskResponse {
-    pub plan: serde_json::Value,
+    pub plan: crate::core::ExecutionPlan,
 }
 
 #[derive(Debug, Serialize)]
@@ -1800,6 +2140,12 @@ pub struct SettingsResponse {
     // Model pool
     pub model_pool: Vec<ModelSlotSummary>,
     pub smart_routing: bool,
+    // Embeddings
+    pub embeddings_provider: String,
+    pub embeddings_model: String,
+    pub embeddings_base_url: Option<String>,
+    pub embeddings_has_api_key: bool,
+    pub embeddings_status: String,
     // Telegram
     pub telegram_enabled: bool,
     pub has_telegram_token: bool,
@@ -1856,18 +2202,65 @@ pub struct SettingsResponse {
     pub whatsapp_enabled: bool,
     pub whatsapp_mode: String,
     pub has_whatsapp_token: bool,
+    pub has_whatsapp_app_secret: bool,
+    pub has_whatsapp_verify_token: bool,
+    pub has_whatsapp_bridge_token: bool,
     pub whatsapp_delivery_ready: bool,
     pub whatsapp_phone_number_id: String,
+    pub whatsapp_bridge_runtime: String,
     pub whatsapp_bridge_url: String,
     pub whatsapp_dm_policy: String,
     pub whatsapp_allowed_numbers: Vec<String>,
+    // Google Chat
+    pub google_chat_enabled: bool,
+    pub has_google_chat_access_token: bool,
+    pub has_google_chat_verify_token: bool,
+    pub google_chat_api_base_url: String,
+    pub google_chat_space: Option<String>,
+    pub google_chat_thread_key: Option<String>,
+    pub google_chat_app_id: Option<String>,
+    pub google_chat_bot_name: Option<String>,
+    pub google_chat_delivery_ready: bool,
+    // Signal
+    pub signal_enabled: bool,
+    pub has_signal_bridge_token: bool,
+    pub signal_bridge_url: String,
+    pub signal_default_recipient: String,
+    pub signal_default_group_id: String,
+    pub signal_delivery_ready: bool,
+    // iMessage
+    pub imessage_enabled: bool,
+    pub has_imessage_bridge_token: bool,
+    pub imessage_bridge_url: String,
+    pub imessage_default_chat_id: String,
+    pub imessage_default_handle: String,
+    pub imessage_delivery_ready: bool,
+    // LINE
+    pub line_enabled: bool,
+    pub has_line_access_token: bool,
+    pub has_line_channel_secret: bool,
+    pub line_api_base_url: String,
+    pub line_default_target: Option<String>,
+    pub line_user_agent: Option<String>,
+    pub line_delivery_ready: bool,
+    // WeChat
+    pub wechat_enabled: bool,
+    pub has_wechat_bridge_token: bool,
+    pub wechat_bridge_url: String,
+    pub wechat_default_target_id: String,
+    pub wechat_delivery_ready: bool,
+    // QQ
+    pub qq_enabled: bool,
+    pub has_qq_bridge_token: bool,
+    pub qq_bridge_url: String,
+    pub qq_default_target_id: String,
+    pub qq_delivery_ready: bool,
     pub auto_approve: Vec<String>,
     // Search
     pub search_primary: String,
     pub search_fallback1: String,
     pub search_fallback2: String,
     pub search_serper_configured: bool,
-    pub search_searxng_url: Option<String>,
     pub search_brave_configured: bool,
     pub settings_complete: bool,
     // Moltbook
@@ -1940,6 +2333,11 @@ pub struct SettingsUpdate {
     /// Model pool routing behavior (if false, always use primary)
     #[serde(default)]
     pub smart_routing: Option<bool>,
+    // Embeddings
+    pub embeddings_provider: Option<String>,
+    pub embeddings_model: Option<String>,
+    pub embeddings_base_url: Option<String>,
+    pub embeddings_api_key: Option<String>,
     // Primary LLM
     pub llm_provider: String,
     pub llm_model: String,
@@ -2008,13 +2406,60 @@ pub struct SettingsUpdate {
     #[serde(default)]
     pub whatsapp_mode: Option<String>,
     pub whatsapp_access_token: Option<String>,
+    pub whatsapp_app_secret: Option<String>,
     pub whatsapp_phone_number_id: Option<String>,
     pub whatsapp_verify_token: Option<String>,
+    pub whatsapp_bridge_runtime: Option<String>,
+    pub whatsapp_bridge_token: Option<String>,
     pub whatsapp_bridge_url: Option<String>,
     #[serde(default)]
     pub whatsapp_dm_policy: Option<String>,
     #[serde(default)]
     pub whatsapp_allowed_numbers: Option<Vec<String>>,
+    // Google Chat
+    #[serde(default)]
+    pub google_chat_enabled: Option<bool>,
+    pub google_chat_access_token: Option<String>,
+    pub google_chat_verify_token: Option<String>,
+    pub google_chat_api_base_url: Option<String>,
+    pub google_chat_space: Option<String>,
+    pub google_chat_thread_key: Option<String>,
+    pub google_chat_app_id: Option<String>,
+    pub google_chat_bot_name: Option<String>,
+    // Signal
+    #[serde(default)]
+    pub signal_enabled: Option<bool>,
+    pub signal_bridge_token: Option<String>,
+    pub signal_bridge_url: Option<String>,
+    pub signal_default_recipient: Option<String>,
+    pub signal_default_group_id: Option<String>,
+    // iMessage
+    #[serde(default)]
+    pub imessage_enabled: Option<bool>,
+    pub imessage_bridge_token: Option<String>,
+    pub imessage_bridge_url: Option<String>,
+    pub imessage_default_chat_id: Option<String>,
+    pub imessage_default_handle: Option<String>,
+    // LINE
+    #[serde(default)]
+    pub line_enabled: Option<bool>,
+    pub line_channel_access_token: Option<String>,
+    pub line_channel_secret: Option<String>,
+    pub line_api_base_url: Option<String>,
+    pub line_default_target: Option<String>,
+    pub line_user_agent: Option<String>,
+    // WeChat
+    #[serde(default)]
+    pub wechat_enabled: Option<bool>,
+    pub wechat_bridge_token: Option<String>,
+    pub wechat_bridge_url: Option<String>,
+    pub wechat_default_target_id: Option<String>,
+    // QQ
+    #[serde(default)]
+    pub qq_enabled: Option<bool>,
+    pub qq_bridge_token: Option<String>,
+    pub qq_bridge_url: Option<String>,
+    pub qq_default_target_id: Option<String>,
     /// Actions that run without approval
     #[serde(default)]
     pub auto_approve: Option<Vec<String>>,
@@ -2049,9 +2494,6 @@ pub struct SettingsUpdate {
     /// Search: Serper API key
     #[serde(default)]
     pub search_serper_key: Option<String>,
-    /// Search: SearXNG URL
-    #[serde(default)]
-    pub search_searxng_url: Option<String>,
     /// Search: Brave API key
     #[serde(default)]
     pub search_brave_key: Option<String>,
@@ -2098,6 +2540,12 @@ pub struct SettingsUpdate {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DataLifecycleSettingsUpdate {
     #[serde(default)]
+    pub cleanup_enabled: Option<bool>,
+    #[serde(default)]
+    pub notifications_cleanup_enabled: Option<bool>,
+    #[serde(default)]
+    pub logs_cleanup_enabled: Option<bool>,
+    #[serde(default)]
     pub notifications_retention_days: Option<u64>,
     #[serde(default)]
     pub notification_cleanup_interval_secs: Option<u64>,
@@ -2119,6 +2567,12 @@ pub struct DataLifecycleSettingsUpdate {
     pub terminal_task_retention_days: Option<u64>,
     #[serde(default)]
     pub message_retention_days: Option<u64>,
+    #[serde(default)]
+    pub experience_run_retention_days: Option<u64>,
+    #[serde(default)]
+    pub experience_edge_retention_days: Option<u64>,
+    #[serde(default)]
+    pub learning_candidate_retention_days: Option<u64>,
     #[serde(default)]
     pub housekeeping_interval_secs: Option<u64>,
     #[serde(default)]
@@ -2207,23 +2661,6 @@ struct KnowledgeQueryRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct NudgeFeedbackRequest {
-    action: String,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    snooze_minutes: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NudgePlannerRequest {
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    max_items: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
 struct TrustEvaluateRequest {
     action_kind: String,
     #[serde(default)]
@@ -2245,6 +2682,8 @@ struct CodeExecuteRequest {
     env: HashMap<String, String>,
     #[serde(default)]
     files: Vec<String>,
+    #[serde(default)]
+    network_access: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2274,9 +2713,21 @@ struct EvolutionSettingsResponse {
     learning_queue_cap: u64,
     learning_queue: crate::storage::LearningQueueCounts,
     canary: EvolutionCanarySummary,
+    prompt_canary: EvolutionCanarySummary,
+    classifier_prompt_canary: EvolutionCanarySummary,
+    specialist_prompt_canary: EvolutionCanarySummary,
     last_promotion_result: String,
     replay_gate_result: Option<String>,
     promotion_mode: String,
+    prompt_last_promotion_result: String,
+    prompt_replay_gate_result: Option<String>,
+    prompt_promotion_mode: String,
+    classifier_prompt_last_promotion_result: String,
+    classifier_prompt_replay_gate_result: Option<String>,
+    classifier_prompt_promotion_mode: String,
+    specialist_prompt_last_promotion_result: String,
+    specialist_prompt_replay_gate_result: Option<String>,
+    specialist_prompt_promotion_mode: String,
     deploy_guard_default: bool,
 }
 
@@ -2305,16 +2756,65 @@ struct EvolutionVersionMetric {
 }
 
 #[derive(Debug, Serialize)]
+struct PromptEvolutionMetric {
+    version: String,
+    samples: usize,
+    success_rate: f64,
+    error_rate: f64,
+    p95_latency_ms: Option<i64>,
+    routing_decisions: usize,
+    delegation_rate: f64,
+    clarification_rate: f64,
+    avg_tool_calls_per_request: f64,
+    tool_success_rate: f64,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct PromptEvolutionInsights {
+    baseline_version: Option<String>,
+    candidate_version: Option<String>,
+    rollout_percent: u8,
+    delegation_avoided: f64,
+    clarification_avoided: f64,
+    successful_direct_resolution_uplift: f64,
+    tool_success_uplift: f64,
+    latency_savings_p95_ms: Option<i64>,
+    failed_delegation_reduction: f64,
+    regressions: Vec<String>,
+    summary: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct EvolutionDevResponse {
     canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     last_result: Option<serde_json::Value>,
     lineage_recent: Vec<serde_json::Value>,
     policy_metrics: Vec<EvolutionVersionMetric>,
     strategy_metrics: Vec<EvolutionVersionMetric>,
+    prompt_canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    prompt_last_result: Option<serde_json::Value>,
+    prompt_lineage_recent: Vec<serde_json::Value>,
+    prompt_metrics: Vec<PromptEvolutionMetric>,
+    prompt_insights: PromptEvolutionInsights,
+    classifier_prompt_canary_state:
+        Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    classifier_prompt_last_result: Option<serde_json::Value>,
+    classifier_prompt_lineage_recent: Vec<serde_json::Value>,
+    classifier_prompt_metrics: Vec<PromptEvolutionMetric>,
+    classifier_prompt_insights: PromptEvolutionInsights,
+    specialist_prompt_canary_state:
+        Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    specialist_prompt_last_result: Option<serde_json::Value>,
+    specialist_prompt_lineage_recent: Vec<serde_json::Value>,
+    specialist_prompt_metrics: Vec<PromptEvolutionMetric>,
+    specialist_prompt_insights: PromptEvolutionInsights,
     learning_queue: crate::storage::LearningQueueCounts,
     learning_candidates: Vec<serde_json::Value>,
     learning_items: Vec<serde_json::Value>,
     learning_patterns: Vec<serde_json::Value>,
+    recent_prompt_runs: Vec<serde_json::Value>,
+    recent_classifier_prompt_runs: Vec<serde_json::Value>,
+    recent_specialist_prompt_runs: Vec<serde_json::Value>,
     recent_experience_runs: Vec<serde_json::Value>,
 }
 
@@ -2325,11 +2825,7 @@ struct EvolutionDevActionRequest {
 }
 
 const AUTONOMY_LAST_BRIEF_KEY: &str = "autonomy_last_brief_v1";
-const AUTONOMY_NUDGE_FEEDBACK_KEY: &str = "autonomy_nudge_feedback_v1";
-const AUTONOMY_NUDGE_NOTIFIED_KEY: &str = "autonomy_nudge_notified_v1";
-const AUTONOMY_LAST_NUDGES_KEY: &str = "autonomy_last_nudges_v1";
-const AUTONOMY_NUDGE_PLANNED_KEY: &str = "autonomy_nudge_planned_v1";
-const AUTONOMY_NUDGE_LAST_SCAN_KEY: &str = "autonomy_nudge_last_scan_v1";
+const AUTONOMY_ANALYSIS_LAST_RUN_KEY: &str = "autonomy_analysis_last_run_v1";
 const AUTONOMY_ATTENTION_STATE_KEY: &str = "autonomy_attention_state_v1";
 const AUTONOMY_CHAT_SUGGESTIONS_KEY: &str = "autonomy_chat_suggestions_v1";
 const AUTONOMY_CHAT_SUGGESTION_SCAN_STATE_KEY: &str = "autonomy_chat_suggestion_scan_state_v1";
@@ -2340,6 +2836,12 @@ const DEFAULT_DAILY_BRIEF_TIME: &str = "09:00";
 const PUBLIC_SELECTED_APP_KEY: &str = "public_selected_app_id";
 const HOOKS_STORAGE_KEY: &str = "hooks_v1";
 const ROUTING_POLICY_LINEAGE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lineage.jsonl";
+const PROMPT_BUNDLE_LINEAGE_REL_PATH: &str = ".agentark/self_evolve/prompt_bundle_lineage.jsonl";
+const CLASSIFIER_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
+    ".agentark/self_evolve/classifier_prompt_bundle_lineage.jsonl";
+const SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
+    ".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl";
+const PROMPT_REPLAY_EVAL_SAMPLE_LIMIT: u64 = 5000;
 const CHAT_SUGGESTION_SCAN_INTERVAL_HOURS: i64 = 12;
 const CHAT_SUGGESTION_SCAN_DEFER_MINUTES: i64 = 30;
 const CHAT_SUGGESTION_SCAN_FETCH_LIMIT: u64 = 48;
@@ -2492,47 +2994,6 @@ struct ChatAutomationSuggestion {
     accepted_outcomes: Vec<suggestions::ChatSuggestionOutcome>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct NudgeFeedbackPreference {
-    #[serde(default)]
-    dismissed: bool,
-    #[serde(default)]
-    suppressed_until: Option<String>,
-    #[serde(default)]
-    last_feedback: Option<String>,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    updated_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryContextSummary {
-    id: String,
-    summary: String,
-    memory_type: String,
-    timestamp: String,
-    channel: Option<String>,
-    importance: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PredictiveNudge {
-    id: String,
-    #[serde(rename = "type")]
-    nudge_type: String,
-    title: String,
-    detail: String,
-    confidence: f32,
-    priority: u8,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    recommended_action: Option<RecommendedAction>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    memory_clues: Vec<MemoryContextSummary>,
-}
-
 fn summarize_text(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.len() <= 160 {
@@ -2550,42 +3011,6 @@ fn parse_rfc3339_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 fn parse_utc_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     parse_rfc3339_utc(value)
-}
-
-async fn collect_memory_clues(agent: &Agent, query: &str) -> Vec<MemoryContextSummary> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let entries = match agent.memory.retrieve_relevant(trimmed, 3, None).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::debug!("Failed to collect predictive nudge memory clues: {}", error);
-            return Vec::new();
-        }
-    };
-
-    entries
-        .into_iter()
-        .map(|entry| {
-            let (memory_type, channel) = match &entry.memory_type {
-                MemoryType::Episodic { context } => {
-                    ("episodic".to_string(), Some(context.channel.clone()))
-                }
-                MemoryType::Semantic { .. } => ("semantic".to_string(), None),
-                MemoryType::Procedural { .. } => ("procedural".to_string(), None),
-            };
-            MemoryContextSummary {
-                id: entry.id.to_string(),
-                summary: summarize_text(&entry.content),
-                memory_type,
-                timestamp: entry.timestamp.to_rfc3339(),
-                channel,
-                importance: entry.importance,
-            }
-        })
-        .collect()
 }
 
 fn normalize_chat_suggestion_text(input: &str) -> String {
@@ -3016,7 +3441,8 @@ fn infer_chat_automation_suggestion(
     };
     let detail = match kind {
         "watcher" => format!(
-            "Draft a watcher so AgentArk can keep tabs on {} without you asking again.",
+            "Draft a watcher so {} can keep tabs on {} without you asking again.",
+            crate::branding::PRODUCT_NAME,
             summarize_text(&focus)
         ),
         "app" => format!(
@@ -3158,8 +3584,7 @@ async fn rate_limit_middleware(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let session_token = auth::current_ui_session_token(&state).await;
-    if auth::has_valid_ui_session_cookie(request.headers(), session_token.as_deref()) {
+    if auth::has_valid_ui_session_cookie(&state, request.headers()).await {
         return next.run(request).await;
     }
 
@@ -3169,10 +3594,7 @@ async fn rate_limit_middleware(
     let limiter = state.tiered_rate_limiter.select_for_path(&path);
 
     if !limiter.check_rate_limit(&ip).await {
-        state
-            .security_events
-            .rate_limit_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.security_events.record_rate_limit_hit();
         spawn_security_log(
             state.agent.clone(),
             "rate_limit",
@@ -3192,11 +3614,89 @@ async fn rate_limit_middleware(
     next.run(request).await
 }
 
+async fn metrics_middleware(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let route_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string());
+    let raw_path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let path = route_path.unwrap_or(raw_path);
+    crate::metrics::observe_http_request(
+        method.as_str(),
+        &path,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
+
+async fn security_headers_middleware(
+    State(state): State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(HEADER_X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        HEADER_X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HEADER_CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'; base-uri 'self'; object-src 'none'"),
+    );
+    if state.deployment_mode == DeploymentMode::InternetFacing {
+        headers.insert(
+            HEADER_STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
+}
+
+fn validate_chat_message_size(message: &str) -> Option<Response> {
+    if message.len() <= MAX_CHAT_MESSAGE_BYTES {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!(
+                    "Chat message exceeds the {} byte limit",
+                    MAX_CHAT_MESSAGE_BYTES
+                ),
+            }),
+        )
+            .into_response(),
+    )
+}
+
+fn sanitize_content_disposition_filename(raw: &str) -> String {
+    let sanitized = raw.replace(['\r', '\n', '"'], "_");
+    if sanitized.trim().is_empty() {
+        "download".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Start the HTTP server with authentication, CORS, and rate limiting
 pub async fn serve(
     agent: SharedAgent,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    {
+        let agent_guard = agent.read().await;
+        if let Err(error) = agent_guard.runtime.reconcile_orphan_containers().await {
+            tracing::warn!("Initial sandbox container reconciliation failed: {}", error);
+        }
+    }
+
     let tiered_rate_limiter = TieredRateLimiter::new();
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or("127.0.0.1:8990".to_string());
 
@@ -3223,23 +3723,25 @@ pub async fn serve(
         let deployment_mode = deployment_mode_from_config(&agent_guard.config);
         let public_app_bind_addr =
             public_app_bind_addr_from_config(&agent_guard.config, deployment_mode);
-        let public_app_base_url =
-            public_app_base_url_from_config(&agent_guard.config).or_else(|| {
+        let configured_public_app_base_url = public_app_base_url_from_config(&agent_guard.config);
+        let isolate_public_apps = internet_facing_apps_should_be_isolated(
+            deployment_mode,
+            public_app_bind_addr.as_deref(),
+        );
+        let public_app_base_url = configured_public_app_base_url.clone().or_else(|| {
+            if isolate_public_apps {
                 public_app_bind_addr
                     .as_deref()
                     .and_then(default_base_url_for_bind_addr)
-            });
-        let allow_insecure_no_auth = parse_env_truthy("AGENTARK_INSECURE_NO_AUTH").unwrap_or(false)
-            && deployment_mode == DeploymentMode::TrustedLocal;
-        if allow_insecure_no_auth {
+            } else {
+                None
+            }
+        });
+        let insecure_no_auth_requested =
+            parse_env_truthy("AGENTARK_INSECURE_NO_AUTH").unwrap_or(false);
+        if insecure_no_auth_requested {
             tracing::warn!(
-                "AGENTARK_INSECURE_NO_AUTH is enabled: protected routes can run without API auth"
-            );
-        } else if parse_env_truthy("AGENTARK_INSECURE_NO_AUTH").unwrap_or(false)
-            && deployment_mode == DeploymentMode::InternetFacing
-        {
-            tracing::warn!(
-                "Ignoring AGENTARK_INSECURE_NO_AUTH because deployment_mode=internet_facing"
+                "Ignoring AGENTARK_INSECURE_NO_AUTH: protected routes always require API auth"
             );
         }
         let api_key_info = crate::core::config::SecureConfigManager::new_with_data_dir(
@@ -3254,10 +3756,6 @@ pub async fn serve(
             .or_else(|| agent_guard.api_key.clone());
         let initial_api_key_expires_at = api_key_info.as_ref().map(|k| k.expires_at);
 
-        // Generate a random session token (in-memory) so the web UI can auth via cookie
-        // without exposing the API key. Rotates on each server start.
-        let session_token = initial_api_key.as_ref().map(|_| generate_ephemeral_token());
-
         // If TLS is configured (direct HTTPS), mark session cookies Secure by default.
         let cookie_secure_default = {
             #[cfg(feature = "tls")]
@@ -3270,7 +3768,15 @@ pub async fn serve(
                 false
             }
         };
+        validate_public_app_listener_posture(
+            deployment_mode,
+            public_app_bind_addr.as_deref(),
+            configured_public_app_base_url.as_deref(),
+            cookie_secure_default,
+        )?;
         let local_ui_bootstrap_enabled = deployment_mode == DeploymentMode::TrustedLocal;
+        let executor_client = build_executor_client()?;
+        let workspace_client = build_workspace_client()?;
         AppState {
             agent: agent.clone(),
             trace_history: agent_guard.trace_history.clone(),
@@ -3281,8 +3787,8 @@ pub async fn serve(
             tiered_rate_limiter,
             api_key: Arc::new(RwLock::new(initial_api_key)),
             api_key_expires_at: Arc::new(RwLock::new(initial_api_key_expires_at)),
-            allow_insecure_no_auth,
-            session_token: Arc::new(RwLock::new(session_token)),
+            allow_insecure_no_auth: false,
+            ui_sessions: Arc::new(RwLock::new(HashMap::new())),
             local_ui_bootstrap_enabled,
             local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
             cookie_secure_default,
@@ -3292,6 +3798,8 @@ pub async fn serve(
             whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
             security_events: agent_guard.security_events.clone(),
             app_registry: agent_guard.app_registry.clone(),
+            executor_client,
+            workspace_client,
             application_registry: applications::ApplicationLauncherRegistry::default(),
             deployment_mode,
             server_role: HttpServerRole::ControlPlane,
@@ -3306,6 +3814,7 @@ pub async fn serve(
         .route("/ui", get(web_ui))
         .route("/ui/v2", get(web_ui_v2))
         .route("/session/bootstrap", post(auth::bootstrap_ui_session))
+        .route("/session/logout", post(auth::logout_ui_session))
         .route(
             "/session/bootstrap/local",
             get(auth::issue_local_ui_bootstrap_token).post(auth::bootstrap_local_ui_session),
@@ -3323,9 +3832,16 @@ pub async fn serve(
         .route("/logo.jpg", get(serve_logo_jpg))
         .route("/public/proxy/raw", get(public_proxy_raw))
         .route("/health", get(health))
+        .route("/readiness", get(readiness))
         // WhatsApp webhook (public - Meta calls without auth)
         .route("/webhook/whatsapp", get(whatsapp_webhook_verify))
         .route("/webhook/whatsapp", post(whatsapp_webhook_handler))
+        .route("/webhook/google-chat", post(google_chat_webhook_handler))
+        .route("/webhook/signal", post(signal_webhook_handler))
+        .route("/webhook/imessage", post(imessage_webhook_handler))
+        .route("/webhook/line", post(line_webhook_handler))
+        .route("/webhook/wechat", post(wechat_webhook_handler))
+        .route("/webhook/qq", post(qq_webhook_handler))
         .route(
             "/webhook/inbound/{source_id}",
             post(webhooks::handle_inbound_webhook),
@@ -3344,6 +3860,7 @@ pub async fn serve(
     // Protected routes (require Bearer token + rate limited)
     let protected_routes = Router::new()
         .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/chat", post(chat))
         .route("/chat/stream", post(chat_stream))
         .route("/chat/clear", post(clear_chat))
@@ -3410,6 +3927,29 @@ pub async fn serve(
         .route(
             "/browser/profiles/{id}/sessions",
             post(browser_profiles_control::record_session),
+        )
+        .route("/auth/profiles", get(auth_profiles_control::list_profiles))
+        .route(
+            "/auth/profiles",
+            post(auth_profiles_control::create_profile),
+        )
+        .route(
+            "/auth/profiles/{id}",
+            get(auth_profiles_control::get_profile)
+                .post(auth_profiles_control::update_profile)
+                .delete(auth_profiles_control::delete_profile),
+        )
+        .route(
+            "/auth/profiles/{id}/revoke",
+            post(auth_profiles_control::revoke_profile),
+        )
+        .route(
+            "/auth/profiles/{id}/oauth/start",
+            post(auth_profiles_control::start_oauth_profile),
+        )
+        .route(
+            "/auth/profiles/{id}/session/capture",
+            post(auth_profiles_control::capture_session_material),
         )
         .route(
             "/models/failover",
@@ -3496,11 +4036,26 @@ pub async fn serve(
             "/background-sessions/{id}",
             axum::routing::delete(delete_background_session),
         )
-        .route("/background-sessions/{id}/attach", post(attach_background_session_work))
-        .route("/background-sessions/{id}/detach", post(detach_background_session_work))
-        .route("/background-sessions/{id}/pause", post(pause_background_session))
-        .route("/background-sessions/{id}/resume", post(resume_background_session))
-        .route("/background-sessions/{id}/cancel", post(cancel_background_session))
+        .route(
+            "/background-sessions/{id}/attach",
+            post(attach_background_session_work),
+        )
+        .route(
+            "/background-sessions/{id}/detach",
+            post(detach_background_session_work),
+        )
+        .route(
+            "/background-sessions/{id}/pause",
+            post(pause_background_session),
+        )
+        .route(
+            "/background-sessions/{id}/resume",
+            post(resume_background_session),
+        )
+        .route(
+            "/background-sessions/{id}/cancel",
+            post(cancel_background_session),
+        )
         .route("/automation/objects", get(list_automation_objects))
         .route("/automation/runs", get(list_automation_runs_endpoint))
         .route("/goals", get(list_goals))
@@ -3510,6 +4065,27 @@ pub async fn serve(
         .route(
             "/autonomy/settings",
             get(get_autonomy_settings).post(update_autonomy_settings),
+        )
+        .route(
+            "/autonomy/sentinel/settings",
+            get(sentinel_panel::get_sentinel_settings)
+                .post(sentinel_panel::update_sentinel_settings),
+        )
+        .route(
+            "/autonomy/sentinel/feed",
+            get(sentinel_panel::get_sentinel_feed),
+        )
+        .route(
+            "/autonomy/sentinel/proposals/{id}/approve",
+            post(sentinel_panel::approve_sentinel_proposal),
+        )
+        .route(
+            "/autonomy/sentinel/proposals/{id}/dismiss",
+            post(sentinel_panel::dismiss_sentinel_proposal),
+        )
+        .route(
+            "/autonomy/sentinel/proposals/{id}/snooze",
+            post(sentinel_panel::snooze_sentinel_proposal),
         )
         .route("/autonomy/briefing", get(get_autonomy_briefing))
         .route(
@@ -3552,15 +4128,6 @@ pub async fn serve(
         .route(
             "/autonomy/knowledge/suggest-imports",
             get(suggest_knowledge_imports),
-        )
-        .route(
-            "/autonomy/nudges",
-            get(get_predictive_nudges).post(emit_predictive_nudges),
-        )
-        .route("/autonomy/nudges/plan", post(plan_predictive_nudges))
-        .route(
-            "/autonomy/nudges/{id}/feedback",
-            post(set_predictive_nudge_feedback),
         )
         .route("/autonomy/trust/evaluate", post(evaluate_trust_request))
         .route("/autonomy/voice/briefing", get(get_voice_briefing))
@@ -3621,8 +4188,6 @@ pub async fn serve(
             "/models/openai-subscription/oauth/status",
             get(codex_cli_oauth_status),
         )
-        .route("/models/codex/oauth/start", post(start_codex_cli_oauth))
-        .route("/models/codex/oauth/status", get(codex_cli_oauth_status))
         .route("/models/discover/{provider}", get(discover_provider_models))
         .route("/profile", get(get_profile))
         .route("/restart", post(restart_server))
@@ -3754,6 +4319,10 @@ pub async fn serve(
         .route("/conversations", get(list_conversations))
         .route("/conversations", post(create_conversation_endpoint))
         .route("/conversations/{id}", get(get_conversation_endpoint))
+        .route(
+            "/conversations/{id}/latest-run",
+            get(get_conversation_latest_run),
+        )
         .route(
             "/conversations/{id}",
             axum::routing::patch(update_conversation_endpoint),
@@ -3889,7 +4458,7 @@ pub async fn serve(
         )
         // File upload for chat attachments
         .route("/api/upload", post(upload_chat_file))
-        .route("/api/uploads/{filename}", get(serve_upload_file))
+        .route("/api/uploads/{upload_id}", get(serve_upload_file))
         // Approval audit log
         .route("/approvals/log", get(get_approval_log))
         // Security event log
@@ -3915,6 +4484,7 @@ pub async fn serve(
         .route("/watchers/{id}/extend", post(extend_watcher))
         // Persisted execution runs
         .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/stream", get(stream_run_events))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/resume", post(resume_run))
         // Greetings (LLM-generated, cached in DB)
@@ -4010,11 +4580,16 @@ pub async fn serve(
     let app = public_routes
         .merge(protected_routes)
         .with_state(state.clone())
+        .layer(middleware::from_fn(metrics_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             tunnel_exposure_middleware,
         ))
-        .layer(cors);
+        .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ));
 
     let isolate_public_apps = internet_facing_apps_should_be_isolated(
         state.deployment_mode,
@@ -4022,24 +4597,100 @@ pub async fn serve(
     );
     let mut public_app_server: Option<tokio::task::JoinHandle<()>> = None;
     if isolate_public_apps {
+        #[cfg(feature = "tls")]
+        let public_app_tls_paths = {
+            let agent_guard = state.agent.read().await;
+            (
+                agent_guard.config.tls_cert_path.clone(),
+                agent_guard.config.tls_key_path.clone(),
+            )
+        };
         let mut public_app_state = state.clone();
         public_app_state.server_role = HttpServerRole::PublicApps;
         public_app_state.local_ui_bootstrap_enabled = false;
         public_app_state.allow_insecure_no_auth = false;
         let public_app_routes = Router::new()
             .route("/health", get(health))
+            .route("/readiness", get(readiness))
             .route("/public/proxy/raw", get(public_proxy_raw))
             .route("/apps/{app_id}", any(serve_app_root))
             .route("/apps/{app_id}/", any(serve_app_root))
             .route("/apps/{app_id}/{*path}", any(serve_app_path))
-            .with_state(public_app_state.clone());
+            .with_state(public_app_state.clone())
+            .layer(middleware::from_fn(metrics_middleware))
+            .layer(middleware::from_fn_with_state(
+                public_app_state.clone(),
+                security_headers_middleware,
+            ));
         let public_app_bind_addr = state
             .public_app_bind_addr
             .clone()
             .unwrap_or("127.0.0.1:8992".to_string());
         let public_app_listener = tokio::net::TcpListener::bind(&public_app_bind_addr).await?;
+        #[cfg(feature = "tls")]
+        let public_app_bind_is_loopback = bind_addr_is_loopback(&public_app_bind_addr);
         let mut app_shutdown = shutdown_rx.clone();
         public_app_server = Some(tokio::spawn(async move {
+            #[cfg(feature = "tls")]
+            if !public_app_bind_is_loopback {
+                if let (Some(cert_path), Some(key_path)) = public_app_tls_paths.clone() {
+                    match public_app_bind_addr.parse::<SocketAddr>() {
+                        Ok(addr) => match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                            &cert_path, &key_path,
+                        )
+                        .await
+                        {
+                            Ok(rustls_config) => {
+                                let handle = axum_server::Handle::new();
+                                let shutdown_handle = handle.clone();
+                                let mut tls_shutdown = app_shutdown.clone();
+                                let shutdown_task = tokio::spawn(async move {
+                                    let _ = tls_shutdown.changed().await;
+                                    shutdown_handle.graceful_shutdown(Some(
+                                        std::time::Duration::from_secs(10),
+                                    ));
+                                });
+                                tracing::info!(
+                                    "Public app server listening on https://{}",
+                                    public_app_bind_addr
+                                );
+                                let result = axum_server::bind_rustls(addr, rustls_config)
+                                    .handle(handle)
+                                    .serve(
+                                        public_app_routes
+                                            .into_make_service_with_connect_info::<SocketAddr>(),
+                                    )
+                                    .await;
+                                let _ = shutdown_task.await;
+                                if let Err(error) = result {
+                                    tracing::error!(
+                                        "Public HTTPS app server on {} exited with error: {}",
+                                        public_app_bind_addr,
+                                        error
+                                    );
+                                }
+                                return;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    "Failed to load TLS certs for public app listener {}: {}",
+                                    public_app_bind_addr,
+                                    error
+                                );
+                                return;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!(
+                                "Invalid public app bind address {} for direct HTTPS listener: {}",
+                                public_app_bind_addr,
+                                error
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
             tracing::info!(
                 "Public app server listening on http://{}",
                 public_app_bind_addr
@@ -4089,13 +4740,13 @@ pub async fn serve(
         });
     }
 
-    // Always auto-start WhatsApp bridge - it's lightweight and just waits for QR scan
-    {
-        let wb = wa_bridge_handle.clone();
+    // Auto-start the bundled WhatsApp bridge only when Baileys + embedded mode is enabled.
+    if should_manage_embedded_whatsapp_bridge(&state).await {
+        let state_for_bridge = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            tracing::info!("Auto-starting WhatsApp bridge...");
-            match spawn_whatsapp_bridge(wb).await {
+            tracing::info!("Auto-starting bundled WhatsApp bridge...");
+            match spawn_whatsapp_bridge(state_for_bridge).await {
                 Ok(()) => tracing::info!("WhatsApp bridge started"),
                 Err(e) => tracing::warn!("WhatsApp bridge unavailable: {}", e),
             }
@@ -4109,6 +4760,7 @@ pub async fn serve(
         let t = tunnel_handle.clone();
         let state_for_tunnel = state.clone();
         let wb = wa_bridge_handle.clone();
+        let state_for_bridge = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -4176,7 +4828,7 @@ pub async fn serve(
                 if wa_needs_restart {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     tracing::info!("ArkSentinel: restarting WhatsApp bridge...");
-                    match spawn_whatsapp_bridge(wb.clone()).await {
+                    match spawn_whatsapp_bridge(state_for_bridge.clone()).await {
                         Ok(()) => {
                             tracing::info!("ArkSentinel: WhatsApp bridge restarted successfully")
                         }
@@ -4234,7 +4886,17 @@ pub async fn serve(
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
             loop {
                 interval.tick().await;
-                let storage = { state_for_suggestions.agent.read().await.storage.clone() };
+                let (storage, autonomy_disabled) = {
+                    let agent = state_for_suggestions.agent.read().await;
+                    let settings = load_autonomy_settings(&agent).await;
+                    (
+                        agent.storage.clone(),
+                        autonomy_background_disabled(&settings),
+                    )
+                };
+                if autonomy_disabled {
+                    continue;
+                }
                 let scan_state = load_chat_suggestion_scan_state(&storage).await;
                 if !chat_suggestion_scan_is_due(&scan_state, chrono::Utc::now()) {
                     continue;
@@ -4367,10 +5029,30 @@ async fn web_ui(
             .into_response()
     };
     if auth::should_issue_ui_session_cookie(&state, &headers, addr).await {
-        let session_token = auth::current_ui_session_token(&state).await;
+        let session_token = generate_ephemeral_token();
+        {
+            let now = auth::unix_now_ts();
+            let mut sessions = state.ui_sessions.write().await;
+            sessions.retain(|_, record| record.expires_at > now);
+            sessions.insert(
+                session_token.clone(),
+                UiSessionRecord {
+                    issued_at: now,
+                    expires_at: now + UI_SESSION_TTL_SECS,
+                    last_seen_at: now,
+                    source: "ui_navigation".to_string(),
+                    client_hint: headers
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.chars().take(160).collect()),
+                },
+            );
+        }
         auth::apply_session_cookie(
             &mut response,
-            session_token.as_ref(),
+            Some(session_token.as_str()),
             state.cookie_secure_default || auth::is_https_forwarded(&headers),
         );
     }
@@ -4393,10 +5075,30 @@ async fn web_ui_v2(
             .into_response()
     };
     if auth::should_issue_ui_session_cookie(&state, &headers, addr).await {
-        let session_token = auth::current_ui_session_token(&state).await;
+        let session_token = generate_ephemeral_token();
+        {
+            let now = auth::unix_now_ts();
+            let mut sessions = state.ui_sessions.write().await;
+            sessions.retain(|_, record| record.expires_at > now);
+            sessions.insert(
+                session_token.clone(),
+                UiSessionRecord {
+                    issued_at: now,
+                    expires_at: now + UI_SESSION_TTL_SECS,
+                    last_seen_at: now,
+                    source: "ui_navigation".to_string(),
+                    client_hint: headers
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.chars().take(160).collect()),
+                },
+            );
+        }
         auth::apply_session_cookie(
             &mut response,
-            session_token.as_ref(),
+            Some(session_token.as_str()),
             state.cookie_secure_default || auth::is_https_forwarded(&headers),
         );
     }
@@ -4434,6 +5136,73 @@ fn extract_request_host(headers: &HeaderMap) -> Option<String> {
     } else {
         Some(normalized)
     }
+}
+
+fn extract_request_authority(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .map(|value| value.trim_matches('"').trim_end_matches('.'))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub(super) fn oauth_redirect_uri_for_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    explicit_redirect_uri: Option<&str>,
+) -> std::result::Result<String, String> {
+    if let Some(raw) = explicit_redirect_uri
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let parsed = reqwest::Url::parse(raw)
+            .map_err(|error| format!("Invalid OAuth redirect URI '{}': {}", raw, error))?;
+        if state.deployment_mode == DeploymentMode::InternetFacing
+            && !parsed.scheme().eq_ignore_ascii_case("https")
+        {
+            return Err("OAuth redirect URIs must use HTTPS in internet-facing mode.".to_string());
+        }
+        return Ok(parsed.to_string());
+    }
+
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if state.cookie_secure_default {
+            "https"
+        } else {
+            "http"
+        });
+    if state.deployment_mode == DeploymentMode::InternetFacing
+        && !scheme.eq_ignore_ascii_case("https")
+    {
+        return Err("OAuth callbacks must arrive over HTTPS in internet-facing mode.".to_string());
+    }
+
+    let authority = extract_request_authority(headers).or_else(|| {
+        if state.deployment_mode == DeploymentMode::TrustedLocal {
+            Some("localhost:8990".to_string())
+        } else {
+            None
+        }
+    });
+    let Some(authority) = authority else {
+        return Err(
+            "Could not determine the external host for OAuth callback routing.".to_string(),
+        );
+    };
+    Ok(format!(
+        "{}://{}/oauth/callback",
+        scheme.to_ascii_lowercase(),
+        authority.trim_end_matches('/')
+    ))
 }
 
 fn request_matches_active_tunnel(headers: &HeaderMap, tunnel_url: Option<&str>) -> bool {
@@ -4571,8 +5340,7 @@ async fn docs_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
         }
     }
 
-    let session_token = auth::current_ui_session_token(state).await;
-    if auth::has_valid_ui_session_cookie(headers, session_token.as_deref()) {
+    if auth::has_valid_ui_session_cookie(state, headers).await {
         return true;
     }
     false
@@ -4588,7 +5356,7 @@ fn docs_auth_required_response() -> Response {
         .into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Basic realm=\"AgentArk Docs\""),
+        HeaderValue::from_static(crate::branding::DOCS_BASIC_AUTH_REALM),
     );
     response
 }
@@ -4885,18 +5653,6 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "Check OpenAI Subscription OAuth status",
         "Models",
     );
-    add(
-        "/models/codex/oauth/start",
-        "POST",
-        "Start OpenAI Subscription browser OAuth (legacy path)",
-        "Models",
-    );
-    add(
-        "/models/codex/oauth/status",
-        "GET",
-        "Check OpenAI Subscription OAuth status (legacy path)",
-        "Models",
-    );
 
     // --- Integrations ---
     add("/integrations", "GET", "List integrations", "Integrations");
@@ -5073,7 +5829,10 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
     add(
         "/memory/knowledge/sync-product-docs",
         "POST",
-        "Sync bundled AgentArk product-help knowledge",
+        &format!(
+            "Sync bundled {} product-help knowledge",
+            crate::branding::PRODUCT_NAME
+        ),
         "Memory",
     );
     add(
@@ -5285,9 +6044,12 @@ async fn openapi_spec(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let spec = serde_json::json!({
         "openapi": "3.0.3",
         "info": {
-            "title": "AgentArk API",
+            "title": format!("{} API", crate::branding::PRODUCT_NAME),
             "version": "1.0.0",
-            "description": "Interactive API reference for AgentArk. Endpoints listed here require API key authentication."
+            "description": format!(
+                "Interactive API reference for {}. Endpoints listed here require API key authentication.",
+                crate::branding::PRODUCT_NAME
+            )
         },
         "servers": [
             { "url": "/" }
@@ -5342,10 +6104,10 @@ async fn api_docs_page(State(state): State<AppState>, headers: HeaderMap) -> Res
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AgentArk API Docs</title>
+  <title>__PRODUCT_NAME__ API Docs</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
   <style>
- /* - AgentArk theme - exact match to app palette - */
+ /* - __PRODUCT_NAME__ theme - exact match to app palette - */
     /* bg.default=#030711  bg.paper=#091527  primary=#2fd4ff  secondary=#14f195
        text.primary=#ecf5ff  text.secondary=#9bb4d6  border=rgba(106,150,198,0.22)
        card=linear-gradient(140deg,rgba(9,21,39,0.92),rgba(9,21,39,0.72))
@@ -5548,7 +6310,7 @@ async fn api_docs_page(State(state): State<AppState>, headers: HeaderMap) -> Res
   <div class="ark-header">
     <img src="/logo.svg" alt="" />
     <div>
-      <strong>AgentArk</strong>
+      <strong>__PRODUCT_NAME__</strong>
       <small>API Docs &middot; /openapi.json</small>
     </div>
   </div>
@@ -5567,6 +6329,7 @@ async fn api_docs_page(State(state): State<AppState>, headers: HeaderMap) -> Res
   </script>
 </body>
 </html>"#;
+    let html = crate::branding::render_template(html);
     (StatusCode::OK, Html(html)).into_response()
 }
 
@@ -5722,16 +6485,30 @@ async fn serve_output_file(
         agent.data_dir().to_path_buf()
     };
     let file_path = data_dir.join("outputs").join(&exec_id).join(&filename);
+    let bytes = match tokio::fs::read(&file_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            if let Some(workspace) = state.workspace_client.as_ref() {
+                workspace
+                    .get_blob(&format!("outputs/{}/{}", exec_id, filename))
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        }
+    };
 
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => {
+    match bytes {
+        Some(bytes) => {
             let content_type = guess_content_type(&filename);
+            let safe_filename = sanitize_content_disposition_filename(&filename);
             (
                 [
                     (header::CONTENT_TYPE, content_type.as_str()),
                     (
                         header::CONTENT_DISPOSITION,
-                        &format!("inline; filename=\"{}\"", filename),
+                        &format!("inline; filename=\"{}\"", safe_filename),
                     ),
                     (header::CACHE_CONTROL, "public, max-age=86400"),
                 ],
@@ -5739,7 +6516,7 @@ async fn serve_output_file(
             )
                 .into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -5760,16 +6537,30 @@ async fn download_output_file(
         agent.data_dir().to_path_buf()
     };
     let file_path = data_dir.join("outputs").join(&exec_id).join(&filename);
+    let bytes = match tokio::fs::read(&file_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            if let Some(workspace) = state.workspace_client.as_ref() {
+                workspace
+                    .get_blob(&format!("outputs/{}/{}", exec_id, filename))
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        }
+    };
 
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => {
+    match bytes {
+        Some(bytes) => {
             let content_type = guess_content_type(&filename);
+            let safe_filename = sanitize_content_disposition_filename(&filename);
             (
                 [
                     (header::CONTENT_TYPE, content_type.as_str()),
                     (
                         header::CONTENT_DISPOSITION,
-                        &format!("attachment; filename=\"{}\"", filename),
+                        &format!("attachment; filename=\"{}\"", safe_filename),
                     ),
                     (header::CACHE_CONTROL, "public, max-age=86400"),
                 ],
@@ -5777,7 +6568,7 @@ async fn download_output_file(
             )
                 .into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -5832,43 +6623,86 @@ fn guess_content_type(filename: &str) -> String {
 
 // ==================== Deployed Apps ====================
 
+fn merge_executor_status_fields(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    status: &crate::clients::AppStatusResponse,
+) {
+    row.insert("running".to_string(), serde_json::json!(status.running));
+    row.insert(
+        "runtime_mode".to_string(),
+        serde_json::Value::String(
+            status
+                .runtime_mode
+                .clone()
+                .unwrap_or_else(|| "stopped".to_string()),
+        ),
+    );
+    row.insert(
+        "is_isolated_runtime".to_string(),
+        serde_json::json!(status.is_isolated_runtime),
+    );
+    row.insert(
+        "port".to_string(),
+        status
+            .port
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    );
+}
+
+fn executor_websocket_base_url(base_url: &str) -> String {
+    if let Some(stripped) = base_url.strip_prefix("https://") {
+        format!("wss://{}", stripped.trim_end_matches('/'))
+    } else if let Some(stripped) = base_url.strip_prefix("http://") {
+        format!("ws://{}", stripped.trim_end_matches('/'))
+    } else {
+        format!("ws://{}", base_url.trim_end_matches('/'))
+    }
+}
+
 /// List all deployed apps
 async fn list_apps(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let apps = state
-        .app_registry
-        .list()
-        .await
-        .into_iter()
-        .map(|mut row| {
-            let Some(obj) = row.as_object_mut() else {
-                return row;
-            };
-            let Some(app_id) = obj
-                .get("id")
-                .and_then(|value| value.as_str())
-                .map(|s| s.to_string())
-            else {
-                return row;
-            };
-            let access_key = obj
-                .get("access_url")
-                .and_then(|value| value.as_str())
-                .and_then(access_key_from_access_url);
-            obj.insert(
-                "url".to_string(),
-                serde_json::Value::String(app_root_url_for_state(&state, &app_id)),
-            );
-            obj.insert(
-                "access_url".to_string(),
-                serde_json::Value::String(app_access_url_for_state(
-                    &state,
-                    &app_id,
-                    access_key.as_deref(),
-                )),
-            );
-            row
-        })
-        .collect::<Vec<_>>();
+    let mut apps = Vec::new();
+    for mut row in state.app_registry.list().await {
+        let Some(obj) = row.as_object_mut() else {
+            apps.push(row);
+            continue;
+        };
+        let Some(app_id) = obj
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+        else {
+            apps.push(row);
+            continue;
+        };
+        let access_guard_enabled = obj
+            .get("access_guard_enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        obj.insert(
+            "url".to_string(),
+            serde_json::Value::String(app_root_url_for_state(&state, &app_id)),
+        );
+        obj.insert(
+            "access_url".to_string(),
+            serde_json::Value::String(
+                app_access_url_for_state(&state, &app_id, access_guard_enabled).await,
+            ),
+        );
+        if !obj
+            .get("is_static")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
+        {
+            if let Some(executor) = state.executor_client.as_ref() {
+                if let Ok(status) = executor.app_status(&app_id).await {
+                    merge_executor_status_fields(obj, &status);
+                }
+            }
+        }
+        apps.push(row);
+    }
     let restore = state.app_registry.restore_snapshot().await;
     Json(serde_json::json!({ "apps": apps, "restore": restore }))
 }
@@ -6688,7 +7522,7 @@ async fn app_scoped_arxiv_search_proxy(
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .redirect(reqwest::redirect::Policy::limited(3))
-        .user_agent("AgentArk/0.1 arXiv app helper")
+        .user_agent(crate::branding::user_agent_with_suffix("arXiv app helper"))
         .build()
     {
         Ok(client) => client,
@@ -7233,7 +8067,7 @@ fn filter_proxy_cookie(cookie_header: &str, app_id: &str) -> Option<String> {
         .split(';')
         .map(|c| c.trim())
         .filter(|c| !c.is_empty())
-        .filter(|c| !c.starts_with("agentark_session="))
+        .filter(|c| !c.starts_with(&format!("{}=", crate::branding::SESSION_COOKIE_NAME)))
         .filter(|c| !c.starts_with(&app_cookie))
         .collect();
     if filtered.is_empty() {
@@ -7275,21 +8109,26 @@ fn app_root_url_for_state(state: &AppState, app_id: &str) -> String {
     build_absolute_app_url(state.public_app_base_url.as_deref(), app_id, "", None)
 }
 
-fn app_access_url_for_state(state: &AppState, app_id: &str, access_key: Option<&str>) -> String {
-    match access_key.filter(|value| !value.trim().is_empty()) {
-        Some(value) => format!(
-            "{}?key={}",
-            app_root_url_for_state(state, app_id),
-            urlencoding::encode(value)
-        ),
-        None => app_root_url_for_state(state, app_id),
+async fn app_access_url_for_state(
+    state: &AppState,
+    app_id: &str,
+    access_guard_enabled: bool,
+) -> String {
+    let relative = if access_guard_enabled {
+        state
+            .app_registry
+            .issue_access_url(app_id)
+            .await
+            .unwrap_or_else(|| build_app_url(app_id, "", None))
+    } else {
+        build_app_url(app_id, "", None)
+    };
+    match state.public_app_base_url.as_deref() {
+        Some(base) if !base.trim().is_empty() => {
+            format!("{}{}", base.trim_end_matches('/'), relative)
+        }
+        _ => relative,
     }
-}
-
-fn access_key_from_access_url(access_url: &str) -> Option<String> {
-    access_url
-        .split_once('?')
-        .and_then(|(_, query)| extract_query_param(Some(query), "key"))
 }
 
 fn is_hop_by_hop_header(header_name: &str) -> bool {
@@ -7566,12 +8405,12 @@ async fn serve_app_file_inner(
 
     let access_guard_enabled = state.app_registry.access_guard_enabled(app_id).await;
     let cookie_name = format!("ark_app_{}", app_id);
-    let key_from_query = if access_guard_enabled {
-        extract_query_param(uri.query(), "key")
+    let grant_from_query = if access_guard_enabled {
+        extract_query_param(uri.query(), "grant")
     } else {
         None
     };
-    let key_from_cookie = if access_guard_enabled {
+    let session_from_cookie = if access_guard_enabled {
         extract_cookie(&headers, &cookie_name)
     } else {
         None
@@ -7589,12 +8428,22 @@ async fn serve_app_file_inner(
     let is_ws_request = is_websocket_upgrade(&headers);
 
     if access_guard_enabled {
-        let query_valid = match key_from_query.as_deref() {
-            Some(key) => state.app_registry.verify_key(app_id, key).await,
+        let query_valid = match grant_from_query.as_deref() {
+            Some(grant) => {
+                state
+                    .app_registry
+                    .consume_access_bootstrap_grant(app_id, grant)
+                    .await
+            }
             None => false,
         };
-        let cookie_valid = match key_from_cookie.as_deref() {
-            Some(key) => state.app_registry.verify_key(app_id, key).await,
+        let cookie_valid = match session_from_cookie.as_deref() {
+            Some(token) => {
+                state
+                    .app_registry
+                    .validate_access_session(app_id, token)
+                    .await
+            }
             None => false,
         };
         let header_valid = match key_from_header.as_deref() {
@@ -7609,7 +8458,7 @@ async fn serve_app_file_inner(
         // First successful key entry: set cookie and redirect to clean URL.
         if query_valid && !cookie_valid && !header_valid && method == Method::GET && !is_ws_request
         {
-            if let Some(key) = key_from_query {
+            if let Some(session_token) = state.app_registry.create_access_session(app_id).await {
                 let request_proto = headers
                     .get("x-forwarded-proto")
                     .and_then(|v| v.to_str().ok())
@@ -7621,9 +8470,9 @@ async fn serve_app_file_inner(
                 };
                 let cookie = format!(
                     "{}={}; Path=/apps/{}; HttpOnly; SameSite=Lax; Max-Age=604800{}",
-                    cookie_name, key, app_id, secure_attr
+                    cookie_name, session_token, app_id, secure_attr
                 );
-                let clean_query = strip_query_param(uri.query(), "key");
+                let clean_query = strip_query_param(uri.query(), "grant");
                 let clean_url = build_app_url(app_id, path, clean_query.as_deref());
                 return Response::builder()
                     .status(StatusCode::FOUND)
@@ -7637,7 +8486,7 @@ async fn serve_app_file_inner(
 
     state.app_registry.touch(app_id).await;
     let clean_query = if access_guard_enabled {
-        strip_query_param(uri.query(), "key")
+        strip_query_param(uri.query(), "grant")
     } else {
         uri.query().map(|q| q.to_string())
     };
@@ -7654,6 +8503,173 @@ async fn serve_app_file_inner(
         }
         return app_scoped_arxiv_search_proxy(state, app_id, &headers, clean_query.as_deref())
             .await;
+    }
+
+    let body_bytes = if is_ws_request {
+        None
+    } else {
+        Some(match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response();
+            }
+        })
+    };
+
+    if let Some(executor) = state.executor_client.as_ref() {
+        let mut proxy_path = if normalized_path.is_empty() {
+            format!("/internal/v1/apps/{}/proxy", app_id)
+        } else {
+            format!("/internal/v1/apps/{}/proxy/{}", app_id, normalized_path)
+        };
+        if let Some(q) = clean_query.as_deref().filter(|q| !q.is_empty()) {
+            proxy_path.push('?');
+            proxy_path.push_str(q);
+        }
+        if is_ws_request {
+            if method != Method::GET {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            }
+
+            let Some(ws_upgrade) = ws else {
+                return (StatusCode::BAD_REQUEST, "Invalid websocket upgrade request")
+                    .into_response();
+            };
+
+            let upstream_url = format!(
+                "{}{}",
+                executor_websocket_base_url(executor.base_url()),
+                proxy_path
+            );
+            let requested_protocols = headers
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok())
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            let mut ws_forward_headers: Vec<(String, String)> = Vec::new();
+            if let Some(v) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+                ws_forward_headers.push(("origin".to_string(), v.to_string()));
+            }
+            if let Some(v) = headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+            {
+                ws_forward_headers.push(("user-agent".to_string(), v.to_string()));
+            }
+            if let Some(v) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+                ws_forward_headers.push(("x-forwarded-host".to_string(), v.to_string()));
+            }
+            if let Some(token) = executor.bearer_token() {
+                ws_forward_headers.push(("authorization".to_string(), format!("Bearer {}", token)));
+            }
+            let forwarded_proto = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http");
+            ws_forward_headers.push(("x-forwarded-proto".to_string(), forwarded_proto.to_string()));
+            ws_forward_headers.push((
+                "x-forwarded-prefix".to_string(),
+                format!("/apps/{}", app_id),
+            ));
+            if let Some(raw_cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+                if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
+                    ws_forward_headers.push(("cookie".to_string(), filtered));
+                }
+            }
+
+            let ws_upgrade = if requested_protocols.is_empty() {
+                ws_upgrade
+            } else {
+                ws_upgrade.protocols(requested_protocols.clone())
+            };
+            return ws_upgrade
+                .on_upgrade(move |socket| async move {
+                    proxy_websocket_connection(
+                        socket,
+                        upstream_url,
+                        requested_protocols,
+                        ws_forward_headers,
+                    )
+                    .await;
+                })
+                .into_response();
+        }
+
+        let mut upstream = executor.request(
+            reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
+            &proxy_path,
+        );
+        for (name, value) in &headers {
+            let lower = name.as_str().to_ascii_lowercase();
+            if is_hop_by_hop_header(&lower)
+                || lower == "host"
+                || lower == "content-length"
+                || lower == "authorization"
+            {
+                continue;
+            }
+            if lower == "cookie" {
+                if let Ok(raw_cookie) = value.to_str() {
+                    if let Some(filtered) = filter_proxy_cookie(raw_cookie, app_id) {
+                        upstream = upstream.header(header::COOKIE, filtered);
+                    }
+                }
+                continue;
+            }
+            upstream = upstream.header(name, value);
+        }
+        if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+            upstream = upstream.header("x-forwarded-host", host);
+        }
+        let forwarded_proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        upstream = upstream
+            .header("x-forwarded-proto", forwarded_proto)
+            .header("x-forwarded-prefix", format!("/apps/{}", app_id));
+        upstream = upstream.body(body_bytes.clone().unwrap_or_default());
+
+        match upstream.send().await {
+            Ok(resp) => {
+                let status =
+                    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                let response_headers = resp.headers().clone();
+                match resp.bytes().await {
+                    Ok(response_body) => {
+                        let mut builder = Response::builder().status(status);
+                        for (name, value) in &response_headers {
+                            if !is_hop_by_hop_header(name.as_str()) {
+                                builder = builder.header(name, value);
+                            }
+                        }
+                        let response_body = if method == Method::HEAD {
+                            axum::body::Body::empty()
+                        } else {
+                            axum::body::Body::from(response_body)
+                        };
+                        return builder
+                            .body(response_body)
+                            .unwrap_or(StatusCode::BAD_GATEWAY.into_response());
+                    }
+                    Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Executor proxy failed for app {} on path '{}': {}",
+                    app_id,
+                    proxy_path,
+                    error
+                );
+            }
+        }
     }
 
     if let Some(port) = state.app_registry.get_port(app_id).await {
@@ -7746,13 +8762,6 @@ async fn serve_app_file_inner(
             target_url.push_str(q);
         }
 
-        let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response()
-            }
-        };
-
         let client = reqwest::Client::new();
         let mut upstream = client.request(method.clone(), &target_url);
         for (name, value) in &headers {
@@ -7784,7 +8793,7 @@ async fn serve_app_file_inner(
         upstream = upstream
             .header("x-forwarded-proto", forwarded_proto)
             .header("x-forwarded-prefix", format!("/apps/{}", app_id))
-            .body(body_bytes);
+            .body(body_bytes.unwrap_or_default());
 
         match upstream.send().await {
             Ok(resp) => {
@@ -7959,8 +8968,24 @@ async fn stop_app(State(state): State<AppState>, Path(app_id): Path<String>) -> 
         )
             .into_response();
     }
-    let stop_result = if state.app_registry.is_static(&app_id).await {
+    let is_static = state.app_registry.is_static(&app_id).await;
+    let stop_result = if is_static {
         Ok(())
+    } else if let Some(executor) = state.executor_client.as_ref() {
+        executor
+            .request(
+                reqwest::Method::POST,
+                &format!("/internal/v1/apps/{}/stop", app_id),
+            )
+            .json(&crate::clients::AppLifecycleRequest {
+                title: None,
+                query: None,
+            })
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
     } else {
         state.app_registry.stop_runtime(&app_id).await
     };
@@ -8008,11 +9033,7 @@ async fn update_app_access_guard(
     {
         Ok(access_key) => {
             trigger_arkpulse_after_app_change(&state, "app_access_guard_update").await;
-            let access_url = app_access_url_for_state(
-                &state,
-                &app_id,
-                request.enabled.then_some(access_key.as_str()),
-            );
+            let access_url = app_access_url_for_state(&state, &app_id, request.enabled).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -8064,6 +9085,80 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
         fallback
     };
 
+    if let Some(executor) = state.executor_client.as_ref() {
+        match executor
+            .request(
+                reqwest::Method::POST,
+                &format!("/internal/v1/apps/{}/restart", app_id),
+            )
+            .json(&crate::clients::AppLifecycleRequest {
+                title: None,
+                query: None,
+            })
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let payload = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if !status.is_success() {
+                    return (
+                        StatusCode::from_u16(status.as_u16())
+                            .unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(serde_json::json!({
+                            "error": payload.get("message").and_then(|value| value.as_str()).unwrap_or("Failed to restart app"),
+                            "details": payload
+                        })),
+                    )
+                        .into_response();
+                }
+                let _ = state.app_registry.set_enabled(&app_id, true).await;
+                trigger_arkpulse_after_app_change(&state, "app_restart").await;
+                let raw = payload
+                    .get("raw")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let title = raw
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&app_id);
+                let access_guard_enabled = raw
+                    .get("access_guard_enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let app_url =
+                    build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
+                let app_access_url =
+                    app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
+                return Json(serde_json::json!({
+                    "status": "restarted",
+                    "type": raw.get("mode").cloned().unwrap_or_else(|| serde_json::json!("dynamic")),
+                    "app_id": app_id,
+                    "title": title,
+                    "url": app_url,
+                    "access_url": app_access_url,
+                    "access_guard_enabled": access_guard_enabled,
+                    "port": raw.get("port").cloned().unwrap_or(serde_json::Value::Null),
+                    "runtime_preference": raw.get("runtime_mode").cloned().unwrap_or_else(|| serde_json::json!("executor")),
+                    "details": payload,
+                }))
+                .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to restart app through executor: {}", error)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let meta_path = app_dir.join(".app_meta.json");
     let mut meta: serde_json::Value = match tokio::fs::read(&meta_path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({})),
@@ -8114,25 +9209,22 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
     let access_guard_enabled = meta
         .get("access_guard_enabled")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let access_key = meta
-        .get("access_key")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if access_guard_enabled {
-                crate::actions::app::generate_access_key()
-            } else {
-                String::new()
-            }
-        });
+        .unwrap_or(false);
+    let access_key = if access_guard_enabled {
+        state
+            .app_registry
+            .access_key(&app_id)
+            .await
+            .unwrap_or_else(crate::actions::app::generate_access_key)
+    } else {
+        String::new()
+    };
 
-    if meta.get("access_guard_enabled").is_none()
-        || (access_guard_enabled && meta.get("access_key").is_none())
-    {
+    if meta.get("access_guard_enabled").is_none() || meta.get("access_key").is_some() {
         meta["access_guard_enabled"] = serde_json::Value::Bool(access_guard_enabled);
-        meta["access_key"] = serde_json::Value::String(access_key.clone());
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("access_key");
+        }
         let _ = tokio::fs::write(
             &meta_path,
             serde_json::to_vec_pretty(&meta).unwrap_or_default(),
@@ -8266,6 +9358,7 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                             access_key: access_key.clone(),
                             access_guard_enabled,
                             enabled: true,
+                            last_accessed: None,
                         },
                     )
                     .await;
@@ -8293,14 +9386,8 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
                 trigger_arkpulse_after_app_change(&state, "app_restart").await;
                 let app_url =
                     build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
-                let app_access_query = access_guard_enabled
-                    .then(|| format!("key={}", urlencoding::encode(&access_key)));
-                let app_access_url = build_absolute_app_url(
-                    state.public_app_base_url.as_deref(),
-                    &app_id,
-                    "",
-                    app_access_query.as_deref(),
-                );
+                let app_access_url =
+                    app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
                 Json(serde_json::json!({
                     "status": "restarted",
                     "type": "dynamic",
@@ -8323,26 +9410,23 @@ async fn restart_app(State(state): State<AppState>, Path(app_id): Path<String>) 
     } else {
         state
             .app_registry
-            .register_static(
+            .register_stored(
                 app_id.clone(),
-                title.clone(),
-                app_dir,
-                access_key.clone(),
-                access_guard_enabled,
-                true,
+                crate::actions::app::StoredAppRegistration {
+                    title: title.clone(),
+                    app_dir,
+                    is_static: true,
+                    access_key: access_key.clone(),
+                    access_guard_enabled,
+                    enabled: true,
+                    last_accessed: None,
+                },
             )
             .await;
         trigger_arkpulse_after_app_change(&state, "app_restart").await;
         let app_url =
             build_absolute_app_url(state.public_app_base_url.as_deref(), &app_id, "", None);
-        let app_access_query =
-            access_guard_enabled.then(|| format!("key={}", urlencoding::encode(&access_key)));
-        let app_access_url = build_absolute_app_url(
-            state.public_app_base_url.as_deref(),
-            &app_id,
-            "",
-            app_access_query.as_deref(),
-        );
+        let app_access_url = app_access_url_for_state(&state, &app_id, access_guard_enabled).await;
         Json(serde_json::json!({
             "status": "restarted",
             "type": "static",
@@ -8393,7 +9477,46 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
         fallback
     };
 
-    if let Err(e) = state.app_registry.stop(&app_id).await {
+    let mut executor_deleted_files = false;
+    if let Some(executor) = state.executor_client.as_ref() {
+        match executor
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/internal/v1/apps/{}", app_id),
+            )
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                executor_deleted_files = true;
+            }
+            Ok(response) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let payload = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": payload.get("message").and_then(|value| value.as_str()).unwrap_or("Failed to stop app before delete"),
+                        "details": payload
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Failed to contact executor before delete: {}", error)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Err(e) = state.app_registry.stop(&app_id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -8404,6 +9527,25 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
     }
     match tokio::fs::remove_dir_all(&app_dir).await {
         Ok(_) => {
+            let _ = state.app_registry.stop(&app_id).await;
+            trigger_arkpulse_after_app_change(&state, "app_delete").await;
+            let deleted_notifications = {
+                let agent = state.agent.read().await;
+                agent
+                    .storage
+                    .delete_app_notifications(&app_id, app_title.as_deref())
+                    .await
+                    .unwrap_or(0)
+            };
+            Json(serde_json::json!({
+                "status": "deleted",
+                "app_id": app_id,
+                "deleted_notifications": deleted_notifications
+            }))
+            .into_response()
+        }
+        Err(error) if executor_deleted_files && error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = state.app_registry.stop(&app_id).await;
             trigger_arkpulse_after_app_change(&state, "app_delete").await;
             let deleted_notifications = {
                 let agent = state.agent.read().await;
@@ -8430,9 +9572,9 @@ async fn delete_app(State(state): State<AppState>, Path(app_id): Path<String>) -
 
 /// Upload a file for use in chat (attachments for code execution, analysis, etc.)
 async fn upload_chat_file(State(state): State<AppState>, mut multipart: Multipart) -> Response {
-    let data_dir = {
+    let (data_dir, storage) = {
         let agent = state.agent.read().await;
-        agent.data_dir().to_path_buf()
+        (agent.data_dir().to_path_buf(), agent.storage.clone())
     };
     let uploads_dir = data_dir.join("uploads");
 
@@ -8440,6 +9582,7 @@ async fn upload_chat_file(State(state): State<AppState>, mut multipart: Multipar
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let original_name: String = field.file_name().unwrap_or("unnamed").to_string();
+        let content_type = field.content_type().map(|value| value.to_string());
 
         // Sanitize filename: keep only safe characters
         let safe_name: String = original_name
@@ -8471,18 +9614,46 @@ async fn upload_chat_file(State(state): State<AppState>, mut multipart: Multipar
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
 
-                let file_path = uploads_dir.join(&safe_name);
+                let upload_id = uuid::Uuid::new_v4().to_string();
+                let stored_name = format!("{}__{}", upload_id, safe_name);
+                let file_path = uploads_dir.join(&stored_name);
                 if let Err(e) = tokio::fs::write(&file_path, &data).await {
                     tracing::error!("Failed to write upload: {}", e);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
 
+                let manifest = crate::storage::UploadManifest {
+                    id: upload_id.clone(),
+                    original_name: safe_name.clone(),
+                    stored_name,
+                    content_type,
+                    size_bytes: data.len() as u64,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                if let Err(error) = storage.save_upload_manifest(&manifest).await {
+                    let _ = tokio::fs::remove_file(&file_path).await;
+                    tracing::error!("Failed to persist upload manifest: {}", error);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                if let Some(workspace) = state.workspace_client.as_ref() {
+                    if let Err(error) = workspace
+                        .put_blob(&format!("uploads/{}", manifest.stored_name), &data)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to mirror upload {} to workspace service: {}",
+                            manifest.id,
+                            error
+                        );
+                    }
+                }
+
                 tracing::info!("File uploaded: {} ({} bytes)", safe_name, data.len());
                 uploaded_files.push(serde_json::json!({
+                    "id": upload_id,
                     "name": safe_name,
                     "size": data.len(),
-                    "path": format!("/api/uploads/{}", safe_name),
-                    "local_path": file_path.to_string_lossy(),
+                    "path": format!("/api/uploads/{}", manifest.id),
                 }));
             }
             Err(e) => {
@@ -8502,43 +9673,91 @@ async fn upload_chat_file(State(state): State<AppState>, mut multipart: Multipar
 /// Serve uploaded files (for preview/download in chat)
 async fn serve_upload_file(
     State(state): State<AppState>,
-    Path(filename): Path<String>,
+    Path(upload_id): Path<String>,
 ) -> Response {
-    // Validate filename
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return StatusCode::BAD_REQUEST.into_response();
+    let normalized_id = match uuid::Uuid::parse_str(upload_id.trim()) {
+        Ok(value) => value.to_string(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let (data_dir, storage) = {
+        let agent = state.agent.read().await;
+        (agent.data_dir().to_path_buf(), agent.storage.clone())
+    };
+    let manifest = match storage.load_upload_manifest(&normalized_id).await {
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(
+                "Failed to load upload manifest {}: {}",
+                normalized_id,
+                error
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let uploads_dir = data_dir.join("uploads");
+    let mut bytes = if let Ok(uploads_root) = tokio::fs::canonicalize(&uploads_dir).await {
+        match tokio::fs::canonicalize(uploads_root.join(&manifest.stored_name)).await {
+            Ok(file_path) if file_path.starts_with(&uploads_root) => {
+                tokio::fs::read(&file_path).await.ok()
+            }
+            Ok(_) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if bytes.is_none() {
+        if let Some(workspace) = state.workspace_client.as_ref() {
+            bytes = workspace
+                .get_blob(&format!("uploads/{}", manifest.stored_name))
+                .await
+                .ok();
+        }
     }
 
-    let data_dir = {
-        let agent = state.agent.read().await;
-        agent.data_dir().to_path_buf()
-    };
-    let file_path = data_dir.join("uploads").join(&filename);
-
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => {
-            let content_type = guess_content_type(&filename);
+    match bytes {
+        Some(bytes) => {
+            let content_type = manifest
+                .content_type
+                .clone()
+                .unwrap_or_else(|| guess_content_type(&manifest.original_name));
+            let safe_filename = sanitize_content_disposition_filename(&manifest.original_name);
             (
                 [
                     (header::CONTENT_TYPE, content_type.as_str()),
                     (
                         header::CONTENT_DISPOSITION,
-                        &format!("inline; filename=\"{}\"", filename),
+                        &format!("inline; filename=\"{}\"", safe_filename),
                     ),
                 ],
                 bytes,
             )
                 .into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Health check endpoint
-async fn health(State(state): State<AppState>) -> Response {
+fn heartbeat_recent_with_threshold(value: Option<&str>, max_age_secs: i64) -> bool {
+    value
+        .and_then(parse_utc_rfc3339)
+        .map(|ts| (chrono::Utc::now() - ts).num_seconds() <= max_age_secs)
+        .unwrap_or(false)
+}
+
+async fn build_runtime_health_payload(
+    state: &AppState,
+    readiness_mode: bool,
+) -> (StatusCode, serde_json::Value) {
     let storage = { state.agent.read().await.storage.clone() };
     let storage_ok = storage.get("__health_probe").await.is_ok();
+    let expected_migration_version = storage.expected_migration_version();
     let migration_version = storage.latest_migration_version().await.ok().flatten();
+    let migration_tracked = migration_version.is_some();
     let table_names = storage.database_table_names().await.ok();
     let database_size_bytes = storage.database_size_bytes().await.ok().flatten();
     let lease_status = storage
@@ -8546,6 +9765,7 @@ async fn health(State(state): State<AppState>) -> Response {
         .await
         .ok()
         .unwrap_or_default();
+    let housekeeping = storage.housekeeping_status().await.ok().unwrap_or_default();
     let required_tables = [
         "approval_log",
         "automation_runs",
@@ -8560,14 +9780,27 @@ async fn health(State(state): State<AppState>) -> Response {
         "tool_attempts",
         "watchers",
     ];
-    let schema_ok = table_names
+    let missing_tables = table_names
         .as_ref()
         .map(|tables| {
             let set = tables.iter().cloned().collect::<HashSet<_>>();
-            required_tables.iter().all(|table| set.contains(*table))
+            required_tables
+                .iter()
+                .filter(|table| !set.contains(**table))
+                .map(|table| (*table).to_string())
+                .collect::<Vec<_>>()
         })
-        .unwrap_or(false)
-        && migration_version.is_some();
+        .unwrap_or_else(|| {
+            required_tables
+                .iter()
+                .map(|table| (*table).to_string())
+                .collect()
+        });
+    let schema_ok = missing_tables.is_empty();
+    let migration_current = migration_version
+        .map(|value| value == expected_migration_version)
+        .unwrap_or(schema_ok);
+
     let scheduler_heartbeat = storage
         .get(crate::sentinel::SENTINEL_SCHEDULER_HEARTBEAT_KEY)
         .await
@@ -8580,27 +9813,113 @@ async fn health(State(state): State<AppState>) -> Response {
         .ok()
         .flatten()
         .and_then(|raw| String::from_utf8(raw).ok());
-    let heartbeat_recent = |value: Option<&String>| {
-        value
-            .and_then(|raw| parse_utc_rfc3339(raw))
-            .map(|ts| (chrono::Utc::now() - ts).num_seconds() <= 5 * 60)
-            .unwrap_or(false)
-    };
+    let integration_sync_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let consolidation_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_CONSOLIDATION_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let approval_expiry_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let arkpulse_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_ARKPULSE_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+    let auto_analysis_heartbeat = storage
+        .get(crate::sentinel::SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok());
+
+    let sentinel_config = crate::sentinel::SentinelConfig::default();
     let scheduler_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
-        heartbeat_recent(scheduler_heartbeat.as_ref())
+        heartbeat_recent_with_threshold(
+            scheduler_heartbeat.as_deref(),
+            (sentinel_config.scheduler_interval as i64 * 3).max(5 * 60),
+        )
     } else {
         true
     };
     let watcher_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
-        heartbeat_recent(watcher_heartbeat.as_ref())
+        heartbeat_recent_with_threshold(
+            watcher_heartbeat.as_deref(),
+            (sentinel_config.watcher_interval as i64 * 3).max(5 * 60),
+        )
     } else {
         true
     };
-    let (mem0_enabled, mem0_url, playwright_url, public_app_base_url_configured) = {
+    let integration_sync_loop_ok = if state.server_role == HttpServerRole::ControlPlane
+        && sentinel_config.integration_sync_interval > 0
+    {
+        heartbeat_recent_with_threshold(
+            integration_sync_heartbeat.as_deref(),
+            (sentinel_config.integration_sync_interval as i64 * 3).max(8 * 60),
+        )
+    } else {
+        true
+    };
+    let consolidation_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
+        heartbeat_recent_with_threshold(
+            consolidation_heartbeat.as_deref(),
+            (sentinel_config.consolidation_interval as i64 * 3).max(20 * 60),
+        )
+    } else {
+        true
+    };
+    let approval_expiry_loop_ok = if state.server_role == HttpServerRole::ControlPlane {
+        heartbeat_recent_with_threshold(
+            approval_expiry_heartbeat.as_deref(),
+            (sentinel_config.approval_expiry_interval as i64 * 3).max(10 * 60),
+        )
+    } else {
+        true
+    };
+    let arkpulse_loop_ok = if state.server_role == HttpServerRole::ControlPlane
+        && sentinel_config.pulse_interval > 0
+    {
+        heartbeat_recent_with_threshold(
+            arkpulse_heartbeat.as_deref(),
+            (sentinel_config.pulse_interval as i64 * 3).max(60 * 60),
+        )
+    } else {
+        true
+    };
+    let auto_analysis_loop_ok = if state.server_role == HttpServerRole::ControlPlane
+        && sentinel_config.auto_analysis_interval > 0
+    {
+        heartbeat_recent_with_threshold(
+            auto_analysis_heartbeat.as_deref(),
+            (sentinel_config.auto_analysis_interval as i64 * 3).max(20 * 60),
+        )
+    } else {
+        true
+    };
+
+    let (
+        embedding_client,
+        playwright_url,
+        public_app_base_url_configured,
+        startup_issues_handle,
+        docker_ok,
+        active_container_count,
+        container_reaper_status,
+    ) = {
         let agent = state.agent.read().await;
         (
-            agent.config.mem0.enabled,
-            agent.config.mem0.bridge_url.clone(),
+            agent.embedding_client.clone(),
             agent.config.browser.bridge_url.clone(),
             agent
                 .config
@@ -8610,22 +9929,31 @@ async fn health(State(state): State<AppState>) -> Response {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some(),
+            agent.startup_issues_handle(),
+            if state.server_role == HttpServerRole::ControlPlane {
+                agent.runtime.docker_available().await
+            } else {
+                true
+            },
+            agent.runtime.active_container_count().await,
+            agent.runtime.container_reaper_status().await,
         )
     };
+    let startup_issues = startup_issues_handle.read().await.clone();
+    let blocking_startup_issue_count = startup_issues
+        .iter()
+        .filter(|issue| issue.blocks_readiness())
+        .count();
+
     let health_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .ok();
-    let mem0_ok = if state.server_role == HttpServerRole::ControlPlane && mem0_enabled {
-        if let Some(client) = health_client.as_ref() {
-            client
-                .get(format!("{}/health", mem0_url.trim_end_matches('/')))
-                .send()
-                .await
-                .map(|resp| resp.status().is_success())
-                .unwrap_or(false)
+    let pgvector_retrieval_ok = if state.server_role == HttpServerRole::ControlPlane {
+        if let Some(client) = embedding_client.as_ref() {
+            client.health_check().await.is_ok()
         } else {
-            false
+            true
         }
     } else {
         true
@@ -8646,6 +9974,12 @@ async fn health(State(state): State<AppState>) -> Response {
     };
     let whatsapp_active = state.whatsapp_bridge.read().await.active;
     let tunnel_active = state.tunnel.read().await.active;
+    let restore = state.app_registry.restore_snapshot().await;
+    let restore_ready = if state.server_role == HttpServerRole::ControlPlane {
+        !restore.active && restore.pending == 0 && restore.degraded == 0
+    } else {
+        true
+    };
     let public_app_origin_ok = if state.server_role == HttpServerRole::ControlPlane
         && state.deployment_mode == DeploymentMode::InternetFacing
     {
@@ -8653,20 +9987,42 @@ async fn health(State(state): State<AppState>) -> Response {
     } else {
         true
     };
+
     let healthy = storage_ok
         && schema_ok
-        && mem0_ok
+        && migration_current
+        && pgvector_retrieval_ok
+        && docker_ok
+        && playwright_ok
         && public_app_origin_ok
         && scheduler_loop_ok
         && watcher_loop_ok;
+    let ready = healthy
+        && integration_sync_loop_ok
+        && consolidation_loop_ok
+        && approval_expiry_loop_ok
+        && arkpulse_loop_ok
+        && auto_analysis_loop_ok
+        && restore_ready
+        && blocking_startup_issue_count == 0;
+    let overall_ok = if readiness_mode { ready } else { healthy };
+
     (
-        if healthy {
+        if overall_ok {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        Json(serde_json::json!({
-            "status": if healthy { "ok" } else { "degraded" },
+        serde_json::json!({
+            "status": if overall_ok {
+                "ok"
+            } else if readiness_mode {
+                "not_ready"
+            } else {
+                "degraded"
+            },
+            "mode": if readiness_mode { "readiness" } else { "health" },
+            "ready": ready,
             "server_role": match state.server_role {
                 HttpServerRole::ControlPlane => "control_plane",
                 HttpServerRole::PublicApps => "public_apps",
@@ -8676,24 +10032,130 @@ async fn health(State(state): State<AppState>) -> Response {
                 "kind": "postgres",
                 "connected": storage_ok,
                 "migration_version": migration_version,
+                "expected_migration_version": expected_migration_version,
+                "migration_tracking": if migration_tracked { "tracked" } else { "bootstrap_only" },
+                "migration_current": migration_current,
                 "schema_ok": schema_ok,
+                "missing_tables": missing_tables,
                 "table_count": table_names.as_ref().map(|tables| tables.len()).unwrap_or(0),
                 "size_bytes": database_size_bytes,
                 "lease_status": lease_status,
             },
+            "startup": {
+                "issue_count": startup_issues.len(),
+                "blocking_issue_count": blocking_startup_issue_count,
+                "issues": startup_issues,
+            },
+            "apps": {
+                "restore": restore,
+            },
+            "runtime": {
+                "active_container_count": active_container_count,
+                "container_reaper": container_reaper_status,
+            },
+            "housekeeping": housekeeping,
             "checks": {
                 "storage": storage_ok,
                 "postgres_connected": storage_ok,
                 "schema_ok": schema_ok,
-                "mem0_bridge": mem0_ok,
+                "migration_current": migration_current,
+                "postgres_pgvector_retrieval": pgvector_retrieval_ok,
+                "docker": docker_ok,
                 "playwright_bridge": playwright_ok,
                 "whatsapp_bridge": whatsapp_active,
                 "tunnel": tunnel_active,
                 "scheduler_loop": scheduler_loop_ok,
                 "watcher_loop": watcher_loop_ok,
+                "integration_sync_loop": integration_sync_loop_ok,
+                "consolidation_loop": consolidation_loop_ok,
+                "approval_expiry_loop": approval_expiry_loop_ok,
+                "arkpulse_loop": arkpulse_loop_ok,
+                "auto_analysis_loop": auto_analysis_loop_ok,
+                "app_restore_ready": restore_ready,
                 "public_app_origin_ready": public_app_origin_ok,
+            },
+            "heartbeats": {
+                "scheduler": scheduler_heartbeat,
+                "watcher": watcher_heartbeat,
+                "integration_sync": integration_sync_heartbeat,
+                "consolidation": consolidation_heartbeat,
+                "approval_expiry": approval_expiry_heartbeat,
+                "arkpulse": arkpulse_heartbeat,
+                "auto_analysis": auto_analysis_heartbeat,
             }
-        })),
+        }),
+    )
+}
+
+async fn health(State(state): State<AppState>) -> Response {
+    let (status, payload) = build_runtime_health_payload(&state, false).await;
+    (status, Json(payload)).into_response()
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let (status, payload) = build_runtime_health_payload(&state, true).await;
+    (status, Json(payload)).into_response()
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    let (queue_depth, active_tasks) = {
+        let tasks = state.tasks.read().await;
+        let all = tasks.all();
+        let active = all
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Pending
+                        | TaskStatus::AwaitingApproval
+                        | TaskStatus::ExpiredNeedsReapproval
+                        | TaskStatus::Paused
+                        | TaskStatus::InProgress
+                )
+            })
+            .count();
+        (all.len(), active)
+    };
+    let (active_container_count, reaper_status) = {
+        let agent = state.agent.read().await;
+        (
+            agent.runtime.active_container_count().await,
+            agent.runtime.container_reaper_status().await,
+        )
+    };
+    let mut extra_metrics = Vec::new();
+    extra_metrics.push("# HELP agentark_task_queue_depth Total tasks currently stored in the in-memory scheduler queue.".to_string());
+    extra_metrics.push("# TYPE agentark_task_queue_depth gauge".to_string());
+    extra_metrics.push(format!("agentark_task_queue_depth {}", queue_depth));
+    extra_metrics.push("# HELP agentark_active_tasks Tasks currently pending or otherwise active in the scheduler queue.".to_string());
+    extra_metrics.push("# TYPE agentark_active_tasks gauge".to_string());
+    extra_metrics.push(format!("agentark_active_tasks {}", active_tasks));
+    extra_metrics.push("# HELP agentark_runtime_active_containers Active sandbox containers reported by the runtime.".to_string());
+    extra_metrics.push("# TYPE agentark_runtime_active_containers gauge".to_string());
+    extra_metrics.push(format!(
+        "agentark_runtime_active_containers {}",
+        active_container_count
+    ));
+    extra_metrics.push("# HELP agentark_container_reaper_last_removed_count Containers removed by the most recent orphan-container sweep.".to_string());
+    extra_metrics.push("# TYPE agentark_container_reaper_last_removed_count gauge".to_string());
+    extra_metrics.push(format!(
+        "agentark_container_reaper_last_removed_count {}",
+        reaper_status.last_removed_count
+    ));
+    extra_metrics.push("# HELP agentark_container_reaper_total_removed_count Cumulative orphan sandbox containers removed by the runtime reaper.".to_string());
+    extra_metrics.push("# TYPE agentark_container_reaper_total_removed_count counter".to_string());
+    extra_metrics.push(format!(
+        "agentark_container_reaper_total_removed_count {}",
+        reaper_status.total_removed_count
+    ));
+    let body = crate::metrics::render_prometheus(&extra_metrics);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
     )
         .into_response()
 }
@@ -8730,147 +10192,129 @@ async fn get_run(
     }
 }
 
-async fn cancel_run(
+async fn stream_run_events(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let storage = { state.agent.read().await.storage.clone() };
-    match storage.request_execution_run_cancel(&id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "ok",
-                "run_id": id,
-                "cancellation_requested": true,
-            })),
-        )
-            .into_response(),
-        Ok(false) => (
+    let since_seq = params
+        .get("since_seq")
+        .and_then(|value| value.parse::<u64>().ok());
+    let agent = state.agent.read().await;
+    let Some((replay, rx)) = agent.subscribe_live_run(&id, since_seq).await else {
+        return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": "Run not found",
-                "run_id": id,
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to request cancellation: {}", error),
-                "run_id": id,
-            })),
-        )
-            .into_response(),
-    }
-}
-
-async fn resume_run(
-    State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Response {
-    let prior_run = {
-        let storage = { state.agent.read().await.storage.clone() };
-        match storage.load_execution_run(&id).await {
-            Ok(Some(run)) => run,
-            Ok(None) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "Run not found",
-                        "run_id": id,
-                    })),
-                )
-                    .into_response();
-            }
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("Failed to load run: {}", error),
-                        "run_id": id,
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let Some(message) = prior_run
-        .request_message
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Run cannot be resumed because no replayable request_message was stored",
+                "error": "Run stream not found",
                 "run_id": id,
             })),
         )
             .into_response();
     };
+    drop(agent);
 
-    let channel = prior_run
-        .channel
-        .clone()
-        .unwrap_or_else(|| "web".to_string());
-    let result = {
-        let agent = state.agent.read().await;
-        agent
-            .process_message_with_meta_and_hints(
-                &message,
-                &channel,
-                prior_run.conversation_id.as_deref(),
-                None,
-                crate::core::RequestExecutionHints::default(),
-            )
-            .await
-    };
+    let replay_stream = futures::stream::iter(
+        replay
+            .into_iter()
+            .map(|event| Ok::<Event, std::convert::Infallible>(run_event_to_sse_event(event))),
+    );
+    let live_stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    return Some((
+                        Ok::<Event, std::convert::Infallible>(run_event_to_sse_event(event)),
+                        rx,
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return None;
+                }
+            }
+        }
+    });
+    let stream = replay_stream.chain(live_stream);
 
-    match result {
-        Ok(processed) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "ok",
-                "resumed_from_run_id": id,
-                "response": processed.response,
-                "conversation_id": processed.conversation_id.or(prior_run.conversation_id),
-                "conversation_title": processed.conversation_title,
-                "run_id": processed.run_id,
-                "run_status": processed.run_status,
-                "trace_id": processed.trace_id,
-                "degradation": processed.degradation,
-                "attempted_models": processed.attempted_models,
-                "user_outcome": processed.user_outcome,
-            })),
-        )
-            .into_response(),
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10)))
+        .into_response()
+}
+
+async fn cancel_run(
+    State(_state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "Run cancellation is temporarily disabled until active executor enforcement is implemented",
+            "run_id": id,
+            "cancellation_requested": false,
+        })),
+    )
+        .into_response()
+}
+
+async fn get_conversation_latest_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let agent = state.agent.read().await;
+    let runs = match agent
+        .storage
+        .list_execution_runs_for_conversation(&id, 1)
+        .await
+    {
+        Ok(runs) => runs,
         Err(error) => {
-            let response =
-                "I hit a framework-level problem while resuming the run. Please retry.".to_string();
-            let degradation = vec![crate::core::DegradationNote {
-                kind: "platform".to_string(),
-                summary: "framework error".to_string(),
-                detail: Some(error.to_string()),
-            }];
-            let user_outcome = crate::core::ExecutionSupervisor::default()
-                .build_service_outage_outcome(&response, "framework_error", &degradation, &[]);
-            (
-                StatusCode::OK,
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "status": "error",
-                    "resumed_from_run_id": id,
-                    "response": response,
-                    "run_status": "platform_failed",
-                    "error": error.to_string(),
-                    "degradation": degradation,
-                    "attempted_models": user_outcome.attempted_models,
-                    "user_outcome": user_outcome,
+                    "error": format!("Failed to load conversation runs: {}", error),
+                    "conversation_id": id,
                 })),
             )
-                .into_response()
+                .into_response();
         }
-    }
+    };
+    let Some(run) = runs.into_iter().next() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "run": serde_json::Value::Null,
+                "events": [],
+            })),
+        )
+            .into_response();
+    };
+
+    let events = agent.load_persisted_run_events(&run.id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "run": run,
+            "events": events,
+        })),
+    )
+        .into_response()
+}
+
+async fn resume_run(
+    State(_state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "Run resume is disabled until checkpoint-based recovery is implemented",
+            "run_id": id,
+        })),
+    )
+        .into_response()
 }
 
 // - WhatsApp Webhook -
@@ -8905,10 +10349,92 @@ async fn whatsapp_webhook_verify(
 /// POST /webhook/whatsapp - Inbound messages from Meta
 async fn whatsapp_webhook_handler(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
+    request: Request<axum::body::Body>,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let signature = parts
+        .headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let body = match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Failed to parse WhatsApp webhook payload: {}", error)
+                })),
+            )
+                .into_response()
+        }
+    };
+    let config = {
+        let guard = state.agent.read().await;
+        guard.config.whatsapp.clone()
+    };
+    let Some(config) = config else {
+        return (StatusCode::FORBIDDEN, "WhatsApp not configured").into_response();
+    };
+    let is_baileys = body.get("_source").and_then(|value| value.as_str()) == Some("baileys");
+
+    if is_baileys {
+        if config.mode != crate::channels::whatsapp::WhatsAppMode::Baileys {
+            return (
+                StatusCode::FORBIDDEN,
+                "WhatsApp bridge payload rejected because Cloud API mode is configured",
+            )
+                .into_response();
+        }
+        let expected_api_key = state
+            .api_key
+            .read()
+            .await
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let Some(expected_api_key) = expected_api_key else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HTTP API key is required before bridge webhooks can be accepted",
+            )
+                .into_response();
+        };
+        if !auth::has_valid_bearer_api_key(&parts.headers, Some(expected_api_key.as_str())) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "WhatsApp bridge authorization failed",
+            )
+                .into_response();
+        }
+    } else {
+        if config.mode != crate::channels::whatsapp::WhatsAppMode::CloudApi {
+            return (
+                StatusCode::FORBIDDEN,
+                "WhatsApp Cloud API payload rejected because Baileys mode is configured",
+            )
+                .into_response();
+        }
+        if let Err(error) = crate::channels::whatsapp::verify_cloud_api_request_signature(
+            &config,
+            &body_bytes,
+            signature.as_deref(),
+        ) {
+            tracing::warn!("WhatsApp webhook request rejected: {}", error);
+            return channel_webhook_error_response(error);
+        }
+    }
+
     let agent = state.agent.clone();
-    // Spawn processing so Meta gets a fast 200 response
     tokio::spawn(async move {
         if let Err(e) = crate::channels::whatsapp::handle_webhook(agent, &body).await {
             tracing::error!("WhatsApp webhook processing error: {}", e);
@@ -9061,18 +10587,374 @@ async fn teams_webhook_handler(
         .into_response()
 }
 
+/// POST /webhook/google-chat - Google Chat app ingress
+async fn google_chat_webhook_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    match crate::channels::google_chat::handle_webhook(state.agent.clone(), &payload).await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("Google Chat webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+/// POST /webhook/signal - Signal bridge ingress
+async fn signal_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let headers = parts.headers.clone();
+    match crate::channels::signal::handle_webhook(state.agent.clone(), &headers, &body_bytes).await
+    {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("Signal webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+/// POST /webhook/imessage - iMessage bridge ingress
+async fn imessage_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let headers = parts.headers.clone();
+    match crate::channels::imessage::handle_webhook(state.agent.clone(), &headers, &body_bytes)
+        .await
+    {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("iMessage webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+/// POST /webhook/line - LINE Messaging API ingress
+async fn line_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let signature = parts
+        .headers
+        .get("x-line-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    match crate::channels::line::handle_webhook(
+        state.agent.clone(),
+        &body_bytes,
+        signature.as_deref(),
+    )
+    .await
+    {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("LINE webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+/// POST /webhook/wechat - WeChat bridge ingress
+async fn wechat_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let headers = parts.headers.clone();
+    match crate::channels::wechat::handle_webhook(state.agent.clone(), &headers, &body_bytes).await
+    {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("WeChat webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+/// POST /webhook/qq - QQ bridge ingress
+async fn qq_webhook_handler(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({ "error": "request body too large" })),
+            )
+                .into_response()
+        }
+    };
+    let headers = parts.headers.clone();
+    match crate::channels::qq::handle_webhook(state.agent.clone(), &headers, &body_bytes).await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": status })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("QQ webhook processing failed: {}", error);
+            channel_webhook_error_response(error)
+        }
+    }
+}
+
+fn channel_webhook_error_response(error: anyhow::Error) -> Response {
+    let message = error.to_string();
+    let lowered = message.to_ascii_lowercase();
+    let status = if lowered.contains("signature")
+        || lowered.contains("verification token")
+        || lowered.contains("bridge token mismatch")
+        || lowered.contains("token mismatch")
+    {
+        StatusCode::UNAUTHORIZED
+    } else if lowered.contains("did not include")
+        || lowered.contains("is required")
+        || lowered.contains("missing")
+        || lowered.contains("invalid")
+        || lowered.contains("failed to parse")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": "error",
+            "error": message
+        })),
+    )
+        .into_response()
+}
+
 // - WhatsApp Bridge Proxy -
 
-/// GET /api/whatsapp-bridge/status - proxy to Baileys bridge sidecar
+fn embedded_whatsapp_bridge_unavailable_reason() -> Option<String> {
+    if !std::path::Path::new("/app/bridges/whatsapp-bridge/index.js").exists() {
+        return Some(
+            "Bundled WhatsApp bridge is not installed in this image. Use the full image or switch to an external bridge."
+                .to_string(),
+        );
+    }
+    if !std::path::Path::new("/app/bridges/whatsapp-bridge/node_modules").exists() {
+        return Some(
+            "Bundled WhatsApp bridge dependencies are missing. Rebuild the full image or switch to an external bridge."
+                .to_string(),
+        );
+    }
+    None
+}
+
+async fn should_manage_embedded_whatsapp_bridge(state: &AppState) -> bool {
+    let config = { state.agent.read().await.config.whatsapp.clone() };
+    config
+        .as_ref()
+        .is_some_and(crate::channels::whatsapp::WhatsAppChannelConfig::uses_embedded_bridge)
+}
+
+fn whatsapp_bridge_managed_by(
+    config: &crate::channels::whatsapp::WhatsAppChannelConfig,
+) -> &'static str {
+    match config.bridge_runtime() {
+        crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => "embedded",
+        crate::channels::whatsapp::WhatsAppBridgeRuntime::External => "external",
+    }
+}
+
+fn legacy_whatsapp_bridge_warning(
+    config: &crate::channels::whatsapp::WhatsAppChannelConfig,
+) -> Option<String> {
+    if config.uses_external_bridge() && config.bridge_token.trim().is_empty() {
+        Some(
+            "This external bridge uses a legacy configuration without a bridge token. Add one to harden bridge requests."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn generate_whatsapp_bridge_token() -> String {
+    format!("wa_bridge_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn whatsapp_bridge_status_payload(
+    status: &str,
+    managed_by: &str,
+    detail: Option<String>,
+    error: Option<String>,
+    warning: Option<String>,
+    installed: Option<bool>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "status": status,
+        "managed_by": managed_by,
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
+            object.insert("detail".to_string(), serde_json::json!(detail));
+        }
+        if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
+            object.insert("error".to_string(), serde_json::json!(error));
+        }
+        if let Some(warning) = warning.filter(|value| !value.trim().is_empty()) {
+            object.insert("warning".to_string(), serde_json::json!(warning));
+        }
+        if let Some(installed) = installed {
+            object.insert("installed".to_string(), serde_json::json!(installed));
+        }
+    }
+    payload
+}
+
+/// GET /api/whatsapp-bridge/status - resolve WhatsApp bridge ownership and status
 async fn whatsapp_bridge_status(State(state): State<AppState>) -> Response {
-    let bridge_url = {
+    let config = {
         let agent = state.agent.read().await;
-        agent
-            .config
-            .whatsapp
-            .as_ref()
-            .map(|w| w.bridge_url.clone())
-            .unwrap_or("http://127.0.0.1:8999".to_string())
+        agent.config.whatsapp.clone()
+    };
+    let Some(config) = config else {
+        return (
+            StatusCode::OK,
+            Json(whatsapp_bridge_status_payload(
+                "disabled",
+                "none",
+                Some("WhatsApp is disabled.".to_string()),
+                None,
+                None,
+                None,
+            )),
+        )
+            .into_response();
+    };
+    if config.mode != crate::channels::whatsapp::WhatsAppMode::Baileys {
+        return (
+            StatusCode::OK,
+            Json(whatsapp_bridge_status_payload(
+                "disabled",
+                "none",
+                Some("Cloud API mode does not use the WhatsApp bridge.".to_string()),
+                None,
+                None,
+                None,
+            )),
+        )
+            .into_response();
+    }
+
+    let managed_by = whatsapp_bridge_managed_by(&config);
+    let warning = legacy_whatsapp_bridge_warning(&config);
+    let installed = if config.uses_embedded_bridge() {
+        Some(embedded_whatsapp_bridge_unavailable_reason().is_none())
+    } else {
+        None
+    };
+    if let Some(error) = config
+        .uses_embedded_bridge()
+        .then(embedded_whatsapp_bridge_unavailable_reason)
+        .flatten()
+    {
+        return (
+            StatusCode::OK,
+            Json(whatsapp_bridge_status_payload(
+                "unavailable",
+                managed_by,
+                Some("Bundled bridge unavailable.".to_string()),
+                Some(error),
+                warning,
+                installed,
+            )),
+        )
+            .into_response();
+    }
+
+    let bridge_url = match config.effective_bridge_url() {
+        Ok(url) => url,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(whatsapp_bridge_status_payload(
+                    "unavailable",
+                    managed_by,
+                    Some("Bridge configuration is incomplete.".to_string()),
+                    Some(error.to_string()),
+                    warning,
+                    installed,
+                )),
+            )
+                .into_response()
+        }
     };
 
     let client = reqwest::Client::builder()
@@ -9080,20 +10962,73 @@ async fn whatsapp_bridge_status(State(state): State<AppState>) -> Response {
         .build()
         .unwrap_or_default();
 
-    match client.get(format!("{}/status", bridge_url)).send().await {
+    let mut request = client.get(format!("{}/status", bridge_url.trim_end_matches('/')));
+    if !config.bridge_token.trim().is_empty() {
+        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+    }
+
+    match request.send().await {
         Ok(resp) => {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                [(header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response()
+            if !resp.status().is_success() {
+                let status_code = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                let detail = if body.trim().is_empty() {
+                    format!("Bridge returned {}", status_code)
+                } else {
+                    format!("Bridge returned {}: {}", status_code, body)
+                };
+                return (
+                    StatusCode::OK,
+                    Json(whatsapp_bridge_status_payload(
+                        "unavailable",
+                        managed_by,
+                        Some("Bridge is unreachable right now.".to_string()),
+                        Some(detail),
+                        warning,
+                        installed,
+                    )),
+                )
+                    .into_response();
+            }
+
+            let mut payload = match resp.json::<serde_json::Value>().await {
+                Ok(value) if value.is_object() => value,
+                Ok(_) | Err(_) => {
+                    return (
+                        StatusCode::OK,
+                        Json(whatsapp_bridge_status_payload(
+                            "unavailable",
+                            managed_by,
+                            Some("Bridge returned invalid status data.".to_string()),
+                            Some("Bridge returned invalid JSON.".to_string()),
+                            warning,
+                            installed,
+                        )),
+                    )
+                        .into_response()
+                }
+            };
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("managed_by".to_string(), serde_json::json!(managed_by));
+                if let Some(warning) = warning.clone() {
+                    object.insert("warning".to_string(), serde_json::json!(warning));
+                }
+                if let Some(installed) = installed {
+                    object.insert("installed".to_string(), serde_json::json!(installed));
+                }
+            }
+            (StatusCode::OK, Json(payload)).into_response()
         }
         Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": format!("Bridge unreachable: {}", e) })),
+            StatusCode::OK,
+            Json(whatsapp_bridge_status_payload(
+                "unavailable",
+                managed_by,
+                Some("Bridge is unreachable right now.".to_string()),
+                Some(format!("Bridge unreachable: {}", e)),
+                warning,
+                installed,
+            )),
         )
             .into_response(),
     }
@@ -9101,14 +11036,46 @@ async fn whatsapp_bridge_status(State(state): State<AppState>) -> Response {
 
 /// POST /api/whatsapp-bridge/logout - proxy logout to Baileys bridge
 async fn whatsapp_bridge_logout(State(state): State<AppState>) -> Response {
-    let bridge_url = {
+    let config = {
         let agent = state.agent.read().await;
-        agent
-            .config
-            .whatsapp
-            .as_ref()
-            .map(|w| w.bridge_url.clone())
-            .unwrap_or("http://127.0.0.1:8999".to_string())
+        agent.config.whatsapp.clone()
+    };
+    let Some(config) = config else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "WhatsApp is disabled." })),
+        )
+            .into_response();
+    };
+    if config.mode != crate::channels::whatsapp::WhatsAppMode::Baileys {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "Cloud API mode does not use the WhatsApp bridge." }),
+            ),
+        )
+            .into_response();
+    }
+    if let Some(error) = config
+        .uses_embedded_bridge()
+        .then(embedded_whatsapp_bridge_unavailable_reason)
+        .flatten()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
+    }
+    let bridge_url = match config.effective_bridge_url() {
+        Ok(url) => url,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
     };
 
     let client = reqwest::Client::builder()
@@ -9116,7 +11083,12 @@ async fn whatsapp_bridge_logout(State(state): State<AppState>) -> Response {
         .build()
         .unwrap_or_default();
 
-    match client.post(format!("{}/logout", bridge_url)).send().await {
+    let mut request = client.post(format!("{}/logout", bridge_url.trim_end_matches('/')));
+    if !config.bridge_token.trim().is_empty() {
+        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+    }
+
+    match request.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -9351,30 +11323,57 @@ async fn get_security_logs(
 }
 
 /// Spawn the WhatsApp bridge Node.js process (if not already running)
-async fn spawn_whatsapp_bridge(bridge_arc: Arc<RwLock<WhatsAppBridgeState>>) -> Result<(), String> {
+async fn spawn_whatsapp_bridge(state: AppState) -> Result<(), String> {
+    let bridge_arc = state.whatsapp_bridge.clone();
     {
         let bridge = bridge_arc.read().await;
         if bridge.active {
             return Ok(());
         }
     }
-
-    // Check that node and the bridge script exist
-    if !std::path::Path::new("/app/whatsapp-bridge/index.js").exists() {
-        return Err("WhatsApp bridge script not found".to_string());
+    let wa_config = {
+        let agent = state.agent.read().await;
+        agent.config.whatsapp.clone()
+    }
+    .ok_or_else(|| "WhatsApp is not configured".to_string())?;
+    if !wa_config.uses_embedded_bridge() {
+        return Err("WhatsApp is not configured to use the bundled embedded bridge".to_string());
     }
 
-    match tokio::process::Command::new("node")
-        .arg("/app/whatsapp-bridge/index.js")
+    let api_key = state
+        .api_key
+        .read()
+        .await
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "HTTP API key is required before the WhatsApp bridge can be started".to_string()
+        })?;
+
+    if let Some(error) = embedded_whatsapp_bridge_unavailable_reason() {
+        let mut bridge = bridge_arc.write().await;
+        bridge.active = false;
+        bridge.error = Some(error.clone());
+        return Err(error);
+    }
+
+    let mut command = tokio::process::Command::new("node");
+    command
+        .arg("/app/bridges/whatsapp-bridge/index.js")
         .env("BRIDGE_PORT", "8999")
         .env("BRIDGE_HOST", "127.0.0.1")
         .env("AGENTARK_URL", "http://127.0.0.1:8990")
-        .env("AUTH_DIR", "/app/data/whatsapp-auth")
+        .env("AGENTARK_API_KEY", api_key)
+        .env("AUTH_DIR", "/app/data/whatsapp-auth");
+    if !wa_config.bridge_token.trim().is_empty() {
+        command.env("BRIDGE_TOKEN", wa_config.bridge_token.trim());
+    }
+    command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+
+    match command.spawn() {
         Ok(child) => {
             let pid = child.id();
             let mut bridge = bridge_arc.write().await;
@@ -9671,7 +11670,10 @@ async fn browser_respond(
         )
             .into_response();
     }
-    let success = agent.browser_sessions.provide_user_response(&id, response);
+    let success = agent
+        .browser_sessions
+        .provide_user_response(&id, response)
+        .await;
     if success {
         (
             StatusCode::OK,
@@ -9703,6 +11705,9 @@ async fn browser_session_status(
                     question, ..
                 } => {
                     format!("waiting_for_user: {}", question)
+                }
+                crate::core::browser_session::SessionStatus::Interrupted { reason } => {
+                    format!("interrupted: {}", reason)
                 }
                 crate::core::browser_session::SessionStatus::Completed { summary } => {
                     format!("completed: {}", summary)
@@ -9762,7 +11767,24 @@ enum ArkPulseFixPlan {
     TunnelStartVerify,
     TunnelRestartVerify,
     AppRestart(String),
-    ShellCommand(String),
+    ShellOperations {
+        app_dir: String,
+        operations: Vec<ArkPulseShellOperation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArkPulseShellOperation {
+    PipCompileRequirements,
+    Ripgrep {
+        pattern: String,
+        path: Option<String>,
+    },
+    CargoGenerateLockfile,
+    NpmPkgDelete {
+        keys: Vec<String>,
+    },
+    MoveEnvBackup,
 }
 
 fn arkpulse_fix_plan_from_remediation(
@@ -9784,12 +11806,7 @@ fn arkpulse_fix_plan_from_remediation(
             }
         }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { command } if allow_shell_command => {
-            let normalized = command.trim();
-            if normalized.is_empty() {
-                None
-            } else {
-                Some(ArkPulseFixPlan::ShellCommand(normalized.to_string()))
-            }
+            parse_supported_arkpulse_shell_command(command.trim())
         }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { .. } => None,
     }
@@ -9809,16 +11826,47 @@ fn parse_arkpulse_app_restart(command: &str) -> Option<String> {
     }
 }
 
-fn is_supported_arkpulse_shell_segment(segment: &str) -> bool {
-    let lower = segment.trim().to_ascii_lowercase();
-    lower.starts_with("pip-compile requirements.txt")
-        || lower.starts_with("rg -n ")
-        || lower == "cargo generate-lockfile"
-        || lower.starts_with("npm pkg delete ")
-        || lower.starts_with("mv .env ")
+fn parse_supported_arkpulse_shell_segment(segment: &str) -> Option<ArkPulseShellOperation> {
+    let trimmed = segment.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "pip-compile requirements.txt" {
+        return Some(ArkPulseShellOperation::PipCompileRequirements);
+    }
+    if lower == "cargo generate-lockfile" {
+        return Some(ArkPulseShellOperation::CargoGenerateLockfile);
+    }
+    if lower == "npm pkg delete scripts.preinstall scripts.install scripts.postinstall" {
+        return Some(ArkPulseShellOperation::NpmPkgDelete {
+            keys: vec![
+                "scripts.preinstall".to_string(),
+                "scripts.install".to_string(),
+                "scripts.postinstall".to_string(),
+            ],
+        });
+    }
+    if lower == "mv .env ../.env.backup" || lower == "mv .env .env.backup" {
+        return Some(ArkPulseShellOperation::MoveEnvBackup);
+    }
+    if let Some(rest) = trimmed.strip_prefix("rg -n ") {
+        let quoted = rest.strip_prefix('"')?;
+        let end = quoted.find('"')?;
+        let pattern = quoted[..end].to_string();
+        let remaining = quoted[end + 1..].trim();
+        if remaining.contains('&')
+            || remaining.contains(';')
+            || remaining.contains('`')
+            || remaining.contains("$(")
+            || remaining.contains('|')
+        {
+            return None;
+        }
+        let path = (!remaining.is_empty()).then(|| remaining.to_string());
+        return Some(ArkPulseShellOperation::Ripgrep { pattern, path });
+    }
+    None
 }
 
-fn parse_supported_arkpulse_shell_command(command: &str) -> Option<String> {
+fn parse_supported_arkpulse_shell_command(command: &str) -> Option<ArkPulseFixPlan> {
     let normalized = command.trim();
     if normalized.is_empty() {
         return None;
@@ -9848,19 +11896,19 @@ fn parse_supported_arkpulse_shell_command(command: &str) -> Option<String> {
         .strip_prefix("cd ")
         .or_else(|| cd_segment.strip_prefix("cd\t"))?;
     let cd_target = cd_prefix.trim();
-    if !cd_target.starts_with("/app/data/apps/") {
+    if cd_target.is_empty() {
         return None;
     }
 
-    if segments
-        .iter()
-        .skip(1)
-        .all(|segment| is_supported_arkpulse_shell_segment(segment))
-    {
-        Some(normalized.to_string())
-    } else {
-        None
+    let mut operations = Vec::new();
+    for segment in segments.iter().skip(1) {
+        operations.push(parse_supported_arkpulse_shell_segment(segment)?);
     }
+
+    Some(ArkPulseFixPlan::ShellOperations {
+        app_dir: cd_target.to_string(),
+        operations,
+    })
 }
 
 fn classify_arkpulse_fix_plan(command: &str) -> Option<ArkPulseFixPlan> {
@@ -9878,7 +11926,7 @@ fn classify_arkpulse_fix_plan(command: &str) -> Option<ArkPulseFixPlan> {
     if let Some(app_id) = parse_arkpulse_app_restart(normalized) {
         return Some(ArkPulseFixPlan::AppRestart(app_id));
     }
-    parse_supported_arkpulse_shell_command(normalized).map(ArkPulseFixPlan::ShellCommand)
+    parse_supported_arkpulse_shell_command(normalized)
 }
 
 fn truncate_for_response(input: &str, max_chars: usize) -> String {
@@ -9913,20 +11961,253 @@ fn describe_arkpulse_remediation(
     }
 }
 
-async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> Response {
+fn describe_arkpulse_shell_operation(operation: &ArkPulseShellOperation) -> String {
+    match operation {
+        ArkPulseShellOperation::PipCompileRequirements => {
+            "pip-compile requirements.txt".to_string()
+        }
+        ArkPulseShellOperation::Ripgrep { pattern, path } => match path {
+            Some(path) => format!("rg -n \"{}\" {}", pattern, path),
+            None => format!("rg -n \"{}\"", pattern),
+        },
+        ArkPulseShellOperation::CargoGenerateLockfile => "cargo generate-lockfile".to_string(),
+        ArkPulseShellOperation::NpmPkgDelete { keys } => {
+            format!("npm pkg delete {}", keys.join(" "))
+        }
+        ArkPulseShellOperation::MoveEnvBackup => "mv .env .env.backup".to_string(),
+    }
+}
+
+fn arkpulse_shell_operation_auto_run_error(
+    operations: &[ArkPulseShellOperation],
+) -> Option<String> {
+    for operation in operations {
+        if matches!(operation, ArkPulseShellOperation::Ripgrep { .. }) {
+            return Some(
+                "ArkPulse grep fixes are no longer auto-run because they can expose file contents. Review the finding and run the search manually if needed."
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn apply_arkpulse_sanitized_env(command: &mut tokio::process::Command) {
+    const SAFE_ENV_KEYS: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "SystemRoot",
+        "COMSPEC",
+        "ComSpec",
+        "TMP",
+        "TEMP",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "ProgramData",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "NPM_CONFIG_CACHE",
+        "npm_config_cache",
+        "PIP_CACHE_DIR",
+    ];
+
+    command.env_clear();
+    for key in SAFE_ENV_KEYS {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+type ArkPulseFixHttpResult = (StatusCode, serde_json::Value);
+
+fn arkpulse_error_result(status: StatusCode, error: impl Into<String>) -> ArkPulseFixHttpResult {
+    let error = error.into();
+    (
+        status,
+        serde_json::json!({
+            "status": "error",
+            "error": error,
+        }),
+    )
+}
+
+fn validate_arkpulse_relative_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("ArkPulse file target cannot be empty".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Err("ArkPulse file targets must stay relative to the app directory".to_string());
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return Err("ArkPulse file targets cannot escape the app directory".to_string());
+        }
+    }
+    Ok(path)
+}
+
+async fn resolve_arkpulse_app_dir(state: &AppState, raw_app_dir: &str) -> Result<PathBuf, String> {
+    let trimmed = raw_app_dir.trim();
+    if trimmed.is_empty() {
+        return Err("App directory is required for ArkPulse shell operations".to_string());
+    }
+    let requested = tokio::fs::canonicalize(PathBuf::from(trimmed))
+        .await
+        .map_err(|e| format!("App directory is not accessible: {}", e))?;
+    let apps_root = {
+        let agent = state.agent.read().await;
+        agent.data_dir.join("apps")
+    };
+    let apps_root = tokio::fs::canonicalize(&apps_root)
+        .await
+        .map_err(|e| format!("Managed apps root is not accessible: {}", e))?;
+    if !requested.starts_with(&apps_root) {
+        return Err("ArkPulse fixes may only run inside the managed apps directory".to_string());
+    }
+    Ok(requested)
+}
+
+async fn run_arkpulse_process(
+    app_dir: &FsPath,
+    program: &str,
+    args: &[String],
+) -> Result<serde_json::Value, String> {
+    let mut command = tokio::process::Command::new(program);
+    apply_arkpulse_sanitized_env(&mut command);
+    command
+        .args(args)
+        .current_dir(app_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(120), command.output())
+        .await
+        .map_err(|_| format!("{} timed out after 120 seconds", program))?
+        .map_err(|e| format!("failed to start {}: {}", program, e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "{} failed with exit code {:?}: {}",
+            program,
+            output.status.code(),
+            detail
+        ));
+    }
+    Ok(serde_json::json!({
+        "program": program,
+        "args": args,
+        "stdout": truncate_for_response(&stdout, 800),
+        "stderr": truncate_for_response(&stderr, 800),
+    }))
+}
+
+async fn run_arkpulse_shell_operations_fix(
+    state: &AppState,
+    raw_app_dir: &str,
+    operations: &[ArkPulseShellOperation],
+) -> ArkPulseFixHttpResult {
+    let app_dir = match resolve_arkpulse_app_dir(state, raw_app_dir).await {
+        Ok(path) => path,
+        Err(error) => return arkpulse_error_result(StatusCode::BAD_REQUEST, error),
+    };
+
+    let mut results = Vec::new();
+    for operation in operations {
+        let detail = match operation {
+            ArkPulseShellOperation::PipCompileRequirements => {
+                let args = vec!["requirements.txt".to_string()];
+                run_arkpulse_process(&app_dir, "pip-compile", &args).await
+            }
+            ArkPulseShellOperation::Ripgrep { pattern, path } => {
+                let mut args = vec!["-n".to_string(), pattern.clone()];
+                if let Some(path) = path {
+                    let safe_path = match validate_arkpulse_relative_path(path) {
+                        Ok(value) => value,
+                        Err(error) => return arkpulse_error_result(StatusCode::BAD_REQUEST, error),
+                    };
+                    args.push(safe_path.to_string_lossy().to_string());
+                }
+                run_arkpulse_process(&app_dir, "rg", &args).await
+            }
+            ArkPulseShellOperation::CargoGenerateLockfile => {
+                let args = vec!["generate-lockfile".to_string()];
+                run_arkpulse_process(&app_dir, "cargo", &args).await
+            }
+            ArkPulseShellOperation::NpmPkgDelete { keys } => {
+                let mut args = vec!["pkg".to_string(), "delete".to_string()];
+                args.extend(keys.clone());
+                run_arkpulse_process(&app_dir, "npm", &args).await
+            }
+            ArkPulseShellOperation::MoveEnvBackup => {
+                let source = app_dir.join(".env");
+                if !source.exists() {
+                    return arkpulse_error_result(
+                        StatusCode::BAD_REQUEST,
+                        "No .env file exists in this app directory",
+                    );
+                };
+                let target = app_dir.join(".env.backup");
+                match tokio::fs::rename(&source, &target).await {
+                    Ok(()) => Ok(serde_json::json!({
+                        "action": "rename",
+                        "from": source.display().to_string(),
+                        "to": target.display().to_string(),
+                    })),
+                    Err(error) => Err(format!("failed to move .env to backup: {}", error)),
+                }
+            }
+        };
+
+        match detail {
+            Ok(detail) => results.push(serde_json::json!({
+                "operation": describe_arkpulse_shell_operation(operation),
+                "detail": detail,
+            })),
+            Err(error) => return arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        serde_json::json!({
+            "status": "ok",
+            "mode": "shell_operations",
+            "app_dir": app_dir.display().to_string(),
+            "operations": results,
+        }),
+    )
+}
+
+async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> ArkPulseFixHttpResult {
     let response = restart_app(State(state.clone()), Path(app_id.to_string())).await;
     let status = response.status();
     let body = response.into_body();
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return (
+            return arkpulse_error_result(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to read app restart response: {}", error),
-                }),
+                format!("Failed to read app restart response: {}", error),
             )
-                .into_response();
         }
     };
     let payload = serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_else(|_| {
@@ -9943,15 +12224,14 @@ async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> Respons
             .unwrap_or("Failed to restart app");
         return (
             status,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "status": "error",
                 "mode": "app_restart",
                 "app_id": app_id,
                 "error": error,
                 "details": payload,
-            })),
-        )
-            .into_response();
+            }),
+        );
     }
 
     let title = payload
@@ -9964,16 +12244,110 @@ async fn run_arkpulse_app_restart_fix(state: &AppState, app_id: &str) -> Respons
         .unwrap_or_default();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        serde_json::json!({
             "status": "ok",
             "mode": "app_restart",
             "app_id": app_id,
             "message": format!("Restarted app {} and queued a fresh ArkPulse run.", title),
             "url": url,
             "details": payload,
-        })),
+        }),
     )
-        .into_response()
+}
+
+fn arkpulse_fix_plan_label(plan: &ArkPulseFixPlan) -> &'static str {
+    match plan {
+        ArkPulseFixPlan::TunnelStartVerify => "tunnel_start_verify",
+        ArkPulseFixPlan::TunnelRestartVerify => "tunnel_restart_verify",
+        ArkPulseFixPlan::AppRestart(_) => "app_restart",
+        ArkPulseFixPlan::ShellOperations { .. } => "shell_operations",
+    }
+}
+
+struct ArkPulseFixAuditDetails<'a> {
+    plan: &'a ArkPulseFixPlan,
+    issue_title: &'a str,
+    target: &'a str,
+    fix_summary: &'a str,
+    event_timestamp: Option<&'a str>,
+    finding_index: Option<usize>,
+}
+
+async fn persist_arkpulse_fix_audit(
+    state: &AppState,
+    audit: &ArkPulseFixAuditDetails<'_>,
+    latency_ms: i64,
+    status: StatusCode,
+    body: &serde_json::Value,
+) {
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    let success = status.is_success()
+        && body
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(|value| !value.eq_ignore_ascii_case("error"))
+            .unwrap_or(true);
+    let mode = body
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| arkpulse_fix_plan_label(audit.plan));
+    let arguments = serde_json::json!({
+        "issue_title": audit.issue_title,
+        "target": audit.target,
+        "fix_summary": truncate_for_response(audit.fix_summary, 400),
+        "plan": arkpulse_fix_plan_label(audit.plan),
+        "event_timestamp": audit.event_timestamp,
+        "finding_index": audit.finding_index,
+    });
+    let payload = truncate_for_response(&body.to_string(), 4000);
+    let log = crate::storage::operational_log::Model {
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        trace_id: None,
+        conversation_id: None,
+        channel: "web".to_string(),
+        event_type: "arkpulse_fix".to_string(),
+        success,
+        outcome: if success {
+            format!("ArkPulse fix completed ({mode})")
+        } else {
+            format!("ArkPulse fix failed ({mode})")
+        },
+        tool_name: Some(mode.to_string()),
+        latency_ms: Some(latency_ms),
+        arguments: Some(arguments.to_string()),
+        payload: Some(payload),
+        strategy_version: None,
+        policy_version: None,
+        prompt_version: None,
+        model_slot: None,
+    };
+    if let Err(error) = storage.insert_operational_log(&log).await {
+        tracing::warn!("Failed to persist ArkPulse fix audit log: {}", error);
+    }
+}
+
+struct ArkPulseFixResponseContext<'a> {
+    audit: ArkPulseFixAuditDetails<'a>,
+    started_at: std::time::Instant,
+}
+
+async fn respond_arkpulse_fix(
+    state: &AppState,
+    context: ArkPulseFixResponseContext<'_>,
+    result: ArkPulseFixHttpResult,
+) -> Response {
+    let (status, body) = result;
+    let latency_ms = context
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    persist_arkpulse_fix_audit(state, &context.audit, latency_ms, status, &body).await;
+    (status, Json(body)).into_response()
 }
 
 /// Execute a supported ArkPulse remediation directly (without going through Chat).
@@ -9989,6 +12363,7 @@ async fn run_arkpulse_fix(
         event_timestamp,
         finding_index,
     } = request;
+    let started_at = std::time::Instant::now();
 
     let request_fix_command = fix_command.trim().to_string();
     if request_fix_command.is_empty() && remediation.is_none() {
@@ -10003,6 +12378,12 @@ async fn run_arkpulse_fix(
 
     let mut effective_fix_command = request_fix_command.clone();
     let mut effective_remediation = remediation.clone();
+    let request_has_event_context = event_timestamp
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || finding_index.is_some();
+    let mut selected_event_timestamp: Option<String> = None;
+    let mut selected_finding_index: Option<usize> = None;
 
     let plan = if event_timestamp.is_some() || finding_index.is_some() {
         let event_timestamp = event_timestamp
@@ -10084,6 +12465,8 @@ async fn run_arkpulse_fix(
                     .into_response();
             }
         }
+        selected_event_timestamp = Some(event_timestamp.to_string());
+        selected_finding_index = Some(finding_index);
         effective_fix_command = finding.fix_command.trim().to_string();
         effective_remediation = finding.remediation.clone();
         effective_remediation
@@ -10109,6 +12492,22 @@ async fn run_arkpulse_fix(
             .into_response();
     };
 
+    if let ArkPulseFixPlan::ShellOperations { operations, .. } = &plan {
+        if !request_has_event_context {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Shell-style ArkPulse fixes must come from a stored ArkPulse finding. Open the finding in ArkPulse and run it from there."
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        if let Some(error) = arkpulse_shell_operation_auto_run_error(operations) {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    }
+
     let issue_title = issue_title.unwrap_or_default();
     let target = target.unwrap_or_default();
     let fix_summary =
@@ -10120,172 +12519,101 @@ async fn run_arkpulse_fix(
         truncate_for_response(&fix_summary, 220)
     );
 
-    match plan {
+    let result = match &plan {
         ArkPulseFixPlan::TunnelStartVerify => {
             let tunnel_arc = state.tunnel.clone();
             if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response();
-            }
-
-            let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
-            if let Some(url) = discovered_url.as_ref() {
-                tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
-            }
-
-            let tunnel = tunnel_arc.read().await;
-            let active = tunnel.active;
-            let url = tunnel.url.clone();
-            let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                format!(
-                    "Remote access is active at {}.",
-                    url.clone().unwrap_or_default()
-                )
+                arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
             } else {
-                "Tunnel start requested. URL is pending; re-check /tunnel/status shortly."
-                    .to_string()
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "mode": "tunnel_start_verify",
-                    "message": message,
-                    "active": active,
-                    "url": url
-                })),
-            )
-                .into_response()
+                let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+                if let Some(url) = discovered_url.as_ref() {
+                    tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
+                }
+
+                let tunnel = tunnel_arc.read().await;
+                let active = tunnel.active;
+                let url = tunnel.url.clone();
+                let message =
+                    if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                        format!(
+                            "Remote access is active at {}.",
+                            url.clone().unwrap_or_default()
+                        )
+                    } else {
+                        "Tunnel start requested. URL is pending; re-check /tunnel/status shortly."
+                            .to_string()
+                    };
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "status": "ok",
+                        "mode": "tunnel_start_verify",
+                        "message": message,
+                        "active": active,
+                        "url": url
+                    }),
+                )
+            }
         }
         ArkPulseFixPlan::TunnelRestartVerify => {
             tunnel::stop_tunnel_internal(&state).await;
             let tunnel_arc = state.tunnel.clone();
             if let Err(error) = tunnel::spawn_tunnel(&state, None).await {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response();
-            }
-
-            let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
-            if let Some(url) = discovered_url.as_ref() {
-                tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
-            }
-
-            let tunnel = tunnel_arc.read().await;
-            let active = tunnel.active;
-            let url = tunnel.url.clone();
-            let message = if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
-                format!(
-                    "Remote access restarted successfully at {}.",
-                    url.clone().unwrap_or_default()
-                )
+                arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error)
             } else {
-                "Tunnel restart requested. URL is pending; re-check /tunnel/status shortly."
-                    .to_string()
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "mode": "tunnel_restart_verify",
-                    "message": message,
-                    "active": active,
-                    "url": url
-                })),
-            )
-                .into_response()
-        }
-        ArkPulseFixPlan::AppRestart(app_id) => run_arkpulse_app_restart_fix(&state, &app_id).await,
-        ArkPulseFixPlan::ShellCommand(command) => {
-            let started_at = Instant::now();
-            let mut process = if cfg!(windows) {
-                let mut cmd = tokio::process::Command::new("cmd");
-                cmd.arg("/C").arg(&command);
-                cmd
-            } else {
-                let mut cmd = tokio::process::Command::new("sh");
-                cmd.arg("-lc").arg(&command);
-                cmd
-            };
-            let exec = process
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output();
-
-            let output = match tokio::time::timeout(Duration::from_secs(120), exec).await {
-                Ok(Ok(output)) => output,
-                Ok(Err(error)) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("Failed to run fix command: {}", error),
-                        }),
-                    )
-                        .into_response();
+                let discovered_url = tunnel::wait_for_tunnel_url(tunnel_arc.clone(), 12).await;
+                if let Some(url) = discovered_url.as_ref() {
+                    tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
                 }
-                Err(_) => {
-                    return (
-                        StatusCode::REQUEST_TIMEOUT,
-                        Json(ErrorResponse {
-                            error: "Fix command timed out after 120s".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            };
 
-            let elapsed_ms = started_at.elapsed().as_millis() as u64;
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let combined = if stdout.is_empty() && stderr.is_empty() {
-                "(no output)".to_string()
-            } else if stderr.is_empty() {
-                stdout.clone()
-            } else if stdout.is_empty() {
-                stderr.clone()
-            } else {
-                format!("{}\n\nstderr:\n{}", stdout, stderr)
-            };
-            let output_preview = truncate_for_response(&combined, 4000);
-
-            if output.status.success() {
+                let tunnel = tunnel_arc.read().await;
+                let active = tunnel.active;
+                let url = tunnel.url.clone();
+                let message =
+                    if active && url.as_ref().is_some_and(|value| !value.trim().is_empty()) {
+                        format!(
+                            "Remote access restarted successfully at {}.",
+                            url.clone().unwrap_or_default()
+                        )
+                    } else {
+                        "Tunnel restart requested. URL is pending; re-check /tunnel/status shortly."
+                            .to_string()
+                    };
                 (
                     StatusCode::OK,
-                    Json(serde_json::json!({
+                    serde_json::json!({
                         "status": "ok",
-                        "mode": "shell",
-                        "message": "ArkPulse fix command executed successfully.",
-                        "command": command,
-                        "duration_ms": elapsed_ms,
-                        "output": output_preview
-                    })),
+                        "mode": "tunnel_restart_verify",
+                        "message": message,
+                        "active": active,
+                        "url": url
+                    }),
                 )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "status": "error",
-                        "mode": "shell",
-                        "error": format!(
-                            "Fix command failed with exit code {}",
-                            output.status.code().unwrap_or(-1)
-                        ),
-                        "command": command,
-                        "duration_ms": elapsed_ms,
-                        "output": output_preview
-                    })),
-                )
-                    .into_response()
             }
         }
-    }
+        ArkPulseFixPlan::AppRestart(app_id) => run_arkpulse_app_restart_fix(&state, app_id).await,
+        ArkPulseFixPlan::ShellOperations {
+            app_dir,
+            operations,
+        } => run_arkpulse_shell_operations_fix(&state, app_dir, operations).await,
+    };
+
+    respond_arkpulse_fix(
+        &state,
+        ArkPulseFixResponseContext {
+            audit: ArkPulseFixAuditDetails {
+                plan: &plan,
+                issue_title: &issue_title,
+                target: &target,
+                fix_summary: &fix_summary,
+                event_timestamp: selected_event_timestamp.as_deref(),
+                finding_index: selected_finding_index,
+            },
+            started_at,
+        },
+        result,
+    )
+    .await
 }
 
 /// Return the ArkPulse event log (last 100 events)
@@ -10303,11 +12631,13 @@ async fn get_pulse_log(
         .unwrap_or(0usize);
     let agent = state.agent.read().await;
     let mut all_events = crate::sentinel::get_pulse_log(&agent).await;
-    let had_raw_payload = crate::storage::legacy_recovery::encrypted_payload_exists(
-        &agent.storage,
-        crate::sentinel::PULSE_LOG_KEY,
-    )
-    .await;
+    let has_persisted_payload = agent
+        .storage
+        .get(crate::sentinel::PULSE_LOG_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
     all_events.sort_by(|a, b| {
         let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
             .map(|ts| ts.timestamp_millis())
@@ -10325,9 +12655,9 @@ async fn get_pulse_log(
         "limit": limit,
         "offset": offset,
         "running": crate::sentinel::is_pulse_running(),
-        "history_unavailable": total == 0 && had_raw_payload,
-        "history_unavailable_reason": if total == 0 && had_raw_payload {
-            Some("An older ArkPulse history payload exists but could not be decrypted after a past password rotation. New runs will appear normally.")
+        "history_unavailable": total == 0 && has_persisted_payload,
+        "history_unavailable_reason": if total == 0 && has_persisted_payload {
+            Some("A persisted ArkPulse history payload exists but could not be read. New runs will appear normally.")
         } else {
             None::<&str>
         }
@@ -10341,7 +12671,7 @@ async fn trigger_arkpulse_after_app_change(state: &AppState, reason: &'static st
     {
         let agent_guard = state.agent.read().await;
         let autonomy = load_autonomy_settings(&agent_guard).await;
-        if autonomy.agent_paused {
+        if autonomy_background_disabled(&autonomy) {
             return;
         }
     }
@@ -10363,10 +12693,10 @@ async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_json::Value>
     {
         let agent_guard = state.agent.read().await;
         let autonomy = load_autonomy_settings(&agent_guard).await;
-        if autonomy.agent_paused {
+        if autonomy_background_disabled(&autonomy) {
             return Json(serde_json::json!({
                 "status": "paused",
-                "message": "Agent is paused. Resume the agent to run ArkPulse."
+                "message": "Autonomy is disabled. Re-enable autonomy to run ArkPulse."
             }));
         }
     }
@@ -10392,12 +12722,55 @@ async fn get_profile(State(state): State<AppState>) -> Json<ProfileResponse> {
     })
 }
 
+fn conversation_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Conversation not found".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn build_request_execution_hints(
+    deep_research: bool,
+    chat_task_id: Option<String>,
+    caller: Option<&crate::actions::ActionCallerPrincipal>,
+    surface: crate::actions::ActionExecutionSurface,
+    direct_user_intent: bool,
+) -> crate::core::RequestExecutionHints {
+    crate::core::RequestExecutionHints {
+        deep_research,
+        chat_task_id,
+        caller_principal: caller.cloned(),
+        execution_surface: surface,
+        direct_user_intent,
+    }
+}
+
+pub(super) fn build_direct_action_auth_context(
+    caller: Option<&crate::actions::ActionCallerPrincipal>,
+    surface: crate::actions::ActionExecutionSurface,
+    direct_user_intent: bool,
+) -> crate::actions::ActionAuthorizationContext {
+    crate::actions::ActionAuthorizationContext {
+        principal: caller.cloned(),
+        surface,
+        direct_user_intent,
+    }
+}
+
 /// Chat with the agent
 async fn chat(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
+    if let Some(response) = validate_chat_message_size(&request.message) {
+        return response;
+    }
+
     tracing::info!(
         "HTTP /chat request: channel={}, msg={}chars, conv_id={:?}, project={:?}",
         request.channel,
@@ -10405,6 +12778,28 @@ async fn chat(
         request.conversation_id.as_deref().unwrap_or("-"),
         request.project_id.as_deref().unwrap_or("-"),
     );
+
+    if let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let agent = state.agent.read().await;
+        match agent.storage.get_conversation(conversation_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return conversation_not_found_response(),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load conversation: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Two-tier secrets UX: allow "set secret KEY=VALUE" without engaging the LLM.
     // This bypasses conversation history + traces, and stores the value encrypted in secrets.enc.
@@ -10639,15 +13034,20 @@ async fn chat(
 
     let result = {
         let agent_guard = state.agent.read().await;
+        let caller = maybe_caller.as_ref().map(|Extension(value)| value);
         agent_guard
             .process_message_with_meta_and_hints(
                 &request.message,
                 &request.channel,
                 request.conversation_id.as_deref(),
                 request.project_id.as_deref(),
-                crate::core::RequestExecutionHints {
-                    deep_research: request.deep_research,
-                },
+                build_request_execution_hints(
+                    request.deep_research,
+                    None,
+                    caller,
+                    crate::actions::ActionExecutionSurface::Chat,
+                    true,
+                ),
             )
             .await
     };
@@ -10673,6 +13073,9 @@ async fn chat(
                 .into_response()
         }
         Err(e) => {
+            if e.to_string() == "Conversation not found" {
+                return conversation_not_found_response();
+            }
             tracing::error!("Framework-level web chat failure: {}", e);
             let response = "I hit a framework-level problem before supervised execution could finish. Please retry. If it keeps happening, restart the runtime or check the server logs.".to_string();
             let degradation = vec![crate::core::DegradationNote {
@@ -10823,8 +13226,7 @@ fn normalize_stream_heartbeat_status(status: &str) -> String {
         return "Still processing. No new output yet.".to_string();
     }
     let lower = trimmed.to_ascii_lowercase();
-    let memory_is_active = (lower.contains("memory") || lower.contains("mem0"))
-        && !lower.contains("available on demand");
+    let memory_is_active = lower.contains("memory") && !lower.contains("available on demand");
     if memory_is_active {
         return "Memory/context setup in progress. No new output yet.".to_string();
     }
@@ -10845,6 +13247,27 @@ fn normalize_stream_event_for_sse(
     last_thinking_detail: &str,
 ) -> (Option<(&'static str, serde_json::Value)>, String) {
     match ev {
+        crate::core::StreamEvent::RunStarted {
+            run_id,
+            flow_kind,
+            origin,
+            conversation_id,
+            trace_id,
+            resumed,
+        } => (
+            Some((
+                "run_started",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "flow_kind": flow_kind,
+                    "origin": origin,
+                    "conversation_id": conversation_id,
+                    "trace_id": trace_id,
+                    "resumed": resumed,
+                }),
+            )),
+            String::new(),
+        ),
         crate::core::StreamEvent::Token(content) => (
             Some(("token", serde_json::json!({ "content": content }))),
             String::new(),
@@ -10937,35 +13360,306 @@ fn normalize_stream_event_for_sse(
             };
             (Some(("tool_progress", payload_json)), String::new())
         }
-        crate::core::StreamEvent::PlanGenerated { steps } => (
+        crate::core::StreamEvent::PlanGenerated { plan } => (
             Some((
                 "plan_generated",
                 serde_json::json!({
                     "step_type": "plan_generated",
                     "title": "Execution Plan",
-                    "detail": format!("{} steps planned", steps.len()),
-                    "steps": steps,
+                    "detail": format!("{} steps planned", plan.steps.len()),
+                    "plan": plan,
+                }),
+            )),
+            String::new(),
+        ),
+        crate::core::StreamEvent::PlanRevised { plan, reason } => (
+            Some((
+                "plan_revised",
+                serde_json::json!({
+                    "step_type": "plan_revised",
+                    "title": "Execution Plan Revised",
+                    "detail": reason.unwrap_or_else(|| format!("Plan revised to {} steps.", plan.steps.len())),
+                    "plan": plan,
+                }),
+            )),
+            String::new(),
+        ),
+        crate::core::StreamEvent::PlanUnavailable { reason } => (
+            Some((
+                "plan_unavailable",
+                serde_json::json!({
+                    "step_type": "plan_unavailable",
+                    "title": "Execution Plan Unavailable",
+                    "detail": reason,
                 }),
             )),
             String::new(),
         ),
         crate::core::StreamEvent::PlanStepUpdate {
+            plan_id,
+            revision,
             step_id,
+            step_title,
             status,
             detail,
-        } => (
-            Some((
-                "plan_step_update",
-                serde_json::json!({
-                    "step_type": "plan_step_update",
-                    "step_id": step_id,
-                    "status": status,
-                    "detail": detail.unwrap_or_default(),
-                }),
-            )),
-            String::new(),
-        ),
+        } => {
+            let title = match status {
+                crate::core::PlanStepStatus::Pending => "Plan Step Queued",
+                crate::core::PlanStepStatus::Running => "Plan Step Started",
+                crate::core::PlanStepStatus::Completed => "Plan Step Completed",
+                crate::core::PlanStepStatus::Failed => "Plan Step Failed",
+                crate::core::PlanStepStatus::Skipped => "Plan Step Skipped",
+            };
+            let step_title_text = step_title
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("Step {}", step_id));
+            let detail_text = detail.unwrap_or_else(|| match status {
+                crate::core::PlanStepStatus::Pending => format!("Queued {}.", step_title_text),
+                crate::core::PlanStepStatus::Running => format!("Started {}.", step_title_text),
+                crate::core::PlanStepStatus::Completed => {
+                    format!("Completed {}.", step_title_text)
+                }
+                crate::core::PlanStepStatus::Failed => format!("Failed {}.", step_title_text),
+                crate::core::PlanStepStatus::Skipped => format!("Skipped {}.", step_title_text),
+            });
+            (
+                Some((
+                    "plan_step_update",
+                    serde_json::json!({
+                        "step_type": "plan_step_update",
+                        "title": title,
+                        "plan_id": plan_id,
+                        "revision": revision,
+                        "step_id": step_id,
+                        "step_title": step_title,
+                        "status": status,
+                        "detail": detail_text,
+                    }),
+                )),
+                String::new(),
+            )
+        }
     }
+}
+
+fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event {
+    let mut payload = match run_event.kind.as_str() {
+        "thinking" => {
+            let detail = run_event
+                .payload
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            serde_json::json!({
+                "step_type": "heartbeat",
+                "title": "Still Working",
+                "detail": detail,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        }
+        "tool_start" => {
+            let name = run_event
+                .payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(inner) = run_event
+                .payload
+                .get("payload")
+                .and_then(|value| value.as_object())
+            {
+                let mut merged = serde_json::Map::new();
+                merged.insert("name".to_string(), serde_json::json!(name));
+                for (key, value) in inner {
+                    merged.insert(key.clone(), value.clone());
+                }
+                merged
+            } else {
+                serde_json::json!({ "name": name })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        }
+        "tool_progress" => {
+            let name = run_event
+                .payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let content = summarize_stream_tool_activity_content(
+                run_event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default(),
+            );
+            if let Some(inner) = run_event
+                .payload
+                .get("payload")
+                .and_then(|value| value.as_object())
+            {
+                let mut merged = serde_json::Map::new();
+                merged.insert("name".to_string(), serde_json::json!(name));
+                merged.insert("content".to_string(), serde_json::json!(content));
+                for (key, value) in inner {
+                    merged.insert(key.clone(), value.clone());
+                }
+                merged
+            } else {
+                serde_json::json!({
+                    "name": name,
+                    "content": content,
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+            }
+        }
+        "tool_result" => {
+            let name = run_event
+                .payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let raw_content = run_event
+                .payload
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let summarized = summarize_stream_tool_activity_content(&raw_content);
+            let trimmed = raw_content.trim();
+            let mut merged = serde_json::Map::new();
+            merged.insert("name".to_string(), serde_json::json!(name));
+            merged.insert("content".to_string(), serde_json::json!(summarized));
+            if !trimmed.is_empty() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Some(obj) = value.as_object() {
+                        for (key, value) in obj {
+                            if matches!(key.as_str(), "name" | "content" | "raw_content" | "result")
+                            {
+                                continue;
+                            }
+                            merged.insert(key.clone(), value.clone());
+                        }
+                    } else {
+                        merged.insert("raw_content".to_string(), serde_json::json!(raw_content));
+                    }
+                } else {
+                    merged.insert("raw_content".to_string(), serde_json::json!(raw_content));
+                }
+            }
+            merged
+        }
+        "plan_generated" => {
+            let plan = run_event.payload.get("plan").cloned().unwrap_or_default();
+            let step_count = plan
+                .get("steps")
+                .and_then(|value| value.as_array())
+                .map(|steps| steps.len())
+                .unwrap_or(0);
+            serde_json::json!({
+                "step_type": "plan_generated",
+                "title": "Execution Plan",
+                "detail": format!("{} steps planned", step_count),
+                "plan": plan,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        }
+        "plan_revised" => {
+            let plan = run_event.payload.get("plan").cloned().unwrap_or_default();
+            let step_count = plan
+                .get("steps")
+                .and_then(|value| value.as_array())
+                .map(|steps| steps.len())
+                .unwrap_or(0);
+            let detail = run_event
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Plan revised to {} steps.", step_count));
+            serde_json::json!({
+                "step_type": "plan_revised",
+                "title": "Execution Plan Revised",
+                "detail": detail,
+                "plan": plan,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        }
+        "plan_unavailable" => {
+            let detail = run_event
+                .payload
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Structured planning was unavailable.")
+                .to_string();
+            serde_json::json!({
+                "step_type": "plan_unavailable",
+                "title": "Execution Plan Unavailable",
+                "detail": detail,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+        }
+        "plan_step_update" => {
+            let detail = run_event
+                .payload
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Updated step {}",
+                        run_event
+                            .payload
+                            .get("step_id")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0)
+                    )
+                });
+            let mut merged = run_event.payload.as_object().cloned().unwrap_or_default();
+            merged.insert(
+                "step_type".to_string(),
+                serde_json::json!("plan_step_update"),
+            );
+            merged.insert("title".to_string(), serde_json::json!("Plan Step Update"));
+            merged.insert("detail".to_string(), serde_json::json!(detail));
+            merged
+        }
+        _ => run_event.payload.as_object().cloned().unwrap_or_default(),
+    };
+    payload.insert("run_id".to_string(), serde_json::json!(run_event.run_id));
+    payload.insert("seq".to_string(), serde_json::json!(run_event.seq));
+    payload.insert("ts".to_string(), serde_json::json!(run_event.ts));
+    payload.insert(
+        "flow_kind".to_string(),
+        serde_json::json!(run_event.flow_kind),
+    );
+    payload.insert("origin".to_string(), serde_json::json!(run_event.origin));
+    payload.insert(
+        "priority".to_string(),
+        serde_json::json!(run_event.priority),
+    );
+    if let Some(stage) = run_event.stage {
+        payload.insert("stage".to_string(), serde_json::json!(stage));
+    }
+    Event::default()
+        .event(run_event.kind)
+        .data(serde_json::to_string(&payload).unwrap_or_default())
 }
 
 fn truncate_stream_task_text(text: &str, max_chars: usize) -> String {
@@ -10994,197 +13688,6 @@ fn normalized_chat_execution_mode(mode: Option<&str>) -> &'static str {
 
 fn chat_message_contains_any(lower: &str, tokens: &[&str]) -> bool {
     tokens.iter().any(|token| lower.contains(token))
-}
-
-fn chat_message_contains_import_source(lower: &str) -> bool {
-    let source_like = [
-        "clawhub.ai/",
-        "openclaw.ai/",
-        "github.com/",
-        "raw.githubusercontent.com/",
-        "/skills/",
-        "skill.md",
-        "action.md",
-    ];
-    chat_message_contains_any(lower, &source_like)
-}
-
-fn chat_message_looks_like_direct_import_source(lower: &str) -> bool {
-    let trimmed = lower.trim();
-    if trimmed.is_empty() || !chat_message_contains_import_source(trimmed) {
-        return false;
-    }
-    trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("www.")
-        || trimmed.split_whitespace().count() <= 6
-}
-
-fn chat_message_requests_app_work(lower: &str) -> bool {
-    let build_like = [
-        "build",
-        "create",
-        "make",
-        "ship",
-        "deploy",
-        "fix",
-        "debug",
-        "repair",
-        "prototype",
-        "scaffold",
-        "spin up",
-        "stand up",
-        "generate",
-        "turn into",
-        "convert",
-    ];
-    let app_like = [
-        "app",
-        "web app",
-        "site",
-        "website",
-        "dashboard",
-        "landing page",
-        "portal",
-        "interface",
-        "admin panel",
-        "console",
-        "ui",
-        "frontend",
-    ];
-    let explicit_like = [
-        "build me an app",
-        "build an app",
-        "create an app",
-        "make an app",
-        "turn this into an app",
-        "build a dashboard",
-        "build a landing page",
-    ];
-    chat_message_contains_any(lower, &explicit_like)
-        || (chat_message_contains_any(lower, &build_like)
-            && chat_message_contains_any(lower, &app_like))
-}
-
-fn chat_message_requests_import(lower: &str) -> bool {
-    let import_like = [
-        "import", "install", "add", "pull in", "ingest", "load", "set up", "setup", "bring in",
-        "use this", "try this",
-    ];
-    let target_like = [
-        "skill",
-        "skills",
-        "repo",
-        "repository",
-        "url",
-        "template",
-        "document",
-        "doc",
-        "github",
-        "clawhub",
-        "openclaw",
-        "skill.md",
-        "action.md",
-    ];
-    let mentions_source = chat_message_contains_import_source(lower);
-    if mentions_source
-        && (chat_message_looks_like_direct_import_source(lower)
-            || chat_message_contains_any(lower, &import_like)
-            || lower.contains("skill"))
-    {
-        return true;
-    }
-    chat_message_contains_any(lower, &import_like)
-        && (chat_message_contains_any(lower, &target_like) || mentions_source)
-}
-
-fn chat_message_requests_automation(lower: &str) -> bool {
-    let automation_like = [
-        "every day",
-        "every week",
-        "hourly",
-        "daily",
-        "weekly",
-        "schedule",
-        "cron",
-        "remind",
-        "monitor",
-        "watch",
-        "watcher",
-        "automation",
-    ];
-    automation_like.iter().any(|token| lower.contains(token))
-}
-
-fn chat_message_requests_workspace_changes(lower: &str) -> bool {
-    let change_like = [
-        "fix",
-        "debug",
-        "edit",
-        "change",
-        "update",
-        "rewrite",
-        "refactor",
-        "implement",
-        "write files",
-        "modify",
-    ];
-    let workspace_like = [
-        "file",
-        "files",
-        "code",
-        "repo",
-        "repository",
-        "project",
-        "workspace",
-        "app",
-    ];
-    change_like.iter().any(|token| lower.contains(token))
-        && workspace_like.iter().any(|token| lower.contains(token))
-}
-
-fn chat_request_should_create_task(
-    execution_mode: Option<&str>,
-    message: &str,
-    deep_research: bool,
-    attachments_present: bool,
-) -> bool {
-    match normalized_chat_execution_mode(execution_mode) {
-        "chat" => false,
-        "task" => true,
-        _ => {
-            if deep_research || attachments_present {
-                return true;
-            }
-            let lower = message.trim().to_ascii_lowercase();
-            chat_message_requests_app_work(&lower)
-                || chat_message_requests_import(&lower)
-                || chat_message_requests_automation(&lower)
-                || chat_message_requests_workspace_changes(&lower)
-        }
-    }
-}
-
-fn classify_chat_task_work_type(
-    message: &str,
-    deep_research: bool,
-    attachments_present: bool,
-) -> &'static str {
-    if deep_research {
-        return "research";
-    }
-    let lower = message.trim().to_ascii_lowercase();
-    if chat_message_requests_app_work(&lower) {
-        "app"
-    } else if chat_message_requests_import(&lower) {
-        "import"
-    } else if chat_message_requests_automation(&lower) {
-        "automation"
-    } else if attachments_present || chat_message_requests_workspace_changes(&lower) {
-        "workspace"
-    } else {
-        "task"
-    }
 }
 
 fn build_chat_task_description(message: &str, work_type: &str) -> String {
@@ -11245,13 +13748,14 @@ struct StreamedChatTask {
     user_message_already_recorded: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum ChatStreamTaskMode {
     CreateIfNeeded {
         execution_mode: Option<String>,
         attachments_present: bool,
     },
-    Existing(StreamedChatTask),
+    Existing(Box<StreamedChatTask>),
 }
 
 #[derive(Clone)]
@@ -11261,6 +13765,7 @@ struct ChatStreamRunRequest {
     conversation_id: Option<String>,
     project_id: Option<String>,
     deep_research: bool,
+    caller_principal: Option<crate::actions::ActionCallerPrincipal>,
     task_mode: ChatStreamTaskMode,
 }
 
@@ -11274,6 +13779,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
     let conversation_id = request.conversation_id.clone();
     let project_id = request.project_id.clone();
     let deep_research = request.deep_research;
+    let caller_principal = request.caller_principal.clone();
     let task_mode = request.task_mode.clone();
     let app_state = state.clone();
 
@@ -11283,15 +13789,35 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                 execution_mode,
                 attachments_present,
             } => {
-                if chat_request_should_create_task(
-                    execution_mode.as_deref(),
-                    &message,
-                    deep_research,
-                    attachments_present,
-                ) {
-                    let work_type =
-                        classify_chat_task_work_type(&message, deep_research, attachments_present)
-                            .to_string();
+                let routing = match normalized_chat_execution_mode(execution_mode.as_deref()) {
+                    "chat" => crate::core::ChatExecutionIntentDecision {
+                        create_task: false,
+                        work_type: "task",
+                    },
+                    "task" => crate::core::ChatExecutionIntentDecision {
+                        create_task: true,
+                        work_type: if deep_research {
+                            "research"
+                        } else if attachments_present {
+                            "workspace"
+                        } else {
+                            "task"
+                        },
+                    },
+                    _ => {
+                        let agent_guard = agent_ref.read().await;
+                        agent_guard
+                            .classify_chat_execution_intent(
+                                &channel,
+                                &message,
+                                deep_research,
+                                attachments_present,
+                            )
+                            .await
+                    }
+                };
+                if routing.create_task {
+                    let work_type = routing.work_type.to_string();
                     let description = build_chat_task_description(&message, &work_type);
                     let mut task = crate::core::Task::new(
                         description.clone(),
@@ -11333,12 +13859,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                             let _ = tx.send(Ok(event)).await;
                             Some(StreamedChatTask {
                                 task,
-                                work_type: classify_chat_task_work_type(
-                                    &message,
-                                    deep_research,
-                                    attachments_present,
-                                )
-                                .to_string(),
+                                work_type: work_type.clone(),
                                 user_message_already_recorded: false,
                             })
                         }
@@ -11364,7 +13885,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     .event("task_started")
                     .data(serde_json::to_string(&payload).unwrap_or_default());
                 let _ = tx.send(Ok(event)).await;
-                Some(task)
+                Some(*task)
             }
         };
 
@@ -11451,14 +13972,12 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                                 let title = s.title.to_ascii_lowercase();
                                 let detail = s.detail.to_ascii_lowercase();
                                 let memory_is_active = (title.contains("memory")
-                                    || detail.contains("memory")
-                                    || title.contains("mem0")
-                                    || detail.contains("mem0"))
+                                    || detail.contains("memory"))
                                     && !detail.contains("available on demand");
                                 if memory_is_active {
-                                    if detail.contains("mem0 pending") {
-                                        "Memory layer is starting up (first run may include embedding warmup)."
-                                    } else if detail.contains("mem0 active") {
+                                    if detail.contains("pending") {
+                                        "Vector memory layer is starting up (first run may include embedding warmup)."
+                                    } else if detail.contains("active") {
                                         "Retrieving semantic memory/context."
                                     } else if detail.contains("warmup") {
                                         "Memory layer warmup in progress."
@@ -11523,6 +14042,8 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let conversation_id = conversation_id.clone();
             let project_id = project_id.clone();
             let trace_ref = trace_ref.clone();
+            let chat_task_id = tracked_task.as_ref().map(|task| task.task.id.to_string());
+            let caller_principal = caller_principal.clone();
             tokio::spawn(async move {
                 let agent_guard = agent_ref.read().await;
                 if user_message_already_recorded {
@@ -11534,7 +14055,13 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            crate::core::RequestExecutionHints { deep_research },
+                            build_request_execution_hints(
+                                deep_research,
+                                chat_task_id.clone(),
+                                caller_principal.as_ref(),
+                                crate::actions::ActionExecutionSurface::Chat,
+                                true,
+                            ),
                         )
                         .await
                 } else {
@@ -11546,7 +14073,13 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            crate::core::RequestExecutionHints { deep_research },
+                            build_request_execution_hints(
+                                deep_research,
+                                chat_task_id.clone(),
+                                caller_principal.as_ref(),
+                                crate::actions::ActionExecutionSurface::Chat,
+                                true,
+                            ),
                         )
                         .await
                 }
@@ -11688,6 +14221,27 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     let result_preview = "Cancelled by user.";
                     {
                         let agent_guard = agent_ref.read().await;
+                        agent_guard
+                            .swarm_activity
+                            .interrupt_run(
+                                &task.task.id.to_string(),
+                                "Cancelled by user before the delegated run completed.",
+                            )
+                            .await;
+                        if let Err(storage_error) = agent_guard
+                            .storage
+                            .mark_swarm_run_interrupted(
+                                &task.task.id.to_string(),
+                                "Cancelled by user before the delegated run completed.",
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to persist interrupted swarm run '{}' after cancellation: {}",
+                                task.task.id,
+                                storage_error
+                            );
+                        }
                         if let Err(finalize_error) = agent_guard
                             .finalize_task(
                                 task.task.id,
@@ -11903,7 +14457,13 @@ fn extract_resumable_web_chat_task(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
-            classify_chat_task_work_type(&message, deep_research, attachments_present).to_string()
+            if deep_research {
+                "research".to_string()
+            } else if attachments_present {
+                "workspace".to_string()
+            } else {
+                "task".to_string()
+            }
         });
 
     Ok(ResumableChatTaskRequest {
@@ -11918,15 +14478,42 @@ fn extract_resumable_web_chat_task(
 
 async fn chat_stream(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     Json(request): Json<ChatRequest>,
 ) -> Response {
+    if let Some(response) = validate_chat_message_size(&request.message) {
+        return response;
+    }
+
     tracing::info!(
         "HTTP /chat/stream request: channel={}, msg={}chars, conv_id={:?}",
         request.channel,
         request.message.len(),
         request.conversation_id.as_deref().unwrap_or("-"),
     );
+
+    if let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let agent = state.agent.read().await;
+        match agent.storage.get_conversation(conversation_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return conversation_not_found_response(),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to load conversation: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Two-tier secrets UX: allow "set secret KEY=VALUE" without engaging the LLM.
     if let Some((key, value)) = parse_set_secret_command(&request.message) {
@@ -12177,6 +14764,7 @@ async fn chat_stream(
             conversation_id: request.conversation_id,
             project_id: request.project_id,
             deep_research: request.deep_research,
+            caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::CreateIfNeeded {
                 execution_mode: request.execution_mode,
                 attachments_present: request.attachments_present,
@@ -12486,9 +15074,7 @@ fn background_session_live_summary(
         crate::core::BackgroundSessionStatus::Failed => {
             "Blocked by a failure. Inspect the latest error before resuming.".to_string()
         }
-        crate::core::BackgroundSessionStatus::Cancelled => {
-            "Stopped by the operator.".to_string()
-        }
+        crate::core::BackgroundSessionStatus::Cancelled => "Stopped by the operator.".to_string(),
     }
 }
 
@@ -12547,9 +15133,7 @@ fn background_session_task_json(task: &Task) -> serde_json::Value {
     })
 }
 
-fn background_session_watcher_json(
-    watcher: &crate::core::watcher::Watcher,
-) -> serde_json::Value {
+fn background_session_watcher_json(watcher: &crate::core::watcher::Watcher) -> serde_json::Value {
     serde_json::json!({
         "id": watcher.id.to_string(),
         "description": watcher.description.clone(),
@@ -12585,13 +15169,7 @@ async fn rebind_task_background_session(
     let agent = state.agent.read().await;
     agent
         .storage
-        .update_task(
-            task_id.trim(),
-            None,
-            Some(serialized_arguments),
-            None,
-            None,
-        )
+        .update_task(task_id.trim(), None, Some(serialized_arguments), None, None)
         .await
         .map_err(|error| format!("Failed to update task linkage: {}", error))?;
     Ok(true)
@@ -12628,7 +15206,10 @@ async fn pause_linked_background_session_work(
                 continue;
             }
             if let Some(inner) = tasks.get_mut(task.id) {
-                if matches!(inner.status, TaskStatus::Pending | TaskStatus::AwaitingApproval) {
+                if matches!(
+                    inner.status,
+                    TaskStatus::Pending | TaskStatus::AwaitingApproval
+                ) {
                     inner.status = TaskStatus::Paused;
                     paused_tasks.push(task_id);
                 }
@@ -12877,11 +15458,7 @@ async fn create_background_session(
                 Ok(true) => linked_task_ids.push(task_id.trim().to_string()),
                 Ok(false) => {}
                 Err(error) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error }),
-                    )
-                        .into_response()
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
                 }
             }
         }
@@ -12890,11 +15467,7 @@ async fn create_background_session(
                 Ok(true) => linked_watcher_ids.push(watcher_id.trim().to_string()),
                 Ok(false) => {}
                 Err(error) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error }),
-                    )
-                        .into_response()
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
                 }
             }
         }
@@ -12906,7 +15479,12 @@ async fn create_background_session(
             .await;
         let _ = agent
             .background_sessions
-            .attach_items(&session.id, &linked_task_ids, &linked_watcher_ids, Some("api"))
+            .attach_items(
+                &session.id,
+                &linked_task_ids,
+                &linked_watcher_ids,
+                Some("api"),
+            )
             .await;
     }
 
@@ -12921,10 +15499,7 @@ async fn create_background_session(
         .into_response()
 }
 
-async fn get_background_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn get_background_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let tasks = { state.tasks.read().await.all().to_vec() };
     let (session, watchers, runs) = {
         let agent = state.agent.read().await;
@@ -12948,7 +15523,8 @@ async fn get_background_session(
 
     let counts = collect_background_session_counts(&session.id, &session, &tasks, &watchers);
     let linked_task_id_set: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
-    let linked_watcher_id_set: HashSet<String> = session.linked_watcher_ids.iter().cloned().collect();
+    let linked_watcher_id_set: HashSet<String> =
+        session.linked_watcher_ids.iter().cloned().collect();
 
     let linked_tasks: Vec<_> = tasks
         .iter()
@@ -13066,11 +15642,7 @@ async fn update_background_session(
     let status = match parse_background_session_status(request.status.as_deref()) {
         Ok(status) => status,
         Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error }),
-            )
-                .into_response()
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
         }
     };
 
@@ -13138,11 +15710,7 @@ async fn attach_background_session_work(
             Ok(true) => linked_task_ids.push(task_id.trim().to_string()),
             Ok(false) => {}
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
             }
         }
     }
@@ -13151,11 +15719,7 @@ async fn attach_background_session_work(
             Ok(true) => linked_watcher_ids.push(watcher_id.trim().to_string()),
             Ok(false) => {}
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
             }
         }
     }
@@ -13221,11 +15785,7 @@ async fn detach_background_session_work(
             Ok(true) => detached_task_ids.push(task_id.trim().to_string()),
             Ok(false) => {}
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
             }
         }
     }
@@ -13234,11 +15794,7 @@ async fn detach_background_session_work(
             Ok(true) => detached_watcher_ids.push(watcher_id.trim().to_string()),
             Ok(false) => {}
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse { error }),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
             }
         }
     }
@@ -14701,6 +17257,7 @@ async fn resume_task(State(state): State<AppState>, Path(id): Path<String>) -> R
 
 async fn resume_chat_task_stream(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     Path(id): Path<String>,
 ) -> Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
@@ -14776,11 +17333,12 @@ async fn resume_chat_task_stream(
             conversation_id: Some(resume_request.conversation_id),
             project_id: resume_request.project_id,
             deep_research: resume_request.deep_research,
-            task_mode: ChatStreamTaskMode::Existing(StreamedChatTask {
+            caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
+            task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
                 task: resumed_task,
                 work_type: resume_request.work_type,
                 user_message_already_recorded: true,
-            }),
+            })),
         },
     )
 }
@@ -14886,8 +17444,6 @@ async fn plan_task(
     State(state): State<AppState>,
     Json(request): Json<PlanTaskRequest>,
 ) -> Response {
-    const MAX_ACTIONS_FOR_PLAN: usize = 8;
-
     let (llm, actions) = {
         let agent = state.agent.read().await;
         let actions = match agent.runtime.list_actions().await {
@@ -14905,44 +17461,14 @@ async fn plan_task(
         (agent.llm.clone(), actions)
     };
 
-    let light_catalog = actions
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "description": s.description,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let selector_prompt = r#"You are a task planner for an AI agent.
-Return ONLY valid JSON. Do not include any extra text.
-
-Output schema:
-{
-  "summary": "short summary",
-  "needed_actions": ["action_name", "action_name"]
-}
-
-Rules:
-- Use only the provided actions.
-- Keep the list minimal (only what is necessary).
-"#;
-
-    let mut selector_message = format!(
-        "Task description: {}\n\nAvailable actions (names + descriptions):\n{}",
-        request.description,
-        serde_json::to_string_pretty(&light_catalog).unwrap_or_default()
+    let (selector_prompt, selector_message) = crate::core::planner::build_action_selector_prompt(
+        &request.description,
+        request.prompt.as_deref(),
+        &actions,
     );
-    if let Some(prompt) = request.prompt.as_ref() {
-        if !prompt.trim().is_empty() {
-            selector_message.push_str("\n\nRefinement request:\n");
-            selector_message.push_str(prompt);
-        }
-    }
 
     let selector_response = match llm
-        .chat(selector_prompt, &selector_message, &[], &actions)
+        .chat(&selector_prompt, &selector_message, &[], &actions)
         .await
     {
         Ok(r) => r,
@@ -14957,90 +17483,27 @@ Rules:
         }
     };
 
-    let selector_json = extract_json(&selector_response.content).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Planner returned invalid JSON for action selection".to_string(),
-            }),
-        )
-            .into_response()
-    });
-
-    let selector_json = match selector_json {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    let needed_action_names: Vec<String> = selector_json
-        .get("needed_actions")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let mut needed_actions = actions
-        .iter()
-        .filter(|s| needed_action_names.iter().any(|n| n == &s.name))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if needed_actions.is_empty() {
-        needed_actions = actions.iter().take(MAX_ACTIONS_FOR_PLAN).cloned().collect();
-    } else if needed_actions.len() > MAX_ACTIONS_FOR_PLAN {
-        needed_actions.truncate(MAX_ACTIONS_FOR_PLAN);
-    }
-
-    let detailed_catalog = needed_actions
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "description": s.description,
-                "input_schema": s.input_schema,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let plan_prompt = r#"You are a task planner for an AI agent.
-Return ONLY valid JSON. Do not include any extra text.
-
-Output schema:
-{
-  "summary": "short summary",
-  "steps": [
-    {
-      "action": "action_name",
-      "arguments": { "key": "value" },
-      "rationale": "why this step is needed"
-    }
-  ],
-  "notes": "optional"
-}
-
-Rules:
-- Use only the provided actions.
-- Provide JSON that is directly runnable.
-- Keep steps minimal and ordered.
-"#;
-
-    let mut plan_message = format!(
-        "Task description: {}\n\nAvailable actions (with schemas):\n{}",
-        request.description,
-        serde_json::to_string_pretty(&detailed_catalog).unwrap_or_default()
+    let needed_action_names = crate::core::planner::parse_action_selection(
+        &selector_response.content,
+        &actions,
+        crate::core::planner::DEFAULT_MAX_ACTIONS_FOR_PLAN,
     );
-    if let Some(prompt) = request.prompt.as_ref() {
-        if !prompt.trim().is_empty() {
-            plan_message.push_str("\n\nRefinement request:\n");
-            plan_message.push_str(prompt);
-        }
-    }
+    let needed_actions = crate::core::planner::shortlist_actions(
+        &actions,
+        &needed_action_names,
+        crate::core::planner::DEFAULT_MAX_ACTIONS_FOR_PLAN,
+    );
+
+    let (plan_prompt, plan_message) = crate::core::planner::build_plan_prompt(
+        &request.description,
+        request.prompt.as_deref(),
+        &needed_actions,
+        crate::core::PlanPromptMode::TaskAutomation,
+        None,
+    );
 
     let plan_response = match llm
-        .chat(plan_prompt, &plan_message, &[], &needed_actions)
+        .chat(&plan_prompt, &plan_message, &[], &needed_actions)
         .await
     {
         Ok(r) => r,
@@ -15055,9 +17518,13 @@ Rules:
         }
     };
 
-    let plan = extract_json(&plan_response.content);
-
-    match plan {
+    match crate::core::planner::parse_plan_from_llm_content(
+        &plan_response.content,
+        &needed_actions,
+        None,
+        1,
+        false,
+    ) {
         Some(plan) => (StatusCode::OK, Json(PlanTaskResponse { plan })).into_response(),
         None => (
             StatusCode::BAD_REQUEST,
@@ -15115,6 +17582,10 @@ fn recommendation(
     }
 }
 
+fn autonomy_background_disabled(settings: &AutonomySettings) -> bool {
+    settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
+}
+
 async fn apply_autopilot_mode(
     agent: &Agent,
     settings: &mut AutonomySettings,
@@ -15131,13 +17602,31 @@ async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) -> serde_json
         });
     };
 
-    let (storage, encrypted_storage) = {
+    let (storage, encrypted_storage, autonomy_disabled) = {
         let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.encrypted_storage.clone())
+        let settings = load_autonomy_settings(&agent).await;
+        (
+            agent.storage.clone(),
+            agent.encrypted_storage.clone(),
+            autonomy_background_disabled(&settings),
+        )
     };
     let now = chrono::Utc::now();
     let now_rfc3339 = now.to_rfc3339();
     let mut scan_state = load_chat_suggestion_scan_state(&storage).await;
+
+    if autonomy_disabled {
+        scan_state.last_completed_at = Some(now_rfc3339.clone());
+        scan_state.last_status = Some("disabled".to_string());
+        scan_state.last_error = None;
+        scan_state.next_due_at = None;
+        scan_state.defer_count = 0;
+        save_chat_suggestion_scan_state(&storage, &scan_state).await;
+        return serde_json::json!({
+            "status": "disabled",
+            "message": "Autonomy is disabled.",
+        });
+    }
 
     if trigger != "manual" && !chat_suggestion_scan_is_due(&scan_state, now) {
         return serde_json::json!({
@@ -15572,6 +18061,10 @@ async fn build_autonomy_briefing(
     let mut suggestion_scan = load_chat_suggestion_scan_state(&agent.storage).await;
     suggestion_scan.tracked_chats = suggestion_scan.conversation_watermarks.len();
     suggestion_scan.conversation_watermarks.clear();
+    if autonomy_background_disabled(settings) {
+        suggestion_scan.last_status = Some("disabled".to_string());
+        suggestion_scan.next_due_at = None;
+    }
 
     let (
         pending_tasks,
@@ -15917,7 +18410,14 @@ async fn start_codex_cli_oauth() -> Response {
 }
 
 async fn codex_cli_oauth_status() -> Response {
-    let has_api_key = read_codex_cli_api_key()
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let has_api_key = resolve_codex_cli_api_key(&client, false)
+        .await
+        .ok()
+        .flatten()
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
     let runtime = codex_oauth_runtime();
@@ -15968,6 +18468,8 @@ struct SecretsVaultUpsertRequest {
     value: String,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16126,6 +18628,24 @@ fn collect_settings_secret_entries(
         push_settings_secret_entry(
             &mut entries,
             "whatsapp_access_token".to_string(),
+            value,
+            "whatsapp",
+            false,
+        );
+    }
+    if let Some(value) = secrets.whatsapp_app_secret.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "whatsapp_app_secret".to_string(),
+            value,
+            "whatsapp",
+            false,
+        );
+    }
+    if let Some(value) = secrets.whatsapp_bridge_token.as_deref() {
+        push_settings_secret_entry(
+            &mut entries,
+            "whatsapp_bridge_token".to_string(),
             value,
             "whatsapp",
             false,
@@ -16384,12 +18904,25 @@ async fn upsert_settings_secret(
             .into_response();
     }
 
+    let followup = if let Some(conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let agent = state.agent.read().await;
+        agent.on_secret_saved_followup(conversation_id).await
+    } else {
+        None
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
             "key": key,
             "masked": mask_secret_value(value),
+            "followup": followup,
         })),
     )
         .into_response()
@@ -16596,6 +19129,25 @@ async fn load_evolution_canary_state(
         .ok()
 }
 
+async fn load_prompt_evolution_canary_state(
+    storage: &crate::storage::Storage,
+) -> Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> {
+    load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await
+}
+
+async fn load_canary_state_by_key(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> {
+    let raw = storage.get(key).await.ok().flatten()?;
+    serde_json::from_slice::<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>(&raw)
+        .ok()
+}
+
 async fn load_last_self_evolve_result(
     storage: &crate::storage::Storage,
 ) -> Option<serde_json::Value> {
@@ -16605,6 +19157,58 @@ async fn load_last_self_evolve_result(
         .ok()
         .flatten()?;
     serde_json::from_slice::<serde_json::Value>(&raw).ok()
+}
+
+async fn load_json_value_by_key(
+    storage: &crate::storage::Storage,
+    key: &str,
+) -> Option<serde_json::Value> {
+    let raw = storage.get(key).await.ok().flatten()?;
+    serde_json::from_slice::<serde_json::Value>(&raw).ok()
+}
+
+async fn load_live_prompt_replay_evaluation(
+    storage: &crate::storage::Storage,
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
+    let state = prompt_canary_state.filter(|state| state.enabled)?;
+    let runs = storage
+        .list_recent_experience_runs_any_scope(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+        .await
+        .ok()?;
+    Some(
+        crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_prompt_version(
+            &runs,
+            &state.baseline_version,
+            &state.candidate_version,
+            state.min_samples_per_version,
+            state.min_success_gain,
+            state.max_sign_test_p_value,
+        ),
+    )
+}
+
+async fn load_live_metadata_prompt_replay_evaluation(
+    storage: &crate::storage::Storage,
+    canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+    metadata_key: &str,
+) -> Option<crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult> {
+    let state = canary_state.filter(|state| state.enabled)?;
+    let runs = storage
+        .list_recent_experience_runs_any_scope(PROMPT_REPLAY_EVAL_SAMPLE_LIMIT)
+        .await
+        .ok()?;
+    Some(
+        crate::core::self_evolve::strategy_runtime::evaluate_experience_canary_by_metadata_version(
+            &runs,
+            metadata_key,
+            &state.baseline_version,
+            &state.candidate_version,
+            state.min_samples_per_version,
+            state.min_success_gain,
+            state.max_sign_test_p_value,
+        ),
+    )
 }
 
 async fn load_deploy_guard_default(storage: &crate::storage::Storage) -> bool {
@@ -16830,6 +19434,8 @@ fn build_experience_run_summary(run: &crate::storage::experience_run::Model) -> 
         "strategy_version": run.strategy_version,
         "policy_version": run.policy_version,
         "prompt_version": run.prompt_version,
+        "classifier_prompt_version": crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(run, "classifier_prompt_version"),
+        "specialist_prompt_version": crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(run, "specialist_prompt_version"),
         "model_slot": run.model_slot,
         "consolidated": run.consolidated,
         "accepted_at": run.accepted_at,
@@ -16845,6 +19451,32 @@ async fn build_evolution_settings_response(
 ) -> EvolutionSettingsResponse {
     let canary_state = load_evolution_canary_state(storage).await;
     let last_result = load_last_self_evolve_result(storage).await;
+    let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
+    let classifier_prompt_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
+    let specialist_prompt_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
+    let prompt_last_result = load_json_value_by_key(
+        storage,
+        crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
+    )
+    .await;
+    let classifier_prompt_last_result = load_json_value_by_key(
+        storage,
+        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
+    )
+    .await;
+    let specialist_prompt_last_result = load_json_value_by_key(
+        storage,
+        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+    )
+    .await;
 
     let canary = if let Some(state) = canary_state.as_ref() {
         EvolutionCanarySummary {
@@ -16861,9 +19493,80 @@ async fn build_evolution_settings_response(
             candidate_version: "-".to_string(),
         }
     };
+    let prompt_canary = if let Some(state) = prompt_canary_state.as_ref() {
+        EvolutionCanarySummary {
+            enabled: state.enabled,
+            rollout_percent: state.rollout_percent,
+            baseline_version: state.baseline_version.clone(),
+            candidate_version: state.candidate_version.clone(),
+        }
+    } else {
+        EvolutionCanarySummary {
+            enabled: false,
+            rollout_percent: 0,
+            baseline_version: crate::core::self_evolve::prompt_evolution::compose_prompt_version(
+                "prompt-bundle-default-v1",
+            ),
+            candidate_version: "-".to_string(),
+        }
+    };
+    let classifier_prompt_canary = if let Some(state) = classifier_prompt_canary_state.as_ref() {
+        EvolutionCanarySummary {
+            enabled: state.enabled,
+            rollout_percent: state.rollout_percent,
+            baseline_version: state.baseline_version.clone(),
+            candidate_version: state.candidate_version.clone(),
+        }
+    } else {
+        EvolutionCanarySummary {
+            enabled: false,
+            rollout_percent: 0,
+            baseline_version:
+                crate::core::self_evolve::classifier_prompt_evolution::compose_classifier_prompt_version(
+                    "classifier-prompt-bundle-default-v1",
+                ),
+            candidate_version: "-".to_string(),
+        }
+    };
+    let specialist_prompt_canary = if let Some(state) = specialist_prompt_canary_state.as_ref() {
+        EvolutionCanarySummary {
+            enabled: state.enabled,
+            rollout_percent: state.rollout_percent,
+            baseline_version: state.baseline_version.clone(),
+            candidate_version: state.candidate_version.clone(),
+        }
+    } else {
+        EvolutionCanarySummary {
+            enabled: false,
+            rollout_percent: 0,
+            baseline_version:
+                crate::core::self_evolve::specialist_prompt_evolution::compose_specialist_prompt_version(
+                    "specialist-prompt-bundle-default-v1",
+                ),
+            candidate_version: "-".to_string(),
+        }
+    };
 
     let mut replay_gate_result: Option<String> = None;
     let mut promotion_mode = if canary.enabled {
+        "canary".to_string()
+    } else {
+        "none".to_string()
+    };
+    let mut prompt_replay_gate_result: Option<String> = None;
+    let mut prompt_promotion_mode = if prompt_canary.enabled {
+        "canary".to_string()
+    } else {
+        "none".to_string()
+    };
+    let mut classifier_prompt_replay_gate_result: Option<String> = None;
+    let mut classifier_prompt_promotion_mode = if classifier_prompt_canary.enabled {
+        "canary".to_string()
+    } else {
+        "none".to_string()
+    };
+    let mut specialist_prompt_replay_gate_result: Option<String> = None;
+    let mut specialist_prompt_promotion_mode = if specialist_prompt_canary.enabled {
         "canary".to_string()
     } else {
         "none".to_string()
@@ -16904,6 +19607,165 @@ async fn build_evolution_settings_response(
     } else {
         "No evolution runs yet".to_string()
     };
+    let prompt_last_promotion_result =
+        if let Some(obj) = prompt_last_result.as_ref().and_then(|v| v.as_object()) {
+            if let Some(mode) = obj.get("promotion_mode").and_then(|v| v.as_str()) {
+                if !mode.trim().is_empty() {
+                    prompt_promotion_mode = mode.to_string();
+                }
+            }
+            if let Some(replay) = obj.get("replay_evaluation").and_then(|v| v.as_object()) {
+                if replay
+                    .get("promote")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    prompt_replay_gate_result = Some("passed".to_string());
+                } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
+                    prompt_replay_gate_result = Some(reason.to_string());
+                }
+            }
+            let promoted = obj
+                .get("promoted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let gate = obj
+                .get("promotion_gate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if prompt_promotion_mode == "baseline" {
+                "Promoted candidate prompt bundle".to_string()
+            } else if prompt_promotion_mode == "canary" {
+                "Activated candidate prompt bundle in canary".to_string()
+            } else if promoted {
+                "Candidate prompt bundle passed offline benchmark gate".to_string()
+            } else if !gate.trim().is_empty() {
+                format!("Not promoted ({})", gate)
+            } else {
+                "Prompt evolution completed".to_string()
+            }
+        } else {
+            "No prompt evolution runs yet".to_string()
+        };
+    let classifier_prompt_last_promotion_result = if let Some(obj) = classifier_prompt_last_result
+        .as_ref()
+        .and_then(|v| v.as_object())
+    {
+        if let Some(mode) = obj.get("promotion_mode").and_then(|v| v.as_str()) {
+            if !mode.trim().is_empty() {
+                classifier_prompt_promotion_mode = mode.to_string();
+            }
+        }
+        if let Some(replay) = obj.get("replay_evaluation").and_then(|v| v.as_object()) {
+            if replay
+                .get("promote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                classifier_prompt_replay_gate_result = Some("passed".to_string());
+            } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
+                classifier_prompt_replay_gate_result = Some(reason.to_string());
+            }
+        }
+        let promoted = obj
+            .get("promoted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let gate = obj
+            .get("promotion_gate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if classifier_prompt_promotion_mode == "baseline" {
+            "Promoted candidate classifier prompt bundle".to_string()
+        } else if classifier_prompt_promotion_mode == "canary" {
+            "Activated candidate classifier prompt bundle in canary".to_string()
+        } else if promoted {
+            "Candidate classifier prompt bundle passed offline benchmark gate".to_string()
+        } else if !gate.trim().is_empty() {
+            format!("Not promoted ({})", gate)
+        } else {
+            "Classifier prompt evolution completed".to_string()
+        }
+    } else {
+        "No classifier prompt evolution runs yet".to_string()
+    };
+    let specialist_prompt_last_promotion_result = if let Some(obj) = specialist_prompt_last_result
+        .as_ref()
+        .and_then(|v| v.as_object())
+    {
+        if let Some(mode) = obj.get("promotion_mode").and_then(|v| v.as_str()) {
+            if !mode.trim().is_empty() {
+                specialist_prompt_promotion_mode = mode.to_string();
+            }
+        }
+        if let Some(replay) = obj.get("replay_evaluation").and_then(|v| v.as_object()) {
+            if replay
+                .get("promote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                specialist_prompt_replay_gate_result = Some("passed".to_string());
+            } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
+                specialist_prompt_replay_gate_result = Some(reason.to_string());
+            }
+        }
+        let promoted = obj
+            .get("promoted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let gate = obj
+            .get("promotion_gate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if specialist_prompt_promotion_mode == "baseline" {
+            "Promoted candidate specialist prompt bundle".to_string()
+        } else if specialist_prompt_promotion_mode == "canary" {
+            "Activated candidate specialist prompt bundle in canary".to_string()
+        } else if promoted {
+            "Candidate specialist prompt bundle passed offline benchmark gate".to_string()
+        } else if !gate.trim().is_empty() {
+            format!("Not promoted ({})", gate)
+        } else {
+            "Specialist prompt evolution completed".to_string()
+        }
+    } else {
+        "No specialist prompt evolution runs yet".to_string()
+    };
+    if let Some(replay_eval) =
+        load_live_prompt_replay_evaluation(storage, prompt_canary_state.as_ref()).await
+    {
+        prompt_replay_gate_result = Some(if replay_eval.promote {
+            "passed".to_string()
+        } else {
+            replay_eval.reason
+        });
+    }
+    if let Some(replay_eval) = load_live_metadata_prompt_replay_evaluation(
+        storage,
+        classifier_prompt_canary_state.as_ref(),
+        "classifier_prompt_version",
+    )
+    .await
+    {
+        classifier_prompt_replay_gate_result = Some(if replay_eval.promote {
+            "passed".to_string()
+        } else {
+            replay_eval.reason
+        });
+    }
+    if let Some(replay_eval) = load_live_metadata_prompt_replay_evaluation(
+        storage,
+        specialist_prompt_canary_state.as_ref(),
+        "specialist_prompt_version",
+    )
+    .await
+    {
+        specialist_prompt_replay_gate_result = Some(if replay_eval.promote {
+            "passed".to_string()
+        } else {
+            replay_eval.reason
+        });
+    }
 
     let self_evolve_enabled = storage
         .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
@@ -16923,23 +19785,32 @@ async fn build_evolution_settings_response(
         learning_queue_cap: load_learning_queue_cap(storage).await,
         learning_queue,
         canary,
+        prompt_canary,
+        classifier_prompt_canary,
+        specialist_prompt_canary,
         last_promotion_result,
         replay_gate_result,
         promotion_mode,
+        prompt_last_promotion_result,
+        prompt_replay_gate_result,
+        prompt_promotion_mode,
+        classifier_prompt_last_promotion_result,
+        classifier_prompt_replay_gate_result,
+        classifier_prompt_promotion_mode,
+        specialist_prompt_last_promotion_result,
+        specialist_prompt_replay_gate_result,
+        specialist_prompt_promotion_mode,
         deploy_guard_default: load_deploy_guard_default(storage).await,
     }
 }
 
 fn aggregate_version_metrics(
-    logs: &[crate::storage::entities::operational_log::Model],
-    selector: impl Fn(&crate::storage::entities::operational_log::Model) -> Option<&str>,
+    logs: &[crate::storage::OperationalLogVersionMetricRow],
+    selector: impl Fn(&crate::storage::OperationalLogVersionMetricRow) -> Option<&str>,
 ) -> Vec<EvolutionVersionMetric> {
-    let mut buckets: HashMap<String, Vec<&crate::storage::entities::operational_log::Model>> =
+    let mut buckets: HashMap<String, Vec<&crate::storage::OperationalLogVersionMetricRow>> =
         HashMap::new();
     for row in logs {
-        if row.event_type != "tool_call" {
-            continue;
-        }
         let Some(version) = selector(row).map(|v| v.trim()).filter(|v| !v.is_empty()) else {
             continue;
         };
@@ -16971,8 +19842,17 @@ fn aggregate_version_metrics(
     out
 }
 
-async fn read_recent_lineage(limit: usize) -> Vec<serde_json::Value> {
-    let path = resolve_project_root().join(ROUTING_POLICY_LINEAGE_REL_PATH);
+fn parse_operational_payload(
+    row: &crate::storage::entities::operational_log::Model,
+) -> serde_json::Value {
+    row.payload
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+async fn read_recent_jsonl(path_rel: &str, limit: usize) -> Vec<serde_json::Value> {
+    let path = resolve_project_root().join(path_rel);
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(content) => content,
         Err(_) => return Vec::new(),
@@ -16992,16 +19872,466 @@ async fn read_recent_lineage(limit: usize) -> Vec<serde_json::Value> {
     parsed.split_off(parsed.len().saturating_sub(limit))
 }
 
+async fn read_recent_lineage(limit: usize) -> Vec<serde_json::Value> {
+    read_recent_jsonl(ROUTING_POLICY_LINEAGE_REL_PATH, limit).await
+}
+
+async fn read_recent_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
+    read_recent_jsonl(PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
+}
+
+async fn read_recent_classifier_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
+    read_recent_jsonl(CLASSIFIER_PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
+}
+
+async fn read_recent_specialist_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
+    read_recent_jsonl(SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
+}
+
+fn experience_run_resolved_for_prompt_metrics(
+    row: &crate::storage::entities::experience_run::Model,
+) -> bool {
+    row.correction_state == "corrected"
+        || row.success_state == "accepted"
+        || row.success_state == "failed"
+}
+
+fn experience_run_success_for_prompt_metrics(
+    row: &crate::storage::entities::experience_run::Model,
+) -> bool {
+    row.correction_state != "corrected" && row.success_state == "accepted"
+}
+
+fn operational_payload_string(
+    row: &crate::storage::entities::operational_log::Model,
+    key: &str,
+) -> Option<String> {
+    row.payload
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|payload| {
+            payload
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn aggregate_bundle_metrics_by_selectors(
+    experience_runs: &[crate::storage::experience_run::Model],
+    tool_logs: &[crate::storage::entities::operational_log::Model],
+    routing_logs: &[crate::storage::entities::operational_log::Model],
+    llm_logs: &[crate::storage::entities::operational_log::Model],
+    experience_version: impl Fn(&crate::storage::experience_run::Model) -> Option<String>,
+    operational_version: impl Fn(&crate::storage::entities::operational_log::Model) -> Option<String>,
+) -> Vec<PromptEvolutionMetric> {
+    let mut versions = std::collections::BTreeSet::new();
+    for run in experience_runs {
+        if let Some(version) = experience_version(run) {
+            versions.insert(version);
+        }
+    }
+    for row in tool_logs {
+        if let Some(version) = operational_version(row) {
+            versions.insert(version);
+        }
+    }
+    for row in routing_logs {
+        if let Some(version) = operational_version(row) {
+            versions.insert(version);
+        }
+    }
+    for row in llm_logs {
+        if let Some(version) = operational_version(row) {
+            versions.insert(version);
+        }
+    }
+
+    let mut out = Vec::new();
+    for version in versions {
+        let experience_rows = experience_runs
+            .iter()
+            .filter(|run| experience_version(run).as_deref() == Some(version.as_str()))
+            .collect::<Vec<_>>();
+        let resolved_experience_rows = experience_rows
+            .iter()
+            .copied()
+            .filter(|run| experience_run_resolved_for_prompt_metrics(run))
+            .collect::<Vec<_>>();
+        let tool_rows = tool_logs
+            .iter()
+            .filter(|row| operational_version(row).as_deref() == Some(version.as_str()))
+            .collect::<Vec<_>>();
+        let routing_rows = routing_logs
+            .iter()
+            .filter(|row| operational_version(row).as_deref() == Some(version.as_str()))
+            .collect::<Vec<_>>();
+        let llm_rows = llm_logs
+            .iter()
+            .filter(|row| operational_version(row).as_deref() == Some(version.as_str()))
+            .collect::<Vec<_>>();
+
+        let samples = resolved_experience_rows.len();
+        let successes = resolved_experience_rows
+            .iter()
+            .filter(|run| experience_run_success_for_prompt_metrics(run))
+            .count();
+        let errors = samples.saturating_sub(successes);
+        let latencies = tool_rows
+            .iter()
+            .filter_map(|row| row.latency_ms)
+            .collect::<Vec<_>>();
+        let routing_decisions = routing_rows.len();
+        let delegation_count = routing_rows
+            .iter()
+            .filter(|row| {
+                parse_operational_payload(row)
+                    .get("needs_delegation")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
+            .count();
+        let clarification_count = routing_rows
+            .iter()
+            .filter(|row| {
+                parse_operational_payload(row)
+                    .get("should_clarify")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
+            .count();
+        let tool_calls_per_request = {
+            let total_tool_calls = llm_rows
+                .iter()
+                .map(|row| {
+                    parse_operational_payload(row)
+                        .get("tool_calls")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+            if llm_rows.is_empty() {
+                0.0
+            } else {
+                total_tool_calls as f64 / llm_rows.len() as f64
+            }
+        };
+        let tool_success_rate = if tool_rows.is_empty() {
+            0.0
+        } else {
+            round4(
+                tool_rows.iter().filter(|row| row.success).count() as f64 / tool_rows.len() as f64,
+            )
+        };
+
+        out.push(PromptEvolutionMetric {
+            version,
+            samples,
+            success_rate: if samples == 0 {
+                0.0
+            } else {
+                round4(successes as f64 / samples as f64)
+            },
+            error_rate: if samples == 0 {
+                0.0
+            } else {
+                round4(errors as f64 / samples as f64)
+            },
+            p95_latency_ms: compute_p95(latencies),
+            routing_decisions,
+            delegation_rate: if routing_decisions == 0 {
+                0.0
+            } else {
+                round4(delegation_count as f64 / routing_decisions as f64)
+            },
+            clarification_rate: if routing_decisions == 0 {
+                0.0
+            } else {
+                round4(clarification_count as f64 / routing_decisions as f64)
+            },
+            avg_tool_calls_per_request: round4(tool_calls_per_request),
+            tool_success_rate,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.samples
+            .cmp(&a.samples)
+            .then_with(|| a.version.cmp(&b.version))
+    });
+    out
+}
+
+fn aggregate_prompt_metrics(
+    experience_runs: &[crate::storage::experience_run::Model],
+    tool_logs: &[crate::storage::entities::operational_log::Model],
+    routing_logs: &[crate::storage::entities::operational_log::Model],
+    llm_logs: &[crate::storage::entities::operational_log::Model],
+) -> Vec<PromptEvolutionMetric> {
+    aggregate_bundle_metrics_by_selectors(
+        experience_runs,
+        tool_logs,
+        routing_logs,
+        llm_logs,
+        |run| {
+            run.prompt_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        },
+        |row| {
+            row.prompt_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        },
+    )
+}
+
+fn build_prompt_insights(
+    prompt_metrics: &[PromptEvolutionMetric],
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) -> PromptEvolutionInsights {
+    let Some(canary_state) = prompt_canary_state else {
+        return PromptEvolutionInsights::default();
+    };
+    let baseline = prompt_metrics
+        .iter()
+        .find(|metric| metric.version == canary_state.baseline_version);
+    let candidate = prompt_metrics
+        .iter()
+        .find(|metric| metric.version == canary_state.candidate_version);
+
+    let mut regressions = Vec::new();
+    let mut summary = Vec::new();
+    let experience_success_uplift = match (baseline, candidate) {
+        (Some(base), Some(cand)) => cand.success_rate - base.success_rate,
+        _ => 0.0,
+    };
+    let delegation_avoided = match (baseline, candidate) {
+        (Some(base), Some(cand)) => {
+            (base.delegation_rate - cand.delegation_rate) * cand.routing_decisions as f64
+        }
+        _ => 0.0,
+    };
+    let clarification_avoided = match (baseline, candidate) {
+        (Some(base), Some(cand)) => {
+            (base.clarification_rate - cand.clarification_rate) * cand.routing_decisions as f64
+        }
+        _ => 0.0,
+    };
+    let successful_direct_resolution_uplift = match (baseline, candidate) {
+        (Some(base), Some(cand)) => {
+            ((1.0 - cand.delegation_rate) * cand.tool_success_rate)
+                - ((1.0 - base.delegation_rate) * base.tool_success_rate)
+        }
+        _ => 0.0,
+    };
+    let tool_success_uplift = match (baseline, candidate) {
+        (Some(base), Some(cand)) => cand.tool_success_rate - base.tool_success_rate,
+        _ => 0.0,
+    };
+    let latency_savings_p95_ms = match (
+        baseline.and_then(|m| m.p95_latency_ms),
+        candidate.and_then(|m| m.p95_latency_ms),
+    ) {
+        (Some(base), Some(cand)) => Some(base - cand),
+        _ => None,
+    };
+    let failed_delegation_reduction = match (baseline, candidate) {
+        (Some(base), Some(cand)) => {
+            (base.delegation_rate * base.error_rate) - (cand.delegation_rate * cand.error_rate)
+        }
+        _ => 0.0,
+    };
+
+    if experience_success_uplift > 0.0 {
+        summary.push(format!(
+            "End-to-end experience success improved by {:.1} points.",
+            experience_success_uplift * 100.0
+        ));
+    } else if experience_success_uplift < 0.0 {
+        regressions.push(format!(
+            "End-to-end experience success is down {:.1} points.",
+            experience_success_uplift.abs() * 100.0
+        ));
+    }
+    if delegation_avoided > 0.0 {
+        summary.push(format!(
+            "Saved an estimated {:.1} delegated runs versus baseline.",
+            delegation_avoided
+        ));
+    }
+    if clarification_avoided > 0.0 {
+        summary.push(format!(
+            "Avoided an estimated {:.1} clarification turns.",
+            clarification_avoided
+        ));
+    }
+    if tool_success_uplift > 0.0 {
+        summary.push(format!(
+            "Improved tool success by {:.1} points.",
+            tool_success_uplift * 100.0
+        ));
+    } else if tool_success_uplift < 0.0 {
+        regressions.push(format!(
+            "Tool success is down {:.1} points.",
+            tool_success_uplift.abs() * 100.0
+        ));
+    }
+    if successful_direct_resolution_uplift > 0.0 {
+        summary.push(format!(
+            "Direct resolution uplift is {:.1} points.",
+            successful_direct_resolution_uplift * 100.0
+        ));
+    }
+    if let Some(delta_ms) = latency_savings_p95_ms {
+        if delta_ms > 0 {
+            summary.push(format!("Reduced p95 latency by {} ms.", delta_ms));
+        } else if delta_ms < 0 {
+            regressions.push(format!("p95 latency regressed by {} ms.", delta_ms.abs()));
+        }
+    }
+    if failed_delegation_reduction > 0.0 {
+        summary.push(format!(
+            "Reduced estimated failed delegation rate by {:.1} points.",
+            failed_delegation_reduction * 100.0
+        ));
+    }
+
+    PromptEvolutionInsights {
+        baseline_version: Some(canary_state.baseline_version.clone()),
+        candidate_version: Some(canary_state.candidate_version.clone()),
+        rollout_percent: canary_state.rollout_percent,
+        delegation_avoided: round4(delegation_avoided),
+        clarification_avoided: round4(clarification_avoided),
+        successful_direct_resolution_uplift: round4(successful_direct_resolution_uplift),
+        tool_success_uplift: round4(tool_success_uplift),
+        latency_savings_p95_ms,
+        failed_delegation_reduction: round4(failed_delegation_reduction),
+        regressions,
+        summary,
+    }
+}
+
+fn build_specialist_prompt_insights(
+    prompt_metrics: &[PromptEvolutionMetric],
+    prompt_canary_state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) -> PromptEvolutionInsights {
+    let Some(canary_state) = prompt_canary_state else {
+        return PromptEvolutionInsights::default();
+    };
+    let baseline = prompt_metrics
+        .iter()
+        .find(|metric| metric.version == canary_state.baseline_version);
+    let candidate = prompt_metrics
+        .iter()
+        .find(|metric| metric.version == canary_state.candidate_version);
+
+    let mut regressions = Vec::new();
+    let mut summary = Vec::new();
+    let experience_success_uplift = match (baseline, candidate) {
+        (Some(base), Some(cand)) => cand.success_rate - base.success_rate,
+        _ => 0.0,
+    };
+    let tool_success_uplift = match (baseline, candidate) {
+        (Some(base), Some(cand)) => cand.tool_success_rate - base.tool_success_rate,
+        _ => 0.0,
+    };
+    let latency_savings_p95_ms = match (
+        baseline.and_then(|m| m.p95_latency_ms),
+        candidate.and_then(|m| m.p95_latency_ms),
+    ) {
+        (Some(base), Some(cand)) => Some(base - cand),
+        _ => None,
+    };
+    let error_rate_reduction = match (baseline, candidate) {
+        (Some(base), Some(cand)) => base.error_rate - cand.error_rate,
+        _ => 0.0,
+    };
+
+    if experience_success_uplift > 0.0 {
+        summary.push(format!(
+            "End-to-end experience success improved by {:.1} points.",
+            experience_success_uplift * 100.0
+        ));
+    } else if experience_success_uplift < 0.0 {
+        regressions.push(format!(
+            "End-to-end experience success is down {:.1} points.",
+            experience_success_uplift.abs() * 100.0
+        ));
+    }
+    if tool_success_uplift > 0.0 {
+        summary.push(format!(
+            "Improved tool success by {:.1} points.",
+            tool_success_uplift * 100.0
+        ));
+    } else if tool_success_uplift < 0.0 {
+        regressions.push(format!(
+            "Tool success is down {:.1} points.",
+            tool_success_uplift.abs() * 100.0
+        ));
+    }
+    if error_rate_reduction > 0.0 {
+        summary.push(format!(
+            "Resolved-run error rate improved by {:.1} points.",
+            error_rate_reduction * 100.0
+        ));
+    } else if error_rate_reduction < 0.0 {
+        regressions.push(format!(
+            "Resolved-run error rate regressed by {:.1} points.",
+            error_rate_reduction.abs() * 100.0
+        ));
+    }
+    if let Some(delta_ms) = latency_savings_p95_ms {
+        if delta_ms > 0 {
+            summary.push(format!("Reduced p95 latency by {} ms.", delta_ms));
+        } else if delta_ms < 0 {
+            regressions.push(format!("p95 latency regressed by {} ms.", delta_ms.abs()));
+        }
+    }
+
+    PromptEvolutionInsights {
+        baseline_version: Some(canary_state.baseline_version.clone()),
+        candidate_version: Some(canary_state.candidate_version.clone()),
+        rollout_percent: canary_state.rollout_percent,
+        delegation_avoided: 0.0,
+        clarification_avoided: 0.0,
+        successful_direct_resolution_uplift: 0.0,
+        tool_success_uplift: round4(tool_success_uplift),
+        latency_savings_p95_ms,
+        failed_delegation_reduction: 0.0,
+        regressions,
+        summary,
+    }
+}
+
 async fn build_evolution_dev_response(
     storage: &crate::storage::Storage,
     limit: u64,
 ) -> EvolutionDevResponse {
     let logs = storage
-        .list_operational_logs_by_event("tool_call", limit)
+        .list_operational_log_version_metrics_by_event("tool_call", limit)
         .await
         .unwrap_or_default();
     let policy_metrics = aggregate_version_metrics(&logs, |row| row.policy_version.as_deref());
     let strategy_metrics = aggregate_version_metrics(&logs, |row| row.strategy_version.as_deref());
+    let prompt_tool_logs = storage
+        .list_operational_logs_by_event("tool_call", limit)
+        .await
+        .unwrap_or_default();
+    let prompt_routing_logs = storage
+        .list_operational_logs_by_event("routing_decision", limit)
+        .await
+        .unwrap_or_default();
+    let prompt_llm_logs = storage
+        .list_operational_logs_by_event("llm_decision", limit)
+        .await
+        .unwrap_or_default();
     let learning_candidates = storage
         .list_learning_candidates(None, 24)
         .await
@@ -17029,9 +20359,100 @@ async fn build_evolution_dev_response(
         .map(|pattern| build_procedural_pattern_summary(&pattern))
         .collect::<Vec<_>>();
     let recent_experience_runs = storage
-        .list_recent_experience_runs(None, None, 24)
+        .list_recent_experience_runs_any_scope(limit.max(24))
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let prompt_metrics = aggregate_prompt_metrics(
+        &recent_experience_runs,
+        &prompt_tool_logs,
+        &prompt_routing_logs,
+        &prompt_llm_logs,
+    );
+    let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
+    let prompt_insights = build_prompt_insights(&prompt_metrics, prompt_canary_state.as_ref());
+    let classifier_prompt_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
+    let classifier_prompt_metrics = aggregate_bundle_metrics_by_selectors(
+        &recent_experience_runs,
+        &prompt_tool_logs,
+        &prompt_routing_logs,
+        &prompt_llm_logs,
+        |run| {
+            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
+                run,
+                "classifier_prompt_version",
+            )
+            .map(str::to_string)
+        },
+        |row| operational_payload_string(row, "classifier_prompt_version"),
+    );
+    let classifier_prompt_insights = build_prompt_insights(
+        &classifier_prompt_metrics,
+        classifier_prompt_canary_state.as_ref(),
+    );
+    let specialist_prompt_canary_state = load_canary_state_by_key(
+        storage,
+        crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+    )
+    .await;
+    let specialist_prompt_metrics = aggregate_bundle_metrics_by_selectors(
+        &recent_experience_runs,
+        &prompt_tool_logs,
+        &prompt_routing_logs,
+        &prompt_llm_logs,
+        |run| {
+            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
+                run,
+                "specialist_prompt_version",
+            )
+            .map(str::to_string)
+        },
+        |row| operational_payload_string(row, "specialist_prompt_version"),
+    );
+    let specialist_prompt_insights = build_specialist_prompt_insights(
+        &specialist_prompt_metrics,
+        specialist_prompt_canary_state.as_ref(),
+    );
+    let recent_prompt_runs = recent_experience_runs
+        .iter()
+        .filter(|run| {
+            run.prompt_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+        })
+        .take(24)
+        .map(build_experience_run_summary)
+        .collect::<Vec<_>>();
+    let recent_classifier_prompt_runs = recent_experience_runs
+        .iter()
+        .filter(|run| {
+            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
+                run,
+                "classifier_prompt_version",
+            )
+            .is_some()
+        })
+        .take(24)
+        .map(build_experience_run_summary)
+        .collect::<Vec<_>>();
+    let recent_specialist_prompt_runs = recent_experience_runs
+        .iter()
+        .filter(|run| {
+            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
+                run,
+                "specialist_prompt_version",
+            )
+            .is_some()
+        })
+        .take(24)
+        .map(build_experience_run_summary)
+        .collect::<Vec<_>>();
+    let recent_experience_runs = recent_experience_runs
         .into_iter()
         .map(|run| build_experience_run_summary(&run))
         .collect::<Vec<_>>();
@@ -17041,10 +20462,40 @@ async fn build_evolution_dev_response(
         lineage_recent: read_recent_lineage(40).await,
         policy_metrics,
         strategy_metrics,
+        prompt_canary_state,
+        prompt_last_result: load_json_value_by_key(
+            storage,
+            crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
+        )
+        .await,
+        prompt_lineage_recent: read_recent_prompt_lineage(40).await,
+        prompt_metrics,
+        prompt_insights,
+        classifier_prompt_canary_state,
+        classifier_prompt_last_result: load_json_value_by_key(
+            storage,
+            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
+        )
+        .await,
+        classifier_prompt_lineage_recent: read_recent_classifier_prompt_lineage(40).await,
+        classifier_prompt_metrics,
+        classifier_prompt_insights,
+        specialist_prompt_canary_state,
+        specialist_prompt_last_result: load_json_value_by_key(
+            storage,
+            crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+        )
+        .await,
+        specialist_prompt_lineage_recent: read_recent_specialist_prompt_lineage(40).await,
+        specialist_prompt_metrics,
+        specialist_prompt_insights,
         learning_queue: storage.learning_queue_counts().await.unwrap_or_default(),
         learning_candidates,
         learning_items,
         learning_patterns,
+        recent_prompt_runs,
+        recent_classifier_prompt_runs,
+        recent_specialist_prompt_runs,
         recent_experience_runs,
     }
 }
@@ -17247,6 +20698,182 @@ async fn persist_evolution_action_trace(
         total_tokens: 0,
         cost_usd: 0.0,
         complexity: Some("evolution".to_string()),
+        plan: None,
+    }));
+
+    let agent = state.agent.read().await;
+    agent.persist_completed_trace(&trace_ref).await;
+    Some(trace_id)
+}
+
+fn truncate_trace_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn summarize_autonomy_action_result(
+    action: &RecommendedAction,
+    result: &serde_json::Value,
+) -> String {
+    let status = result
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if status == "queued_for_approval" {
+        return format!("Queued '{}' for approval.", action.title.trim());
+    }
+
+    let kind = result
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or(action.action_kind.as_str())
+        .trim()
+        .to_ascii_lowercase();
+
+    match kind.as_str() {
+        "daily_brief_now" => "Generated a daily brief and attempted delivery.".to_string(),
+        "create_task" => {
+            let task_id = result
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if result
+                .get("reused_existing")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                if task_id.is_empty() {
+                    "Reused an existing task for this suggestion.".to_string()
+                } else {
+                    format!("Reused existing task {}.", task_id)
+                }
+            } else if task_id.is_empty() {
+                "Created a task from this suggestion.".to_string()
+            } else {
+                format!("Created task {}.", task_id)
+            }
+        }
+        "activate_mode" => {
+            let mode_name = result
+                .get("result")
+                .and_then(|value| value.get("mode_name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if mode_name.is_empty() {
+                format!("Activated '{}'.", action.title.trim())
+            } else {
+                format!("Activated mode '{}'.", mode_name)
+            }
+        }
+        "chat_prompt" => {
+            let response = result
+                .get("response")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if response.is_empty() {
+                format!("Ran '{}'.", action.title.trim())
+            } else {
+                truncate_trace_text(response, 220)
+            }
+        }
+        "delegate" => {
+            let final_result = result
+                .get("final_result")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
+            if final_result.is_empty() {
+                "Delegated the requested work.".to_string()
+            } else {
+                truncate_trace_text(final_result, 220)
+            }
+        }
+        _ => result
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_trace_text(value, 220))
+            .unwrap_or_else(|| format!("Ran '{}'.", action.title.trim())),
+    }
+}
+
+async fn persist_autonomy_action_trace(
+    state: &AppState,
+    action: &RecommendedAction,
+    status: &str,
+    summary: &str,
+    detail_payload: serde_json::Value,
+) -> Option<String> {
+    let started_at = chrono::Utc::now();
+    let trace_id = uuid::Uuid::new_v4().to_string();
+    let status_normalized = status.trim().to_ascii_lowercase();
+    let (step_type, icon, title) = if status_normalized == "error" {
+        ("error", "[err]", "Autonomy Action Failed")
+    } else if status_normalized == "queued_for_approval" {
+        ("warning", "[wait]", "Autonomy Action Queued")
+    } else {
+        ("success", "[ok]", "Autonomy Action Completed")
+    };
+    let detail_data = serde_json::to_string_pretty(&detail_payload)
+        .ok()
+        .map(|text| crate::security::redact_pii(&truncate_trace_text(&text, 12000)));
+    let request_data = serde_json::to_string_pretty(&serde_json::json!({
+        "trace_kind": "autonomy.action.request",
+        "action_id": action.id,
+        "title": action.title,
+        "kind": action.action_kind,
+        "payload": action.payload,
+    }))
+    .ok()
+    .map(|text| crate::security::redact_pii(&truncate_trace_text(&text, 12000)));
+
+    let trace_ref = Arc::new(RwLock::new(ExecutionTrace {
+        id: trace_id.clone(),
+        message: format!("Autonomy action: {}", action.title),
+        channel: "autonomy".to_string(),
+        started_at: Some(started_at),
+        completed_at: Some(started_at),
+        steps: vec![
+            crate::core::ExecutionStep {
+                icon: "[auto]".to_string(),
+                title: "Autonomy Action Requested".to_string(),
+                detail: format!("{} ({})", action.title.trim(), action.action_kind.trim()),
+                step_type: "info".to_string(),
+                data: request_data,
+                timestamp: started_at,
+                duration_ms: Some(0),
+            },
+            crate::core::ExecutionStep {
+                icon: icon.to_string(),
+                title: title.to_string(),
+                detail: summary.to_string(),
+                step_type: step_type.to_string(),
+                data: detail_data,
+                timestamp: started_at,
+                duration_ms: Some(0),
+            },
+        ],
+        proof_id: None,
+        response: Some(summary.to_string()),
+        model: Some("internal:autonomy".to_string()),
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0.0,
+        complexity: Some("autonomy".to_string()),
         plan: None,
     }));
 
@@ -17827,13 +21454,14 @@ async fn run_evolution_dev_action(
 
 /// Get current settings
 async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
-    let (config, storage, config_dir, data_dir) = {
+    let (config, storage, config_dir, data_dir, embedding_client) = {
         let agent = state.agent.read().await;
         (
             agent.config.clone(),
             agent.storage.clone(),
             agent.config_dir.clone(),
             agent.data_dir.clone(),
+            agent.embedding_client.clone(),
         )
     };
     let profile = state.user_profile.read().await;
@@ -17886,6 +21514,41 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         .await
         .ok()
         .and_then(|c| toml::from_str::<crate::actions::SearchConfig>(&c).ok());
+    let embeddings_cfg = config.embeddings_config();
+    let embeddings_provider = match embeddings_cfg.provider {
+        EmbeddingsProviderKind::LocalHf => "local-hf",
+        EmbeddingsProviderKind::Ollama => "ollama",
+        EmbeddingsProviderKind::OpenaiCompatible => "openai-compatible",
+    }
+    .to_string();
+    let embeddings_model = embeddings_cfg.model.clone();
+    let embeddings_base_url = embeddings_cfg.base_url.clone();
+    let embeddings_has_api_key =
+        !embeddings_cfg.api_key.is_empty() && embeddings_cfg.api_key != "[ENCRYPTED]";
+    let embeddings_status = if let Some(client) = embedding_client.as_ref() {
+        match client.health_check().await {
+            Ok(message) => message,
+            Err(error) => error.to_string(),
+        }
+    } else {
+        match embeddings_cfg.provider {
+            EmbeddingsProviderKind::LocalHf => format!(
+                "Local embeddings are configured for {} and will initialize on first use",
+                embeddings_model
+            ),
+            EmbeddingsProviderKind::Ollama => {
+                "No Ollama embeddings URL is configured yet.".to_string()
+            }
+            EmbeddingsProviderKind::OpenaiCompatible => {
+                if let Some(base_url) = embeddings_base_url.as_deref() {
+                    format!("External embeddings are configured at {}.", base_url)
+                } else {
+                    "External embeddings will use OpenAI's default /embeddings endpoint."
+                        .to_string()
+                }
+            }
+        }
+    };
 
     // Primary LLM - has_key is true if a real api_key is set (not the placeholder)
     let (provider, model, base_url, has_key) = match &config.llm {
@@ -17906,11 +21569,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             model,
             base_url,
         } => {
-            let provider = provider_label_for_openai(base_url);
-            let display_base_url = match base_url.as_deref() {
-                Some(url) if is_codex_cli_base_url(url) => None,
-                _ => base_url.clone(),
-            };
+            let provider = openai_provider_label(base_url.as_deref());
+            let display_base_url = display_openai_base_url(base_url.as_ref());
             (
                 provider.to_string(),
                 model.clone(),
@@ -17940,11 +21600,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                 model,
                 base_url,
             }) => {
-                let provider = provider_label_for_openai(base_url);
-                let display_base_url = match base_url.as_deref() {
-                    Some(url) if is_codex_cli_base_url(url) => None,
-                    _ => base_url.clone(),
-                };
+                let provider = openai_provider_label(base_url.as_deref());
+                let display_base_url = display_openai_base_url(base_url.as_ref());
                 (
                     Some(provider.to_string()),
                     Some(model.clone()),
@@ -18020,6 +21677,15 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     ) = match &config.discord {
         Some(discord) => {
             let has_bot_token = is_configured_secret(&discord.bot_token);
+            let has_scope = discord
+                .guild_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || !discord.default_channel_id.trim().is_empty()
+                || discord
+                    .default_thread_id
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty());
             (
                 true,
                 has_bot_token,
@@ -18029,7 +21695,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                 discord.guild_id.clone(),
                 discord.application_id.clone(),
                 discord.webhook_url.clone(),
-                has_bot_token || !discord.webhook_url.trim().is_empty(),
+                has_bot_token && has_scope,
             )
         }
         None => (
@@ -18165,52 +21831,248 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         whatsapp_enabled,
         whatsapp_mode_str,
         whatsapp_phone_id,
+        whatsapp_bridge_runtime,
         whatsapp_bridge,
         whatsapp_dm,
         whatsapp_numbers,
         has_whatsapp_token,
+        has_whatsapp_app_secret,
+        has_whatsapp_verify_token,
+        has_whatsapp_bridge_token,
         whatsapp_delivery_ready,
     ) = match &config.whatsapp {
         Some(wa) => {
+            let has_token = is_configured_secret(&wa.access_token);
+            let has_app_secret = is_configured_secret(&wa.app_secret);
+            let has_verify_token = !wa.verify_token.trim().is_empty();
+            let has_bridge_token = is_configured_secret(&wa.bridge_token);
+            let bridge_runtime = wa.bridge_runtime();
+            let inbound_ready = match wa.mode {
+                crate::channels::whatsapp::WhatsAppMode::CloudApi => {
+                    has_token
+                        && has_app_secret
+                        && !wa.phone_number_id.trim().is_empty()
+                        && has_verify_token
+                }
+                crate::channels::whatsapp::WhatsAppMode::Baileys => match bridge_runtime {
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => true,
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::External => {
+                        !wa.bridge_url.trim().is_empty()
+                    }
+                },
+            };
             let mode = match wa.mode {
                 crate::channels::whatsapp::WhatsAppMode::Baileys => "baileys",
                 crate::channels::whatsapp::WhatsAppMode::CloudApi => "cloud_api",
+            };
+            let runtime = match bridge_runtime {
+                crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => "embedded",
+                crate::channels::whatsapp::WhatsAppBridgeRuntime::External => "external",
             };
             (
                 true,
                 mode.to_string(),
                 wa.phone_number_id.clone(),
+                runtime.to_string(),
                 wa.bridge_url.clone(),
                 wa.dm_policy.clone(),
                 wa.allowed_numbers.clone(),
-                !wa.access_token.is_empty() && wa.access_token != "[ENCRYPTED]",
-                !wa.access_token.is_empty()
-                    && wa.access_token != "[ENCRYPTED]"
-                    && whatsapp_last_sender.is_some(),
+                has_token,
+                has_app_secret,
+                has_verify_token,
+                has_bridge_token,
+                inbound_ready && whatsapp_last_sender.is_some(),
             )
         }
         None => (
             false,
             "baileys".to_string(),
             String::new(),
+            "embedded".to_string(),
             "http://127.0.0.1:8999".to_string(),
             "pairing".to_string(),
             vec![],
             false,
             false,
+            false,
+            false,
+            false,
         ),
     };
-
-    // Settings are complete if name is set AND at least one LLM is configured
-    // Check both legacy single-provider AND model pool (new way)
-    let has_legacy_llm = !model.trim().is_empty()
-        && match &config.llm {
-            LlmProvider::Ollama { base_url, .. } => !base_url.trim().is_empty(),
-            LlmProvider::Anthropic { .. } => has_key,
-            LlmProvider::OpenAI { base_url, .. } => {
-                has_key && (base_url.is_none() || !base_url.as_ref().unwrap().trim().is_empty())
-            }
+    let (
+        google_chat_enabled,
+        has_google_chat_access_token,
+        has_google_chat_verify_token,
+        google_chat_api_base_url,
+        google_chat_space,
+        google_chat_thread_key,
+        google_chat_app_id,
+        google_chat_bot_name,
+        google_chat_delivery_ready,
+    ) = match &config.google_chat {
+        Some(google_chat) => (
+            true,
+            is_configured_secret(&google_chat.access_token),
+            is_configured_secret(&google_chat.verify_token),
+            google_chat.api_base_url.clone(),
+            google_chat.space.clone(),
+            google_chat.thread_key.clone(),
+            google_chat.app_id.clone(),
+            google_chat.bot_name.clone(),
+            is_configured_secret(&google_chat.access_token)
+                && is_configured_secret(&google_chat.verify_token)
+                && google_chat
+                    .space
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        ),
+        None => (
+            false,
+            false,
+            false,
+            "https://chat.googleapis.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+    };
+    let (
+        signal_enabled,
+        has_signal_bridge_token,
+        signal_bridge_url,
+        signal_default_recipient,
+        signal_default_group_id,
+        signal_delivery_ready,
+    ) = match &config.signal {
+        Some(signal) => (
+            true,
+            is_configured_secret(&signal.bridge_token),
+            signal.bridge_url.clone(),
+            signal.default_recipient.clone(),
+            signal.default_group_id.clone(),
+            is_configured_secret(&signal.bridge_token)
+                && !signal.bridge_url.trim().is_empty()
+                && (!signal.default_recipient.trim().is_empty()
+                    || !signal.default_group_id.trim().is_empty()),
+        ),
+        None => (
+            false,
+            false,
+            SignalChannelConfig::default().bridge_url,
+            String::new(),
+            String::new(),
+            false,
+        ),
+    };
+    let (
+        imessage_enabled,
+        has_imessage_bridge_token,
+        imessage_bridge_url,
+        imessage_default_chat_id,
+        imessage_default_handle,
+        imessage_delivery_ready,
+    ) = match &config.imessage {
+        Some(imessage) => (
+            true,
+            is_configured_secret(&imessage.bridge_token),
+            imessage.bridge_url.clone(),
+            imessage.default_chat_id.clone(),
+            imessage.default_handle.clone(),
+            is_configured_secret(&imessage.bridge_token)
+                && !imessage.bridge_url.trim().is_empty()
+                && (!imessage.default_chat_id.trim().is_empty()
+                    || !imessage.default_handle.trim().is_empty()),
+        ),
+        None => (
+            false,
+            false,
+            IMessageChannelConfig::default().bridge_url,
+            String::new(),
+            String::new(),
+            false,
+        ),
+    };
+    let (
+        line_enabled,
+        has_line_access_token,
+        has_line_channel_secret,
+        line_api_base_url,
+        line_default_target,
+        line_user_agent,
+        line_delivery_ready,
+    ) = match &config.line {
+        Some(line) => (
+            true,
+            is_configured_secret(&line.channel_access_token),
+            is_configured_secret(&line.channel_secret),
+            line.api_base_url.clone(),
+            line.default_target.clone(),
+            line.user_agent.clone(),
+            is_configured_secret(&line.channel_access_token)
+                && is_configured_secret(&line.channel_secret)
+                && line
+                    .default_target
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        ),
+        None => (
+            false,
+            false,
+            false,
+            "https://api.line.me".to_string(),
+            None,
+            None,
+            false,
+        ),
+    };
+    let (
+        wechat_enabled,
+        has_wechat_bridge_token,
+        wechat_bridge_url,
+        wechat_default_target_id,
+        wechat_delivery_ready,
+    ) = match &config.wechat {
+        Some(wechat) => (
+            true,
+            is_configured_secret(&wechat.bridge_token),
+            wechat.bridge_url.clone(),
+            wechat.default_target_id.clone(),
+            is_configured_secret(&wechat.bridge_token)
+                && !wechat.bridge_url.trim().is_empty()
+                && !wechat.default_target_id.trim().is_empty(),
+        ),
+        None => (
+            false,
+            false,
+            WeChatChannelConfig::default().bridge_url,
+            String::new(),
+            false,
+        ),
+    };
+    let (qq_enabled, has_qq_bridge_token, qq_bridge_url, qq_default_target_id, qq_delivery_ready) =
+        match &config.qq {
+            Some(qq) => (
+                true,
+                is_configured_secret(&qq.bridge_token),
+                qq.bridge_url.clone(),
+                qq.default_target_id.clone(),
+                is_configured_secret(&qq.bridge_token)
+                    && !qq.bridge_url.trim().is_empty()
+                    && !qq.default_target_id.trim().is_empty(),
+            ),
+            None => (
+                false,
+                false,
+                QqChannelConfig::default().bridge_url,
+                String::new(),
+                false,
+            ),
         };
+
+    // Settings are complete if name is set AND at least one non-default LLM is configured.
+    let has_legacy_llm = settings_has_configured_legacy_llm(&config, has_key);
     let has_model_pool = !config.model_pool.slots.is_empty();
     let settings_complete = !config.name.trim().is_empty() && (has_legacy_llm || has_model_pool);
 
@@ -18238,7 +22100,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
                     model,
                     base_url,
                 } => {
-                    let p = provider_label_for_openai(base_url);
+                    let p = openai_provider_label(base_url.as_deref());
                     (
                         p.to_string(),
                         model.clone(),
@@ -18267,6 +22129,13 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         })
         .collect();
 
+    let (settings_llm_provider, settings_llm_model, settings_llm_base_url, settings_has_api_key) =
+        if has_model_pool || has_legacy_llm {
+            (provider, model, base_url, has_key)
+        } else {
+            (String::new(), String::new(), None, false)
+        };
+
     Json(SettingsResponse {
         bot_name: config.name.clone(),
         personality: config.personality.clone(),
@@ -18277,16 +22146,21 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         daily_brief_enabled,
         daily_brief_time,
         daily_brief_channel,
-        llm_provider: provider,
-        llm_model: model,
-        llm_base_url: base_url,
-        has_api_key: has_key,
+        llm_provider: settings_llm_provider,
+        llm_model: settings_llm_model,
+        llm_base_url: settings_llm_base_url,
+        has_api_key: settings_has_api_key,
         llm_fallback_provider: fallback_provider,
         llm_fallback_model: fallback_model,
         llm_fallback_base_url: fallback_base_url,
         has_fallback_api_key: has_fallback_key,
         model_pool: model_pool_summary,
         smart_routing: config.model_pool.smart_routing,
+        embeddings_provider,
+        embeddings_model,
+        embeddings_base_url,
+        embeddings_has_api_key,
+        embeddings_status,
         telegram_enabled,
         has_telegram_token,
         telegram_delivery_ready,
@@ -18337,12 +22211,54 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         whatsapp_enabled,
         whatsapp_mode: whatsapp_mode_str,
         has_whatsapp_token,
+        has_whatsapp_app_secret,
+        has_whatsapp_verify_token,
+        has_whatsapp_bridge_token,
         whatsapp_delivery_ready,
         whatsapp_phone_number_id: whatsapp_phone_id,
+        whatsapp_bridge_runtime,
         whatsapp_bridge_url: whatsapp_bridge,
         whatsapp_dm_policy: whatsapp_dm,
         whatsapp_allowed_numbers: whatsapp_numbers,
-        auto_approve: config.auto_approve.clone(),
+        google_chat_enabled,
+        has_google_chat_access_token,
+        has_google_chat_verify_token,
+        google_chat_api_base_url,
+        google_chat_space,
+        google_chat_thread_key,
+        google_chat_app_id,
+        google_chat_bot_name,
+        google_chat_delivery_ready,
+        signal_enabled,
+        has_signal_bridge_token,
+        signal_bridge_url,
+        signal_default_recipient,
+        signal_default_group_id,
+        signal_delivery_ready,
+        imessage_enabled,
+        has_imessage_bridge_token,
+        imessage_bridge_url,
+        imessage_default_chat_id,
+        imessage_default_handle,
+        imessage_delivery_ready,
+        line_enabled,
+        has_line_access_token,
+        has_line_channel_secret,
+        line_api_base_url,
+        line_default_target,
+        line_user_agent,
+        line_delivery_ready,
+        wechat_enabled,
+        has_wechat_bridge_token,
+        wechat_bridge_url,
+        wechat_default_target_id,
+        wechat_delivery_ready,
+        qq_enabled,
+        has_qq_bridge_token,
+        qq_bridge_url,
+        qq_default_target_id,
+        qq_delivery_ready,
+        auto_approve: crate::core::config::sanitize_auto_approve_actions(&config.auto_approve),
         search_primary: search_cfg
             .as_ref()
             .and_then(|c| c.primary.clone())
@@ -18359,13 +22275,6 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             .as_ref()
             .map(|cfg| cfg.serper.is_some())
             .unwrap_or(false),
-        search_searxng_url: search_cfg
-            .as_ref()
-            .and_then(|cfg| match &cfg.searxng {
-                Some(crate::actions::SearchBackend::SearXNG { base_url }) => Some(base_url),
-                _ => None,
-            })
-            .cloned(),
         search_brave_configured: search_cfg
             .as_ref()
             .map(|cfg| cfg.brave.is_some())
@@ -18402,13 +22311,13 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     })
 }
 
-fn google_workspace_client_source_label(source: &str) -> &'static str {
+fn google_workspace_client_source_label(source: &str) -> String {
     match source {
-        "environment_google_workspace" => "Environment override",
-        "settings" => "Saved in AgentArk",
-        "environment_legacy_google" => "Legacy environment override",
-        "legacy_integration" => "Legacy integration config",
-        _ => "Not configured",
+        "environment_google_workspace" => "Environment override".to_string(),
+        "settings" => format!("Saved in {}", crate::branding::PRODUCT_NAME),
+        "environment_legacy_google" => "Legacy environment override".to_string(),
+        "legacy_integration" => "Legacy integration config".to_string(),
+        _ => "Not configured".to_string(),
     }
 }
 
@@ -18424,6 +22333,7 @@ fn google_workspace_client_id_hint(client_id: &str) -> String {
 
 fn build_google_workspace_oauth_client_settings_response(
     config_dir: &std::path::Path,
+    redirect_uri: String,
 ) -> GoogleWorkspaceOAuthClientSettingsResponse {
     let source = crate::actions::google_workspace::workspace_client_config_source(config_dir)
         .ok()
@@ -18435,7 +22345,7 @@ fn build_google_workspace_oauth_client_settings_response(
         .flatten();
     GoogleWorkspaceOAuthClientSettingsResponse {
         configured: config.is_some(),
-        source_label: google_workspace_client_source_label(&source).to_string(),
+        source_label: google_workspace_client_source_label(&source),
         managed_externally: source == "environment_google_workspace"
             || source == "environment_legacy_google",
         source,
@@ -18443,26 +22353,55 @@ fn build_google_workspace_oauth_client_settings_response(
             .as_ref()
             .map(|value| google_workspace_client_id_hint(&value.client_id)),
         secret_configured: config.is_some(),
-        redirect_uri: crate::actions::google_workspace::oauth_redirect_uri().to_string(),
+        redirect_uri,
+    }
+}
+
+fn google_workspace_settings_redirect_uri(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<String, String> {
+    match oauth_redirect_uri_for_request(state, headers, None) {
+        Ok(value) => Ok(value),
+        Err(_) if state.deployment_mode == DeploymentMode::TrustedLocal => {
+            Ok(crate::actions::google_workspace::oauth_redirect_uri().to_string())
+        }
+        Err(error) => Err(error),
     }
 }
 
 async fn get_google_workspace_oauth_client_settings(
     State(state): State<AppState>,
-) -> Json<GoogleWorkspaceOAuthClientSettingsResponse> {
+    headers: HeaderMap,
+) -> Response {
     let config_dir = { state.agent.read().await.config_dir.clone() };
+    let redirect_uri = match google_workspace_settings_redirect_uri(&state, &headers) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    };
     Json(build_google_workspace_oauth_client_settings_response(
         &config_dir,
+        redirect_uri,
     ))
+    .into_response()
 }
 
 async fn update_google_workspace_oauth_client_settings(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<GoogleWorkspaceOAuthClientSettingsUpdate>,
 ) -> Response {
     let (config_dir, data_dir) = {
         let agent = state.agent.read().await;
         (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    let redirect_uri = match google_workspace_settings_redirect_uri(&state, &headers) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
     };
     let manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
         &config_dir,
@@ -18496,6 +22435,7 @@ async fn update_google_workspace_oauth_client_settings(
             StatusCode::OK,
             Json(build_google_workspace_oauth_client_settings_response(
                 &config_dir,
+                redirect_uri.clone(),
             )),
         )
             .into_response();
@@ -18590,6 +22530,7 @@ async fn update_google_workspace_oauth_client_settings(
         StatusCode::OK,
         Json(build_google_workspace_oauth_client_settings_response(
             &config_dir,
+            redirect_uri,
         )),
     )
         .into_response()
@@ -18658,7 +22599,6 @@ async fn update_settings(
     let search_fallback1 = settings.search_fallback1.clone();
     let search_fallback2 = settings.search_fallback2.clone();
     let search_serper_key = settings.search_serper_key.clone();
-    let search_searxng_url = settings.search_searxng_url.clone();
     let search_brave_key = settings.search_brave_key.clone();
     let moltbook_api_key = settings.moltbook_api_key.clone();
     let observability_auth_token = settings
@@ -18791,12 +22731,24 @@ async fn update_settings(
         let normalized = channel.trim().to_lowercase();
         if !matches!(
             normalized.as_str(),
-            "telegram" | "whatsapp" | "slack" | "discord" | "matrix" | "teams" | "email"
+            "telegram"
+                | "whatsapp"
+                | "slack"
+                | "discord"
+                | "matrix"
+                | "teams"
+                | "google_chat"
+                | "signal"
+                | "imessage"
+                | "line"
+                | "wechat"
+                | "qq"
+                | "email"
         ) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Daily brief channel must be 'telegram', 'whatsapp', 'slack', 'discord', 'matrix', 'teams', or 'email'"
+                    error: "Daily brief channel must be one of telegram, whatsapp, slack, discord, matrix, teams, google_chat, signal, imessage, line, wechat, qq, or email"
                         .to_string(),
                 }),
             )
@@ -18837,6 +22789,15 @@ async fn update_settings(
 
     if let Some(update) = settings.data_lifecycle.as_ref() {
         let mut current = load_data_lifecycle_settings(&deferred_storage).await;
+        if let Some(v) = update.cleanup_enabled {
+            current.cleanup_enabled = v;
+        }
+        if let Some(v) = update.notifications_cleanup_enabled {
+            current.notifications_cleanup_enabled = v;
+        }
+        if let Some(v) = update.logs_cleanup_enabled {
+            current.logs_cleanup_enabled = v;
+        }
         if let Some(v) = update.notifications_retention_days {
             current.notifications_retention_days = v;
         }
@@ -18870,6 +22831,15 @@ async fn update_settings(
         if let Some(v) = update.message_retention_days {
             current.message_retention_days = v;
         }
+        if let Some(v) = update.experience_run_retention_days {
+            current.experience_run_retention_days = v;
+        }
+        if let Some(v) = update.experience_edge_retention_days {
+            current.experience_edge_retention_days = v;
+        }
+        if let Some(v) = update.learning_candidate_retention_days {
+            current.learning_candidate_retention_days = v;
+        }
         if let Some(v) = update.housekeeping_interval_secs {
             current.housekeeping_interval_secs = v;
         }
@@ -18891,14 +22861,7 @@ async fn update_settings(
             .telegram
             .as_ref()
             .map(|t| (t.bot_token.clone(), t.allowed_users.clone()));
-        let old_whatsapp = agent_guard.config.whatsapp.as_ref().map(|w| {
-            (
-                w.mode.clone(),
-                w.access_token.clone(),
-                w.phone_number_id.clone(),
-                w.bridge_url.clone(),
-            )
-        });
+        let old_whatsapp = agent_guard.config.whatsapp.clone();
 
         // Update bot name if provided
         if let Some(name) = &settings.bot_name {
@@ -18969,6 +22932,14 @@ async fn update_settings(
             _ => None,
         };
         let mut existing_api_key = existing_api_key_raw.clone();
+        let current_embeddings = agent_guard.config.embeddings_config();
+        let mut existing_embeddings_api_key = if current_embeddings.api_key.is_empty()
+            || current_embeddings.api_key == "[ENCRYPTED]"
+        {
+            None
+        } else {
+            Some(current_embeddings.api_key.clone())
+        };
 
         // Get existing fallback API key to preserve if not provided
         let mut existing_fallback_api_key =
@@ -18985,6 +22956,9 @@ async fn update_settings(
             existing_api_key.as_deref(),
             None | Some("") | Some("[ENCRYPTED]")
         ) || matches!(
+            existing_embeddings_api_key.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
             existing_fallback_api_key.as_deref(),
             None | Some("") | Some("[ENCRYPTED]")
         ) {
@@ -18998,6 +22972,12 @@ async fn update_settings(
                         None | Some("") | Some("[ENCRYPTED]")
                     ) {
                         existing_api_key = secrets.llm_api_key.clone();
+                    }
+                    if matches!(
+                        existing_embeddings_api_key.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_embeddings_api_key = secrets.embeddings_api_key.clone();
                     }
                     if matches!(
                         existing_fallback_api_key.as_deref(),
@@ -19046,6 +23026,16 @@ async fn update_settings(
             .whatsapp
             .as_ref()
             .map(|w| w.access_token.clone());
+        let mut existing_whatsapp_app_secret = agent_guard
+            .config
+            .whatsapp
+            .as_ref()
+            .map(|w| w.app_secret.clone());
+        let mut existing_whatsapp_bridge_token = agent_guard
+            .config
+            .whatsapp
+            .as_ref()
+            .map(|w| w.bridge_token.clone());
 
         if matches!(
             existing_telegram_token.as_deref(),
@@ -19067,6 +23057,12 @@ async fn update_settings(
             None | Some("") | Some("[ENCRYPTED]")
         ) || matches!(
             existing_whatsapp_token.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_whatsapp_app_secret.as_deref(),
+            None | Some("") | Some("[ENCRYPTED]")
+        ) || matches!(
+            existing_whatsapp_bridge_token.as_deref(),
             None | Some("") | Some("[ENCRYPTED]")
         ) {
             if let Ok(secure) = crate::core::config::SecureConfigManager::new_with_data_dir(
@@ -19116,6 +23112,18 @@ async fn update_settings(
                     ) {
                         existing_whatsapp_token = secrets.whatsapp_access_token.clone();
                     }
+                    if matches!(
+                        existing_whatsapp_app_secret.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_whatsapp_app_secret = secrets.whatsapp_app_secret.clone();
+                    }
+                    if matches!(
+                        existing_whatsapp_bridge_token.as_deref(),
+                        None | Some("") | Some("[ENCRYPTED]")
+                    ) {
+                        existing_whatsapp_bridge_token = secrets.whatsapp_bridge_token.clone();
+                    }
                 }
             }
         }
@@ -19147,6 +23155,109 @@ async fn update_settings(
                 Some(trimmed.to_string())
             }
         });
+        let new_embeddings_api_key = settings
+            .embeddings_api_key
+            .clone()
+            .filter(|key| !key.is_empty() && key != "[ENCRYPTED]");
+        let embeddings_api_key = new_embeddings_api_key
+            .clone()
+            .or(existing_embeddings_api_key.filter(|key| key != "[ENCRYPTED]"))
+            .unwrap_or_default();
+        let embeddings_provider_raw = settings
+            .embeddings_provider
+            .clone()
+            .unwrap_or_else(|| "local-hf".to_string());
+        let embeddings_model_raw = settings
+            .embeddings_model
+            .clone()
+            .unwrap_or_else(|| current_embeddings.model.clone());
+        let embeddings_base_url = settings.embeddings_base_url.clone().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let new_embeddings = match embeddings_provider_raw.trim() {
+            "" | "local-hf" | "local_hf" => EmbeddingsConfig {
+                provider: EmbeddingsProviderKind::LocalHf,
+                model: if embeddings_model_raw.trim().is_empty() {
+                    "sentence-transformers/all-MiniLM-L6-v2".to_string()
+                } else {
+                    embeddings_model_raw.trim().to_string()
+                },
+                base_url: None,
+                api_key: String::new(),
+            },
+            "ollama" => {
+                let Some(url) = embeddings_base_url.clone() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Embeddings base URL is required for Ollama".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                if embeddings_model_raw.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Embeddings model is required for Ollama".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                EmbeddingsConfig {
+                    provider: EmbeddingsProviderKind::Ollama,
+                    model: embeddings_model_raw.trim().to_string(),
+                    base_url: Some(url),
+                    api_key: String::new(),
+                }
+            }
+            "openai-compatible" | "openai_compatible" | "openai-compatible-hosted" => {
+                if embeddings_model_raw.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Embeddings model is required for the external provider"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                let normalized_embeddings_base_url = if embeddings_base_url.is_some() {
+                    match normalize_openai_base_url(
+                        "openai-compatible",
+                        embeddings_base_url.clone(),
+                    ) {
+                        Ok(url) => url,
+                        Err(error) => {
+                            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                                .into_response();
+                        }
+                    }
+                } else {
+                    None
+                };
+                EmbeddingsConfig {
+                    provider: EmbeddingsProviderKind::OpenaiCompatible,
+                    model: embeddings_model_raw.trim().to_string(),
+                    base_url: normalized_embeddings_base_url,
+                    api_key: embeddings_api_key.clone(),
+                }
+            }
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Unknown embeddings provider: {}", other),
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
         // Determine if the user actually changed LLM settings or is just saving other fields.
         // If the user didn't send a new API key AND a valid LLM config already exists in memory,
@@ -19166,11 +23277,27 @@ async fn update_settings(
                         None | Some("") | Some("[ENCRYPTED]")
                     )));
 
+        let llm_request_is_blank = settings.llm_provider.trim().is_empty()
+            && settings.llm_model.trim().is_empty()
+            && base_url.is_none()
+            && new_api_key.is_none();
+
         let new_llm = if llm_unchanged {
             // Preserve current LLM config as-is - user didn't change it
             agent_guard.config.llm.clone()
+        } else if llm_request_is_blank {
+            LlmProvider::default()
         } else {
             // Validate LLM fields
+            if settings.llm_provider.trim().is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "LLM provider is required".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
             if settings.llm_model.trim().is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -19180,15 +23307,34 @@ async fn update_settings(
                 )
                     .into_response();
             }
+            let Some(llm_provider_id) = canonical_provider_id(settings.llm_provider.as_str())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Unknown provider: {}", settings.llm_provider),
+                    }),
+                )
+                    .into_response();
+            };
 
             let mut api_key_for_provider = api_key.clone();
-            if (settings.llm_provider.as_str() == "codex-cli"
-                || settings.llm_provider.as_str() == "openai-subscription")
-                && api_key_for_provider.trim().is_empty()
-            {
-                api_key_for_provider = read_codex_cli_api_key().unwrap_or_default();
+            if llm_provider_id == "openai-subscription" && api_key_for_provider.trim().is_empty() {
+                let oauth_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build();
+                api_key_for_provider = match oauth_client {
+                    Ok(client) => resolve_codex_cli_api_key(&client, false)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
             }
-            if settings.llm_provider.as_str() != "ollama" && api_key_for_provider.trim().is_empty()
+            if llm_provider_id != "ollama"
+                && llm_provider_id != "openai-compatible"
+                && api_key_for_provider.trim().is_empty()
             {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -19199,21 +23345,16 @@ async fn update_settings(
                     .into_response();
             }
 
-            if settings.llm_provider.as_str() == "ollama" {
-                let url = base_url
-                    .clone()
-                    .unwrap_or("http://localhost:11434".to_string());
-                if url.trim().is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "Ollama base URL is required".to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
+            if llm_provider_id == "ollama" && base_url.as_deref().unwrap_or("").trim().is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Ollama base URL is required".to_string(),
+                    }),
+                )
+                    .into_response();
             }
-            if settings.llm_provider.as_str() == "openai-compatible"
+            if llm_provider_id == "openai-compatible"
                 && base_url.as_deref().unwrap_or("").trim().is_empty()
             {
                 return (
@@ -19224,19 +23365,19 @@ async fn update_settings(
                 )
                     .into_response();
             }
-            let compat_base_url =
-                match normalize_openai_base_url(settings.llm_provider.as_str(), base_url.clone()) {
-                    Ok(url) => url,
-                    Err(error) => {
-                        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
-                            .into_response();
-                    }
-                };
+            let compat_base_url = match normalize_openai_base_url(llm_provider_id, base_url.clone())
+            {
+                Ok(url) => url,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            };
 
             // Build new LLM provider
-            match settings.llm_provider.as_str() {
+            match llm_provider_id {
                 "ollama" => LlmProvider::Ollama {
-                    base_url: base_url.unwrap_or("http://localhost:11434".to_string()),
+                    base_url: base_url.unwrap_or_default(),
                     model: settings.llm_model,
                 },
                 "anthropic" => LlmProvider::Anthropic {
@@ -19253,7 +23394,7 @@ async fn update_settings(
                     model: settings.llm_model,
                     base_url: compat_base_url,
                 },
-                "codex-cli" | "openai-subscription" => LlmProvider::OpenAI {
+                "openai-subscription" => LlmProvider::OpenAI {
                     api_key: api_key_for_provider.clone(),
                     model: settings.llm_model,
                     base_url: compat_base_url,
@@ -19290,33 +23431,66 @@ async fn update_settings(
                     .unwrap_or(false)
             {
                 let fb_model = settings.llm_fallback_model.clone().unwrap_or_default();
-                let fallback_compat_base_url = match normalize_openai_base_url(
-                    fb_provider.as_str(),
-                    fallback_base_url.clone(),
-                ) {
-                    Ok(url) => url,
-                    Err(error) => {
-                        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
-                            .into_response();
-                    }
+                let Some(fb_provider_id) = canonical_provider_id(fb_provider.as_str()) else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Unknown fallback provider: {}", fb_provider),
+                        }),
+                    )
+                        .into_response();
                 };
-                match fb_provider.as_str() {
+                let mut resolved_fallback_api_key = fallback_api_key.clone();
+                if fb_provider_id == "openai-subscription"
+                    && resolved_fallback_api_key.trim().is_empty()
+                {
+                    let oauth_client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build();
+                    resolved_fallback_api_key = match oauth_client {
+                        Ok(client) => resolve_codex_cli_api_key(&client, false)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                }
+                let fallback_compat_base_url =
+                    match normalize_openai_base_url(fb_provider_id, fallback_base_url.clone()) {
+                        Ok(url) => url,
+                        Err(error) => {
+                            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                                .into_response();
+                        }
+                    };
+                match fb_provider_id {
                     "ollama" => Some(LlmProvider::Ollama {
-                        base_url: fallback_base_url.unwrap_or("http://localhost:11434".to_string()),
+                        base_url: if let Some(url) = fallback_base_url {
+                            url
+                        } else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: "Fallback Ollama base URL is required".to_string(),
+                                }),
+                            )
+                                .into_response();
+                        },
                         model: fb_model,
                     }),
                     "anthropic" => Some(LlmProvider::Anthropic {
-                        api_key: fallback_api_key.clone(),
+                        api_key: resolved_fallback_api_key.clone(),
                         model: fb_model,
                     }),
                     "openai" => Some(LlmProvider::OpenAI {
-                        api_key: fallback_api_key.clone(),
+                        api_key: resolved_fallback_api_key.clone(),
                         model: fb_model,
                         base_url: None,
                     }),
-                    "openai-compatible" | "openrouter" | "codex-cli" | "openai-subscription" => {
+                    "openai-compatible" | "openrouter" | "openai-subscription" => {
                         Some(LlmProvider::OpenAI {
-                            api_key: fallback_api_key.clone(),
+                            api_key: resolved_fallback_api_key.clone(),
                             model: fb_model,
                             base_url: fallback_compat_base_url,
                         })
@@ -19498,17 +23672,60 @@ async fn update_settings(
                     .clone()
                     .or_else(|| current_discord.as_ref().map(|c| c.webhook_url.clone()))
                     .unwrap_or_default();
-                if bot_token.trim().is_empty() && webhook_url.trim().is_empty() {
+                if bot_token.trim().is_empty() {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error:
-                                "Discord bot token or webhook URL is required when Discord is enabled"
-                                    .to_string(),
+                            error: "Discord bot token is required when Discord is enabled"
+                                .to_string(),
                         }),
                     )
                         .into_response();
                 }
+                let default_channel_id = settings
+                    .discord_default_channel_id
+                    .clone()
+                    .or_else(|| {
+                        current_discord
+                            .as_ref()
+                            .map(|c| c.default_channel_id.clone())
+                    })
+                    .unwrap_or_default();
+                let default_thread_id = settings.discord_default_thread_id.clone().or_else(|| {
+                    current_discord
+                        .as_ref()
+                        .and_then(|c| c.default_thread_id.clone())
+                });
+                let guild_id = settings
+                    .discord_guild_id
+                    .clone()
+                    .or_else(|| current_discord.as_ref().and_then(|c| c.guild_id.clone()));
+                if guild_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                    && default_thread_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    && default_channel_id.trim().is_empty()
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Discord requires a guild, channel, or thread scope when it is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                let application_id = settings.discord_application_id.clone().or_else(|| {
+                    current_discord
+                        .as_ref()
+                        .and_then(|c| c.application_id.clone())
+                });
 
                 Some(DiscordChannelConfig {
                     bot_token,
@@ -19518,29 +23735,10 @@ async fn update_settings(
                         .clone()
                         .or_else(|| current_discord.as_ref().map(|c| c.api_base_url.clone()))
                         .unwrap_or("https://discord.com/api".to_string()),
-                    default_channel_id: settings
-                        .discord_default_channel_id
-                        .clone()
-                        .or_else(|| {
-                            current_discord
-                                .as_ref()
-                                .map(|c| c.default_channel_id.clone())
-                        })
-                        .unwrap_or_default(),
-                    default_thread_id: settings.discord_default_thread_id.clone().or_else(|| {
-                        current_discord
-                            .as_ref()
-                            .and_then(|c| c.default_thread_id.clone())
-                    }),
-                    guild_id: settings
-                        .discord_guild_id
-                        .clone()
-                        .or_else(|| current_discord.as_ref().and_then(|c| c.guild_id.clone())),
-                    application_id: settings.discord_application_id.clone().or_else(|| {
-                        current_discord
-                            .as_ref()
-                            .and_then(|c| c.application_id.clone())
-                    }),
+                    default_channel_id,
+                    default_thread_id,
+                    guild_id,
+                    application_id,
                 })
             } else {
                 None
@@ -19792,8 +23990,11 @@ async fn update_settings(
         let whatsapp_update_requested = settings.whatsapp_enabled.is_some()
             || settings.whatsapp_mode.is_some()
             || settings.whatsapp_access_token.is_some()
+            || settings.whatsapp_app_secret.is_some()
             || settings.whatsapp_phone_number_id.is_some()
             || settings.whatsapp_verify_token.is_some()
+            || settings.whatsapp_bridge_runtime.is_some()
+            || settings.whatsapp_bridge_token.is_some()
             || settings.whatsapp_bridge_url.is_some()
             || settings.whatsapp_dm_policy.is_some()
             || settings.whatsapp_allowed_numbers.is_some();
@@ -19826,6 +24027,18 @@ async fn update_settings(
                     .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
                     .or(existing_whatsapp_token.filter(|t| t != "[ENCRYPTED]"))
                     .unwrap_or_default();
+                let app_secret = settings
+                    .whatsapp_app_secret
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_whatsapp_app_secret.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
+                let mut bridge_token = settings
+                    .whatsapp_bridge_token
+                    .clone()
+                    .filter(|t| !t.is_empty() && t != "[ENCRYPTED]")
+                    .or(existing_whatsapp_bridge_token.filter(|t| t != "[ENCRYPTED]"))
+                    .unwrap_or_default();
 
                 let phone_id = settings
                     .whatsapp_phone_number_id
@@ -19839,11 +24052,72 @@ async fn update_settings(
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.verify_token.clone()))
                     .unwrap_or("agentark_verify".to_string());
 
-                let bridge_url = settings
+                let bridge_runtime = settings
+                    .whatsapp_bridge_runtime
+                    .as_deref()
+                    .map(|value| match value {
+                        "external" => crate::channels::whatsapp::WhatsAppBridgeRuntime::External,
+                        _ => crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded,
+                    })
+                    .or_else(|| current_whatsapp.as_ref().map(|w| w.bridge_runtime()))
+                    .unwrap_or(crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded);
+
+                let requested_bridge_url = settings
                     .whatsapp_bridge_url
                     .clone()
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.bridge_url.clone()))
-                    .unwrap_or("http://127.0.0.1:8999".to_string());
+                    .unwrap_or(crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string());
+                let bridge_url = match bridge_runtime {
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => {
+                        if !crate::channels::whatsapp::is_loopback_bridge_url(&requested_bridge_url)
+                        {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: "Bundled WhatsApp bridge mode only supports a local loopback URL"
+                                        .to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        if mode == crate::channels::whatsapp::WhatsAppMode::Baileys
+                            && bridge_token.trim().is_empty()
+                        {
+                            bridge_token = generate_whatsapp_bridge_token();
+                        }
+                        crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string()
+                    }
+                    crate::channels::whatsapp::WhatsAppBridgeRuntime::External => {
+                        let trimmed = requested_bridge_url.trim().to_string();
+                        if trimmed.is_empty() {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: "WhatsApp external bridge URL is required in external bridge mode"
+                                        .to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        let legacy_external_missing_token =
+                            current_whatsapp.as_ref().is_some_and(|config| {
+                                config.uses_external_bridge()
+                                    && config.bridge_token.trim().is_empty()
+                                    && settings.whatsapp_bridge_token.is_none()
+                            });
+                        if bridge_token.trim().is_empty() && !legacy_external_missing_token {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: "WhatsApp external bridge token is required for new external bridge setups"
+                                        .to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        trimmed
+                    }
+                };
 
                 let dm_policy = settings
                     .whatsapp_dm_policy
@@ -19851,13 +24125,23 @@ async fn update_settings(
                     .or_else(|| current_whatsapp.as_ref().map(|w| w.dm_policy.clone()))
                     .unwrap_or("pairing".to_string());
 
-                // Cloud API mode requires access token and phone number ID
+                // Cloud API mode requires access token, app secret, verify token, and phone number ID.
                 if mode == crate::channels::whatsapp::WhatsAppMode::CloudApi {
                     if token.trim().is_empty() {
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(ErrorResponse {
                                 error: "WhatsApp access token is required for Cloud API mode"
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    if app_secret.trim().is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "WhatsApp app secret is required for Cloud API mode"
                                     .to_string(),
                             }),
                         )
@@ -19873,14 +24157,27 @@ async fn update_settings(
                         )
                             .into_response();
                     }
+                    if verify_tok.trim().is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: "WhatsApp verify token is required for Cloud API mode"
+                                    .to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
                 }
 
                 Some(crate::channels::whatsapp::WhatsAppChannelConfig {
                     mode,
                     access_token: token,
+                    app_secret,
                     phone_number_id: phone_id,
                     verify_token: verify_tok,
+                    bridge_runtime: Some(bridge_runtime),
                     bridge_url,
+                    bridge_token,
                     allowed_numbers: settings.whatsapp_allowed_numbers.clone().unwrap_or_else(
                         || {
                             current_whatsapp
@@ -19896,6 +24193,501 @@ async fn update_settings(
             }
         } else {
             current_whatsapp
+        };
+
+        let google_chat_update_requested = settings.google_chat_enabled.is_some()
+            || settings.google_chat_access_token.is_some()
+            || settings.google_chat_verify_token.is_some()
+            || settings.google_chat_api_base_url.is_some()
+            || settings.google_chat_space.is_some()
+            || settings.google_chat_thread_key.is_some()
+            || settings.google_chat_app_id.is_some()
+            || settings.google_chat_bot_name.is_some();
+        let current_google_chat = agent_guard.config.google_chat.clone();
+        let new_google_chat = if google_chat_update_requested {
+            let google_chat_enabled = settings.google_chat_enabled.unwrap_or(
+                current_google_chat.is_some()
+                    || settings.google_chat_access_token.is_some()
+                    || settings.google_chat_verify_token.is_some()
+                    || settings.google_chat_space.is_some(),
+            );
+            if google_chat_enabled {
+                let access_token = settings
+                    .google_chat_access_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_google_chat
+                            .as_ref()
+                            .map(|cfg| cfg.access_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let verify_token = settings
+                    .google_chat_verify_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_google_chat
+                            .as_ref()
+                            .map(|cfg| cfg.verify_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let space = settings.google_chat_space.clone().or_else(|| {
+                    current_google_chat
+                        .as_ref()
+                        .and_then(|cfg| cfg.space.clone())
+                });
+                if access_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "Google Chat access token is required when Google Chat is enabled"
+                                    .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if verify_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "Google Chat verification token is required when Google Chat is enabled"
+                                    .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if space
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Google Chat space is required when Google Chat is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(GoogleChatChannelConfig {
+                    api_base_url: settings
+                        .google_chat_api_base_url
+                        .clone()
+                        .or_else(|| {
+                            current_google_chat
+                                .as_ref()
+                                .map(|cfg| cfg.api_base_url.clone())
+                        })
+                        .unwrap_or_else(|| "https://chat.googleapis.com".to_string()),
+                    access_token,
+                    verify_token,
+                    space,
+                    thread_key: settings.google_chat_thread_key.clone().or_else(|| {
+                        current_google_chat
+                            .as_ref()
+                            .and_then(|cfg| cfg.thread_key.clone())
+                    }),
+                    app_id: settings.google_chat_app_id.clone().or_else(|| {
+                        current_google_chat
+                            .as_ref()
+                            .and_then(|cfg| cfg.app_id.clone())
+                    }),
+                    bot_name: settings.google_chat_bot_name.clone().or_else(|| {
+                        current_google_chat
+                            .as_ref()
+                            .and_then(|cfg| cfg.bot_name.clone())
+                    }),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_google_chat
+        };
+
+        let line_update_requested = settings.line_enabled.is_some()
+            || settings.line_channel_access_token.is_some()
+            || settings.line_channel_secret.is_some()
+            || settings.line_api_base_url.is_some()
+            || settings.line_default_target.is_some()
+            || settings.line_user_agent.is_some();
+        let current_line = agent_guard.config.line.clone();
+        let new_line = if line_update_requested {
+            let line_enabled = settings.line_enabled.unwrap_or(
+                current_line.is_some()
+                    || settings.line_channel_access_token.is_some()
+                    || settings.line_default_target.is_some(),
+            );
+            if line_enabled {
+                let access_token = settings
+                    .line_channel_access_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_line
+                            .as_ref()
+                            .map(|cfg| cfg.channel_access_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let channel_secret = settings
+                    .line_channel_secret
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_line
+                            .as_ref()
+                            .map(|cfg| cfg.channel_secret.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let default_target = settings.line_default_target.clone().or_else(|| {
+                    current_line
+                        .as_ref()
+                        .and_then(|cfg| cfg.default_target.clone())
+                });
+                if access_token.trim().is_empty() || channel_secret.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "LINE access token and channel secret are required when LINE is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if default_target
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "LINE default target is required when LINE is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(LineChannelConfig {
+                    api_base_url: settings
+                        .line_api_base_url
+                        .clone()
+                        .or_else(|| current_line.as_ref().map(|cfg| cfg.api_base_url.clone()))
+                        .unwrap_or_else(|| "https://api.line.me".to_string()),
+                    channel_access_token: access_token,
+                    channel_secret,
+                    default_target,
+                    user_agent: settings
+                        .line_user_agent
+                        .clone()
+                        .or_else(|| current_line.as_ref().and_then(|cfg| cfg.user_agent.clone())),
+                })
+            } else {
+                None
+            }
+        } else {
+            current_line
+        };
+
+        let signal_update_requested = settings.signal_enabled.is_some()
+            || settings.signal_bridge_token.is_some()
+            || settings.signal_bridge_url.is_some()
+            || settings.signal_default_recipient.is_some()
+            || settings.signal_default_group_id.is_some();
+        let current_signal = agent_guard.config.signal.clone();
+        let new_signal = if signal_update_requested {
+            let signal_enabled = settings.signal_enabled.unwrap_or(
+                current_signal.is_some()
+                    || settings.signal_bridge_token.is_some()
+                    || settings.signal_default_recipient.is_some()
+                    || settings.signal_default_group_id.is_some(),
+            );
+            if signal_enabled {
+                let bridge_token = settings
+                    .signal_bridge_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_signal
+                            .as_ref()
+                            .map(|cfg| cfg.bridge_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let default_recipient = settings
+                    .signal_default_recipient
+                    .clone()
+                    .or_else(|| {
+                        current_signal
+                            .as_ref()
+                            .map(|cfg| cfg.default_recipient.clone())
+                    })
+                    .unwrap_or_default();
+                let default_group_id = settings
+                    .signal_default_group_id
+                    .clone()
+                    .or_else(|| {
+                        current_signal
+                            .as_ref()
+                            .map(|cfg| cfg.default_group_id.clone())
+                    })
+                    .unwrap_or_default();
+                if bridge_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Signal bridge token is required when Signal is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if default_recipient.trim().is_empty() && default_group_id.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error:
+                                "Signal needs a default recipient or group ID when it is enabled"
+                                    .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(SignalChannelConfig {
+                    bridge_url: settings
+                        .signal_bridge_url
+                        .clone()
+                        .or_else(|| current_signal.as_ref().map(|cfg| cfg.bridge_url.clone()))
+                        .unwrap_or_else(|| SignalChannelConfig::default().bridge_url),
+                    bridge_token,
+                    default_recipient,
+                    default_group_id,
+                })
+            } else {
+                None
+            }
+        } else {
+            agent_guard.config.signal.clone()
+        };
+
+        let imessage_update_requested = settings.imessage_enabled.is_some()
+            || settings.imessage_bridge_token.is_some()
+            || settings.imessage_bridge_url.is_some()
+            || settings.imessage_default_chat_id.is_some()
+            || settings.imessage_default_handle.is_some();
+        let current_imessage = agent_guard.config.imessage.clone();
+        let new_imessage = if imessage_update_requested {
+            let imessage_enabled = settings.imessage_enabled.unwrap_or(
+                current_imessage.is_some()
+                    || settings.imessage_bridge_token.is_some()
+                    || settings.imessage_default_chat_id.is_some()
+                    || settings.imessage_default_handle.is_some(),
+            );
+            if imessage_enabled {
+                let bridge_token = settings
+                    .imessage_bridge_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_imessage
+                            .as_ref()
+                            .map(|cfg| cfg.bridge_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let default_chat_id = settings
+                    .imessage_default_chat_id
+                    .clone()
+                    .or_else(|| {
+                        current_imessage
+                            .as_ref()
+                            .map(|cfg| cfg.default_chat_id.clone())
+                    })
+                    .unwrap_or_default();
+                let default_handle = settings
+                    .imessage_default_handle
+                    .clone()
+                    .or_else(|| {
+                        current_imessage
+                            .as_ref()
+                            .map(|cfg| cfg.default_handle.clone())
+                    })
+                    .unwrap_or_default();
+                if bridge_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "iMessage bridge token is required when iMessage is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if default_chat_id.trim().is_empty() && default_handle.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "iMessage needs a default chat ID or handle when it is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(IMessageChannelConfig {
+                    bridge_url: settings
+                        .imessage_bridge_url
+                        .clone()
+                        .or_else(|| current_imessage.as_ref().map(|cfg| cfg.bridge_url.clone()))
+                        .unwrap_or_else(|| IMessageChannelConfig::default().bridge_url),
+                    bridge_token,
+                    default_chat_id,
+                    default_handle,
+                })
+            } else {
+                None
+            }
+        } else {
+            agent_guard.config.imessage.clone()
+        };
+
+        let wechat_update_requested = settings.wechat_enabled.is_some()
+            || settings.wechat_bridge_token.is_some()
+            || settings.wechat_bridge_url.is_some()
+            || settings.wechat_default_target_id.is_some();
+        let current_wechat = agent_guard.config.wechat.clone();
+        let new_wechat = if wechat_update_requested {
+            let wechat_enabled = settings.wechat_enabled.unwrap_or(
+                current_wechat.is_some()
+                    || settings.wechat_bridge_token.is_some()
+                    || settings.wechat_default_target_id.is_some(),
+            );
+            if wechat_enabled {
+                let bridge_token = settings
+                    .wechat_bridge_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_wechat
+                            .as_ref()
+                            .map(|cfg| cfg.bridge_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let default_target_id = settings
+                    .wechat_default_target_id
+                    .clone()
+                    .or_else(|| {
+                        current_wechat
+                            .as_ref()
+                            .map(|cfg| cfg.default_target_id.clone())
+                    })
+                    .unwrap_or_default();
+                if bridge_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "WeChat bridge token is required when WeChat is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if default_target_id.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "WeChat needs a default target ID when it is enabled"
+                                .to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(WeChatChannelConfig {
+                    bridge_url: settings
+                        .wechat_bridge_url
+                        .clone()
+                        .or_else(|| current_wechat.as_ref().map(|cfg| cfg.bridge_url.clone()))
+                        .unwrap_or_else(|| WeChatChannelConfig::default().bridge_url),
+                    bridge_token,
+                    default_target_id,
+                })
+            } else {
+                None
+            }
+        } else {
+            agent_guard.config.wechat.clone()
+        };
+
+        let qq_update_requested = settings.qq_enabled.is_some()
+            || settings.qq_bridge_token.is_some()
+            || settings.qq_bridge_url.is_some()
+            || settings.qq_default_target_id.is_some();
+        let current_qq = agent_guard.config.qq.clone();
+        let new_qq = if qq_update_requested {
+            let qq_enabled = settings.qq_enabled.unwrap_or(
+                current_qq.is_some()
+                    || settings.qq_bridge_token.is_some()
+                    || settings.qq_default_target_id.is_some(),
+            );
+            if qq_enabled {
+                let bridge_token = settings
+                    .qq_bridge_token
+                    .clone()
+                    .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    .or_else(|| {
+                        current_qq
+                            .as_ref()
+                            .map(|cfg| cfg.bridge_token.clone())
+                            .filter(|value| !value.is_empty() && value != "[ENCRYPTED]")
+                    })
+                    .unwrap_or_default();
+                let default_target_id = settings
+                    .qq_default_target_id
+                    .clone()
+                    .or_else(|| current_qq.as_ref().map(|cfg| cfg.default_target_id.clone()))
+                    .unwrap_or_default();
+                if bridge_token.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "QQ bridge token is required when QQ is enabled".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                if default_target_id.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "QQ needs a default target ID when it is enabled".to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(QqChannelConfig {
+                    bridge_url: settings
+                        .qq_bridge_url
+                        .clone()
+                        .or_else(|| current_qq.as_ref().map(|cfg| cfg.bridge_url.clone()))
+                        .unwrap_or_else(|| QqChannelConfig::default().bridge_url),
+                    bridge_token,
+                    default_target_id,
+                })
+            } else {
+                None
+            }
+        } else {
+            agent_guard.config.qq.clone()
         };
 
         // Defer network connectivity probing until after lock is released to avoid
@@ -19958,12 +24750,19 @@ async fn update_settings(
         // Update config
         agent_guard.config.llm = new_llm.clone();
         agent_guard.config.llm_fallback = new_llm_fallback;
+        agent_guard.config.embeddings = Some(new_embeddings.clone());
         agent_guard.config.telegram = new_telegram.clone();
         agent_guard.config.slack = new_slack.clone();
         agent_guard.config.discord = new_discord.clone();
         agent_guard.config.matrix = new_matrix.clone();
         agent_guard.config.teams = new_teams.clone();
         agent_guard.config.whatsapp = new_whatsapp.clone();
+        agent_guard.config.google_chat = new_google_chat.clone();
+        agent_guard.config.line = new_line.clone();
+        agent_guard.config.signal = new_signal.clone();
+        agent_guard.config.imessage = new_imessage.clone();
+        agent_guard.config.wechat = new_wechat.clone();
+        agent_guard.config.qq = new_qq.clone();
 
         // Detect if Telegram config changed (needs process restart)
         let new_tg_snapshot = new_telegram
@@ -19974,23 +24773,34 @@ async fn update_settings(
         }
 
         // Detect WhatsApp config change (managed via bridge process, no full restart needed)
-        let wa_was_enabled = old_whatsapp.is_some();
-        let wa_is_enabled = new_whatsapp.is_some();
-        if !wa_was_enabled && wa_is_enabled {
-            wa_start_bridge = true; // User just enabled WhatsApp
-        } else if wa_was_enabled && !wa_is_enabled {
-            wa_stop_bridge = true; // User just disabled WhatsApp
-        } else if wa_was_enabled && wa_is_enabled {
-            // Check if config changed (bridge URL, mode, etc.) - needs restart
-            let new_wa_snapshot = new_whatsapp.as_ref().map(|w| {
+        let old_embedded_bridge = old_whatsapp
+            .as_ref()
+            .is_some_and(|config| config.uses_embedded_bridge());
+        let new_embedded_bridge = new_whatsapp
+            .as_ref()
+            .is_some_and(|config| config.uses_embedded_bridge());
+        if !old_embedded_bridge && new_embedded_bridge {
+            wa_start_bridge = true;
+        } else if old_embedded_bridge && !new_embedded_bridge {
+            wa_stop_bridge = true;
+        } else if old_embedded_bridge && new_embedded_bridge {
+            let old_wa_snapshot = old_whatsapp.as_ref().map(|w| {
                 (
-                    w.mode.clone(),
-                    w.access_token.clone(),
-                    w.phone_number_id.clone(),
-                    w.bridge_url.clone(),
+                    w.mode,
+                    w.bridge_runtime(),
+                    w.bridge_token.clone(),
+                    w.verify_token.clone(),
                 )
             });
-            if old_whatsapp != new_wa_snapshot {
+            let new_wa_snapshot = new_whatsapp.as_ref().map(|w| {
+                (
+                    w.mode,
+                    w.bridge_runtime(),
+                    w.bridge_token.clone(),
+                    w.verify_token.clone(),
+                )
+            });
+            if old_wa_snapshot != new_wa_snapshot {
                 wa_restart_bridge = true;
             }
         }
@@ -20004,6 +24814,7 @@ async fn update_settings(
             agent_guard.config.auto_approve = allowed.clone();
             // Sync to safety engine so RequireApproval rules are skipped for these actions
             agent_guard.safety.set_auto_approved(&allowed);
+            agent_guard.runtime.set_auto_approved_actions(&allowed);
         }
 
         // Save media provider API keys to config (they will be encrypted by SecureConfigManager)
@@ -20035,6 +24846,22 @@ async fn update_settings(
             agent_guard.config.media_gen.fallback_video_provider = Some(provider.clone());
         }
 
+        let next_embedding_client = match crate::core::EmbeddingClient::from_config(
+            &agent_guard.config,
+            &agent_guard.data_dir,
+        ) {
+            Ok(client) => client.map(Arc::new),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to initialize embeddings backend: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+
         if let Some(observability) = settings.observability.as_ref() {
             if let Some(enabled) = observability.enabled {
                 agent_guard.config.observability.enabled = enabled;
@@ -20065,7 +24892,6 @@ async fn update_settings(
             || search_fallback1.is_some()
             || search_fallback2.is_some()
             || search_serper_key.is_some()
-            || search_searxng_url.is_some()
             || search_brave_key.is_some()
         {
             deferred_search_config_dir = Some(agent_guard.config_dir.clone());
@@ -20150,6 +24976,21 @@ async fn update_settings(
             }
         }
 
+        agent_guard.embedding_client = next_embedding_client.clone();
+        agent_guard
+            .memory
+            .set_embedding_client(next_embedding_client.clone());
+        if let Some(client) = next_embedding_client {
+            tokio::spawn(async move {
+                if let Err(error) = client.prepare().await {
+                    tracing::warn!(
+                        "Embedding warmup unavailable after settings save: {}",
+                        error
+                    );
+                }
+            });
+        }
+
         save_result
     };
 
@@ -20191,11 +25032,6 @@ async fn update_settings(
             .and_then(|c| toml::from_str::<crate::actions::SearchConfig>(&c).ok())
             .unwrap_or_default();
 
-        if let Some(url) = &search_searxng_url {
-            search_config.searxng = Some(crate::actions::SearchBackend::SearXNG {
-                base_url: url.clone(),
-            });
-        }
         if let Some(key) = &search_serper_key {
             search_config.serper = if key.trim().is_empty() {
                 None
@@ -20371,6 +25207,7 @@ async fn update_settings(
 
             // Handle WhatsApp bridge lifecycle (no full process restart needed)
             if wa_start_bridge || wa_restart_bridge {
+                let state_for_bridge = state.clone();
                 let wb = state.whatsapp_bridge.clone();
                 tokio::spawn(async move {
                     if wa_restart_bridge {
@@ -20378,7 +25215,7 @@ async fn update_settings(
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     tracing::info!("Starting WhatsApp bridge (user enabled in settings)...");
-                    match spawn_whatsapp_bridge(wb).await {
+                    match spawn_whatsapp_bridge(state_for_bridge).await {
                         Ok(()) => tracing::info!("WhatsApp bridge started successfully"),
                         Err(e) => tracing::error!("Failed to start WhatsApp bridge: {}", e),
                     }
@@ -20453,19 +25290,49 @@ async fn test_llm_connection(provider: &LlmProvider) -> Result<(), String> {
         LlmProvider::OpenAI {
             api_key, base_url, ..
         } => {
-            let base = effective_openai_base_url(base_url.as_deref()).trim_end_matches('/');
+            let mut request_config =
+                resolve_openai_request_config(&client, api_key, base_url.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let base = request_config.base_url.trim_end_matches('/');
             let url = format!("{}/models", base);
-            let resp = client
-                .get(url)
-                .bearer_auth(api_key)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut request = client.get(url);
+            if !request_config.api_key.trim().is_empty() {
+                request = request.bearer_auth(&request_config.api_key);
+            }
+            if request_config.is_openrouter {
+                request = request
+                    .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                    .header("X-Title", crate::branding::PRODUCT_NAME);
+            }
+            let mut resp = request.send().await.map_err(|e| e.to_string())?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && request_config.uses_codex_cli_oauth
+            {
+                let refreshed = force_refresh_codex_cli_api_key(&client)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+                request_config.api_key = refreshed;
+                let mut retry = client.get(format!("{}/models", base));
+                if !request_config.api_key.trim().is_empty() {
+                    retry = retry.bearer_auth(&request_config.api_key);
+                }
+                if request_config.is_openrouter {
+                    retry = retry
+                        .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                        .header("X-Title", crate::branding::PRODUCT_NAME);
+                }
+                resp = retry.send().await.map_err(|e| e.to_string())?;
+            }
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let label = provider_label_for_openai(base_url);
-                Err(format!("{} returned {}", label, resp.status()))
+                Err(format!(
+                    "{} returned {}",
+                    request_config.provider_label,
+                    resp.status()
+                ))
             }
         }
         LlmProvider::Anthropic { api_key, .. } => {
@@ -20486,11 +25353,73 @@ async fn test_llm_connection(provider: &LlmProvider) -> Result<(), String> {
     }
 }
 
-/// Restart the server (Docker will auto-restart due to restart policy)
-async fn restart_server() -> Response {
-    tracing::info!("Restart requested via API - shutting down for restart");
+/// Restart the server or split-stack services.
+async fn restart_server(State(state): State<AppState>) -> Response {
+    if matches!(stack_role().as_deref(), Some("control-plane" | "control")) {
+        tracing::info!("Restart requested via API - delegating split-stack restart to executor");
+        let executor_client = state
+            .executor_client
+            .clone()
+            .or_else(|| build_executor_client().ok().flatten());
+        let Some(executor_client) = executor_client else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": "Internal executor client is unavailable for split-stack restart."
+                })),
+            )
+                .into_response();
+        };
 
-    // Spawn a task to exit after a short delay (allows response to be sent)
+        match executor_client
+            .request(reqwest::Method::POST, "/internal/v1/system/restart-stack")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let payload = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if !status.is_success() {
+                    return (
+                        StatusCode::from_u16(status.as_u16())
+                            .unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "message": payload.get("message").and_then(|value| value.as_str()).unwrap_or("Failed to restart AgentArk services."),
+                            "details": payload
+                        })),
+                    )
+                        .into_response();
+                }
+
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": payload.get("status").and_then(|value| value.as_str()).unwrap_or("restarting"),
+                        "message": payload.get("message").and_then(|value| value.as_str()).unwrap_or("AgentArk services are restarting."),
+                        "services": payload.get("services").cloned().unwrap_or_else(|| serde_json::json!([]))
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "message": format!("Failed to reach executor for split-stack restart: {}", error)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    tracing::info!("Restart requested via API - shutting down local server process");
     tokio::spawn(async {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         std::process::exit(0);
@@ -20776,7 +25705,8 @@ async fn list_models(State(state): State<AppState>) -> Response {
         .model_pool
         .slots
         .iter()
-        .map(|slot| {
+        .enumerate()
+        .map(|(idx, slot)| {
             let (prov, mdl, burl, has_key) = match &slot.provider {
                 LlmProvider::Ollama { base_url, model } => (
                     "ollama".to_string(),
@@ -20795,11 +25725,8 @@ async fn list_models(State(state): State<AppState>) -> Response {
                     model,
                     base_url,
                 } => {
-                    let p = provider_label_for_openai(base_url);
-                    let display_base_url = match base_url.as_deref() {
-                        Some(url) if is_codex_cli_base_url(url) => None,
-                        _ => base_url.clone(),
-                    };
+                    let p = openai_provider_label(base_url.as_deref());
+                    let display_base_url = display_openai_base_url(base_url.as_ref());
                     (
                         p.to_string(),
                         model.clone(),
@@ -20816,7 +25743,7 @@ async fn list_models(State(state): State<AppState>) -> Response {
                 ModelRole::Fallback => "fallback",
             };
             ModelSlotSummary {
-                id: slot.id.clone(),
+                id: model_slot_response_id(slot, idx),
                 label: slot.label.clone(),
                 role: role_str.to_string(),
                 provider: prov,
@@ -20838,110 +25765,502 @@ async fn list_models(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+const MODEL_SLOT_INDEX_ID_PREFIX: &str = "__slot_idx_";
+
+fn model_slot_response_id(slot: &ModelSlot, index: usize) -> String {
+    let trimmed = slot.id.trim();
+    if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{}{}", MODEL_SLOT_INDEX_ID_PREFIX, index)
+    }
+}
+
+fn model_role_from_external_id(value: &str) -> Option<ModelRole> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "primary" => Some(ModelRole::Primary),
+        "fast" => Some(ModelRole::Fast),
+        "code" => Some(ModelRole::Code),
+        "research" => Some(ModelRole::Research),
+        "fallback" => Some(ModelRole::Fallback),
+        _ => None,
+    }
+}
+
+fn resolve_model_slot_index(slots: &[ModelSlot], requested_id: &str) -> Option<usize> {
+    let requested = requested_id.trim();
+    if requested.is_empty() {
+        return None;
+    }
+
+    if let Some(idx) = slots.iter().position(|slot| slot.id.trim() == requested) {
+        return Some(idx);
+    }
+
+    if let Some(raw_idx) = requested.strip_prefix(MODEL_SLOT_INDEX_ID_PREFIX) {
+        if let Ok(idx) = raw_idx.parse::<usize>() {
+            if idx < slots.len() {
+                return Some(idx);
+            }
+        }
+    }
+
+    if let Some(idx) = slots
+        .iter()
+        .position(|slot| slot.label.trim().eq_ignore_ascii_case(requested))
+    {
+        return Some(idx);
+    }
+
+    if let Some(role) = model_role_from_external_id(requested) {
+        let mut matches = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| (slot.role == role).then_some(idx));
+        let first = matches.next();
+        if matches.next().is_none() {
+            return first;
+        }
+
+        let requested_prefix = format!("{}_", requested.to_ascii_lowercase());
+        if let Some(idx) = slots.iter().position(|slot| {
+            slot.id
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with(&requested_prefix)
+        }) {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+fn model_slot_has_runtime_credentials(slot: &ModelSlot) -> bool {
+    match &slot.provider {
+        LlmProvider::Ollama { base_url, .. } => !base_url.trim().is_empty(),
+        LlmProvider::Anthropic { api_key, .. } | LlmProvider::OpenAI { api_key, .. } => {
+            !api_key.trim().is_empty() && api_key != "[ENCRYPTED]"
+        }
+    }
+}
+
+fn model_slot_is_runtime_ready(agent: &Agent, slot: &ModelSlot) -> bool {
+    slot.enabled
+        && agent.model_pool.contains_key(&slot.id)
+        && model_slot_has_runtime_credentials(slot)
+}
+
+fn resolve_primary_model_slot_id(agent: &Agent, preferred_slot_id: Option<&str>) -> String {
+    let slots = &agent.config.model_pool.slots;
+    let preferred = preferred_slot_id.and_then(|slot_id| {
+        slots
+            .iter()
+            .find(|slot| slot.id == slot_id && model_slot_is_runtime_ready(agent, slot))
+            .or_else(|| slots.iter().find(|slot| slot.id == slot_id && slot.enabled))
+    });
+    if let Some(slot) = preferred {
+        return slot.id.clone();
+    }
+
+    let current = slots
+        .iter()
+        .find(|slot| slot.id == agent.primary_model_id && model_slot_is_runtime_ready(agent, slot));
+    if let Some(slot) = current {
+        return slot.id.clone();
+    }
+
+    let current_enabled = slots
+        .iter()
+        .find(|slot| slot.id == agent.primary_model_id && slot.enabled);
+    if let Some(slot) = current_enabled {
+        return slot.id.clone();
+    }
+
+    for predicate in [
+        ModelRole::Primary,
+        ModelRole::Fast,
+        ModelRole::Code,
+        ModelRole::Research,
+        ModelRole::Fallback,
+    ] {
+        if let Some(slot) = slots
+            .iter()
+            .find(|slot| slot.role == predicate && model_slot_is_runtime_ready(agent, slot))
+        {
+            return slot.id.clone();
+        }
+    }
+
+    if let Some(slot) = slots
+        .iter()
+        .find(|slot| model_slot_is_runtime_ready(agent, slot))
+    {
+        return slot.id.clone();
+    }
+
+    if let Some(slot) = slots
+        .iter()
+        .find(|slot| slot.role == ModelRole::Primary && slot.enabled)
+    {
+        return slot.id.clone();
+    }
+
+    if let Some(slot) = slots.iter().find(|slot| slot.enabled) {
+        return slot.id.clone();
+    }
+
+    slots
+        .first()
+        .map(|slot| slot.id.clone())
+        .unwrap_or_default()
+}
+
+fn sync_legacy_chat_model_from_slots(agent: &mut Agent) {
+    let chosen_slot = agent
+        .config
+        .model_pool
+        .slots
+        .iter()
+        .find(|slot| slot.id == agent.primary_model_id)
+        .or_else(|| agent.config.model_pool.slots.first())
+        .cloned();
+
+    if let Some(slot) = chosen_slot {
+        agent.config.llm = slot.provider.clone();
+        if let Ok(client) = crate::core::LlmClient::new(&slot.provider) {
+            agent.llm = client;
+        }
+    } else {
+        agent.config.llm = crate::core::LlmProvider::Ollama {
+            base_url: String::new(),
+            model: String::new(),
+        };
+        agent.config.llm_fallback = None;
+        if let Ok(client) = crate::core::LlmClient::new(&agent.config.llm) {
+            agent.llm = client;
+        }
+    }
+}
+
+fn reconcile_model_pool_state(agent: &mut Agent, preferred_primary_slot_id: Option<&str>) {
+    agent.primary_model_id = resolve_primary_model_slot_id(agent, preferred_primary_slot_id);
+    sync_legacy_chat_model_from_slots(agent);
+}
+
+fn legacy_llm_is_unconfigured_placeholder(config: &crate::core::config::AgentConfig) -> bool {
+    config.model_pool.slots.is_empty()
+        && config.llm_fallback.is_none()
+        && matches!(
+            &config.llm,
+            LlmProvider::Ollama { base_url, model }
+                if model.trim().is_empty() && base_url.trim().is_empty()
+        )
+}
+
+fn legacy_llm_is_explicitly_configured(config: &crate::core::config::AgentConfig) -> bool {
+    match &config.llm {
+        LlmProvider::Ollama { base_url, model } => {
+            !base_url.trim().is_empty() && !model.trim().is_empty()
+        }
+        LlmProvider::Anthropic { model, .. } => !model.trim().is_empty(),
+        LlmProvider::OpenAI {
+            model, base_url, ..
+        } => {
+            !model.trim().is_empty()
+                && (base_url.is_none()
+                    || base_url.as_ref().is_some_and(|url| !url.trim().is_empty()))
+        }
+    }
+}
+
+fn settings_has_configured_legacy_llm(
+    config: &crate::core::config::AgentConfig,
+    has_key: bool,
+) -> bool {
+    if legacy_llm_is_unconfigured_placeholder(config) {
+        return false;
+    }
+
+    match &config.llm {
+        LlmProvider::Ollama { .. } => legacy_llm_is_explicitly_configured(config),
+        LlmProvider::Anthropic { .. } => has_key && legacy_llm_is_explicitly_configured(config),
+        LlmProvider::OpenAI { base_url, .. } => {
+            has_key
+                && legacy_llm_is_explicitly_configured(config)
+                && (base_url.is_none()
+                    || !base_url.as_ref().is_some_and(|url| url.trim().is_empty()))
+        }
+    }
+}
+
+fn well_known_anthropic_models() -> Vec<serde_json::Value> {
+    vec![
+        "claude-opus-4-20250514",
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    ]
+    .into_iter()
+    .map(|id| serde_json::json!({ "id": id }))
+    .collect()
+}
+
+fn collect_model_catalog_rows(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body.get("data")
+        .or_else(|| body.get("models"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn filter_openai_chat_model_ids(ids: &mut Vec<String>) {
+    ids.retain(|id| {
+        (id.starts_with("gpt-")
+            || id.starts_with("o1")
+            || id.starts_with("o3")
+            || id.starts_with("o4")
+            || id.starts_with("chatgpt-"))
+            && !id.contains("codex")
+            && !id.contains("realtime")
+            && !id.contains("audio")
+            && !id.contains("tts")
+            && !id.contains("whisper")
+            && !id.contains("dall-e")
+            && !id.contains("embedding")
+            && !id.contains("moderation")
+            && !id.ends_with("-instruct")
+    });
+    ids.sort();
+    ids.dedup();
+    ids.sort_by(|a, b| {
+        let rank = |s: &str| -> u8 {
+            if s.contains("5.2") {
+                0
+            } else if s.contains("5.1") {
+                1
+            } else if s.starts_with("gpt-5") && !s.contains('.') {
+                2
+            } else if s.starts_with("o4") {
+                3
+            } else if s.starts_with("o3") {
+                4
+            } else if s.contains("4.1") {
+                5
+            } else if s.contains("4o") {
+                6
+            } else {
+                10
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+}
+
+async fn fetch_openai_catalog_models(
+    client: &reqwest::Client,
+    provider_id: &str,
+    base_url: Option<&str>,
+    api_key: &str,
+) -> std::result::Result<Vec<serde_json::Value>, String> {
+    let mut request_config = resolve_openai_request_config(client, api_key, base_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let endpoint = format!("{}/models", request_config.base_url);
+
+    let mut request = client.get(&endpoint);
+    if !request_config.api_key.trim().is_empty() {
+        request = request.bearer_auth(&request_config.api_key);
+    }
+    if request_config.is_openrouter {
+        request = request
+            .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+            .header("X-Title", crate::branding::PRODUCT_NAME);
+    }
+
+    let mut response = request.send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED && request_config.uses_codex_cli_oauth
+    {
+        let refreshed = force_refresh_codex_cli_api_key(client)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        request_config.api_key = refreshed;
+        let mut retry = client.get(&endpoint);
+        if !request_config.api_key.trim().is_empty() {
+            retry = retry.bearer_auth(&request_config.api_key);
+        }
+        if request_config.is_openrouter {
+            retry = retry
+                .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                .header("X-Title", crate::branding::PRODUCT_NAME);
+        }
+        response = retry.send().await.map_err(|e| e.to_string())?;
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Provider returned {}: {}", status, text.trim()));
+    }
+
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    let rows = collect_model_catalog_rows(&body);
+    if provider_id == "openai" || provider_id == "openai-subscription" {
+        let mut ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get("id").and_then(|value| value.as_str()))
+            .map(|value| value.to_string())
+            .collect();
+        filter_openai_chat_model_ids(&mut ids);
+        return Ok(ids
+            .into_iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect());
+    }
+
+    let mut rows: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            let name = row
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string());
+            Some((id, name))
+        })
+        .collect();
+    rows.sort_by(|(left_id, left_name), (right_id, right_name)| {
+        left_id.cmp(right_id).then_with(|| {
+            left_name
+                .as_deref()
+                .unwrap_or("")
+                .cmp(right_name.as_deref().unwrap_or(""))
+        })
+    });
+    rows.dedup_by(|left, right| left.0 == right.0);
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| match name {
+            Some(name) => serde_json::json!({ "id": id, "name": name }),
+            None => serde_json::json!({ "id": id }),
+        })
+        .collect())
+}
+
 /// Discover available models from a provider API
 async fn discover_provider_models(
     Path(provider): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    let Some(provider_id) = canonical_provider_id(provider.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown provider: {}", provider) })),
+        )
+            .into_response();
+    };
+    if !provider_allows_model_discovery(provider_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Provider does not support discovery: {}", provider_id) })),
+        )
+            .into_response();
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
 
-    let models: Vec<serde_json::Value> = match provider.as_str() {
-        "openai" | "openai-subscription" => {
-            let api_key = if provider == "openai-subscription" {
-                read_codex_cli_api_key().unwrap_or_default()
-            } else {
-                params.get("api_key").cloned().unwrap_or_default()
-            };
-            if api_key.is_empty() {
+    let models: Vec<serde_json::Value> = match provider_id {
+        "openai" => {
+            let api_key = params
+                .get("api_key")
+                .map(String::as_str)
+                .unwrap_or_default();
+            if api_key.trim().is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "error": "No API key available" })),
                 )
                     .into_response();
             }
-            let base = params
-                .get("base_url")
-                .map(|s| s.as_str())
-                .unwrap_or("https://api.openai.com/v1");
-            let resp = client
-                .get(format!("{}/models", base))
-                .header("Authorization", format!("Bearer {}", api_key))
-                .send()
-                .await;
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let body: serde_json::Value = r.json().await.unwrap_or_default();
-                    let mut ids: Vec<String> = body["data"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // Filter to chat-completions-capable models
-                    // Exclude codex models (Responses API only, not Chat Completions)
-                    ids.retain(|id| {
-                        (id.starts_with("gpt-")
-                            || id.starts_with("o1")
-                            || id.starts_with("o3")
-                            || id.starts_with("o4")
-                            || id.starts_with("chatgpt-"))
-                            && !id.contains("codex")
-                            && !id.contains("realtime")
-                            && !id.contains("audio")
-                            && !id.contains("tts")
-                            && !id.contains("whisper")
-                            && !id.contains("dall-e")
-                            && !id.contains("embedding")
-                            && !id.contains("moderation")
-                            && !id.ends_with("-instruct")
-                    });
-                    ids.sort();
-                    ids.dedup();
-                    // Sort: prefer newer/larger models first
-                    ids.sort_by(|a, b| {
-                        let rank = |s: &str| -> u8 {
-                            if s.contains("5.2") {
-                                0
-                            } else if s.contains("5.1") {
-                                1
-                            } else if s.starts_with("gpt-5") && !s.contains('.') {
-                                2
-                            } else if s.starts_with("o4") {
-                                3
-                            } else if s.starts_with("o3") {
-                                4
-                            } else if s.contains("4.1") {
-                                5
-                            } else if s.contains("4o") {
-                                6
-                            } else {
-                                10
-                            }
-                        };
-                        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-                    });
-                    ids.into_iter()
-                        .map(|id| serde_json::json!({ "id": id }))
-                        .collect()
-                }
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    let text = r.text().await.unwrap_or_default();
+            match fetch_openai_catalog_models(&client, provider_id, None, api_key).await {
+                Ok(models) => models,
+                Err(error) => {
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": format!("Provider returned {}: {}", status, text) })),
+                        Json(serde_json::json!({ "error": error })),
                     )
                         .into_response();
                 }
-                Err(e) => {
+            }
+        }
+        "openai-subscription" => {
+            let connected = resolve_codex_cli_api_key(&client, false)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if !connected {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": "OpenAI Subscription is not connected yet" }),
+                    ),
+                )
+                    .into_response();
+            }
+            match fetch_openai_catalog_models(&client, provider_id, Some(CODEX_CLI_BASE_URL), "")
+                .await
+            {
+                Ok(models) => models,
+                Err(error) => {
                     return (
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": format!("Failed to reach provider: {}", e) })),
+                        Json(serde_json::json!({ "error": error })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "openai-compatible" => {
+            let Some(base_url) = params
+                .get("base_url")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Base URL is required for OpenAI-Compatible providers" })),
+                )
+                    .into_response();
+            };
+            match fetch_openai_catalog_models(
+                &client,
+                provider_id,
+                Some(base_url),
+                params
+                    .get("api_key")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+            .await
+            {
+                Ok(models) => models,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": error })),
                     )
                         .into_response();
                 }
@@ -20950,18 +26269,9 @@ async fn discover_provider_models(
         "anthropic" => {
             let api_key = params.get("api_key").cloned().unwrap_or_default();
             if api_key.is_empty() {
-                // Return well-known Anthropic models as fallback
-                let known = vec![
-                    "claude-opus-4-20250514",
-                    "claude-sonnet-4-20250514",
-                    "claude-3-7-sonnet-latest",
-                    "claude-3-5-haiku-latest",
-                ];
                 return (
                     StatusCode::OK,
-                    Json(serde_json::json!({
-                        "models": known.into_iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>()
-                    })),
+                    Json(serde_json::json!({ "models": well_known_anthropic_models() })),
                 )
                     .into_response();
             }
@@ -20974,38 +26284,30 @@ async fn discover_provider_models(
             match resp {
                 Ok(r) if r.status().is_success() => {
                     let body: serde_json::Value = r.json().await.unwrap_or_default();
-                    let mut ids: Vec<String> = body["data"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
-                                .collect()
+                    let mut ids: Vec<String> = collect_model_catalog_rows(&body)
+                        .into_iter()
+                        .filter_map(|m| {
+                            m.get("id")
+                                .and_then(|value| value.as_str())
+                                .map(|s| s.to_string())
                         })
-                        .unwrap_or_default();
+                        .collect();
                     ids.sort();
                     ids.into_iter()
                         .map(|id| serde_json::json!({ "id": id }))
                         .collect()
                 }
-                _ => {
-                    // Fallback to well-known
-                    vec![
-                        "claude-opus-4-20250514",
-                        "claude-sonnet-4-20250514",
-                        "claude-3-7-sonnet-latest",
-                        "claude-3-5-haiku-latest",
-                    ]
-                    .into_iter()
-                    .map(|id| serde_json::json!({ "id": id }))
-                    .collect()
-                }
+                _ => well_known_anthropic_models(),
             }
         }
         "ollama" => {
-            let base = params
-                .get("base_url")
-                .map(|s| s.as_str())
-                .unwrap_or("http://localhost:11434");
+            let Some(base) = params.get("base_url").map(|s| s.as_str()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Base URL is required for Ollama" })),
+                )
+                    .into_response();
+            };
             let resp = client.get(format!("{}/api/tags", base)).send().await;
             match resp {
                 Ok(r) if r.status().is_success() => {
@@ -21026,7 +26328,7 @@ async fn discover_provider_models(
         }
         "openrouter" => {
             let resp = client
-                .get("https://openrouter.ai/api/v1/models")
+                .get(OPENROUTER_API_BASE_URL.to_string() + "/models")
                 .send()
                 .await;
             match resp {
@@ -21051,7 +26353,7 @@ async fn discover_provider_models(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Unknown provider: {}", provider) })),
+                Json(serde_json::json!({ "error": format!("Unknown provider: {}", provider_id) })),
             )
                 .into_response();
         }
@@ -21089,7 +26391,7 @@ async fn add_model(
             }
         };
 
-        let provider = match provider_from_model_slot_request(&request, None) {
+        let provider = match provider_from_model_slot_request(&request, None).await {
             Ok(provider) => provider,
             Err(error) => {
                 return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
@@ -21126,10 +26428,6 @@ async fn add_model(
         match crate::core::LlmClient::new(&provider) {
             Ok(client) => {
                 agent.model_pool.insert(slot_id.clone(), (slot, client));
-                // Update primary_model_id if this is a primary and none exists
-                if request.role == "primary" && agent.primary_model_id.is_empty() {
-                    agent.primary_model_id = slot_id.clone();
-                }
             }
             Err(e) => {
                 return (
@@ -21142,13 +26440,12 @@ async fn add_model(
             }
         }
 
-        // Also keep legacy llm in sync if this is primary
-        if request.role == "primary" {
-            agent.config.llm = provider.clone();
-            if let Ok(client) = crate::core::LlmClient::new(&provider) {
-                agent.llm = client;
-            }
-        }
+        let preferred_primary = if request.role == "primary" {
+            Some(slot_id.as_str())
+        } else {
+            None
+        };
+        reconcile_model_pool_state(&mut agent, preferred_primary);
 
         let provider_for_probe = provider.clone();
         agent
@@ -21159,20 +26456,9 @@ async fn add_model(
 
     match result {
         Ok(provider_for_probe) => {
-            // Push LLM config to Mem0 sidecar in background
-            let agent = state.agent.read().await;
-            if let Some((slot, _)) = agent.model_pool.values().next() {
-                let provider = slot.provider.clone();
-                let mem0 = agent.mem0.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = mem0.configure(&provider).await {
-                        tracing::warn!("Mem0 configure after model add failed: {}", e);
-                    } else if let Err(e) = mem0.warmup().await {
-                        tracing::warn!("Mem0 warmup after model add failed: {}", e);
-                    }
-                });
-            }
-            drop(agent);
+            tracing::debug!(
+                "Vector memory backend retains its current configuration after model add."
+            );
             let connectivity = match test_llm_connection(&provider_for_probe).await {
                 Ok(_) => serde_json::json!({ "ok": true }),
                 Err(error) => serde_json::json!({ "ok": false, "error": error }),
@@ -21206,12 +26492,7 @@ async fn update_model(
     let result = {
         let mut agent = state.agent.write().await;
 
-        let slot_idx = agent
-            .config
-            .model_pool
-            .slots
-            .iter()
-            .position(|s| s.id == id);
+        let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, &id);
         let Some(idx) = slot_idx else {
             return (
                 StatusCode::NOT_FOUND,
@@ -21239,6 +26520,23 @@ async fn update_model(
             }
         };
 
+        let previous_slot_id = agent.config.model_pool.slots[idx].id.trim().to_string();
+        let slot_id = if !previous_slot_id.is_empty() {
+            previous_slot_id.clone()
+        } else if !id.trim().is_empty() && !id.trim().starts_with(MODEL_SLOT_INDEX_ID_PREFIX) {
+            id.trim().to_string()
+        } else {
+            format!(
+                "{}_{}",
+                request.role,
+                uuid::Uuid::new_v4()
+                    .to_string()
+                    .split('-')
+                    .next()
+                    .unwrap_or("x")
+            )
+        };
+
         // Preserve existing API key if not provided.
         // If in-memory slot key is placeholder, recover the real value from encrypted secrets.
         let mut existing_key = match &agent.config.model_pool.slots[idx].provider {
@@ -21255,11 +26553,17 @@ async fn update_model(
                 Some(&agent.data_dir),
             ) {
                 if let Ok(secrets) = secure.load_secrets() {
-                    existing_key = secrets.model_pool_keys.get(&id).cloned();
+                    existing_key = secrets
+                        .model_pool_keys
+                        .get(&previous_slot_id)
+                        .cloned()
+                        .or_else(|| secrets.model_pool_keys.get(id.trim()).cloned())
+                        .or_else(|| secrets.model_pool_keys.get(request.role.trim()).cloned())
+                        .or_else(|| secrets.model_pool_keys.get(request.label.trim()).cloned());
                 }
             }
         }
-        let provider = match provider_from_model_slot_request(&request, existing_key) {
+        let provider = match provider_from_model_slot_request(&request, existing_key).await {
             Ok(provider) => provider,
             Err(error) => {
                 return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
@@ -21271,7 +26575,7 @@ async fn update_model(
             .unwrap_or(agent.config.model_pool.slots[idx].enabled);
 
         let slot = ModelSlot {
-            id: id.clone(),
+            id: slot_id.clone(),
             label: request.label.clone(),
             role,
             provider: provider.clone(),
@@ -21286,20 +26590,21 @@ async fn update_model(
         agent.config.model_pool.slots[idx] = slot.clone();
 
         // Update runtime pool
-        agent.model_pool.remove(&id);
+        if !previous_slot_id.is_empty() {
+            agent.model_pool.remove(&previous_slot_id);
+        }
         if enabled {
             if let Ok(client) = crate::core::LlmClient::new(&provider) {
-                agent.model_pool.insert(id.clone(), (slot, client));
+                agent.model_pool.insert(slot_id.clone(), (slot, client));
             }
         }
 
-        // Keep legacy llm in sync
-        if request.role == "primary" {
-            agent.config.llm = provider.clone();
-            if let Ok(client) = crate::core::LlmClient::new(&provider) {
-                agent.llm = client;
-            }
-        }
+        let preferred_primary = if request.role == "primary" && enabled {
+            Some(slot_id.as_str())
+        } else {
+            None
+        };
+        reconcile_model_pool_state(&mut agent, preferred_primary);
 
         let provider_for_probe = provider.clone();
         agent
@@ -21310,20 +26615,9 @@ async fn update_model(
 
     match result {
         Ok(provider_for_probe) => {
-            // Push updated LLM config to Mem0 sidecar in background
-            let agent = state.agent.read().await;
-            if let Some((slot, _)) = agent.model_pool.values().next() {
-                let provider = slot.provider.clone();
-                let mem0 = agent.mem0.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = mem0.configure(&provider).await {
-                        tracing::warn!("Mem0 configure after model update failed: {}", e);
-                    } else if let Err(e) = mem0.warmup().await {
-                        tracing::warn!("Mem0 warmup after model update failed: {}", e);
-                    }
-                });
-            }
-            drop(agent);
+            tracing::debug!(
+                "Vector memory backend retains its current configuration after model update."
+            );
             let connectivity = match test_llm_connection(&provider_for_probe).await {
                 Ok(_) => serde_json::json!({ "ok": true }),
                 Err(error) => serde_json::json!({ "ok": false, "error": error }),
@@ -21353,12 +26647,7 @@ async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> 
     let result = {
         let mut agent = state.agent.write().await;
 
-        let slot_idx = agent
-            .config
-            .model_pool
-            .slots
-            .iter()
-            .position(|s| s.id == id);
+        let slot_idx = resolve_model_slot_index(&agent.config.model_pool.slots, &id);
         let Some(idx) = slot_idx else {
             return (
                 StatusCode::NOT_FOUND,
@@ -21369,13 +26658,42 @@ async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> 
                 .into_response();
         };
 
+        let requested_id = id.trim().to_string();
+        let resolved_slot_id = agent.config.model_pool.slots[idx].id.trim().to_string();
         agent.config.model_pool.slots.remove(idx);
-        agent.model_pool.remove(&id);
-
-        // If we removed the primary, promote the next one
-        if agent.primary_model_id == id {
-            agent.primary_model_id = agent.model_pool.keys().next().cloned().unwrap_or_default();
+        if !resolved_slot_id.is_empty() {
+            agent.model_pool.remove(&resolved_slot_id);
         }
+        if !requested_id.is_empty() && requested_id != resolved_slot_id {
+            agent.model_pool.remove(&requested_id);
+        }
+
+        if let Ok(mut selected_slot_id) = agent.user_selected_model_slot_id.write() {
+            if selected_slot_id.as_deref() == Some(resolved_slot_id.as_str())
+                || (!requested_id.is_empty()
+                    && selected_slot_id.as_deref() == Some(requested_id.as_str()))
+            {
+                *selected_slot_id = None;
+            }
+        }
+        let _ = agent.storage.delete("user_selected_model_slot_v1").await;
+
+        if let Ok(manager) = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &agent.config_dir,
+            Some(&agent.data_dir),
+        ) {
+            let _ = manager.update_secrets(|secrets| {
+                if !resolved_slot_id.is_empty() {
+                    secrets.model_pool_keys.remove(&resolved_slot_id);
+                }
+                if !requested_id.is_empty() && requested_id != resolved_slot_id {
+                    secrets.model_pool_keys.remove(&requested_id);
+                }
+                Ok(())
+            });
+        }
+
+        reconcile_model_pool_state(&mut agent, None);
 
         agent.config.save(&agent.config_dir, Some(&agent.data_dir))
     };
@@ -21398,9 +26716,220 @@ async fn delete_model(State(state): State<AppState>, Path(id): Path<String>) -> 
 
 // ==================== Swarm API ====================
 
+fn parse_swarm_delegation_result(
+    raw: Option<&str>,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(raw.unwrap_or_default())
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|map| map.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn swarm_result_string(
+    payload: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_swarm_agent_from_delegation(
+    row: &crate::storage::entities::swarm_delegation::Model,
+) -> crate::core::swarm::SwarmActivityAgent {
+    let payload = parse_swarm_delegation_result(row.result.as_deref());
+    let status = swarm_result_string(&payload, "status").unwrap_or_else(|| {
+        if row.completed_at.is_none() {
+            "running".to_string()
+        } else if row.success == 1 {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        }
+    });
+    let summary = swarm_result_string(&payload, "content")
+        .or_else(|| swarm_result_string(&payload, "latest_update"))
+        .or_else(|| swarm_result_string(&payload, "summary"))
+        .unwrap_or_else(|| truncate_stream_task_text(&row.task_description, 180));
+    let latest_update = swarm_result_string(&payload, "latest_update")
+        .or_else(|| swarm_result_string(&payload, "content"))
+        .or_else(|| swarm_result_string(&payload, "summary"))
+        .unwrap_or_else(|| summary.clone());
+    crate::core::swarm::SwarmActivityAgent {
+        id: row.agent_id.clone(),
+        agent_name: swarm_result_string(&payload, "agent_name")
+            .unwrap_or_else(|| row.agent_id.clone()),
+        agent_role: swarm_result_string(&payload, "agent_role")
+            .unwrap_or_else(|| "Agent".to_string()),
+        model_name: swarm_result_string(&payload, "model_name").unwrap_or_else(|| "-".to_string()),
+        task: row.task_description.clone(),
+        status,
+        summary,
+        latest_update,
+        is_specialist: payload
+            .get("is_specialist")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        depends_on: payload
+            .get("depends_on")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_u64().map(|idx| idx as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        started_at: Some(row.created_at.clone()),
+        completed_at: row.completed_at.clone(),
+        updated_at: swarm_result_string(&payload, "updated_at").unwrap_or_else(|| {
+            row.completed_at
+                .clone()
+                .unwrap_or_else(|| row.created_at.clone())
+        }),
+        elapsed_ms: payload
+            .get("elapsed_ms")
+            .and_then(|value| value.as_u64())
+            .or_else(|| row.execution_time_ms.map(|value| value.max(0) as u64)),
+    }
+}
+
+fn summarize_swarm_run_status(agents: &[crate::core::swarm::SwarmActivityAgent]) -> String {
+    if agents.iter().any(|agent| {
+        matches!(
+            agent.status.as_str(),
+            "assigned" | "running" | "synthesizing"
+        )
+    }) {
+        return "running".to_string();
+    }
+    if agents.iter().all(|agent| agent.status == "completed") {
+        return "completed".to_string();
+    }
+    if agents
+        .iter()
+        .any(|agent| matches!(agent.status.as_str(), "interrupted" | "cancelled"))
+    {
+        return "interrupted".to_string();
+    }
+    if agents.iter().any(|agent| agent.status == "completed") {
+        return "partial".to_string();
+    }
+    if agents.iter().any(|agent| agent.status == "timed_out") {
+        return "timed_out".to_string();
+    }
+    if agents.iter().any(|agent| agent.status == "panicked") {
+        return "panicked".to_string();
+    }
+    "failed".to_string()
+}
+
+fn summarize_swarm_run_text(status: &str, completed_count: usize, total_count: usize) -> String {
+    match status {
+        "running" => format!(
+            "{} of {} delegated agents active.",
+            completed_count, total_count
+        ),
+        "completed" => format!("All {} delegated agents completed.", total_count),
+        "partial" => format!(
+            "{} of {} delegated agents completed; follow-up is still needed.",
+            completed_count, total_count
+        ),
+        "interrupted" => "Delegated run was stopped before completion.".to_string(),
+        "timed_out" => "Delegated run timed out.".to_string(),
+        "panicked" => "Delegated run hit an internal failure.".to_string(),
+        _ => "Delegated run failed.".to_string(),
+    }
+}
+
+fn build_swarm_run_from_rows(
+    run_id: &str,
+    rows: &[crate::storage::entities::swarm_delegation::Model],
+) -> crate::core::swarm::SwarmActivityRun {
+    let mut agents = rows
+        .iter()
+        .map(build_swarm_agent_from_delegation)
+        .collect::<Vec<_>>();
+    agents.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let first_payload = rows
+        .first()
+        .map(|row| parse_swarm_delegation_result(row.result.as_deref()))
+        .unwrap_or_default();
+    let started_at = rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .min()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let updated_at = rows
+        .iter()
+        .map(|row| {
+            row.completed_at
+                .clone()
+                .unwrap_or_else(|| row.created_at.clone())
+        })
+        .max()
+        .unwrap_or_else(|| started_at.clone());
+    let completed_at = if rows.iter().all(|row| row.completed_at.is_some()) {
+        rows.iter().filter_map(|row| row.completed_at.clone()).max()
+    } else {
+        None
+    };
+    let status = summarize_swarm_run_status(&agents);
+    let completed_count = agents
+        .iter()
+        .filter(|agent| agent.status == "completed")
+        .count();
+    crate::core::swarm::SwarmActivityRun {
+        id: run_id.to_string(),
+        conversation_id: swarm_result_string(&first_payload, "conversation_id"),
+        channel: swarm_result_string(&first_payload, "channel"),
+        request: swarm_result_string(&first_payload, "request").unwrap_or_else(|| {
+            rows.first()
+                .map(|row| truncate_stream_task_text(&row.task_description, 220))
+                .unwrap_or_else(|| "Delegated run".to_string())
+        }),
+        status: status.clone(),
+        summary: summarize_swarm_run_text(&status, completed_count, agents.len()),
+        started_at,
+        updated_at,
+        completed_at,
+        agent_count: agents.len(),
+        agents,
+    }
+}
+
+fn sort_swarm_runs(runs: &mut [crate::core::swarm::SwarmActivityRun]) {
+    runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+}
+
 /// Swarm status overview
 async fn swarm_status(State(state): State<AppState>) -> Response {
     let agent = state.agent.read().await;
+    let mut active_runs = agent.swarm_activity.active_runs().await;
+    let mut persisted_grouped: std::collections::HashMap<
+        String,
+        Vec<crate::storage::entities::swarm_delegation::Model>,
+    > = std::collections::HashMap::new();
+    if let Ok(rows) = agent.storage.get_active_swarm_delegations(250).await {
+        for row in rows {
+            let run_id = row.parent_task_id.clone().unwrap_or_else(|| row.id.clone());
+            persisted_grouped.entry(run_id).or_default().push(row);
+        }
+    }
+    for (run_id, rows) in persisted_grouped {
+        if active_runs.iter().any(|existing| existing.id == run_id) {
+            continue;
+        }
+        active_runs.push(build_swarm_run_from_rows(&run_id, &rows));
+    }
+    sort_swarm_runs(&mut active_runs);
+    let tracked_active_agents = active_runs
+        .iter()
+        .map(|run| run.active_agent_count())
+        .sum::<usize>();
 
     if let Some(ref swarm) = agent.swarm {
         let status = swarm.status().await;
@@ -21409,8 +26938,9 @@ async fn swarm_status(State(state): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "enabled": status.enabled,
                 "total_agents": status.total_agents,
-                "active_agents": status.active_agents,
+                "active_agents": status.active_agents.max(tracked_active_agents),
                 "agents": status.agents,
+                "active_runs": active_runs,
             })),
         )
             .into_response()
@@ -21420,8 +26950,9 @@ async fn swarm_status(State(state): State<AppState>) -> Response {
             Json(serde_json::json!({
                 "enabled": true,
                 "total_agents": 0,
-                "active_agents": 0,
+                "active_agents": tracked_active_agents,
                 "agents": [],
+                "active_runs": active_runs,
             })),
         )
             .into_response()
@@ -21436,6 +26967,36 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
     } else {
         None
     };
+    let active_runs = agent.swarm_activity.active_runs().await;
+    let active_rows = agent
+        .storage
+        .get_active_swarm_delegations(250)
+        .await
+        .unwrap_or_default();
+    let recent_rows = agent
+        .storage
+        .get_recent_delegations(250)
+        .await
+        .unwrap_or_default();
+    let mut recent_by_agent_id: std::collections::HashMap<
+        String,
+        crate::core::swarm::SwarmActivityAgent,
+    > = std::collections::HashMap::new();
+    for run in &active_runs {
+        for delegated in &run.agents {
+            recent_by_agent_id.insert(delegated.id.clone(), delegated.clone());
+        }
+    }
+    for row in &active_rows {
+        recent_by_agent_id
+            .entry(row.agent_id.clone())
+            .or_insert_with(|| build_swarm_agent_from_delegation(row));
+    }
+    for row in &recent_rows {
+        recent_by_agent_id
+            .entry(row.agent_id.clone())
+            .or_insert_with(|| build_swarm_agent_from_delegation(row));
+    }
 
     match agent.storage.get_swarm_agents().await {
         Ok(agents) => {
@@ -21456,6 +27017,10 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
             let agent_infos: Vec<serde_json::Value> = agents
                 .iter()
                 .map(|a| {
+                    let agent_type = crate::core::swarm::persistence::parse_agent_type(
+                        &a.agent_type,
+                        a.system_prompt.as_deref(),
+                    );
                     let provider = crate::core::swarm::persistence::parse_llm_provider(
                         &a.llm_provider,
                         &agent.config.llm,
@@ -21463,16 +27028,7 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                     let provider_label = match &provider {
                         LlmProvider::Anthropic { .. } => "anthropic",
                         LlmProvider::OpenAI { base_url, .. } => {
-                            let base = base_url.as_deref().unwrap_or_default();
-                            if base.eq_ignore_ascii_case("codex://cli") {
-                                "openai-subscription"
-                            } else if base.contains("openrouter.ai") {
-                                "openrouter"
-                            } else if base.trim().is_empty() {
-                                "openai"
-                            } else {
-                                "openai-compatible"
-                            }
+                            openai_provider_label(base_url.as_deref())
                         }
                         LlmProvider::Ollama { .. } => "ollama",
                     };
@@ -21483,13 +27039,19 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                     };
                     let llm_base_url = match &provider {
                         LlmProvider::Anthropic { .. } => None,
-                        LlmProvider::OpenAI { base_url, .. } => base_url.clone(),
+                        LlmProvider::OpenAI { base_url, .. } => {
+                            display_openai_base_url(base_url.as_ref())
+                        }
                         LlmProvider::Ollama { base_url, .. } => Some(base_url.clone()),
                     };
                     let live = live_by_id.get(&a.id);
+                    let recent_activity = recent_by_agent_id.get(&a.id);
+                    let display_name =
+                        crate::core::task_router::display_name_for_specialist(&a.name, &agent_type);
                     serde_json::json!({
                         "id": a.id,
                         "name": a.name,
+                        "display_name": display_name,
                         "agent_type": a.agent_type,
                         "llm_provider": provider_label,
                         "llm_model": live.map(|info| info.llm_model.clone()).unwrap_or(llm_model),
@@ -21502,7 +27064,14 @@ async fn swarm_list_agents(State(state): State<AppState>) -> Response {
                         "enabled": a.enabled == 1,
                         "status": live
                             .map(|info| format!("{:?}", info.status))
-                .unwrap_or("Idle".to_string()),
+                            .or_else(|| recent_activity.map(|activity| activity.status.clone()))
+                            .unwrap_or("Idle".to_string()),
+                        "last_task": recent_activity.map(|activity| activity.task.clone()),
+                        "last_summary": recent_activity.map(|activity| activity.summary.clone()),
+                        "last_update": recent_activity.map(|activity| activity.latest_update.clone()),
+                        "last_activity_at": recent_activity
+                            .map(|activity| activity.updated_at.clone())
+                            .filter(|value| !value.trim().is_empty()),
                         "created_at": a.created_at,
                     })
                 })
@@ -21543,8 +27112,10 @@ fn build_swarm_agent_spec(
     request: &AddSwarmAgentRequest,
     existing_provider: Option<&LlmProvider>,
 ) -> std::result::Result<(LlmProvider, crate::core::swarm::SpecialistConfig), String> {
-    let swarm_base_url =
-        normalize_openai_base_url(request.llm_provider.as_str(), request.llm_base_url.clone())?;
+    let Some(llm_provider_id) = canonical_provider_id(request.llm_provider.as_str()) else {
+        return Err(format!("Unknown provider: {}", request.llm_provider));
+    };
+    let swarm_base_url = normalize_openai_base_url(llm_provider_id, request.llm_base_url.clone())?;
     let requested_api_key = request.llm_api_key.clone().unwrap_or_default();
     let preserved_api_key = existing_provider
         .and_then(|provider| match provider {
@@ -21558,30 +27129,32 @@ fn build_swarm_agent_spec(
     } else {
         requested_api_key
     };
+    let ollama_base_url = request
+        .llm_base_url
+        .clone()
+        .filter(|value| !value.trim().is_empty());
 
-    let llm_provider = match request.llm_provider.as_str() {
+    let llm_provider = match llm_provider_id {
         "anthropic" => LlmProvider::Anthropic {
             api_key: effective_api_key,
             model: request.llm_model.clone(),
         },
-        "openai" | "openai-compatible" | "openrouter" | "codex-cli" | "openai-subscription" => {
+        "openai" | "openai-compatible" | "openrouter" | "openai-subscription" => {
             LlmProvider::OpenAI {
                 api_key: effective_api_key,
                 model: request.llm_model.clone(),
-                base_url: if request.llm_provider == "openai" {
+                base_url: if llm_provider_id == "openai" {
                     None
                 } else {
                     swarm_base_url
                 },
             }
         }
-        _ => LlmProvider::Ollama {
-            base_url: request
-                .llm_base_url
-                .clone()
-                .unwrap_or("http://localhost:11434".to_string()),
+        "ollama" => LlmProvider::Ollama {
+            base_url: ollama_base_url.ok_or_else(|| "Ollama base URL is required".to_string())?,
             model: request.llm_model.clone(),
         },
+        _ => return Err(format!("Unknown provider: {}", llm_provider_id)),
     };
 
     let specialist_config = crate::core::swarm::SpecialistConfig {
@@ -21916,15 +27489,55 @@ async fn swarm_list_delegations(
 ) -> Response {
     let agent = state.agent.read().await;
     let limit_param = params.get("limit").map(|value| value.trim().to_string());
+    let limit = if matches!(limit_param.as_deref(), Some("all")) {
+        usize::MAX
+    } else {
+        limit_param
+            .as_deref()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 200)
+    };
     let delegations = match limit_param.as_deref() {
         Some("all") => agent.storage.get_all_delegations().await,
         _ => {
-            let limit = limit_param
-                .as_deref()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(50)
-                .clamp(1, 200);
-            agent.storage.get_recent_delegations(limit).await
+            let mut merged: std::collections::HashMap<
+                String,
+                crate::storage::entities::swarm_delegation::Model,
+            > = std::collections::HashMap::new();
+            for row in agent
+                .storage
+                .get_active_swarm_delegations(limit as u64)
+                .await
+                .unwrap_or_default()
+            {
+                merged.insert(row.id.clone(), row);
+            }
+            for row in agent
+                .storage
+                .get_recent_delegations(limit as u64)
+                .await
+                .unwrap_or_default()
+            {
+                merged.entry(row.id.clone()).or_insert(row);
+            }
+            let mut rows = merged.into_values().collect::<Vec<_>>();
+            rows.sort_by(|left, right| {
+                right
+                    .completed_at
+                    .clone()
+                    .unwrap_or_else(|| right.created_at.clone())
+                    .cmp(
+                        &left
+                            .completed_at
+                            .clone()
+                            .unwrap_or_else(|| left.created_at.clone()),
+                    )
+            });
+            if limit != usize::MAX && rows.len() > limit {
+                rows.truncate(limit);
+            }
+            Ok(rows)
         }
     };
     match delegations {
@@ -21932,22 +27545,57 @@ async fn swarm_list_delegations(
             let items: Vec<serde_json::Value> = delegations
                 .iter()
                 .map(|d| {
+                    let payload = parse_swarm_delegation_result(d.result.as_deref());
                     serde_json::json!({
                         "id": d.id,
+                        "parent_task_id": d.parent_task_id,
                         "agent_id": d.agent_id,
                         "task": d.task_description,
                         "success": d.success == 1,
                         "confidence": d.confidence,
                         "execution_time_ms": d.execution_time_ms,
                         "result": d.result,
+                        "status": swarm_result_string(&payload, "status"),
+                        "agent_name": swarm_result_string(&payload, "agent_name"),
+                        "agent_role": swarm_result_string(&payload, "agent_role"),
+                        "model_name": swarm_result_string(&payload, "model_name"),
+                        "conversation_id": swarm_result_string(&payload, "conversation_id"),
+                        "channel": swarm_result_string(&payload, "channel"),
                         "created_at": d.created_at,
                         "completed_at": d.completed_at,
                     })
                 })
                 .collect();
+            let mut grouped: std::collections::HashMap<
+                String,
+                Vec<crate::storage::entities::swarm_delegation::Model>,
+            > = std::collections::HashMap::new();
+            for row in delegations {
+                let run_id = row.parent_task_id.clone().unwrap_or_else(|| row.id.clone());
+                grouped.entry(run_id).or_default().push(row);
+            }
+            let mut runs = agent.swarm_activity.recent_runs(limit).await;
+            for run in agent.swarm_activity.active_runs().await {
+                if !runs.iter().any(|existing| existing.id == run.id) {
+                    runs.push(run);
+                }
+            }
+            for (run_id, rows) in grouped {
+                if runs.iter().any(|existing| existing.id == run_id) {
+                    continue;
+                }
+                runs.push(build_swarm_run_from_rows(&run_id, &rows));
+            }
+            sort_swarm_runs(&mut runs);
+            if limit != usize::MAX && runs.len() > limit {
+                runs.truncate(limit);
+            }
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "delegations": items })),
+                Json(serde_json::json!({
+                    "delegations": items,
+                    "runs": runs,
+                })),
             )
                 .into_response()
         }
@@ -22613,6 +28261,13 @@ async fn update_autonomy_settings(
             settings.modes = parsed;
         }
     }
+    if let Some(sentinel) = request.get("sentinel") {
+        if let Ok(parsed) =
+            serde_json::from_value::<crate::core::autonomy::SentinelSettings>(sentinel.clone())
+        {
+            settings.sentinel = parsed;
+        }
+    }
 
     match save_autonomy_settings(&agent, &settings).await {
         Ok(_) => (
@@ -22786,13 +28441,71 @@ async fn execute_autonomy_action(
             if !request.dry_run {
                 spawn_autonomy_analysis_tick(state.agent.clone(), "autonomy_action");
             }
+            let summary = summarize_autonomy_action_result(&request.action, &result);
+            let trace_id_from_result = result
+                .get("trace_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string());
+            drop(agent);
+            let trace_id = if request.dry_run {
+                None
+            } else if trace_id_from_result.is_some() {
+                trace_id_from_result
+            } else {
+                persist_autonomy_action_trace(
+                    &state,
+                    &request.action,
+                    result
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("executed"),
+                    &summary,
+                    serde_json::json!({
+                        "action": request.action.clone(),
+                        "result": result.clone(),
+                    }),
+                )
+                .await
+            };
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status":"ok","result":result})),
+                Json(serde_json::json!({
+                    "status":"ok",
+                    "message": summary,
+                    "trace_id": trace_id,
+                    "result": result
+                })),
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response(),
+        Err(error) => {
+            drop(agent);
+            let trace_id = if request.dry_run {
+                None
+            } else {
+                persist_autonomy_action_trace(
+                    &state,
+                    &request.action,
+                    "error",
+                    &error,
+                    serde_json::json!({
+                        "action": request.action.clone(),
+                        "error": error.clone(),
+                    }),
+                )
+                .await
+            };
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "trace_id": trace_id,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -22821,58 +28534,51 @@ async fn start_goal_loop(
 
     let agent = state.agent.read().await;
     let actions = agent.runtime.list_actions().await.unwrap_or_default();
-    let action_names: Vec<String> = actions.iter().map(|a| a.name.clone()).collect();
-    let planner_prompt = format!(
-        "Create a compact execution plan for this goal as strict JSON.\n\
-Return format:\n\
-{{\"summary\":\"...\",\"steps\":[{{\"title\":\"...\",\"action\":\"...\",\"arguments\":{{}},\"why\":\"...\"}}]}}\n\
-Use only known actions when possible: {}\n\
-Goal: {}\n\
-Constraints: {}",
-        action_names.join(", "),
+    let planner_request = format!(
+        "Goal: {}\nConstraints: {}",
         goal,
-        request.constraints.clone().unwrap_or("none".to_string())
+        request
+            .constraints
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
     );
-
-    let llm_plan = agent
-        .llm
-        .chat(
-            "You are an execution planner that outputs strict JSON.",
-            &planner_prompt,
-            &[],
+    let override_plan = request.plan_override.as_ref().and_then(|value| {
+        crate::core::planner::parse_plan_from_value(value, &actions, None, 1, false)
+    });
+    let planned = if let Some(plan) = override_plan {
+        Some(plan)
+    } else {
+        let (planner_system, planner_prompt) = crate::core::planner::build_plan_prompt(
+            &planner_request,
+            None,
             &actions,
+            crate::core::PlanPromptMode::GoalLoop,
+            None,
+        );
+        match agent
+            .llm
+            .chat(&planner_system, &planner_prompt, &[], &actions)
+            .await
+        {
+            Ok(response) => crate::core::planner::parse_plan_from_llm_content(
+                &response.content,
+                &actions,
+                None,
+                1,
+                false,
+            ),
+            Err(_) => None,
+        }
+    };
+    let Some(parsed) = planned else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Planner returned invalid JSON".to_string(),
+            }),
         )
-        .await
-        .ok();
-
-    let parsed = llm_plan
-        .as_ref()
-        .and_then(|r| extract_json(&r.content))
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "summary": format!("Execution loop for {}", goal),
-                "steps": [
-                    {
-                        "title": "Research latest constraints and options",
-                        "action": if action_names.iter().any(|a| a == "research") {
-                            "research".to_string()
-                        } else {
-                            action_names
-                                .first()
-                                .cloned()
-                                .unwrap_or("daily_brief".to_string())
-                        },
-                        "arguments": { "query": goal }
-                    }
-                ]
-            })
-        });
-    let parsed = request
-        .plan_override
-        .as_ref()
-        .filter(|v| v.is_object())
-        .cloned()
-        .unwrap_or(parsed);
+            .into_response();
+    };
 
     let report_cron = request
         .report_cron
@@ -22947,36 +28653,50 @@ Constraints: {}",
         }
     }
 
-    let steps = parsed
-        .get("steps")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let normalized_steps: Vec<serde_json::Value> = steps
+    let action_names: Vec<String> = actions.iter().map(|a| a.name.clone()).collect();
+    let normalized_steps: Vec<serde_json::Value> = parsed
+        .steps
         .iter()
-        .map(|step| {
+        .filter_map(|step| {
             let action_name = step
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("research");
-            let safe_action = if action_names.iter().any(|n| n == action_name) {
+                .action
+                .as_deref()
+                .or(step.tool_hint.as_deref())
+                .unwrap_or("");
+            if action_name.is_empty() {
+                return None;
+            }
+            let safe_action = if action_names.iter().any(|name| name == action_name) {
                 action_name
             } else {
-                "research"
+                return None;
             };
             let mut args = step
-                .get("arguments")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
+                .arguments
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
             args["goal_id"] = serde_json::json!(goal_id.clone());
             args["goal"] = serde_json::json!(goal);
-            serde_json::json!({
+            Some(serde_json::json!({
                 "action": safe_action,
                 "arguments": args,
-                "rationale": step.get("why").and_then(|v| v.as_str()).unwrap_or("goal-driven step"),
-            })
+                "rationale": if step.description.trim().is_empty() {
+                    "goal-driven step"
+                } else {
+                    step.description.trim()
+                },
+            }))
         })
         .collect();
+    if normalized_steps.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Planner returned no runnable goal steps".to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let mut plan_task = Task::new(
         format!("Goal Loop Plan: {}", goal),
@@ -22984,7 +28704,8 @@ Constraints: {}",
         serde_json::json!({
             "goal_id": goal_id,
             "steps": normalized_steps,
-            "summary": parsed.get("summary").cloned().unwrap_or(serde_json::json!("")),
+            "summary": parsed.summary.clone(),
+            "plan": parsed.clone(),
         }),
     );
     plan_task.status = TaskStatus::Pending;
@@ -23641,11 +29362,32 @@ async fn query_knowledge_brain(
         .search_documents(&request.query, limit, request.project_id.as_deref())
         .await
         .unwrap_or_default();
-    let facts = agent
-        .encrypted_storage
-        .get_facts_by_project_decrypted(limit as u64, 0, request.project_id.as_deref())
-        .await
-        .unwrap_or_default();
+    let facts = if let Some(project_id) = request.project_id.as_deref() {
+        let mut merged = agent
+            .encrypted_storage
+            .get_facts_by_project_decrypted(limit as u64, 0, Some(project_id))
+            .await
+            .unwrap_or_default();
+        if merged.len() < limit {
+            let remaining = (limit - merged.len()) as u64;
+            let global = agent
+                .encrypted_storage
+                .get_global_facts_decrypted(remaining, 0)
+                .await
+                .unwrap_or_default();
+            merged.extend(global);
+        }
+        merged
+    } else {
+        agent
+            .encrypted_storage
+            .get_facts_decrypted()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .collect()
+    };
 
     let evidence_docs: Vec<serde_json::Value> = docs
         .iter()
@@ -23764,449 +29506,28 @@ async fn suggest_knowledge_imports(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn load_nudge_feedback(agent: &Agent) -> HashMap<String, NudgeFeedbackPreference> {
-    agent
-        .storage
-        .get(AUTONOMY_NUDGE_FEEDBACK_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| {
-            serde_json::from_slice::<HashMap<String, NudgeFeedbackPreference>>(&raw).ok()
-        })
-        .unwrap_or_default()
-}
-
-async fn save_nudge_feedback(agent: &Agent, map: &HashMap<String, NudgeFeedbackPreference>) {
-    if let Ok(raw) = serde_json::to_vec(map) {
-        let _ = agent.storage.set(AUTONOMY_NUDGE_FEEDBACK_KEY, &raw).await;
-    }
-}
-
-async fn load_nudge_timestamps(agent: &Agent, key: &str) -> HashMap<String, String> {
-    agent
-        .storage
-        .get(key)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_slice::<HashMap<String, String>>(&raw).ok())
-        .unwrap_or_default()
-}
-
-async fn save_nudge_timestamps(agent: &Agent, key: &str, map: &HashMap<String, String>) {
-    if let Ok(raw) = serde_json::to_vec(map) {
-        let _ = agent.storage.set(key, &raw).await;
-    }
-}
-
-fn is_feedback_suppressed(
-    pref: Option<&NudgeFeedbackPreference>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    let Some(pref) = pref else {
-        return false;
-    };
-    if pref.dismissed {
-        return true;
-    }
-    if let Some(until) = pref.suppressed_until.as_deref().and_then(parse_utc_rfc3339) {
-        return now < until;
-    }
-    false
-}
-
-fn nudge_emit_cooldown_secs(priority: u8) -> i64 {
-    match priority {
-        5 => 20 * 60,
-        4 => 30 * 60,
-        3 => 60 * 60,
-        _ => 3 * 60 * 60,
-    }
-}
-
-async fn maybe_push_nudge(
-    agent: &Agent,
-    out: &mut Vec<PredictiveNudge>,
-    hidden: &mut usize,
-    feedback: &HashMap<String, NudgeFeedbackPreference>,
-    now: chrono::DateTime<chrono::Utc>,
-    mut nudge: PredictiveNudge,
-) {
-    if is_feedback_suppressed(feedback.get(&nudge.id), now) {
-        *hidden += 1;
-        return;
-    }
-    let query = format!("{} {}", nudge.title, nudge.detail);
-    nudge.memory_clues = collect_memory_clues(agent, &query).await;
-    out.push(nudge);
-}
-
-async fn build_predictive_nudges(
-    agent: &Agent,
-    settings: &AutonomySettings,
-) -> (Vec<PredictiveNudge>, usize) {
-    let now = chrono::Utc::now();
-    let feedback = load_nudge_feedback(agent).await;
-    let mut hidden = 0usize;
-    let mut nudges: Vec<PredictiveNudge> = Vec::new();
-
-    let (overdue_tasks, due_soon_tasks, failed_tasks, pending_tasks) = {
-        let tasks = agent.tasks.read().await;
-        let mut overdue = Vec::new();
-        let mut due_soon = Vec::new();
-        let mut failed = 0usize;
-        let mut pending = 0usize;
-        for task in tasks.all().iter() {
-            if matches!(task.status, TaskStatus::Failed { .. }) {
-                failed += 1;
-            }
-            if matches!(
-                task.status,
-                TaskStatus::Pending | TaskStatus::AwaitingApproval | TaskStatus::Paused
-            ) {
-                pending += 1;
-            }
-            if let Some(scheduled_for) = task.scheduled_for {
-                let minutes = (scheduled_for - now).num_minutes();
-                if minutes < 0
-                    && matches!(
-                        task.status,
-                        TaskStatus::Pending | TaskStatus::AwaitingApproval
-                    )
-                {
-                    overdue.push((
-                        task.id.to_string(),
-                        task.description.clone(),
-                        task.action.clone(),
-                        task.arguments.clone(),
-                        -minutes,
-                    ));
-                } else if (0..=45).contains(&minutes)
-                    && matches!(
-                        task.status,
-                        TaskStatus::Pending
-                            | TaskStatus::AwaitingApproval
-                            | TaskStatus::Paused
-                            | TaskStatus::InProgress
-                    )
-                {
-                    due_soon.push((task.id.to_string(), task.description.clone(), minutes));
-                }
-            }
-        }
-        (overdue, due_soon, failed, pending)
-    };
-
-    for (task_id, description, action_name, arguments, overdue_minutes) in
-        overdue_tasks.into_iter().take(4)
-    {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: format!("overdue-task-{}", task_id),
-                nudge_type: "deadline_risk".to_string(),
-                title: "Missed scheduled execution window".to_string(),
-                detail: format!(
-                    "Task '{}' is overdue by {} minutes.",
-                    description, overdue_minutes
-                ),
-                confidence: 0.92,
-                priority: 5,
-                source: Some("task_scheduler".to_string()),
-                recommended_action: Some(recommendation(
-                    "Reschedule overdue task",
-                    "Move overdue task into an explicit immediate window.",
-                    "create_task",
-                    serde_json::json!({
-                        "description": format!("Retry: {}", description),
-                        "action": action_name,
-                        "arguments": arguments,
-                        "approval": "auto"
-                    }),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    for (task_id, description, due_minutes) in due_soon_tasks.into_iter().take(3) {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: format!("due-soon-{}", task_id),
-                nudge_type: "schedule_attention".to_string(),
-                title: "Task is due soon".to_string(),
-                detail: format!(
-                    "'{}' is scheduled in {} minute(s).",
-                    description, due_minutes
-                ),
-                confidence: 0.84,
-                priority: 3,
-                source: Some("task_scheduler".to_string()),
-                recommended_action: Some(recommendation(
-                    "Prep due-soon task",
-                    "Draft immediate next steps so the due task executes cleanly.",
-                    "chat_prompt",
-                    serde_json::json!({
-                        "prompt": format!("Prepare a quick execution checklist for this due-soon task: {}", description)
-                    }),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    if failed_tasks >= 2 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "failure-cluster".to_string(),
-                nudge_type: "reliability".to_string(),
-                title: "Reliability regression detected".to_string(),
-                detail: format!(
-                    "{} failed task(s) are in the queue. A triage pass can prevent repeat failures.",
-                    failed_tasks
-                ),
-                confidence: 0.82,
-                priority: 4,
-                source: Some("task_history".to_string()),
-                recommended_action: Some(recommendation(
-                    "Triage failed tasks",
-                    "Summarize root causes and propose fixes for the latest failed tasks.",
-                    "chat_prompt",
-                    serde_json::json!({
-                        "prompt":"Triage recent failed tasks, group by root cause, and propose fix tasks with priorities."
-                    }),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    if pending_tasks == 0 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "capacity-window".to_string(),
-                nudge_type: "planning".to_string(),
-                title: "High strategic capacity available".to_string(),
-                detail:
-                    "Queue is clear. This is a good time to schedule one high-leverage routine."
-                        .to_string(),
-                confidence: 0.68,
-                priority: 2,
-                source: Some("task_queue".to_string()),
-                recommended_action: Some(recommendation(
-                    "Schedule a strategic routine",
-                    "Create a recurring brief so the system keeps improving proactively.",
-                    "create_task",
-                    serde_json::json!({
-                        "description":"Strategic weekly brief",
-                        "action":"daily_brief",
-                        "arguments":{"mode":"strategy"},
-                        "cron":"0 0 9 * * 1",
-                        "approval":"auto"
-                    }),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    let unread_alerts = agent
-        .storage
-        .count_unread_notifications()
-        .await
-        .unwrap_or(0);
-    if unread_alerts > 0 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "attention-load".to_string(),
-                nudge_type: "attention_load".to_string(),
-                title: "Unread system alerts are accumulating".to_string(),
-                detail: format!(
-                    "{} unread notification(s) may hide urgent work.",
-                    unread_alerts
-                ),
-                confidence: 0.74,
-                priority: 4,
-                source: Some("notifications".to_string()),
-                recommended_action: Some(recommendation(
-                    "Enable Ops Mode",
-                    "Apply the Ops preset: create monitoring watchers and incident-focused routines, and make Ops the active autonomy mode.",
-                    "activate_mode",
-                    serde_json::json!({"mode_id":"ops"}),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    let watcher_count = agent.watcher_manager.list().await.len();
-    if watcher_count == 0 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "automation-gap".to_string(),
-                nudge_type: "automation_gap".to_string(),
-                title: "No active watchers".to_string(),
-                detail: "Set at least one watcher for key external signals to stay proactive."
-                    .to_string(),
-                confidence: 0.66,
-                priority: 3,
-                source: Some("watchers".to_string()),
-                recommended_action: Some(recommendation(
-                    "Create first watcher",
-                    "Create one watcher for the highest-risk external dependency.",
-                    "chat_prompt",
-                    serde_json::json!({"prompt":"Create one watcher for my highest-risk external dependency."}),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    let memory_entries = agent.memory.entry_count();
-    if memory_entries < 20 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "memory-thin".to_string(),
-                nudge_type: "memory_coverage".to_string(),
-                title: "Memory coverage is still thin".to_string(),
-                detail: format!(
-                    "Only {} durable memory entries are available. More context will improve personalization.",
-                    memory_entries
-                ),
-                confidence: 0.62,
-                priority: 2,
-                source: Some("memory".to_string()),
-                recommended_action: Some(recommendation(
-                    "Capture preferences check-in",
-                    "Ask the user for persistent preferences and constraints to improve long-term suggestions.",
-                    "chat_prompt",
-                    serde_json::json!({"prompt":"Ask me 5 high-impact preference questions to improve future proactive suggestions."}),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    let (trace_total, trace_failures) = {
-        let traces = agent.trace_history.read().await;
-        let total = traces.len();
-        let failures = traces
-            .iter()
-            .take(40)
-            .filter(|t| {
-                t.steps.iter().any(|step| {
-                    let step_type = step.step_type.to_ascii_lowercase();
-                    step_type.contains("fail")
-                        || step_type.contains("error")
-                        || step_type.contains("warning")
-                })
-            })
-            .count();
-        (total, failures)
-    };
-    if trace_total >= 8 && trace_failures >= 4 {
-        maybe_push_nudge(
-            agent,
-            &mut nudges,
-            &mut hidden,
-            &feedback,
-            now,
-            PredictiveNudge {
-                id: "stream-instability".to_string(),
-                nudge_type: "event_stream_health".to_string(),
-                title: "Execution stream instability".to_string(),
-                detail: format!(
-                    "{} of the latest traces ended in failure states; investigate recurring failure patterns.",
-                    trace_failures
-                ),
-                confidence: 0.79,
-                priority: 4,
-                source: Some("trace_history".to_string()),
-                recommended_action: Some(recommendation(
-                    "Investigate event-stream failures",
-                    "Summarize recurring failure patterns and propose concrete fixes.",
-                    "chat_prompt",
-                    serde_json::json!({"prompt":"Analyze the latest failed traces and propose a concrete hardening plan with prioritized fixes."}),
-                    &settings.trust_policy,
-                )),
-                memory_clues: Vec::new(),
-            },
-        )
-        .await;
-    }
-
-    nudges.sort_by(|a, b| {
-        b.priority.cmp(&a.priority).then_with(|| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-    nudges.truncate(12);
-    (nudges, hidden)
-}
-
 pub async fn run_autonomy_analysis_tick(
     shared: Arc<RwLock<Agent>>,
     trigger: &str,
 ) -> serde_json::Value {
     let agent = shared.read().await;
     let now = chrono::Utc::now();
+    let settings = load_autonomy_settings(&agent).await;
+
+    if autonomy_background_disabled(&settings) {
+        return serde_json::json!({
+            "status":"paused",
+            "trigger": trigger,
+            "generated_at": now.to_rfc3339(),
+            "message": "Autonomy is disabled.",
+        });
+    }
 
     // Prevent storming on chat-heavy sessions. Manual and scheduled triggers bypass this gate.
     if trigger != "manual" && trigger != "sentinel_periodic" {
         let last_scan = agent
             .storage
-            .get(AUTONOMY_NUDGE_LAST_SCAN_KEY)
+            .get(AUTONOMY_ANALYSIS_LAST_RUN_KEY)
             .await
             .ok()
             .flatten()
@@ -24223,38 +29544,6 @@ pub async fn run_autonomy_analysis_tick(
                 });
             }
         }
-    }
-
-    let settings = load_autonomy_settings(&agent).await;
-    let (nudges, hidden_count) = build_predictive_nudges(&agent, &settings).await;
-
-    let mut notified = load_nudge_timestamps(&agent, AUTONOMY_NUDGE_NOTIFIED_KEY).await;
-    let mut emitted = 0usize;
-
-    for nudge in nudges.iter().take(6) {
-        if nudge.priority < 3 {
-            continue;
-        }
-        let should_emit = match notified.get(&nudge.id).and_then(|s| parse_utc_rfc3339(s)) {
-            Some(last) => (now - last).num_seconds() >= nudge_emit_cooldown_secs(nudge.priority),
-            None => true,
-        };
-        if !should_emit {
-            continue;
-        }
-
-        let body = format!(
-            "{} (priority {}, confidence {:.0}%) - {}",
-            nudge.title,
-            nudge.priority,
-            (nudge.confidence * 100.0).round(),
-            nudge.detail
-        );
-        agent
-            .emit_notification("What To Improve Now", &body, "info", "predictive_nudge")
-            .await;
-        notified.insert(nudge.id.clone(), now.to_rfc3339());
-        emitted += 1;
     }
 
     let (awaiting_approval, missing_inputs) = {
@@ -24327,26 +29616,22 @@ pub async fn run_autonomy_analysis_tick(
         let _ = agent.storage.delete(AUTONOMY_ATTENTION_STATE_KEY).await;
     }
 
-    save_nudge_timestamps(&agent, AUTONOMY_NUDGE_NOTIFIED_KEY, &notified).await;
-    if let Ok(raw) = serde_json::to_vec(&nudges) {
-        let _ = agent.storage.set(AUTONOMY_LAST_NUDGES_KEY, &raw).await;
-    }
     let _ = agent
         .storage
-        .set(AUTONOMY_NUDGE_LAST_SCAN_KEY, now.to_rfc3339().as_bytes())
+        .set(AUTONOMY_ANALYSIS_LAST_RUN_KEY, now.to_rfc3339().as_bytes())
         .await;
+    drop(agent);
+    let sentinel = sentinel_panel::run_sentinel_scan_tick(shared.clone(), trigger).await;
 
     serde_json::json!({
         "status":"ok",
         "trigger": trigger,
         "generated_at": now.to_rfc3339(),
-        "nudges": nudges.len(),
-        "hidden": hidden_count,
-        "emitted": emitted,
         "needs_attention": {
             "awaiting_approval": awaiting_approval,
             "missing_inputs": missing_inputs,
-        }
+        },
+        "sentinel": sentinel,
     })
 }
 
@@ -24355,168 +29640,6 @@ fn spawn_autonomy_analysis_tick(agent: SharedAgent, trigger: &str) {
     tokio::spawn(async move {
         let _ = run_autonomy_analysis_tick(agent, &trigger).await;
     });
-}
-
-async fn get_predictive_nudges(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
-    let settings = load_autonomy_settings(&agent).await;
-    let (nudges, hidden_count) = build_predictive_nudges(&agent, &settings).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "generated_at": chrono::Utc::now().to_rfc3339(),
-            "nudges": nudges,
-            "hidden_count": hidden_count,
-        })),
-    )
-        .into_response()
-}
-
-async fn set_predictive_nudge_feedback(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<NudgeFeedbackRequest>,
-) -> Response {
-    if id.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "nudge id is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let action = request.action.trim().to_ascii_lowercase();
-    let agent = state.agent.read().await;
-    let mut map = load_nudge_feedback(&agent).await;
-    let now = chrono::Utc::now();
-
-    match action.as_str() {
-        "dismiss" => {
-            let entry = map.entry(id.clone()).or_default();
-            entry.dismissed = true;
-            entry.suppressed_until = None;
-            entry.last_feedback = Some("dismiss".to_string());
-            entry.note = request.note.clone();
-            entry.updated_at = Some(now.to_rfc3339());
-        }
-        "snooze" => {
-            let minutes = request
-                .snooze_minutes
-                .unwrap_or(24 * 60)
-                .clamp(5, 60 * 24 * 30);
-            let until = now + chrono::Duration::minutes(minutes as i64);
-            let entry = map.entry(id.clone()).or_default();
-            entry.dismissed = false;
-            entry.suppressed_until = Some(until.to_rfc3339());
-            entry.last_feedback = Some("snooze".to_string());
-            entry.note = request.note.clone();
-            entry.updated_at = Some(now.to_rfc3339());
-        }
-        "interested" | "reset" => {
-            map.remove(&id);
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "action must be one of: dismiss, snooze, interested, reset".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    save_nudge_feedback(&agent, &map).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status":"ok",
-            "id": id,
-            "action": action,
-            "preference": map.get(&id).cloned(),
-        })),
-    )
-        .into_response()
-}
-
-async fn plan_predictive_nudges(
-    State(state): State<AppState>,
-    Json(request): Json<NudgePlannerRequest>,
-) -> Response {
-    let max_items = request.max_items.unwrap_or(3).clamp(1, 8);
-    let agent = state.agent.read().await;
-    let mut settings = load_autonomy_settings(&agent).await;
-    let (nudges, _) = build_predictive_nudges(&agent, &settings).await;
-    let now = chrono::Utc::now();
-    let mut planned_map = load_nudge_timestamps(&agent, AUTONOMY_NUDGE_PLANNED_KEY).await;
-
-    let mut planned_results = Vec::new();
-    let mut skipped = Vec::new();
-    for nudge in nudges.into_iter().take(max_items) {
-        let Some(action) = nudge.recommended_action.clone() else {
-            skipped.push(serde_json::json!({
-                "id": nudge.id,
-                "reason":"no_recommended_action",
-            }));
-            continue;
-        };
-
-        if !request.dry_run {
-            let recently_planned = planned_map
-                .get(&nudge.id)
-                .and_then(|s| parse_utc_rfc3339(s))
-                .is_some_and(|last| (now - last).num_seconds() < 2 * 60 * 60);
-            if recently_planned {
-                skipped.push(serde_json::json!({
-                    "id": nudge.id,
-                    "reason":"cooldown_active",
-                }));
-                continue;
-            }
-        }
-
-        match run_recommended_action(&agent, &mut settings, &action, request.dry_run).await {
-            Ok(result) => {
-                if !request.dry_run {
-                    planned_map.insert(nudge.id.clone(), now.to_rfc3339());
-                }
-                planned_results.push(serde_json::json!({
-                    "id": nudge.id,
-                    "title": nudge.title,
-                    "priority": nudge.priority,
-                    "confidence": nudge.confidence,
-                    "result": result,
-                }));
-            }
-            Err(e) => {
-                skipped.push(serde_json::json!({
-                    "id": nudge.id,
-                    "reason":"execution_error",
-                    "error": e,
-                }));
-            }
-        }
-    }
-
-    let _ = save_autonomy_settings(&agent, &settings).await;
-    save_nudge_timestamps(&agent, AUTONOMY_NUDGE_PLANNED_KEY, &planned_map).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status":"ok",
-            "dry_run": request.dry_run,
-            "planned": planned_results,
-            "skipped": skipped,
-        })),
-    )
-        .into_response()
-}
-
-async fn emit_predictive_nudges(State(state): State<AppState>) -> Response {
-    let result = run_autonomy_analysis_tick(state.agent.clone(), "manual").await;
-    (StatusCode::OK, Json(result)).into_response()
 }
 
 async fn evaluate_trust_request(
@@ -25107,8 +30230,8 @@ async fn fetch_openrouter_pricing(
     let mut req = client
         .get("https://openrouter.ai/api/v1/models")
         .header("Accept", "application/json")
-        .header("HTTP-Referer", "https://github.com/agentark-ai/AgentArk")
-        .header("X-Title", "AgentArk");
+        .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+        .header("X-Title", crate::branding::PRODUCT_NAME);
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
         req = req.bearer_auth(key.trim());
     }
@@ -25817,15 +30940,9 @@ async fn insert_document_from_text(
         content_type,
         project_id,
         chunk_count: chunks.len() as i32,
-        file_size: content.len().min(i32::MAX as usize) as i32,
+        file_size: content.len().min(i64::MAX as usize) as i64,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-
-    agent
-        .storage
-        .insert_document(&doc)
-        .await
-        .map_err(|e| e.to_string())?;
 
     let mut chunk_rows: Vec<crate::storage::entities::document_chunk::Model> = chunks
         .iter()
@@ -25841,7 +30958,7 @@ async fn insert_document_from_text(
         )
         .collect();
     if let Err(e) = crate::core::document_search::embed_document_chunks(
-        agent.mem0.as_ref(),
+        agent.embedding_client.as_deref(),
         &filename,
         &doc.content_type,
         doc.project_id.as_deref(),
@@ -25852,12 +30969,11 @@ async fn insert_document_from_text(
         tracing::warn!("Document embedding failed for {}: {}", filename, e);
     }
 
-    // Insert chunks
-    for (i, chunk) in chunk_rows.iter().enumerate() {
-        if let Err(e) = agent.storage.insert_document_chunk(chunk).await {
-            tracing::warn!("Failed to insert chunk {}: {}", i, e);
-        }
-    }
+    agent
+        .storage
+        .insert_document_with_chunks(&doc, &chunk_rows)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Emit notification
     agent
@@ -26739,7 +31855,10 @@ async fn delete_knowledge_item(State(state): State<AppState>, Path(id): Path<Str
 async fn sync_product_help_knowledge(State(state): State<AppState>) -> Response {
     let agent = state.agent.read().await;
     match agent.sync_bundled_product_help().await {
-        Ok(synced) => (StatusCode::OK, Json(serde_json::json!({ "synced": synced })))
+        Ok(synced) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "synced": synced })),
+        )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -26754,6 +31873,7 @@ async fn sync_product_help_knowledge(State(state): State<AppState>) -> Response 
 /// Execute code in an isolated sandbox
 async fn execute_code(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     Json(request): Json<CodeExecuteRequest>,
 ) -> Response {
     let arguments = serde_json::json!({
@@ -26761,13 +31881,23 @@ async fn execute_code(
         "code": request.code,
         "env": request.env,
         "files": request.files,
+        "network_access": request.network_access,
     });
 
     let result = {
         let agent_guard = state.agent.read().await;
+        let caller = maybe_caller.as_ref().map(|Extension(value)| value);
         agent_guard
             .runtime
-            .execute_action("code_execute", &arguments)
+            .execute_action_with_context(
+                "code_execute",
+                &arguments,
+                &build_direct_action_auth_context(
+                    caller,
+                    crate::actions::ActionExecutionSurface::Api,
+                    true,
+                ),
+            )
             .await
     };
 
@@ -26817,6 +31947,7 @@ async fn execute_code(
 
 async fn mcp_handler(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     Json(request): Json<crate::mcp::McpRequest>,
 ) -> Response {
     let mcp = crate::mcp::McpServer::new();
@@ -26844,8 +31975,21 @@ async fn mcp_handler(
                 let conversation_id = args.get("conversation_id").and_then(|v| v.as_str());
                 let project_id = args.get("project_id").and_then(|v| v.as_str());
                 let agent = state.agent.read().await;
+                let caller = maybe_caller.as_ref().map(|Extension(value)| value);
                 match agent
-                    .process_message_with_meta(message, channel, conversation_id, project_id)
+                    .process_message_with_meta_and_hints(
+                        message,
+                        channel,
+                        conversation_id,
+                        project_id,
+                        build_request_execution_hints(
+                            false,
+                            None,
+                            caller,
+                            crate::actions::ActionExecutionSurface::Api,
+                            true,
+                        ),
+                    )
                     .await
                 {
                     Ok(processed) => serde_json::json!({
@@ -26950,7 +32094,20 @@ async fn mcp_handler(
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
                 let agent = state.agent.read().await;
-                match agent.runtime.execute_action(action, &action_args).await {
+                let caller = maybe_caller.as_ref().map(|Extension(value)| value);
+                match agent
+                    .runtime
+                    .execute_action_with_context(
+                        action,
+                        &action_args,
+                        &build_direct_action_auth_context(
+                            caller,
+                            crate::actions::ActionExecutionSurface::Api,
+                            true,
+                        ),
+                    )
+                    .await
+                {
                     Ok(result) => {
                         serde_json::json!({ "content": [{ "type": "text", "text": result }] })
                     }
@@ -27006,29 +32163,44 @@ async fn list_mcp_servers(
 ) -> Response {
     let agent = state.agent.read().await;
     let registry = agent.mcp.read().await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "servers": registry.list_servers(query.include_details),
-        })),
-    )
-        .into_response()
+    match registry.list_servers(query.include_details).await {
+        Ok(servers) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "servers": servers,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 /// Get a specific MCP server
 async fn get_mcp_server(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let agent = state.agent.read().await;
     let registry = agent.mcp.read().await;
-    if let Some(server) = registry.get_server(&id, true) {
-        (StatusCode::OK, Json(server)).into_response()
-    } else {
-        (
+    match registry.get_server(&id, true).await {
+        Ok(Some(server)) => (StatusCode::OK, Json(server)).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: "MCP server not found".to_string(),
             }),
         )
-            .into_response()
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -27053,18 +32225,19 @@ async fn create_mcp_server(
     }
 
     let existing = None;
-    let (config, auth_update) = match build_mcp_config(&request, &server_id, existing) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let (config, auth_update) =
+        match build_mcp_config(&agent.storage, &request, &server_id, existing).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
     agent.config.mcp.servers.push(config);
 
@@ -27093,7 +32266,7 @@ async fn create_mcp_server(
 
     let agent = state.agent.read().await;
     let registry = agent.mcp.read().await;
-    let server = registry.get_server(&server_id, true);
+    let server = registry.get_server(&server_id, true).await.unwrap_or(None);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -27125,18 +32298,19 @@ async fn update_mcp_server(
     };
 
     let existing = agent.config.mcp.servers.get(idx).cloned();
-    let (config, auth_update) = match build_mcp_config(&request, &id, existing.as_ref()) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let (config, auth_update) =
+        match build_mcp_config(&agent.storage, &request, &id, existing.as_ref()).await {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
 
     agent.config.mcp.servers[idx] = config;
 
@@ -27165,7 +32339,7 @@ async fn update_mcp_server(
 
     let agent = state.agent.read().await;
     let registry = agent.mcp.read().await;
-    let server = registry.get_server(&id, true);
+    let server = registry.get_server(&id, true).await.unwrap_or(None);
     (
         StatusCode::OK,
         Json(serde_json::json!({ "server": server, "sync_queued": true })),
@@ -27237,7 +32411,7 @@ async fn refresh_mcp_server(State(state): State<AppState>, Path(id): Path<String
 
     let agent = state.agent.read().await;
     let registry = agent.mcp.read().await;
-    let server = registry.get_server(&id, true);
+    let server = registry.get_server(&id, true).await.unwrap_or(None);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -27249,7 +32423,8 @@ async fn refresh_mcp_server(State(state): State<AppState>, Path(id): Path<String
         .into_response()
 }
 
-fn build_mcp_config(
+async fn build_mcp_config(
+    storage: &crate::storage::Storage,
     request: &McpServerRequest,
     server_id: &str,
     existing: Option<&crate::core::config::McpServerConfig>,
@@ -27305,6 +32480,33 @@ fn build_mcp_config(
         }
     };
 
+    let auth_profile_id = request
+        .auth_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| existing.and_then(|cfg| cfg.auth_profile_id.clone()));
+    if let Some(profile_id) = auth_profile_id.as_deref() {
+        if !matches!(
+            &transport,
+            crate::core::config::McpTransportConfig::Http { .. }
+        ) {
+            return Err(anyhow::anyhow!(
+                "HTTP auth profiles can only be attached to HTTP MCP transports."
+            ));
+        }
+        if crate::core::auth_profiles::AuthProfileControlPlane::get(storage, profile_id)
+            .await?
+            .is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "Auth profile '{}' was not found.",
+                profile_id
+            ));
+        }
+    }
+
     let (auth_config, auth_update) = parse_mcp_auth(
         request.auth.as_ref(),
         existing.and_then(|e| e.auth.as_ref()),
@@ -27326,6 +32528,7 @@ fn build_mcp_config(
         enabled: request.enabled,
         resources_enabled: request.resources_enabled,
         auth: auth_config,
+        auth_profile_id,
         tool_allowlist: clean_allowlist(&request.tool_allowlist),
         tool_blocklist: request
             .tool_blocklist
@@ -27809,6 +33012,7 @@ pub async fn serve_locked(
         .route("/ui/", get(locked_page))
         .route("/ui/{*path}", get(locked_page))
         .route("/health", get(locked_health))
+        .route("/readiness", get(locked_readiness))
         .route("/unlock", post(handle_unlock))
         .route("/logo.svg", get(serve_logo_svg_locked))
         .with_state(locked_state);
@@ -27827,7 +33031,7 @@ pub async fn serve_locked(
 
     println!();
     println!(" -");
-    println!(" - AgentArk is LOCKED -");
+    println!(" - {} is LOCKED -", crate::branding::PRODUCT_NAME);
     println!(" -");
     println!(
         " - Open http://{} to unlock in your browser -",
@@ -27868,6 +33072,18 @@ async fn locked_health() -> Json<serde_json::Value> {
         "status": "locked",
         "message": "Master password required to unlock"
     }))
+}
+
+async fn locked_readiness() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "status": "locked",
+            "ready": false,
+            "message": "Master password required to unlock"
+        })),
+    )
+        .into_response()
 }
 
 async fn serve_logo_svg_locked() -> Response {
@@ -28046,42 +33262,6 @@ where
                 rollback_err
             ),
             None => anyhow::anyhow!("Encrypted storage rekey failed: {}", storage_err),
-        });
-    }
-
-    if let Err(archive_err) = crate::storage::legacy_recovery::remember_legacy_storage_key(
-        &agent.storage,
-        old_storage_key.as_ref(),
-    )
-    .await
-    {
-        let storage_rollback_err = agent
-            .encrypted_storage
-            .reencrypt_all_sensitive_data(new_key.clone(), old_storage_key.clone())
-            .await
-            .err();
-        let secrets_rollback_err = old_mgr.save_secrets_unlocked(&secrets).err();
-        return Err(match (storage_rollback_err, secrets_rollback_err) {
-            (Some(storage_rollback_err), Some(secrets_rollback_err)) => anyhow::anyhow!(
-                "Failed to archive prior storage key: {}. Encrypted storage rollback also failed: {}. secrets.enc rollback also failed: {}",
-                archive_err,
-                storage_rollback_err,
-                secrets_rollback_err
-            ),
-            (Some(storage_rollback_err), None) => anyhow::anyhow!(
-                "Failed to archive prior storage key: {}. Encrypted storage rollback also failed: {}",
-                archive_err,
-                storage_rollback_err
-            ),
-            (None, Some(secrets_rollback_err)) => anyhow::anyhow!(
-                "Failed to archive prior storage key: {}. secrets.enc rollback also failed: {}",
-                archive_err,
-                secrets_rollback_err
-            ),
-            (None, None) => anyhow::anyhow!(
-                "Failed to archive prior storage key: {}",
-                archive_err
-            ),
         });
     }
 
@@ -28477,7 +33657,7 @@ mod tests {
             api_key: Arc::new(RwLock::new(None)),
             api_key_expires_at: Arc::new(RwLock::new(None)),
             allow_insecure_no_auth: true,
-            session_token: Arc::new(RwLock::new(None)),
+            ui_sessions: Arc::new(RwLock::new(HashMap::new())),
             local_ui_bootstrap_enabled: true,
             local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
             cookie_secure_default: false,
@@ -28487,6 +33667,8 @@ mod tests {
             whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
             security_events,
             app_registry,
+            executor_client: None,
+            workspace_client: None,
             application_registry: applications::ApplicationLauncherRegistry::default(),
             deployment_mode: DeploymentMode::TrustedLocal,
             server_role: HttpServerRole::ControlPlane,
@@ -28544,6 +33726,384 @@ mod tests {
             })
             .await
             .expect("user message should be inserted");
+    }
+
+    #[tokio::test]
+    async fn security_headers_include_hsts_for_internet_facing() {
+        let (mut state, _config_dir, _data_dir) = build_test_state().await;
+        state.deployment_mode = DeploymentMode::InternetFacing;
+        let router = Router::new()
+            .route("/headers", get(|| async { "ok" }))
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                security_headers_middleware,
+            ));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/headers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(&HEADER_X_FRAME_OPTIONS),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+        assert_eq!(
+            response.headers().get(&HEADER_X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response.headers().get(&HEADER_CONTENT_SECURITY_POLICY),
+            Some(&HeaderValue::from_static(
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+            ))
+        );
+        assert_eq!(
+            response.headers().get(&HEADER_STRICT_TRANSPORT_SECURITY),
+            Some(&HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_does_not_bypass_when_legacy_flag_is_set() {
+        let (mut state, _config_dir, _data_dir) = build_test_state().await;
+        state.allow_insecure_no_auth = true;
+
+        let router = Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::auth_middleware,
+            ));
+
+        let mut request = Request::builder()
+            .uri("/protected")
+            .header(header::HOST, "example.com")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 4242))));
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_oversized_messages() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/chat", post(chat))
+            .with_state(state.clone());
+        let body = serde_json::json!({
+            "message": "x".repeat(MAX_CHAT_MESSAGE_BYTES + 1),
+            "channel": "http",
+            "conversation_id": serde_json::Value::Null,
+            "project_id": serde_json::Value::Null,
+            "deep_research": false,
+            "execution_mode": serde_json::Value::Null,
+            "attachments_present": false
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8990))));
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let payload = response_json(response).await;
+        assert!(payload
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("100000"));
+    }
+
+    #[tokio::test]
+    async fn chat_fast_path_stores_secret_without_live_server() {
+        let (state, config_dir, data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/chat", post(chat))
+            .with_state(state.clone());
+        let body = serde_json::json!({
+            "message": "please save my secret TEST_FAST_PATH_SECRET=abc123",
+            "channel": "web",
+            "conversation_id": serde_json::Value::Null,
+            "project_id": serde_json::Value::Null,
+            "deep_research": false,
+            "execution_mode": serde_json::Value::Null,
+            "attachments_present": false
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8990))));
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload["response"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Saved secret 'TEST_FAST_PATH_SECRET'"));
+
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("test manager should initialize");
+        assert_eq!(
+            manager
+                .get_custom_secret("TEST_FAST_PATH_SECRET")
+                .expect("secret should be readable"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fast_path_controls_notifications_without_live_server() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/chat", post(chat))
+            .with_state(state.clone());
+        let body = serde_json::json!({
+            "message": "turn notifications off",
+            "channel": "web",
+            "conversation_id": serde_json::Value::Null,
+            "project_id": serde_json::Value::Null,
+            "deep_research": false,
+            "execution_mode": serde_json::Value::Null,
+            "attachments_present": false
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8990))));
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert!(payload["response"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Push notifications paused until"));
+
+        let agent = state.agent.read().await;
+        assert!(agent.push_notifications_muted_until_ts().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_fast_path_stores_secret_without_live_server() {
+        let (state, config_dir, data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/chat/stream", post(chat_stream))
+            .with_state(state);
+        let body = serde_json::json!({
+            "message": "save my secret TEST_STREAM_SECRET=stream-abc",
+            "channel": "web",
+            "conversation_id": serde_json::Value::Null,
+            "project_id": serde_json::Value::Null,
+            "deep_research": false,
+            "execution_mode": serde_json::Value::Null,
+            "attachments_present": false
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat/stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8990))));
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("event: content"));
+        assert!(text.contains("TEST_STREAM_SECRET"));
+
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("test manager should initialize");
+        assert_eq!(
+            manager
+                .get_custom_secret("TEST_STREAM_SECRET")
+                .expect("stream secret should be readable"),
+            Some("stream-abc".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_endpoints_work_hermetically() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let agent = state.agent.read().await;
+            agent
+                .emit_notification("Hermetic test one", "body", "info", "test")
+                .await;
+            agent
+                .emit_notification("Hermetic test two", "body", "warning", "test")
+                .await;
+        }
+
+        let router = Router::new()
+            .route("/notifications/count", get(notification_count_endpoint))
+            .route("/notifications/read-all", post(mark_all_read_endpoint))
+            .with_state(state);
+
+        let count_request = Request::builder()
+            .method("GET")
+            .uri("/notifications/count?unread=true")
+            .body(Body::empty())
+            .unwrap();
+        let count_response = router.clone().oneshot(count_request).await.unwrap();
+        assert_eq!(count_response.status(), StatusCode::OK);
+        let count_payload = response_json(count_response).await;
+        assert_eq!(count_payload["unread"].as_u64().unwrap_or_default(), 2);
+
+        let mark_all_request = Request::builder()
+            .method("POST")
+            .uri("/notifications/read-all")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let mark_all_response = router.clone().oneshot(mark_all_request).await.unwrap();
+        assert_eq!(mark_all_response.status(), StatusCode::OK);
+
+        let unread_after_request = Request::builder()
+            .method("GET")
+            .uri("/notifications/count?unread=true")
+            .body(Body::empty())
+            .unwrap();
+        let unread_after_response = router.oneshot(unread_after_request).await.unwrap();
+        assert_eq!(unread_after_response.status(), StatusCode::OK);
+        let unread_after_payload = response_json(unread_after_response).await;
+        assert_eq!(
+            unread_after_payload["unread"].as_u64().unwrap_or_default(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn swarm_endpoints_work_hermetically() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/swarm/status", get(swarm_status))
+            .route("/swarm/config", get(swarm_get_config))
+            .route("/swarm/config", post(swarm_update_config))
+            .with_state(state);
+
+        let status_request = Request::builder()
+            .method("GET")
+            .uri("/swarm/status")
+            .body(Body::empty())
+            .unwrap();
+        let status_response = router.clone().oneshot(status_request).await.unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_payload = response_json(status_response).await;
+        assert!(status_payload.get("enabled").is_some());
+        assert!(status_payload.get("agents").is_some());
+
+        let update_request = Request::builder()
+            .method("POST")
+            .uri("/swarm/config")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "max_specialists": 5,
+                    "default_timeout_secs": 240
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let update_response = router.clone().oneshot(update_request).await.unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+
+        let config_request = Request::builder()
+            .method("GET")
+            .uri("/swarm/config")
+            .body(Body::empty())
+            .unwrap();
+        let config_response = router.oneshot(config_request).await.unwrap();
+        assert_eq!(config_response.status(), StatusCode::OK);
+        let config_payload = response_json(config_response).await;
+        assert_eq!(
+            config_payload["max_specialists"]
+                .as_u64()
+                .unwrap_or_default(),
+            5
+        );
+        assert_eq!(
+            config_payload["default_timeout_secs"]
+                .as_u64()
+                .unwrap_or_default(),
+            240
+        );
+    }
+
+    #[test]
+    fn arkpulse_shell_commands_parse_to_typed_operations() {
+        let plan = classify_arkpulse_fix_plan(
+            r#"cd /app/data/apps/demo && rg -n "git\s*=|path\s*=" Cargo.toml && cargo generate-lockfile"#,
+        );
+
+        match plan {
+            Some(ArkPulseFixPlan::ShellOperations {
+                app_dir,
+                operations,
+            }) => {
+                assert_eq!(app_dir, "/app/data/apps/demo");
+                assert_eq!(operations.len(), 2);
+                assert!(matches!(
+                    operations[0],
+                    ArkPulseShellOperation::Ripgrep { .. }
+                ));
+                assert!(matches!(
+                    operations[1],
+                    ArkPulseShellOperation::CargoGenerateLockfile
+                ));
+            }
+            other => panic!(
+                "expected typed shell operations, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[test]
+    fn arkpulse_shell_command_rejects_metacharacter_injection() {
+        let plan = classify_arkpulse_fix_plan(
+            r#"cd /app/data/apps/demo && rg -n "git\s*=|path\s*=" Cargo.toml | cat"#,
+        );
+        assert!(plan.is_none());
     }
 
     #[test]
@@ -28620,7 +34180,9 @@ mod tests {
             "Waiting on model response. No new output yet."
         );
         assert_eq!(
-            normalize_stream_heartbeat_status("Mem0 active | Scope: channel:web | Channel: web"),
+            normalize_stream_heartbeat_status(
+                "Vector memory active | Scope: channel:web | Channel: web"
+            ),
             "Memory/context setup in progress. No new output yet."
         );
         assert_eq!(
@@ -28792,55 +34354,6 @@ mod tests {
         assert_eq!(
             payload.get("elapsed_secs").and_then(|v| v.as_u64()),
             Some(18)
-        );
-    }
-
-    #[test]
-    fn chat_task_classifier_promotes_plain_english_app_requests() {
-        let message = "Spin up an admin console for lead triage and deploy it";
-        assert!(chat_message_requests_app_work(
-            &message.to_ascii_lowercase()
-        ));
-        assert!(chat_request_should_create_task(
-            Some("auto"),
-            message,
-            false,
-            false
-        ));
-        assert_eq!(classify_chat_task_work_type(message, false, false), "app");
-    }
-
-    #[test]
-    fn chat_task_classifier_promotes_direct_import_sources() {
-        let message = "https://clawhub.ai/pskoett/self-improving-agent";
-        assert!(chat_message_requests_import(&message.to_ascii_lowercase()));
-        assert!(chat_request_should_create_task(
-            Some("auto"),
-            message,
-            false,
-            false
-        ));
-        assert_eq!(
-            classify_chat_task_work_type(message, false, false),
-            "import"
-        );
-    }
-
-    #[test]
-    fn chat_task_classifier_promotes_file_backed_runs_in_auto_mode() {
-        assert!(chat_request_should_create_task(
-            Some("auto"),
-            "Please review these files and tell me what matters.",
-            false,
-            true
-        ));
-        assert_eq!(
-            classify_chat_task_work_type(
-                "Please review these files and tell me what matters.",
-                false,
-                true
-            ),
-            "workspace"
         );
     }
 
@@ -29079,9 +34592,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_endpoint_accepts_discord_webhook_without_bot_token() {
+    async fn settings_endpoint_rejects_discord_without_bot_token() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
-        let state_for_assert = state.clone();
         let router = Router::new()
             .route("/settings", post(update_settings))
             .with_state(state);
@@ -29094,6 +34606,7 @@ mod tests {
                     "llm_provider": "ollama",
                     "llm_model": "llama3.2",
                     "discord_enabled": true,
+                    "discord_guild_id": "guild-1",
                     "discord_webhook_url": "https://discord.com/api/webhooks/123/token"
                 })
                 .to_string(),
@@ -29101,19 +34614,76 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("Discord bot token is required"));
+    }
 
-        let guard = state_for_assert.agent.read().await;
-        let discord = guard
-            .config
-            .discord
-            .as_ref()
-            .expect("discord config should be saved");
-        assert_eq!(
-            discord.webhook_url,
-            "https://discord.com/api/webhooks/123/token"
-        );
-        assert!(discord.bot_token.is_empty());
+    #[tokio::test]
+    async fn settings_endpoint_rejects_discord_without_scope() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "llm_provider": "ollama",
+                    "llm_model": "llama3.2",
+                    "discord_enabled": true,
+                    "discord_bot_token": "discord-bot-token"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("guild, channel, or thread scope"));
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_requires_google_chat_verify_token() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "llm_provider": "ollama",
+                    "llm_model": "llama3.2",
+                    "google_chat_enabled": true,
+                    "google_chat_access_token": "chat-token",
+                    "google_chat_space": "spaces/AAA"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("verification token"));
     }
 
     #[tokio::test]
@@ -29265,6 +34835,380 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whatsapp_webhook_endpoint_rejects_unsigned_cloud_api_requests() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                mode: crate::channels::whatsapp::WhatsAppMode::CloudApi,
+                access_token: "wa-token".to_string(),
+                app_secret: "topsecret".to_string(),
+                phone_number_id: "phone-id".to_string(),
+                verify_token: "verify".to_string(),
+                bridge_runtime: Some(crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded),
+                bridge_url: "http://127.0.0.1:8999".to_string(),
+                bridge_token: String::new(),
+                allowed_numbers: vec![],
+                dm_policy: "pairing".to_string(),
+            });
+        }
+        let router = Router::new()
+            .route("/webhook/whatsapp", post(whatsapp_webhook_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/whatsapp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "entry": [{
+                        "changes": [{
+                            "value": {
+                                "messages": [{
+                                    "from": "15551234567",
+                                    "id": "wamid.1",
+                                    "type": "text",
+                                    "text": { "body": "hello" }
+                                }]
+                            }
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_endpoint_rejects_bridge_requests_without_bearer_auth() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        *state.api_key.write().await = Some("bridge-secret".to_string());
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                mode: crate::channels::whatsapp::WhatsAppMode::Baileys,
+                access_token: String::new(),
+                app_secret: String::new(),
+                phone_number_id: String::new(),
+                verify_token: "verify".to_string(),
+                bridge_runtime: Some(crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded),
+                bridge_url: "http://127.0.0.1:8999".to_string(),
+                bridge_token: String::new(),
+                allowed_numbers: vec![],
+                dm_policy: "pairing".to_string(),
+            });
+        }
+        let router = Router::new()
+            .route("/webhook/whatsapp", post(whatsapp_webhook_handler))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook/whatsapp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "_source": "baileys",
+                    "entry": [{
+                        "changes": [{
+                            "value": {
+                                "messages": [{
+                                    "from": "15551234567",
+                                    "id": "wamid.1",
+                                    "type": "text",
+                                    "text": { "body": "hello" }
+                                }]
+                            }
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_bridge_status_returns_disabled_when_whatsapp_is_off() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/api/whatsapp-bridge/status", get(whatsapp_bridge_status))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/whatsapp-bridge/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("disabled")
+        );
+        assert_eq!(
+            body.get("managed_by").and_then(|value| value.as_str()),
+            Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_bridge_status_returns_disabled_for_cloud_api_mode() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                mode: crate::channels::whatsapp::WhatsAppMode::CloudApi,
+                access_token: "wa-token".to_string(),
+                app_secret: "topsecret".to_string(),
+                phone_number_id: "phone-id".to_string(),
+                verify_token: "verify".to_string(),
+                bridge_runtime: Some(crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded),
+                bridge_url: crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string(),
+                bridge_token: "bridge-secret".to_string(),
+                allowed_numbers: vec![],
+                dm_policy: "pairing".to_string(),
+            });
+        }
+
+        let router = Router::new()
+            .route("/api/whatsapp-bridge/status", get(whatsapp_bridge_status))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/whatsapp-bridge/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("disabled")
+        );
+        assert_eq!(
+            body.get("managed_by").and_then(|value| value.as_str()),
+            Some("none")
+        );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_bridge_status_reports_embedded_bridge_missing_from_image() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                mode: crate::channels::whatsapp::WhatsAppMode::Baileys,
+                access_token: String::new(),
+                app_secret: String::new(),
+                phone_number_id: String::new(),
+                verify_token: "verify".to_string(),
+                bridge_runtime: Some(crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded),
+                bridge_url: crate::channels::whatsapp::EMBEDDED_BRIDGE_URL.to_string(),
+                bridge_token: "bridge-secret".to_string(),
+                allowed_numbers: vec![],
+                dm_policy: "pairing".to_string(),
+            });
+        }
+
+        let router = Router::new()
+            .route("/api/whatsapp-bridge/status", get(whatsapp_bridge_status))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/whatsapp-bridge/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("unavailable")
+        );
+        assert_eq!(
+            body.get("managed_by").and_then(|value| value.as_str()),
+            Some("embedded")
+        );
+        assert_eq!(
+            body.get("installed").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_bridge_status_reports_external_warning_for_legacy_bridge() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        {
+            let mut guard = state.agent.write().await;
+            guard.config.whatsapp = Some(crate::channels::whatsapp::WhatsAppChannelConfig {
+                mode: crate::channels::whatsapp::WhatsAppMode::Baileys,
+                access_token: String::new(),
+                app_secret: String::new(),
+                phone_number_id: String::new(),
+                verify_token: "verify".to_string(),
+                bridge_runtime: Some(crate::channels::whatsapp::WhatsAppBridgeRuntime::External),
+                bridge_url: "http://127.0.0.1:65531".to_string(),
+                bridge_token: String::new(),
+                allowed_numbers: vec![],
+                dm_policy: "pairing".to_string(),
+            });
+        }
+
+        let router = Router::new()
+            .route("/api/whatsapp-bridge/status", get(whatsapp_bridge_status))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/whatsapp-bridge/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body.get("status").and_then(|value| value.as_str()),
+            Some("unavailable")
+        );
+        assert_eq!(
+            body.get("managed_by").and_then(|value| value.as_str()),
+            Some("external")
+        );
+        assert!(body
+            .get("warning")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("legacy configuration"));
+        assert!(body.get("installed").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_settings_generates_whatsapp_bridge_token_for_embedded_baileys() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "llm_provider": "ollama",
+                            "llm_model": "llama3.2",
+                            "llm_base_url": "http://127.0.0.1:11434",
+                            "whatsapp_enabled": true,
+                            "whatsapp_mode": "baileys",
+                            "whatsapp_bridge_runtime": "embedded"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "unexpected response: {}", body);
+        let guard = state.agent.read().await;
+        let config = guard
+            .config
+            .whatsapp
+            .as_ref()
+            .expect("whatsapp config should exist");
+        assert_eq!(
+            config.mode,
+            crate::channels::whatsapp::WhatsAppMode::Baileys
+        );
+        assert_eq!(
+            config.bridge_runtime(),
+            crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded
+        );
+        assert_eq!(
+            config.bridge_url,
+            crate::channels::whatsapp::EMBEDDED_BRIDGE_URL
+        );
+        assert!(!config.bridge_token.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_settings_rejects_new_external_whatsapp_bridge_without_token() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/settings", post(update_settings))
+            .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "llm_provider": "ollama",
+                            "llm_model": "llama3.2",
+                            "llm_base_url": "http://127.0.0.1:11434",
+                            "whatsapp_enabled": true,
+                            "whatsapp_mode": "baileys",
+                            "whatsapp_bridge_runtime": "external",
+                            "whatsapp_bridge_url": "http://127.0.0.1:65531"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unexpected response: {}",
+            body
+        );
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("external bridge token is required"));
+    }
+
+    #[tokio::test]
     async fn teams_webhook_endpoint_rejects_requests_without_authorization() {
         let (state, _config_dir, _data_dir) = build_test_state().await;
         {
@@ -29297,5 +35241,321 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn arkpulse_fix_rejects_shell_operations_without_finding_context() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let router = Router::new()
+            .route("/arkpulse/fix", post(run_arkpulse_fix))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/arkpulse/fix")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "issue_title": "Secret exposure",
+                    "target": "app:test",
+                    "fix_command": "cd C:/tmp/app && cargo generate-lockfile"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert!(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .contains("stored ArkPulse finding"));
+    }
+
+    #[test]
+    fn parse_set_secret_command_accepts_normalized_paraphrases() {
+        assert_eq!(
+            parse_set_secret_command("please save my secret OPENAI_API_KEY=abc123"),
+            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+        );
+        assert_eq!(
+            parse_set_secret_command("please save my secrret OPENAI_API_KEY=abc123"),
+            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+        );
+        assert_eq!(
+            parse_set_secret_command("secret set OPENAI_API_KEY abc123"),
+            Some(("OPENAI_API_KEY".to_string(), "abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_autonomy_quick_command_accepts_delegate_and_rollback_variants() {
+        match parse_autonomy_quick_command("can you delegate fixing login") {
+            Some(AutonomyQuickCommand::Delegate { task, .. }) => {
+                assert_eq!(task, "fixing login");
+            }
+            other => panic!("unexpected delegate parse result: {:?}", other),
+        }
+        match parse_autonomy_quick_command("please undo evt-123 read") {
+            Some(AutonomyQuickCommand::Rollback {
+                event_id,
+                operation,
+            }) => {
+                assert_eq!(event_id, "evt-123");
+                assert_eq!(operation.as_deref(), Some("mark_read"));
+            }
+            other => panic!("unexpected rollback parse result: {:?}", other),
+        }
+        match parse_autonomy_quick_command("could you please roll back evt-123 unread") {
+            Some(AutonomyQuickCommand::Rollback {
+                event_id,
+                operation,
+            }) => {
+                assert_eq!(event_id, "evt-123");
+                assert_eq!(operation.as_deref(), Some("mark_unread"));
+            }
+            other => panic!("unexpected rollback typo parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_notification_control_command_accepts_conservative_variants() {
+        assert!(matches!(
+            parse_notification_control_command("pause push notifications"),
+            Some(NotificationControlCommand::Pause24h)
+        ));
+        assert!(matches!(
+            parse_notification_control_command("turn notifications off"),
+            Some(NotificationControlCommand::Pause24h)
+        ));
+        assert!(matches!(
+            parse_notification_control_command("notifications on"),
+            Some(NotificationControlCommand::Resume)
+        ));
+        assert!(matches!(
+            parse_notification_control_command("status notifications"),
+            Some(NotificationControlCommand::Status)
+        ));
+    }
+
+    fn test_experience_run(
+        id: &str,
+        prompt_version: &str,
+        intent_key: &str,
+        success_state: &str,
+        correction_state: &str,
+    ) -> crate::storage::entities::experience_run::Model {
+        crate::storage::entities::experience_run::Model {
+            id: id.to_string(),
+            execution_run_id: None,
+            trace_id: Some(format!("trace-{id}")),
+            conversation_id: None,
+            project_id: None,
+            channel: "chat".to_string(),
+            scope: "global".to_string(),
+            intent_key: intent_key.to_string(),
+            task_type: Some("task".to_string()),
+            request_text: None,
+            tool_sequence_digest: None,
+            tool_sequence_json: serde_json::json!([]),
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: Some(prompt_version.to_string()),
+            model_slot: None,
+            success_state: success_state.to_string(),
+            correction_state: correction_state.to_string(),
+            outcome_summary: None,
+            failure_reason: None,
+            metadata: serde_json::json!({}),
+            consolidated: false,
+            accepted_at: None,
+            corrected_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_operational_log(
+        id: &str,
+        event_type: &str,
+        prompt_version: &str,
+        payload: serde_json::Value,
+        success: bool,
+        latency_ms: Option<i64>,
+    ) -> crate::storage::entities::operational_log::Model {
+        crate::storage::entities::operational_log::Model {
+            id: id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            trace_id: Some(format!("trace-{id}")),
+            conversation_id: None,
+            channel: "chat".to_string(),
+            event_type: event_type.to_string(),
+            success,
+            outcome: if success {
+                "ok".to_string()
+            } else {
+                "failed".to_string()
+            },
+            tool_name: None,
+            latency_ms,
+            arguments: None,
+            payload: Some(payload.to_string()),
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: Some(prompt_version.to_string()),
+            model_slot: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_prompt_metrics_uses_experience_and_routing_signals() {
+        let version = "system_prompt_v2+prompt-candidate-a";
+        let experience_runs = vec![
+            test_experience_run("run-1", version, "fix_bug", "accepted", "none"),
+            test_experience_run("run-2", version, "fix_bug", "failed", "none"),
+        ];
+        let tool_logs = vec![
+            test_operational_log(
+                "tool-1",
+                "tool_call",
+                version,
+                serde_json::json!({}),
+                true,
+                Some(100),
+            ),
+            test_operational_log(
+                "tool-2",
+                "tool_call",
+                version,
+                serde_json::json!({}),
+                false,
+                Some(200),
+            ),
+        ];
+        let routing_logs = vec![
+            test_operational_log(
+                "route-1",
+                "routing_decision",
+                version,
+                serde_json::json!({
+                    "needs_delegation": true,
+                    "should_clarify": false
+                }),
+                true,
+                None,
+            ),
+            test_operational_log(
+                "route-2",
+                "routing_decision",
+                version,
+                serde_json::json!({
+                    "needs_delegation": false,
+                    "should_clarify": true
+                }),
+                true,
+                None,
+            ),
+        ];
+        let llm_logs = vec![test_operational_log(
+            "llm-1",
+            "llm_decision",
+            version,
+            serde_json::json!({ "tool_calls": 3 }),
+            true,
+            None,
+        )];
+
+        let metrics =
+            aggregate_prompt_metrics(&experience_runs, &tool_logs, &routing_logs, &llm_logs);
+
+        assert_eq!(metrics.len(), 1);
+        let row = &metrics[0];
+        assert_eq!(row.version, version);
+        assert_eq!(row.samples, 2);
+        assert_eq!(row.success_rate, 0.5);
+        assert_eq!(row.error_rate, 0.5);
+        assert_eq!(row.routing_decisions, 2);
+        assert_eq!(row.delegation_rate, 0.5);
+        assert_eq!(row.clarification_rate, 0.5);
+        assert_eq!(row.avg_tool_calls_per_request, 3.0);
+        assert_eq!(row.tool_success_rate, 0.5);
+        assert_eq!(row.p95_latency_ms, Some(200));
+    }
+
+    #[test]
+    fn aggregate_prompt_metrics_excludes_provisional_runs_from_resolved_samples() {
+        let version = "system_prompt_v2+prompt-candidate-b";
+        let experience_runs = vec![
+            test_experience_run("run-1", version, "fix_bug", "provisional", "none"),
+            test_experience_run("run-2", version, "fix_bug", "accepted", "none"),
+        ];
+        let tool_logs: Vec<crate::storage::entities::operational_log::Model> = Vec::new();
+        let routing_logs: Vec<crate::storage::entities::operational_log::Model> = Vec::new();
+        let llm_logs: Vec<crate::storage::entities::operational_log::Model> = Vec::new();
+
+        let metrics =
+            aggregate_prompt_metrics(&experience_runs, &tool_logs, &routing_logs, &llm_logs);
+
+        assert_eq!(metrics.len(), 1);
+        let row = &metrics[0];
+        assert_eq!(row.samples, 1);
+        assert_eq!(row.success_rate, 1.0);
+        assert_eq!(row.error_rate, 0.0);
+    }
+
+    #[test]
+    fn build_prompt_insights_surfaces_end_to_end_regressions() {
+        let metrics = vec![
+            PromptEvolutionMetric {
+                version: "system_prompt_v2+baseline".to_string(),
+                samples: 40,
+                success_rate: 0.80,
+                error_rate: 0.20,
+                p95_latency_ms: Some(420),
+                routing_decisions: 40,
+                delegation_rate: 0.30,
+                clarification_rate: 0.05,
+                avg_tool_calls_per_request: 1.20,
+                tool_success_rate: 0.92,
+            },
+            PromptEvolutionMetric {
+                version: "system_prompt_v2+candidate".to_string(),
+                samples: 40,
+                success_rate: 0.62,
+                error_rate: 0.38,
+                p95_latency_ms: Some(610),
+                routing_decisions: 40,
+                delegation_rate: 0.45,
+                clarification_rate: 0.12,
+                avg_tool_calls_per_request: 1.10,
+                tool_success_rate: 0.71,
+            },
+        ];
+        let canary_state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+            enabled: true,
+            baseline_version: "system_prompt_v2+baseline".to_string(),
+            candidate_version: "system_prompt_v2+candidate".to_string(),
+            rollout_percent: 20,
+            min_samples_per_version: 25,
+            min_success_gain: 0.03,
+            max_sign_test_p_value: 0.10,
+            activated_at: None,
+        };
+
+        let insights = build_prompt_insights(&metrics, Some(&canary_state));
+
+        assert!(insights
+            .regressions
+            .iter()
+            .any(|line| line.contains("End-to-end experience success is down")));
+        assert!(insights
+            .regressions
+            .iter()
+            .any(|line| line.contains("Tool success is down")));
+        assert!(insights
+            .regressions
+            .iter()
+            .any(|line| line.contains("p95 latency regressed")));
     }
 }

@@ -8,7 +8,7 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgentArk Remote Access</title>
+    <title>__PRODUCT_NAME__ Remote Access</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -126,19 +126,19 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
 <body>
     <div class="login-card">
         <div class="brand">
-            <img src="/logo.svg" alt="AgentArk">
+            <img src="/logo.svg" alt="__PRODUCT_NAME__">
             <div>
                 <div class="eyebrow">Secure Remote Access</div>
-                <h1>Sign in to AgentArk</h1>
+                <h1>Sign in to __PRODUCT_NAME__</h1>
             </div>
         </div>
-        <p>This remote access URL opens your full AgentArk console. Enter the custom AgentArk password you set in Settings to continue.</p>
-        <div class="note">AgentArk keeps the internal server API key private. Remote access on this link uses your AgentArk password and a secure session cookie.</div>
+        <p>This remote access URL opens your full __PRODUCT_NAME__ console. Enter the custom __PRODUCT_NAME__ password you set in Settings to continue.</p>
+        <div class="note">__PRODUCT_NAME__ keeps the internal server API key private. Remote access on this link uses your __PRODUCT_NAME__ password and a secure session cookie.</div>
         <form id="login-form">
             <input
                 type="password"
                 id="password"
-                placeholder="AgentArk password"
+                placeholder="__PRODUCT_NAME__ password"
                 autocomplete="current-password"
                 autofocus
             >
@@ -164,7 +164,7 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
             event.preventDefault();
             const password = passwordInput.value;
             if (!password) {
-                showMessage('error', 'Enter your AgentArk password.');
+                showMessage('error', 'Enter your __PRODUCT_NAME__ password.');
                 return;
             }
 
@@ -186,10 +186,10 @@ const TUNNEL_LOGIN_PAGE_TEMPLATE: &str = r##"<!DOCTYPE html>
                     passwordInput.select();
                     return;
                 }
-                showMessage('success', 'Signed in. Opening AgentArk...');
+                showMessage('success', 'Signed in. Opening __PRODUCT_NAME__...');
                 window.location.assign(nextTarget);
             } catch (_) {
-                showMessage('error', 'Could not reach AgentArk.');
+                showMessage('error', 'Could not reach __PRODUCT_NAME__.');
                 button.disabled = false;
                 button.textContent = 'Sign In';
             }
@@ -211,12 +211,18 @@ impl ControlPlaneTunnelError {
     pub(super) fn message(&self) -> String {
         match self {
             Self::CustomPasswordRequired => {
-                "Set a custom AgentArk password before enabling remote access.".to_string()
+                format!(
+                    "Set a custom {} password before enabling remote access.",
+                    crate::branding::PRODUCT_NAME
+                )
             }
             Self::InsecureNoAuthMode => {
                 "Disable insecure no-auth mode before enabling remote access.".to_string()
             }
-            Self::HttpsProviderRequired => "Full AgentArk remote access requires an HTTPS-capable provider. Choose Cloudflare, ngrok, Tailscale Funnel, or Tailscale Private.".to_string(),
+            Self::HttpsProviderRequired => format!(
+                "Full {} remote access requires an HTTPS-capable provider. Choose Cloudflare, ngrok, Tailscale Funnel, or Tailscale Private.",
+                crate::branding::PRODUCT_NAME
+            ),
             Self::AuthUnavailable(detail) => {
                 format!("Failed to prepare secure remote access: {}", detail)
             }
@@ -329,8 +335,7 @@ pub(super) async fn is_control_plane_tunnel_authenticated(
         return true;
     }
 
-    let session_token = auth::current_ui_session_token(state).await;
-    auth::has_valid_ui_session_cookie(headers, session_token.as_deref())
+    auth::has_valid_ui_session_cookie(state, headers).await
 }
 
 pub(super) fn redirect_to_tunnel_login(uri: &Uri) -> Response {
@@ -362,7 +367,11 @@ pub(super) async fn tunnel_login_page(
 
     let next_json =
         serde_json::to_string(&next_target).unwrap_or_else(|_| "\"/ui/v2\"".to_string());
-    Html(TUNNEL_LOGIN_PAGE_TEMPLATE.replace("__NEXT_TARGET__", &next_json)).into_response()
+    Html(
+        crate::branding::render_template(TUNNEL_LOGIN_PAGE_TEMPLATE)
+            .replace("__NEXT_TARGET__", &next_json),
+    )
+    .into_response()
 }
 
 pub(super) async fn tunnel_login(
@@ -401,7 +410,7 @@ pub(super) async fn tunnel_login(
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
-                "error": "Incorrect AgentArk password"
+                "error": format!("Incorrect {} password", crate::branding::PRODUCT_NAME)
             })),
         )
             .into_response();
@@ -421,10 +430,30 @@ pub(super) async fn tunnel_login(
 
     let mut response =
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response();
-    let session_token = auth::current_ui_session_token(&state).await;
+    let session_token = generate_ephemeral_token();
+    {
+        let now = auth::unix_now_ts();
+        let mut sessions = state.ui_sessions.write().await;
+        sessions.retain(|_, record| record.expires_at > now);
+        sessions.insert(
+            session_token.clone(),
+            UiSessionRecord {
+                issued_at: now,
+                expires_at: now + UI_SESSION_TTL_SECS,
+                last_seen_at: now,
+                source: "tunnel_login".to_string(),
+                client_hint: headers
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.chars().take(160).collect()),
+            },
+        );
+    }
     auth::apply_session_cookie(
         &mut response,
-        session_token.as_ref(),
+        Some(session_token.as_str()),
         state.cookie_secure_default || auth::is_https_forwarded(&headers),
     );
     response

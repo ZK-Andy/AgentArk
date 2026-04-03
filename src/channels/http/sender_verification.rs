@@ -14,6 +14,22 @@ fn error_response(status: StatusCode, error: impl ToString) -> Response {
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct UpdateSenderVerificationSettingsRequest {
     #[serde(default)]
+    pub google_chat_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub google_chat_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
+    pub signal_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub signal_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
+    pub imessage_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub imessage_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
+    pub line_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub line_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
     pub slack_policy: Option<SenderTrustPolicy>,
     #[serde(default)]
     pub slack_allowed_senders: Option<Vec<String>>,
@@ -25,6 +41,14 @@ pub(super) struct UpdateSenderVerificationSettingsRequest {
     pub whatsapp_policy: Option<SenderTrustPolicy>,
     #[serde(default)]
     pub whatsapp_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
+    pub wechat_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub wechat_allowed_senders: Option<Vec<String>>,
+    #[serde(default)]
+    pub qq_policy: Option<SenderTrustPolicy>,
+    #[serde(default)]
+    pub qq_allowed_senders: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +86,14 @@ fn normalize_sender_list(channel: SenderChannel, values: Option<Vec<String>>) ->
                 .chars()
                 .filter(|ch| ch.is_ascii_digit())
                 .collect::<String>(),
-            SenderChannel::Slack | SenderChannel::Teams => value.to_ascii_lowercase(),
+            SenderChannel::Slack
+            | SenderChannel::Teams
+            | SenderChannel::GoogleChat
+            | SenderChannel::Signal
+            | SenderChannel::IMessage
+            | SenderChannel::Line
+            | SenderChannel::WeChat
+            | SenderChannel::Qq => value.to_ascii_lowercase(),
         })
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
@@ -121,6 +152,26 @@ async fn sync_whatsapp_legacy_approval(
 
 async fn overview_payload(agent: &Agent) -> Result<serde_json::Value> {
     let snapshot = sender_verification::load_snapshot(&agent.storage).await?;
+    let google_chat = serde_json::json!({
+        "configured": agent.config.google_chat.is_some(),
+        "policy": snapshot.settings.google_chat.policy,
+        "allowed_senders": snapshot.settings.google_chat.allowed_senders,
+    });
+    let signal = serde_json::json!({
+        "configured": agent.config.signal.is_some(),
+        "policy": snapshot.settings.signal.policy,
+        "allowed_senders": snapshot.settings.signal.allowed_senders,
+    });
+    let imessage = serde_json::json!({
+        "configured": agent.config.imessage.is_some(),
+        "policy": snapshot.settings.imessage.policy,
+        "allowed_senders": snapshot.settings.imessage.allowed_senders,
+    });
+    let line = serde_json::json!({
+        "configured": agent.config.line.is_some(),
+        "policy": snapshot.settings.line.policy,
+        "allowed_senders": snapshot.settings.line.allowed_senders,
+    });
     let slack = serde_json::json!({
         "configured": agent.config.slack.is_some(),
         "policy": snapshot.settings.slack.policy,
@@ -130,6 +181,16 @@ async fn overview_payload(agent: &Agent) -> Result<serde_json::Value> {
         "configured": agent.config.teams.is_some(),
         "policy": snapshot.settings.teams.policy,
         "allowed_senders": snapshot.settings.teams.allowed_senders,
+    });
+    let wechat = serde_json::json!({
+        "configured": agent.config.wechat.is_some(),
+        "policy": snapshot.settings.wechat.policy,
+        "allowed_senders": snapshot.settings.wechat.allowed_senders,
+    });
+    let qq = serde_json::json!({
+        "configured": agent.config.qq.is_some(),
+        "policy": snapshot.settings.qq.policy,
+        "allowed_senders": snapshot.settings.qq.allowed_senders,
     });
     let whatsapp_config = agent.config.whatsapp.clone();
     let whatsapp = serde_json::json!({
@@ -152,13 +213,19 @@ async fn overview_payload(agent: &Agent) -> Result<serde_json::Value> {
 
     Ok(serde_json::json!({
         "settings": {
+            "google_chat": google_chat,
+            "signal": signal,
+            "imessage": imessage,
+            "line": line,
             "slack": slack,
             "teams": teams,
             "whatsapp": whatsapp,
+            "wechat": wechat,
+            "qq": qq,
         },
         "pending": snapshot.pending,
         "approved": snapshot.approved,
-        "channels": ["slack", "teams", "whatsapp"],
+        "channels": ["google_chat", "signal", "imessage", "line", "slack", "teams", "whatsapp", "wechat", "qq"],
     }))
 }
 
@@ -184,6 +251,33 @@ pub(super) async fn update_sender_verification_settings(
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
 
+    if let Some(policy) = request.google_chat_policy {
+        settings.google_chat.policy = policy;
+    }
+    if let Some(values) = request.google_chat_allowed_senders {
+        settings.google_chat.allowed_senders =
+            normalize_sender_list(SenderChannel::GoogleChat, Some(values));
+    }
+    if let Some(policy) = request.signal_policy {
+        settings.signal.policy = policy;
+    }
+    if let Some(values) = request.signal_allowed_senders {
+        settings.signal.allowed_senders =
+            normalize_sender_list(SenderChannel::Signal, Some(values));
+    }
+    if let Some(policy) = request.imessage_policy {
+        settings.imessage.policy = policy;
+    }
+    if let Some(values) = request.imessage_allowed_senders {
+        settings.imessage.allowed_senders =
+            normalize_sender_list(SenderChannel::IMessage, Some(values));
+    }
+    if let Some(policy) = request.line_policy {
+        settings.line.policy = policy;
+    }
+    if let Some(values) = request.line_allowed_senders {
+        settings.line.allowed_senders = normalize_sender_list(SenderChannel::Line, Some(values));
+    }
     if let Some(policy) = request.slack_policy {
         settings.slack.policy = policy;
     }
@@ -195,6 +289,19 @@ pub(super) async fn update_sender_verification_settings(
     }
     if let Some(values) = request.teams_allowed_senders {
         settings.teams.allowed_senders = normalize_sender_list(SenderChannel::Teams, Some(values));
+    }
+    if let Some(policy) = request.wechat_policy {
+        settings.wechat.policy = policy;
+    }
+    if let Some(values) = request.wechat_allowed_senders {
+        settings.wechat.allowed_senders =
+            normalize_sender_list(SenderChannel::WeChat, Some(values));
+    }
+    if let Some(policy) = request.qq_policy {
+        settings.qq.policy = policy;
+    }
+    if let Some(values) = request.qq_allowed_senders {
+        settings.qq.allowed_senders = normalize_sender_list(SenderChannel::Qq, Some(values));
     }
 
     if request.whatsapp_policy.is_some() || request.whatsapp_allowed_senders.is_some() {
@@ -382,7 +489,7 @@ mod tests {
                 api_key: Arc::new(RwLock::new(None)),
                 api_key_expires_at: Arc::new(RwLock::new(None)),
                 allow_insecure_no_auth: true,
-                session_token: Arc::new(RwLock::new(None)),
+                ui_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 local_ui_bootstrap_enabled: true,
                 local_ui_bootstrap_tokens: Arc::new(RwLock::new(HashMap::new())),
                 cookie_secure_default: false,
@@ -392,6 +499,8 @@ mod tests {
                 whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
                 security_events,
                 app_registry,
+                executor_client: None,
+                workspace_client: None,
                 application_registry: applications::ApplicationLauncherRegistry::default(),
                 deployment_mode: DeploymentMode::TrustedLocal,
                 server_role: HttpServerRole::ControlPlane,

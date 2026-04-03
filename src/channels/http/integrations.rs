@@ -36,7 +36,10 @@ struct IntegrationResponse {
     pub config_values: Option<serde_json::Value>,
 }
 
-pub(super) async fn gmail_oauth_start(State(state): State<AppState>) -> Response {
+pub(super) async fn gmail_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     // Try env var first, then fall back to secure config
     let (config_dir, data_dir) = {
         let a = state.agent.read().await;
@@ -69,14 +72,26 @@ pub(super) async fn gmail_oauth_start(State(state): State<AppState>) -> Response
         }
     };
 
-    let state_token = auth::issue_oauth_state(&state, "gmail").await;
-    let auth_url = format_gmail_auth_url(&client_id, &state_token);
+    let redirect_uri = match oauth_redirect_uri_for_request(&state, &headers, None) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+    let (state_token, code_challenge) =
+        auth::issue_oauth_state_with_pkce(&state, "gmail", Some(redirect_uri.clone())).await;
+    let auth_url = format_gmail_auth_url(&client_id, &state_token, &code_challenge, &redirect_uri);
 
     (StatusCode::OK, Json(GmailOAuthStartResponse { auth_url })).into_response()
 }
 
 /// Exchange Gmail authorization code for tokens (called from oauth_callback)
-async fn gmail_exchange_code(state: &AppState, code: &str) -> Result<(), String> {
+async fn gmail_exchange_code(
+    state: &AppState,
+    redirect_uri: &str,
+    code: &str,
+    pkce_verifier: Option<&str>,
+) -> Result<(), String> {
     let (config_dir, data_dir) = {
         let a = state.agent.read().await;
         (a.config_dir.clone(), a.data_dir.clone())
@@ -108,20 +123,21 @@ async fn gmail_exchange_code(state: &AppState, code: &str) -> Result<(), String>
         })
         .ok_or_else(|| "Gmail client_secret not configured".to_string())?;
 
-    let redirect_uri = "http://localhost:8990/oauth/callback";
-
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let params = [
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-        ("grant_type", "authorization_code"),
+    let mut params = vec![
+        ("client_id", client_id.as_str().to_string()),
+        ("client_secret", client_secret.as_str().to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("grant_type", "authorization_code".to_string()),
     ];
+    if let Some(verifier) = pkce_verifier {
+        params.push(("code_verifier", verifier.to_string()));
+    }
 
     let resp = http_client
         .post("https://oauth2.googleapis.com/token")
@@ -165,12 +181,6 @@ async fn gmail_exchange_code(state: &AppState, code: &str) -> Result<(), String>
         .map_err(|e| format!("Failed to save tokens: {}", e))?;
     set_builtin_integration_enabled(&config_dir, &data_dir, &["gmail"], true)?;
     set_builtin_integration_user_disabled(&config_dir, &data_dir, &["gmail"], false)?;
-
-    // Remove legacy plaintext token file if it exists
-    let legacy_path = config_dir.join("gmail.json");
-    if legacy_path.exists() {
-        let _ = tokio::fs::remove_file(&legacy_path).await;
-    }
 
     Ok(())
 }
@@ -594,7 +604,8 @@ fn google_workspace_status_detail(
             .collect::<Vec<_>>()
             .join(", ");
         return Some(format!(
-            "AgentArk requested additional Google Workspace access for {}. Reconnect to approve it.",
+            "{} requested additional Google Workspace access for {}. Reconnect to approve it.",
+            crate::branding::PRODUCT_NAME,
             list
         ));
     }
@@ -668,68 +679,108 @@ fn config_only_status_detail(id: &str, enabled: bool) -> String {
     let name = id.replace('_', " ");
     if enabled {
         format!(
-            "{} credentials are saved and agent use is enabled, but AgentArk has not run a live health probe for this connector yet.",
-            name
+            "{} credentials are saved and agent use is enabled, but {} has not run a live health probe for this connector yet.",
+            name,
+            crate::branding::PRODUCT_NAME
         )
     } else {
         format!(
-            "{} credentials are saved, but this connector is still waiting for explicit enablement and live use before AgentArk can confirm connectivity.",
-            name
+            "{} credentials are saved, but this connector is still waiting for explicit enablement and live use before {} can confirm connectivity.",
+            name,
+            crate::branding::PRODUCT_NAME
         )
     }
 }
 
-fn format_gmail_auth_url(client_id: &str, state_token: &str) -> String {
-    let redirect_uri = "http://localhost:8990/oauth/callback";
+fn format_gmail_auth_url(
+    client_id: &str,
+    state_token: &str,
+    code_challenge: &str,
+    redirect_uri: &str,
+) -> String {
     let scope =
         "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
     format!(
-        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent&code_challenge={}&code_challenge_method=S256",
         urlencoding::encode(client_id),
         urlencoding::encode(redirect_uri),
         urlencoding::encode(scope),
         urlencoding::encode(state_token),
+        urlencoding::encode(code_challenge),
     )
 }
 
-fn format_calendar_auth_url(client_id: &str, state_token: &str) -> String {
-    let redirect_uri = "http://localhost:8990/oauth/callback";
+fn format_calendar_auth_url(
+    client_id: &str,
+    state_token: &str,
+    code_challenge: &str,
+    redirect_uri: &str,
+) -> String {
     let scope = "https://www.googleapis.com/auth/calendar";
     format!(
-        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent&code_challenge={}&code_challenge_method=S256",
         urlencoding::encode(client_id),
         urlencoding::encode(redirect_uri),
         urlencoding::encode(scope),
         urlencoding::encode(state_token),
+        urlencoding::encode(code_challenge),
     )
 }
 
 async fn build_gmail_auth_url(
     state: &AppState,
+    headers: &HeaderMap,
     manager: Option<&crate::core::config::SecureConfigManager>,
 ) -> std::result::Result<String, String> {
     let (client_id, _) = gmail_oauth_pair(manager)
         .ok_or_else(|| "Gmail not configured. Add Google OAuth credentials first.".to_string())?;
-    let state_token = auth::issue_oauth_state(state, "gmail").await;
-    Ok(format_gmail_auth_url(&client_id, &state_token))
+    let redirect_uri = oauth_redirect_uri_for_request(state, headers, None)?;
+    let (state_token, code_challenge) =
+        auth::issue_oauth_state_with_pkce(state, "gmail", Some(redirect_uri.clone())).await;
+    Ok(format_gmail_auth_url(
+        &client_id,
+        &state_token,
+        &code_challenge,
+        &redirect_uri,
+    ))
 }
 
 async fn build_calendar_auth_url(
     state: &AppState,
+    headers: &HeaderMap,
     manager: Option<&crate::core::config::SecureConfigManager>,
 ) -> std::result::Result<String, String> {
     let (client_id, _) = calendar_oauth_pair(manager).ok_or_else(|| {
         "Google Calendar not configured. Add Google OAuth credentials first.".to_string()
     })?;
-    let state_token = auth::issue_oauth_state(state, "google_calendar").await;
-    Ok(format_calendar_auth_url(&client_id, &state_token))
+    let redirect_uri = oauth_redirect_uri_for_request(state, headers, None)?;
+    let (state_token, code_challenge) =
+        auth::issue_oauth_state_with_pkce(state, "google_calendar", Some(redirect_uri.clone()))
+            .await;
+    Ok(format_calendar_auth_url(
+        &client_id,
+        &state_token,
+        &code_challenge,
+        &redirect_uri,
+    ))
 }
 
-async fn build_google_workspace_auth_url(state: &AppState) -> std::result::Result<String, String> {
+async fn build_google_workspace_auth_url(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<String, String> {
     let config_dir = { state.agent.read().await.config_dir.clone() };
-    let state_token = auth::issue_oauth_state(state, "google_workspace").await;
-    crate::actions::google_workspace::build_auth_url(&config_dir, &state_token)
-        .map_err(|e| e.to_string())
+    let redirect_uri = oauth_redirect_uri_for_request(state, headers, None)?;
+    let (state_token, code_challenge) =
+        auth::issue_oauth_state_with_pkce(state, "google_workspace", Some(redirect_uri.clone()))
+            .await;
+    crate::actions::google_workspace::build_auth_url(
+        &config_dir,
+        &state_token,
+        &code_challenge,
+        &redirect_uri,
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub(super) fn external_integration_config(
@@ -765,7 +816,10 @@ pub(super) fn external_integration_config(
                     options: None,
                 },
             ],
-            Some("Enter the Google OAuth client ID and client secret for this AgentArk instance, choose the Workspace bundles you want, then continue with Google in your browser.".to_string()),
+            Some(format!(
+                "Enter the Google OAuth client ID and client secret for this {} instance, choose the Workspace bundles you want, then continue with Google in your browser.",
+                crate::branding::PRODUCT_NAME
+            )),
             Some("Save Setup".to_string()),
         )),
         "gmail" => Some((
@@ -1090,9 +1144,44 @@ fn oauth_callback_signal_script(service_id: &str, status: &str, detail: &str) ->
     )
 }
 
+fn oauth_profile_callback_signal_script(profile_id: &str, status: &str, detail: &str) -> String {
+    let payload = serde_json::json!({
+        "type": "oauth_callback",
+        "service_id": "auth_profile",
+        "auth_profile_id": profile_id,
+        "status": status,
+        "detail": detail,
+    });
+    let payload_json = serde_json::to_string(&payload)
+        .unwrap_or_else(|_| "{\"type\":\"oauth_callback\"}".to_string())
+        .replace("</", "<\\/");
+    format!(
+        r#"<script>
+(function () {{
+  const payload = {payload_json};
+  try {{
+    window.localStorage.setItem("agentark:oauth-callback", JSON.stringify(payload));
+  }} catch (_) {{}}
+  try {{
+    if ("BroadcastChannel" in window) {{
+      const channel = new BroadcastChannel("agentark-oauth");
+      channel.postMessage(payload);
+      channel.close();
+    }}
+  }} catch (_) {{}}
+  try {{
+    window.opener?.postMessage(payload, window.location.origin);
+  }} catch (_) {{}}
+  setTimeout(() => window.close(), 1200);
+}})();
+</script>"#
+    )
+}
+
 /// Handle OAuth callback from providers (Google, etc.)
 pub(super) async fn oauth_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<OAuthCallbackParams>,
 ) -> Response {
     let Some(state_token) = params.state.as_deref() else {
@@ -1111,17 +1200,18 @@ body { font-family: system-ui; background: #1a1a2e; color: #eee; display: flex; 
 <body>
 <div class="card">
 <h2 class="error">Authorization Failed</h2>
-<p>This authorization request is invalid or has expired. Start the sign-in flow again from AgentArk.</p>
-<p><a href="/" style="color: #00d9ff;">Return to AgentArk</a></p>
+<p>This authorization request is invalid or has expired. Start the sign-in flow again from __PRODUCT_NAME__.</p>
+<p><a href="/" style="color: #00d9ff;">Return to __PRODUCT_NAME__</a></p>
 </div>
 </body>
-</html>"#,
+</html>"#
+                    .replace("__PRODUCT_NAME__", crate::branding::PRODUCT_NAME),
             ),
         )
             .into_response();
     };
 
-    let Some(service_id) = auth::consume_oauth_state(&state, state_token).await else {
+    let Some(oauth_state) = auth::consume_oauth_state(&state, state_token).await else {
         return (
             StatusCode::BAD_REQUEST,
             Html(
@@ -1137,18 +1227,34 @@ body { font-family: system-ui; background: #1a1a2e; color: #eee; display: flex; 
 <body>
 <div class="card">
 <h2 class="error">Authorization Failed</h2>
-<p>This authorization request is invalid or has expired. Start the sign-in flow again from AgentArk.</p>
-<p><a href="/" style="color: #00d9ff;">Return to AgentArk</a></p>
+<p>This authorization request is invalid or has expired. Start the sign-in flow again from __PRODUCT_NAME__.</p>
+<p><a href="/" style="color: #00d9ff;">Return to __PRODUCT_NAME__</a></p>
 </div>
 </body>
-</html>"#,
+</html>"#
+                    .replace("__PRODUCT_NAME__", crate::branding::PRODUCT_NAME),
             ),
         )
             .into_response();
     };
 
+    let redirect_uri_result = oauth_state
+        .redirect_uri
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| oauth_redirect_uri_for_request(&state, &headers, None));
+    let pkce_verifier = oauth_state.pkce_verifier;
+    let oauth_target = oauth_state.target;
+
     if let Some(error) = params.error {
-        let signal = oauth_callback_signal_script(&service_id, "error", &error);
+        let signal = match &oauth_target {
+            PendingOAuthTarget::Integration { service_id } => {
+                oauth_callback_signal_script(service_id, "error", &error)
+            }
+            PendingOAuthTarget::AuthProfile { profile_id } => {
+                oauth_profile_callback_signal_script(profile_id, "error", &error)
+            }
+        };
         let html = format!(
             r#"<!DOCTYPE html>
 <html>
@@ -1163,14 +1269,15 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
 <div class="card">
 <h2 class="error"> Authorization Failed</h2>
 <p>{}</p>
-<p><a href="/" style="color: #00d9ff;">Return to AgentArk</a></p>
+<p><a href="/" style="color: #00d9ff;">Return to __PRODUCT_NAME__</a></p>
 </div>
 {}
 </body>
 </html>"#,
             escape_html(&error),
             signal
-        );
+        )
+        .replace("__PRODUCT_NAME__", crate::branding::PRODUCT_NAME);
         return (StatusCode::OK, Html(html)).into_response();
     }
 
@@ -1181,50 +1288,111 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
         }
     };
 
-    let result = match service_id.as_str() {
-        "gmail" => gmail_exchange_code(&state, &code)
-            .await
-            .map(|_| serde_json::json!({"status": "connected"}))
-            .map_err(|e| anyhow::anyhow!(e)),
-        "google_workspace" => {
-            let config_dir = { state.agent.read().await.config_dir.clone() };
-            crate::actions::google_workspace::exchange_code(&config_dir, &code)
-                .await
-                .map(|tokens| {
-                    serde_json::json!({
-                        "status": "connected",
-                        "granted_bundles": tokens.granted_bundles
-                    })
-                })
-                .map_err(|e| anyhow::anyhow!(e))
-        }
-        "google_calendar" | "calendar" => calendar_exchange_code(&state, &code)
-            .await
-            .map(|_| serde_json::json!({"status": "connected"}))
-            .map_err(|e| anyhow::anyhow!(e)),
-        _ => {
-            let agent = state.agent.read().await;
-            if let Some(integration) = agent.integrations.get(&service_id) {
-                integration
-                    .execute("auth_callback", &serde_json::json!({"code": code}))
+    let (callback_label, result) = match &oauth_target {
+        PendingOAuthTarget::Integration { service_id } => {
+            let result = match service_id.as_str() {
+                "gmail" => match redirect_uri_result.as_ref() {
+                    Ok(redirect_uri) => gmail_exchange_code(
+                        &state,
+                        redirect_uri.as_str(),
+                        &code,
+                        pkce_verifier.as_deref(),
+                    )
                     .await
-            } else {
-                Err(anyhow::anyhow!("Unknown service: {}", service_id))
-            }
+                    .map(|_| serde_json::json!({"status": "connected"}))
+                    .map_err(|e| anyhow::anyhow!(e)),
+                    Err(error) => Err(anyhow::anyhow!(error.clone())),
+                },
+                "google_workspace" => {
+                    let config_dir = { state.agent.read().await.config_dir.clone() };
+                    match redirect_uri_result.as_ref() {
+                        Ok(redirect_uri) => crate::actions::google_workspace::exchange_code(
+                            &config_dir,
+                            redirect_uri.as_str(),
+                            &code,
+                            pkce_verifier.as_deref(),
+                        )
+                        .await
+                        .map(|tokens| {
+                            serde_json::json!({
+                                "status": "connected",
+                                "granted_bundles": tokens.granted_bundles
+                            })
+                        })
+                        .map_err(|e| anyhow::anyhow!(e)),
+                        Err(error) => Err(anyhow::anyhow!(error.clone())),
+                    }
+                }
+                "google_calendar" | "calendar" => match redirect_uri_result.as_ref() {
+                    Ok(redirect_uri) => calendar_exchange_code(
+                        &state,
+                        redirect_uri.as_str(),
+                        &code,
+                        pkce_verifier.as_deref(),
+                    )
+                    .await
+                    .map(|_| serde_json::json!({"status": "connected"}))
+                    .map_err(|e| anyhow::anyhow!(e)),
+                    Err(error) => Err(anyhow::anyhow!(error.clone())),
+                },
+                _ => {
+                    let agent = state.agent.read().await;
+                    if let Some(integration) = agent.integrations.get(service_id) {
+                        integration
+                            .execute("auth_callback", &serde_json::json!({"code": code}))
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!("Unknown service: {}", service_id))
+                    }
+                }
+            };
+            (service_id.clone(), result)
+        }
+        PendingOAuthTarget::AuthProfile { profile_id } => {
+            let storage = { state.agent.read().await.storage.clone() };
+            let result = match redirect_uri_result.as_ref() {
+                Ok(redirect_uri) => {
+                    crate::core::auth_profiles::AuthProfileControlPlane::complete_oauth_callback(
+                        &storage,
+                        profile_id,
+                        &code,
+                        pkce_verifier.as_deref(),
+                        Some(redirect_uri.as_str()),
+                    )
+                    .await
+                    .map(|profile| {
+                        serde_json::json!({
+                            "status": "connected",
+                            "profile_id": profile.id,
+                            "kind": profile.kind,
+                        })
+                    })
+                }
+                Err(error) => Err(anyhow::anyhow!(error.clone())),
+            };
+            (profile_id.clone(), result)
         }
     };
 
     match result {
         Ok(_) => {
             if matches!(
-                service_id.as_str(),
-                "gmail" | "google_calendar" | "calendar" | "google_workspace"
+                &oauth_target,
+                PendingOAuthTarget::Integration { service_id }
+                    if matches!(
+                        service_id.as_str(),
+                        "gmail" | "google_calendar" | "calendar" | "google_workspace"
+                    )
             ) {
                 let (config_dir, data_dir) = {
                     let agent = state.agent.read().await;
                     (agent.config_dir.clone(), agent.data_dir.clone())
                 };
-                let mut integration_ids = match service_id.as_str() {
+                let service_id = match &oauth_target {
+                    PendingOAuthTarget::Integration { service_id } => service_id.as_str(),
+                    PendingOAuthTarget::AuthProfile { .. } => "",
+                };
+                let mut integration_ids = match service_id {
                     "gmail" => vec!["gmail"],
                     "google_calendar" | "calendar" => vec!["google_calendar"],
                     "google_workspace" => vec!["google_workspace"],
@@ -1262,7 +1430,14 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
                     );
                 }
             }
-            let signal = oauth_callback_signal_script(&service_id, "connected", "");
+            let signal = match &oauth_target {
+                PendingOAuthTarget::Integration { service_id } => {
+                    oauth_callback_signal_script(service_id, "connected", "")
+                }
+                PendingOAuthTarget::AuthProfile { profile_id } => {
+                    oauth_profile_callback_signal_script(profile_id, "connected", "")
+                }
+            };
             let html = format!(
                 r#"<!DOCTYPE html>
 <html>
@@ -1276,20 +1451,28 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
 <body>
 <div class="card">
 <h2 class="success"> {} Connected!</h2>
-<p>You can close this window and return to AgentArk.</p>
-<p><a href="/" style="color: #00d9ff;">Return to AgentArk</a></p>
+<p>You can close this window and return to __PRODUCT_NAME__.</p>
+<p><a href="/" style="color: #00d9ff;">Return to __PRODUCT_NAME__</a></p>
 </div>
 {}
 </body>
 </html>"#,
-                escape_html(&service_id.replace('_', " ")),
+                escape_html(&callback_label.replace('_', " ")),
                 signal
-            );
+            )
+            .replace("__PRODUCT_NAME__", crate::branding::PRODUCT_NAME);
             (StatusCode::OK, Html(html)).into_response()
         }
         Err(e) => {
             let error_text = e.to_string();
-            let signal = oauth_callback_signal_script(&service_id, "error", &error_text);
+            let signal = match &oauth_target {
+                PendingOAuthTarget::Integration { service_id } => {
+                    oauth_callback_signal_script(service_id, "error", &error_text)
+                }
+                PendingOAuthTarget::AuthProfile { profile_id } => {
+                    oauth_profile_callback_signal_script(profile_id, "error", &error_text)
+                }
+            };
             let html = format!(
                 r#"<!DOCTYPE html>
 <html>
@@ -1304,14 +1487,15 @@ body {{ font-family: system-ui; background: #1a1a2e; color: #eee; display: flex;
 <div class="card">
 <h2 class="error"> Connection Failed</h2>
 <p>{}</p>
-<p><a href="/" style="color: #00d9ff;">Return to AgentArk</a></p>
+<p><a href="/" style="color: #00d9ff;">Return to __PRODUCT_NAME__</a></p>
 </div>
 {}
 </body>
 </html>"#,
                 escape_html(&error_text),
                 signal
-            );
+            )
+            .replace("__PRODUCT_NAME__", crate::branding::PRODUCT_NAME);
             (StatusCode::OK, Html(html)).into_response()
         }
     }
@@ -1391,9 +1575,10 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
         integrations.push(IntegrationResponse {
             id: "google_workspace".to_string(),
             name: "Google Workspace".to_string(),
-            description:
-                "Connect Google Workspace once, then let AgentArk use Gmail, Calendar, read Drive/Docs/Sheets/Chat/Admin data, and access the broader gws CLI surface from the same credential set."
-                    .to_string(),
+            description: format!(
+                "Connect Google Workspace once, then let {} use Gmail, Calendar, read Drive/Docs/Sheets/Chat/Admin data, and access the broader gws CLI surface from the same credential set.",
+                crate::branding::PRODUCT_NAME
+            ),
             icon: "".to_string(),
             status: status.to_string(),
             enabled,
@@ -1489,6 +1674,7 @@ pub(super) async fn list_integrations(State(state): State<AppState>) -> Response
 pub(super) async fn get_integration_auth_url(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     if id == "gmail" || id == "google_calendar" || id == "google_workspace" {
         let (config_dir, data_dir) = {
@@ -1501,11 +1687,11 @@ pub(super) async fn get_integration_auth_url(
         )
         .ok();
         let auth_url = if id == "gmail" {
-            build_gmail_auth_url(&state, manager.as_ref()).await
+            build_gmail_auth_url(&state, &headers, manager.as_ref()).await
         } else if id == "google_workspace" {
-            build_google_workspace_auth_url(&state).await
+            build_google_workspace_auth_url(&state, &headers).await
         } else {
-            build_calendar_auth_url(&state, manager.as_ref()).await
+            build_calendar_auth_url(&state, &headers, manager.as_ref()).await
         };
         return match auth_url {
             Ok(url) => (
@@ -1521,7 +1707,7 @@ pub(super) async fn get_integration_auth_url(
 
     match agent.integrations.get(&id) {
         Some(integration) => {
-            let state_token = auth::issue_oauth_state(&state, &id).await;
+            let state_token = auth::issue_oauth_state(&state, &id, None).await;
             match integration
                 .execute("get_auth_url", &serde_json::json!({"state": state_token}))
                 .await
@@ -2743,7 +2929,10 @@ pub(super) async fn configure_calendar(
     }
 }
 
-pub(super) async fn calendar_oauth_start(State(state): State<AppState>) -> Response {
+pub(super) async fn calendar_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     let (config_dir, data_dir) = {
         let a = state.agent.read().await;
         (a.config_dir.clone(), a.data_dir.clone())
@@ -2788,8 +2977,17 @@ pub(super) async fn calendar_oauth_start(State(state): State<AppState>) -> Respo
             Json(ErrorResponse { error: "Calendar not configured. Add credentials in Settings > Calendar, or connect Gmail first (same Google project).".to_string() })).into_response(),
     };
 
-    let state_token = auth::issue_oauth_state(&state, "google_calendar").await;
-    let auth_url = format_calendar_auth_url(&client_id, &state_token);
+    let redirect_uri = match oauth_redirect_uri_for_request(&state, &headers, None) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+    let (state_token, code_challenge) =
+        auth::issue_oauth_state_with_pkce(&state, "google_calendar", Some(redirect_uri.clone()))
+            .await;
+    let auth_url =
+        format_calendar_auth_url(&client_id, &state_token, &code_challenge, &redirect_uri);
 
     (
         StatusCode::OK,
@@ -2798,7 +2996,12 @@ pub(super) async fn calendar_oauth_start(State(state): State<AppState>) -> Respo
         .into_response()
 }
 
-async fn calendar_exchange_code(state: &AppState, code: &str) -> Result<(), String> {
+async fn calendar_exchange_code(
+    state: &AppState,
+    redirect_uri: &str,
+    code: &str,
+    pkce_verifier: Option<&str>,
+) -> Result<(), String> {
     let (config_dir, data_dir) = {
         let a = state.agent.read().await;
         (a.config_dir.clone(), a.data_dir.clone())
@@ -2854,20 +3057,21 @@ async fn calendar_exchange_code(state: &AppState, code: &str) -> Result<(), Stri
         })
         .ok_or_else(|| "Calendar client_secret not configured".to_string())?;
 
-    let redirect_uri = "http://localhost:8990/oauth/callback";
-
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let params = [
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
-        ("code", code),
-        ("redirect_uri", redirect_uri),
-        ("grant_type", "authorization_code"),
+    let mut params = vec![
+        ("client_id", client_id.as_str().to_string()),
+        ("client_secret", client_secret.as_str().to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("grant_type", "authorization_code".to_string()),
     ];
+    if let Some(verifier) = pkce_verifier {
+        params.push(("code_verifier", verifier.to_string()));
+    }
 
     let resp = http_client
         .post("https://oauth2.googleapis.com/token")

@@ -3,6 +3,7 @@ import {
   AppBar,
   Badge,
   Box,
+  Chip,
   Button,
   Dialog,
   DialogContent,
@@ -34,6 +35,7 @@ import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import AutoStoriesRoundedIcon from "@mui/icons-material/AutoStoriesRounded";
 import AnalyticsRoundedIcon from "@mui/icons-material/AnalyticsRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
+import MenuRoundedIcon from "@mui/icons-material/MenuRounded";
 import NotificationsActiveRoundedIcon from "@mui/icons-material/NotificationsActiveRounded";
 import NotificationsNoneRoundedIcon from "@mui/icons-material/NotificationsNoneRounded";
 import SpaceDashboardRoundedIcon from "@mui/icons-material/SpaceDashboardRounded";
@@ -41,6 +43,7 @@ import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import useMediaQuery from "@mui/material/useMediaQuery";
 import { api } from "./api/client";
 import { GuidedTour } from "./components/GuidedTour";
 import { NativeWorkspace, type WorkspaceView } from "./components/NativeWorkspace";
@@ -53,6 +56,7 @@ import type { Task } from "./types";
 const REFRESH_MS = 8000;
 const PING_STALE_MS = 30_000;
 const APPROVAL_FALLBACK_POLL_MS = 2500;
+const NAV_HIDDEN_STORAGE_KEY = "agentark.ui.navHidden";
 type ViewKey =
   | "overview"
   | "chat"
@@ -73,6 +77,7 @@ type ViewKey =
   | "memory"
   | "goals"
   | "autonomy"
+  | "sentinel"
   | "trace"
   | "status"
   | "swarm"
@@ -87,6 +92,7 @@ type NotificationStreamPayload = {
   kind?: string;
   source?: string;
   title?: string;
+  body?: string;
 };
 
 const VIEW_ALIASES: Record<string, ViewKey> = {
@@ -95,23 +101,43 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   workspace: "chat",
   chat: "chat",
   inbox: "overview",
+  task: "tasks",
+  tasks: "tasks",
+  session: "sessions",
+  sessions: "sessions",
+  app: "apps",
+  apps: "apps",
+  skill: "skills",
+  skills: "skills",
+  goal: "goals",
+  goals: "goals",
+  sentinel: "sentinel",
+  agent: "swarm",
+  agents: "swarm",
+  swarm: "swarm",
   project: "projects",
   projects: "projects",
+  document: "documents",
+  documents: "documents",
+  file: "documents",
+  files: "documents",
   library: "library",
   connections: "connections",
   channels: "channels",
   routing: "routing",
   devices: "devices",
   browser: "browser",
+  "gateway-ops": "arkpulse",
   gatewayops: "arkpulse",
   failover: "settings",
   watchers: "status",
   watcher: "status",
-  sessions: "sessions",
-  session: "sessions",
   status: "status",
-  memory: "settings",
+  integration: "settings",
   integrations: "settings",
+  ambient: "sentinel",
+  memory: "settings",
+  setting: "settings",
   settings: "settings",
 };
 
@@ -135,6 +161,7 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "memory",
   "goals",
   "autonomy",
+  "sentinel",
   "trace",
   "status",
   "swarm",
@@ -172,6 +199,7 @@ const NAV_GROUPS: NavGroup[] = [
       { key: "sessions", label: "Sessions", icon: <HubRoundedIcon fontSize="small" /> },
       { key: "status", label: "Watchers", icon: <VisibilityRoundedIcon fontSize="small" /> },
       { key: "arkpulse", label: "ArkPulse", icon: <MonitorHeartRoundedIcon fontSize="small" /> },
+      { key: "sentinel", label: "Sentinel", icon: <NotificationsActiveRoundedIcon fontSize="small" /> },
       { key: "trace", label: "Trace", icon: <TimelineRoundedIcon fontSize="small" /> },
     ]
   },
@@ -205,6 +233,7 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   memory: "memory",
   goals: "goals",
   autonomy: "autonomy",
+  sentinel: "sentinel",
   trace: "trace",
   status: "watchers",
   swarm: "swarm",
@@ -235,11 +264,33 @@ function viewPath(view: ViewKey): string {
 }
 
 function normalizeViewKey(rawView: string): ViewKey {
-  const normalized = rawView.trim().toLowerCase();
+  const raw = rawView.trim().toLowerCase();
+  if (!raw) return "chat";
+
+  const withoutOrigin = raw.replace(/^https?:\/\/[^/]+/, "");
+  const withoutHash = withoutOrigin.startsWith("#") ? withoutOrigin.slice(1) : withoutOrigin;
+  const routeRef = withoutHash.split(/[?#]/, 1)[0]?.replace(/\/+$/, "") || "";
+  if (routeRef === "/ui" || routeRef === "/ui/v2" || routeRef.startsWith("/ui/") || routeRef.startsWith("ui/")) {
+    const resolved = resolveViewFromPath(routeRef.startsWith("/") ? routeRef : `/${routeRef}`);
+    if (resolved.matched) {
+      return resolved.view;
+    }
+  }
+
+  const normalized = withoutHash
+    .split(/[?#]/, 1)[0]
+    ?.replace(/^\/+/, "")
+    .replace(/^ui\/v2\/?/, "")
+    .replace(/^ui\/?/, "")
+    .replace(/\/+$/, "") || "";
+  const alias = VIEW_ALIASES[normalized];
+  if (alias) {
+    return alias;
+  }
   if (VIEW_KEYS.has(normalized as ViewKey)) {
     return normalized as ViewKey;
   }
-  return VIEW_ALIASES[normalized] || "chat";
+  return "chat";
 }
 
 function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolean } {
@@ -265,6 +316,10 @@ function resolveViewFromPath(pathname: string): { view: ViewKey; matched: boolea
       const view = PATH_SEGMENT_TO_VIEW[segment];
       if (view) {
         return { view, matched: true };
+      }
+      const alias = VIEW_ALIASES[segment];
+      if (alias) {
+        return { view: alias, matched: true };
       }
   }
 
@@ -353,6 +408,49 @@ function isAutomationFailureNotification(notification: {
   return failureSignal && automationSignal;
 }
 
+function isInputNeededNotification(notification: {
+  title?: string;
+  body?: string;
+  source?: string;
+  kind?: string;
+}): boolean {
+  const title = (notification.title || "").toLowerCase();
+  const body = (notification.body || "").toLowerCase();
+  const source = (notification.source || "").toLowerCase();
+  const kind = (notification.kind || "").toLowerCase();
+  const text = `${title} ${body} ${source} ${kind}`;
+  return (
+    source.includes("workflow_inputs") ||
+    kind.includes("input_needed") ||
+    kind.includes("input-needed") ||
+    text.includes("missing input") ||
+    text.includes("required input") ||
+    text.includes("input needed")
+  );
+}
+
+function notificationDisplayTitle(notification: {
+  title?: string;
+  body?: string;
+  source?: string;
+  kind?: string;
+}): string {
+  if (isInputNeededNotification(notification)) return "Input needed";
+  return notification.title || "Notification";
+}
+
+function notificationDisplaySummary(notification: {
+  title?: string;
+  body?: string;
+  source?: string;
+  kind?: string;
+}): string {
+  if (isInputNeededNotification(notification)) {
+    return notification.body || "Waiting on you to provide the missing inputs and resume the task.";
+  }
+  return notification.body || notification.source || "Open to view details.";
+}
+
 function shouldSurfaceNotification(notification: {
   title?: string;
   body?: string;
@@ -363,6 +461,8 @@ function shouldSurfaceNotification(notification: {
   const title = (notification.title || "").toLowerCase();
   if (source.includes("watcher") || title.includes("watcher triggered")) return false;
   if (source.includes("arkpulse")) return false;
+  if (source.includes("predictive_nudge")) return false;
+  if (title.includes("what to improve now")) return false;
   return true;
 }
 
@@ -401,11 +501,18 @@ export default function App() {
   }, []);
 
   const [notifAnchorEl, setNotifAnchorEl] = useState<HTMLElement | null>(null);
+  const [navHidden, setNavHidden] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(NAV_HIDDEN_STORAGE_KEY) === "1";
+  });
+  const isMobileShell = useMediaQuery("(max-width:980px)");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const notifListOpen = Boolean(notifAnchorEl);
-  const [notifFilter, setNotifFilter] = useState<"all" | "unread" | "errors" | "automation_failures">("all");
+  const [notifFilter, setNotifFilter] = useState<"all" | "unread" | "input_needed" | "errors" | "automation_failures">("all");
   const [notificationsStreamConnected, setNotificationsStreamConnected] = useState(false);
   const [approvalBusyTaskId, setApprovalBusyTaskId] = useState<string | null>(null);
   const [approvalPopupError, setApprovalPopupError] = useState<string | null>(null);
+  const desktopNavCollapsed = !isMobileShell && navHidden;
   const navigateToView = (nextViewRaw: ViewKey | string, replace = false) => {
     const nextView = normalizeViewKey(nextViewRaw);
     const nextPath = viewPath(nextView);
@@ -416,6 +523,9 @@ export default function App() {
       } else {
         window.history.pushState(null, "", nextUrl);
       }
+    }
+    if (isMobileShell) {
+      setMobileNavOpen(false);
     }
     setViewState(nextView);
   };
@@ -454,6 +564,17 @@ export default function App() {
       setLastNonSettingsView(view);
     }
   }, [view]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(NAV_HIDDEN_STORAGE_KEY, navHidden ? "1" : "0");
+  }, [navHidden]);
+
+  useEffect(() => {
+    if (!isMobileShell) {
+      setMobileNavOpen(false);
+    }
+  }, [isMobileShell]);
 
   const serverQ = useQuery({
     queryKey: ["server-ping"],
@@ -505,13 +626,14 @@ export default function App() {
   const filteredNotifications = useMemo(() => {
     if (notifFilter === "all") return visibleNotifications;
     if (notifFilter === "unread") return visibleNotifications.filter((n) => !n.read);
+    if (notifFilter === "input_needed") return visibleNotifications.filter((n) => isInputNeededNotification(n));
     if (notifFilter === "errors") {
       return visibleNotifications.filter((n) => {
         const level = (n.level || "").toLowerCase();
         return level === "error" || level === "critical";
       });
     }
-    return visibleNotifications.filter((n) => isAutomationFailureNotification(n));
+    return visibleNotifications.filter((n) => isAutomationFailureNotification(n) && !isInputNeededNotification(n));
   }, [visibleNotifications, notifFilter]);
   const approvalTasks = useMemo(() => pickTasks(approvalTasksQ.data), [approvalTasksQ.data]);
 
@@ -716,6 +838,74 @@ export default function App() {
     .join(" ");
   const mainPaneClassName = `main-pane main-pane-${activeView}`;
 
+  const renderSideNav = ({ collapsed, mobile = false }: { collapsed: boolean; mobile?: boolean }) => (
+    <Box className={`side-nav${collapsed ? " collapsed" : ""}${mobile ? " side-nav-mobile" : ""}`}>
+      <Stack
+        direction="row"
+        alignItems="center"
+        justifyContent={collapsed ? "center" : "space-between"}
+        sx={{ px: collapsed ? 0 : 0.5, mb: collapsed ? 0.4 : 1 }}
+      >
+        {!collapsed ? (
+          <Typography variant="caption" className="nav-label">
+            {mobile ? "Navigation" : "Navigate"}
+          </Typography>
+        ) : null}
+        {mobile ? (
+          <Tooltip title="Close navigation">
+            <IconButton size="small" className="nav-collapse-btn" onClick={() => setMobileNavOpen(false)}>
+              <CloseRoundedIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        ) : (
+          <Tooltip title={collapsed ? "Expand navigation" : "Collapse navigation"}>
+            <IconButton size="small" className="nav-collapse-btn" onClick={() => setNavHidden((prev) => !prev)}>
+              {collapsed ? <ChevronRightRoundedIcon fontSize="small" /> : <ChevronLeftRoundedIcon fontSize="small" />}
+            </IconButton>
+          </Tooltip>
+        )}
+      </Stack>
+      <List disablePadding>
+        {NAV_GROUPS.map((group, groupIdx) => (
+          <Box key={group.id} className="nav-group">
+            {!collapsed ? (
+              <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="overline" className="nav-group-label">
+                  {group.label}
+                </Typography>
+              </Stack>
+            ) : null}
+            {group.items.map((item) => (
+              <Tooltip
+                key={item.key}
+                title={item.label}
+                placement="right"
+                disableHoverListener={!collapsed}
+              >
+                <ListItemButton
+                  selected={isNavItemActive(item.key, activeView)}
+                  onClick={() => navigateToView(item.key)}
+                  className={`nav-item${collapsed ? " collapsed" : ""}`}
+                  data-tour-target={`nav-${item.key}`}
+                >
+                  <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
+                  <ListItemText
+                    className={`nav-item-text${collapsed ? " collapsed" : ""}`}
+                    primary={item.label}
+                    primaryTypographyProps={{ noWrap: true }}
+                  />
+                </ListItemButton>
+              </Tooltip>
+            ))}
+            {!collapsed && groupIdx < NAV_GROUPS.length - 1 ? (
+              <Divider className="nav-group-divider" />
+            ) : null}
+          </Box>
+        ))}
+      </List>
+    </Box>
+  );
+
   return (
     <Box className="agi-shell">
       <Box className="bg-orb orb-a" />
@@ -727,6 +917,18 @@ export default function App() {
             sx={{ minHeight: "var(--appbar-height)", px: { xs: 1.25, md: 1.5 } }}
           >
             <Stack direction="row" alignItems="center" spacing={1} sx={{ flexGrow: 1, minWidth: 0 }}>
+              {isMobileShell ? (
+                <Tooltip title="Open navigation">
+                  <IconButton
+                    color="primary"
+                    className="mobile-nav-trigger"
+                    onClick={() => setMobileNavOpen(true)}
+                    aria-label="Open navigation"
+                  >
+                    <MenuRoundedIcon />
+                  </IconButton>
+                </Tooltip>
+              ) : null}
               <Box className="shell-brand-mark">
                 <img src="/logo.svg" alt="AgentArk" width={36} height={36} />
               </Box>
@@ -735,7 +937,7 @@ export default function App() {
                   AgentArk
                 </Typography>
                 <Typography variant="subtitle1" className="shell-title" noWrap>
-                  Operator Console
+                  Secure Daily Assistant
                 </Typography>
               </Box>
               <Tooltip title={serverTooltip} arrow>
@@ -779,50 +981,8 @@ export default function App() {
           </Toolbar>
         </AppBar>
 
-        <Box className="main-grid">
-          <Box className="side-nav">
-            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ px: 0.5, mb: 1 }}>
-              <Typography variant="caption" className="nav-label">
-                Navigate
-              </Typography>
-            </Stack>
-            <List dense>
-              {NAV_GROUPS.map((group, groupIdx) => (
-                <Box key={group.id} className="nav-group">
-                  <Stack direction="row" alignItems="center" justifyContent="space-between">
-                    <Typography variant="overline" className="nav-group-label">
-                      {group.label}
-                    </Typography>
-                  </Stack>
-                  {group.items.map((item) => (
-                    <Tooltip
-                      key={item.key}
-                      title={item.label}
-                      placement="right"
-                      disableHoverListener
-                    >
-                      <ListItemButton
-                        selected={isNavItemActive(item.key, activeView)}
-                        onClick={() => navigateToView(item.key)}
-                        className="nav-item"
-                        data-tour-target={`nav-${item.key}`}
-                      >
-                        <ListItemIcon className="nav-item-icon">{item.icon}</ListItemIcon>
-                        <ListItemText
-                          className="nav-item-text"
-                          primary={item.label}
-                          primaryTypographyProps={{ noWrap: true }}
-                        />
-                      </ListItemButton>
-                    </Tooltip>
-                  ))}
-                  {groupIdx < NAV_GROUPS.length - 1 ? (
-                    <Divider className="nav-group-divider" />
-                  ) : null}
-                </Box>
-              ))}
-            </List>
-          </Box>
+        <Box className={`main-grid${desktopNavCollapsed ? " nav-collapsed" : ""}${isMobileShell ? " is-mobile-shell" : ""}`}>
+          {!isMobileShell ? renderSideNav({ collapsed: desktopNavCollapsed }) : null}
 
             <Box className={mainPaneClassName}>
               <Box className={stageClassName}>
@@ -857,6 +1017,16 @@ export default function App() {
             </Box>
           </Box>
         </Box>
+
+        <Drawer
+          anchor="left"
+          open={isMobileShell && mobileNavOpen}
+          onClose={() => setMobileNavOpen(false)}
+          ModalProps={{ keepMounted: true }}
+          PaperProps={{ className: "side-nav-mobile-paper" }}
+        >
+          {renderSideNav({ collapsed: false, mobile: true })}
+        </Drawer>
       </Box>
 
       <ApprovalPromptOverlay
@@ -973,6 +1143,13 @@ export default function App() {
             </Button>
             <Button
               size="small"
+              variant={notifFilter === "input_needed" ? "contained" : "outlined"}
+              onClick={() => setNotifFilter("input_needed")}
+            >
+              Input Needed
+            </Button>
+            <Button
+              size="small"
               variant={notifFilter === "errors" ? "contained" : "outlined"}
               onClick={() => setNotifFilter("errors")}
             >
@@ -997,83 +1174,114 @@ export default function App() {
             </Box>
           ) : (
             <List dense disablePadding sx={{ display: "flex", flexDirection: "column", gap: 0.25 }}>
-              {filteredNotifications.slice(0, 40).map((n) => (
-                <ListItemButton
-                  key={n.id}
-                  sx={{
-                    alignItems: "flex-start",
-                    position: "relative",
-                    overflow: "hidden",
-                    borderRadius: 1.5,
-                    px: 1.25,
-                    py: 0.85,
-                    border: "none",
-                    background: "transparent",
-                    transition: "background 140ms ease",
-                    "&:hover": {
-                      background: "rgba(108, 156, 212, 0.08)"
-                    },
-                    "&:not(:last-child)": {
-                      borderBottom: "1px solid rgba(108, 156, 212, 0.08)"
-                    }
-                  }}
-                  onClick={async () => {
-                    openNotification(n.id);
-                    setNotifAnchorEl(null);
-                    if (!n.read) {
-                      markReadMutation.mutate(n.id);
-                    }
-                  }}
-                >
-                  {!n.read ? (
-                    <Box sx={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: "50%",
-                      background: "rgba(47, 212, 255, 0.9)",
-                      boxShadow: "0 0 6px rgba(47, 212, 255, 0.5)",
-                      flexShrink: 0,
-                      mt: 0.8,
-                      mr: 1
-                    }} />
-                  ) : (
-                    <Box sx={{ width: 6, flexShrink: 0, mr: 1 }} />
-                  )}
-                  <ListItemText
-                    sx={{ my: 0, minWidth: 0 }}
-                    primary={
-                      <Stack direction="row" justifyContent="space-between" spacing={2} sx={{ minWidth: 0 }}>
-                        <Typography
-                          variant="body2"
-                          fontWeight={n.read ? 400 : 600}
-                          noWrap
-                          sx={{ minWidth: 0, flex: 1, color: n.read ? "rgba(195, 221, 252, 0.6)" : "rgba(195, 221, 252, 0.95)" }}
-                        >
-                          {n.title || "Notification"}
-                        </Typography>
-                        <Typography variant="caption" noWrap sx={{ flexShrink: 0, color: "rgba(195, 221, 252, 0.35)" }} title={notifTimeAgo(n.created_at).tip}>
-                          {notifTimeAgo(n.created_at).label}
-                        </Typography>
-                      </Stack>
-                    }
-                    secondary={
-                      <Typography
-                        variant="caption"
+              {filteredNotifications.slice(0, 40).map((n) => {
+                const inputNeeded = isInputNeededNotification(n);
+                const automationFailure = isAutomationFailureNotification(n) && !inputNeeded;
+                const displayTitle = notificationDisplayTitle(n);
+                const displaySummary = notificationDisplaySummary(n);
+                return (
+                  <ListItemButton
+                    key={n.id}
+                    sx={{
+                      alignItems: "flex-start",
+                      position: "relative",
+                      overflow: "hidden",
+                      borderRadius: 1.5,
+                      px: 1.25,
+                      py: 0.85,
+                      border: "none",
+                      background: inputNeeded ? "rgba(255, 193, 7, 0.06)" : "transparent",
+                      transition: "background 140ms ease",
+                      "&:hover": {
+                        background: inputNeeded ? "rgba(255, 193, 7, 0.1)" : "rgba(108, 156, 212, 0.08)"
+                      },
+                      "&:not(:last-child)": {
+                        borderBottom: "1px solid rgba(108, 156, 212, 0.08)"
+                      }
+                    }}
+                    onClick={async () => {
+                      openNotification(n.id);
+                      setNotifAnchorEl(null);
+                      if (!n.read) {
+                        markReadMutation.mutate(n.id);
+                      }
+                    }}
+                  >
+                    {!n.read ? (
+                      <Box
                         sx={{
-                          display: "-webkit-box",
-                          WebkitBoxOrient: "vertical",
-                          WebkitLineClamp: 2,
-                          overflow: "hidden",
-                          wordBreak: "break-word",
-                          color: n.read ? "rgba(195, 221, 252, 0.35)" : "rgba(195, 221, 252, 0.55)"
+                          width: 6,
+                          height: 6,
+                          borderRadius: "50%",
+                          background: inputNeeded ? "rgba(255, 193, 7, 0.95)" : "rgba(47, 212, 255, 0.9)",
+                          boxShadow: inputNeeded ? "0 0 6px rgba(255, 193, 7, 0.45)" : "0 0 6px rgba(47, 212, 255, 0.5)",
+                          flexShrink: 0,
+                          mt: 0.8,
+                          mr: 1
                         }}
-                      >
-                        {n.body}
-                      </Typography>
-                    }
-                  />
-                </ListItemButton>
-              ))}
+                      />
+                    ) : (
+                      <Box sx={{ width: 6, flexShrink: 0, mr: 1 }} />
+                    )}
+                    <ListItemText
+                      sx={{ my: 0, minWidth: 0 }}
+                      primary={
+                        <Stack direction="row" justifyContent="space-between" spacing={2} sx={{ minWidth: 0 }}>
+                          <Typography
+                            variant="body2"
+                            fontWeight={n.read ? 400 : 600}
+                            noWrap
+                            sx={{ minWidth: 0, flex: 1, color: n.read ? "rgba(195, 221, 252, 0.6)" : "rgba(195, 221, 252, 0.95)" }}
+                            title={n.title || displayTitle}
+                          >
+                            {displayTitle}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            noWrap
+                            sx={{ flexShrink: 0, color: "rgba(195, 221, 252, 0.35)" }}
+                            title={notifTimeAgo(n.created_at).tip}
+                          >
+                            {notifTimeAgo(n.created_at).label}
+                          </Typography>
+                        </Stack>
+                      }
+                      secondary={
+                        <Stack spacing={0.5} sx={{ mt: 0.35 }}>
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              display: "block",
+                              color: n.read ? "rgba(195, 221, 252, 0.45)" : "rgba(195, 221, 252, 0.72)",
+                              lineHeight: 1.45
+                            }}
+                            noWrap
+                            title={displaySummary}
+                          >
+                            {displaySummary}
+                          </Typography>
+                          <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap>
+                            {inputNeeded ? (
+                              <Chip size="small" label="Waiting on you" color="warning" variant="outlined" sx={{ height: 22 }} />
+                            ) : null}
+                            {automationFailure ? (
+                              <Chip size="small" label="Automation failure" color="error" variant="outlined" sx={{ height: 22 }} />
+                            ) : null}
+                            {n.source ? (
+                              <Chip
+                                size="small"
+                                label={n.source}
+                                variant="outlined"
+                                sx={{ height: 22, color: "rgba(195, 221, 252, 0.65)", borderColor: "rgba(108, 156, 212, 0.18)" }}
+                              />
+                            ) : null}
+                          </Stack>
+                        </Stack>
+                      }
+                    />
+                  </ListItemButton>
+                );
+              })}
             </List>
           )}
         </Box>
@@ -1096,10 +1304,13 @@ export default function App() {
           <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
             <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
               <NotificationsActiveRoundedIcon color="warning" />
-              <Typography variant="h6" noWrap>
-                {selectedNotification?.title || "Notification detail"}
+              <Typography variant="h6" noWrap title={selectedNotification?.title || "Notification detail"}>
+                {notificationDisplayTitle(selectedNotification || {})}
               </Typography>
             </Stack>
+            {selectedNotification && isInputNeededNotification(selectedNotification) ? (
+              <Chip size="small" label="Waiting on you" color="warning" variant="outlined" />
+            ) : null}
             {!selectedNotification?.read ? (
               <Button
                 size="small"
@@ -1118,7 +1329,7 @@ export default function App() {
             {selectedNotification ? (
               <Stack spacing={1}>
                 <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                  {selectedNotification.body}
+                  {notificationDisplaySummary(selectedNotification)}
                 </Typography>
                 {selectedNotification.metadata ? (
                   <>

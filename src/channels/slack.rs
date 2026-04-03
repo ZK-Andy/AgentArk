@@ -2,8 +2,6 @@
 //!
 //! This module is intentionally self-contained so it can be wired into the
 //! channel tree later without changing shared glue files.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -117,10 +115,6 @@ struct SlackApiResponse {
     ok: bool,
     #[serde(default)]
     error: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -232,7 +226,8 @@ fn slack_sender_verification_notification(
         )
     };
     format!(
-        "A new Slack sender needs approval before AgentArk will act.\nSender: {}{}{}\nApprove it in Settings -> Connected Systems -> Sender Verification.",
+        "A new Slack sender needs approval before {} will act.\nSender: {}{}{}\nApprove it in Settings -> Connected Systems -> Sender Verification.",
+        crate::branding::PRODUCT_NAME,
         user_id.trim(),
         scope,
         preview
@@ -281,16 +276,6 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<SlackC
         workspace_id,
         workspace_name,
     }))
-}
-
-pub async fn has_configuration(storage: &Storage) -> Result<bool> {
-    Ok(load_config_from_storage(storage).await?.is_some())
-}
-
-pub async fn save_config(agent: &Agent, config: &SlackChannelConfig) -> Result<()> {
-    let raw = serde_json::to_vec(config)?;
-    agent.storage.set(CONFIG_STORAGE_KEY, &raw).await?;
-    Ok(())
 }
 
 async fn load_destination(agent: &Agent) -> Result<Option<SlackDestinationContext>> {
@@ -595,14 +580,16 @@ fn verify_webhook_request_with_config(
     signature: Option<&str>,
 ) -> Result<()> {
     let Some(config) = config else {
-        return Ok(());
+        return Err(anyhow!("Slack is not configured for inbound webhooks"));
     };
 
-    require_slack_signature_headers(&config.signing_secret, timestamp, signature)?;
     if config.signing_secret.trim().is_empty() {
-        return Ok(());
+        return Err(anyhow!(
+            "Slack signing secret is required for inbound webhooks"
+        ));
     }
 
+    require_slack_signature_headers(&config.signing_secret, timestamp, signature)?;
     let (Some(ts), Some(sig)) = (timestamp, signature) else {
         return Err(anyhow!(
             "Slack signature headers are required when a signing secret is configured"
@@ -816,6 +803,28 @@ mod tests {
     }
 
     #[test]
+    fn webhook_verification_fails_closed_when_config_is_missing() {
+        let error = verify_webhook_request_with_config(None, br#"{}"#, Some("1"), Some("v0=test"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not configured"));
+    }
+
+    #[test]
+    fn webhook_verification_fails_closed_when_secret_is_blank() {
+        let config = SlackChannelConfig {
+            bot_token: "xoxb-test".to_string(),
+            signing_secret: String::new(),
+            ..Default::default()
+        };
+        let error =
+            verify_webhook_request_with_config(Some(&config), br#"{}"#, Some("1"), Some("v0=test"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("signing secret"));
+    }
+
+    #[test]
     fn recent_event_state_is_pruned_to_a_bounded_window() {
         let mut state = SlackRecentEventState {
             recent: (0..(MAX_RECENT_EVENT_IDS + 10))
@@ -831,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_event_id_is_idempotent_for_retries() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let storage = Storage::connect(
             crate::storage::DatabaseConfig::for_tests().expect("test database config"),
         )

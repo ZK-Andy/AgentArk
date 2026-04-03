@@ -397,42 +397,6 @@ impl Integration for WhatsAppConnector {
             _ => Err(anyhow!("Unknown action: {}", action)),
         }
     }
-
-    async fn handle_webhook(&self, payload: &serde_json::Value) -> Result<()> {
-        // Parse incoming webhook from Meta
-        // Structure: { entry: [{ changes: [{ value: { messages: [...] } }] }] }
-
-        if let Some(entries) = payload.get("entry").and_then(|e| e.as_array()) {
-            for entry in entries {
-                if let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) {
-                    for change in changes {
-                        if let Some(value) = change.get("value") {
-                            if let Some(messages) = value.get("messages").and_then(|m| m.as_array())
-                            {
-                                for msg in messages {
-                                    let _from =
-                                        msg.get("from").and_then(|f| f.as_str()).unwrap_or("");
-                                    let text = msg
-                                        .get("text")
-                                        .and_then(|t| t.get("body"))
-                                        .and_then(|b| b.as_str())
-                                        .unwrap_or("");
-
-                                    tracing::info!(
-                                        "WhatsApp message received ({} chars)",
-                                        text.len()
-                                    );
-                                    // TODO: Route to agent for processing
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for WhatsAppConnector {

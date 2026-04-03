@@ -53,7 +53,7 @@ pub struct AgentArkApp {
 }
 
 /// Form state for adding/editing a specialist agent
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct AgentFormState {
     name: String,
     agent_type_index: usize,
@@ -66,22 +66,6 @@ struct AgentFormState {
     system_prompt: String,
 }
 
-impl Default for AgentFormState {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            agent_type_index: 0,
-            llm_provider_index: 2, // Ollama
-            model: String::new(),
-            base_url: "http://localhost:11434".to_string(),
-            api_key: String::new(),
-            capabilities: String::new(),
-            description: String::new(),
-            system_prompt: String::new(),
-        }
-    }
-}
-
 const AGENT_TYPES: &[&str] = &[
     "Researcher",
     "Coder",
@@ -91,7 +75,7 @@ const AGENT_TYPES: &[&str] = &[
     "Planner",
     "Custom",
 ];
-const LLM_PROVIDERS: &[&str] = &["Anthropic", "OpenAI", "Ollama"];
+const LLM_PROVIDERS: &[&str] = &["Select provider", "Anthropic", "OpenAI", "Ollama"];
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -119,7 +103,7 @@ impl AgentArkApp {
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("AgentArk");
+        ui.heading(crate::branding::PRODUCT_NAME);
         ui.separator();
 
         ui.vertical(|ui| {
@@ -713,14 +697,14 @@ impl AgentArkApp {
                 ui.end_row();
 
                 // Show base URL for OpenAI/Ollama
-                if self.agent_form.llm_provider_index != 0 {
+                if matches!(self.agent_form.llm_provider_index, 2 | 3) {
                     ui.label("Base URL:");
                     ui.text_edit_singleline(&mut self.agent_form.base_url);
                     ui.end_row();
                 }
 
                 // Show API key for Anthropic/OpenAI
-                if self.agent_form.llm_provider_index != 2 {
+                if matches!(self.agent_form.llm_provider_index, 1 | 2) {
                     ui.label("API Key:");
                     ui.add(egui::TextEdit::singleline(&mut self.agent_form.api_key).password(true));
                     ui.end_row();
@@ -750,7 +734,7 @@ impl AgentArkApp {
     /// Build a SpecialistConfig from the current form state
     fn build_specialist_config(&self) -> Option<SpecialistConfig> {
         let name = self.agent_form.name.trim();
-        if name.is_empty() {
+        if name.is_empty() || self.agent_form.llm_provider_index == 0 {
             return None;
         }
 
@@ -768,22 +752,17 @@ impl AgentArkApp {
             _ => SubAgentType::Researcher,
         };
 
-        let model = if self.agent_form.model.trim().is_empty() {
-            match self.agent_form.llm_provider_index {
-                0 => "claude-sonnet-4-5-20250929".to_string(),
-                1 => "gpt-4o".to_string(),
-                _ => "llama3.2".to_string(),
-            }
-        } else {
-            self.agent_form.model.trim().to_string()
-        };
+        let model = self.agent_form.model.trim().to_string();
+        if model.is_empty() {
+            return None;
+        }
 
         let llm_provider = match self.agent_form.llm_provider_index {
-            0 => LlmProvider::Anthropic {
+            1 => LlmProvider::Anthropic {
                 api_key: self.agent_form.api_key.clone(),
                 model,
             },
-            1 => LlmProvider::OpenAI {
+            2 => LlmProvider::OpenAI {
                 api_key: self.agent_form.api_key.clone(),
                 model,
                 base_url: if self.agent_form.base_url.trim().is_empty() {
@@ -792,14 +771,11 @@ impl AgentArkApp {
                     Some(self.agent_form.base_url.trim().to_string())
                 },
             },
-            _ => LlmProvider::Ollama {
-                base_url: if self.agent_form.base_url.trim().is_empty() {
-                    "http://localhost:11434".to_string()
-                } else {
-                    self.agent_form.base_url.trim().to_string()
-                },
+            3 => LlmProvider::Ollama {
+                base_url: self.agent_form.base_url.trim().to_string(),
                 model,
             },
+            _ => return None,
         };
 
         let capabilities: Vec<AgentCapability> = self
@@ -853,7 +829,7 @@ impl AgentArkApp {
 
         match &config.llm_provider {
             LlmProvider::Anthropic { api_key, model } => {
-                self.agent_form.llm_provider_index = 0;
+                self.agent_form.llm_provider_index = 1;
                 self.agent_form.model = model.clone();
                 self.agent_form.api_key = api_key.clone();
                 self.agent_form.base_url.clear();
@@ -863,13 +839,13 @@ impl AgentArkApp {
                 model,
                 base_url,
             } => {
-                self.agent_form.llm_provider_index = 1;
+                self.agent_form.llm_provider_index = 2;
                 self.agent_form.model = model.clone();
                 self.agent_form.api_key = api_key.clone();
                 self.agent_form.base_url = base_url.clone().unwrap_or_default();
             }
             LlmProvider::Ollama { base_url, model } => {
-                self.agent_form.llm_provider_index = 2;
+                self.agent_form.llm_provider_index = 3;
                 self.agent_form.model = model.clone();
                 self.agent_form.api_key.clear();
                 self.agent_form.base_url = base_url.clone();

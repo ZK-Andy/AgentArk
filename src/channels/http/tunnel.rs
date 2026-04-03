@@ -41,7 +41,7 @@ trait TunnelProvider {
     fn label(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn config_fields(&self) -> Vec<IntegrationConfigField>;
-    fn config_help(&self) -> Option<&'static str>;
+    fn config_help(&self) -> Option<String>;
 }
 
 struct CloudflareTunnelProvider;
@@ -67,9 +67,10 @@ impl TunnelProvider for CloudflareTunnelProvider {
         vec![]
     }
 
-    fn config_help(&self) -> Option<&'static str> {
+    fn config_help(&self) -> Option<String> {
         Some(
-            "Click Start to get a temporary public HTTPS link. No Cloudflare account or token is required for Quick Tunnel.",
+            "Click Start to get a temporary public HTTPS link. No Cloudflare account or token is required for Quick Tunnel."
+                .to_string(),
         )
     }
 }
@@ -98,8 +99,11 @@ impl TunnelProvider for NgrokTunnelProvider {
         }]
     }
 
-    fn config_help(&self) -> Option<&'static str> {
-        Some("Save an ngrok auth token, then AgentArk will start an `ngrok http` tunnel for remote access to the local control plane.")
+    fn config_help(&self) -> Option<String> {
+        Some(format!(
+            "Save an ngrok auth token, then {} will start an `ngrok http` tunnel for remote access to the local AgentArk app.",
+            crate::branding::PRODUCT_NAME
+        ))
     }
 }
 
@@ -137,10 +141,11 @@ impl TunnelProvider for TailscalePrivateTunnelProvider {
         ]
     }
 
-    fn config_help(&self) -> Option<&'static str> {
-        Some(
-            "Use this for private end-to-end encrypted access from your own Tailscale devices. Save an auth key if this runtime is not already signed in, and make sure the AgentArk runtime can reach the Tailscale CLI plus a running tailscaled or TS_SOCKET mount.",
-        )
+    fn config_help(&self) -> Option<String> {
+        Some(format!(
+            "Use this for private end-to-end encrypted access from your own Tailscale devices. Save an auth key if this runtime is not already signed in, and make sure the {} runtime can reach the Tailscale CLI plus a running tailscaled or TS_SOCKET mount.",
+            crate::branding::PRODUCT_NAME
+        ))
     }
 }
 
@@ -178,8 +183,11 @@ impl TunnelProvider for TailscaleTunnelProvider {
         ]
     }
 
-    fn config_help(&self) -> Option<&'static str> {
-        Some("Requires a working Tailscale runtime. Save an auth key if this runtime is not already signed in, and make sure the AgentArk runtime can reach the Tailscale CLI plus a running tailscaled or TS_SOCKET mount before opening Funnel.")
+    fn config_help(&self) -> Option<String> {
+        Some(format!(
+            "Requires a working Tailscale runtime. Save an auth key if this runtime is not already signed in, and make sure the {} runtime can reach the Tailscale CLI plus a running tailscaled or TS_SOCKET mount before opening Funnel.",
+            crate::branding::PRODUCT_NAME
+        ))
     }
 }
 
@@ -207,8 +215,11 @@ impl TunnelProvider for BoreTunnelProvider {
         }]
     }
 
-    fn config_help(&self) -> Option<&'static str> {
-        Some("Bore exposes the HTTP service over a raw TCP tunnel. AgentArk will surface the resulting public HTTP base URL.")
+    fn config_help(&self) -> Option<String> {
+        Some(format!(
+            "Bore exposes the HTTP service over a raw TCP tunnel. {} will surface the resulting public HTTP base URL.",
+            crate::branding::PRODUCT_NAME
+        ))
     }
 }
 
@@ -506,7 +517,7 @@ fn tunnel_provider_summary(
         config_fields: provider.config_fields(),
         config_values,
         stored_secret_fields,
-        config_help: provider.config_help().map(|value| value.to_string()),
+        config_help: provider.config_help(),
     }
 }
 
@@ -1197,11 +1208,22 @@ async fn test_tailscale_provider_connection(
             "tailscale_cli",
             "Tailscale CLI",
             "fail",
-            format!("AgentArk could not find `{}` on this runtime.", binary),
-            Some("Install Tailscale in the AgentArk runtime first."),
+            format!(
+                "{} could not find `{}` on this runtime.",
+                crate::branding::PRODUCT_NAME,
+                binary
+            ),
+            Some(&format!(
+                "Install Tailscale in the {} runtime first.",
+                crate::branding::PRODUCT_NAME
+            )),
         ));
         return Err(TunnelTestError {
-            message: format!("{} is not available on this AgentArk runtime.", label),
+            message: format!(
+                "{} is not available on this {} runtime.",
+                label,
+                crate::branding::PRODUCT_NAME
+            ),
             checks,
         });
     }
@@ -1209,7 +1231,11 @@ async fn test_tailscale_provider_connection(
         "tailscale_cli",
         "Tailscale CLI",
         "pass",
-        format!("AgentArk can run `{}` from this runtime.", binary),
+        format!(
+            "{} can run `{}` from this runtime.",
+            crate::branding::PRODUCT_NAME,
+            binary
+        ),
         None,
     ));
 
@@ -1229,15 +1255,22 @@ async fn test_tailscale_provider_connection(
                 checks,
             });
         }
+        let runtime_message = if socket_override.is_some() {
+            format!(
+                "{} found a TS_SOCKET override for the Tailscale daemon.",
+                crate::branding::PRODUCT_NAME
+            )
+        } else {
+            format!(
+                "{} found a local tailscaled runtime.",
+                crate::branding::PRODUCT_NAME
+            )
+        };
         checks.push(make_tunnel_setup_check(
             "tailscale_runtime_socket",
             "tailscaled / TS_SOCKET",
             "pass",
-            if socket_override.is_some() {
-                "AgentArk found a TS_SOCKET override for the Tailscale daemon."
-            } else {
-                "AgentArk found a local tailscaled runtime."
-            },
+            runtime_message,
             None,
         ));
     }
@@ -1262,7 +1295,10 @@ async fn test_tailscale_provider_connection(
                     "Tailscale is installed, but the runtime state is {}.",
                     status.backend_state.as_deref().unwrap_or("unknown")
                 ),
-                Some("AgentArk can sign this runtime in if you save an auth key."),
+                Some(&format!(
+                    "{} can sign this runtime in if you save an auth key.",
+                    crate::branding::PRODUCT_NAME
+                )),
             ));
             status
         }
@@ -1271,7 +1307,11 @@ async fn test_tailscale_provider_connection(
                 "tailscale_signed_in",
                 "Signed-in runtime",
                 "warn",
-                format!("AgentArk could not confirm a running Tailscale session yet: {}", error),
+                format!(
+                    "{} could not confirm a running Tailscale session yet: {}",
+                    crate::branding::PRODUCT_NAME,
+                    error
+                ),
                 Some("If this runtime is not already signed in, save an auth key and run Check setup again."),
             ));
             TailscaleStatusSnapshot::default()
@@ -1301,7 +1341,10 @@ async fn test_tailscale_provider_connection(
             "Auth key",
             "fail",
             "No Tailscale auth key is saved, and this runtime is not signed in yet.",
-            Some("Save a Tailscale auth key so AgentArk can run `tailscale up` in Docker."),
+            Some(&format!(
+                "Save a Tailscale auth key so {} can run `tailscale up` in Docker.",
+                crate::branding::PRODUCT_NAME
+            )),
         ));
         return Err(TunnelTestError {
             message: format!("{} still needs a Tailscale auth key.", label),
@@ -1323,7 +1366,8 @@ async fn test_tailscale_provider_connection(
                         "Runtime sign-in",
                         "pass",
                         format!(
-                            "AgentArk signed the runtime into Tailscale as {}.",
+                            "{} signed the runtime into Tailscale as {}.",
+                            crate::branding::PRODUCT_NAME,
                             status.display_name()
                         ),
                         None,
@@ -1336,7 +1380,8 @@ async fn test_tailscale_provider_connection(
                         "Runtime sign-in",
                         "fail",
                         format!(
-                            "AgentArk ran `tailscale up`, but the runtime state is still {}.",
+                            "{} ran `tailscale up`, but the runtime state is still {}.",
+                            crate::branding::PRODUCT_NAME,
                             status.backend_state.as_deref().unwrap_or("unknown")
                         ),
                         Some("Wait a few seconds and run Check setup again."),
@@ -1453,7 +1498,10 @@ async fn test_tailscale_provider_connection(
                 },
                 "info",
                 format!("The management command did not return a clean status yet: {}", error),
-                Some("Try Start next. If Tailscale still blocks startup, AgentArk will surface the exact runtime error."),
+                Some(&format!(
+                    "Try Start next. If Tailscale still blocks startup, {} will surface the exact runtime error.",
+                    crate::branding::PRODUCT_NAME
+                )),
             ));
         }
     }
@@ -1481,8 +1529,14 @@ async fn test_tunnel_provider_connection(
                         "cloudflared_binary",
                         "cloudflared",
                         "fail",
-                        "AgentArk could not find cloudflared on this runtime.",
-                        Some("Install cloudflared on the AgentArk runtime first."),
+                        format!(
+                            "{} could not find cloudflared on this runtime.",
+                            crate::branding::PRODUCT_NAME
+                        ),
+                        Some(&format!(
+                            "Install cloudflared on the {} runtime first.",
+                            crate::branding::PRODUCT_NAME
+                        )),
                     )],
                 });
             };
@@ -1505,7 +1559,10 @@ async fn test_tunnel_provider_connection(
                         "cloudflared",
                         "fail",
                         error,
-                        Some("Install cloudflared on the AgentArk runtime first."),
+                        Some(&format!(
+                            "Install cloudflared on the {} runtime first.",
+                            crate::branding::PRODUCT_NAME
+                        )),
                     )],
                 }),
             }
@@ -1551,7 +1608,10 @@ async fn test_tunnel_provider_connection(
                         "ngrok CLI",
                         "fail",
                         error,
-                        Some("Install ngrok on the AgentArk runtime first."),
+                        Some(&format!(
+                            "Install ngrok on the {} runtime first.",
+                            crate::branding::PRODUCT_NAME
+                        )),
                     )],
                 }),
             }
@@ -1596,7 +1656,10 @@ async fn test_tunnel_provider_connection(
                         "Bore CLI",
                         "fail",
                         error,
-                        Some("Install Bore on the AgentArk runtime first."),
+                        Some(&format!(
+                            "Install Bore on the {} runtime first.",
+                            crate::branding::PRODUCT_NAME
+                        )),
                     )],
                 }),
             }

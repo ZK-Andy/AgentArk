@@ -475,7 +475,8 @@ async fn distill_moltbook_memory_insights(
         "feed": feed_items
     });
 
-    let prompt = r#"You are extracting durable semantic memory from AgentArk's Moltbook run.
+    let prompt = crate::branding::render_template(
+        r#"You are extracting durable semantic memory from __PRODUCT_NAME__'s Moltbook run.
 Return strict JSON only with this shape:
 {"summary":"short string","insights":["insight 1","insight 2"]}
 
@@ -485,10 +486,11 @@ Rules:
 - Ignore routine operational details, one-off status updates, IDs, timestamps, and pure process notes.
 - Do not include usernames, post IDs, URLs, or private data.
 - Keep 0-4 insights, each one sentence and under 180 characters.
-- If nothing is worth saving for future conversations, return an empty insights array."#;
+- If nothing is worth saving for future conversations, return an empty insights array."#,
+    );
 
     let response = llm
-        .chat(prompt, &payload.to_string(), &[], &[])
+        .chat(&prompt, &payload.to_string(), &[], &[])
         .await
         .map_err(|e| e.to_string())?;
     {
@@ -1040,8 +1042,10 @@ async fn run_moltbook_cycle_with_guard(
         )
         .await;
     } else if settings.mode == "read_only" {
-        decision_summary =
-            "Read-only mode: AgentArk reviewed the feed without public engagement.".to_string();
+        decision_summary = format!(
+            "Read-only mode: {} reviewed the feed without public engagement.",
+            crate::branding::PRODUCT_NAME
+        );
         append_moltbook_activity(
             &storage,
             &run_id,
@@ -1154,7 +1158,8 @@ async fn run_moltbook_cycle_with_guard(
             "submolt_context": submolt_context,
             "feed": planner_posts
         });
-        let planner_prompt = r#"You are AgentArk's Moltbook participation planner.
+        let planner_prompt = crate::branding::render_template(
+            r#"You are __PRODUCT_NAME__'s Moltbook participation planner.
 Return strict JSON only with this shape:
 {"summary":"short string","actions":[{"action":"comment|upvote_post|create_post","post_id":"optional","parent_id":"optional","submolt":"optional","title":"optional","content":"optional","reason":"optional"}]}
 
@@ -1171,10 +1176,11 @@ Rules:
 - Do not comment on or upvote the agent's own post.
 - Do not invent post IDs or submolt names.
 - If nothing should be done, return an empty actions array and explain why in summary.
-- There is no downvote action available in this environment."#;
+- There is no downvote action available in this environment."#,
+        );
         let llm_response = if has_planner_posts || (settings.mode == "autopost" && can_create_post)
         {
-            llm.chat(planner_prompt, &planner_payload.to_string(), &[], &[])
+            llm.chat(&planner_prompt, &planner_payload.to_string(), &[], &[])
                 .await
                 .ok()
         } else {
@@ -1213,7 +1219,8 @@ Rules:
             && can_create_post
             && has_planner_posts
         {
-            let post_probe_prompt = r#"You are AgentArk's Moltbook original-post planner.
+            let post_probe_prompt = crate::branding::render_template(
+                r#"You are __PRODUCT_NAME__'s Moltbook original-post planner.
 Return strict JSON only with this shape:
 {"summary":"short string","actions":[{"action":"create_post","submolt":"optional","title":"required if posting","content":"required if posting","reason":"optional"}]}
 
@@ -1224,9 +1231,10 @@ Rules:
 - Use recent_activity to avoid spam: if there was a recent original post, skip unless this thread is clearly distinct.
 - Use submolt_context to choose the best destination when there is a clear fit.
 - Do not produce filler updates, check-ins, or posts that merely restate the feed.
-- If no original post is justified, return an empty actions array."#;
+- If no original post is justified, return an empty actions array."#,
+            );
             let post_probe_response = llm
-                .chat(post_probe_prompt, &planner_payload.to_string(), &[], &[])
+                .chat(&post_probe_prompt, &planner_payload.to_string(), &[], &[])
                 .await
                 .ok();
             if let Some(ref response) = post_probe_response {

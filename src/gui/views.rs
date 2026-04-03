@@ -21,8 +21,6 @@ pub struct SetupWizard {
     telegram_users: String,
 
     // Search backends
-    enable_searxng: bool,
-    searxng_url: String,
     enable_serper: bool,
     serper_key: String,
     enable_brave: bool,
@@ -46,6 +44,7 @@ enum SetupStep {
 
 #[derive(Debug, Clone, PartialEq)]
 enum LlmProviderChoice {
+    Unset,
     Anthropic,
     OpenAI,
     OpenAICompatible,
@@ -87,6 +86,17 @@ impl SetupWizard {
                         )
                     }
                 }
+                LlmProvider::Ollama { base_url, model }
+                    if base_url.trim().is_empty() && model.trim().is_empty() =>
+                {
+                    (
+                        LlmProviderChoice::Unset,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                }
                 LlmProvider::Ollama { base_url, model } => (
                     LlmProviderChoice::Ollama,
                     String::new(),
@@ -111,24 +121,14 @@ impl SetupWizard {
         Self {
             agent,
             step: SetupStep::Welcome,
-            agent_name: "AgentArk".to_string(),
+            agent_name: crate::branding::default_agent_name(),
             llm_provider,
             api_key,
-            ollama_url: if ollama_url.is_empty() {
-                "http://localhost:11434".to_string()
-            } else {
-                ollama_url
-            },
-            ollama_model: if ollama_model.is_empty() {
-                "llama3.2".to_string()
-            } else {
-                ollama_model
-            },
+            ollama_url,
+            ollama_model,
             openai_base_url,
             telegram_token,
             telegram_users,
-            enable_searxng: false,
-            searxng_url: "http://localhost:8080".to_string(),
             enable_serper: false,
             serper_key: String::new(),
             enable_brave: false,
@@ -144,7 +144,7 @@ impl SetupWizard {
             ui.add_space(30.0);
 
             // Logo/Title
-            ui.heading(egui::RichText::new("AgentArk").size(32.0));
+            ui.heading(egui::RichText::new(crate::branding::PRODUCT_NAME).size(32.0));
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Secure, Self-Improving AI Assistant").italics());
 
@@ -225,6 +225,20 @@ impl SetupWizard {
             .num_columns(2)
             .spacing([20.0, 10.0])
             .show(ui, |ui| {
+                let unset_selected = self.llm_provider == LlmProviderChoice::Unset;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        unset_selected,
+                        egui::RichText::new("Choose Later").strong(),
+                    ))
+                    .clicked()
+                {
+                    self.llm_provider = LlmProviderChoice::Unset;
+                    self.connection_result = None;
+                }
+                ui.label("Leave models unconfigured for now");
+                ui.end_row();
+
                 // Ollama (Local)
                 let ollama_selected = self.llm_provider == LlmProviderChoice::Ollama;
                 if ui
@@ -292,6 +306,9 @@ impl SetupWizard {
 
         // Provider-specific settings
         match self.llm_provider {
+            LlmProviderChoice::Unset => {
+                ui.label("No model is configured yet. You can finish setup now and add one later.");
+            }
             LlmProviderChoice::Anthropic => {
                 ui.horizontal(|ui| {
                     ui.label("API Key: ");
@@ -300,6 +317,15 @@ impl SetupWizard {
                             .password(true)
                             .hint_text("sk-ant-...")
                             .desired_width(300.0),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label("Model: ");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ollama_model)
+                            .hint_text("claude-sonnet-4-5")
+                            .desired_width(250.0),
                     );
                 });
                 ui.add_space(5.0);
@@ -316,6 +342,15 @@ impl SetupWizard {
                             .password(true)
                             .hint_text("sk-...")
                             .desired_width(300.0),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label("Model: ");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ollama_model)
+                            .hint_text("gpt-4.1")
+                            .desired_width(250.0),
                     );
                 });
                 ui.add_space(5.0);
@@ -364,13 +399,13 @@ impl SetupWizard {
                     ui.label("Model: ");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.ollama_model)
-                            .hint_text("llama3.2")
+                            .hint_text("example: llama3.2")
                             .desired_width(150.0),
                     );
                 });
                 ui.add_space(5.0);
                 ui.small("Make sure Ollama is running: ollama serve");
-                ui.small("Pull a model first: ollama pull llama3.2");
+                ui.small("Example: ollama pull llama3.2");
             }
         }
 
@@ -410,27 +445,6 @@ impl SetupWizard {
         ui.label("Configure search backends for research capabilities.");
         ui.small("DuckDuckGo is always available as a fallback (no API key needed).");
         ui.add_space(15.0);
-
-        // SearXNG
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(40, 45, 50))
-            .rounding(8.0)
-            .inner_margin(10.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.enable_searxng, "");
-                    ui.label(egui::RichText::new("SearXNG").strong());
-                    ui.small("(Self-hosted, privacy-focused)");
-                });
-                if self.enable_searxng {
-                    ui.horizontal(|ui| {
-                        ui.label("URL: ");
-                        ui.text_edit_singleline(&mut self.searxng_url);
-                    });
-                }
-            });
-
-        ui.add_space(10.0);
 
         // Serper
         egui::Frame::none()
@@ -572,14 +586,17 @@ impl SetupWizard {
                     ui.label(egui::RichText::new("[+]").strong());
                     ui.label("LLM Provider: ");
                     match self.llm_provider {
+                        LlmProviderChoice::Unset => {
+                            ui.label("Not configured yet");
+                        }
                         LlmProviderChoice::Anthropic => {
-                            ui.label("Anthropic Claude");
+                            ui.label(format!("Anthropic Claude ({})", self.ollama_model));
                             if self.api_key.is_empty() {
                                 ui.colored_label(egui::Color32::YELLOW, "(no API key)");
                             }
                         }
                         LlmProviderChoice::OpenAI => {
-                            ui.label("OpenAI GPT");
+                            ui.label(format!("OpenAI GPT ({})", self.ollama_model));
                             if self.api_key.is_empty() {
                                 ui.colored_label(egui::Color32::YELLOW, "(no API key)");
                             }
@@ -609,9 +626,6 @@ impl SetupWizard {
                     ui.label(egui::RichText::new("[+]").strong());
                     ui.label("Search Backends: ");
                     let mut backends = vec!["DuckDuckGo"];
-                    if self.enable_searxng {
-                        backends.push("SearXNG");
-                    }
                     if self.enable_serper {
                         backends.push("Serper");
                     }
@@ -704,7 +718,10 @@ impl SetupWizard {
 
             ui.add_space(20.0);
 
-            ui.label("Your AgentArk is ready to use.");
+            ui.label(format!(
+                "Your {} is ready to use.",
+                crate::branding::PRODUCT_NAME
+            ));
 
             ui.add_space(30.0);
 
@@ -751,15 +768,29 @@ impl SetupWizard {
     }
 
     fn save_config(&mut self) -> anyhow::Result<()> {
+        let model_id = self.ollama_model.trim().to_string();
+        if self.llm_provider != LlmProviderChoice::Unset && model_id.is_empty() {
+            return Err(anyhow::anyhow!("Model is required"));
+        }
+        if self.llm_provider == LlmProviderChoice::Ollama && self.ollama_url.trim().is_empty() {
+            return Err(anyhow::anyhow!("Ollama URL is required"));
+        }
+        if self.llm_provider == LlmProviderChoice::OpenAICompatible
+            && self.openai_base_url.trim().is_empty()
+        {
+            return Err(anyhow::anyhow!("OpenAI-compatible base URL is required"));
+        }
+
         // Build LLM provider config
         let llm = match self.llm_provider {
+            LlmProviderChoice::Unset => LlmProvider::default(),
             LlmProviderChoice::Anthropic => LlmProvider::Anthropic {
                 api_key: self.api_key.clone(),
-                model: "claude-sonnet-4-20250514".to_string(),
+                model: model_id.clone(),
             },
             LlmProviderChoice::OpenAI => LlmProvider::OpenAI {
                 api_key: self.api_key.clone(),
-                model: "gpt-4o".to_string(),
+                model: model_id.clone(),
                 base_url: None,
             },
             LlmProviderChoice::OpenAICompatible => LlmProvider::OpenAI {
@@ -768,12 +799,12 @@ impl SetupWizard {
                 } else {
                     self.api_key.clone()
                 },
-                model: self.ollama_model.clone(),
+                model: model_id.clone(),
                 base_url: Some(self.openai_base_url.clone()),
             },
             LlmProviderChoice::Ollama => LlmProvider::Ollama {
                 base_url: self.ollama_url.clone(),
-                model: self.ollama_model.clone(),
+                model: model_id.clone(),
             },
         };
 
@@ -805,13 +836,6 @@ impl SetupWizard {
 
         // Save search config
         let search_config = SearchConfig {
-            searxng: if self.enable_searxng {
-                Some(crate::actions::SearchBackend::SearXNG {
-                    base_url: self.searxng_url.clone(),
-                })
-            } else {
-                None
-            },
             serper: if self.enable_serper {
                 Some(crate::actions::SearchBackend::Serper {
                     api_key: self.serper_key.clone(),

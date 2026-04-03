@@ -56,40 +56,13 @@ impl SubAgentType {
     pub fn system_prompt(&self) -> String {
         match self {
             Self::Researcher => {
-                "You are a Research Agent. Your role is to gather, analyze, and synthesize \
-                information from various sources. Focus on accuracy, comprehensiveness, \
-                and citing sources when possible. Break down complex research tasks into \
-                specific queries."
-                    .to_string()
+                crate::core::prompt_policy::specialist_researcher_system_prompt_v1()
             }
-            Self::Coder => {
-                "You are a Coding Agent. Your role is to write, analyze, and debug code. \
-                Focus on clean, efficient, and well-documented code. Follow best practices \
-                and consider edge cases. Explain your implementation decisions."
-                    .to_string()
-            }
-            Self::Analyst => {
-                "You are an Analysis Agent. Your role is to examine data, identify patterns, \
-                and draw insights. Be thorough in your analysis and present findings clearly. \
-                Use quantitative methods when appropriate."
-                    .to_string()
-            }
-            Self::Writer => "You are a Writing Agent. Your role is to create clear, engaging, and \
-                well-structured content. Adapt your tone and style to the target audience. \
-                Focus on clarity and coherence."
-                .to_string(),
-            Self::Validator => {
-                "You are a Validation Agent. Your role is to verify facts, check logic, \
-                and ensure accuracy. Be skeptical and thorough. Flag any inconsistencies \
-                or potential errors you find."
-                    .to_string()
-            }
-            Self::Planner => {
-                "You are a Planning Agent. Your role is to break down complex tasks into \
-                manageable steps, identify dependencies, and create actionable plans. \
-                Consider resource constraints and potential risks."
-                    .to_string()
-            }
+            Self::Coder => crate::core::prompt_policy::specialist_coder_system_prompt_v1(),
+            Self::Analyst => crate::core::prompt_policy::specialist_analyst_system_prompt_v1(),
+            Self::Writer => crate::core::prompt_policy::specialist_writer_system_prompt_v1(),
+            Self::Validator => crate::core::prompt_policy::specialist_validator_system_prompt_v1(),
+            Self::Planner => crate::core::prompt_policy::specialist_planner_system_prompt_v1(),
             Self::Custom { instructions, .. } => instructions.clone(),
         }
     }

@@ -55,6 +55,12 @@ const CHANNEL_ICON_COLORS: Record<string, string> = {
   discord: "#5865F2",
   matrix: "#0DBD8B",
   teams: "#6264A7",
+  google_chat: "#34A853",
+  signal: "#3A76F0",
+  imessage: "#147EFB",
+  line: "#06C755",
+  wechat: "#07C160",
+  qq: "#12B7F5",
   "web search": "#69e2ff",
   google_workspace: "#4285F4",
   github: "#f0f0f0",
@@ -93,6 +99,7 @@ const CHANNEL_ICON_MAP: Record<string, string> = {
   discord: iconDiscord,
   matrix: iconMatrix,
   teams: iconTeams,
+  google_chat: iconGoogle,
   github: iconGithub,
   google: iconGoogle,
   google_workspace: iconGoogle,
@@ -240,7 +247,6 @@ type ChannelSettingsForm = {
   search_fallback1: string;
   search_fallback2: string;
   search_serper_key: string;
-  search_searxng_url: string;
   search_brave_key: string;
   telegram_enabled: boolean;
   telegram_bot_token: string;
@@ -288,11 +294,58 @@ type ChannelSettingsForm = {
   teams_user_agent: string;
   teams_trust_policy: string;
   teams_allowed_senders_csv: string;
+  google_chat_enabled: boolean;
+  google_chat_access_token: string;
+  google_chat_verify_token: string;
+  google_chat_api_base_url: string;
+  google_chat_space: string;
+  google_chat_thread_key: string;
+  google_chat_app_id: string;
+  google_chat_bot_name: string;
+  google_chat_trust_policy: string;
+  google_chat_allowed_senders_csv: string;
+  signal_enabled: boolean;
+  signal_bridge_token: string;
+  signal_bridge_url: string;
+  signal_default_recipient: string;
+  signal_default_group_id: string;
+  signal_trust_policy: string;
+  signal_allowed_senders_csv: string;
+  imessage_enabled: boolean;
+  imessage_bridge_token: string;
+  imessage_bridge_url: string;
+  imessage_default_chat_id: string;
+  imessage_default_handle: string;
+  imessage_trust_policy: string;
+  imessage_allowed_senders_csv: string;
+  line_enabled: boolean;
+  line_channel_access_token: string;
+  line_channel_secret: string;
+  line_api_base_url: string;
+  line_default_target: string;
+  line_user_agent: string;
+  line_trust_policy: string;
+  line_allowed_senders_csv: string;
+  wechat_enabled: boolean;
+  wechat_bridge_token: string;
+  wechat_bridge_url: string;
+  wechat_default_target_id: string;
+  wechat_trust_policy: string;
+  wechat_allowed_senders_csv: string;
+  qq_enabled: boolean;
+  qq_bridge_token: string;
+  qq_bridge_url: string;
+  qq_default_target_id: string;
+  qq_trust_policy: string;
+  qq_allowed_senders_csv: string;
   whatsapp_enabled: boolean;
   whatsapp_mode: "baileys" | "cloud_api";
+  whatsapp_bridge_runtime: "embedded" | "external";
   whatsapp_access_token: string;
+  whatsapp_app_secret: string;
   whatsapp_phone_number_id: string;
   whatsapp_verify_token: string;
+  whatsapp_bridge_token: string;
   whatsapp_bridge_url: string;
   whatsapp_dm_policy: string;
   whatsapp_allowed_numbers_csv: string;
@@ -464,7 +517,7 @@ function messagingDisplayState(status: string, enabled: boolean): MessagingDispl
   const s = (status || "").toLowerCase();
   if (s === "checking" || s === "refreshing") return "checking";
   if (s === "connected" || s === "ready" || s === "configured") return "ready";
-  if (s === "error" || s === "failed" || s === "invalid_token") return "error";
+  if (s === "error" || s === "failed" || s === "invalid_token" || s === "unavailable") return "error";
   return "needs_setup";
 }
 
@@ -802,12 +855,17 @@ export function IntegrationsPanel({
   const [matrixSetupOpen, setMatrixSetupOpen] = useState(false);
   const [teamsSetupOpen, setTeamsSetupOpen] = useState(false);
   const [whatsAppSetupOpen, setWhatsAppSetupOpen] = useState(false);
+  const [googleChatSetupOpen, setGoogleChatSetupOpen] = useState(false);
+  const [signalSetupOpen, setSignalSetupOpen] = useState(false);
+  const [imessageSetupOpen, setImessageSetupOpen] = useState(false);
+  const [lineSetupOpen, setLineSetupOpen] = useState(false);
+  const [wechatSetupOpen, setWechatSetupOpen] = useState(false);
+  const [qqSetupOpen, setQqSetupOpen] = useState(false);
   const [channelForm, setChannelForm] = useState<ChannelSettingsForm>({
     search_primary: "lightpanda",
     search_fallback1: "duckduckgo",
     search_fallback2: "none",
     search_serper_key: "",
-    search_searxng_url: "",
     search_brave_key: "",
     telegram_enabled: false,
     telegram_bot_token: "",
@@ -855,11 +913,58 @@ export function IntegrationsPanel({
     teams_user_agent: "",
     teams_trust_policy: "open",
     teams_allowed_senders_csv: "",
+    google_chat_enabled: false,
+    google_chat_access_token: "",
+    google_chat_verify_token: "",
+    google_chat_api_base_url: "https://chat.googleapis.com",
+    google_chat_space: "",
+    google_chat_thread_key: "",
+    google_chat_app_id: "",
+    google_chat_bot_name: "",
+    google_chat_trust_policy: "open",
+    google_chat_allowed_senders_csv: "",
+    signal_enabled: false,
+    signal_bridge_token: "",
+    signal_bridge_url: "http://127.0.0.1:9120",
+    signal_default_recipient: "",
+    signal_default_group_id: "",
+    signal_trust_policy: "open",
+    signal_allowed_senders_csv: "",
+    imessage_enabled: false,
+    imessage_bridge_token: "",
+    imessage_bridge_url: "http://127.0.0.1:9130",
+    imessage_default_chat_id: "",
+    imessage_default_handle: "",
+    imessage_trust_policy: "open",
+    imessage_allowed_senders_csv: "",
+    line_enabled: false,
+    line_channel_access_token: "",
+    line_channel_secret: "",
+    line_api_base_url: "https://api.line.me",
+    line_default_target: "",
+    line_user_agent: "",
+    line_trust_policy: "open",
+    line_allowed_senders_csv: "",
+    wechat_enabled: false,
+    wechat_bridge_token: "",
+    wechat_bridge_url: "http://127.0.0.1:9140",
+    wechat_default_target_id: "",
+    wechat_trust_policy: "open",
+    wechat_allowed_senders_csv: "",
+    qq_enabled: false,
+    qq_bridge_token: "",
+    qq_bridge_url: "http://127.0.0.1:9150",
+    qq_default_target_id: "",
+    qq_trust_policy: "open",
+    qq_allowed_senders_csv: "",
     whatsapp_enabled: false,
     whatsapp_mode: "baileys",
+    whatsapp_bridge_runtime: "embedded",
     whatsapp_access_token: "",
+    whatsapp_app_secret: "",
     whatsapp_phone_number_id: "",
     whatsapp_verify_token: "",
+    whatsapp_bridge_token: "",
     whatsapp_bridge_url: "",
     whatsapp_dm_policy: "all",
     whatsapp_allowed_numbers_csv: ""
@@ -1097,8 +1202,14 @@ export function IntegrationsPanel({
   const settings = asRecord(settingsQ.data);
   const senderVerification = asRecord(senderVerificationQ.data);
   const senderVerificationSettings = asRecord(senderVerification.settings);
+  const googleChatTrustSettings = asRecord(senderVerificationSettings.google_chat);
+  const signalTrustSettings = asRecord(senderVerificationSettings.signal);
+  const imessageTrustSettings = asRecord(senderVerificationSettings.imessage);
+  const lineTrustSettings = asRecord(senderVerificationSettings.line);
   const slackTrustSettings = asRecord(senderVerificationSettings.slack);
   const teamsTrustSettings = asRecord(senderVerificationSettings.teams);
+  const wechatTrustSettings = asRecord(senderVerificationSettings.wechat);
+  const qqTrustSettings = asRecord(senderVerificationSettings.qq);
   const whatsappTrustSettings = asRecord(senderVerificationSettings.whatsapp);
   const pendingSenderRows = asRecords(senderVerification.pending);
   const approvedSenderRows = asRecords(senderVerification.approved);
@@ -1114,11 +1225,44 @@ export function IntegrationsPanel({
   const hasMatrixAccessToken = toBool(settings.has_matrix_access_token);
   const hasTeamsAccessToken = toBool(settings.has_teams_access_token);
   const hasWhatsAppToken = toBool(settings.has_whatsapp_token);
+  const hasWhatsAppAppSecret = toBool(settings.has_whatsapp_app_secret);
+  const hasWhatsAppVerifyToken = toBool(settings.has_whatsapp_verify_token);
+  const hasWhatsAppBridgeToken = toBool(settings.has_whatsapp_bridge_token);
+  const hasGoogleChatAccessToken = toBool(settings.has_google_chat_access_token);
+  const hasGoogleChatVerifyToken = toBool(settings.has_google_chat_verify_token);
+  const hasSignalBridgeToken = toBool(settings.has_signal_bridge_token);
+  const hasIMessageBridgeToken = toBool(settings.has_imessage_bridge_token);
+  const hasLineAccessToken = toBool(settings.has_line_access_token);
+  const hasLineChannelSecret = toBool(settings.has_line_channel_secret);
+  const hasWeChatBridgeToken = toBool(settings.has_wechat_bridge_token);
+  const hasQqBridgeToken = toBool(settings.has_qq_bridge_token);
   const searchSerperConfigured = toBool(settings.search_serper_configured);
   const searchBraveConfigured = toBool(settings.search_brave_configured);
   const telegramDraftTokenConfigured = channelForm.telegram_bot_token.trim().length > 0;
   const telegramTokenConfigured = hasTelegramToken || telegramDraftTokenConfigured;
   const whatsappTokenConfigured = hasWhatsAppToken || channelForm.whatsapp_access_token.trim().length > 0;
+  const whatsappAppSecretConfigured =
+    hasWhatsAppAppSecret || channelForm.whatsapp_app_secret.trim().length > 0;
+  const whatsappVerifyTokenConfigured =
+    hasWhatsAppVerifyToken || channelForm.whatsapp_verify_token.trim().length > 0;
+  const whatsappExternalBridgeTokenConfigured =
+    hasWhatsAppBridgeToken || channelForm.whatsapp_bridge_token.trim().length > 0;
+  const whatsappEmbeddedBridgeSelected =
+    channelForm.whatsapp_mode === "baileys" && channelForm.whatsapp_bridge_runtime === "embedded";
+  const whatsappExternalBridgeSelected =
+    channelForm.whatsapp_mode === "baileys" && channelForm.whatsapp_bridge_runtime === "external";
+  const whatsappModeSummary =
+    channelForm.whatsapp_mode === "cloud_api"
+      ? "Cloud API"
+      : whatsappExternalBridgeSelected
+        ? "External bridge"
+        : "Bundled bridge";
+  const whatsappBridgeStatus = str(waBridge.status, "disconnected");
+  const whatsappBridgeDetail = str(waBridge.detail, "");
+  const whatsappBridgeError = str(waBridge.error, "");
+  const whatsappBridgeWarning = str(waBridge.warning, "");
+  const whatsappBridgeNumber = str(waBridge.number, "").trim();
+  const whatsappBridgeInstalled = waBridge.installed !== false;
   const telegramProbeStatus = str(telegramStatus.status, "").trim().toLowerCase();
   const telegramProbeDetail = str(telegramStatus.detail, "").trim();
   const telegramConnectionStatusRaw = (() => {
@@ -1160,22 +1304,71 @@ export function IntegrationsPanel({
   const whatsappConnectionStatusRaw = (() => {
     if (!channelForm.whatsapp_enabled) return "disabled";
     if (channelForm.whatsapp_mode === "cloud_api") {
-      return whatsappTokenConfigured && channelForm.whatsapp_phone_number_id.trim() ? "ready" : "missing_config";
+      return whatsappTokenConfigured &&
+        whatsappAppSecretConfigured &&
+        whatsappVerifyTokenConfigured &&
+        channelForm.whatsapp_phone_number_id.trim()
+        ? "ready"
+        : "missing_config";
+    }
+    if (whatsappExternalBridgeSelected && !channelForm.whatsapp_bridge_url.trim()) {
+      return "missing_config";
     }
     if (waBridgeQ.isFetching) return "checking";
     if (waBridgeQ.error) return "error";
-    return str(waBridge.status, "disconnected");
+    return whatsappBridgeStatus === "disabled" ? "missing_config" : whatsappBridgeStatus;
   })();
-  const whatsappConnectionDetail =
-    channelForm.whatsapp_mode === "cloud_api"
-      ? whatsappConnectionStatusRaw === "ready"
+  const whatsappConnectionDetail = (() => {
+    if (!channelForm.whatsapp_enabled) return "WhatsApp is disabled.";
+    if (channelForm.whatsapp_mode === "cloud_api") {
+      return whatsappConnectionStatusRaw === "ready"
         ? "Cloud API credentials are configured."
-        : "Cloud API token and phone number ID are required."
-      : str(waBridge.error, "");
+        : "Cloud API token, app secret, verify token, and phone number ID are required.";
+    }
+    if (whatsappExternalBridgeSelected) {
+      if (!channelForm.whatsapp_bridge_url.trim()) {
+        return "External bridge URL is required.";
+      }
+      if (!whatsappExternalBridgeTokenConfigured) {
+        return "External bridge token is required for new setups. Leave the field blank only when keeping a saved token or preserving a legacy tokenless bridge.";
+      }
+      if (waBridgeQ.isFetching) return "Checking external bridge status...";
+      if (waBridgeQ.error) return "External bridge status check failed.";
+      if (whatsappBridgeStatus === "connected" && whatsappBridgeNumber) {
+        return `External bridge connected as ${whatsappBridgeNumber}.`;
+      }
+      if (whatsappBridgeDetail) return whatsappBridgeDetail;
+      if (whatsappBridgeError) return whatsappBridgeError;
+      if (whatsappBridgeStatus === "connected") return "External bridge is connected.";
+      if (whatsappBridgeWarning) return whatsappBridgeWarning;
+      return "Save the external bridge URL and token, then make sure that bridge is reachable from AgentArk.";
+    }
+    if (waBridgeQ.isFetching) return "Checking bundled WhatsApp bridge...";
+    if (!whatsappBridgeInstalled) {
+      return whatsappBridgeError ||
+        "Bundled WhatsApp bridge is not installed in this image. Use the full image or switch to an external bridge.";
+    }
+    if (waBridgeQ.error) return "Bundled WhatsApp bridge status check failed.";
+    if (whatsappBridgeStatus === "connected" && whatsappBridgeNumber) {
+      return `Bundled bridge connected as ${whatsappBridgeNumber}.`;
+    }
+    if (whatsappBridgeStatus === "qr") {
+      return "Open WhatsApp > Linked Devices > Link a Device, then scan the QR.";
+    }
+    if (whatsappBridgeDetail) return whatsappBridgeDetail;
+    if (whatsappBridgeError) return whatsappBridgeError;
+    return "Save settings, then use the bundled bridge to pair with a QR code.";
+  })();
   const slackGateway = gatewayChannelById(gatewayChannels, "slack");
   const discordGateway = gatewayChannelById(gatewayChannels, "discord");
   const matrixGateway = gatewayChannelById(gatewayChannels, "matrix");
   const teamsGateway = gatewayChannelById(gatewayChannels, "teams");
+  const googleChatGateway = gatewayChannelById(gatewayChannels, "google_chat");
+  const signalGateway = gatewayChannelById(gatewayChannels, "signal");
+  const imessageGateway = gatewayChannelById(gatewayChannels, "imessage");
+  const lineGateway = gatewayChannelById(gatewayChannels, "line");
+  const wechatGateway = gatewayChannelById(gatewayChannels, "wechat");
+  const qqGateway = gatewayChannelById(gatewayChannels, "qq");
   const slackConnectionStatusRaw = slackGateway?.status || (channelForm.slack_enabled ? "missing_config" : "disabled");
   const discordConnectionStatusRaw =
     discordGateway?.status || (channelForm.discord_enabled ? "missing_config" : "disabled");
@@ -1183,6 +1376,18 @@ export function IntegrationsPanel({
     matrixGateway?.status || (channelForm.matrix_enabled ? "missing_config" : "disabled");
   const teamsConnectionStatusRaw =
     teamsGateway?.status || (channelForm.teams_enabled ? "missing_config" : "disabled");
+  const googleChatConnectionStatusRaw =
+    googleChatGateway?.status || (channelForm.google_chat_enabled ? "missing_config" : "disabled");
+  const signalConnectionStatusRaw =
+    signalGateway?.status || (channelForm.signal_enabled ? "missing_config" : "disabled");
+  const imessageConnectionStatusRaw =
+    imessageGateway?.status || (channelForm.imessage_enabled ? "missing_config" : "disabled");
+  const lineConnectionStatusRaw =
+    lineGateway?.status || (channelForm.line_enabled ? "missing_config" : "disabled");
+  const wechatConnectionStatusRaw =
+    wechatGateway?.status || (channelForm.wechat_enabled ? "missing_config" : "disabled");
+  const qqConnectionStatusRaw =
+    qqGateway?.status || (channelForm.qq_enabled ? "missing_config" : "disabled");
   const slackConnectionDetail = gatewayChannelDetail(
     slackGateway,
     channelForm.slack_enabled ? "Bot token and signing secret are required." : "Not configured"
@@ -1198,6 +1403,42 @@ export function IntegrationsPanel({
   const teamsConnectionDetail = gatewayChannelDetail(
     teamsGateway,
     channelForm.teams_enabled ? "Service URL, access token, and bot app ID are required." : "Not configured"
+  );
+  const googleChatConnectionDetail = gatewayChannelDetail(
+    googleChatGateway,
+    channelForm.google_chat_enabled
+      ? "Google Chat needs an access token to reply in linked spaces. Add a default space if you want AgentArk to send proactive updates there."
+      : "Not configured"
+  );
+  const signalConnectionDetail = gatewayChannelDetail(
+    signalGateway,
+    channelForm.signal_enabled
+      ? "Signal needs a bridge URL and bridge token. Add a default recipient or group if you want proactive updates without waiting for an inbound chat first."
+      : "Not configured"
+  );
+  const imessageConnectionDetail = gatewayChannelDetail(
+    imessageGateway,
+    channelForm.imessage_enabled
+      ? "iMessage needs a bridge URL and bridge token. Add a default chat or handle if you want proactive updates before someone messages AgentArk first."
+      : "Not configured"
+  );
+  const lineConnectionDetail = gatewayChannelDetail(
+    lineGateway,
+    channelForm.line_enabled
+      ? "LINE needs a channel access token and channel secret. Add a default target if you want proactive updates outside an active chat."
+      : "Not configured"
+  );
+  const wechatConnectionDetail = gatewayChannelDetail(
+    wechatGateway,
+    channelForm.wechat_enabled
+      ? "WeChat needs a bridge URL and bridge token. Add a default target if you want proactive updates before an inbound chat establishes a reply route."
+      : "Not configured"
+  );
+  const qqConnectionDetail = gatewayChannelDetail(
+    qqGateway,
+    channelForm.qq_enabled
+      ? "QQ needs a bridge URL and bridge token. Add a default target if you want proactive updates before an inbound chat establishes a reply route."
+      : "Not configured"
   );
   const mcpServers = showMcp ? asRecords(asRecord(mcpQ.data).servers) : [];
   const sorted = useMemo(
@@ -1463,7 +1704,6 @@ export function IntegrationsPanel({
       search_fallback1: str(next.search_fallback1, "duckduckgo"),
       search_fallback2: str(next.search_fallback2, "none"),
       search_serper_key: "",
-      search_searxng_url: str(next.search_searxng_url, ""),
       search_brave_key: "",
       telegram_enabled: toBool(next.telegram_enabled),
       telegram_bot_token: "",
@@ -1515,11 +1755,59 @@ export function IntegrationsPanel({
       teams_user_agent: str(next.teams_user_agent, ""),
       teams_trust_policy: str(teamsTrustSettings.policy, "open"),
       teams_allowed_senders_csv: asStringList(teamsTrustSettings.allowed_senders).join(", "),
+      google_chat_enabled: toBool(next.google_chat_enabled),
+      google_chat_access_token: "",
+      google_chat_verify_token: "",
+      google_chat_api_base_url: str(next.google_chat_api_base_url, "https://chat.googleapis.com"),
+      google_chat_space: str(next.google_chat_space, ""),
+      google_chat_thread_key: str(next.google_chat_thread_key, ""),
+      google_chat_app_id: str(next.google_chat_app_id, ""),
+      google_chat_bot_name: str(next.google_chat_bot_name, ""),
+      google_chat_trust_policy: str(googleChatTrustSettings.policy, "open"),
+      google_chat_allowed_senders_csv: asStringList(googleChatTrustSettings.allowed_senders).join(", "),
+      signal_enabled: toBool(next.signal_enabled),
+      signal_bridge_token: "",
+      signal_bridge_url: str(next.signal_bridge_url, "http://127.0.0.1:9120"),
+      signal_default_recipient: str(next.signal_default_recipient, ""),
+      signal_default_group_id: str(next.signal_default_group_id, ""),
+      signal_trust_policy: str(signalTrustSettings.policy, "open"),
+      signal_allowed_senders_csv: asStringList(signalTrustSettings.allowed_senders).join(", "),
+      imessage_enabled: toBool(next.imessage_enabled),
+      imessage_bridge_token: "",
+      imessage_bridge_url: str(next.imessage_bridge_url, "http://127.0.0.1:9130"),
+      imessage_default_chat_id: str(next.imessage_default_chat_id, ""),
+      imessage_default_handle: str(next.imessage_default_handle, ""),
+      imessage_trust_policy: str(imessageTrustSettings.policy, "open"),
+      imessage_allowed_senders_csv: asStringList(imessageTrustSettings.allowed_senders).join(", "),
+      line_enabled: toBool(next.line_enabled),
+      line_channel_access_token: "",
+      line_channel_secret: "",
+      line_api_base_url: str(next.line_api_base_url, "https://api.line.me"),
+      line_default_target: str(next.line_default_target, ""),
+      line_user_agent: str(next.line_user_agent, ""),
+      line_trust_policy: str(lineTrustSettings.policy, "open"),
+      line_allowed_senders_csv: asStringList(lineTrustSettings.allowed_senders).join(", "),
+      wechat_enabled: toBool(next.wechat_enabled),
+      wechat_bridge_token: "",
+      wechat_bridge_url: str(next.wechat_bridge_url, "http://127.0.0.1:9140"),
+      wechat_default_target_id: str(next.wechat_default_target_id, ""),
+      wechat_trust_policy: str(wechatTrustSettings.policy, "open"),
+      wechat_allowed_senders_csv: asStringList(wechatTrustSettings.allowed_senders).join(", "),
+      qq_enabled: toBool(next.qq_enabled),
+      qq_bridge_token: "",
+      qq_bridge_url: str(next.qq_bridge_url, "http://127.0.0.1:9150"),
+      qq_default_target_id: str(next.qq_default_target_id, ""),
+      qq_trust_policy: str(qqTrustSettings.policy, "open"),
+      qq_allowed_senders_csv: asStringList(qqTrustSettings.allowed_senders).join(", "),
       whatsapp_enabled: toBool(next.whatsapp_enabled),
       whatsapp_mode: str(next.whatsapp_mode, "baileys") === "cloud_api" ? "cloud_api" : "baileys",
+      whatsapp_bridge_runtime:
+        str(next.whatsapp_bridge_runtime, "embedded") === "external" ? "external" : "embedded",
       whatsapp_access_token: "",
+      whatsapp_app_secret: "",
       whatsapp_phone_number_id: str(next.whatsapp_phone_number_id, ""),
       whatsapp_verify_token: "",
+      whatsapp_bridge_token: "",
       whatsapp_bridge_url: str(next.whatsapp_bridge_url, ""),
       whatsapp_dm_policy: str(whatsappTrustSettings.policy, str(next.whatsapp_dm_policy, "pairing")) || "pairing",
       whatsapp_allowed_numbers_csv: asStringList(whatsappTrustSettings.allowed_senders).join(", ")
@@ -1530,8 +1818,14 @@ export function IntegrationsPanel({
     settingsQ.dataUpdatedAt,
     channelsDirty,
     senderVerificationQ.data,
+    googleChatTrustSettings,
+    signalTrustSettings,
+    imessageTrustSettings,
+    lineTrustSettings,
     slackTrustSettings,
     teamsTrustSettings,
+    wechatTrustSettings,
+    qqTrustSettings,
     whatsappTrustSettings
   ]);
 
@@ -1583,6 +1877,48 @@ export function IntegrationsPanel({
     setTeamsSetupOpen(true);
   };
 
+  const openGoogleChatSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.google_chat_enabled) {
+      setChannelField("google_chat_enabled", true);
+    }
+    setGoogleChatSetupOpen(true);
+  };
+
+  const openSignalSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.signal_enabled) {
+      setChannelField("signal_enabled", true);
+    }
+    setSignalSetupOpen(true);
+  };
+
+  const openIMessageSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.imessage_enabled) {
+      setChannelField("imessage_enabled", true);
+    }
+    setImessageSetupOpen(true);
+  };
+
+  const openLineSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.line_enabled) {
+      setChannelField("line_enabled", true);
+    }
+    setLineSetupOpen(true);
+  };
+
+  const openWeChatSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.wechat_enabled) {
+      setChannelField("wechat_enabled", true);
+    }
+    setWechatSetupOpen(true);
+  };
+
+  const openQqSetup = (enableIfDisabled = false) => {
+    if (enableIfDisabled && !channelForm.qq_enabled) {
+      setChannelField("qq_enabled", true);
+    }
+    setQqSetupOpen(true);
+  };
+
   const openWhatsAppSetup = (enableIfDisabled = false) => {
     if (enableIfDisabled && !channelForm.whatsapp_enabled) {
       setChannelField("whatsapp_enabled", true);
@@ -1612,11 +1948,11 @@ export function IntegrationsPanel({
       enabled: channelForm.whatsapp_enabled,
       status: whatsappConnectionStatusRaw,
       detail: !channelForm.whatsapp_enabled
-        ? "Turn WhatsApp on in the wizard, then choose QR pairing or Cloud API."
+        ? "Turn WhatsApp on in the wizard, then choose a bundled bridge, an external bridge, or Cloud API."
         : whatsappConnectionDetail ||
           (channelForm.whatsapp_mode === "cloud_api"
-            ? "Add the Cloud API token and phone number ID to finish setup."
-            : "Open the wizard and scan the QR code to finish pairing."),
+            ? "Add the Cloud API token, app secret, verify token, and phone number ID to finish setup."
+            : "Open the wizard to finish your bundled or external bridge setup."),
       actionLabel: channelForm.whatsapp_enabled ? "Open wizard" : "Turn on",
       open: () => openWhatsAppSetup(!channelForm.whatsapp_enabled)
     },
@@ -1663,6 +1999,72 @@ export function IntegrationsPanel({
         : teamsConnectionDetail,
       actionLabel: channelForm.teams_enabled ? "Open wizard" : "Turn on",
       open: () => openTeamsSetup(!channelForm.teams_enabled)
+    },
+    {
+      id: "google_chat",
+      name: "Google Chat",
+      enabled: channelForm.google_chat_enabled,
+      status: googleChatConnectionStatusRaw,
+      detail: !channelForm.google_chat_enabled
+        ? "Turn Google Chat on, then add an access token. Add a default space only if you want proactive updates there."
+        : googleChatConnectionDetail,
+      actionLabel: channelForm.google_chat_enabled ? "Open wizard" : "Turn on",
+      open: () => openGoogleChatSetup(!channelForm.google_chat_enabled)
+    },
+    {
+      id: "signal",
+      name: "Signal",
+      enabled: channelForm.signal_enabled,
+      status: signalConnectionStatusRaw,
+      detail: !channelForm.signal_enabled
+        ? "Turn Signal on, then add the bridge URL and token. Add a default recipient or group if you want proactive delivery."
+        : signalConnectionDetail,
+      actionLabel: channelForm.signal_enabled ? "Open wizard" : "Turn on",
+      open: () => openSignalSetup(!channelForm.signal_enabled)
+    },
+    {
+      id: "imessage",
+      name: "iMessage",
+      enabled: channelForm.imessage_enabled,
+      status: imessageConnectionStatusRaw,
+      detail: !channelForm.imessage_enabled
+        ? "Turn iMessage on, then add the bridge URL and token. Add a default chat or handle if you want proactive delivery."
+        : imessageConnectionDetail,
+      actionLabel: channelForm.imessage_enabled ? "Open wizard" : "Turn on",
+      open: () => openIMessageSetup(!channelForm.imessage_enabled)
+    },
+    {
+      id: "line",
+      name: "LINE",
+      enabled: channelForm.line_enabled,
+      status: lineConnectionStatusRaw,
+      detail: !channelForm.line_enabled
+        ? "Turn LINE on, then add the channel token and secret. Add a default target if you want proactive delivery outside an active chat."
+        : lineConnectionDetail,
+      actionLabel: channelForm.line_enabled ? "Open wizard" : "Turn on",
+      open: () => openLineSetup(!channelForm.line_enabled)
+    },
+    {
+      id: "wechat",
+      name: "WeChat",
+      enabled: channelForm.wechat_enabled,
+      status: wechatConnectionStatusRaw,
+      detail: !channelForm.wechat_enabled
+        ? "Turn WeChat on, then add the bridge URL and token. Add a default target if you want proactive delivery."
+        : wechatConnectionDetail,
+      actionLabel: channelForm.wechat_enabled ? "Open wizard" : "Turn on",
+      open: () => openWeChatSetup(!channelForm.wechat_enabled)
+    },
+    {
+      id: "qq",
+      name: "QQ",
+      enabled: channelForm.qq_enabled,
+      status: qqConnectionStatusRaw,
+      detail: !channelForm.qq_enabled
+        ? "Turn QQ on, then add the bridge URL and token. Add a default target if you want proactive delivery."
+        : qqConnectionDetail,
+      actionLabel: channelForm.qq_enabled ? "Open wizard" : "Turn on",
+      open: () => openQqSetup(!channelForm.qq_enabled)
     }
   ];
   const messagingReadyCount = messagingSetups.filter(
@@ -1673,7 +2075,7 @@ export function IntegrationsPanel({
   const saveChannelsMutation = useMutation({
     mutationFn: async () => {
       const payload: Record<string, unknown> = {
-        llm_provider: str(settings.llm_provider, "ollama"),
+        llm_provider: str(settings.llm_provider, ""),
         llm_model: str(settings.llm_model, ""),
         llm_base_url: settings.llm_base_url ?? null,
         llm_api_key: null,
@@ -1685,7 +2087,6 @@ export function IntegrationsPanel({
         search_fallback1: channelForm.search_fallback1.trim() || null,
         search_fallback2: channelForm.search_fallback2.trim() || null,
         search_serper_key: channelForm.search_serper_key.trim() || null,
-        search_searxng_url: channelForm.search_searxng_url.trim() || null,
         search_brave_key: channelForm.search_brave_key.trim() || null,
         telegram_enabled: !!channelForm.telegram_enabled,
         telegram_bot_token: channelForm.telegram_bot_token.trim() || null,
@@ -1729,21 +2130,79 @@ export function IntegrationsPanel({
         teams_delivery_mode: channelForm.teams_delivery_mode,
         teams_timeout_secs: Number(channelForm.teams_timeout_secs) || null,
         teams_user_agent: channelForm.teams_user_agent.trim() || null,
+        google_chat_enabled: !!channelForm.google_chat_enabled,
+        google_chat_access_token: channelForm.google_chat_access_token.trim() || null,
+        google_chat_verify_token: channelForm.google_chat_verify_token.trim() || null,
+        google_chat_api_base_url: channelForm.google_chat_api_base_url.trim() || null,
+        google_chat_space: channelForm.google_chat_space.trim() || null,
+        google_chat_thread_key: channelForm.google_chat_thread_key.trim() || null,
+        google_chat_app_id: channelForm.google_chat_app_id.trim() || null,
+        google_chat_bot_name: channelForm.google_chat_bot_name.trim() || null,
+        signal_enabled: !!channelForm.signal_enabled,
+        signal_bridge_token: channelForm.signal_bridge_token.trim() || null,
+        signal_bridge_url: channelForm.signal_bridge_url.trim() || null,
+        signal_default_recipient: channelForm.signal_default_recipient.trim() || null,
+        signal_default_group_id: channelForm.signal_default_group_id.trim() || null,
+        imessage_enabled: !!channelForm.imessage_enabled,
+        imessage_bridge_token: channelForm.imessage_bridge_token.trim() || null,
+        imessage_bridge_url: channelForm.imessage_bridge_url.trim() || null,
+        imessage_default_chat_id: channelForm.imessage_default_chat_id.trim() || null,
+        imessage_default_handle: channelForm.imessage_default_handle.trim() || null,
+        line_enabled: !!channelForm.line_enabled,
+        line_channel_access_token: channelForm.line_channel_access_token.trim() || null,
+        line_channel_secret: channelForm.line_channel_secret.trim() || null,
+        line_api_base_url: channelForm.line_api_base_url.trim() || null,
+        line_default_target: channelForm.line_default_target.trim() || null,
+        line_user_agent: channelForm.line_user_agent.trim() || null,
+        wechat_enabled: !!channelForm.wechat_enabled,
+        wechat_bridge_token: channelForm.wechat_bridge_token.trim() || null,
+        wechat_bridge_url: channelForm.wechat_bridge_url.trim() || null,
+        wechat_default_target_id: channelForm.wechat_default_target_id.trim() || null,
+        qq_enabled: !!channelForm.qq_enabled,
+        qq_bridge_token: channelForm.qq_bridge_token.trim() || null,
+        qq_bridge_url: channelForm.qq_bridge_url.trim() || null,
+        qq_default_target_id: channelForm.qq_default_target_id.trim() || null,
         whatsapp_enabled: !!channelForm.whatsapp_enabled,
         whatsapp_mode: channelForm.whatsapp_mode,
+        whatsapp_bridge_runtime:
+          channelForm.whatsapp_mode === "baileys" ? channelForm.whatsapp_bridge_runtime : null,
         whatsapp_access_token: channelForm.whatsapp_access_token.trim() || null,
+        whatsapp_app_secret: channelForm.whatsapp_app_secret.trim() || null,
         whatsapp_phone_number_id: channelForm.whatsapp_phone_number_id.trim() || null,
         whatsapp_verify_token: channelForm.whatsapp_verify_token.trim() || null,
-        whatsapp_bridge_url: channelForm.whatsapp_bridge_url.trim() || null,
+        whatsapp_bridge_token:
+          channelForm.whatsapp_mode === "baileys" &&
+          channelForm.whatsapp_bridge_runtime === "external"
+            ? channelForm.whatsapp_bridge_token.trim() || null
+            : null,
+        whatsapp_bridge_url:
+          channelForm.whatsapp_mode === "baileys" &&
+          channelForm.whatsapp_bridge_runtime === "external"
+            ? channelForm.whatsapp_bridge_url.trim() || null
+            : null,
         whatsapp_dm_policy: channelForm.whatsapp_dm_policy.trim() || null,
         whatsapp_allowed_numbers: parseCsvList(channelForm.whatsapp_allowed_numbers_csv)
       };
       await api.rawPost("/settings", payload);
       return api.rawPost("/sender-verification/settings", {
+        google_chat_policy: channelForm.google_chat_trust_policy.trim() || "open",
+        google_chat_allowed_senders: parseCsvList(channelForm.google_chat_allowed_senders_csv),
+        signal_policy: channelForm.signal_trust_policy.trim() || "open",
+        signal_allowed_senders: parseCsvList(channelForm.signal_allowed_senders_csv),
+        imessage_policy: channelForm.imessage_trust_policy.trim() || "open",
+        imessage_allowed_senders: parseCsvList(channelForm.imessage_allowed_senders_csv),
+        line_policy: channelForm.line_trust_policy.trim() || "open",
+        line_allowed_senders: parseCsvList(channelForm.line_allowed_senders_csv),
         slack_policy: channelForm.slack_trust_policy.trim() || "open",
         slack_allowed_senders: parseCsvList(channelForm.slack_allowed_senders_csv),
         teams_policy: channelForm.teams_trust_policy.trim() || "open",
-        teams_allowed_senders: parseCsvList(channelForm.teams_allowed_senders_csv)
+        teams_allowed_senders: parseCsvList(channelForm.teams_allowed_senders_csv),
+        whatsapp_policy: channelForm.whatsapp_dm_policy.trim() || "pairing",
+        whatsapp_allowed_senders: parseCsvList(channelForm.whatsapp_allowed_numbers_csv),
+        wechat_policy: channelForm.wechat_trust_policy.trim() || "open",
+        wechat_allowed_senders: parseCsvList(channelForm.wechat_allowed_senders_csv),
+        qq_policy: channelForm.qq_trust_policy.trim() || "open",
+        qq_allowed_senders: parseCsvList(channelForm.qq_allowed_senders_csv)
       });
     },
     onSuccess: async () => {
@@ -1780,7 +2239,7 @@ export function IntegrationsPanel({
     allowedLabel,
     allowedHelper
   }: {
-    channel: "slack" | "teams" | "whatsapp";
+    channel: "google_chat" | "signal" | "imessage" | "line" | "slack" | "teams" | "whatsapp" | "wechat" | "qq";
     configured: boolean;
     policyValue: string;
     onPolicyChange: (value: string) => void;
@@ -1791,7 +2250,18 @@ export function IntegrationsPanel({
   }) => {
     const pending = pendingSenderRows.filter((row) => str(row.channel) === channel);
     const approved = approvedSenderRows.filter((row) => str(row.channel) === channel);
-    const channelName = channel === "slack" ? "Slack" : channel === "teams" ? "Teams" : "WhatsApp";
+    const channelNameMap: Record<string, string> = {
+      google_chat: "Google Chat",
+      signal: "Signal",
+      imessage: "iMessage",
+      line: "LINE",
+      slack: "Slack",
+      teams: "Teams",
+      whatsapp: "WhatsApp",
+      wechat: "WeChat",
+      qq: "QQ"
+    };
+    const channelName = channelNameMap[channel] || channel;
     const formatSeen = (value: string) => {
       const parsed = new Date(value);
       return Number.isNaN(parsed.getTime()) ? value || "-" : parsed.toLocaleString();
@@ -2614,64 +3084,71 @@ export function IntegrationsPanel({
   };
 
   return (
-    <Stack spacing={2} sx={embedded ? undefined : { p: 1, height: "100%", overflow: "auto" }}>
-      <Stack direction="row" alignItems="center" justifyContent="space-between">
-        <Typography variant="h6">
-          {mode === "mcp"
-            ? "MCP Servers"
-            : mode === "channels"
-              ? "Messaging Channels"
-              : mode === "connectors"
-                ? "Prebuilt Connectors"
-                : mode === "messaging"
-                  ? "Messaging Setup"
-                  : "Integrations"}
-        </Typography>
-        <Stack direction="row" spacing={1} />
-      </Stack>
-      {mode === "channels" ? (
-        <Typography variant="caption" color="text.secondary">
-          Configure delivery transports and review live channel health. If something looks off, run ArkPulse for diagnostics.
-        </Typography>
-      ) : mode === "connectors" ? (
-        <Typography variant="caption" color="text.secondary">
-          OAuth-based integrations for Google Workspace, GitHub, Jira, and more. Connect once, then the agent can use them in any conversation.
-        </Typography>
-      ) : mode === "messaging" ? (
+    <Stack
+      spacing={2}
+      sx={embedded ? undefined : { p: { xs: 1, md: 1.5 }, height: "100%", overflow: "auto" }}
+    >
+      {!embedded ? (
         <>
-          <Typography
-            variant="body2"
-            sx={{
-              fontWeight: 700,
-              color: "#69e2ff"
-            }}
-          >
-            Finish channel onboarding here. If you need a health check later, run ArkPulse.
-          </Typography>
-          <Typography variant="caption" color="text.secondary">
-            This page is intentionally focused on messaging only: Telegram, WhatsApp, Slack, Discord, Matrix, and Teams.
-          </Typography>
+          <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Typography variant="h6">
+              {mode === "mcp"
+                ? "MCP Servers"
+                : mode === "channels"
+                  ? "Messaging Channels"
+                  : mode === "connectors"
+                    ? "Prebuilt Connectors"
+                    : mode === "messaging"
+                      ? "Messaging Setup"
+                      : "Integrations"}
+            </Typography>
+            <Stack direction="row" spacing={1} />
+          </Stack>
+          {mode === "channels" ? (
+            <Typography variant="caption" color="text.secondary">
+              Configure delivery transports and review live channel health. If something looks off, run ArkPulse for diagnostics.
+            </Typography>
+          ) : mode === "connectors" ? (
+            <Typography variant="caption" color="text.secondary">
+              OAuth-based integrations for Google Workspace, GitHub, Jira, and more. Connect once, then the agent can use them in any conversation.
+            </Typography>
+          ) : mode === "messaging" ? (
+            <>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontWeight: 700,
+                  color: "#69e2ff"
+                }}
+              >
+                Finish channel onboarding here. If you need a health check later, run ArkPulse.
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                This page is intentionally focused on messaging only: Telegram, WhatsApp, Slack, Discord, Matrix, and Teams.
+              </Typography>
+            </>
+          ) : mode !== "mcp" ? (
+            <>
+              <Typography
+                variant="body2"
+                sx={{
+                  fontWeight: 700,
+                  color: "#69e2ff"
+                }}
+              >
+                These are pre-built integrations. You can always chat with the agent to build any custom integration on your own.
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                Integrations are long-lived connectors (auth + config). To import skills from a URL, use the Skills tab.
+              </Typography>
+            </>
+          ) : (
+            <Typography variant="caption" color="text.secondary">
+              Configure external MCP servers (HTTP or stdio), auth, allowlists, and refresh tools/resources.
+            </Typography>
+          )}
         </>
-      ) : mode !== "mcp" ? (
-        <>
-          <Typography
-            variant="body2"
-            sx={{
-              fontWeight: 700,
-              color: "#69e2ff"
-            }}
-          >
-            These are pre-built integrations. You can always chat with the agent to build any custom integration on your own.
-          </Typography>
-          <Typography variant="caption" color="text.secondary">
-            Integrations are long-lived connectors (auth + config). To import skills from a URL, use the Skills tab.
-          </Typography>
-        </>
-      ) : (
-        <Typography variant="caption" color="text.secondary">
-          Configure external MCP servers (HTTP or stdio), auth, allowlists, and refresh tools/resources.
-        </Typography>
-      )}
+      ) : null}
 
       {showIntegrations && notice?.kind === "error" ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {showMcp && mcpNotice ? <Alert severity={mcpNotice.kind}>{mcpNotice.text}</Alert> : null}
@@ -3183,11 +3660,17 @@ export function IntegrationsPanel({
                 {[
                   { name: "Web Search", enabled: true, statusRaw: "connected", detail: `${channelForm.search_primary || "lightpanda"} \u2192 ${channelForm.search_fallback1 || "duckduckgo"} \u2192 ${channelForm.search_fallback2 || "none"}`, onSetup: openSearchSetup, ready: true },
                   { name: "Telegram", enabled: telegramEnabledSaved, statusRaw: telegramConnectionStatusRaw, detail: telegramConnectionDetail || (telegramTokenConfigured ? "Token set" : "Not configured"), onSetup: () => openTelegramSetup(!channelForm.telegram_enabled), ready: telegramDeliveryReady, actionLabel: channelForm.telegram_enabled ? "Setup" : "Enable" },
-                  { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || (channelForm.whatsapp_mode === "cloud_api" ? "Cloud API" : "QR pairing"), onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: toBool(settings.whatsapp_delivery_ready), actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
+                  { name: "WhatsApp", enabled: channelForm.whatsapp_enabled, statusRaw: whatsappConnectionStatusRaw, detail: whatsappConnectionDetail || whatsappModeSummary, onSetup: () => openWhatsAppSetup(!channelForm.whatsapp_enabled), ready: messagingDisplayState(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled) === "ready", actionLabel: channelForm.whatsapp_enabled ? "Setup" : "Enable" },
                   { name: "Slack", enabled: toBool(settings.slack_enabled), statusRaw: slackConnectionStatusRaw, detail: slackConnectionDetail || "Not configured", onSetup: () => openSlackSetup(!channelForm.slack_enabled), ready: toBool(settings.slack_delivery_ready), actionLabel: channelForm.slack_enabled ? "Setup" : "Enable" },
                   { name: "Discord", enabled: toBool(settings.discord_enabled), statusRaw: discordConnectionStatusRaw, detail: discordConnectionDetail || "Not configured", onSetup: () => openDiscordSetup(!channelForm.discord_enabled), ready: toBool(settings.discord_delivery_ready), actionLabel: channelForm.discord_enabled ? "Setup" : "Enable" },
                   { name: "Matrix", enabled: toBool(settings.matrix_enabled), statusRaw: matrixConnectionStatusRaw, detail: matrixConnectionDetail || "Not configured", onSetup: () => openMatrixSetup(!channelForm.matrix_enabled), ready: toBool(settings.matrix_delivery_ready), actionLabel: channelForm.matrix_enabled ? "Setup" : "Enable" },
                   { name: "Teams", enabled: toBool(settings.teams_enabled), statusRaw: teamsConnectionStatusRaw, detail: teamsConnectionDetail || "Not configured", onSetup: () => openTeamsSetup(!channelForm.teams_enabled), ready: toBool(settings.teams_delivery_ready), actionLabel: channelForm.teams_enabled ? "Setup" : "Enable" },
+                  { name: "Google Chat", enabled: toBool(settings.google_chat_enabled), statusRaw: googleChatConnectionStatusRaw, detail: googleChatConnectionDetail || "Not configured", onSetup: () => openGoogleChatSetup(!channelForm.google_chat_enabled), ready: toBool(settings.google_chat_delivery_ready), actionLabel: channelForm.google_chat_enabled ? "Setup" : "Enable" },
+                  { name: "Signal", enabled: toBool(settings.signal_enabled), statusRaw: signalConnectionStatusRaw, detail: signalConnectionDetail || "Not configured", onSetup: () => openSignalSetup(!channelForm.signal_enabled), ready: toBool(settings.signal_delivery_ready), actionLabel: channelForm.signal_enabled ? "Setup" : "Enable" },
+                  { name: "iMessage", enabled: toBool(settings.imessage_enabled), statusRaw: imessageConnectionStatusRaw, detail: imessageConnectionDetail || "Not configured", onSetup: () => openIMessageSetup(!channelForm.imessage_enabled), ready: toBool(settings.imessage_delivery_ready), actionLabel: channelForm.imessage_enabled ? "Setup" : "Enable" },
+                  { name: "LINE", enabled: toBool(settings.line_enabled), statusRaw: lineConnectionStatusRaw, detail: lineConnectionDetail || "Not configured", onSetup: () => openLineSetup(!channelForm.line_enabled), ready: toBool(settings.line_delivery_ready), actionLabel: channelForm.line_enabled ? "Setup" : "Enable" },
+                  { name: "WeChat", enabled: toBool(settings.wechat_enabled), statusRaw: wechatConnectionStatusRaw, detail: wechatConnectionDetail || "Not configured", onSetup: () => openWeChatSetup(!channelForm.wechat_enabled), ready: toBool(settings.wechat_delivery_ready), actionLabel: channelForm.wechat_enabled ? "Setup" : "Enable" },
+                  { name: "QQ", enabled: toBool(settings.qq_enabled), statusRaw: qqConnectionStatusRaw, detail: qqConnectionDetail || "Not configured", onSetup: () => openQqSetup(!channelForm.qq_enabled), ready: toBool(settings.qq_delivery_ready), actionLabel: channelForm.qq_enabled ? "Setup" : "Enable" },
                 ]
                   .filter((ch) => ch.ready || ch.enabled)
                   .sort((a, b) => (a.ready === b.ready ? 0 : a.ready ? -1 : 1))
@@ -3221,7 +3704,7 @@ export function IntegrationsPanel({
             <Box>
               <Typography variant="subtitle2">Setup Wizards</Typography>
               <Typography variant="caption" color="text.secondary">
-                Onboard Slack, Discord, Matrix, and Teams here. If something looks off later, run ArkPulse for diagnostics.
+                Connect each messaging channel here. Every inbound DM, group, room, or space becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
               </Typography>
             </Box>
             {channelsQ.error ? (
@@ -3350,13 +3833,27 @@ export function IntegrationsPanel({
                   <TableCell>WhatsApp</TableCell>
                   <TableCell>
                     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                      <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: channelForm.whatsapp_enabled ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                      <Box
+                        component="span"
+                        sx={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          flexShrink: 0,
+                          bgcolor:
+                            messagingDisplayState(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled) === "ready"
+                              ? "rgba(74,210,157,0.85)"
+                              : channelForm.whatsapp_enabled
+                                ? "rgba(255,180,50,0.85)"
+                                : "rgba(180,200,220,0.5)"
+                        }}
+                      />
                       <Typography variant="body2" color="text.secondary" noWrap>{channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}</Typography>
                     </Box>
                   </TableCell>
                   <TableCell>
                     <Typography variant="body2" color="text.secondary" noWrap>
-                      {whatsappConnectionDetail || (channelForm.whatsapp_mode === "cloud_api" ? "Cloud API" : "QR pairing")}
+                      {whatsappConnectionDetail || whatsappModeSummary}
                     </Typography>
                   </TableCell>
                   <TableCell align="right">
@@ -3898,7 +4395,6 @@ export function IntegrationsPanel({
               <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="searxng">searxng</MenuItem>
               <MenuItem value="brave_api">brave_api</MenuItem>
               <MenuItem value="duckduckgo">duckduckgo</MenuItem>
             </TextField>
@@ -3914,7 +4410,6 @@ export function IntegrationsPanel({
               <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="searxng">searxng</MenuItem>
               <MenuItem value="brave_api">brave_api</MenuItem>
               <MenuItem value="duckduckgo">duckduckgo</MenuItem>
             </TextField>
@@ -3930,7 +4425,6 @@ export function IntegrationsPanel({
               <MenuItem value="lightpanda">lightpanda</MenuItem>
               <MenuItem value="playwright">playwright</MenuItem>
               <MenuItem value="serper">serper</MenuItem>
-              <MenuItem value="searxng">searxng</MenuItem>
               <MenuItem value="brave_api">brave_api</MenuItem>
               <MenuItem value="duckduckgo">duckduckgo</MenuItem>
             </TextField>
@@ -3943,16 +4437,6 @@ export function IntegrationsPanel({
                 value={channelForm.search_serper_key}
                 onChange={(e) => setChannelField("search_serper_key", e.target.value)}
                 placeholder={searchSerperConfigured ? "Leave blank to keep current key" : "Enter Serper API key"}
-              />
-            ) : null}
-            {[channelForm.search_primary, channelForm.search_fallback1, channelForm.search_fallback2].includes("searxng") ? (
-              <TextField
-                fullWidth
-                size="small"
-                label="SearXNG URL"
-                value={channelForm.search_searxng_url}
-                onChange={(e) => setChannelField("search_searxng_url", e.target.value)}
-                placeholder="http://localhost:8080"
               />
             ) : null}
             {[channelForm.search_primary, channelForm.search_fallback1, channelForm.search_fallback2].includes("brave_api") ? (
@@ -4160,7 +4644,7 @@ export function IntegrationsPanel({
         <DialogContent dividers>
           <Stack spacing={1.5}>
             <Typography variant="body2" color="text.secondary">
-              Choose either a live bot token for gateway delivery or a webhook URL for scoped channel posting. Use the wizard to save defaults that the runtime can fall back to before route rules exist.
+              Discord now requires a live bot token plus at least one guild, channel, or thread scope for inbound handling. The webhook URL is optional and only helps with outbound thread posting.
             </Typography>
             <Stack direction="row" spacing={1} alignItems="center">
               <Chip
@@ -4375,6 +4859,466 @@ export function IntegrationsPanel({
       ) : null}
 
       {showIntegrations ? (
+      <Dialog open={googleChatSetupOpen} onClose={() => setGoogleChatSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Google Chat Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Use this when you want AgentArk to send and receive messages inside Google Chat. This is separate from Google Workspace data access. Each space or DM becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(googleChatConnectionStatusRaw, channelForm.google_chat_enabled)}
+                color={channelStatusColor(googleChatConnectionStatusRaw, channelForm.google_chat_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {googleChatConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.google_chat_enabled} onChange={(e) => setChannelField("google_chat_enabled", e.target.checked)} />}
+              label={channelForm.google_chat_enabled ? "Google Chat enabled" : "Google Chat disabled"}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Access Token"
+              value={channelForm.google_chat_access_token}
+              onChange={(e) => setChannelField("google_chat_access_token", e.target.value)}
+              placeholder={hasGoogleChatAccessToken ? "Configured (leave blank to keep)" : "Enter access token"}
+              helperText={hasGoogleChatAccessToken ? "Leave blank to keep the saved access token." : "Required for outbound messages and replies."}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Verification Token"
+              value={channelForm.google_chat_verify_token}
+              onChange={(e) => setChannelField("google_chat_verify_token", e.target.value)}
+              placeholder={hasGoogleChatVerifyToken ? "Configured (leave blank to keep)" : "Optional verification token"}
+              helperText="Optional. Use it if your Google Chat ingress includes a shared verification token."
+            />
+            <TextField fullWidth size="small" label="Default Space" value={channelForm.google_chat_space} onChange={(e) => setChannelField("google_chat_space", e.target.value)} helperText="Optional. Use a space like spaces/AAAA... if you want AgentArk to send proactive updates there." />
+            <TextField fullWidth size="small" label="Thread Key" value={channelForm.google_chat_thread_key} onChange={(e) => setChannelField("google_chat_thread_key", e.target.value)} helperText="Optional. Example: weekly-digest. Use it when proactive updates should stay inside one Google Chat thread." />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="API Base URL" value={channelForm.google_chat_api_base_url} onChange={(e) => setChannelField("google_chat_api_base_url", e.target.value)} />
+              <TextField fullWidth size="small" label="App ID" value={channelForm.google_chat_app_id} onChange={(e) => setChannelField("google_chat_app_id", e.target.value)} helperText="Optional. Helpful for matching logs and Google Chat app configuration." />
+            </Box>
+            <TextField fullWidth size="small" label="Bot Name" value={channelForm.google_chat_bot_name} onChange={(e) => setChannelField("google_chat_bot_name", e.target.value)} helperText="Optional display label for status screens." />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "google_chat",
+              configured: channelForm.google_chat_enabled,
+              policyValue: channelForm.google_chat_trust_policy,
+              onPolicyChange: (value) => setChannelField("google_chat_trust_policy", value),
+              allowedValue: channelForm.google_chat_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("google_chat_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted Sender IDs",
+              allowedHelper: "Use Google Chat sender IDs or app-mapped user IDs that should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setGoogleChatSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setGoogleChatSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={signalSetupOpen} onClose={() => setSignalSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Signal Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              Signal uses a companion bridge. Each Signal DM or group becomes its own AgentArk conversation thread, while AgentArk still keeps access to your shared docs, memories, apps, tasks, and watchers.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(signalConnectionStatusRaw, channelForm.signal_enabled)}
+                color={channelStatusColor(signalConnectionStatusRaw, channelForm.signal_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {signalConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.signal_enabled} onChange={(e) => setChannelField("signal_enabled", e.target.checked)} />}
+              label={channelForm.signal_enabled ? "Signal enabled" : "Signal disabled"}
+            />
+            <TextField fullWidth size="small" label="Bridge URL" value={channelForm.signal_bridge_url} onChange={(e) => setChannelField("signal_bridge_url", e.target.value)} helperText="Example: http://127.0.0.1:9120" />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bridge Token"
+              value={channelForm.signal_bridge_token}
+              onChange={(e) => setChannelField("signal_bridge_token", e.target.value)}
+              placeholder={hasSignalBridgeToken ? "Configured (leave blank to keep)" : "Enter bridge token"}
+              helperText={hasSignalBridgeToken ? "Leave blank to keep the saved bridge token." : "Required so only your bridge can talk to AgentArk."}
+            />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="Default Recipient" value={channelForm.signal_default_recipient} onChange={(e) => setChannelField("signal_default_recipient", e.target.value)} helperText="Optional. Example: +14155551212. Add this if you want AgentArk to send proactive Signal messages without waiting for an inbound chat." />
+              <TextField fullWidth size="small" label="Default Group ID" value={channelForm.signal_default_group_id} onChange={(e) => setChannelField("signal_default_group_id", e.target.value)} helperText="Optional. Use this when proactive updates should land in one Signal group by default." />
+            </Box>
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "signal",
+              configured: channelForm.signal_enabled,
+              policyValue: channelForm.signal_trust_policy,
+              onPolicyChange: (value) => setChannelField("signal_trust_policy", value),
+              allowedValue: channelForm.signal_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("signal_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted Signal Senders",
+              allowedHelper: "Use the sender IDs that your bridge reports for contacts who should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSignalSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setSignalSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={imessageSetupOpen} onClose={() => setImessageSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>iMessage Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              iMessage requires a companion bridge backed by an Apple device. Each chat becomes its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across all channels.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(imessageConnectionStatusRaw, channelForm.imessage_enabled)}
+                color={channelStatusColor(imessageConnectionStatusRaw, channelForm.imessage_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {imessageConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.imessage_enabled} onChange={(e) => setChannelField("imessage_enabled", e.target.checked)} />}
+              label={channelForm.imessage_enabled ? "iMessage enabled" : "iMessage disabled"}
+            />
+            <TextField fullWidth size="small" label="Bridge URL" value={channelForm.imessage_bridge_url} onChange={(e) => setChannelField("imessage_bridge_url", e.target.value)} helperText="Example: http://127.0.0.1:9130" />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bridge Token"
+              value={channelForm.imessage_bridge_token}
+              onChange={(e) => setChannelField("imessage_bridge_token", e.target.value)}
+              placeholder={hasIMessageBridgeToken ? "Configured (leave blank to keep)" : "Enter bridge token"}
+              helperText={hasIMessageBridgeToken ? "Leave blank to keep the saved bridge token." : "Required so only your iMessage bridge can talk to AgentArk."}
+            />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="Default Chat ID" value={channelForm.imessage_default_chat_id} onChange={(e) => setChannelField("imessage_default_chat_id", e.target.value)} helperText="Optional. Use this if your bridge exposes a stable chat ID for proactive delivery." />
+              <TextField fullWidth size="small" label="Default Handle" value={channelForm.imessage_default_handle} onChange={(e) => setChannelField("imessage_default_handle", e.target.value)} helperText="Optional. Example: +14155551212 or name@icloud.com. Use it when proactive messages should open a specific chat." />
+            </Box>
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "imessage",
+              configured: channelForm.imessage_enabled,
+              policyValue: channelForm.imessage_trust_policy,
+              onPolicyChange: (value) => setChannelField("imessage_trust_policy", value),
+              allowedValue: channelForm.imessage_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("imessage_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted iMessage Senders",
+              allowedHelper: "Use the sender IDs or handles your bridge reports for contacts who should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setImessageSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setImessageSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={lineSetupOpen} onClose={() => setLineSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>LINE Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              LINE is a first-class messaging channel for AgentArk. Each DM, room, or group becomes its own AgentArk conversation thread, while still sharing your global docs, memories, apps, tasks, and watchers.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(lineConnectionStatusRaw, channelForm.line_enabled)}
+                color={channelStatusColor(lineConnectionStatusRaw, channelForm.line_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {lineConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.line_enabled} onChange={(e) => setChannelField("line_enabled", e.target.checked)} />}
+              label={channelForm.line_enabled ? "LINE enabled" : "LINE disabled"}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Channel Access Token"
+              value={channelForm.line_channel_access_token}
+              onChange={(e) => setChannelField("line_channel_access_token", e.target.value)}
+              placeholder={hasLineAccessToken ? "Configured (leave blank to keep)" : "Enter channel access token"}
+              helperText={hasLineAccessToken ? "Leave blank to keep the saved access token." : "Required for replies and push messages."}
+            />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Channel Secret"
+              value={channelForm.line_channel_secret}
+              onChange={(e) => setChannelField("line_channel_secret", e.target.value)}
+              placeholder={hasLineChannelSecret ? "Configured (leave blank to keep)" : "Enter channel secret"}
+              helperText={hasLineChannelSecret ? "Leave blank to keep the saved secret." : "Required to verify LINE webhook signatures."}
+            />
+            <TextField fullWidth size="small" label="Default Target" value={channelForm.line_default_target} onChange={(e) => setChannelField("line_default_target", e.target.value)} helperText="Optional. Use a user, room, or group ID if you want proactive LINE updates outside an active chat thread." />
+            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1 }}>
+              <TextField fullWidth size="small" label="API Base URL" value={channelForm.line_api_base_url} onChange={(e) => setChannelField("line_api_base_url", e.target.value)} />
+              <TextField fullWidth size="small" label="User Agent" value={channelForm.line_user_agent} onChange={(e) => setChannelField("line_user_agent", e.target.value)} helperText="Optional. Leave blank unless your proxy expects one." />
+            </Box>
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "line",
+              configured: channelForm.line_enabled,
+              policyValue: channelForm.line_trust_policy,
+              onPolicyChange: (value) => setChannelField("line_trust_policy", value),
+              allowedValue: channelForm.line_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("line_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted LINE Senders",
+              allowedHelper: "Use the LINE user IDs that should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setLineSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setLineSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={wechatSetupOpen} onClose={() => setWechatSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>WeChat Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              WeChat uses a bridge so each WeChat chat can stay in its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across channels.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(wechatConnectionStatusRaw, channelForm.wechat_enabled)}
+                color={channelStatusColor(wechatConnectionStatusRaw, channelForm.wechat_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {wechatConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.wechat_enabled} onChange={(e) => setChannelField("wechat_enabled", e.target.checked)} />}
+              label={channelForm.wechat_enabled ? "WeChat enabled" : "WeChat disabled"}
+            />
+            <TextField fullWidth size="small" label="Bridge URL" value={channelForm.wechat_bridge_url} onChange={(e) => setChannelField("wechat_bridge_url", e.target.value)} />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bridge Token"
+              value={channelForm.wechat_bridge_token}
+              onChange={(e) => setChannelField("wechat_bridge_token", e.target.value)}
+              placeholder={hasWeChatBridgeToken ? "Configured (leave blank to keep)" : "Enter bridge token"}
+              helperText={hasWeChatBridgeToken ? "Leave blank to keep the saved bridge token." : "Required so only your WeChat bridge can talk to AgentArk."}
+            />
+            <TextField fullWidth size="small" label="Default Target ID" value={channelForm.wechat_default_target_id} onChange={(e) => setChannelField("wechat_default_target_id", e.target.value)} helperText="Optional. Add the target ID your bridge expects if you want proactive WeChat delivery before anyone messages AgentArk first." />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "wechat",
+              configured: channelForm.wechat_enabled,
+              policyValue: channelForm.wechat_trust_policy,
+              onPolicyChange: (value) => setChannelField("wechat_trust_policy", value),
+              allowedValue: channelForm.wechat_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("wechat_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted WeChat Senders",
+              allowedHelper: "Use the sender IDs your bridge reports for contacts who should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setWechatSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setWechatSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
+      <Dialog open={qqSetupOpen} onClose={() => setQqSetupOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>QQ Setup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography variant="body2" color="text.secondary">
+              QQ uses a bridge so each QQ chat can stay in its own AgentArk conversation thread, while AgentArk still shares your global docs, memories, apps, tasks, and watchers across channels.
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                label={channelStatusLabel(qqConnectionStatusRaw, channelForm.qq_enabled)}
+                color={channelStatusColor(qqConnectionStatusRaw, channelForm.qq_enabled)}
+                variant="outlined"
+              />
+              <Button size="small" onClick={() => channelsQ.refetch()} disabled={channelsQ.isFetching}>
+                {channelsQ.isFetching ? "Refreshing..." : "Refresh Status"}
+              </Button>
+            </Stack>
+            <Typography variant="caption" color="text.secondary">
+              {qqConnectionDetail}
+            </Typography>
+            <FormControlLabel
+              control={<Switch checked={channelForm.qq_enabled} onChange={(e) => setChannelField("qq_enabled", e.target.checked)} />}
+              label={channelForm.qq_enabled ? "QQ enabled" : "QQ disabled"}
+            />
+            <TextField fullWidth size="small" label="Bridge URL" value={channelForm.qq_bridge_url} onChange={(e) => setChannelField("qq_bridge_url", e.target.value)} />
+            <TextField
+              fullWidth
+              size="small"
+              type="password"
+              label="Bridge Token"
+              value={channelForm.qq_bridge_token}
+              onChange={(e) => setChannelField("qq_bridge_token", e.target.value)}
+              placeholder={hasQqBridgeToken ? "Configured (leave blank to keep)" : "Enter bridge token"}
+              helperText={hasQqBridgeToken ? "Leave blank to keep the saved bridge token." : "Required so only your QQ bridge can talk to AgentArk."}
+            />
+            <TextField fullWidth size="small" label="Default Target ID" value={channelForm.qq_default_target_id} onChange={(e) => setChannelField("qq_default_target_id", e.target.value)} helperText="Optional. Add the target ID your bridge expects if you want proactive QQ delivery before anyone messages AgentArk first." />
+            <Divider />
+            {renderSenderTrustSection({
+              channel: "qq",
+              configured: channelForm.qq_enabled,
+              policyValue: channelForm.qq_trust_policy,
+              onPolicyChange: (value) => setChannelField("qq_trust_policy", value),
+              allowedValue: channelForm.qq_allowed_senders_csv,
+              onAllowedChange: (value) => setChannelField("qq_allowed_senders_csv", value),
+              allowedLabel: "Always-Trusted QQ Senders",
+              allowedHelper: "Use the sender IDs your bridge reports for contacts who should bypass pairing."
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setQqSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
+          <Button
+            variant="contained"
+            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+            onClick={async () => {
+              try {
+                await saveChannelsMutation.mutateAsync();
+                setQqSetupOpen(false);
+              } catch {
+                // Error alert handled by mutation + top-level notice.
+              }
+            }}
+          >
+            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      ) : null}
+
+      {showIntegrations ? (
       <Dialog open={whatsAppSetupOpen} onClose={() => setWhatsAppSetupOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>WhatsApp Setup</DialogTitle>
         <DialogContent dividers>
@@ -4408,78 +5352,145 @@ export function IntegrationsPanel({
             </TextField>
 
             {channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "baileys" ? (
-              <Box className="metadata-box" sx={{ maxHeight: "none", p: 1.5 }}>
-                <Stack spacing={1}>
-                  <Stack direction="row" spacing={1} alignItems="center">
-                    <Typography variant="body2" fontWeight={700}>
-                      Bridge status
-                    </Typography>
-                    <Chip
+              <>
+                <TextField
+                  fullWidth
+                  size="small"
+                  select
+                  label="Bridge Runtime"
+                  value={channelForm.whatsapp_bridge_runtime}
+                  onChange={(e) =>
+                    setChannelField(
+                      "whatsapp_bridge_runtime",
+                      e.target.value === "external" ? "external" : "embedded"
+                    )
+                  }
+                  disabled={!channelForm.whatsapp_enabled}
+                >
+                  <MenuItem value="embedded">Bundled bridge</MenuItem>
+                  <MenuItem value="external">External bridge</MenuItem>
+                </TextField>
+
+                {whatsappEmbeddedBridgeSelected ? (
+                  <Box className="metadata-box" sx={{ maxHeight: "none", p: 1.5 }}>
+                    <Stack spacing={1}>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Typography variant="body2" fontWeight={700}>
+                          Bundled bridge status
+                        </Typography>
+                        <Chip
+                          size="small"
+                          label={channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
+                          color={channelStatusColor(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
+                          variant="outlined"
+                        />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary">
+                        {whatsappConnectionDetail}
+                      </Typography>
+                      {!whatsappBridgeInstalled ? (
+                        <Alert severity="warning" sx={{ py: 0.75 }}>
+                          Full image required. This install does not include the bundled WhatsApp bridge.
+                        </Alert>
+                      ) : null}
+                      {whatsappBridgeWarning ? (
+                        <Alert severity="warning" sx={{ py: 0.75 }}>
+                          {whatsappBridgeWarning}
+                        </Alert>
+                      ) : null}
+                      {whatsappBridgeStatus === "qr" ? (
+                        str(waBridge.qr, "").trim() ? (
+                          <Box
+                            component="img"
+                            src={str(waBridge.qr, "")}
+                            alt="WhatsApp QR code"
+                            sx={{
+                              width: 220,
+                              height: 220,
+                              borderRadius: 1,
+                              border: "1px solid rgba(108, 156, 212, 0.35)",
+                              background: "#fff",
+                              p: 0.75
+                            }}
+                          />
+                        ) : (
+                          <Alert severity="info" sx={{ py: 0.75 }}>
+                            QR is being generated. Click Refresh if it does not appear.
+                          </Alert>
+                        )
+                      ) : null}
+                      <Stack direction="row" spacing={1}>
+                        <Button
+                          size="small"
+                          onClick={async () => {
+                            await queryClient.invalidateQueries({ queryKey: ["wa-bridge-status", "integrations-panel"] });
+                          }}
+                        >
+                          Refresh
+                        </Button>
+                        <Button
+                          size="small"
+                          color="warning"
+                          disabled={waLogoutMutation.isPending}
+                          onClick={async () => {
+                            if (!window.confirm("Disconnect WhatsApp and clear current pairing?")) return;
+                            try {
+                              await waLogoutMutation.mutateAsync();
+                            } catch {
+                              // Error alert handled by mutation + top-level notice.
+                            }
+                          }}
+                        >
+                          {waLogoutMutation.isPending ? "Disconnecting..." : "Disconnect"}
+                        </Button>
+                      </Stack>
+                    </Stack>
+                  </Box>
+                ) : (
+                  <Stack spacing={1.25}>
+                    <Alert
+                      severity={
+                        whatsappConnectionStatusRaw === "ready" || whatsappConnectionStatusRaw === "connected"
+                          ? "success"
+                          : ["error", "unavailable"].includes(whatsappConnectionStatusRaw)
+                            ? "error"
+                            : "info"
+                      }
+                      sx={{ py: 0.75 }}
+                    >
+                      {whatsappConnectionDetail}
+                    </Alert>
+                    {whatsappBridgeWarning ? (
+                      <Alert severity="warning" sx={{ py: 0.75 }}>
+                        {whatsappBridgeWarning}
+                      </Alert>
+                    ) : null}
+                    <TextField
+                      fullWidth
                       size="small"
-                      label={channelStatusLabel(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
-                      color={channelStatusColor(whatsappConnectionStatusRaw, channelForm.whatsapp_enabled)}
-                      variant="outlined"
+                      label="External Bridge URL"
+                      value={channelForm.whatsapp_bridge_url}
+                      onChange={(e) => setChannelField("whatsapp_bridge_url", e.target.value)}
+                      placeholder="https://bridge.example.com"
+                      helperText="AgentArk will send WhatsApp requests to this bridge instead of starting its bundled bridge."
+                    />
+                    <TextField
+                      fullWidth
+                      size="small"
+                      type="password"
+                      label="External Bridge Token"
+                      value={channelForm.whatsapp_bridge_token}
+                      onChange={(e) => setChannelField("whatsapp_bridge_token", e.target.value)}
+                      placeholder={hasWhatsAppBridgeToken ? "Configured (leave blank to keep)" : "Enter bridge token"}
+                      helperText={
+                        hasWhatsAppBridgeToken
+                          ? "Leave blank to keep the saved token. New external bridge setups require a token."
+                          : "Required for new external bridge setups."
+                      }
                     />
                   </Stack>
-                  <Typography variant="caption" color="text.secondary">
-                    {waBridgeQ.isLoading
-                      ? "Checking WhatsApp bridge status..."
-                      : waBridgeQ.error
-                        ? "Bridge unreachable. Ensure bridge is running."
-                        : str(waBridge.status, "disconnected") === "connected"
-                          ? `Connected as ${str(waBridge.number, "-")}`
-                          : str(waBridge.status, "disconnected") === "qr"
-                            ? "Open WhatsApp > Linked Devices > Link a Device, then scan the QR."
-                            : `Current status: ${str(waBridge.status, "disconnected")}`}
-                  </Typography>
-                  {str(waBridge.status, "disconnected") === "qr" ? (
-                    str(waBridge.qr, "").trim() ? (
-                      <Box
-                        component="img"
-                        src={str(waBridge.qr, "")}
-                        alt="WhatsApp QR code"
-                        sx={{
-                          width: 220,
-                          height: 220,
-                          borderRadius: 1,
-                          border: "1px solid rgba(108, 156, 212, 0.35)",
-                          background: "#fff",
-                          p: 0.75
-                        }}
-                      />
-                    ) : (
-                      <Alert severity="info" sx={{ py: 0.75 }}>
-                        QR is being generated. Click Refresh if it does not appear.
-                      </Alert>
-                    )
-                  ) : null}
-                  <Stack direction="row" spacing={1}>
-                    <Button
-                      size="small"
-                      onClick={async () => {
-                        await queryClient.invalidateQueries({ queryKey: ["wa-bridge-status", "integrations-panel"] });
-                      }}
-                    >
-                      Refresh
-                    </Button>
-                    <Button
-                      size="small"
-                      color="warning"
-                      disabled={waLogoutMutation.isPending}
-                      onClick={async () => {
-                        if (!window.confirm("Disconnect WhatsApp and clear current pairing?")) return;
-                        try {
-                          await waLogoutMutation.mutateAsync();
-                        } catch {
-                          // Error alert handled by mutation + top-level notice.
-                        }
-                      }}
-                    >
-                      {waLogoutMutation.isPending ? "Disconnecting..." : "Disconnect"}
-                    </Button>
-                  </Stack>
-                </Stack>
-              </Box>
+                )}
+              </>
             ) : null}
 
             {channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "cloud_api" ? (
@@ -4507,6 +5518,15 @@ export function IntegrationsPanel({
                 <TextField
                   fullWidth
                   size="small"
+                  type="password"
+                  label="App Secret"
+                  value={channelForm.whatsapp_app_secret}
+                  onChange={(e) => setChannelField("whatsapp_app_secret", e.target.value)}
+                  placeholder={hasWhatsAppAppSecret ? "Configured (leave blank to keep)" : "Enter app secret"}
+                />
+                <TextField
+                  fullWidth
+                  size="small"
                   label="Phone Number ID"
                   value={channelForm.whatsapp_phone_number_id}
                   onChange={(e) => setChannelField("whatsapp_phone_number_id", e.target.value)}
@@ -4517,6 +5537,7 @@ export function IntegrationsPanel({
                   label="Webhook Verify Token"
                   value={channelForm.whatsapp_verify_token}
                   onChange={(e) => setChannelField("whatsapp_verify_token", e.target.value)}
+                  placeholder={hasWhatsAppVerifyToken ? "Configured (leave blank to keep)" : "Enter verify token"}
                 />
               </>
             ) : null}
@@ -4557,10 +5578,10 @@ export function IntegrationsPanel({
       ) : null}
 
       {showIntegrations ? (
-      <Dialog open={!!active} onClose={closeConfig} maxWidth="sm" fullWidth>
-        <DialogTitle sx={{ textTransform: "none" }}>{active?.name || "Configure integration"}</DialogTitle>
-        <DialogContent>
-          <Stack spacing={1.25} sx={{ pt: 1 }}>
+        <Dialog open={!!active} onClose={closeConfig} maxWidth="md" fullWidth>
+          <DialogTitle sx={{ textTransform: "none" }}>{active?.name || "Configure integration"}</DialogTitle>
+          <DialogContent sx={{ px: { xs: 2, md: 3 }, py: { xs: 1.5, md: 2.5 } }}>
+            <Stack spacing={1.5} sx={{ pt: 0.5 }}>
             <Typography variant="body2" color="text.secondary">
               {active?.description}
             </Typography>
@@ -4874,8 +5895,8 @@ export function IntegrationsPanel({
               </Alert>
             ) : null}
           </Stack>
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
+          </DialogContent>
+          <DialogActions sx={{ px: 3, pb: 2 }}>
           {activeHasSavedConfig ? (
             <Button
               color="warning"
@@ -4929,8 +5950,8 @@ export function IntegrationsPanel({
                     : "Validate & Enable"}
               </Button>
           ) : null}
-        </DialogActions>
-      </Dialog>
+          </DialogActions>
+        </Dialog>
       ) : null}
 
       {showMcp ? (

@@ -49,6 +49,7 @@ import ChevronRightRoundedIcon from "@mui/icons-material/ChevronRightRounded";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
 import FileDownloadRoundedIcon from "@mui/icons-material/FileDownloadRounded";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
 import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
@@ -70,11 +71,13 @@ import { BackgroundSessionsManager } from "./BackgroundSessionsManager";
 import { ChannelsControlPanel } from "./ChannelsControlPanel";
 import { DevicesControlPanel } from "./DevicesControlPanel";
 import { IntegrationsPanel } from "./IntegrationsPanel";
+import { LiveEventConsole } from "./LiveEventConsole";
 import { ObservabilityPanel } from "./ObservabilityPanel";
 import { IntegrationQuickstartPanel } from "./IntegrationQuickstartPanel";
 import { PluginSdkPanel } from "./PluginSdkPanel";
 import { WebhooksPanel } from "./WebhooksPanel";
 import { RoutingControlPanel } from "./RoutingControlPanel";
+import { SentinelPanel } from "./SentinelPanel";
 import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
 import { SwarmManager } from "./SwarmManager";
 import {
@@ -92,7 +95,7 @@ import {
   getTunnelStopButtonLabel,
   getTunnelUrlFieldLabel
 } from "../lib/tunnelAccess";
-import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest, SkillImportResponse, LlmAnalyticsResponse } from "../types";
+import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest, SkillImportResponse, LlmAnalyticsResponse, TraceOperationalEvent, TraceSummary } from "../types";
 import { useUiStore } from "../store/uiStore";
 
 const REFRESH_MS = 8000;
@@ -114,10 +117,40 @@ const CHAT_WORKSPACE_SNAPSHOT_MAX_FILE_CHARS = 60_000;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_TOTAL_CHARS = 240_000;
 const CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS = 16000;
 const CHAT_PENDING_STREAM_STEPS_MAX = 48;
+const CHAT_INLINE_CONVERSATIONS_MIN_WIDTH = 1340;
+const CHAT_INLINE_ACTIVITY_MIN_WIDTH = 1560;
+const TASK_INPUT_NEEDED_MARKER = "__INPUT_NEEDED__:";
+const RESTART_NOTICE_DURATION_MS = 10_000;
 const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
 const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
 const CHAT_CONVERSATIONS_PAGE_SIZE = 20;
 const CHAT_STARRED_LIMIT = 3;
+const AUTO_APPROVE_BLOCKED_ACTIONS = [
+  "shell",
+  "bash",
+  "code_execute",
+  "file_write",
+  "file_delete",
+  "file_move",
+  "docker_exec",
+  "http_request",
+  "gmail_send"
+] as const;
+const AUTO_APPROVE_ACTION_OPTIONS = [
+  "web_search",
+  "research",
+  "generate_image",
+  "generate_video",
+  "browse",
+  "file_read",
+  "http_get",
+  "schedule_task",
+  "list_tasks",
+  "clipboard_read",
+  "clipboard_write",
+  "gmail_scan",
+  "gmail_reply"
+] as const;
 type ImportRiskBand = "secure" | "review" | "risky";
 type ChatPendingRunMode = "fresh" | "resume";
 type ChatPendingRunPhase = "running" | "interrupted";
@@ -127,6 +160,7 @@ type ChatPendingRunSnapshot = {
   message: string;
   projectId: string;
   startedAt: number;
+  runId?: string;
   mode?: ChatPendingRunMode;
   phase?: ChatPendingRunPhase;
   taskId?: string;
@@ -772,7 +806,16 @@ type ExecutionPlanItem = {
   title: string;
   description: string;
   status: string;
+  action?: string | null;
+  arguments?: JsonRecord | null;
   tool_hint: string | null;
+};
+
+type ExecutionPlanState = {
+  plan_id: string;
+  revision: number;
+  summary: string;
+  steps: ExecutionPlanItem[];
 };
 
 type ToolProgressPresentation = {
@@ -846,10 +889,7 @@ type SkillImportSummary = {
   message?: string;
 };
 
-function normalizeExecutionPlanSteps(
-  rawSteps: unknown[],
-  options?: { markFirstRunning?: boolean }
-): ExecutionPlanItem[] {
+function normalizeExecutionPlanSteps(rawSteps: unknown[]): ExecutionPlanItem[] {
   const steps = rawSteps.map((value, index) => {
     const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
     const id = typeof record.id === "number" ? record.id : index + 1;
@@ -858,218 +898,64 @@ function normalizeExecutionPlanSteps(
       title: typeof record.title === "string" ? record.title : `Step ${id}`,
       description: typeof record.description === "string" ? record.description : "",
       status: typeof record.status === "string" ? record.status : "pending",
+      action: typeof record.action === "string" ? record.action : null,
+      arguments:
+        record.arguments && typeof record.arguments === "object" && !Array.isArray(record.arguments)
+          ? (record.arguments as JsonRecord)
+          : null,
       tool_hint: typeof record.tool_hint === "string" ? record.tool_hint : null
     };
   });
 
-  if (
-    options?.markFirstRunning &&
-    !steps.some((step) => step.status === "running" || step.status === "completed" || step.status === "failed")
-  ) {
-    const firstPendingIndex = steps.findIndex((step) => step.status === "pending");
-    if (firstPendingIndex >= 0) {
-      steps[firstPendingIndex] = {
-        ...steps[firstPendingIndex],
-        status: "running"
-      };
-    }
-  }
-
   return steps;
 }
-
-function normalizeExecutionPlanToolHint(value: string | null): string {
-  return str(value, "").trim().toLowerCase();
+function normalizeExecutionPlanState(rawPlan: unknown): ExecutionPlanState | null {
+  const record = rawPlan && typeof rawPlan === "object" ? (rawPlan as JsonRecord) : {};
+  const rawSteps = Array.isArray(record.steps) ? record.steps : [];
+  if (rawSteps.length === 0) return null;
+  return {
+    plan_id: str(record.plan_id, ""),
+    revision: num(record.revision, 0),
+    summary: str(record.summary, ""),
+    steps: normalizeExecutionPlanSteps(rawSteps)
+  };
 }
 
-function advanceExecutionPlanSequentially(
-  plan: ExecutionPlanItem[],
-  phase: "start" | "result"
-): ExecutionPlanItem[] {
-  if (plan.length === 0) return plan;
-  const runningIndex = plan.findIndex((step) => step.status === "running");
-  const firstPendingIndex = plan.findIndex((step) => step.status === "pending");
-  const activeIndex = runningIndex >= 0 ? runningIndex : firstPendingIndex;
-  if (activeIndex < 0) return plan;
-
-  const next = plan.map((step) => ({ ...step }));
-  if (phase === "start") {
-    if (runningIndex < 0 && next[activeIndex]) {
-      next[activeIndex].status = "running";
-    }
-    return next;
-  }
-
-  if (next[activeIndex] && next[activeIndex].status !== "failed" && next[activeIndex].status !== "skipped") {
-    next[activeIndex].status = "completed";
-  }
-  if (!next.some((step) => step.status === "running")) {
-    const nextPendingIndex = next.findIndex((step, index) => index > activeIndex && step.status === "pending");
-    if (nextPendingIndex >= 0) {
-      next[nextPendingIndex].status = "running";
-    }
-  }
-  return next;
-}
-
-function advanceExecutionPlanForToolEvent(
-  plan: ExecutionPlanItem[],
-  toolName: string,
-  phase: "start" | "result"
-): ExecutionPlanItem[] {
-  if (plan.length === 0) return plan;
-  const normalizedToolName = str(toolName, "").trim().toLowerCase();
-  const hasToolHints = plan.some((step) => normalizeExecutionPlanToolHint(step.tool_hint) !== "");
-  if (!normalizedToolName) {
-    return hasToolHints ? plan : advanceExecutionPlanSequentially(plan, phase);
-  }
-
-  const matchingIndex = plan.findIndex(
-    (step) => normalizeExecutionPlanToolHint(step.tool_hint) === normalizedToolName
-  );
-  if (matchingIndex < 0) {
-    const currentActiveIndex = plan.findIndex((step) => step.status === "running");
-    if (
-      currentActiveIndex >= 0 &&
-      normalizeExecutionPlanToolHint(plan[currentActiveIndex].tool_hint) === ""
-    ) {
-      return advanceExecutionPlanSequentially(plan, phase);
-    }
-    return hasToolHints ? plan : advanceExecutionPlanSequentially(plan, phase);
-  }
-
-  const next = plan.map((step) => ({ ...step }));
-  for (let index = 0; index < matchingIndex; index += 1) {
-    if (next[index].status === "pending" || next[index].status === "running") {
-      next[index].status = "completed";
-    }
-  }
-
-  if (phase === "start") {
-    if (next[matchingIndex].status === "pending") {
-      next[matchingIndex].status = "running";
-    }
-    return next;
-  }
-
-  if (next[matchingIndex].status !== "failed" && next[matchingIndex].status !== "skipped") {
-    next[matchingIndex].status = "completed";
-  }
-  if (!next.some((step) => step.status === "running")) {
-    const nextPendingIndex = next.findIndex(
-      (step, index) => index > matchingIndex && step.status === "pending"
-    );
-    if (nextPendingIndex >= 0) {
-      next[nextPendingIndex].status = "running";
-    }
-  }
-  return next;
-}
-
-function inferExecutionPlanTraceOutcome(steps: JsonRecord[]): "completed" | "failed" | null {
-  const meaningfulSteps = steps.filter((step) => {
-    const stepType = str(step.step_type, "").trim().toLowerCase();
-    return stepType !== "thinking";
-  });
-  if (meaningfulSteps.some((step) => str(step.step_type, "").trim().toLowerCase() === "error")) {
-    return "failed";
-  }
-  if (
-    meaningfulSteps.some((step) => str(step.title, "").trim().toLowerCase() === "response complete")
-  ) {
-    return "completed";
-  }
-  return null;
-}
-
-function applyTraceOutcomeToExecutionPlan(
-  plan: ExecutionPlanItem[],
-  steps: JsonRecord[]
-): ExecutionPlanItem[] {
-  if (plan.length === 0) return plan;
-  const outcome = inferExecutionPlanTraceOutcome(steps);
-  if (outcome === "completed") {
-    return plan.map((step) =>
-      step.status === "failed" || step.status === "skipped"
-        ? step
-        : {
-            ...step,
-            status: "completed"
-          }
-    );
-  }
-  if (outcome === "failed" && !plan.some((step) => step.status === "failed")) {
-    const runningIndex = plan.findIndex((step) => step.status === "running");
-    const pendingIndex = plan.findIndex((step) => step.status === "pending");
-    const targetIndex = runningIndex >= 0 ? runningIndex : pendingIndex;
-    if (targetIndex >= 0) {
-      return plan.map((step, index) =>
-        index === targetIndex
-          ? {
-              ...step,
-              status: "failed"
-            }
-          : step
-      );
-    }
-  }
-  if (!plan.some((step) => step.status === "running" || step.status === "completed" || step.status === "failed")) {
-    const firstPendingIndex = plan.findIndex((step) => step.status === "pending");
-    if (firstPendingIndex >= 0) {
-      return plan.map((step, index) =>
-        index === firstPendingIndex
-          ? {
-              ...step,
-              status: "running"
-            }
-          : step
-      );
-    }
-  }
-  return plan;
-}
-
-function extractExecutionPlanFromTraceSteps(steps: JsonRecord[]): ExecutionPlanItem[] {
+function extractExecutionPlanFromTraceSteps(steps: JsonRecord[]): ExecutionPlanState | null {
   for (const step of [...steps].reverse()) {
     const title = typeof step.title === "string" ? step.title.trim().toLowerCase() : "";
     const stepType = typeof step.step_type === "string" ? step.step_type.trim().toLowerCase() : "";
     if (stepType !== "plan" && title !== "execution plan") continue;
 
     const rawData = step.data;
-    if (Array.isArray(rawData)) {
-      return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(rawData), steps);
-    }
-
     if (rawData && typeof rawData === "object") {
-      const record = rawData as Record<string, unknown>;
-      const nested = Array.isArray(record.steps) ? record.steps : [];
-      if (nested.length > 0) {
-        return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(nested), steps);
-      }
+      const parsed = normalizeExecutionPlanState(rawData);
+      if (parsed) return parsed;
     }
 
     if (typeof rawData === "string" && rawData.trim()) {
       try {
         const parsed = JSON.parse(rawData) as unknown;
-        if (Array.isArray(parsed)) {
-          return applyTraceOutcomeToExecutionPlan(normalizeExecutionPlanSteps(parsed), steps);
-        }
-        if (parsed && typeof parsed === "object") {
-          const record = parsed as Record<string, unknown>;
-          if (Array.isArray(record.steps)) {
-            return applyTraceOutcomeToExecutionPlan(
-              normalizeExecutionPlanSteps(record.steps),
-              steps
-            );
-          }
-        }
+        const normalized = normalizeExecutionPlanState(parsed);
+        if (normalized) return normalized;
       } catch {
         // Ignore malformed trace payloads and continue scanning.
       }
     }
   }
 
-  return [];
+  return null;
+}
+
+function extractExecutionPlanFailureFromTraceSteps(steps: JsonRecord[]): string {
+  for (const step of [...steps].reverse()) {
+    const title = str(step.title, "").trim().toLowerCase();
+    const stepType = str(step.step_type, "").trim().toLowerCase();
+    if (stepType === "plan_unavailable" || title === "execution plan unavailable") {
+      return str(step.detail, "");
+    }
+  }
+  return "";
 }
 
 type ImportCallback = (summary: SkillImportSummary) => Promise<void> | void;
@@ -1101,6 +987,7 @@ export type WorkspaceView =
   | "moltbook"
   | "goals"
   | "autonomy"
+  | "sentinel"
   | "documents"
   | "memory"
   | "projects"
@@ -1566,12 +1453,87 @@ function buildToolProgressPresentation(
   const preview = (content || "").trim().slice(0, 1600);
   const detail = summarizeActivityDetail(preview);
   const payloadObj = asRecord(payload);
+  const delegationKind = str(payloadObj.kind, "");
   const isFileWriteProgress =
     (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
     name === "file_write";
   const isArgumentStream = str(payloadObj.kind, "") === "argument_stream";
   const isDraftFile = str(payloadObj.kind, "") === "draft_file";
   const isPhaseStatus = str(payloadObj.kind, "") === "phase_status";
+  const isConsoleChunk = str(payloadObj.kind, "") === "console_chunk";
+
+  if (name === "delegation" && delegationKind.startsWith("delegation_")) {
+    const agentName = str(payloadObj.agent_name, "").trim();
+    const agentRole = str(payloadObj.agent_role, "").trim();
+    const taskSummary = str(payloadObj.task, "").trim();
+    const elapsedMs = Math.max(0, num(payloadObj.elapsed_ms, 0));
+    const streamKey = agentName
+      ? `delegation:${str(payloadObj.delegation_id, "run")}:${str(payloadObj.agent_id, agentName)}`
+      : `delegation:${str(payloadObj.delegation_id, "run")}`;
+    const elapsedLabel = elapsedMs > 0 ? `${Math.round(elapsedMs / 1000)}s elapsed` : "";
+    const roleLabel = agentRole ? `${agentName || "Agent"} · ${agentRole}` : agentName || "Delegation";
+    if (delegationKind === "delegation_started") {
+      const count = Math.max(0, num(payloadObj.agent_count, 0));
+      return {
+        title: "Launching agent swarm",
+        detail: count > 0 ? `Starting ${count} delegated agent${count === 1 ? "" : "s"}.` : detail || "Starting delegated work.",
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_assignment") {
+      return {
+        title: `Assigned ${roleLabel}`,
+        detail: taskSummary || detail || "Prepared delegated assignment.",
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_agent_started") {
+      return {
+        title: `${roleLabel} is working`,
+        detail: [taskSummary || detail, elapsedLabel].filter(Boolean).join(" - ") || "Delegated work started.",
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_agent_progress") {
+      return {
+        title: `${roleLabel} is working`,
+        detail: [detail || taskSummary || "Delegated work is still running.", elapsedLabel]
+          .filter(Boolean)
+          .join(" - "),
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_agent_completed") {
+      return {
+        title: `${roleLabel} finished`,
+        detail: [detail || taskSummary || "Delegated work completed.", elapsedLabel]
+          .filter(Boolean)
+          .join(" - "),
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_agent_failed") {
+      return {
+        title: `${roleLabel} needs attention`,
+        detail: detail || taskSummary || "Delegated work failed.",
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_synthesis_started") {
+      return {
+        title: "Synthesizing agent results",
+        detail: detail || "Combining delegated results into one response.",
+        streamKey
+      };
+    }
+    if (delegationKind === "delegation_completed") {
+      return {
+        title: "Agent swarm completed",
+        detail: detail || "Delegated work completed.",
+        streamKey
+      };
+    }
+  }
 
   if (isArgumentStream) {
     const stage = str(payloadObj.stage, "");
@@ -1651,10 +1613,447 @@ function buildToolProgressPresentation(
     };
   }
 
+  if (isConsoleChunk) {
+    const stage = str(payloadObj.stage, "").trim();
+    const stream = str(payloadObj.stream, "").trim();
+    const text = str(payloadObj.text, content).trim();
+    return {
+      title: `${stage ? `${stage} ` : ""}${stream || "console"}`.trim(),
+      detail: text || detail || "Console output",
+      streamKey: str(payloadObj.stream_key, `console:${name || "tool"}:${stage || "stage"}:${stream || "stream"}`)
+    };
+  }
+
   return {
     title: `Tool progress: ${name || "tool"}`,
     detail: detail || preview
   };
+}
+
+type SwarmChatAgent = {
+  id: string;
+  agentName: string;
+  agentRole: string;
+  modelName: string;
+  task: string;
+  status: string;
+  summary: string;
+  latestUpdate: string;
+  isSpecialist: boolean;
+  dependsOn: number[];
+  elapsedMs?: number;
+  sequence: number;
+};
+
+type SwarmChatRun = {
+  id: string;
+  request: string;
+  status: string;
+  summary: string;
+  agentCount: number;
+  updatedAtIndex: number;
+  agents: SwarmChatAgent[];
+};
+
+function normalizeSwarmStatus(status: unknown): string {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return "running";
+  if (normalized === "cancelled" || normalized === "canceled") return "interrupted";
+  if (normalized === "degraded") return "partial";
+  return normalized;
+}
+
+function swarmStatusChipColor(status: string): "default" | "success" | "warning" | "error" {
+  switch (normalizeSwarmStatus(status)) {
+    case "completed":
+      return "success";
+    case "partial":
+    case "running":
+    case "assigned":
+    case "synthesizing":
+      return "warning";
+    case "failed":
+    case "timed_out":
+    case "panicked":
+    case "interrupted":
+      return "error";
+    default:
+      return "default";
+  }
+}
+
+function swarmStatusLabel(status: string): string {
+  switch (normalizeSwarmStatus(status)) {
+    case "assigned":
+      return "Assigned";
+    case "running":
+      return "Running";
+    case "synthesizing":
+      return "Synthesizing";
+    case "completed":
+      return "Completed";
+    case "partial":
+      return "Partial";
+    case "timed_out":
+      return "Timed out";
+    case "panicked":
+      return "Panicked";
+    case "failed":
+      return "Failed";
+    case "interrupted":
+      return "Stopped";
+    default:
+      return "Queued";
+  }
+}
+
+function formatSwarmElapsedMs(value: unknown): string {
+  const ms = Math.max(0, num(value, 0));
+  if (!ms) return "";
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(secs >= 10 ? 0 : 1)}s`;
+  const mins = Math.floor(secs / 60);
+  const remSecs = Math.round(secs % 60);
+  return remSecs > 0 ? `${mins}m ${remSecs}s` : `${mins}m`;
+}
+
+function deriveSwarmRunStatus(agents: SwarmChatAgent[], fallback = "running"): string {
+  if (agents.some((agent) => ["assigned", "running", "synthesizing"].includes(normalizeSwarmStatus(agent.status)))) {
+    return "running";
+  }
+  if (agents.every((agent) => normalizeSwarmStatus(agent.status) === "completed")) {
+    return "completed";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "interrupted")) {
+    return "interrupted";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "completed")) {
+    return "partial";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "timed_out")) {
+    return "timed_out";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "panicked")) {
+    return "panicked";
+  }
+  if (agents.some((agent) => normalizeSwarmStatus(agent.status) === "failed")) {
+    return "failed";
+  }
+  return normalizeSwarmStatus(fallback);
+}
+
+function buildSwarmRunsFromStreamingSteps(
+  steps: JsonRecord[],
+  options?: { interrupted?: boolean }
+): SwarmChatRun[] {
+  const interrupted = Boolean(options?.interrupted);
+  const runs = new Map<
+    string,
+    {
+      id: string;
+      request: string;
+      status: string;
+      summary: string;
+      agentCount: number;
+      updatedAtIndex: number;
+      agents: Map<string, SwarmChatAgent>;
+      order: string[];
+    }
+  >();
+
+  steps.forEach((step, index) => {
+    const payload = asRecord(step.data);
+    const kind = str(payload.kind, "");
+    if (!kind.startsWith("delegation_")) return;
+    const runId = str(payload.delegation_id, "").trim();
+    if (!runId) return;
+
+    let run = runs.get(runId);
+    if (!run) {
+      run = {
+        id: runId,
+        request: "",
+        status: "running",
+        summary: "",
+        agentCount: 0,
+        updatedAtIndex: index,
+        agents: new Map<string, SwarmChatAgent>(),
+        order: []
+      };
+      runs.set(runId, run);
+    }
+
+    run.updatedAtIndex = index;
+    run.summary = str(payload.summary, str(step.detail, run.summary)).trim() || run.summary;
+    run.request = str(payload.request, run.request).trim() || run.request;
+    run.agentCount = Math.max(run.agentCount, Math.max(0, num(payload.agent_count, 0)));
+
+    if (kind === "delegation_started") {
+      run.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_synthesis_started") {
+      run.status = normalizeSwarmStatus(str(payload.status, "synthesizing"));
+    } else if (kind === "delegation_completed") {
+      run.status = normalizeSwarmStatus(str(payload.status, "completed"));
+    }
+
+    const agentId = str(payload.agent_id, "").trim();
+    if (!agentId) return;
+
+    let agent = run.agents.get(agentId);
+    if (!agent) {
+      agent = {
+        id: agentId,
+        agentName: str(payload.agent_name, "Agent").trim() || "Agent",
+        agentRole: str(payload.agent_role, "").trim(),
+        modelName: str(payload.model_name, "").trim(),
+        task: str(payload.task, "").trim(),
+        status: "assigned",
+        summary: str(payload.summary, "").trim(),
+        latestUpdate: str(step.detail, "").trim(),
+        isSpecialist: toBool(payload.is_specialist),
+        dependsOn: Array.isArray(payload.depends_on)
+          ? payload.depends_on
+              .map((value) => num(value, -1))
+              .filter((value) => value >= 0)
+          : [],
+        elapsedMs: undefined,
+        sequence: Math.max(1, num(payload.sequence, run.order.length + 1))
+      };
+      run.agents.set(agentId, agent);
+      run.order.push(agentId);
+    }
+
+    agent.agentName = str(payload.agent_name, agent.agentName).trim() || agent.agentName;
+    agent.agentRole = str(payload.agent_role, agent.agentRole).trim() || agent.agentRole;
+    agent.modelName = str(payload.model_name, agent.modelName).trim() || agent.modelName;
+    agent.task = str(payload.task, agent.task).trim() || agent.task;
+    agent.summary = str(payload.summary, agent.summary).trim() || agent.summary;
+    agent.latestUpdate =
+      str(step.detail, str(payload.summary, agent.latestUpdate)).trim() || agent.latestUpdate;
+    agent.isSpecialist = toBool(payload.is_specialist) || agent.isSpecialist;
+    if (Array.isArray(payload.depends_on)) {
+      agent.dependsOn = payload.depends_on
+        .map((value) => num(value, -1))
+        .filter((value) => value >= 0);
+    }
+    const elapsedMs = num(payload.elapsed_ms, 0);
+    if (elapsedMs > 0) {
+      agent.elapsedMs = elapsedMs;
+    }
+
+    if (kind === "delegation_assignment") {
+      agent.status = "assigned";
+    } else if (kind === "delegation_agent_started") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_agent_progress") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "running"));
+    } else if (kind === "delegation_agent_completed") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "completed"));
+    } else if (kind === "delegation_agent_failed") {
+      agent.status = normalizeSwarmStatus(str(payload.status, "failed"));
+    }
+  });
+
+  const out = Array.from(runs.values()).map((run) => {
+    const agents = run.order
+      .map((agentId) => run.agents.get(agentId))
+      .filter((agent): agent is SwarmChatAgent => Boolean(agent))
+      .sort((left, right) => left.sequence - right.sequence);
+
+    let status = deriveSwarmRunStatus(agents, run.status);
+    if (interrupted && ["running", "assigned", "synthesizing"].includes(status)) {
+      status = "interrupted";
+    }
+    const normalizedAgents = agents.map((agent) => {
+      const next = { ...agent };
+      if (interrupted && ["assigned", "running", "synthesizing"].includes(normalizeSwarmStatus(next.status))) {
+        next.status = "interrupted";
+        next.latestUpdate = next.latestUpdate || "Stopped before this delegated step finished.";
+      }
+      return next;
+    });
+
+    return {
+      id: run.id,
+      request: run.request,
+      status,
+      summary: run.summary,
+      agentCount: Math.max(run.agentCount, normalizedAgents.length),
+      updatedAtIndex: run.updatedAtIndex,
+      agents: normalizedAgents
+    };
+  });
+
+  return out.sort((left, right) => right.updatedAtIndex - left.updatedAtIndex);
+}
+
+function SwarmActivityPanel({
+  runs,
+  interrupted = false
+}: {
+  runs: SwarmChatRun[];
+  interrupted?: boolean;
+}) {
+  if (runs.length === 0) return null;
+  const totalAgents = runs.reduce((sum, run) => sum + Math.max(run.agentCount, run.agents.length), 0);
+
+  return (
+    <Box
+      sx={{
+        mt: 1.5,
+        p: 1.5,
+        borderRadius: "18px",
+        border: interrupted
+          ? "1px solid rgba(255, 171, 64, 0.28)"
+          : "1px solid rgba(90, 180, 255, 0.20)",
+        background: interrupted
+          ? "linear-gradient(180deg, rgba(255, 171, 64, 0.10) 0%, rgba(17, 24, 39, 0.82) 100%)"
+          : "linear-gradient(180deg, rgba(67, 153, 255, 0.12) 0%, rgba(16, 24, 40, 0.82) 100%)",
+        boxShadow: interrupted
+          ? "0 16px 40px rgba(120, 72, 0, 0.18)"
+          : "0 16px 40px rgba(11, 52, 110, 0.18)"
+      }}
+    >
+      <Stack spacing={1.4}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          alignItems={{ xs: "flex-start", sm: "center" }}
+          justifyContent="space-between"
+          gap={1}
+        >
+          <Box>
+            <Typography
+              variant="overline"
+              sx={{ letterSpacing: "0.16em", color: interrupted ? "warning.light" : "info.light" }}
+            >
+              Agent activity
+            </Typography>
+            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+              {interrupted
+                ? "Delegated work was paused with live state preserved."
+                : "Delegated specialists are working in parallel."}
+            </Typography>
+          </Box>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            <Chip
+              size="small"
+              color={interrupted ? "warning" : "info"}
+              variant={interrupted ? "filled" : "outlined"}
+              label={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
+            />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`${totalAgents} agent${totalAgents === 1 ? "" : "s"}`}
+            />
+          </Stack>
+        </Stack>
+
+        {runs.map((run) => (
+          <Box
+            key={run.id}
+            sx={{
+              p: 1.25,
+              borderRadius: "14px",
+              background: "rgba(6, 11, 23, 0.52)",
+              border: "1px solid rgba(255,255,255,0.06)"
+            }}
+          >
+            <Stack spacing={1.2}>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                alignItems={{ xs: "flex-start", md: "center" }}
+                justifyContent="space-between"
+                gap={1}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                    {run.request || "Delegated run"}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+                    {run.summary || `${run.agents.length} delegated agents tracked.`}
+                  </Typography>
+                </Box>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                  <Chip
+                    size="small"
+                    color={swarmStatusChipColor(run.status)}
+                    label={swarmStatusLabel(run.status)}
+                  />
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    label={`${Math.max(run.agentCount, run.agents.length)} agent${Math.max(run.agentCount, run.agents.length) === 1 ? "" : "s"}`}
+                  />
+                </Stack>
+              </Stack>
+
+              <Grid2 container spacing={1}>
+                {run.agents.map((agent) => (
+                  <Grid2 key={agent.id} size={{ xs: 12, xl: 6 }}>
+                    <Box
+                      sx={{
+                        height: "100%",
+                        p: 1.1,
+                        borderRadius: "12px",
+                        border: "1px solid rgba(255,255,255,0.06)",
+                        background: "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)"
+                      }}
+                    >
+                      <Stack spacing={0.8}>
+                        <Stack
+                          direction={{ xs: "column", sm: "row" }}
+                          alignItems={{ xs: "flex-start", sm: "center" }}
+                          justifyContent="space-between"
+                          gap={0.8}
+                        >
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                              {agent.agentRole
+                                ? `${agent.agentName} · ${agent.agentRole}`
+                                : agent.agentName}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {agent.modelName || (agent.isSpecialist ? "Specialist model" : "Auto agent")}
+                            </Typography>
+                          </Box>
+                          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                            <Chip
+                              size="small"
+                              color={swarmStatusChipColor(agent.status)}
+                              label={swarmStatusLabel(agent.status)}
+                              sx={{ height: 22 }}
+                            />
+                            {agent.elapsedMs ? (
+                              <Chip
+                                size="small"
+                                variant="outlined"
+                                label={formatSwarmElapsedMs(agent.elapsedMs)}
+                                sx={{ height: 22 }}
+                              />
+                            ) : null}
+                          </Stack>
+                        </Stack>
+                        {agent.task ? (
+                          <Typography variant="body2" sx={{ color: "rgba(229, 236, 246, 0.94)" }}>
+                            {agent.task}
+                          </Typography>
+                        ) : null}
+                        <Typography variant="caption" color="text.secondary">
+                          {agent.latestUpdate || agent.summary || "Waiting for the next update."}
+                        </Typography>
+                      </Stack>
+                    </Box>
+                  </Grid2>
+                ))}
+              </Grid2>
+            </Stack>
+          </Box>
+        ))}
+      </Stack>
+    </Box>
+  );
 }
 
 function extractPhaseStatusFromProgress(
@@ -1675,6 +2074,116 @@ function extractPhaseStatusFromProgress(
     elapsedSecs: Math.max(0, num(payloadObj.elapsed_secs, 0)),
     streamKey: str(payloadObj.stream_key, `phase-status:${name || "tool"}:${phase || "unknown"}`)
   };
+}
+
+function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
+  const steps: JsonRecord[] = [];
+  for (const rawEvent of events) {
+    const event = asRecord(rawEvent);
+    const kind = str(event.kind, "").trim().toLowerCase();
+    const payload = asRecord(event.payload);
+    const timestamp = str(event.ts, "");
+    if (!kind) continue;
+
+    if (kind === "thinking") {
+      steps.push({
+        step_type: "heartbeat",
+        title: "Still Working",
+        detail: str(payload.detail, ""),
+        data: payload,
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "tool_start") {
+      const name = str(payload.name, "");
+      const inner = asRecord(payload.payload);
+      steps.push({
+        step_type: "tool_start",
+        title: `Tool started: ${name || "tool"}`,
+        detail: compactUnknown(inner, 240) || `Starting ${name || "tool"}.`,
+        data: Object.keys(inner).length > 0 ? inner : payload,
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "tool_progress") {
+      const name = str(payload.name, "");
+      const content = str(payload.content, "");
+      const inner = asRecord(payload.payload);
+      const presentation = buildToolProgressPresentation(name, content, inner, "");
+      steps.push({
+        step_type: "tool_progress",
+        title: presentation.title,
+        detail: presentation.detail,
+        data: Object.keys(inner).length > 0 ? inner : payload,
+        ...(presentation.streamKey ? { __streamKey: presentation.streamKey } : {}),
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "tool_result") {
+      const name = str(payload.name, "");
+      const content = str(payload.content, "");
+      steps.push({
+        step_type: "tool_result",
+        title: `Tool finished: ${name || "tool"}`,
+        detail: summarizeActivityDetail(content),
+        data: payload,
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "plan_generated" || kind === "plan_revised") {
+      const normalizedPlan = normalizeExecutionPlanState(payload.plan);
+      steps.push({
+        step_type: kind,
+        title: kind === "plan_generated" ? "Execution Plan" : "Execution Plan Revised",
+        detail:
+          kind === "plan_generated"
+            ? `${normalizedPlan?.steps.length || 0} steps planned`
+            : str(payload.reason, "Execution plan revised."),
+        plan: payload.plan,
+        data: payload,
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "plan_unavailable" || kind === "plan_step_update") {
+      steps.push({
+        step_type: kind,
+        title:
+          kind === "plan_unavailable"
+            ? "Execution Plan Unavailable"
+            : "Plan Step Update",
+        detail:
+          kind === "plan_unavailable"
+            ? str(payload.reason, "Structured planning was unavailable.")
+            : str(payload.detail, `Updated step ${num(payload.step_id, 0)}`),
+        data: payload,
+        timestamp
+      });
+      continue;
+    }
+
+    if (kind === "run_status") {
+      const inner = asRecord(payload.payload);
+      const stage = str(payload.stage, str(event.stage, ""));
+      steps.push({
+        step_type: "run_status",
+        title: `Run status: ${str(payload.run_status, stage || "updated").replace(/_/g, " ")}`,
+        detail: compactUnknown(inner, 400) || stage || "Run status updated.",
+        data: payload,
+        timestamp
+      });
+    }
+  }
+  return steps;
 }
 
 function isHumanReadableStatus(detail: string): boolean {
@@ -1909,6 +2418,7 @@ function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
       message: typeof parsed.message === "string" ? parsed.message : "",
       projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
       startedAt,
+      runId: typeof parsed.runId === "string" ? parsed.runId : "",
       mode: parsed.mode === "resume" ? "resume" : "fresh",
       phase: parsed.phase === "interrupted" ? "interrupted" : "running",
       taskId: typeof parsed.taskId === "string" ? parsed.taskId : "",
@@ -3811,7 +4321,7 @@ function BulkImportDialog({
             {`Examples:
 https://github.com/org/repo/tree/main/skills
 https://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md
-https://clawhub.ai/org/my-skill`}
+https://raw.githubusercontent.com/org/repo/main/skills/another-skill/SKILL.md`}
           </Typography>
           <TextField
             fullWidth
@@ -3826,7 +4336,7 @@ https://clawhub.ai/org/my-skill`}
               setAnalysisDone(false);
               setError(null);
             }}
-            placeholder={"https://github.com/openclaw/skills/tree/main/skills\nhttps://clawhub.ai/org/my-skill"}
+            placeholder={"https://github.com/org/repo/tree/main/skills\nhttps://raw.githubusercontent.com/org/repo/main/skills/my-skill/SKILL.md"}
           />
           <TextField
             fullWidth
@@ -4191,13 +4701,13 @@ function ImportUrlDialog({
           {error && <Alert severity="error">{error}</Alert>}
           {info && <Alert severity="info">{info}</Alert>}
           <Typography variant="caption" color="text.secondary">
-            Supports direct SKILL.md links plus GitHub and ClawHub/OpenClaw skill page URLs.
+            Supports direct SKILL.md links plus GitHub-hosted skill sources.
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "pre-line" }}>
             {`Examples:
 1. https://github.com/org/repo/tree/main/skills/market-analysis
 2. https://raw.githubusercontent.com/org/repo/main/skills/market-analysis/SKILL.md
-3. https://clawhub.ai/pskoett/self-improving-agent`}
+3. https://raw.githubusercontent.com/org/repo/main/skills/self-improving-agent/SKILL.md`}
           </Typography>
           <TextField
             fullWidth
@@ -4956,17 +5466,21 @@ function ChatManager({
   const [failedUserMessage, setFailedUserMessage] = useState<string | null>(null);
   const [streamingResponse, setStreamingResponse] = useState("");
   const [streamingSteps, setStreamingSteps] = useState<JsonRecord[]>([]);
-  const [executionPlan, setExecutionPlan] = useState<ExecutionPlanItem[]>([]);
+  const [executionPlan, setExecutionPlan] = useState<ExecutionPlanState | null>(null);
+  const [executionPlanFailure, setExecutionPlanFailure] = useState("");
   const [executionPlanExpanded, setExecutionPlanExpanded] = useState(false);
   const [streamingProgressMessages, setStreamingProgressMessages] = useState<string[]>([]);
   const [completedProgressMessagesByConversation, setCompletedProgressMessagesByConversation] =
     useState<Record<string, { messages: string[]; beforeMessageId: string }>>({});
   const [streamTraceOpen, setStreamTraceOpen] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : CHAT_INLINE_ACTIVITY_MIN_WIDTH
+  );
   const [workspaceOpen, setWorkspaceOpen] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= 1360
+    () => typeof window !== "undefined" && window.innerWidth >= 1880
   );
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(
-    () => typeof window !== "undefined" && window.innerWidth >= 1520
+    () => typeof window !== "undefined" && window.innerWidth >= 1720
   );
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
@@ -5005,13 +5519,20 @@ function ChatManager({
   const streamingStepsRef = useRef<JsonRecord[]>([]);
   const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
+  const previousInlineSidebarsRef = useRef({
+    conversations: viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH,
+    activity: viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH
+  });
   const pendingFileReadPathRef = useRef("");
   const pendingFileWritePathRef = useRef("");
   const lastProgressBubbleCategoryRef = useRef("");
   const lastProgressBubbleAtRef = useRef(0);
   const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
   const lastWorkspaceRestoreSeedRef = useRef("");
+  const reattachedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
+  const canInlineConversationSidebar = viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH;
+  const canInlineWorkspacePanel = viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH;
   const scopedConversationPath = useMemo(
     () =>
       withProjectScope(
@@ -5027,6 +5548,33 @@ function ChatManager({
     refetchInterval: chatAutoRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
     refetchIntervalInBackground: chatBackgroundRefresh
   });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    handleResize();
+    window.addEventListener("resize", handleResize, { passive: true });
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    const previous = previousInlineSidebarsRef.current;
+    if (previous.conversations && !canInlineConversationSidebar && conversationSidebarOpen) {
+      setConversationSidebarOpen(false);
+    }
+    if (previous.activity && !canInlineWorkspacePanel && workspaceOpen) {
+      setWorkspaceOpen(false);
+    }
+    previousInlineSidebarsRef.current = {
+      conversations: canInlineConversationSidebar,
+      activity: canInlineWorkspacePanel
+    };
+  }, [
+    canInlineConversationSidebar,
+    canInlineWorkspacePanel,
+    conversationSidebarOpen,
+    workspaceOpen
+  ]);
 
   const conversationsPayload = asRecord(convQ.data);
   const conversations = pickRecords(conversationsPayload, "conversations");
@@ -5361,16 +5909,6 @@ function ChatManager({
           }
         }));
       }
-      setExecutionPlan((prev) =>
-        prev.map((step) =>
-          step.status === "failed"
-            ? step
-            : {
-                ...step,
-                status: "completed"
-              }
-        )
-      );
       storeChatPendingRunSnapshot(null);
       setPendingRunSnapshot(null);
       setPendingUserMessage(null);
@@ -5399,6 +5937,28 @@ function ChatManager({
     traceLoadingById,
     traceErrorById
   ]);
+
+  useEffect(() => {
+    if (!conversationId || isStreaming || hasPendingSnapshotForConversation) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const payload = asRecord(
+          await api.rawGet(`/conversations/${encodeURIComponent(conversationId)}/latest-run`)
+        );
+        if (cancelled) return;
+        const events = asRecords(payload.events);
+        setLastRunSteps(buildPersistedRunSteps(events));
+      } catch {
+        if (!cancelled) {
+          setLastRunSteps([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, isStreaming, hasPendingSnapshotForConversation]);
 
   const toHumanToolName = (name: string): string => {
     const normalized = (name || "").trim().toLowerCase();
@@ -5452,11 +6012,20 @@ function ChatManager({
     lastProgressBubbleAtRef.current = 0;
   };
 
+  const normalizeStreamingProgressBubbleText = (value: string): string =>
+    (value || "")
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.replace(/[ \t]+/g, " ").trim())
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
   const pushStreamingProgressBubble = (
     message: string,
     options?: { category?: string; replace?: boolean; minIntervalMs?: number }
   ) => {
-    const text = (message || "").replace(/\s+/g, " ").trim();
+    const text = normalizeStreamingProgressBubbleText(message);
     if (!text) return;
     const category = str(options?.category, "").trim();
     const replace = Boolean(options?.replace && category);
@@ -5557,9 +6126,8 @@ function ChatManager({
 
     if (/^loaded \d+ messages?, packed \d+/i.test(text)) return "Collected recent chat context.";
     if (/channel:\s*\w+\s*\|\s*length:\s*\d+\s*chars/i.test(text)) return "Reading your request.";
-    if (/mem0 pending/i.test(text)) return "Checking saved memory context.";
-    if (/found \d+ relevant memories/i.test(text)) {
-      const m = text.match(/found\s+(\d+)\s+relevant memories/i);
+      if (/found \d+ relevant memories/i.test(text)) {
+        const m = text.match(/found\s+(\d+)\s+relevant memories/i);
       const count = m?.[1] || "0";
       return `Found ${count} related memory item${count === "1" ? "" : "s"}.`;
     }
@@ -5612,12 +6180,120 @@ function ChatManager({
     return false;
   };
 
+  const planStepUpdateTitle = (status: string): string => {
+    switch ((status || "").trim().toLowerCase()) {
+      case "completed":
+        return "Plan Step Completed";
+      case "failed":
+        return "Plan Step Failed";
+      case "skipped":
+        return "Plan Step Skipped";
+      case "running":
+        return "Plan Step Started";
+      default:
+        return "Plan Step Updated";
+    }
+  };
+
+  const planStepUpdateDetail = (status: string, stepId: number, stepTitle: string): string => {
+    const subject = stepTitle || (stepId > 0 ? `step ${stepId}` : "plan step");
+    switch ((status || "").trim().toLowerCase()) {
+      case "completed":
+        return `Completed ${subject}.`;
+      case "failed":
+        return `Failed ${subject}.`;
+      case "skipped":
+        return `Skipped ${subject}.`;
+      case "running":
+        return `Started ${subject}.`;
+      default:
+        return `Updated ${subject}.`;
+    }
+  };
+
+  const normalizePlanStepUpdateStep = (step: JsonRecord): JsonRecord => {
+    const stepType = str(step.step_type, "");
+    if (stepType !== "plan_step_update") return step;
+    const status = str(step.status, "pending");
+    const stepId = typeof step.step_id === "number" ? step.step_id : num(step.step_id, 0);
+    const stepTitle = str(step.step_title, "").trim();
+    const title = str(step.title, "").trim() || planStepUpdateTitle(status);
+    const detail = str(step.detail, "").trim() || planStepUpdateDetail(status, stepId, stepTitle);
+    return {
+      ...step,
+      title,
+      detail,
+      step_title: stepTitle
+    };
+  };
+
+  const maybeSurfacePlanStepProgressBubble = (step: JsonRecord) => {
+    const stepType = str(step.step_type, "");
+    if (stepType !== "plan_step_update") return;
+    const status = str(step.status, "").trim().toLowerCase();
+    if (!["running", "completed", "failed", "skipped"].includes(status)) return;
+    const stepId = typeof step.step_id === "number" ? step.step_id : num(step.step_id, 0);
+    const stepTitle = str(step.step_title, "").trim();
+    const message = planStepUpdateDetail(status, stepId, stepTitle);
+    if (!message) return;
+    pushStreamingProgressBubble(message, {
+      category: `plan-step:${str(step.plan_id, "")}:${num(step.revision, 0)}:${stepId}:${status}`,
+      minIntervalMs: 0
+    });
+  };
+
+  const currentExecutionPlanStepMeta = () => {
+    if (!executionPlan) return null;
+    const activeStep =
+      executionPlan.steps.find((step) => step.status === "running") ||
+      executionPlan.steps.find((step) => step.status === "pending");
+    if (!activeStep) return null;
+    return {
+      planId: executionPlan.plan_id,
+      revision: executionPlan.revision,
+      stepId: activeStep.id,
+      stepTitle: activeStep.title
+    };
+  };
+
+  const attachCurrentPlanStepPayload = (payload: JsonRecord): JsonRecord => {
+    const meta = currentExecutionPlanStepMeta();
+    if (!meta) return payload;
+    return {
+      ...payload,
+      plan_id: str(payload.plan_id, "") || meta.planId,
+      plan_revision: num(payload.plan_revision, 0) || meta.revision,
+      plan_step_id:
+        typeof payload.plan_step_id === "number" ? payload.plan_step_id : meta.stepId,
+      plan_step_title: str(payload.plan_step_title, "").trim() || meta.stepTitle
+    };
+  };
+
+  const decorateActivityDetailWithPlanStep = (detail: string, payloadObj: JsonRecord): string => {
+    const planStepTitle = str(payloadObj.plan_step_title, "").trim();
+    if (!planStepTitle) return detail;
+    const prefix = `Plan step: ${planStepTitle}.`;
+    if (!detail) return prefix;
+    return isRedundantStatusDetail(prefix, detail) ? detail : `${prefix} ${detail}`;
+  };
+
   const humanizeStep = (
     title: string,
     detail: string,
     stepType: string
   ): { label: string; detail: string; kind?: string; tone?: string } => {
     const t = title.toLowerCase();
+    if (stepType === "plan_step_update" || t.startsWith("plan step ")) {
+      if (t.includes("failed")) {
+        return { label: title || "Plan step failed", detail: detail || "", kind: "Issue", tone: "tone-error" };
+      }
+      if (t.includes("completed") || t.includes("skipped")) {
+        return { label: title || "Plan step completed", detail: detail || "", kind: "Done", tone: "tone-success" };
+      }
+      if (t.includes("started") || t.includes("running") || t.includes("queued") || t.includes("updated")) {
+        return { label: title || "Plan step updated", detail: detail || "", kind: "Running", tone: "tone-action" };
+      }
+    }
     // Log-style: short typed label + actual detail from the step data
     if (t === "message received" || t.startsWith("message received") || t === "request received" || t.startsWith("request received")) {
       return { label: "Reading your request", detail: detail || "" };
@@ -6012,7 +6688,7 @@ function ChatManager({
       setPendingUserMessage(null);
       setFailedUserMessage(null);
       setStreamingResponse("");
-      setStreamingSteps([]); setExecutionPlan([]);
+      setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
       setExecutionPlanExpanded(false);
       setStreamingProgressMessages([]);
       resetStreamingProgressBubbleState();
@@ -6033,6 +6709,9 @@ function ChatManager({
     setMessageTraceOpen({});
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
+    if (typeof window !== "undefined" && window.innerWidth < CHAT_INLINE_CONVERSATIONS_MIN_WIDTH) {
+      setConversationSidebarOpen(false);
+    }
   };
 
   useEffect(() => {
@@ -6049,7 +6728,7 @@ function ChatManager({
       setPendingUserMessage(null);
       setFailedUserMessage(null);
       setStreamingResponse("");
-      setStreamingSteps([]); setExecutionPlan([]);
+      setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
       setExecutionPlanExpanded(false);
       setStreamingProgressMessages([]);
       resetStreamingProgressBubbleState();
@@ -6070,7 +6749,7 @@ function ChatManager({
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
     setConversationId(id);
-    if (typeof window !== "undefined" && window.innerWidth < 980) {
+    if (typeof window !== "undefined" && window.innerWidth < CHAT_INLINE_CONVERSATIONS_MIN_WIDTH) {
       setConversationSidebarOpen(false);
     }
     if (pendingRunSnapshot?.conversationId === id) {
@@ -6567,7 +7246,7 @@ function ChatManager({
   };
 
   const normalizeActivityStepForDisplay = (step: JsonRecord): JsonRecord => {
-    const timedStep = normalizeActivityStepTime(step);
+    const timedStep = normalizeActivityStepTime(normalizePlanStepUpdateStep(step));
     if (isHeartbeatStreamingStep(timedStep)) {
       return {
         ...timedStep,
@@ -6686,21 +7365,46 @@ function ChatManager({
   };
 
   const pushStreamingStep = (step: JsonRecord) => {
+    const normalizedIncomingStep = normalizePlanStepUpdateStep(step);
     // Handle execution plan events
-    const stepType = str(step.step_type, "");
+    const stepType = str(normalizedIncomingStep.step_type, "");
     if (stepType === "plan_generated") {
-      const rawSteps = Array.isArray(step.steps) ? step.steps : [];
-      setExecutionPlan(normalizeExecutionPlanSteps(rawSteps, { markFirstRunning: true }));
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      setExecutionPlan(nextPlan);
+      setExecutionPlanFailure("");
       setExecutionPlanExpanded(false);
     }
-    if (stepType === "plan_step_update" && typeof step.step_id === "number") {
-      const sid = step.step_id as number;
-      const newStatus = typeof step.status === "string" ? step.status : "running";
-      setExecutionPlan((prev) => prev.map((s) => s.id === sid ? { ...s, status: newStatus } : s));
+    if (stepType === "plan_revised") {
+      const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
+      if (nextPlan) {
+        setExecutionPlan(nextPlan);
+        setExecutionPlanFailure("");
+      }
+      setExecutionPlanExpanded(false);
+    }
+    if (stepType === "plan_unavailable") {
+      setExecutionPlan(null);
+      setExecutionPlanFailure(str(normalizedIncomingStep.detail, "Structured planning was unavailable."));
+    }
+    if (stepType === "plan_step_update" && typeof normalizedIncomingStep.step_id === "number") {
+      const sid = normalizedIncomingStep.step_id as number;
+      const newStatus = typeof normalizedIncomingStep.status === "string" ? normalizedIncomingStep.status : "running";
+      const planId = str(normalizedIncomingStep.plan_id, "");
+      const revision = num(normalizedIncomingStep.revision, 0);
+      setExecutionPlan((prev) => {
+        if (!prev) return prev;
+        if (planId && prev.plan_id && planId !== prev.plan_id) return prev;
+        if (revision > 0 && prev.revision > 0 && revision !== prev.revision) return prev;
+        return {
+          ...prev,
+          steps: prev.steps.map((s) => (s.id === sid ? { ...s, status: newStatus } : s))
+        };
+      });
+      maybeSurfacePlanStepProgressBubble(normalizedIncomingStep);
     }
 
     setStreamingSteps((prev) => {
-      const normalizedStep = ensureActivityStepTime(normalizeActivityStepForDisplay(step));
+      const normalizedStep = ensureActivityStepTime(normalizeActivityStepForDisplay(normalizedIncomingStep));
       const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
       const incomingStableKey = getStreamingStepStableKey(normalizedStep);
       let next: JsonRecord[];
@@ -6764,13 +7468,16 @@ function ChatManager({
   };
 
   const handleStreamToolStart = (name: string, payload?: Record<string, unknown>) => {
-    const payloadSummary = summarizeToolStartPayload(name, payload);
-    const payloadObj = asRecord(payload);
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    const payloadSummary = decorateActivityDetailWithPlanStep(
+      summarizeToolStartPayload(name, payloadObj),
+      payloadObj
+    );
     pushStreamingStep({
       step_type: "tool_start",
       title: `Tool started: ${name}`,
       detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
-      data: name
+      data: Object.keys(payloadObj).length > 0 ? payloadObj : name
     });
     if (name === "file_read") {
       pendingFileReadPathRef.current = normalizeWorkspaceFileName(
@@ -6831,8 +7538,11 @@ function ChatManager({
     payload?: Record<string, unknown>
   ) => {
     const preview = content.trim().slice(0, 1600);
-    const detail = simplifyConsoleDetail(summarizeActivityDetail(preview));
-    const payloadObj = asRecord(payload);
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    const detail = decorateActivityDetailWithPlanStep(
+      simplifyConsoleDetail(summarizeActivityDetail(preview)),
+      payloadObj
+    );
     const capturedApp = extractWorkspaceAppFromStreamPayload(name, payloadObj);
     rememberStreamedWorkspaceApp(capturedApp);
     const workspaceAppDir = str(
@@ -6930,7 +7640,7 @@ function ChatManager({
     content: string,
     payload?: Record<string, unknown>
   ) => {
-    const payloadObj = asRecord(payload);
+    const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
     const workspaceAppDir = str(streamedWorkspaceAppRef.current?.app_dir, "");
     const progressPresentation = buildToolProgressPresentation(
       name,
@@ -6957,6 +7667,10 @@ function ChatManager({
       ) {
         setWorkspaceOpen(true);
       }
+    }
+
+    if (str(payloadObj.kind, "") === "console_chunk") {
+      setWorkspaceOpen(true);
     }
 
     const isDraftFile = str(payloadObj.kind, "") === "draft_file";
@@ -7062,7 +7776,7 @@ function ChatManager({
     pushStreamingStep({
       step_type: "tool_progress",
       title: progressPresentation.title,
-      detail: progressPresentation.detail,
+      detail: decorateActivityDetailWithPlanStep(progressPresentation.detail, payloadObj),
       data: Object.keys(payloadObj).length > 0 ? payloadObj : progressPresentation.detail,
       ...(progressPresentation.streamKey ? { __streamKey: progressPresentation.streamKey } : {})
     });
@@ -7132,7 +7846,7 @@ function ChatManager({
     setPendingUserMessage(!isResumeMode && !sensitiveMessage ? activeMessage : null);
     setFailedUserMessage(null);
     setStreamingResponse("");
-    setStreamingSteps([]); setExecutionPlan([]);
+    setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
     setExecutionPlanExpanded(false);
     setStreamingProgressMessages([]);
     resetStreamingProgressBubbleState();
@@ -7161,6 +7875,7 @@ function ChatManager({
       message: !isResumeMode && !sensitiveMessage ? activeMessage : "",
       projectId: targetProjectId,
       startedAt: Date.now(),
+      runId: "",
       mode: isResumeMode ? "resume" : "fresh",
       phase: "running",
       taskId: resumeTaskId,
@@ -7178,11 +7893,21 @@ function ChatManager({
     const absorbConversationId = (payload: unknown) => {
       const obj = asRecord(payload);
       const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, "")));
+      const runId = str(obj.run_id, "");
       if (cid) {
         resolvedConversationId = cid;
         setPendingRunSnapshot((prev) => {
           const base = prev ?? initialPendingSnapshot;
-          const next = { ...base, conversationId: cid };
+          const next = { ...base, conversationId: cid, ...(runId ? { runId } : {}) };
+          storeChatPendingRunSnapshot(next);
+          return next;
+        });
+        return;
+      }
+      if (runId) {
+        setPendingRunSnapshot((prev) => {
+          const base = prev ?? initialPendingSnapshot;
+          const next = { ...base, runId };
           storeChatPendingRunSnapshot(next);
           return next;
         });
@@ -7207,7 +7932,12 @@ function ChatManager({
             signal: abortController.signal,
             onEvent: (eventName, payload) => {
               absorbConversationId(payload);
-              if (eventName === "plan_generated" || eventName === "plan_step_update") {
+              if (
+                eventName === "plan_generated" ||
+                eventName === "plan_revised" ||
+                eventName === "plan_step_update" ||
+                eventName === "plan_unavailable"
+              ) {
                 const planPayload = asRecord(payload);
                 if (Object.keys(planPayload).length > 0) {
                   pushStreamingStep(planPayload);
@@ -7243,6 +7973,9 @@ function ChatManager({
             setChatNotice(`Task started: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
           },
           onTaskStatus: (payload) => {
             const taskId = str(payload.task_id, "");
@@ -7262,6 +7995,9 @@ function ChatManager({
             setChatNotice(`Task ${statusLabel}: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
           },
           onContent: (payload) => {
             const text = str(payload.content, "");
@@ -7289,7 +8025,12 @@ function ChatManager({
               signal: abortController.signal,
             onEvent: (eventName, payload) => {
                 absorbConversationId(payload);
-                if (eventName === "plan_generated" || eventName === "plan_step_update") {
+                if (
+                  eventName === "plan_generated" ||
+                  eventName === "plan_revised" ||
+                  eventName === "plan_step_update" ||
+                  eventName === "plan_unavailable"
+                ) {
                   const planPayload = asRecord(payload);
                   if (Object.keys(planPayload).length > 0) {
                     pushStreamingStep(planPayload);
@@ -7325,6 +8066,9 @@ function ChatManager({
             setChatNotice(`Task started: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
           },
           onTaskStatus: (payload) => {
             const taskId = str(payload.task_id, "");
@@ -7344,6 +8088,9 @@ function ChatManager({
             setChatNotice(`Task ${statusLabel}: ${description}`);
             void queryClient.invalidateQueries({ queryKey: ["tasks"] });
             void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+            void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
           },
           onContent: (payload) => {
             const text = str(payload.content, "");
@@ -7378,6 +8125,9 @@ function ChatManager({
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+      await queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
       if (!streamError && !wasStopped) {
         setFailedUserMessage(null);
         const candidateConversationId = resolvedConversationId || targetConversationId;
@@ -7432,6 +8182,7 @@ function ChatManager({
             ...initialPendingSnapshot,
             conversationId: resolvedConversationId || targetConversationId,
             projectId: targetProjectId || initialPendingSnapshot.projectId || "",
+            runId: str(pendingRunSnapshot?.runId, initialPendingSnapshot.runId || ""),
             taskId: finalTaskId,
             mode: isResumeMode ? "resume" : "fresh",
             phase: "interrupted",
@@ -7449,7 +8200,7 @@ function ChatManager({
           storeChatPendingRunSnapshot(null);
           setPendingRunSnapshot(null);
           setPendingUserMessage(null);
-          setStreamingSteps([]); setExecutionPlan([]);
+          setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
           setExecutionPlanExpanded(false);
           streamingStepsRef.current = [];
           setStreamingResponse("");
@@ -7458,7 +8209,7 @@ function ChatManager({
         storeChatPendingRunSnapshot(null);
         setPendingRunSnapshot(null);
         setPendingUserMessage(null);
-        setStreamingSteps([]); setExecutionPlan([]);
+        setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
         setExecutionPlanExpanded(false);
         streamingStepsRef.current = [];
         setStreamingResponse("");
@@ -7472,6 +8223,114 @@ function ChatManager({
     }
     return !streamError;
   };
+
+  useEffect(() => {
+    const runId = str(pendingRunSnapshot?.runId, "").trim();
+    const pendingConversationId = str(pendingRunSnapshot?.conversationId, "").trim();
+    if (!runId || !pendingConversationId) return;
+    if (pendingRunSnapshot?.phase === "interrupted") return;
+    if (!conversationId || conversationId !== pendingConversationId) return;
+    if (isStreaming || streamLockRef.current) return;
+    if (reattachedRunIdRef.current === runId) return;
+
+    reattachedRunIdRef.current = runId;
+    const abortController = new AbortController();
+    let latestStreamingResponse = streamingResponse;
+
+    const absorbRunPayload = (payload: unknown) => {
+      const obj = asRecord(payload);
+      const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, pendingConversationId)));
+      const nextRunId = str(obj.run_id, runId);
+      setPendingRunSnapshot((prev) => {
+        const base = prev ?? pendingRunSnapshot ?? {
+          conversationId: cid,
+          message: "",
+          projectId: effectiveProjectId || "",
+          startedAt: Date.now()
+        };
+        const next = {
+          ...base,
+          conversationId: cid || base.conversationId,
+          runId: nextRunId || base.runId || runId
+        };
+        storeChatPendingRunSnapshot(next);
+        return next;
+      });
+    };
+
+    setChatNotice("Reattaching to the live run...");
+    void api.runStream(runId, 0, {
+      signal: abortController.signal,
+      onEvent: (eventName, payload) => {
+        absorbRunPayload(payload);
+        if (
+          eventName === "plan_generated" ||
+          eventName === "plan_revised" ||
+          eventName === "plan_step_update" ||
+          eventName === "plan_unavailable"
+        ) {
+          const planPayload = asRecord(payload);
+          if (Object.keys(planPayload).length > 0) {
+            pushStreamingStep(planPayload);
+          }
+        }
+      },
+      onToken: (token) => {
+        latestStreamingResponse += token;
+        setStreamingResponse((prev) => prev + token);
+      },
+      onThinking: (step) => {
+        absorbRunPayload(step);
+        pushStreamingStep(step);
+      },
+      onToolStart: handleStreamToolStart,
+      onToolResult: handleStreamToolResult,
+      onToolProgress: handleStreamToolProgress,
+      onContent: (payload) => {
+        const text = str(payload.content, "");
+        if (text) {
+          latestStreamingResponse = text;
+          setStreamingResponse(text);
+        }
+        absorbRunPayload(payload);
+      },
+      onError: (messageText) => {
+        if (!abortController.signal.aborted) {
+          setChatError(normalizeChatError(messageText));
+        }
+      },
+      onDone: () => {
+        setChatNotice(null);
+        void queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
+        void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+        void queryClient.invalidateQueries({ queryKey: ["chat-messages", pendingConversationId] });
+      }
+    }).finally(() => {
+      if (!abortController.signal.aborted) {
+        setChatNotice(null);
+        if (!latestStreamingResponse && str(pendingRunSnapshot?.streamingResponse, "")) {
+          setStreamingResponse(str(pendingRunSnapshot?.streamingResponse, ""));
+        }
+      }
+    });
+
+    return () => {
+      abortController.abort();
+      if (reattachedRunIdRef.current === runId) {
+        reattachedRunIdRef.current = "";
+      }
+    };
+  }, [
+    pendingRunSnapshot,
+    conversationId,
+    isStreaming,
+    streamingResponse,
+    effectiveProjectId,
+    queryClient,
+    handleStreamToolStart,
+    handleStreamToolResult,
+    handleStreamToolProgress
+  ]);
 
   const handleStopStreaming = async () => {
     if (!isStreaming && !streamLockRef.current) return;
@@ -7493,6 +8352,9 @@ function ChatManager({
     }
     void queryClient.invalidateQueries({ queryKey: ["tasks"] });
     void queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-status"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-agents"] });
+    void queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
   };
 
   useEffect(() => {
@@ -7740,7 +8602,7 @@ function ChatManager({
           <Typography variant="caption" color="text.secondary">
             AgentArk | working...
           </Typography>
-          <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+          <Typography variant="body2" className="chat-progress-copy" sx={{ whiteSpace: "pre-wrap" }}>
             {msg}
           </Typography>
         </Box>
@@ -7790,11 +8652,21 @@ function ChatManager({
   const persistedExecutionPlan = useMemo(
     () =>
       showStreamingAssistant || hasPendingSnapshotForConversation
-        ? []
+        ? null
         : extractExecutionPlanFromTraceSteps(completedPersistedTraceSteps),
     [showStreamingAssistant, hasPendingSnapshotForConversation, completedPersistedTraceSteps]
   );
-  const displayedExecutionPlan = executionPlan.length > 0 ? executionPlan : persistedExecutionPlan;
+  const persistedExecutionPlanFailure = useMemo(
+    () =>
+      showStreamingAssistant || hasPendingSnapshotForConversation
+        ? ""
+        : extractExecutionPlanFailureFromTraceSteps(completedPersistedTraceSteps),
+    [showStreamingAssistant, hasPendingSnapshotForConversation, completedPersistedTraceSteps]
+  );
+  const displayedExecutionPlanState = executionPlan ?? persistedExecutionPlan;
+  const displayedExecutionPlan = displayedExecutionPlanState?.steps || [];
+  const displayedExecutionPlanSummary = str(displayedExecutionPlanState?.summary, "");
+  const displayedExecutionPlanFailure = executionPlanFailure || persistedExecutionPlanFailure;
   const completedWorkspaceSteps =
     completedPersistedTraceSteps.length >= completedLastRunSteps.length &&
     completedPersistedTraceSteps.length > 0
@@ -7805,6 +8677,13 @@ function ChatManager({
     (showStreamingAssistant || hasPendingSnapshotForConversation) && streamingSteps.length > 0
       ? trimTrailingHeartbeatSteps(streamingSteps)
       : completedWorkspaceSteps;
+  const swarmActivityRuns = useMemo(
+    () =>
+      buildSwarmRunsFromStreamingSteps(workspaceSteps, {
+        interrupted: showInterruptedRunCard
+      }),
+    [workspaceSteps, showInterruptedRunCard]
+  );
   const workspaceCards = useMemo(() => {
     return workspaceSteps.map((step, idx) => safeBuildStepCard(step, idx));
   }, [workspaceSteps]);
@@ -7879,10 +8758,9 @@ function ChatManager({
       ? workspaceSnippetFiles[workspaceSnippetFiles.length - 1] || null
       : null;
   }, [workspaceSnippetFiles, selectedSnippetId, deployedFiles.length]);
-  const activeLiveWrite = activeCodeFile ? liveFileWrites[activeCodeFile.name] : undefined;
   const activePhaseStatus = streamPhaseStatus;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
-    activeLiveWrite?.content || "",
+    activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
     activeCodeFile?.content || ""
   );
   const codeViewerContent = activeCodeFile
@@ -7894,13 +8772,6 @@ function ChatManager({
   const activeWorkspaceCodeContent = activeSnippetFile?.content || codeViewerContent;
   const activeWorkspaceCodeSourceLabel = activeSnippetFile?.sourceLabel || "";
   const isShowingSnippetPreview = Boolean(activeSnippetFile);
-  const codeViewerWriteStatus = activeLiveWrite
-    ? activeLiveWrite.totalLines > 0
-      ? `${Math.min(activeLiveWrite.line, activeLiveWrite.totalLines)}/${activeLiveWrite.totalLines} lines written${activeLiveWrite.done ? " (done)" : ""}`
-      : activeLiveWrite.done
-        ? "File write complete"
-        : "Writing file..."
-    : "";
 
   const appsWorkspaceQ = useQuery({
     queryKey: ["chat-workspace-apps"],
@@ -7992,6 +8863,10 @@ function ChatManager({
   })();
   const showWorkspacePanel = workspaceOpen;
   const showConversationSidebar = conversationSidebarOpen;
+  const showWorkspacePanelInline = showWorkspacePanel && canInlineWorkspacePanel;
+  const showConversationSidebarInline = showConversationSidebar && canInlineConversationSidebar;
+  const showWorkspacePanelDrawer = showWorkspacePanel && !canInlineWorkspacePanel;
+  const showConversationSidebarDrawer = showConversationSidebar && !canInlineConversationSidebar;
   const chatErrorLower = (chatError || "").toLowerCase();
   const chatErrorNormalized = chatError ? normalizeChatError(chatError).toLowerCase() : "";
   const apiKeyActionNeeded =
@@ -8116,18 +8991,6 @@ function ChatManager({
     () => liveWriteEntries.find(([, state]) => !state.done) || liveWriteEntries[0] || null,
     [liveWriteEntries]
   );
-  const activeLiveWriteName = activeLiveWriteEntry?.[0] || "";
-
-  useEffect(() => {
-    if (!activeLiveWriteName) return;
-    const nextIndex = deployedFiles.findIndex((file) => file.name === activeLiveWriteName);
-    if (nextIndex >= 0) {
-      if (selectedSnippetId) setSelectedSnippetId(null);
-      if (nextIndex !== codeViewerFileIdx) {
-        setCodeViewerFileIdx(nextIndex);
-      }
-    }
-  }, [activeLiveWriteName, deployedFiles, codeViewerFileIdx, selectedSnippetId]);
   const executionPlanCompletedCount = displayedExecutionPlan.filter((step) => step.status === "completed").length;
   const executionPlanActiveCount = displayedExecutionPlan.filter((step) => step.status === "running").length;
   const executionPlanFailedCount = displayedExecutionPlan.filter((step) => step.status === "failed").length;
@@ -8135,24 +8998,31 @@ function ChatManager({
     0,
     displayedExecutionPlan.length - executionPlanCompletedCount - executionPlanActiveCount - executionPlanFailedCount
   );
-  const executionPlanStatusLabel = executionPlanFailedCount > 0
+  const executionPlanNeedsAttention = apiKeyActionNeeded || safetyPolicyBlocked;
+  const executionPlanStatusLabel = executionPlanNeedsAttention
     ? "Needs attention"
+    : displayedExecutionPlanFailure
+      ? "Planner offline"
     : executionPlanActiveCount > 0
       ? "Working"
       : displayedExecutionPlan.length > 0 && executionPlanCompletedCount === displayedExecutionPlan.length
         ? "Completed"
+        : executionPlanFailedCount > 0 && executionPlanCompletedCount > 0
+          ? "Completed"
         : "Ready";
   const executionPlanSummaryText = displayedExecutionPlan.length > 0
     ? [
-        `${displayedExecutionPlan.length} step${displayedExecutionPlan.length === 1 ? "" : "s"}`,
+        displayedExecutionPlanSummary || `${displayedExecutionPlan.length} step${displayedExecutionPlan.length === 1 ? "" : "s"}`,
         `${executionPlanCompletedCount} done`,
         executionPlanActiveCount > 0 ? `${executionPlanActiveCount} running` : null,
         executionPlanPendingCount > 0 ? `${executionPlanPendingCount} pending` : null
       ].filter(Boolean).join(" - ")
-    : "";
+    : displayedExecutionPlanFailure;
   const executionPlanTone =
-    executionPlanFailedCount > 0
+    executionPlanNeedsAttention
       ? "failed"
+      : displayedExecutionPlanFailure
+        ? "failed"
       : executionPlanActiveCount > 0
         ? "running"
         : displayedExecutionPlan.length > 0 && executionPlanCompletedCount === displayedExecutionPlan.length
@@ -8230,6 +9100,267 @@ function ChatManager({
     workspaceStatusCopy.line2
   ]);
 
+  const renderConversationSidebarContent = (drawer = false) => (
+    <Box
+      className="list-shell chat-sidebar"
+      sx={{
+        minHeight: 0,
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        maxHeight: drawer ? "none" : { xs: 260, lg: "none" }
+      }}
+    >
+      <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.5}>
+        <Typography variant="h6">Conversations</Typography>
+        <Stack direction="row" spacing={0.75} alignItems="center">
+          <Button
+            size="small"
+            variant="outlined"
+            className="chat-toolbar-btn"
+            onClick={startNewConversation}
+          >
+            New chat
+          </Button>
+          {drawer ? (
+            <IconButton size="small" onClick={() => setConversationSidebarOpen(false)}>
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          ) : null}
+        </Stack>
+      </Stack>
+
+      <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
+        <Stack spacing={0.9} className="conversation-list">
+          {starredConversations.length === 0 && conversations.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              No conversations yet.
+            </Typography>
+          ) : (
+            <>
+              {starredConversations.length > 0 ? (
+                <Box className="conversation-group">
+                  <Typography variant="caption" className="conversation-group-label">
+                    Starred
+                  </Typography>
+                  <Stack spacing={0.9}>
+                    {starredConversations.map((conv) => renderConversationCard(conv))}
+                  </Stack>
+                </Box>
+              ) : null}
+              {conversations.length > 0 ? (
+                <Box className="conversation-group">
+                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 0.25 }}>
+                    <Typography variant="caption" className="conversation-group-label">
+                      All Chats
+                    </Typography>
+                    <Typography variant="caption" className="conversation-page-indicator">
+                      Page {conversationPageLabel}
+                    </Typography>
+                  </Stack>
+                  <Stack spacing={0.9}>
+                    {conversations.map((conv) => renderConversationCard(conv))}
+                  </Stack>
+                </Box>
+              ) : null}
+            </>
+          )}
+        </Stack>
+      </Box>
+      <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" sx={{ mt: 1.25 }}>
+        <Typography variant="caption" className="conversation-pagination-copy">
+          {conversationListTotal} chat{conversationListTotal === 1 ? "" : "s"}
+        </Typography>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => setConversationPage((prev) => Math.max(0, prev - 1))}
+            disabled={conversationPage <= 0}
+          >
+            Prev
+          </Button>
+          <Typography variant="caption" className="conversation-page-indicator">
+            {conversationPageLabel}
+          </Typography>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() =>
+              setConversationPage((prev) =>
+                Math.min(Math.max(0, conversationPageCount - 1), prev + 1)
+              )
+            }
+            disabled={conversationPage >= conversationPageCount - 1}
+          >
+            Next
+          </Button>
+        </Stack>
+      </Stack>
+      <Menu anchorEl={conversationMenuAnchor} open={Boolean(conversationMenuAnchor)} onClose={closeConversationMenu}>
+        <MenuItem
+          disabled={toggleConversationStarMutation.isPending}
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            const starred = toBool(conversationMenuTarget?.starred);
+            closeConversationMenu();
+            if (id) void toggleConversationStar(id, !starred);
+          }}
+        >
+          {toBool(conversationMenuTarget?.starred) ? "Unstar chat" : "Star chat"}
+        </MenuItem>
+        <MenuItem
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            const title = str(conversationMenuTarget?.title, "chat");
+            closeConversationMenu();
+            if (id) void exportConversationById(id, title);
+          }}
+        >
+          Export chat
+        </MenuItem>
+        <MenuItem
+          disabled={isStreaming || deleteConversationMutation.isPending}
+          onClick={() => {
+            const id = str(conversationMenuTarget?.id, "");
+            closeConversationMenu();
+            if (id) void deleteConversation(id);
+          }}
+        >
+          Delete chat
+        </MenuItem>
+      </Menu>
+    </Box>
+  );
+
+  const renderActivityPanelContent = (drawer = false) => (
+    <Box
+      className="list-shell chat-workspace-shell"
+      sx={{
+        minHeight: 0,
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        p: 0.85,
+        alignSelf: "start"
+      }}
+    >
+      {drawer ? (
+        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 0.5, pt: 0.25, pb: 0.75 }}>
+          <Typography variant="subtitle2">Activity</Typography>
+          <IconButton size="small" onClick={() => setWorkspaceOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Stack>
+      ) : null}
+      <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }} className="chat-workspace-sections">
+        <Box className="chat-activity-intro">
+          <Typography variant="overline" className="chat-activity-intro-kicker">
+            Activity
+          </Typography>
+          <Typography variant="body2" className="chat-activity-intro-title">
+            Secondary runtime detail lives here, not in the main conversation.
+          </Typography>
+          <Typography variant="caption" className="chat-activity-intro-copy">
+            Watch progress, previews, and code evidence when you need it. The center pane stays focused on the outcome.
+          </Typography>
+        </Box>
+        {signalRows.length > 0 ? (
+          <Box className="activity-signal-list">
+            {signalRows.map((row) => (
+              <Box key={`${row.label}-${row.value}`} className={`activity-signal-row tone-${row.tone || "default"}`}>
+                <span className="activity-signal-label">{row.label}</span>
+                <Box className="activity-signal-main">
+                  <span className="activity-signal-value">{row.value}</span>
+                  {row.detail ? (
+                    row.href ? (
+                      <Link
+                        href={row.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        underline="hover"
+                        className="activity-signal-detail activity-signal-link"
+                      >
+                        {row.detail}
+                      </Link>
+                    ) : (
+                      <span className="activity-signal-detail">{row.detail}</span>
+                    )
+                  ) : null}
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        ) : null}
+
+        <Box className="term-shell">
+          <Box className="term-titlebar">
+            <span className="term-tl-dot" style={{ background: "#ff5f57" }} />
+            <span className="term-tl-dot" style={{ background: "#febc2e" }} />
+            <span className="term-tl-dot" style={{ background: "#28c840" }} />
+            <Typography variant="caption" className="term-titlebar-text">
+              Live Activity
+            </Typography>
+            <Box sx={{ flex: 1 }} />
+            <Typography variant="caption" className="term-titlebar-stats">
+              {progressSummary}
+            </Typography>
+          </Box>
+          <Box
+            className="term-body"
+            ref={workspaceActivityRef}
+            onScroll={() => {
+              const node = workspaceActivityRef.current;
+              if (!node) return;
+              const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 22;
+              if (nearBottom && !activityAutoFollow) setActivityAutoFollow(true);
+              if (!nearBottom && activityAutoFollow) setActivityAutoFollow(false);
+            }}
+          >
+            {workspaceCards.length === 0 ? (
+              <Box className="term-empty-state">
+                <Typography variant="overline" className="term-empty-kicker">
+                  Quiet for now
+                </Typography>
+                <Typography variant="body2" className="term-empty-copy">
+                  Activity updates will appear here when AgentArk starts working, emits a preview, or records a notable runtime step.
+                </Typography>
+              </Box>
+            ) : (
+              workspaceCards.map((row, idx) => {
+                const isLast = idx === workspaceCards.length - 1;
+                const isActive = isLast && isStreamingForCurrentConversation;
+                const lineTone =
+                  row.kind === "Issue"
+                    ? "var(--danger, #ff7a7a)"
+                    : row.kind === "Done"
+                      ? "var(--success, #74f7bf)"
+                      : row.kind === "Running"
+                        ? "var(--accent-strong, #7fe7ff)"
+                        : row.kind === "Planning"
+                          ? "var(--warning, #ffd36a)"
+                          : "rgba(191, 222, 255, 0.92)";
+                return (
+                  <Box key={`activity-${row.id}`} className={`term-line${isActive ? " term-line-active" : ""}`}>
+                    <span className="term-prompt" style={{ color: lineTone }}>-</span>
+                    <Box className="term-content">
+                      <span className="term-label" style={{ color: lineTone }}>
+                        {row.time ? `[${formatTraceStepTime(row.time)}] ` : ""}{row.label}
+                      </span>
+                      {(row.detailFull || row.detail) ? (
+                        <span className="term-detail">{row.detailFull || row.detail || ""}</span>
+                      ) : null}
+                    </Box>
+                  </Box>
+                );
+              })
+            )}
+          </Box>
+        </Box>
+      </Box>
+    </Box>
+  );
+
   const submitSecretHelper = async (modeOverride?: "reuse" | "manual") => {
     if (secretHelperBusy || isStreaming) return;
     const key = (secretHelperKey || "").trim().toUpperCase();
@@ -8287,146 +9418,28 @@ function ChatManager({
         display: "grid",
         gridTemplateColumns: {
           xs: "1fr",
-          md: showConversationSidebar
-            ? "clamp(220px, 25vw, 270px) minmax(0,1fr)"
+          md: showConversationSidebarInline
+            ? "clamp(208px, 20vw, 240px) minmax(0,1fr)"
             : "1fr",
-          lg: showWorkspacePanel
-            ? showConversationSidebar
-              ? "clamp(214px, 16vw, 248px) minmax(0,1fr) clamp(286px, 21vw, 332px)"
-              : "minmax(0,1fr) clamp(286px, 21vw, 332px)"
-            : showConversationSidebar
-              ? "clamp(214px, 16vw, 248px) minmax(0,1fr)"
+          lg: showWorkspacePanelInline
+            ? showConversationSidebarInline
+              ? "clamp(204px, 14vw, 230px) minmax(0,1fr) clamp(244px, 16vw, 286px)"
+              : "minmax(0,1fr) clamp(244px, 16vw, 286px)"
+            : showConversationSidebarInline
+              ? "clamp(208px, 14vw, 236px) minmax(0,1fr)"
               : "minmax(0,1fr)",
-          xl: showWorkspacePanel
-            ? showConversationSidebar
-              ? "clamp(220px, 15vw, 256px) minmax(0,1fr) clamp(300px, 20vw, 340px)"
-              : "minmax(0,1fr) clamp(300px, 20vw, 340px)"
-            : showConversationSidebar
-              ? "clamp(220px, 15vw, 256px) minmax(0,1fr)"
+          xl: showWorkspacePanelInline
+            ? showConversationSidebarInline
+              ? "clamp(210px, 13vw, 238px) minmax(0,1fr) clamp(252px, 16vw, 294px)"
+              : "minmax(0,1fr) clamp(252px, 16vw, 294px)"
+            : showConversationSidebarInline
+              ? "clamp(216px, 13vw, 244px) minmax(0,1fr)"
               : "minmax(0,1fr)"
         },
-        gap: { xs: 1, md: 1.25 }
+        gap: { xs: 1.1, md: 1.45 }
       }}
     >
-      {showConversationSidebar ? (
-        <Box
-          className="list-shell chat-sidebar"
-          sx={{
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-            maxHeight: { xs: 260, lg: "none" }
-          }}
-        >
-          <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1.25}>
-            <Typography variant="h6">Conversations</Typography>
-            <Button size="small" onClick={startNewConversation}>
-              New chat
-            </Button>
-          </Stack>
-
-          <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", pr: 0.5 }}>
-            <Stack spacing={0.9} className="conversation-list">
-              {starredConversations.length === 0 && conversations.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">
-                  No conversations yet.
-                </Typography>
-              ) : (
-                <>
-                  {starredConversations.length > 0 ? (
-                    <Box className="conversation-group">
-                      <Typography variant="caption" className="conversation-group-label">
-                        Starred
-                      </Typography>
-                      <Stack spacing={0.9}>
-                        {starredConversations.map((conv) => renderConversationCard(conv))}
-                      </Stack>
-                    </Box>
-                  ) : null}
-                  {conversations.length > 0 ? (
-                    <Box className="conversation-group">
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ px: 0.25 }}>
-                        <Typography variant="caption" className="conversation-group-label">
-                          All Chats
-                        </Typography>
-                        <Typography variant="caption" className="conversation-page-indicator">
-                          Page {conversationPageLabel}
-                        </Typography>
-                      </Stack>
-                      <Stack spacing={0.9}>
-                        {conversations.map((conv) => renderConversationCard(conv))}
-                      </Stack>
-                    </Box>
-                  ) : null}
-                </>
-              )}
-            </Stack>
-          </Box>
-          <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" sx={{ mt: 1.25 }}>
-            <Typography variant="caption" className="conversation-pagination-copy">
-              {conversationListTotal} chat{conversationListTotal === 1 ? "" : "s"}
-            </Typography>
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Button
-                size="small"
-                variant="outlined"
-                onClick={() => setConversationPage((prev) => Math.max(0, prev - 1))}
-                disabled={conversationPage <= 0}
-              >
-                Prev
-              </Button>
-              <Typography variant="caption" className="conversation-page-indicator">
-                {conversationPageLabel}
-              </Typography>
-              <Button
-                size="small"
-                variant="outlined"
-                onClick={() =>
-                  setConversationPage((prev) =>
-                    Math.min(Math.max(0, conversationPageCount - 1), prev + 1)
-                  )
-                }
-                disabled={conversationPage >= conversationPageCount - 1}
-              >
-                Next
-              </Button>
-            </Stack>
-          </Stack>
-          <Menu anchorEl={conversationMenuAnchor} open={Boolean(conversationMenuAnchor)} onClose={closeConversationMenu}>
-            <MenuItem
-              disabled={toggleConversationStarMutation.isPending}
-              onClick={() => {
-                const id = str(conversationMenuTarget?.id, "");
-                const starred = toBool(conversationMenuTarget?.starred);
-                closeConversationMenu();
-                if (id) void toggleConversationStar(id, !starred);
-              }}
-            >
-              {toBool(conversationMenuTarget?.starred) ? "Unstar chat" : "Star chat"}
-            </MenuItem>
-            <MenuItem
-              onClick={() => {
-                const id = str(conversationMenuTarget?.id, "");
-                const title = str(conversationMenuTarget?.title, "chat");
-                closeConversationMenu();
-                if (id) void exportConversationById(id, title);
-              }}
-            >
-              Export chat
-            </MenuItem>
-            <MenuItem
-              disabled={isStreaming || deleteConversationMutation.isPending}
-              onClick={() => {
-                const id = str(conversationMenuTarget?.id, "");
-                closeConversationMenu();
-                if (id) void deleteConversation(id);
-              }}
-            >
-              Delete chat
-            </MenuItem>
-          </Menu>
-        </Box>
-      ) : null}
+      {showConversationSidebarInline ? renderConversationSidebarContent() : null}
 
       <Box
         className={`list-shell chat-shell chat-density-immersive${isDragOverChat ? " chat-shell-drop-active" : ""}`}
@@ -8436,30 +9449,38 @@ function ChatManager({
         onDragLeave={handleChatDragLeave}
         onDrop={handleChatDrop}
       >
-        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }} spacing={1.25} mb={1.25}>
-          <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap" }} useFlexGap>
+        <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", sm: "center" }} spacing={1} mb={1}>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap" }} useFlexGap>
             <Button
               size="small"
-              variant={showConversationSidebar ? "contained" : "outlined"}
-              startIcon={showConversationSidebar ? <ChevronLeftRoundedIcon fontSize="small" /> : <ChevronRightRoundedIcon fontSize="small" />}
-              onClick={() => setConversationSidebarOpen((prev) => !prev)}
+              variant="outlined"
+              className={`chat-toolbar-btn${showConversationSidebarInline || showConversationSidebarDrawer ? " active" : ""}`}
+              startIcon={showConversationSidebarInline ? <ChevronLeftRoundedIcon fontSize="small" /> : <ChevronRightRoundedIcon fontSize="small" />}
+              onClick={() => {
+                if (canInlineConversationSidebar) {
+                  setConversationSidebarOpen((prev) => !prev);
+                } else {
+                  setConversationSidebarOpen(true);
+                }
+              }}
             >
-              {showConversationSidebar ? "Hide conversations" : "Conversations"}
+              {showConversationSidebarInline ? "Hide conversations" : "Conversations"}
             </Button>
-            {!showConversationSidebar ? (
+            {!showConversationSidebarInline ? (
               <Button
                 size="small"
                 variant="outlined"
+                className="chat-toolbar-btn"
                 onClick={startNewConversation}
                 disabled={isStreaming}
               >
                 New chat
               </Button>
             ) : null}
-            <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28, bgcolor: "rgba(12,22,40,0.85)" }} />
-            <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>Agent Workspace</Typography>
+            <Avatar src={AgentLogo} variant="rounded" sx={{ width: 24, height: 24, bgcolor: "rgba(12,22,40,0.85)" }} />
+            <Typography variant="body1" sx={{ fontWeight: 600 }}>Focused Workspace</Typography>
           </Stack>
-          <Stack direction="row" spacing={1.1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, flexWrap: "wrap", justifyContent: { xs: "flex-start", sm: "flex-end" } }} useFlexGap>
             <WorkspaceScopeMenuButton
               activeProjectId={activeProjectId}
               projects={projects}
@@ -8472,29 +9493,26 @@ function ChatManager({
                 color="info"
                 clickable={!!onNavigateToView}
                 onClick={() => onNavigateToView?.("sessions")}
-                label={`Session: ${str(activeConversationSession.title, "Background session")} - ${str(activeConversationSession.status, "active")}`}
+                label={`Session: ${str(activeConversationSession.title, "Background session")}`}
                 sx={{ maxWidth: 280 }}
               />
             ) : null}
-            <Tooltip title={showWorkspacePanel ? "Hide workspace panel" : "Show workspace panel"}>
+            <Tooltip title={showWorkspacePanelInline || showWorkspacePanelDrawer ? "Hide activity panel" : "Show activity panel"}>
               <span
-                className={`activity-toggle-pill${showWorkspacePanel ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
-                onClick={() => setWorkspaceOpen((prev) => !prev)}
+                className={`activity-toggle-pill${showWorkspacePanelInline || showWorkspacePanelDrawer ? " active" : ""}${isStreamingForCurrentConversation ? " streaming" : ""}`}
+                onClick={() => {
+                  if (canInlineWorkspacePanel) {
+                    setWorkspaceOpen((prev) => !prev);
+                  } else {
+                    setWorkspaceOpen(true);
+                  }
+                }}
                 style={{ display: "inline-flex" }}
               >
                 <span className="toggle-dot" />
-                Workspace
+                Activity
               </span>
             </Tooltip>
-            {conversationId ? (
-              <Typography variant="caption" color="text.secondary" sx={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" }}>
-                ID: {conversationId}
-              </Typography>
-            ) : (
-              <Typography variant="caption" color="text.secondary">
-                Draft chat
-              </Typography>
-            )}
           </Stack>
         </Stack>
         <Box
@@ -8507,21 +9525,22 @@ function ChatManager({
             flexDirection: "column"
           }}
         >
-          {selectedConversationProjectId ? (
-            <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 1.25 }} useFlexGap flexWrap="wrap">
-              <Chip
-                size="small"
-                variant="outlined"
-                label={`Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`}
-              />
-            </Stack>
-          ) : null}
+          <Box className="chat-reading-column">
+            {selectedConversationProjectId ? (
+              <Stack direction="row" spacing={0.9} alignItems="center" sx={{ mb: 0.5 }} useFlexGap flexWrap="wrap">
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={`Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`}
+                />
+              </Stack>
+            ) : null}
 
-          <Box
-            ref={threadRef}
-            sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
-            className={`chat-thread chat-thread-immersive${showEmptyHero ? " chat-thread-empty" : ""}`}
-          >
+            <Box
+              ref={threadRef}
+              sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
+              className={`chat-thread chat-thread-immersive${showEmptyHero ? " chat-thread-empty" : ""}`}
+            >
             {showEmptyHero ? (
               <Box className="chat-empty-state">
                 <Typography variant="overline" className="chat-empty-kicker">
@@ -8691,6 +9710,7 @@ function ChatManager({
                             This run was stopped before a full reply was sent.
                           </Typography>
                         )}
+                      <SwarmActivityPanel runs={swarmActivityRuns} interrupted />
                       <Box>
                         <Button
                           size="small"
@@ -8736,6 +9756,7 @@ function ChatManager({
                         <span />
                       </div>
                     )}
+                    <SwarmActivityPanel runs={swarmActivityRuns} />
                   </Box>
                 </Box>
               ) : null}
@@ -8907,7 +9928,7 @@ function ChatManager({
             </AccordionDetails>
           </Accordion>
         ) : null}
-        <Box className={`chat-composer-shell${displayedExecutionPlan.length > 0 ? " has-plan" : ""}${executionPlanExpanded ? " plan-expanded" : ""}`}>
+        <Box className={`chat-composer-shell${displayedExecutionPlan.length > 0 || !!displayedExecutionPlanFailure ? " has-plan" : ""}${executionPlanExpanded ? " plan-expanded" : ""}`}>
           {displayedExecutionPlan.length > 0 ? (
             <Box className="chat-composer-plan">
               <Box
@@ -8984,6 +10005,27 @@ function ChatManager({
                   </Stack>
                 </Box>
               ) : null}
+            </Box>
+          ) : displayedExecutionPlanFailure ? (
+            <Box className="chat-composer-plan-warning">
+              <Stack direction="row" spacing={1.1} alignItems="flex-start">
+                <Box className="chat-composer-plan-icon status-failed">
+                  {renderExecutionPlanStatusIcon("failed")}
+                </Box>
+                <Box sx={{ minWidth: 0, flex: 1 }}>
+                  <Stack direction="row" spacing={0.8} alignItems="center" useFlexGap flexWrap="wrap">
+                    <Typography variant="caption" className="chat-composer-plan-kicker">
+                      Planner
+                    </Typography>
+                    <Typography variant="caption" className="chat-composer-plan-status">
+                      Planner offline
+                    </Typography>
+                  </Stack>
+                  <Typography variant="caption" className="chat-composer-plan-summary">
+                    {displayedExecutionPlanFailure}
+                  </Typography>
+                </Box>
+              </Stack>
             </Box>
           ) : null}
           <textarea
@@ -9112,15 +10154,33 @@ function ChatManager({
             )}
           </div>
         </Box>
+          </Box>
         </Box>
       </Box>
 
-      {showWorkspacePanel ? (
+      {showWorkspacePanelInline ? (
         <Box
           className="list-shell chat-workspace-shell"
-          sx={{ minHeight: 0, display: { xs: "none", lg: "flex" }, flexDirection: "column", p: 1.15 }}
+          sx={{
+            minHeight: 0,
+            display: { xs: "none", lg: "flex" },
+            flexDirection: "column",
+            p: 0.85,
+            alignSelf: "start"
+          }}
         >
           <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }} className="chat-workspace-sections">
+              <Box className="chat-activity-intro">
+                <Typography variant="overline" className="chat-activity-intro-kicker">
+                  Activity
+                </Typography>
+                <Typography variant="body2" className="chat-activity-intro-title">
+                  Secondary runtime detail lives here, not in the main conversation.
+                </Typography>
+                <Typography variant="caption" className="chat-activity-intro-copy">
+                  Watch progress, previews, and code evidence when you need it. The center pane stays focused on the outcome.
+                </Typography>
+              </Box>
               {signalRows.length > 0 ? (
                 <Box className="activity-signal-list">
                   {signalRows.map((row) => (
@@ -9155,7 +10215,7 @@ function ChatManager({
                   <span className="term-tl-dot" style={{ background: "#febc2e" }} />
                   <span className="term-tl-dot" style={{ background: "#28c840" }} />
                   <Typography variant="caption" className="term-titlebar-text">
-                    AgentArk Console
+                    Live Activity
                   </Typography>
                   <Box sx={{ flex: 1 }} />
                   <Typography variant="caption" className="term-titlebar-stats">
@@ -9174,9 +10234,13 @@ function ChatManager({
                     }}
                   >
                     {workspaceCards.length === 0 ? (
-                      <Box className="term-line">
-                        <span className="term-prompt">&gt;</span>
-                        <span className="term-text term-dim">awaiting_activity</span>
+                      <Box className="term-empty-state">
+                        <Typography variant="overline" className="term-empty-kicker">
+                          Quiet for now
+                        </Typography>
+                        <Typography variant="body2" className="term-empty-copy">
+                          Activity updates will appear here when AgentArk starts working, emits a preview, or records a notable runtime step.
+                        </Typography>
                       </Box>
                     ) : (
                       workspaceCards.map((row, idx) => {
@@ -9209,45 +10273,6 @@ function ChatManager({
                     )}
                   </Box>
               </Box>
-
-
-            {deployedFiles.length > 0 ? (
-              <Accordion className="chat-workspace-section" disableGutters>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
-                  <Typography variant="subtitle2">Files ({deployedFiles.length})</Typography>
-                </AccordionSummary>
-                <AccordionDetails sx={{ p: "4px 8px 8px" }}>
-                  <Stack spacing={0.5}>
-                    {deployedFiles.map((f, i) => {
-                      const live = liveFileWrites[f.name];
-                      return (
-                        <Box
-                          key={f.name}
-                          className={`deployed-file-row${live && !live.done ? " is-live" : ""}${i === codeViewerFileIdx ? " is-selected" : ""}`}
-                          onClick={() => {
-                            setSelectedSnippetId(null);
-                            setCodeViewerFileIdx(i);
-                          }}
-                        >
-                          <span className="deployed-file-icon">&#128196;</span>
-                          <span className="deployed-file-name">{f.name}</span>
-                          <span className="deployed-file-size">
-                            {(() => {
-                              if (!live) return `${(f.content.length / 1024).toFixed(1)}KB`;
-                              if (live.totalLines > 0) {
-                                return `${Math.min(live.line, live.totalLines)}/${live.totalLines} lines${live.done ? " done" : ""}`;
-                              }
-                              return live.done ? "written" : "writing...";
-                            })()}
-                          </span>
-                        </Box>
-                      );
-                    })}
-                  </Stack>
-                </AccordionDetails>
-              </Accordion>
-            ) : null}
-
             {workspaceSnippetFiles.length > 0 ? (
               <Accordion className="chat-workspace-section" disableGutters>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
@@ -9274,12 +10299,12 @@ function ChatManager({
               </Accordion>
             ) : null}
 
-            {activeWorkspaceCodeEntry ? (
+            {isShowingSnippetPreview && activeWorkspaceCodeEntry ? (
               <Accordion className="chat-workspace-section" disableGutters defaultExpanded>
                 <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 34 }}>
                   <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-summary">
                     <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-heading">
-                      <Typography variant="subtitle2">{isShowingSnippetPreview ? "Code preview" : "Live code"}</Typography>
+                      <Typography variant="subtitle2">Snippet preview</Typography>
                       <Typography
                         variant="caption"
                         className="chat-workspace-code-path"
@@ -9290,25 +10315,14 @@ function ChatManager({
                     </Stack>
                     <Box sx={{ flex: 1, minWidth: 0 }} />
                     <Stack direction="row" spacing={1} alignItems="center" className="chat-workspace-code-actions">
-                      {isShowingSnippetPreview ? (
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          className="chat-workspace-code-meta"
-                          title={activeWorkspaceCodeSourceLabel}
-                        >
-                          {activeWorkspaceCodeSourceLabel}
-                        </Typography>
-                      ) : codeViewerWriteStatus ? (
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          className="chat-workspace-code-meta"
-                          title={codeViewerWriteStatus}
-                        >
-                          {codeViewerWriteStatus}
-                        </Typography>
-                      ) : null}
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        className="chat-workspace-code-meta"
+                        title={activeWorkspaceCodeSourceLabel}
+                      >
+                        {activeWorkspaceCodeSourceLabel}
+                      </Typography>
                       <Button
                         size="small"
                         variant="text"
@@ -9324,54 +10338,27 @@ function ChatManager({
                   </Stack>
                 </AccordionSummary>
                 <AccordionDetails>
-                  {isShowingSnippetPreview ? (
-                    workspaceSnippetFiles.length > 1 ? (
-                      <Box className="code-file-tabs chat-workspace-file-tabs">
-                        {workspaceSnippetFiles.map((snippet) => (
-                          <button
-                            key={snippet.id}
-                            className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
-                            onClick={() => setSelectedSnippetId(snippet.id)}
-                          >
-                            {snippet.displayName}
-                          </button>
-                        ))}
-                      </Box>
-                    ) : null
-                  ) : deployedFiles.length > 1 ? (
+                  {workspaceSnippetFiles.length > 1 ? (
                     <Box className="code-file-tabs chat-workspace-file-tabs">
-                      {deployedFiles.map((f, i) => (
+                      {workspaceSnippetFiles.map((snippet) => (
                         <button
-                          key={f.name}
-                          className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
-                          onClick={() => {
-                            setSelectedSnippetId(null);
-                            setCodeViewerFileIdx(i);
-                          }}
+                          key={snippet.id}
+                          className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                          onClick={() => setSelectedSnippetId(snippet.id)}
                         >
-                          {f.name}
+                          {snippet.displayName}
                         </button>
                       ))}
                     </Box>
                   ) : null}
                   <pre className="code-viewer-pre chat-workspace-code-inline">
                     <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
-                      fileName: activeWorkspaceCodePath,
-                      activeLine:
-                        !isShowingSnippetPreview && activeLiveWrite && !activeLiveWrite.done
-                          ? activeLiveWrite.line
-                          : null
+                      fileName: activeWorkspaceCodePath
                     })}</code>
                   </pre>
-                  {isShowingSnippetPreview ? (
-                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-                      Referenced from {activeWorkspaceCodeSourceLabel}.
-                    </Typography>
-                  ) : activeLiveWrite && !activeLiveWrite.done ? (
-                    <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-                      Writing in progress...
-                    </Typography>
-                  ) : null}
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+                    Referenced from {activeWorkspaceCodeSourceLabel}.
+                  </Typography>
                 </AccordionDetails>
               </Accordion>
             ) : codeSnapshot ? (
@@ -9450,9 +10437,29 @@ function ChatManager({
         </Box>
       ) : null}
 
+      <Drawer
+        anchor="left"
+        open={showConversationSidebarDrawer}
+        onClose={() => setConversationSidebarOpen(false)}
+        ModalProps={{ keepMounted: true }}
+        PaperProps={{ className: "chat-mobile-drawer chat-mobile-drawer-left" }}
+      >
+        {renderConversationSidebarContent(true)}
+      </Drawer>
+
+      <Drawer
+        anchor="right"
+        open={showWorkspacePanelDrawer}
+        onClose={() => setWorkspaceOpen(false)}
+        ModalProps={{ keepMounted: true }}
+        PaperProps={{ className: "chat-mobile-drawer chat-mobile-drawer-right" }}
+      >
+        {renderActivityPanelContent(true)}
+      </Drawer>
+
       {/* Code Viewer Dialog */}
       <Dialog
-        open={codeViewerOpen}
+        open={codeViewerOpen && isShowingSnippetPreview}
         onClose={() => setCodeViewerOpen(false)}
         maxWidth="lg"
         fullWidth
@@ -9462,78 +10469,43 @@ function ChatManager({
           <Stack direction="row" justifyContent="space-between" alignItems="center">
             <Box>
               <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
-                {isShowingSnippetPreview ? "Assistant Snippets" : "Generated Files"}
+                Assistant Snippets
               </Typography>
-              {isShowingSnippetPreview ? (
-                <Typography variant="caption" color="text.secondary">
-                  {activeWorkspaceCodeSourceLabel}
-                </Typography>
-              ) : activeCodeFile && codeViewerWriteStatus ? (
-                <Typography variant="caption" color="text.secondary">
-                  {`${activeCodeFile.name} - ${codeViewerWriteStatus}`}
-                </Typography>
-              ) : null}
+              <Typography variant="caption" color="text.secondary">
+                {activeWorkspaceCodeSourceLabel}
+              </Typography>
             </Box>
             <IconButton size="small" onClick={() => setCodeViewerOpen(false)}>
               <CloseIcon fontSize="small" />
             </IconButton>
           </Stack>
-          {isShowingSnippetPreview ? (
-            workspaceSnippetFiles.length > 1 ? (
-              <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
-                {workspaceSnippetFiles.map((snippet) => (
-                  <button
-                    key={snippet.id}
-                    className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
-                    onClick={() => setSelectedSnippetId(snippet.id)}
-                  >
-                    {snippet.displayName}
-                  </button>
-                ))}
-              </Box>
-            ) : null
-          ) : deployedFiles.length > 1 && (
+          {workspaceSnippetFiles.length > 1 ? (
             <Box className="code-file-tabs" sx={{ mt: 0.5 }}>
-              {deployedFiles.map((f, i) => (
+              {workspaceSnippetFiles.map((snippet) => (
                 <button
-                  key={f.name}
-                  className={`code-file-tab${i === codeViewerFileIdx ? " code-file-tab-active" : ""}`}
-                  onClick={() => {
-                    setSelectedSnippetId(null);
-                    setCodeViewerFileIdx(i);
-                  }}
+                  key={snippet.id}
+                  className={`code-file-tab${activeSnippetFile?.id === snippet.id ? " code-file-tab-active" : ""}`}
+                  onClick={() => setSelectedSnippetId(snippet.id)}
                 >
-                  {f.name}
+                  {snippet.displayName}
                 </button>
               ))}
             </Box>
-          )}
+          ) : null}
         </DialogTitle>
         <DialogContent sx={{ p: 0 }}>
           {activeWorkspaceCodeEntry && (
             <>
               <pre className="code-viewer-pre">
                 <code>{renderCodeBlockLines(activeWorkspaceCodeContent || "", {
-                  fileName: activeWorkspaceCodePath,
-                  activeLine:
-                    !isShowingSnippetPreview && activeLiveWrite && !activeLiveWrite.done
-                      ? activeLiveWrite.line
-                      : null
+                  fileName: activeWorkspaceCodePath
                 })}</code>
               </pre>
-              {isShowingSnippetPreview ? (
-                <Box sx={{ px: 1.5, pb: 1 }}>
-                  <Typography variant="caption" color="text.secondary">
-                    Referenced from {activeWorkspaceCodeSourceLabel}.
-                  </Typography>
-                </Box>
-              ) : activeLiveWrite && !activeLiveWrite.done ? (
-                <Box sx={{ px: 1.5, pb: 1 }}>
-                  <Typography variant="caption" color="text.secondary">
-                    Writing in progress...
-                  </Typography>
-                </Box>
-              ) : null}
+              <Box sx={{ px: 1.5, pb: 1 }}>
+                <Typography variant="caption" color="text.secondary">
+                  Referenced from {activeWorkspaceCodeSourceLabel}.
+                </Typography>
+              </Box>
             </>
           )}
         </DialogContent>
@@ -9600,6 +10572,9 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [approval, setApproval] = useState("auto");
   const [formError, setFormError] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<JsonRecord | null>(null);
+  const [editTaskInputsOpen, setEditTaskInputsOpen] = useState(false);
+  const [editTaskInputsJson, setEditTaskInputsJson] = useState("{}");
+  const [editTaskInputsError, setEditTaskInputsError] = useState<string | null>(null);
 
   function resetTaskCreateForm(): void {
     setQuickIntent("");
@@ -9620,7 +10595,67 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
     setFormError(null);
   }
 
-  function statusLabel(raw: string): string {
+  function parseTaskResultPayload(raw: unknown): JsonRecord | null {
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return asRecord(raw);
+    }
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const normalized = trimmed.startsWith(TASK_INPUT_NEEDED_MARKER)
+      ? trimmed.slice(TASK_INPUT_NEEDED_MARKER.length).trim()
+      : trimmed;
+    try {
+      const parsed = JSON.parse(normalized);
+      return parsed && typeof parsed === "object" ? (parsed as JsonRecord) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function normalizeStringList(raw: unknown): string[] {
+    if (Array.isArray(raw)) {
+      return raw
+        .map((value) => String(value).trim())
+        .filter((value) => !!value);
+    }
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      return trimmed ? [trimmed] : [];
+    }
+    return [];
+  }
+
+  function inputNeededResult(task: JsonRecord): JsonRecord | null {
+    const payload = parseTaskResultPayload(task.result);
+    if (!payload) return null;
+    const kind = str(payload.kind, "").toLowerCase();
+    if (kind === "input_needed" || kind === "input-needed" || kind === "workflow_inputs") {
+      return payload;
+    }
+    return null;
+  }
+
+  function isSensitiveTaskInputKey(raw: string): boolean {
+    const lower = raw.trim().toLowerCase();
+    if (!lower) return false;
+    return [
+      "key",
+      "token",
+      "secret",
+      "password",
+      "passwd",
+      "credential",
+      "auth",
+      "api_key",
+      "client_secret",
+      "webhook_secret"
+    ].some((token) => lower.includes(token));
+  }
+
+  function statusLabel(raw: string, result?: unknown): string {
+    const needed = result && inputNeededResult(asRecord({ result }));
+    if (needed) return "Input needed";
     const s = (raw || "").toLowerCase();
     if (s.includes("awaitingapproval")) return "Needs approval";
     if (s.includes("paused")) return "Paused";
@@ -9632,7 +10667,9 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
     return raw || "-";
   }
 
-  function statusColor(raw: string): "success" | "warning" | "error" | "default" | "info" {
+  function statusColor(raw: string, result?: unknown): "success" | "warning" | "error" | "default" | "info" {
+    const needed = result && inputNeededResult(asRecord({ result }));
+    if (needed) return "warning";
     const s = (raw || "").toLowerCase();
     if (s.includes("failed")) return "error";
     if (s.includes("awaitingapproval")) return "warning";
@@ -9667,6 +10704,38 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
     }) => (method === "DELETE" ? api.rawDelete(path) : api.rawPost(path, payload ?? {})),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+    }
+  });
+  const updateTaskInputsMutation = useMutation({
+    mutationFn: async ({
+      id,
+      argumentsJson
+    }: {
+      id: string;
+      argumentsJson: string;
+    }) => {
+      const trimmed = argumentsJson.trim() || "{}";
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        throw new Error("Arguments JSON must be valid JSON.");
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Arguments JSON must be a JSON object.");
+      }
+      await api.rawPost(`/tasks/${encodeURIComponent(id)}`, { arguments: parsed });
+      return parsed as JsonRecord;
+    },
+    onSuccess: async (parsed, variables) => {
+      await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
+      setSelectedTask((current) =>
+        current && str(current.id, "").trim() === variables.id
+          ? { ...current, arguments: parsed }
+          : current
+      );
+      setEditTaskInputsOpen(false);
+      setEditTaskInputsError(null);
     }
   });
 
@@ -9767,8 +10836,20 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   };
   const counts = useMemo(() => {
-    const by = { total: tasks.length, queued: 0, running: 0, needs_approval: 0, paused: 0, done: 0 };
+    const by = {
+      total: tasks.length,
+      queued: 0,
+      running: 0,
+      needs_approval: 0,
+      input_needed: 0,
+      paused: 0,
+      done: 0
+    };
     for (const t of tasks) {
+      if (inputNeededResult(t)) {
+        by.input_needed += 1;
+        continue;
+      }
       const s = str(t.status, "").toLowerCase();
       if (s.includes("awaitingapproval")) by.needs_approval += 1;
       else if (s.includes("paused")) by.paused += 1;
@@ -9780,7 +10861,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
   }, [tasks]);
 
   return (
-    <Stack spacing={2}>
+    <Stack spacing={1.5} sx={{ flex: 1, minHeight: 0, height: "100%" }}>
       <Box className="list-shell">
         <Stack
           direction={{ xs: "column", sm: "row" }}
@@ -9824,14 +10905,20 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
         </Grid2>
         <Grid2 size={{ xs: 12, sm: 6, md: 3 }}>
           <Box className="list-shell" sx={{ minHeight: 120 }}>
-            <Typography variant="caption" color="text.secondary">Done</Typography>
-            <Typography variant="h5">{counts.done}</Typography>
+            <Typography variant="caption" color="text.secondary">Input Needed</Typography>
+            <Typography variant="h5">{counts.input_needed}</Typography>
           </Box>
         </Grid2>
         <Grid2 size={{ xs: 12, sm: 6, md: 3 }}>
           <Box className="list-shell" sx={{ minHeight: 120 }}>
             <Typography variant="caption" color="text.secondary">Paused</Typography>
             <Typography variant="h5">{counts.paused}</Typography>
+          </Box>
+        </Grid2>
+        <Grid2 size={{ xs: 12, sm: 6, md: 3 }}>
+          <Box className="list-shell" sx={{ minHeight: 120 }}>
+            <Typography variant="caption" color="text.secondary">Done</Typography>
+            <Typography variant="h5">{counts.done}</Typography>
           </Box>
         </Grid2>
       </Grid2>
@@ -9955,7 +11042,7 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
                       </Typography>
                     </TableCell>
                     <TableCell>
-                      <Chip size="small" label={statusLabel(rawStatus)} color={statusColor(rawStatus)} />
+                      <Chip size="small" label={statusLabel(rawStatus, task.result)} color={statusColor(rawStatus, task.result)} />
                     </TableCell>
                     <TableCell sx={{ maxWidth: 220 }}>
                       <Typography variant="body2" noWrap title={schedule}>
@@ -9984,8 +11071,8 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
               <Chip
                 size="small"
-                label={statusLabel(str(selectedTask?.status, ""))}
-                color={statusColor(str(selectedTask?.status, ""))}
+                label={statusLabel(str(selectedTask?.status, ""), selectedTask?.result)}
+                color={statusColor(str(selectedTask?.status, ""), selectedTask?.result)}
               />
               <Chip size="small" variant="outlined" label={str(selectedTask?.cron, "") ? "Scheduled" : "Manual"} />
               <Chip size="small" variant="outlined" label={`Action: ${str(selectedTask?.action, "-")}`} />
@@ -10017,7 +11104,101 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
               </Box>
             ) : null}
 
-            {str(selectedTask?.result, "") ? (
+            {selectedTask && inputNeededResult(selectedTask) ? (() => {
+              const payload = inputNeededResult(selectedTask);
+              const missing = normalizeStringList(payload?.missing);
+              const required = normalizeStringList(payload?.required);
+              const provided = normalizeStringList(payload?.provided);
+              const summary = str(
+                payload?.summary,
+                "This task is paused until the missing inputs are provided."
+              );
+              const canEditTaskInputs = missing.some((item) => !isSensitiveTaskInputKey(item));
+              const fixHint = str(
+                payload?.resolution_hint,
+                str(
+                  payload?.fix_hint,
+                  "Update the task inputs or required secrets, then resume it."
+                )
+              );
+
+              return (
+                <Stack spacing={1}>
+                  <Alert severity="warning">
+                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                      Input needed
+                    </Typography>
+                    <Typography variant="body2">{summary}</Typography>
+                  </Alert>
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">
+                      Missing fields
+                    </Typography>
+                    {missing.length === 0 ? (
+                      <Typography variant="body2">Required inputs were not specified.</Typography>
+                    ) : (
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                        {missing.map((item) => (
+                          <Chip key={item} size="small" label={item} color="warning" variant="outlined" />
+                        ))}
+                      </Stack>
+                    )}
+                  </Box>
+                  {required.length > 0 ? (
+                    <Box className="metadata-box">
+                      <Typography variant="caption" color="text.secondary">
+                        Required inputs
+                      </Typography>
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                        {required.map((item) => (
+                          <Chip key={item} size="small" label={item} variant="outlined" />
+                        ))}
+                      </Stack>
+                    </Box>
+                  ) : null}
+                  {provided.length > 0 ? (
+                    <Box className="metadata-box">
+                      <Typography variant="caption" color="text.secondary">
+                        Already provided
+                      </Typography>
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                        {provided.map((item) => (
+                          <Chip key={item} size="small" label={item} variant="outlined" />
+                        ))}
+                      </Stack>
+                    </Box>
+                  ) : null}
+                  <Box className="metadata-box">
+                    <Typography variant="caption" color="text.secondary">
+                      Fix guidance
+                    </Typography>
+                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                      {fixHint}
+                    </Typography>
+                  </Box>
+                  <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "stretch", sm: "center" }}>
+                    {canEditTaskInputs ? (
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        onClick={() => {
+                          setEditTaskInputsError(null);
+                          setEditTaskInputsJson(
+                            JSON.stringify(asRecord(selectedTask?.arguments), null, 2)
+                          );
+                          setEditTaskInputsOpen(true);
+                        }}
+                      >
+                        Edit task inputs
+                      </Button>
+                    ) : null}
+                    <Typography variant="caption" color="text.secondary">
+                      Save the missing values, then resume the task from the task list.
+                    </Typography>
+                  </Stack>
+                </Stack>
+              );
+            })() : str(selectedTask?.result, "") ? (
               <Box className="metadata-box">
                 <Typography variant="caption" color="text.secondary">
                   Last Result
@@ -10036,6 +11217,69 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
             <KeyValuePanel title="System fields" data={asRecord(selectedTask)} emptyLabel="No extra fields." maxRows={10} />
           </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editTaskInputsOpen}
+        onClose={() => {
+          if (!updateTaskInputsMutation.isPending) {
+            setEditTaskInputsOpen(false);
+            setEditTaskInputsError(null);
+          }
+        }}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Edit Task Inputs</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            <Typography variant="body2" color="text.secondary">
+              Update the arguments JSON with the missing fields, save it, then resume the task.
+            </Typography>
+            <TextField
+              fullWidth
+              multiline
+              minRows={10}
+              label="Arguments JSON"
+              value={editTaskInputsJson}
+              onChange={(event) => setEditTaskInputsJson(event.target.value)}
+            />
+            {editTaskInputsError ? <Alert severity="error">{editTaskInputsError}</Alert> : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setEditTaskInputsOpen(false);
+              setEditTaskInputsError(null);
+            }}
+            disabled={updateTaskInputsMutation.isPending}
+          >
+            Close
+          </Button>
+          <Button
+            variant="contained"
+            disabled={updateTaskInputsMutation.isPending || !selectedTask}
+            onClick={async () => {
+              const taskId = str(selectedTask?.id, "").trim();
+              if (!taskId) {
+                setEditTaskInputsError("Task id is missing.");
+                return;
+              }
+              setEditTaskInputsError(null);
+              try {
+                await updateTaskInputsMutation.mutateAsync({
+                  id: taskId,
+                  argumentsJson: editTaskInputsJson
+                });
+              } catch (error) {
+                setEditTaskInputsError(errMessage(error));
+              }
+            }}
+          >
+            {updateTaskInputsMutation.isPending ? "Saving..." : "Save inputs"}
+          </Button>
+        </DialogActions>
       </Dialog>
 
       <Dialog open={createTaskOpen} onClose={closeCreateTaskDialog} maxWidth="md" fullWidth>
@@ -10181,6 +11425,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [lastImport, setLastImport] = useState<SkillImportSummary | null>(null);
   const [testResults, setTestResults] = useState<Record<string, string>>({});
   const [skillMenuAnchor, setSkillMenuAnchor] = useState<{ el: HTMLElement; name: string } | null>(null);
+  const [bundledSkillsExpanded, setBundledSkillsExpanded] = useState(true);
   const [importOpen, setImportOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -10348,6 +11593,12 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
     return map;
   }, [hookRuns]);
+
+  useEffect(() => {
+    if (bundledSkills.length > 0) {
+      setBundledSkillsExpanded(true);
+    }
+  }, [bundledSkills.length]);
 
   const closeEditor = () => {
     setEditOpen(false);
@@ -10652,13 +11903,14 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   const renderActionRow = (action: JsonRecord, type: "system" | "bundled" | "custom") => {
-    const name = str(action.name, "Untitled");
-    const description = str(action.description, "No description");
-    const version = str(action.version, "?");
-    const enabled = toBool(action.enabled);
-    const testMessage = testResults[name];
-    const isTesting = testMutation.isPending && testMutation.variables?.name === name;
-    const isSystem = type === "system";
+      const name = str(action.name, "Untitled");
+      const description = str(action.description, "No description");
+      const version = str(action.version, "?");
+      const enabled = toBool(action.enabled);
+      const testMessage = testResults[name];
+      const isTesting = testMutation.isPending && testMutation.variables?.name === name;
+      const isSystem = type === "system";
+      const isBundled = type === "bundled";
 
     const menuOpen = skillMenuAnchor?.name === name;
 
@@ -10733,20 +11985,24 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
                     </MenuItem>
                   ) : null}
                   <Divider />
-                  <MenuItem
-                    disabled={deleteSkillMutation.isPending}
-                    sx={{ color: "error.main" }}
-                    onClick={async () => {
-                      setSkillMenuAnchor(null);
-                      const ok = window.confirm(`Delete skill "${name}"? This cannot be undone.`);
-                      if (ok) deleteSkillMutation.mutate(name);
-                    }}
-                  >
-                    Delete
-                  </MenuItem>
-                </Menu>
-              </>
-            ) : null}
+                    <MenuItem
+                      disabled={deleteSkillMutation.isPending}
+                      sx={{ color: "error.main" }}
+                      onClick={async () => {
+                        setSkillMenuAnchor(null);
+                        const ok = window.confirm(
+                          isBundled
+                            ? `Delete bundled skill "${name}" from this install? Fresh installs restore it from the image defaults.`
+                            : `Delete skill "${name}"? This cannot be undone.`
+                        );
+                        if (ok) deleteSkillMutation.mutate(name);
+                      }}
+                    >
+                      Delete
+                    </MenuItem>
+                  </Menu>
+                </>
+              ) : null}
           </Stack>
         </Stack>
       </Box>
@@ -10785,7 +12041,7 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
           ) : null}
         </Stack>
         <Typography variant="body2" color="text.secondary">
-          System skills: {systemSkills.length}, custom skills: {customSkills.length}, automations: {hooks.length}.
+          System skills: {systemSkills.length}, bundled skills: {bundledSkills.length}, custom skills: {customSkills.length}, automations: {hooks.length}.
         </Typography>
         {skillsTab === "manage" ? (
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
@@ -10944,27 +12200,31 @@ function SkillsManager({ autoRefresh }: { autoRefresh: boolean }) {
 
           <Box className="list-shell">
             <Accordion
-              defaultExpanded={false}
+              expanded={bundledSkillsExpanded}
+              onChange={(_, expanded) => setBundledSkillsExpanded(expanded)}
               elevation={0}
               sx={{
                 background: "transparent",
                 "&::before": { display: "none" }
               }}
             >
-              <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0 }}>
-                <Stack spacing={0.25}>
-                  <Typography variant="h6">Bundled Skills</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Ready-made skills you can enable and use.
-                  </Typography>
-                </Stack>
-              </AccordionSummary>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0 }}>
+                  <Stack spacing={0.25}>
+                    <Typography variant="h6">Bundled Skills ({bundledSkills.length})</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Ready-made skills you can enable and use.
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Deleting one removes it for this install. Fresh installs restore the bundled defaults.
+                    </Typography>
+                  </Stack>
+                </AccordionSummary>
               <AccordionDetails sx={{ px: 0, pt: 0 }}>
-                {bundledSkills.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
-                    No bundled skills detected.
-                  </Typography>
-                ) : (
+                  {bundledSkills.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No bundled skills available in this install.
+                    </Typography>
+                  ) : (
                   <Stack spacing={1}>{bundledSkills.map((act) => renderActionRow(act, "bundled"))}</Stack>
                 )}
               </AccordionDetails>
@@ -11544,16 +12804,12 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     queryFn: () => api.rawGet("/tunnel/status"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
   });
-  const evolutionQ = useQuery({
-    queryKey: ["settings-evolution"],
-    queryFn: () => api.rawGet("/settings/evolution"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
-  });
   const [tunnelActionError, setTunnelActionError] = useState<string | null>(null);
   const [tunnelActionState, setTunnelActionState] = useState<"idle" | "starting" | "stopping">("idle");
   const [tunnelActionAppId, setTunnelActionAppId] = useState<string>("");
   const [appsActionError, setAppsActionError] = useState<string | null>(null);
   const [appsActionSuccess, setAppsActionSuccess] = useState<string | null>(null);
+  const [appsRestartNotice, setAppsRestartNotice] = useState<string | null>(null);
   const [appsActionBusy, setAppsActionBusy] = useState<string | null>(null);
 
   const opMutation = useMutation({
@@ -11562,12 +12818,6 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["apps-manager"] });
       await queryClient.invalidateQueries({ queryKey: ["apps-manager-tunnel-status"] });
-    }
-  });
-  const updateEvolutionSettingsMutation = useMutation({
-    mutationFn: (payload: JsonRecord) => api.rawPost("/settings/evolution", payload),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["settings-evolution"] });
     }
   });
   const tunnelStartMutation = useMutation({
@@ -11605,8 +12855,6 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const tunnelAvailable = toBool(tunnel.available);
   const tunnelErrorText = str(tunnel.error, "").trim();
   const selectedPublicAppId = str(tunnel.selected_app_id, "").trim();
-  const evolution = asRecord(evolutionQ.data);
-  const deployGuardDefault = toBool(evolution.deploy_guard_default);
   const tunnelStarting = tunnelActionState === "starting" || tunnelStartMutation.isPending;
   const tunnelStopping = tunnelActionState === "stopping" || tunnelStopMutation.isPending;
 
@@ -11628,6 +12876,21 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
       return () => clearTimeout(timer);
     }
   }, [appsActionSuccess]);
+
+  useEffect(() => {
+    if (!appsRestartNotice) return;
+    const timer = window.setTimeout(() => setAppsRestartNotice(null), RESTART_NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [appsRestartNotice]);
+
+  useEffect(() => {
+    if (!appsRestartNotice) return;
+    const timer = window.setInterval(() => {
+      void appsQ.refetch();
+      void tunnelQ.refetch();
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [appsRestartNotice, appsQ, tunnelQ]);
 
   useEffect(() => {
     if (autoRefresh || (!restoreActive && restoringAppsCount === 0)) return;
@@ -11659,25 +12922,25 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
   const runAppOp = async (opts: { label: string; path: string; method: "POST" | "DELETE"; body?: JsonRecord }) => {
     setAppsActionError(null);
     setAppsActionSuccess(null);
+    setAppsRestartNotice(null);
     setAppsActionBusy(opts.label);
     try {
       await opMutation.mutateAsync({ path: opts.path, method: opts.method, body: opts.body });
       await refreshAppState();
-      setAppsActionSuccess(`${opts.label} completed.`);
+      if (/\brestart\b|\breload\b/i.test(opts.label)) {
+        setAppsRestartNotice(
+          /reload/i.test(opts.label)
+            ? "App refresh in progress. Give it up to 10 seconds. This card will disappear automatically."
+            : "App restart in progress. Give it up to 10 seconds. This card will disappear automatically."
+        );
+      } else {
+        setAppsActionSuccess(`${opts.label} completed.`);
+      }
     } catch (e) {
+      setAppsRestartNotice(null);
       setAppsActionError(errMessage(e));
     } finally {
       setAppsActionBusy(null);
-    }
-  };
-  const setDeployGuardDefault = async (enabled: boolean) => {
-    setAppsActionError(null);
-    setAppsActionSuccess(null);
-    try {
-      await updateEvolutionSettingsMutation.mutateAsync({ deploy_guard_default: enabled });
-      setAppsActionSuccess(`Deploy guard default ${enabled ? "enabled" : "disabled"}.`);
-    } catch (e) {
-      setAppsActionError(errMessage(e));
     }
   };
   const startTunnel = async (appId?: string) => {
@@ -11711,35 +12974,39 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Box>
             <Typography variant="h6">Deployed Apps</Typography>
             <Typography variant="caption" color="text.secondary">
-              Manage app runtime, public exposure, and guard defaults.
+              Manage app runtime, health, and local access.
             </Typography>
           </Box>
-          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-            <Chip
-              size="small"
-              color={deployGuardDefault ? "warning" : "default"}
-              label={deployGuardDefault ? "Guard default ON" : "Guard default OFF"}
-            />
-            <Tooltip title="Toggle the default access guard behavior used for new app deploys." arrow>
-              <span>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  disabled={updateEvolutionSettingsMutation.isPending}
-                  onClick={() => void setDeployGuardDefault(!deployGuardDefault)}
-                >
-                  {deployGuardDefault ? "Disable Default Guard" : "Enable Default Guard"}
-                </Button>
-              </span>
-            </Tooltip>
-          </Stack>
         </Stack>
-        {evolutionQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(evolutionQ.error)}</Alert> : null}
         {tunnelQ.error ? <Alert severity="error" sx={{ mb: 1 }}>{errMessage(tunnelQ.error)}</Alert> : null}
         {tunnelErrorText ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelErrorText}</Alert> : null}
         {tunnelActionError ? <Alert severity="error" sx={{ mb: 1 }}>{tunnelActionError}</Alert> : null}
         {appsActionError ? <Alert severity="error" sx={{ mb: 1 }}>{appsActionError}</Alert> : null}
         {appsActionSuccess ? <Alert severity="success" sx={{ mb: 1 }}>{appsActionSuccess}</Alert> : null}
+        {appsRestartNotice ? (
+          <Box className="settings-inline-card tone-info" sx={{ mb: 1.25 }}>
+            <Stack
+              className="settings-inline-card-head"
+              direction={{ xs: "column", sm: "row" }}
+              justifyContent="space-between"
+              alignItems={{ xs: "flex-start", sm: "center" }}
+              spacing={1}
+            >
+              <Box className="settings-inline-card-copy">
+                <Typography className="settings-inline-card-kicker">Restarting</Typography>
+                <Typography className="settings-inline-card-title">App changes are being applied</Typography>
+                <Typography className="settings-inline-card-description">{appsRestartNotice}</Typography>
+              </Box>
+              <Chip
+                size="small"
+                icon={<AutorenewRoundedIcon />}
+                label="Up to 10 seconds"
+                color="info"
+                variant="outlined"
+              />
+            </Stack>
+          </Box>
+        ) : null}
         {restoreActive ? (
           <Alert severity="info" sx={{ mb: 1 }}>
             Restoring {restoreTotal} app{restoreTotal === 1 ? "" : "s"} in the background. {restorePending} remaining, {restoreReady} ready{restoreDegraded > 0 ? `, ${restoreDegraded} degraded` : ""}.
@@ -11837,9 +13104,11 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               Access Key: {accessKey || "-"}
                             </Typography>
                           ) : null}
-                          <Typography variant="caption" component="div" color={toBool(appItem.access_guard_enabled) ? "warning.main" : "text.secondary"} noWrap>
-                            Guard: {toBool(appItem.access_guard_enabled) ? "enabled" : "disabled"}
-                          </Typography>
+                          {toBool(appItem.access_guard_enabled) ? (
+                            <Typography variant="caption" component="div" color="warning.main" noWrap>
+                              Guard enabled
+                            </Typography>
+                          ) : null}
                           {!isEnabled ? (
                             <Typography variant="caption" component="div" color="text.secondary">
                               Disabled until you start it again from this page.
@@ -11874,11 +13143,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             <Typography variant="caption" component="div" color="text.secondary">
                               {shareCaptionLabel} control-plane access is active. Expose this app to get a working app link.
                             </Typography>
-                          ) : (
-                            <Typography variant="caption" component="div" color="text.secondary">
-                              {shareCaptionLabel} inactive
-                            </Typography>
-                          )}
+                          ) : null}
                           {toBool(appItem.access_guard_enabled) && (publicShareUrl || localShareUrl) ? (
                             <Typography variant="caption" component="div" color="warning.main" noWrap>
                               Visitors will be asked for the access key.
@@ -11923,7 +13188,7 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                               : []),
                             {
                               label: toBool(appItem.access_guard_enabled) ? "Disable App Guard" : "Enable App Guard",
-                              disabled: updateEvolutionSettingsMutation.isPending || appsActionBusy != null,
+                              disabled: appsActionBusy != null,
                               onClick: () =>
                                 void runAppOp({
                                   label: toBool(appItem.access_guard_enabled) ? "Disable App Guard" : "Enable App Guard",
@@ -11935,7 +13200,6 @@ function AppsManager({ autoRefresh }: { autoRefresh: boolean }) {
                             {
                               label: "Regenerate Access Key",
                               disabled:
-                                updateEvolutionSettingsMutation.isPending ||
                                 appsActionBusy != null ||
                                 !toBool(appItem.access_guard_enabled),
                               onClick: () =>
@@ -12661,6 +13925,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   const [quietHoursEnd, setQuietHoursEnd] = useState("");
   const [dailyRunLimit, setDailyRunLimit] = useState("40");
   const [settingsHydrated, setSettingsHydrated] = useState(false);
+  const [disableConfirmOpen, setDisableConfirmOpen] = useState(false);
 
   const [incidentResult, setIncidentResult] = useState<JsonRecord | null>(null);
   const [rollingBackEventId, setRollingBackEventId] = useState<string | null>(null);
@@ -12868,6 +14133,8 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   const suggestionScanLabel =
     suggestionScanStatus === "completed"
       ? "Ready"
+      : suggestionScanStatus === "disabled"
+      ? "Disabled"
       : suggestionScanStatus === "deferred_busy"
       ? "Deferred"
       : suggestionScanStatus === "running"
@@ -12882,12 +14149,14 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   const triageTabIndex = 2;
   const browserTabIndex = SHOW_EXPERIMENTAL_AUTONOMY_TOOLS ? 3 : 1;
   const waitingStatusLine =
-    awaitingApprovals === 0 && missingInputs === 0
+    autonomyMode === "off"
+      ? "Mode: Off | Background autonomy is disabled. Existing tasks, watchers, and history stay stored, but no new autonomy runs will start until you turn it back on."
+      : awaitingApprovals === 0 && missingInputs === 0
       ? `Mode: ${modeIndicator} | You're all set. Nothing is waiting on you.`
       : `Mode: ${modeIndicator} | Waiting on you: ${awaitingApprovals} approval${awaitingApprovals === 1 ? "" : "s"}, ${missingInputs} required input${missingInputs === 1 ? "" : "s"}`;
   const modePlainHint =
     autonomyMode === "off"
-      ? "You start everything manually."
+      ? "Autonomy is disabled. Sentinel, ArkPulse, background learning, and chat suggestion scans are paused until you turn it back on."
       : autonomyMode === "assist"
       ? "Agent prepares work and asks before sensitive actions."
       : "Agent runs allowed work automatically and only asks when required.";
@@ -12896,6 +14165,8 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
     configuredModeRaw === "off" || configuredModeRaw === "auto" || configuredModeRaw === "assist"
       ? configuredModeRaw
       : "assist";
+  const configuredAutonomyDisabled = Boolean(settingsRecord.agent_paused ?? false) || configuredMode === "off";
+  const configuredEffectiveMode: "off" | "assist" | "auto" = configuredAutonomyDisabled ? "off" : configuredMode;
   const configuredAlwaysAskHighRisk = Boolean(settingsRecord.always_ask_high_risk ?? true);
   const configuredOnlyApprovedSkills = Boolean(settingsRecord.only_approved_skills ?? true);
   const configuredQuietHoursStart = str(settingsRecord.quiet_hours_start, "").trim();
@@ -12919,7 +14190,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   }
   const guardrailsDirty =
     settingsHydrated &&
-    (autonomyMode !== configuredMode ||
+    (autonomyMode !== configuredEffectiveMode ||
       alwaysAskHighRisk !== configuredAlwaysAskHighRisk ||
       onlyApprovedSkills !== configuredOnlyApprovedSkills ||
       normalizedQuietHoursStart !== configuredQuietHoursStart ||
@@ -12953,15 +14224,27 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
   }
 
   function openWorkspacePanel(view: string) {
-    const normalized = (view || "").toLowerCase();
+    const normalized = (view || "").trim().toLowerCase();
     const path =
-      normalized === "apps"
+      normalized === "app" || normalized === "apps"
         ? "/ui/apps"
-        : normalized === "tasks"
+        : normalized === "task" || normalized === "tasks"
           ? "/ui/tasks"
-          : normalized === "watchers"
+          : normalized === "watcher" || normalized === "watchers" || normalized === "status"
             ? "/ui/watchers"
-            : "";
+            : normalized === "session" || normalized === "sessions"
+              ? "/ui/sessions"
+              : normalized === "trace"
+                ? "/ui/trace"
+                : normalized === "project" || normalized === "projects"
+                  ? "/ui/projects"
+                  : normalized === "document" || normalized === "documents" || normalized === "file" || normalized === "files"
+                    ? "/ui/documents"
+                    : normalized === "skill" || normalized === "skills"
+                      ? "/ui/skills"
+                      : normalized === "goal" || normalized === "goals"
+                        ? "/ui/goals"
+                        : "";
     if (!path) return;
     if (window.location.pathname !== path) {
       window.history.pushState(null, "", path);
@@ -13125,7 +14408,10 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
     if (settingsHydrated) return;
     if (!Object.keys(settingsRecord).length) return;
     const rawMode = str(settingsRecord.autonomy_mode, "assist").toLowerCase();
-    if (rawMode === "off" || rawMode === "auto" || rawMode === "assist") {
+    const disabled = Boolean(settingsRecord.agent_paused ?? false) || rawMode === "off";
+    if (disabled) {
+      setAutonomyMode("off");
+    } else if (rawMode === "auto" || rawMode === "assist") {
       setAutonomyMode(rawMode);
     } else {
       setAutonomyMode("assist");
@@ -13168,6 +14454,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
     try {
       await saveAutonomySettingsMutation.mutateAsync({
         autonomy_mode: selectedMode,
+        agent_paused: selectedMode === "off",
         always_ask_high_risk: alwaysAskHighRisk,
         only_approved_skills: onlyApprovedSkills,
         quiet_hours_start: quietHoursStart.trim() || null,
@@ -13180,6 +14467,12 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
     }
   }
 
+  async function confirmDisableAutonomy() {
+    setDisableConfirmOpen(false);
+    setAutonomyMode("off");
+    await saveBeginnerAutonomySettings("off");
+  }
+
   return (
     <Stack spacing={2}>
       <Box className="list-shell">
@@ -13188,6 +14481,11 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Typography variant="caption" color="text.secondary">
             Choose how hands-off you want this agent to be. Anything that needs your decision appears here.
           </Typography>
+          {autonomyMode === "off" ? (
+            <Alert severity="warning" sx={{ py: 0.75 }}>
+              Autonomy is currently disabled. Background autonomy, Sentinel queueing, ArkPulse checks, and proactive scans are paused.
+            </Alert>
+          ) : null}
           <Alert severity="info" sx={{ py: 0.75 }}>
             {waitingStatusLine}
           </Alert>
@@ -13197,9 +14495,8 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
           <Stack direction={{ xs: "column", md: "row" }} spacing={1}>
             <Button
               variant={autonomyMode === "off" ? "contained" : "outlined"}
-              onClick={async () => {
-                setAutonomyMode("off");
-                await saveBeginnerAutonomySettings("off");
+              onClick={() => {
+                if (autonomyMode !== "off") setDisableConfirmOpen(true);
               }}
               disabled={saveAutonomySettingsMutation.isPending}
             >
@@ -13228,7 +14525,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Stack>
           <Box component="ul" sx={{ m: 0, pl: 2, color: "text.secondary" }}>
             <Typography component="li" variant="caption" color="text.secondary">
-              Off: You review and start every run manually.
+              Off: Disables background autonomy until you turn it back on.
             </Typography>
             <Typography component="li" variant="caption" color="text.secondary">
               Assist (recommended): Agent drafts work first, then asks before sensitive steps.
@@ -13242,16 +14539,17 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
           </Box>
           {!showAdvanced ? (
             <Stack spacing={1}>
-              <Alert severity="success" sx={{ py: 0.75 }}>
-                Beginner safety defaults are active: ask before risky actions, approved skills only, and daily run cap.
+              <Alert severity={autonomyMode === "off" ? "warning" : "success"} sx={{ py: 0.75 }}>
+                {autonomyMode === "off"
+                  ? "Autonomy is off. Re-enable Assist or Auto when you want background autonomy again."
+                  : "Beginner safety defaults are active: ask before risky actions, approved skills only, and daily run cap."}
               </Alert>
               <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
                 <Button
                   color="warning"
                   variant="outlined"
-                  onClick={async () => {
-                    setAutonomyMode("off");
-                    await saveBeginnerAutonomySettings("off");
+                  onClick={() => {
+                    if (autonomyMode !== "off") setDisableConfirmOpen(true);
                   }}
                   disabled={saveAutonomySettingsMutation.isPending}
                 >
@@ -13349,9 +14647,8 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
                   <Button
                     color="warning"
                     variant="outlined"
-                    onClick={async () => {
-                      setAutonomyMode("off");
-                      await saveBeginnerAutonomySettings("off");
+                    onClick={() => {
+                      if (autonomyMode !== "off") setDisableConfirmOpen(true);
                     }}
                     disabled={saveAutonomySettingsMutation.isPending}
                   >
@@ -13949,6 +15246,37 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
         humanTs={humanTs}
         errMessage={errMessage}
       />
+
+      <Dialog open={disableConfirmOpen} onClose={() => setDisableConfirmOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Disable Autonomy?</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.25}>
+            <Alert severity="warning">
+              This will pause AgentArk's background autonomy until you turn Assist or Auto back on.
+            </Alert>
+            <Typography variant="body2" color="text.secondary">
+              If you disable autonomy:
+            </Typography>
+            <Typography variant="body2">1. Sentinel stops preparing and running background work.</Typography>
+            <Typography variant="body2">2. ArkPulse stops running automatic health and follow-up checks.</Typography>
+            <Typography variant="body2">3. Background learning, proactive suggestions, and chat suggestion scans pause.</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Existing tasks, watchers, traces, and history stay saved, but you may miss proactive follow-ups until autonomy is re-enabled.
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDisableConfirmOpen(false)}>Cancel</Button>
+          <Button
+            color="warning"
+            variant="contained"
+            onClick={() => void confirmDisableAutonomy()}
+            disabled={saveAutonomySettingsMutation.isPending}
+          >
+            {saveAutonomySettingsMutation.isPending ? "Disabling..." : "Disable Autonomy"}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       {settingsQ.error || briefingQ.error || notificationsQ.error || error || (showAdvanced && (timelineQ.error || browserStatusQ.error)) ? (
         <Alert severity="error">
@@ -15469,6 +16797,117 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       }
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain)) evidence.push(`Replay gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (traceKind === "self_evolve.prompt.result") {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineScore = percentageLabel(data.baseline_score, 0);
+      const candidateScore = percentageLabel(data.best_candidate_score, 0);
+      const gain = num(data.score_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      const notes = stringList(data.notes);
+      const diffSummary = asRecord(data.diff_summary);
+      const routerChanged = stringList(diffSummary.router_changed_fields);
+      const primaryResponseChanged = stringList(diffSummary.primary_response_changed_fields);
+      const synthesisChanged = stringList(diffSummary.delegation_synthesis_changed_fields);
+      chips.push(`${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`);
+      if (baselineScore || candidateScore) {
+        chips.push(`${baselineScore || "?"} -> ${candidateScore || "?"}`);
+      }
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (Number.isFinite(gain)) chips.push(`Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`);
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (routerChanged.length) evidence.push(`Router changes: ${routerChanged.join(", ")}`);
+      if (primaryResponseChanged.length) evidence.push(`Primary response changes: ${primaryResponseChanged.join(", ")}`);
+      if (synthesisChanged.length) evidence.push(`Synthesis changes: ${synthesisChanged.join(", ")}`);
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(`Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`);
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue)) evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      const invalidRateBefore = num(data.baseline_router_invalid_json_rate, Number.NaN);
+      const invalidRateAfter = num(data.candidate_router_invalid_json_rate, Number.NaN);
+      if (Number.isFinite(invalidRateBefore) && Number.isFinite(invalidRateAfter)) {
+        evidence.push(`Router invalid JSON: ${(invalidRateBefore * 100).toFixed(1)}% -> ${(invalidRateAfter * 100).toFixed(1)}%`);
+      }
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (traceKind === "self_evolve.prompt.promotion") {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      chips.push(`Promotion ${promotionMode}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(`Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`);
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(`Experience samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`);
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain)) evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
+    } else if (traceKind === "self_evolve.classifier_prompt.result" || traceKind === "self_evolve.specialist_prompt.result") {
+      const evaluatedCandidates = num(data.evaluated_candidates, 0);
+      const baselineScore = percentageLabel(data.baseline_score, 0);
+      const candidateScore = percentageLabel(data.best_candidate_score, 0);
+      const gain = num(data.score_gain, Number.NaN);
+      const candidateSource = str(data.candidate_source, "").trim();
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      const notes = stringList(data.notes);
+      const diffSummary = asRecord(data.diff_summary);
+      const changedItems = stringList(diffSummary.changed_surfaces).concat(stringList(diffSummary.changed_roles));
+      const changePreview = stringList(diffSummary.change_preview);
+      chips.push(`${evaluatedCandidates} candidate${evaluatedCandidates === 1 ? "" : "s"}`);
+      if (baselineScore || candidateScore) chips.push(`${baselineScore || "?"} -> ${candidateScore || "?"}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (Number.isFinite(gain)) chips.push(`Gain ${gain >= 0 ? "+" : ""}${(gain * 100).toFixed(1)} pts`);
+      if (candidateSource) chips.push(candidateSource);
+      rationale = `Gate: ${str(data.promotion_gate, "unknown")}`;
+      if (changedItems.length) evidence.push(`Changed: ${changedItems.join(", ")}`);
+      if (changePreview.length) evidence.push(`Preview: ${changePreview.join(" | ")}`);
+      if (num(data.wins, -1) >= 0 || num(data.losses, -1) >= 0) {
+        evidence.push(`Wins/Losses: ${num(data.wins, 0)} / ${num(data.losses, 0)}`);
+      }
+      const pValue = num(data.p_value, Number.NaN);
+      if (Number.isFinite(pValue)) evidence.push(`P-value: ${pValue.toFixed(4)}`);
+      if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
+      const lineageId = str(data.lineage_entry_id, "").trim();
+      if (lineageId) evidence.push(`Lineage: ${lineageId}`);
+    } else if (traceKind === "self_evolve.classifier_prompt.promotion" || traceKind === "self_evolve.specialist_prompt.promotion") {
+      const promotionMode = str(data.promotion_mode, "none").trim();
+      const canaryState = asRecord(data.canary_state);
+      const replay = asRecord(data.replay_evaluation);
+      const optimizedSurfaces = stringList(data.optimized_surfaces);
+      chips.push(`Promotion ${promotionMode}`);
+      if (optimizedSurfaces.length) chips.push(optimizedSurfaces.join(" + "));
+      if (toBool(data.promotion_applied)) chips.push("Applied");
+      const rollout = num(canaryState.rollout_percent, -1);
+      if (rollout > 0) chips.push(`Rollout ${rollout}%`);
+      const baselineVersion = str(canaryState.baseline_version, "").trim();
+      const candidateVersion = str(canaryState.candidate_version, "").trim();
+      if (baselineVersion || candidateVersion) {
+        evidence.push(`Versions: ${baselineVersion || "baseline"} -> ${candidateVersion || "candidate"}`);
+      }
+      const replayReason = str(replay.reason, "").trim();
+      if (replayReason) rationale = replayReason;
+      const baselineSamples = num(asRecord(replay.baseline).samples, -1);
+      const candidateSamples = num(asRecord(replay.candidate).samples, -1);
+      if (baselineSamples >= 0 || candidateSamples >= 0) {
+        evidence.push(`Experience samples: baseline ${Math.max(0, baselineSamples)} | candidate ${Math.max(0, candidateSamples)}`);
+      }
+      const successGain = num(replay.success_gain, Number.NaN);
+      if (Number.isFinite(successGain)) evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
     } else if (traceKind === "self_evolve.code.blocked") {
       chips.push("Code evolution");
       chips.push("Blocked");
@@ -15612,7 +17051,8 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
   const exportLogs = pickRecords(asRecord(exportLogsQ.data), "logs");
 
   const traceData = asRecord(traceQ.data);
-  const history = pickRecords(traceData, "history");
+  const history = pickRecords(traceData, "history") as TraceSummary[];
+  const recentEvents = pickRecords(traceData, "recent_events") as TraceOperationalEvent[];
   const selectedTrace = asRecord(traceDetailQ.data);
   const steps = pickRecords(traceDetailQ.data, "steps");
   const historyTotal = num(traceData.history_total, history.length);
@@ -15659,14 +17099,16 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
     title,
     description,
     meta,
+    compact = false,
   }: {
     eyebrow: string;
     title: string;
     description: string;
     meta: string;
+    compact?: boolean;
   }) => (
     <Stack
-      className="diagnostics-section-head"
+      className={`diagnostics-section-head${compact ? " diagnostics-section-head-compact" : ""}`}
       direction={{ xs: "column", lg: "row" }}
       alignItems={{ xs: "flex-start", lg: "center" }}
       justifyContent="space-between"
@@ -15674,7 +17116,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
     >
       <Box className="diagnostics-section-copy">
         <Typography className="diagnostics-section-eyebrow">{eyebrow}</Typography>
-        <Typography variant="h5" className="diagnostics-section-title">{title}</Typography>
+        <Typography variant="h5" className={`diagnostics-section-title${compact ? " diagnostics-section-title-compact" : ""}`}>{title}</Typography>
         <Typography variant="body2" className="diagnostics-section-description">
           {description}
         </Typography>
@@ -15685,189 +17127,199 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
     </Stack>
   );
 
-  return (
-    <Stack spacing={2}>
-      <Box className="list-shell" sx={{ p: "4px 8px" }}>
-        <Stack direction="row" alignItems="center" justifyContent="space-between">
-          <Tabs
-            value={traceSection}
-            onChange={(_, value) => setTraceSection(value)}
-            variant="scrollable"
-            allowScrollButtonsMobile
-            sx={{
-              minHeight: 36,
-              flex: 1,
-              "& .MuiTabs-indicator": { backgroundColor: "#39d0ff", height: 2, borderRadius: 1 },
-              "& .MuiTab-root": {
-                minHeight: 36,
-                px: 2,
-                py: 0.75,
-                textTransform: "none",
-                fontSize: "0.82rem",
-                fontWeight: 500,
-                letterSpacing: "0.01em",
-                color: "rgba(214, 228, 255, 0.55)",
-                "&:hover": { color: "rgba(214, 228, 255, 0.85)" },
-              },
-              "& .Mui-selected": { color: "#e8f4ff !important", fontWeight: 600 }
-            }}
+    return (
+      <Stack spacing={1.25} className="workspace-page-shell trace-page-shell">
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          justifyContent="space-between"
+          alignItems={{ xs: "stretch", md: "flex-start" }}
+          spacing={1}
+          className="workspace-page-header"
+        >
+          <Box className="workspace-page-header-copy">
+            <Typography className="workspace-page-kicker">Observability</Typography>
+            <Typography className="workspace-page-title">Trace</Typography>
+            <Typography className="workspace-page-copy">
+              Execution history, integration sync runs, and export delivery in one place.
+            </Typography>
+          </Box>
+          <TextField
+            select
+            className="workspace-page-select"
+            size="small"
+            value={traceRange}
+            onChange={(event) => setTraceRange(event.target.value as TraceRange)}
+            sx={{ minWidth: 132, flexShrink: 0 }}
           >
-            <Tab value="history" label={`Execution History (${historyTotal})`} />
-            <Tab value="sync" label={`Sync Runs (${syncRunTotal})`} />
-            <Tab value="exports" label={`Export Delivery (${exportLogs.length})`} />
-          </Tabs>
-          <Stack direction="row" spacing={0.5} sx={{ flexShrink: 0, pl: 1 }}>
             {TRACE_RANGE_PRESETS.map((preset) => (
-              <Chip
-                key={preset.value}
-                size="small"
-                label={preset.label}
-                variant={traceRange === preset.value ? "filled" : "outlined"}
-                color={traceRange === preset.value ? "primary" : "default"}
-                onClick={() => setTraceRange(preset.value)}
-                sx={{ fontSize: "0.72rem", height: 24, cursor: "pointer" }}
-              />
+              <MenuItem key={preset.value} value={preset.value}>
+                {preset.label}
+              </MenuItem>
             ))}
-          </Stack>
+          </TextField>
         </Stack>
-      </Box>
+
+        <Box className="list-shell workspace-page-subnav-shell">
+          <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Tabs
+              value={traceSection}
+              onChange={(_, value) => setTraceSection(value)}
+              variant="scrollable"
+              allowScrollButtonsMobile
+              className="workspace-page-subnav-tabs"
+              sx={{ flex: 1 }}
+            >
+              <Tab value="history" label={`Execution History (${historyTotal})`} />
+              <Tab value="sync" label={`Sync Runs (${syncRunTotal})`} />
+              <Tab value="exports" label={`Export Delivery (${exportLogs.length})`} />
+            </Tabs>
+            </Stack>
+        </Box>
 
       {traceSection === "history" ? (
-      <Box className="list-shell diagnostics-section-shell">
+      <Box className="list-shell diagnostics-section-shell trace-section-shell">
         {renderDiagnosticsSectionHeader({
           eyebrow: "Execution diagnostics",
           title: "Execution History",
           description: "Shows every recorded run with source, request preview, status, step count, and duration. Open a row to inspect the full execution trace.",
-          meta: `Showing ${history.length} of ${historyTotal} runs`
+          meta: `Showing ${history.length} of ${historyTotal} runs`,
+          compact: true,
         })}
         {(() => {
           const completed = history.filter((h) => str(h.status, "").toLowerCase() === "completed");
           const failed = history.filter((h) => str(h.status, "").toLowerCase() === "failed");
-          const histTrendValues = bucketizeTraceItems(history, (h) => str(h.started_at || h.created_at, ""), traceBuckets);
+          const histTrendValues = bucketizeTraceItems(history, (h) => str(h.started_at || asRecord(h).created_at, ""), traceBuckets);
           const histTrendRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(histTrendValues[i] || 0) }));
-          const histFailValues = bucketizeTraceItems(failed, (h) => str(h.started_at || h.created_at, ""), traceBuckets);
+          const histFailValues = bucketizeTraceItems(failed, (h) => str(h.started_at || asRecord(h).created_at, ""), traceBuckets);
           const histFailRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(histFailValues[i] || 0) }));
           return (
-          <>
-          <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
-            <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
-                <Typography variant="h5" className="diagnostics-stat-value">{history.length}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
-                <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{completed.length}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
-                <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{failed.length}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, sm: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                <Typography variant="caption" className="diagnostics-stat-label">Avg steps</Typography>
-                <Typography variant="h5" className="diagnostics-stat-value">{history.length > 0 ? Math.round(history.reduce((sum, h) => sum + num(h.step_count, 0), 0) / history.length) : 0}</Typography>
-              </Box>
-            </Grid2>
-          </Grid2>
-          {history.length > 0 ? (
-            <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
-              <Grid2 size={{ xs: 12, lg: 6 }}>
-                <MetricBarCard
-                  className="diagnostics-chart-card delay-1"
-                  title="Execution Volume"
-                  value={`${history.length} runs`}
-                  values={histTrendValues}
-                  rows={histTrendRows}
-                  palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
-                />
+          <Box className="trace-section-body">
+            <Box className="trace-summary-rail">
+              <Grid2 container spacing={1} className="trace-summary-stats">
+                <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                    <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
+                    <Typography variant="h5" className="diagnostics-stat-value">{history.length}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                    <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
+                    <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{completed.length}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                    <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
+                    <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{failed.length}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                    <Typography variant="caption" className="diagnostics-stat-label">Avg steps</Typography>
+                    <Typography variant="h5" className="diagnostics-stat-value">{history.length > 0 ? Math.round(history.reduce((sum, h) => sum + num(h.step_count, 0), 0) / history.length) : 0}</Typography>
+                  </Box>
+                </Grid2>
               </Grid2>
-              <Grid2 size={{ xs: 12, lg: 6 }}>
-                <MetricBarCard
-                  className="diagnostics-chart-card delay-2"
-                  title="Failures"
-                  value={`${failed.length} failed`}
-                  values={histFailValues}
-                  rows={histFailRows}
-                  palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
-                />
-              </Grid2>
-            </Grid2>
-          ) : null}
-          </>
+              {history.length > 0 ? (
+                <Box className="trace-chart-grid">
+                  <LiveEventConsole history={history} events={recentEvents} compact />
+                  <MetricBarCard
+                    className="diagnostics-chart-card trace-metric-card delay-1"
+                    title="Execution Volume"
+                    value={`${history.length} runs`}
+                    values={histTrendValues}
+                    rows={histTrendRows}
+                    palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
+                    chartHeight={64}
+                    compact
+                    rowsLimit={4}
+                  />
+                  <MetricBarCard
+                    className="diagnostics-chart-card trace-metric-card delay-2"
+                    title="Failures"
+                    value={`${failed.length} failed`}
+                    values={histFailValues}
+                    rows={histFailRows}
+                    palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
+                    chartHeight={64}
+                    compact
+                    rowsLimit={4}
+                  />
+                </Box>
+              ) : null}
+            </Box>
+            <Box className="trace-table-panel">
+              {history.length === 0 ? (
+                <Alert severity="info">
+                  No trace history is available yet. New chat runs will appear here with detailed execution steps.
+                </Alert>
+              ) : (
+                <TableContainer className="table-shell diagnostics-table-shell">
+                  <Table size="small" sx={{ tableLayout: "fixed" }}>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell width="14%">Started</TableCell>
+                        <TableCell width="12%">Source</TableCell>
+                        <TableCell width="40%">Message</TableCell>
+                        <TableCell width="12%">Status</TableCell>
+                        <TableCell width="10%">Steps</TableCell>
+                        <TableCell width="12%">Duration</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {history.map((item, idx) => {
+                        const id = str(item.id, `trace-${idx}`);
+                        const status = str(item.status, "running");
+                        return (
+                          <TableRow
+                            key={id}
+                            hover
+                            onClick={() => setSelectedTraceId(id)}
+                            sx={{ cursor: "pointer" }}
+                          >
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
+                                {humanTs(str(item.started_at)).label}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap title={str(item.channel)}>
+                                {str(item.channel)}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" fontWeight={600} className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.message_preview)}>
+                                {str(item.message_preview)}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                                <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: status === "completed" ? "rgba(74,210,157,0.85)" : status === "failed" ? "rgba(255,100,100,0.85)" : "rgba(180,200,220,0.5)" }} />
+                                <Typography variant="body2" color="text.secondary" noWrap>{status}</Typography>
+                              </Box>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap>
+                                {num(item.step_count, 0)}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2" noWrap>
+                                {formatTraceDuration(item.duration_ms)}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              )}
+            </Box>
+          </Box>
           );
         })()}
-        {history.length === 0 ? (
-          <Alert severity="info">
-            No trace history is available yet. New chat runs will appear here with detailed execution steps.
-          </Alert>
-        ) : (
-          <TableContainer className="table-shell diagnostics-table-shell">
-            <Table size="small" sx={{ tableLayout: "fixed" }}>
-              <TableHead>
-                <TableRow>
-                  <TableCell width="14%">Started</TableCell>
-                  <TableCell width="12%">Source</TableCell>
-                  <TableCell width="40%">Message</TableCell>
-                  <TableCell width="12%">Status</TableCell>
-                  <TableCell width="10%">Steps</TableCell>
-                  <TableCell width="12%">Duration</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {history.map((item, idx) => {
-                  const id = str(item.id, `trace-${idx}`);
-                  const status = str(item.status, "running");
-                  return (
-                    <TableRow
-                      key={id}
-                      hover
-                      onClick={() => setSelectedTraceId(id)}
-                      sx={{ cursor: "pointer" }}
-                    >
-                      <TableCell>
-                        <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
-                          {humanTs(str(item.started_at)).label}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" noWrap title={str(item.channel)}>
-                          {str(item.channel)}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" fontWeight={600} className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.message_preview)}>
-                          {str(item.message_preview)}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                          <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: status === "completed" ? "rgba(74,210,157,0.85)" : status === "failed" ? "rgba(255,100,100,0.85)" : "rgba(180,200,220,0.5)" }} />
-                          <Typography variant="body2" color="text.secondary" noWrap>{status}</Typography>
-                        </Box>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" noWrap>
-                          {num(item.step_count, 0)}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" noWrap>
-                          {formatTraceDuration(item.duration_ms)}
-                        </Typography>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </TableContainer>
-        )}
       </Box>
       ) : null}
 
@@ -15876,144 +17328,153 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
       ) : null}
 
       {traceSection === "sync" ? (
-      <Box className="list-shell diagnostics-section-shell">
-        <Stack spacing={1.25}>
+      <Box className="list-shell diagnostics-section-shell trace-section-shell">
+        <Stack spacing={1.25} className="trace-section-stack">
           {renderDiagnosticsSectionHeader({
             eyebrow: "Integration health",
             title: "Sync Runs",
             description: "Shows background and manual integration sync executions, their outcome, item counts, summaries, and the runtime state captured for each run.",
-            meta: `Showing ${syncRuns.length} of ${syncRunTotal} runs`
+            meta: `Showing ${syncRuns.length} of ${syncRunTotal} runs`,
+            compact: true,
           })}
 
-          {syncRunBuckets.length > 0 ? (
-            <Grid2 container spacing={1.25}>
-              <Grid2 size={{ xs: 12, lg: 6 }}>
-                <MetricBarCard
-                  className="diagnostics-chart-card delay-1"
-                  title="Sync Run Volume"
-                  value={`${num(syncRunStats.total_runs, 0)} total`}
-                  values={syncRunTrendValues}
-                  rows={syncRunTrendRows}
-                  palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
-                />
+          <Box className="trace-section-body">
+            <Box className="trace-summary-rail">
+              <Grid2 container spacing={1} className="trace-summary-stats">
+                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.completed_runs, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.failed_runs, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Blocked</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.blocked_runs, 0)}</Typography>
+                  </Box>
+                </Grid2>
+                <Grid2 size={{ xs: 6, md: 3, xl: 6 }}>
+                  <Box className="metadata-box diagnostics-stat-card">
+                    <Typography variant="caption" className="diagnostics-stat-label">Avg duration</Typography>
+                    <Typography variant="h6" className="diagnostics-stat-value">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
+                  </Box>
+                </Grid2>
               </Grid2>
-              <Grid2 size={{ xs: 12, lg: 6 }}>
-                <MetricBarCard
-                  className="diagnostics-chart-card delay-2"
-                  title="Attention Load"
-                  value={`${num(syncRunStats.important_hits, 0)} important`}
-                  values={syncAttentionValues}
-                  rows={syncAttentionRows}
-                  palette={["#ffb347", "#ff7a7a", "#ff9966", "#ffd166", "#ff857d", "#ffb86c", "#ff9e64"]}
-                />
-              </Grid2>
-            </Grid2>
-          ) : null}
 
-          <Grid2 container spacing={1}>
-            <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card">
-                <Typography variant="caption" className="diagnostics-stat-label">Completed</Typography>
-                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.completed_runs, 0)}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card">
-                <Typography variant="caption" className="diagnostics-stat-label">Failed</Typography>
-                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.failed_runs, 0)}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card">
-                <Typography variant="caption" className="diagnostics-stat-label">Blocked</Typography>
-                <Typography variant="h6" className="diagnostics-stat-value">{num(syncRunStats.blocked_runs, 0)}</Typography>
-              </Box>
-            </Grid2>
-            <Grid2 size={{ xs: 6, md: 3 }}>
-              <Box className="metadata-box diagnostics-stat-card">
-                <Typography variant="caption" className="diagnostics-stat-label">Avg duration</Typography>
-                <Typography variant="h6" className="diagnostics-stat-value">{formatTraceDuration(syncRunStats.avg_duration_ms)}</Typography>
-              </Box>
-            </Grid2>
-          </Grid2>
+              {syncRunBuckets.length > 0 ? (
+                <Box className="trace-chart-grid">
+                  <MetricBarCard
+                    className="diagnostics-chart-card trace-metric-card delay-1"
+                    title="Sync Run Volume"
+                    value={`${num(syncRunStats.total_runs, 0)} total`}
+                    values={syncRunTrendValues}
+                    rows={syncRunTrendRows}
+                    palette={["#47d7ff", "#29b8ff", "#0fe3c2", "#8be9fd", "#6aa7ff", "#1db5ff", "#67d4ff"]}
+                    chartHeight={64}
+                    compact
+                    rowsLimit={4}
+                  />
+                  <MetricBarCard
+                    className="diagnostics-chart-card trace-metric-card delay-2"
+                    title="Attention Load"
+                    value={`${num(syncRunStats.important_hits, 0)} important`}
+                    values={syncAttentionValues}
+                    rows={syncAttentionRows}
+                    palette={["#ffb347", "#ff7a7a", "#ff9966", "#ffd166", "#ff857d", "#ffb86c", "#ff9e64"]}
+                    chartHeight={64}
+                    compact
+                    rowsLimit={4}
+                  />
+                </Box>
+              ) : null}
+            </Box>
 
-          {syncRunsQ.error ? (
-            <Alert severity="warning">{errMessage(syncRunsQ.error)}</Alert>
-          ) : syncRuns.length === 0 ? (
-            <Alert severity="info">
-              No integration sync runs have been recorded yet. Once background sync or manual sync runs execute, they will appear here.
-            </Alert>
-          ) : (
-            <>
-              <TableContainer className="table-shell diagnostics-table-shell">
-                <Table size="small" sx={{ tableLayout: "fixed" }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell width="14%">Started</TableCell>
-                      <TableCell width="14%">Integration</TableCell>
-                      <TableCell width="10%">Trigger</TableCell>
-                      <TableCell width="12%">Status</TableCell>
-                      <TableCell width="28%">Summary</TableCell>
-                      <TableCell width="12%">Items</TableCell>
-                      <TableCell width="10%">Duration</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {syncRuns.map((item, idx) => {
-                      const id = str(item.id, `sync-run-${idx}`);
-                      const status = str(item.status, "completed");
-                      return (
-                        <TableRow key={id} hover onClick={() => setSelectedSyncRunId(id)} sx={{ cursor: "pointer" }}>
-                          <TableCell>
-                            <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
-                              {humanTs(str(item.started_at)).label}
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Typography variant="body2" noWrap title={str(item.integration_name)}>
-                              {str(item.integration_name)}
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Typography variant="body2" noWrap>{syncRunTriggerLabel(str(item.trigger))}</Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Chip size="small" color={syncRunStatusColor(status)} label={status} />
-                          </TableCell>
-                          <TableCell>
-                            <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.summary)}>
-                              {str(item.summary)}
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Typography variant="body2" noWrap>
-                              {num(item.new_item_count, 0)} new / {num(item.important_item_count, 0)} imp
-                            </Typography>
-                          </TableCell>
-                          <TableCell>
-                            <Typography variant="body2" noWrap>{formatTraceDuration(item.duration_ms)}</Typography>
-                          </TableCell>
+            <Box className="trace-table-panel">
+              {syncRunsQ.error ? (
+                <Alert severity="warning">{errMessage(syncRunsQ.error)}</Alert>
+              ) : syncRuns.length === 0 ? (
+                <Alert severity="info">
+                  No integration sync runs have been recorded yet. Once background sync or manual sync runs execute, they will appear here.
+                </Alert>
+              ) : (
+                <>
+                  <TableContainer className="table-shell diagnostics-table-shell">
+                    <Table size="small" sx={{ tableLayout: "fixed" }}>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell width="14%">Started</TableCell>
+                          <TableCell width="14%">Integration</TableCell>
+                          <TableCell width="10%">Trigger</TableCell>
+                          <TableCell width="12%">Status</TableCell>
+                          <TableCell width="28%">Summary</TableCell>
+                          <TableCell width="12%">Items</TableCell>
+                          <TableCell width="10%">Duration</TableCell>
                         </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-              <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" useFlexGap>
-                <Typography variant="caption" color="text.secondary">
-                  Page {Math.min(syncRunPage + 1, syncRunPages)} of {syncRunPages}
-                </Typography>
-                <Stack direction="row" spacing={1}>
-                  <Button size="small" variant="outlined" disabled={syncRunPage === 0} onClick={() => setSyncRunPage((prev) => Math.max(0, prev - 1))}>
-                    Prev
-                  </Button>
-                  <Button size="small" variant="outlined" disabled={syncRunPage >= syncRunPages - 1} onClick={() => setSyncRunPage((prev) => Math.min(syncRunPages - 1, prev + 1))}>
-                    Next
-                  </Button>
-                </Stack>
-              </Stack>
-            </>
-          )}
+                      </TableHead>
+                      <TableBody>
+                        {syncRuns.map((item, idx) => {
+                          const id = str(item.id, `sync-run-${idx}`);
+                          const status = str(item.status, "completed");
+                          return (
+                            <TableRow key={id} hover onClick={() => setSelectedSyncRunId(id)} sx={{ cursor: "pointer" }}>
+                              <TableCell>
+                                <Typography variant="body2" noWrap title={humanTs(str(item.started_at)).tip}>
+                                  {humanTs(str(item.started_at)).label}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" noWrap title={str(item.integration_name)}>
+                                  {str(item.integration_name)}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" noWrap>{syncRunTriggerLabel(str(item.trigger))}</Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Chip size="small" color={syncRunStatusColor(status)} label={status} />
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" title={str(item.summary)}>
+                                  {str(item.summary)}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" noWrap>
+                                  {num(item.new_item_count, 0)} new / {num(item.important_item_count, 0)} imp
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" noWrap>{formatTraceDuration(item.duration_ms)}</Typography>
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                  <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" useFlexGap className="trace-table-footer">
+                    <Typography variant="caption" color="text.secondary">
+                      Page {Math.min(syncRunPage + 1, syncRunPages)} of {syncRunPages}
+                    </Typography>
+                    <Stack direction="row" spacing={1}>
+                      <Button size="small" variant="outlined" disabled={syncRunPage === 0} onClick={() => setSyncRunPage((prev) => Math.max(0, prev - 1))}>
+                        Prev
+                      </Button>
+                      <Button size="small" variant="outlined" disabled={syncRunPage >= syncRunPages - 1} onClick={() => setSyncRunPage((prev) => Math.min(syncRunPages - 1, prev + 1))}>
+                        Next
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </>
+              )}
+            </Box>
+          </Box>
         </Stack>
       </Box>
       ) : null}
@@ -16319,12 +17780,13 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
 
       {/* Observability Export Delivery Logs */}
       {traceSection === "exports" ? (
-        <Box className="list-shell diagnostics-section-shell">
+        <Box className="list-shell diagnostics-section-shell trace-section-shell">
           {renderDiagnosticsSectionHeader({
             eyebrow: "Delivery evidence",
             title: "Export Deliveries",
             description: "Shows observability exports sent by the system, whether delivery succeeded, which event fired, and which trace each delivery belongs to.",
-            meta: `${exportLogs.length} deliveries`
+            meta: `${exportLogs.length} deliveries`,
+            compact: true,
           })}
           {(() => {
             const successLogs = exportLogs.filter((e) => str(e.level, "").toLowerCase() === "success");
@@ -16334,118 +17796,125 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
             const expErrorValues = bucketizeTraceItems(errorLogs, (e) => str(e.timestamp, ""), traceBuckets);
             const expErrorRows: Array<{ label: string; value: string }> = traceBuckets.map((b, i) => ({ label: b.label, value: String(expErrorValues[i] || 0) }));
             return (
-            <>
-            <Grid2 container spacing={1} sx={{ mb: 1.5 }}>
-              <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
-                  <Typography variant="h5" className="diagnostics-stat-value">{exportLogs.length}</Typography>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" className="diagnostics-stat-label">Success</Typography>
-                  <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{successLogs.length}</Typography>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" className="diagnostics-stat-label">Errors</Typography>
-                  <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{errorLogs.length}</Typography>
-                </Box>
-              </Grid2>
-              <Grid2 size={{ xs: 6, sm: 3 }}>
-                <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
-                  <Typography variant="caption" className="diagnostics-stat-label">Events</Typography>
-                  <Typography variant="h5" className="diagnostics-stat-value">{new Set(exportLogs.map((e) => str(e.event, ""))).size}</Typography>
-                </Box>
-              </Grid2>
-            </Grid2>
-            {exportLogs.length > 0 ? (
-              <Grid2 container spacing={1.25} sx={{ mb: 2 }}>
-                <Grid2 size={{ xs: 12, lg: 6 }}>
-                  <MetricBarCard
-                    className="diagnostics-chart-card delay-1"
-                    title="Delivery Volume"
-                    value={`${exportLogs.length} exports`}
-                    values={expTrendValues}
-                    rows={expTrendRows}
-                    palette={["#6cf2ff", "#33d8ff", "#0bd8b8", "#7de2ff", "#63a6ff", "#00c7ff", "#8df7ff"]}
-                  />
+            <Box className="trace-section-body">
+              <Box className="trace-summary-rail">
+                <Grid2 container spacing={1} className="trace-summary-stats">
+                  <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                    <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                      <Typography variant="caption" className="diagnostics-stat-label">Total</Typography>
+                      <Typography variant="h5" className="diagnostics-stat-value">{exportLogs.length}</Typography>
+                    </Box>
+                  </Grid2>
+                  <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                    <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                      <Typography variant="caption" className="diagnostics-stat-label">Success</Typography>
+                      <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(74,210,157,0.9)" }}>{successLogs.length}</Typography>
+                    </Box>
+                  </Grid2>
+                  <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                    <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                      <Typography variant="caption" className="diagnostics-stat-label">Errors</Typography>
+                      <Typography variant="h5" className="diagnostics-stat-value" sx={{ color: "rgba(255,100,100,0.9)" }}>{errorLogs.length}</Typography>
+                    </Box>
+                  </Grid2>
+                  <Grid2 size={{ xs: 6, sm: 3, xl: 6 }}>
+                    <Box className="metadata-box diagnostics-stat-card" sx={{ textAlign: "center" }}>
+                      <Typography variant="caption" className="diagnostics-stat-label">Events</Typography>
+                      <Typography variant="h5" className="diagnostics-stat-value">{new Set(exportLogs.map((e) => str(e.event, ""))).size}</Typography>
+                    </Box>
+                  </Grid2>
                 </Grid2>
-                <Grid2 size={{ xs: 12, lg: 6 }}>
-                  <MetricBarCard
-                    className="diagnostics-chart-card delay-2"
-                    title="Export Errors"
-                    value={`${errorLogs.length} errors`}
-                    values={expErrorValues}
-                    rows={expErrorRows}
-                    palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
-                  />
-                </Grid2>
-              </Grid2>
-            ) : null}
-            </>
+                {exportLogs.length > 0 ? (
+                  <Box className="trace-chart-grid">
+                    <MetricBarCard
+                      className="diagnostics-chart-card trace-metric-card delay-1"
+                      title="Delivery Volume"
+                      value={`${exportLogs.length} exports`}
+                      values={expTrendValues}
+                      rows={expTrendRows}
+                      palette={["#6cf2ff", "#33d8ff", "#0bd8b8", "#7de2ff", "#63a6ff", "#00c7ff", "#8df7ff"]}
+                      chartHeight={64}
+                      compact
+                      rowsLimit={4}
+                    />
+                    <MetricBarCard
+                      className="diagnostics-chart-card trace-metric-card delay-2"
+                      title="Export Errors"
+                      value={`${errorLogs.length} errors`}
+                      values={expErrorValues}
+                      rows={expErrorRows}
+                      palette={["#ff7a7a", "#ff5555", "#ff9966", "#ff857d", "#ff6b6b", "#ff4444", "#ff8877"]}
+                      chartHeight={64}
+                      compact
+                      rowsLimit={4}
+                    />
+                  </Box>
+                ) : null}
+              </Box>
+
+              <Box className="trace-table-panel">
+                {exportLogs.length === 0 ? (
+                  <Alert severity="info">
+                    No observability export delivery logs are available yet.
+                  </Alert>
+                ) : (
+                  <TableContainer className="table-shell diagnostics-table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Time</TableCell>
+                          <TableCell>Status</TableCell>
+                          <TableCell>Event</TableCell>
+                          <TableCell>Message</TableCell>
+                          <TableCell>Trace</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {exportLogs.slice(0, 20).map((entry, idx) => {
+                          const level = str(entry.level, "").toLowerCase();
+                          const ts = humanTs(str(entry.timestamp, ""));
+                          const traceId = str(entry.trace_id, "").trim();
+                          return (
+                            <TableRow
+                              key={`exp-${str(entry.id, "log")}-${idx}`}
+                              hover
+                              onClick={() => {
+                                if (traceId) {
+                                  setTraceSection("history");
+                                  setSelectedTraceId(traceId);
+                                }
+                              }}
+                              sx={{ cursor: traceId ? "pointer" : "default" }}
+                            >
+                              <TableCell sx={{ whiteSpace: "nowrap" }}>
+                                <Typography variant="body2" noWrap title={ts.tip}>{ts.label}</Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
+                                  <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: level === "error" ? "rgba(255,100,100,0.85)" : level === "success" ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
+                                  <Typography variant="body2" color="text.secondary" noWrap>{level || "info"}</Typography>
+                                </Box>
+                              </TableCell>
+                              <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
+                              <TableCell sx={{ maxWidth: 520 }}>
+                                <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" color={level === "error" ? "error" : "text.secondary"} title={str(entry.message, "-")}>
+                                  {str(entry.message, "-")}
+                                </Typography>
+                              </TableCell>
+                              <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>
+                                {traceId ? traceId.slice(0, 8) : "-"}
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Box>
             );
           })()}
-          {exportLogs.length === 0 ? (
-            <Alert severity="info">
-              No observability export delivery logs are available yet.
-            </Alert>
-          ) : (
-            <TableContainer className="table-shell diagnostics-table-shell">
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>Time</TableCell>
-                    <TableCell>Status</TableCell>
-                    <TableCell>Event</TableCell>
-                    <TableCell>Message</TableCell>
-                    <TableCell>Trace</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {exportLogs.slice(0, 20).map((entry, idx) => {
-                    const level = str(entry.level, "").toLowerCase();
-                    const ts = humanTs(str(entry.timestamp, ""));
-                    const traceId = str(entry.trace_id, "").trim();
-                    return (
-                      <TableRow
-                        key={`exp-${str(entry.id, "log")}-${idx}`}
-                        hover
-                        onClick={() => {
-                          if (traceId) {
-                            setTraceSection("history");
-                            setSelectedTraceId(traceId);
-                          }
-                        }}
-                        sx={{ cursor: traceId ? "pointer" : "default" }}
-                      >
-                        <TableCell sx={{ whiteSpace: "nowrap" }}>
-                          <Typography variant="body2" noWrap title={ts.tip}>{ts.label}</Typography>
-                        </TableCell>
-                        <TableCell>
-                          <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.75 }}>
-                            <Box component="span" sx={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, bgcolor: level === "error" ? "rgba(255,100,100,0.85)" : level === "success" ? "rgba(74,210,157,0.85)" : "rgba(180,200,220,0.5)" }} />
-                            <Typography variant="body2" color="text.secondary" noWrap>{level || "info"}</Typography>
-                          </Box>
-                        </TableCell>
-                        <TableCell><Typography variant="body2" noWrap>{str(entry.event, "-")}</Typography></TableCell>
-                        <TableCell sx={{ maxWidth: 520 }}>
-                          <Typography variant="body2" className="diagnostics-cell-clamp diagnostics-cell-clamp--2" color={level === "error" ? "error" : "text.secondary"} title={str(entry.message, "-")}>
-                            {str(entry.message, "-")}
-                          </Typography>
-                        </TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: "0.76rem" }}>
-                          {traceId ? traceId.slice(0, 8) : "-"}
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </TableContainer>
-          )}
         </Box>
       ) : null}
     </Stack>
@@ -17383,6 +18852,7 @@ function SettingsManager({
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [restartNotice, setRestartNotice] = useState<string | null>(null);
   const [modelConnectivityWarning, setModelConnectivityWarning] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
   const [apiKeyRevealed, setApiKeyRevealed] = useState(false);
@@ -17420,6 +18890,12 @@ function SettingsManager({
     text: string;
   } | null>(null);
   const [resumeTunnelStartAfterPassword, setResumeTunnelStartAfterPassword] = useState(false);
+  const securityTabActive = tab === 4;
+  const advancedTabActive = tab === 5;
+  const observabilityTabActive = tab === 6;
+  const moltbookTabActive = tab === 7;
+  const pulseTabActive = tab === 9;
+  const evolutionTabActive = tab === 13;
 
   useEffect(() => {
     if (typeof initialTab === "number" && tab !== initialTab) {
@@ -17444,9 +18920,38 @@ function SettingsManager({
   }, [success]);
 
   useEffect(() => {
+    if (!restartNotice) return;
+    const timer = window.setTimeout(() => setRestartNotice(null), RESTART_NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [restartNotice]);
+
+  async function monitorRestartRecovery() {
+    const deadlineAt = Date.now() + RESTART_NOTICE_DURATION_MS;
+    const minimumVisibleUntil = Date.now() + 2000;
+    let sawUnavailable = false;
+    while (Date.now() < deadlineAt) {
+      try {
+        const response = await fetch("/health", { cache: "no-store" });
+        if (response.ok) {
+          if (sawUnavailable || Date.now() >= minimumVisibleUntil) {
+            window.location.reload();
+            return;
+          }
+        } else {
+          sawUnavailable = true;
+        }
+      } catch {
+        sawUnavailable = true;
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+    }
+  }
+
+  useEffect(() => {
+    if (!advancedTabActive) return;
     const timer = window.setInterval(() => setApiKeyNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [advancedTabActive]);
 
   const settingsQ = useQuery({
     queryKey: ["settings"],
@@ -17466,23 +18971,27 @@ function SettingsManager({
   const apiKeyQ = useQuery({
     queryKey: ["settings-api-key"],
     queryFn: () => api.rawGet("/settings/api-key"),
-    refetchInterval: 10000,
-    refetchIntervalInBackground: true
+    enabled: advancedTabActive,
+    refetchInterval: advancedTabActive ? 10000 : false,
+    refetchIntervalInBackground: advancedTabActive
   });
   const tunnelQ = useQuery({
     queryKey: ["tunnel-status"],
     queryFn: () => api.rawGet("/tunnel/status"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    enabled: securityTabActive,
+    refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false
   });
   const tunnelProvidersQ = useQuery({
     queryKey: ["tunnel-providers"],
     queryFn: () => api.rawGet("/tunnel/providers"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    enabled: securityTabActive,
+    refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false
   });
   const securityStatusQ = useQuery({
     queryKey: ["security-status"],
     queryFn: () => api.rawGet("/security/status"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    enabled: securityTabActive,
+    refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false
   });
   const securityLogsQ = useQuery({
     queryKey: ["settings-security-logs-dialog"],
@@ -17493,39 +19002,44 @@ function SettingsManager({
   const observabilityLogsQ = useQuery({
     queryKey: ["settings-observability-logs"],
     queryFn: () => api.rawGet("/settings/observability/logs?limit=40"),
-    enabled: tab === 6,
-    refetchInterval: tab === 6 && autoRefresh ? REFRESH_MS : false
+    enabled: observabilityTabActive,
+    refetchInterval: observabilityTabActive && autoRefresh ? REFRESH_MS : false
   });
   const vaultSecretsQ = useQuery({
     queryKey: ["settings-secrets"],
     queryFn: () => api.rawGet("/settings/secrets"),
+    enabled: securityTabActive,
     refetchInterval: false
   });
   const pulseQ = useQuery({
     queryKey: ["arkpulse-log"],
     queryFn: () => api.rawGet("/arkpulse?limit=40"),
-    refetchInterval: pulsePollState ? 2000 : autoRefresh ? REFRESH_MS : false
+    enabled: pulseTabActive,
+    refetchInterval: pulseTabActive ? (pulsePollState ? 2000 : autoRefresh ? REFRESH_MS : false) : false
   });
   const moltbookStatusQ = useQuery({
     queryKey: ["moltbook-status"],
     queryFn: () => api.rawGet("/moltbook/status"),
-    refetchInterval: moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false
+    enabled: moltbookTabActive,
+    refetchInterval: moltbookTabActive ? (moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false) : false
   });
   const moltbookLogQ = useQuery({
     queryKey: ["moltbook-log"],
     queryFn: () => api.rawGet("/moltbook/log?limit=500"),
-    refetchInterval: moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false
+    enabled: moltbookTabActive,
+    refetchInterval: moltbookTabActive ? (moltbookPollState ? 2000 : autoRefresh ? REFRESH_MS : false) : false
   });
   const evolutionQ = useQuery({
     queryKey: ["settings-evolution"],
     queryFn: () => api.rawGet("/settings/evolution"),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    enabled: evolutionTabActive,
+    refetchInterval: evolutionTabActive && autoRefresh ? REFRESH_MS : false
   });
   const evolutionDevQ = useQuery({
     queryKey: ["settings-evolution-dev"],
     queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
-    enabled: tab === 13,
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    enabled: evolutionTabActive,
+    refetchInterval: evolutionTabActive && autoRefresh ? REFRESH_MS : false
   });
   const settings = asRecord(settingsQ.data);
   const observabilitySettings = asRecord(settings.observability);
@@ -17534,10 +19048,31 @@ function SettingsManager({
   const modelsPayload = asRecord(modelsQ.data);
   const evolution = asRecord(evolutionQ.data);
   const evolutionCanary = asRecord(evolution.canary);
+  const evolutionPromptCanary = asRecord(evolution.prompt_canary);
+  const evolutionClassifierPromptCanary = asRecord(evolution.classifier_prompt_canary);
+  const evolutionSpecialistPromptCanary = asRecord(evolution.specialist_prompt_canary);
   const evolutionLearningQueue = asRecord(evolution.learning_queue);
   const evolutionDev = asRecord(evolutionDevQ.data);
   const evolutionStrategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const evolutionLineage = pickRecords(evolutionDev, "lineage_recent");
+  const evolutionPromptLineage = pickRecords(evolutionDev, "prompt_lineage_recent");
+  const evolutionPromptMetrics = pickRecords(evolutionDev, "prompt_metrics");
+  const evolutionPromptRuns = pickRecords(evolutionDev, "recent_prompt_runs");
+  const evolutionPromptLastResult = asRecord(evolutionDev.prompt_last_result);
+  const evolutionPromptReplayEvaluation = asRecord(evolutionPromptLastResult.replay_evaluation);
+  const evolutionPromptInsights = asRecord(evolutionDev.prompt_insights);
+  const evolutionClassifierPromptLineage = pickRecords(evolutionDev, "classifier_prompt_lineage_recent");
+  const evolutionClassifierPromptMetrics = pickRecords(evolutionDev, "classifier_prompt_metrics");
+  const evolutionClassifierPromptRuns = pickRecords(evolutionDev, "recent_classifier_prompt_runs");
+  const evolutionClassifierPromptLastResult = asRecord(evolutionDev.classifier_prompt_last_result);
+  const evolutionClassifierPromptReplayEvaluation = asRecord(evolutionClassifierPromptLastResult.replay_evaluation);
+  const evolutionClassifierPromptInsights = asRecord(evolutionDev.classifier_prompt_insights);
+  const evolutionSpecialistPromptLineage = pickRecords(evolutionDev, "specialist_prompt_lineage_recent");
+  const evolutionSpecialistPromptMetrics = pickRecords(evolutionDev, "specialist_prompt_metrics");
+  const evolutionSpecialistPromptRuns = pickRecords(evolutionDev, "recent_specialist_prompt_runs");
+  const evolutionSpecialistPromptLastResult = asRecord(evolutionDev.specialist_prompt_last_result);
+  const evolutionSpecialistPromptReplayEvaluation = asRecord(evolutionSpecialistPromptLastResult.replay_evaluation);
+  const evolutionSpecialistPromptInsights = asRecord(evolutionDev.specialist_prompt_insights);
   const evolutionLearningCandidates = pickRecords(evolutionDev, "learning_candidates");
   const evolutionLearningItems = pickRecords(evolutionDev, "learning_items");
   const evolutionLearningPatterns = pickRecords(evolutionDev, "learning_patterns");
@@ -17565,10 +19100,14 @@ function SettingsManager({
     daily_brief_time: "09:00",
     daily_brief_channel: "telegram",
     smart_routing: true,
+    embeddings_provider: "local-hf",
+    embeddings_model: "sentence-transformers/all-MiniLM-L6-v2",
+    embeddings_base_url: "",
+    embeddings_api_key: "",
 
-    llm_provider: "ollama",
+    llm_provider: "",
     llm_model: "",
-    llm_base_url: "http://localhost:11434",
+    llm_base_url: "",
     llm_api_key: "",
 
     llm_fallback_provider: "",
@@ -17626,6 +19165,7 @@ function SettingsManager({
     whatsapp_enabled: false,
     whatsapp_mode: "baileys",
     whatsapp_access_token: "",
+    whatsapp_app_secret: "",
     whatsapp_phone_number_id: "",
     whatsapp_verify_token: "agentark_verify",
     whatsapp_bridge_url: "http://127.0.0.1:8999",
@@ -17653,7 +19193,6 @@ function SettingsManager({
     search_fallback1: "duckduckgo",
     search_fallback2: "none",
     search_serper_key: "",
-    search_searxng_url: "",
     search_brave_key: "",
 
     moltbook_api_key: "",
@@ -17663,7 +19202,7 @@ function SettingsManager({
     moltbook_write_enabled: true,
     moltbook_defer_when_busy: true,
 
-    memory_retention_enabled: false,
+    memory_retention_enabled: true,
     memory_retention_min_age_days: "180",
     memory_retention_keep_last: "2500",
     memory_retention_max_importance: "0.6",
@@ -17674,6 +19213,9 @@ function SettingsManager({
     memory_retention_max_delete_per_run: "500",
     memory_retention_protect_fact_sources: true,
 
+    data_lifecycle_cleanup_enabled: true,
+    data_lifecycle_notifications_cleanup_enabled: true,
+    data_lifecycle_logs_cleanup_enabled: true,
     data_lifecycle_notifications_retention_days: "7",
     data_lifecycle_notification_cleanup_interval_secs: "3600",
     data_lifecycle_execution_trace_retention_days: "30",
@@ -17737,6 +19279,31 @@ function SettingsManager({
       .split(/[,\\n]/g)
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
+  }
+
+  function sanitizeAutoApproveList(items: string[]): string[] {
+    const blocked = new Set<string>(AUTO_APPROVE_BLOCKED_ACTIONS);
+    const seen = new Set<string>();
+    const sanitized: string[] = [];
+    for (const item of items) {
+      const trimmed = item.trim();
+      if (!trimmed || blocked.has(trimmed) || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      sanitized.push(trimmed);
+    }
+    return sanitized;
+  }
+
+  function findBlockedAutoApproveEntries(csv: string): string[] {
+    const blocked = new Set<string>(AUTO_APPROVE_BLOCKED_ACTIONS);
+    const seen = new Set<string>();
+    const blockedEntries: string[] = [];
+    for (const item of parseCsvList(csv)) {
+      if (!blocked.has(item) || seen.has(item)) continue;
+      seen.add(item);
+      blockedEntries.push(item);
+    }
+    return blockedEntries;
   }
 
   function parseTelegramUsers(csv: string): number[] {
@@ -17865,10 +19432,14 @@ function SettingsManager({
       daily_brief_time: str(settings.daily_brief_time, "09:00"),
       daily_brief_channel: str(settings.daily_brief_channel, "telegram"),
       smart_routing: toBool(settings.smart_routing),
+      embeddings_provider: str(settings.embeddings_provider, "local-hf"),
+      embeddings_model: str(settings.embeddings_model, "sentence-transformers/all-MiniLM-L6-v2"),
+      embeddings_base_url: str(settings.embeddings_base_url, ""),
+      embeddings_api_key: "",
 
-      llm_provider: str(settings.llm_provider, "ollama"),
+      llm_provider: str(settings.llm_provider, ""),
       llm_model: str(settings.llm_model, ""),
-      llm_base_url: str(settings.llm_base_url, "http://localhost:11434"),
+      llm_base_url: str(settings.llm_base_url, ""),
       llm_api_key: "",
 
       llm_fallback_provider: str(settings.llm_fallback_provider, ""),
@@ -17929,6 +19500,7 @@ function SettingsManager({
       whatsapp_enabled: toBool(settings.whatsapp_enabled),
       whatsapp_mode: str(settings.whatsapp_mode, "baileys"),
       whatsapp_access_token: "",
+      whatsapp_app_secret: "",
       whatsapp_phone_number_id: str(settings.whatsapp_phone_number_id, ""),
       whatsapp_verify_token: str(settings.whatsapp_verify_token, "agentark_verify"),
       whatsapp_bridge_url: str(settings.whatsapp_bridge_url, "http://127.0.0.1:8999"),
@@ -17962,7 +19534,6 @@ function SettingsManager({
       search_fallback1: str(settings.search_fallback1, "duckduckgo"),
       search_fallback2: str(settings.search_fallback2, "none"),
       search_serper_key: "",
-      search_searxng_url: str(settings.search_searxng_url, ""),
       search_brave_key: "",
 
       moltbook_api_key: "",
@@ -17973,7 +19544,10 @@ function SettingsManager({
         settings.moltbook_write_enabled == null ? true : toBool(settings.moltbook_write_enabled),
       moltbook_defer_when_busy: toBool(settings.moltbook_defer_when_busy),
 
-      memory_retention_enabled: toBool(settings.memory_retention_enabled),
+      memory_retention_enabled:
+        settings.memory_retention_enabled == null
+          ? true
+          : toBool(settings.memory_retention_enabled),
       memory_retention_min_age_days: str(settings.memory_retention_min_age_days, "180"),
       memory_retention_keep_last: str(settings.memory_retention_keep_last, "2500"),
       memory_retention_max_importance: str(settings.memory_retention_max_importance, "0.6"),
@@ -17990,6 +19564,18 @@ function SettingsManager({
           ? true
           : toBool(settings.memory_retention_protect_fact_sources),
 
+      data_lifecycle_cleanup_enabled:
+        dataLifecycleSettings.cleanup_enabled == null
+          ? true
+          : toBool(dataLifecycleSettings.cleanup_enabled),
+      data_lifecycle_notifications_cleanup_enabled:
+        dataLifecycleSettings.notifications_cleanup_enabled == null
+          ? true
+          : toBool(dataLifecycleSettings.notifications_cleanup_enabled),
+      data_lifecycle_logs_cleanup_enabled:
+        dataLifecycleSettings.logs_cleanup_enabled == null
+          ? true
+          : toBool(dataLifecycleSettings.logs_cleanup_enabled),
       data_lifecycle_notifications_retention_days: str(
         dataLifecycleSettings.notifications_retention_days,
         "7"
@@ -18146,6 +19732,7 @@ function SettingsManager({
         fieldChanged("teams_user_agent");
       const includeWhatsappSettings =
         form.whatsapp_access_token.trim().length > 0 ||
+        form.whatsapp_app_secret.trim().length > 0 ||
         fieldChanged("whatsapp_enabled") ||
         fieldChanged("whatsapp_mode") ||
         fieldChanged("whatsapp_phone_number_id") ||
@@ -18207,6 +19794,9 @@ function SettingsManager({
         10
       );
       const dataLifecycle = {
+        cleanup_enabled: form.data_lifecycle_cleanup_enabled,
+        notifications_cleanup_enabled: form.data_lifecycle_notifications_cleanup_enabled,
+        logs_cleanup_enabled: form.data_lifecycle_logs_cleanup_enabled,
         notifications_retention_days: parseNonNegativeInt(
           form.data_lifecycle_notifications_retention_days,
           "Notification retention (days)"
@@ -18280,6 +19870,10 @@ function SettingsManager({
         daily_brief_time: form.daily_brief_time || "09:00",
         daily_brief_channel: form.daily_brief_channel || "telegram",
         smart_routing: form.smart_routing,
+        embeddings_provider: form.embeddings_provider || "local-hf",
+        embeddings_model: form.embeddings_model || "sentence-transformers/all-MiniLM-L6-v2",
+        embeddings_base_url: form.embeddings_base_url || null,
+        embeddings_api_key: form.embeddings_api_key || null,
 
         llm_provider: form.llm_provider,
         llm_model: form.llm_model,
@@ -18291,7 +19885,7 @@ function SettingsManager({
         llm_fallback_base_url: form.llm_fallback_base_url || null,
         llm_fallback_api_key: form.llm_fallback_api_key || null,
 
-        auto_approve: parseCsvList(form.auto_approve_csv),
+        auto_approve: sanitizeAutoApproveList(parseCsvList(form.auto_approve_csv)),
 
         media_providers: mediaProviders,
         default_image_provider: form.default_image_provider || null,
@@ -18304,7 +19898,6 @@ function SettingsManager({
         search_fallback1: form.search_fallback1 || null,
         search_fallback2: form.search_fallback2 || null,
         search_serper_key: form.search_serper_key || null,
-        search_searxng_url: form.search_searxng_url || null,
         search_brave_key: form.search_brave_key || null,
 
         moltbook_api_key: form.moltbook_api_key || null,
@@ -18398,6 +19991,7 @@ function SettingsManager({
         payload.whatsapp_enabled = !!form.whatsapp_enabled;
         payload.whatsapp_mode = form.whatsapp_mode || null;
         payload.whatsapp_access_token = form.whatsapp_access_token || null;
+        payload.whatsapp_app_secret = form.whatsapp_app_secret || null;
         payload.whatsapp_phone_number_id = form.whatsapp_phone_number_id || null;
         payload.whatsapp_verify_token = form.whatsapp_verify_token || null;
         payload.whatsapp_bridge_url = form.whatsapp_bridge_url || null;
@@ -18426,10 +20020,12 @@ function SettingsManager({
       setForm((prev) => {
         const nextForm = {
           ...prev,
+        embeddings_api_key: "",
         llm_api_key: "",
         llm_fallback_api_key: "",
         telegram_bot_token: "",
         whatsapp_access_token: "",
+        whatsapp_app_secret: "",
         media_provider_keys_json: "",
         media_key_replicate: "",
         media_key_fal: "",
@@ -18568,6 +20164,7 @@ function SettingsManager({
   const moltbookEvents = pickRecords(moltbookLogQ.data, "events");
 
   const [modelDialogOpen, setModelDialogOpen] = useState(false);
+  const [modelsSectionTab, setModelsSectionTab] = useState<"pool" | "embeddings">("pool");
   const [modelEditingId, setModelEditingId] = useState<string | null>(null);
   const [modelAdvancedOpen, setModelAdvancedOpen] = useState(false);
   const [openaiSubAuth, setOpenaiSubAuth] = useState<{
@@ -18581,23 +20178,13 @@ function SettingsManager({
   const [modelForm, setModelForm] = useState({
     label: "",
     role: "primary",
-    provider: "ollama",
+    provider: "",
     model: "",
-    base_url: OLLAMA_DEFAULT_BASE_URL,
+    base_url: "",
     api_key: "",
     enabled: true
   });
   const previousModelProviderRef = useRef(modelForm.provider);
-
-  useEffect(() => {
-    if (modelForm.role !== "research") return;
-    setModelForm((p) => ({
-      ...p,
-      provider: "openrouter",
-      model: p.model || "perplexity/sonar-deep-research",
-      base_url: p.base_url || OPENROUTER_DEFAULT_BASE_URL
-    }));
-  }, [modelForm.role]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const prevProvider = previousModelProviderRef.current;
@@ -18609,14 +20196,13 @@ function SettingsManager({
       const current = p.base_url.trim();
       let next = p.base_url;
       if (p.provider === "openrouter") {
-        if (!current || current === OLLAMA_DEFAULT_BASE_URL) next = OPENROUTER_DEFAULT_BASE_URL;
+        if (current === OLLAMA_DEFAULT_BASE_URL) next = "";
       } else if (p.provider === "ollama") {
-        if (!current || current === OPENROUTER_DEFAULT_BASE_URL) next = OLLAMA_DEFAULT_BASE_URL;
+        if (current === OPENROUTER_DEFAULT_BASE_URL) next = "";
       } else if (
         (p.provider === "openai" ||
           p.provider === "anthropic" ||
-          p.provider === "openai-subscription" ||
-          p.provider === "codex-cli") &&
+          p.provider === "openai-subscription") &&
         (current === OLLAMA_DEFAULT_BASE_URL || current === OPENROUTER_DEFAULT_BASE_URL)
       ) {
         next = "";
@@ -18629,22 +20215,54 @@ function SettingsManager({
     queryKey: ["discover-models", modelForm.provider, modelForm.api_key, modelForm.base_url],
     queryFn: async () => {
       const p = modelForm.provider;
-      if (p === "openai-compatible") return [] as string[];
+      if (!p) return [] as Array<{ id: string; name?: string }>;
+      if (p === "openai-compatible" && !modelForm.base_url.trim()) return [] as Array<{ id: string; name?: string }>;
       const params = new URLSearchParams();
       if (modelForm.api_key.trim()) params.set("api_key", modelForm.api_key.trim());
       if (modelForm.base_url.trim()) params.set("base_url", modelForm.base_url.trim());
       try {
         const resp = asRecord(await api.rawGet(`/models/discover/${encodeURIComponent(p)}?${params.toString()}`));
         const models = resp.models;
-        if (Array.isArray(models)) return models.map((m: unknown) => str((m as Record<string, unknown>).id, "")).filter(Boolean);
+        if (Array.isArray(models)) {
+          return models.reduce<Array<{ id: string; name?: string }>>((acc, m: unknown) => {
+            const row = asRecord(m);
+            const id = str(row.id, "").trim();
+            if (!id) return acc;
+            const name = str(row.name, "").trim();
+            acc.push({ id, name: name || undefined });
+            return acc;
+          }, []);
+        }
       } catch { /* ignore */ }
-      return [] as string[];
+      return [] as Array<{ id: string; name?: string }>;
     },
-    enabled: modelDialogOpen && modelForm.provider !== "openai-compatible",
+    enabled:
+      modelDialogOpen &&
+      !!modelForm.provider &&
+      (modelForm.provider !== "openai-compatible" || !!modelForm.base_url.trim()),
     staleTime: 60_000,
     retry: false,
   });
-  const modelOptions = (discoverModelsQ.data?.length ? discoverModelsQ.data : MODEL_FALLBACKS_BY_PROVIDER[modelForm.provider]) || [];
+  const modelOptionNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const model of discoverModelsQ.data || []) {
+      if (model.name && model.name !== model.id) names.set(model.id, model.name);
+    }
+    return names;
+  }, [discoverModelsQ.data]);
+  const modelOptions = useMemo(() => {
+    const merged: string[] = [];
+    for (const candidate of [
+      ...(discoverModelsQ.data || []).map((model) => model.id),
+      ...(MODEL_FALLBACKS_BY_PROVIDER[modelForm.provider] || []),
+      modelForm.model.trim()
+    ]) {
+      const value = String(candidate || "").trim();
+      if (!value || merged.includes(value)) continue;
+      merged.push(value);
+    }
+    return merged;
+  }, [discoverModelsQ.data, modelForm.model, modelForm.provider]);
 
   function openAddModel() {
     setModelEditingId(null);
@@ -18654,9 +20272,9 @@ function SettingsManager({
     setModelForm({
       label: "",
       role: "primary",
-      provider: "ollama",
+      provider: "",
       model: "",
-      base_url: OLLAMA_DEFAULT_BASE_URL,
+      base_url: "",
       api_key: "",
       enabled: true
     });
@@ -18671,10 +20289,7 @@ function SettingsManager({
     setModelForm({
       label: str(slot.label, ""),
       role: str(slot.role, "primary"),
-      provider:
-        str(slot.provider, "ollama") === "codex-cli"
-          ? "openai-subscription"
-          : str(slot.provider, "ollama"),
+      provider: str(slot.provider, ""),
       model: str(slot.model, ""),
       base_url: str(slot.base_url, ""),
       api_key: "",
@@ -18748,16 +20363,9 @@ function SettingsManager({
     mutationFn: async () => {
       const provider = modelForm.provider;
       const baseUrl = modelForm.base_url.trim();
+      if (!provider.trim()) throw new Error("Provider is required.");
       const normalizedBaseUrl =
-        provider === "openrouter"
-          ? baseUrl || OPENROUTER_DEFAULT_BASE_URL
-          : provider === "ollama"
-            ? baseUrl || OLLAMA_DEFAULT_BASE_URL
-            : provider === "openai-subscription" || provider === "codex-cli"
-              ? ""
-            : provider === "openai-compatible"
-              ? baseUrl
-              : "";
+        provider === "openai-subscription" ? "" : baseUrl;
       const payload: Record<string, unknown> = {
         label: modelForm.label.trim(),
         role: modelForm.role,
@@ -18812,6 +20420,7 @@ function SettingsManager({
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["models"] });
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      setSuccess("Model removed.");
     },
     onError: (e) => setError(errMessage(e))
   });
@@ -18822,7 +20431,7 @@ function SettingsManager({
       const payload: Record<string, unknown> = {
         label: str(slot.label, ""),
         role: str(slot.role, "primary"),
-        provider: str(slot.provider, "ollama"),
+        provider: str(slot.provider, ""),
         model: str(slot.model, ""),
         base_url: str(slot.base_url, "") || null,
         enabled: !toBool(slot.enabled)
@@ -18848,9 +20457,17 @@ function SettingsManager({
   const hasTeamsAccessToken = toBool(settings.has_teams_access_token);
   const teamsDeliveryReady = toBool(settings.teams_delivery_ready);
   const hasWhatsAppToken = toBool(settings.has_whatsapp_token);
+  const hasWhatsAppAppSecret = toBool(settings.has_whatsapp_app_secret);
+  const hasWhatsAppVerifyToken = toBool(settings.has_whatsapp_verify_token);
   const whatsappDeliveryReady = toBool(settings.whatsapp_delivery_ready);
   const hasPrimaryApiKey = toBool(settings.has_api_key);
   const hasFallbackApiKey = toBool(settings.has_fallback_api_key);
+  const embeddingsHasApiKey = toBool(settings.embeddings_has_api_key);
+  const embeddingsStatus = str(settings.embeddings_status, "");
+  const embeddingsProvider = form.embeddings_provider || "local-hf";
+  const embeddingsIsLocal = embeddingsProvider === "local-hf";
+  const embeddingsIsOllama = embeddingsProvider === "ollama";
+  const embeddingsIsExternal = embeddingsProvider === "openai-compatible" || embeddingsIsOllama;
   const dailyBriefDeliveryWarning = !form.daily_brief_enabled
     ? ""
     : form.daily_brief_channel === "telegram"
@@ -18860,7 +20477,9 @@ function SettingsManager({
           ? "Telegram bot is connected, but there is no delivery target yet. Message the bot once or add an allowed user ID."
           : ""
       : form.daily_brief_channel === "whatsapp"
-        ? !hasWhatsAppToken
+        ? !hasWhatsAppToken ||
+          !hasWhatsAppAppSecret ||
+          !hasWhatsAppVerifyToken
           ? "WhatsApp is not configured yet."
           : !whatsappDeliveryReady
             ? "WhatsApp is configured, but there is no delivery target yet. Send the agent a WhatsApp message first."
@@ -18872,10 +20491,10 @@ function SettingsManager({
               ? "Slack is configured, but it still needs a signed webhook and delivery target."
               : ""
           : form.daily_brief_channel === "discord"
-            ? !hasDiscordBotToken && !str(form.discord_webhook_url, "").trim()
+            ? !hasDiscordBotToken
               ? "Discord is not configured yet."
               : !discordDeliveryReady
-                ? "Discord is configured, but it still needs a live bot or webhook destination."
+                ? "Discord is configured, but it still needs a guild, channel, or thread scope."
                 : ""
             : form.daily_brief_channel === "matrix"
               ? !hasMatrixAccessToken
@@ -19000,7 +20619,7 @@ function SettingsManager({
       : selectedTunnelMeta.isPrivate
         ? "Private access only works from devices already connected to your tailnet. It does not create a public internet URL."
         : str(selectedTunnelProviderRecord?.id, "") === "bore"
-          ? "Bore is a raw TCP tunnel. It is fine for app sharing, but the AgentArk control plane works best with an HTTPS provider such as Cloudflare, ngrok, or Tailscale Funnel."
+          ? "Bore is a raw TCP tunnel. It is fine for app sharing, but the main AgentArk app works best with an HTTPS provider such as Cloudflare, ngrok, or Tailscale Funnel."
           : selectedTunnelHelp;
     const sec = asRecord(securityStatusQ.data);
 
@@ -20109,8 +21728,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
   const restartMutation = useMutation({
     mutationFn: () => api.rawPost("/restart", {}),
-    onSuccess: () => setSuccess("Restart scheduled. Page will reload shortly."),
-    onError: (e) => setError(errMessage(e))
+    onSuccess: () => {
+      setSuccess(null);
+      setRestartNotice("AgentArk is restarting. Give it up to 10 seconds. The page will refresh automatically when it is ready.");
+    },
+    onError: (e) => {
+      setRestartNotice(null);
+      setError(errMessage(e));
+    }
   });
 
   const triggerPulseMutation = useMutation({
@@ -20452,6 +22077,140 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
   }, [tab]);
 
   const tabSupportsSave = ![9, 11, 16, 17, 20, 21, 22, 23].includes(tab);
+  const selectedSettingsMeta = (() => {
+    switch (tab) {
+      case 0:
+        return { kicker: "Setup", description: "Core instance identity, defaults, and readiness signals for this AgentArk workspace." };
+      case 1:
+        return { kicker: "Setup", description: "Model routing, fallbacks, and provider posture for operator and autonomous work." };
+      case 3:
+        return { kicker: "Setup", description: "Media generation defaults, rendering paths, and asset handling behavior." };
+      case 4:
+        return { kicker: "Security", description: "Instance protection, secrets posture, and security review controls." };
+      case 5:
+        return { kicker: "Security", description: "Advanced runtime switches and expert-only instance controls." };
+      case 6:
+        return { kicker: "Admin", description: "External trace export, privacy mode, and observability delivery configuration." };
+      case 7:
+        return { kicker: "Network", description: "Moltbook federation, participation mode, and connector runtime settings." };
+      case 8:
+        return { kicker: "Knowledge", description: "MCP server registration, transport, auth, and tool/resource exposure." };
+      case 9:
+        return { kicker: "Admin", description: "Diagnostics, onboarding readiness, and runtime health in one place." };
+      case 11:
+        return { kicker: "Observability", description: "Execution history, integration sync runs, and export delivery in one place." };
+      case 12:
+        return { kicker: "Knowledge", description: "Durable memory, learned facts, and knowledge controls used across conversations." };
+      case 13:
+        return { kicker: "Admin", description: "Review what AgentArk has learned, what is proposed, and what should be promoted." };
+      case 14:
+        return { kicker: "Admin", description: "Retention windows, cleanup cadence, and long-run storage posture." };
+      case 20:
+        return { kicker: "Integrations", description: "Delivery channels, target routing, and messaging readiness." };
+      case 21:
+        return { kicker: "Integrations", description: "OAuth-based connectors AgentArk can use across chat, tasks, and automation." };
+      case 22:
+        return { kicker: "Integrations", description: "Inbound webhooks and imported external APIs that create or extend runtime actions." };
+      case 23:
+        return { kicker: "Integrations", description: "External plugin endpoints, event subscriptions, and plugin runtime health." };
+      default:
+        return { kicker: "Settings", description: "Operator controls and system defaults for this AgentArk instance." };
+    }
+  })();
+
+  async function runArkPulseCheck() {
+    setError(null);
+    const baselineEventId = latestPulseEventId;
+    setPulsePollState({
+      baselineEventId,
+      deadlineAt: Date.now() + 2 * 60 * 1000
+    });
+    try {
+      const out = asRecord(await triggerPulseMutation.mutateAsync());
+      const status = str(out.status, "").toLowerCase();
+      if (status === "running") {
+        setSuccess(str(out.message, "ArkPulse is already running."));
+      } else {
+        setSuccess(str(out.message, "ArkPulse check started."));
+      }
+    } catch (e) {
+      setPulsePollState(null);
+      setError(errMessage(e));
+    }
+  }
+
+  const renderSettingsSectionIntro = ({
+    eyebrow,
+    title,
+    description,
+    info = null,
+    action = null,
+  }: {
+    eyebrow: string;
+    title: string;
+    description: string;
+    info?: string | null;
+    action?: JSX.Element | null;
+  }) => (
+    <Stack
+      className="settings-section-intro"
+      direction={{ xs: "column", md: "row" }}
+      justifyContent="space-between"
+      alignItems={{ xs: "flex-start", md: "center" }}
+      spacing={1}
+    >
+      <Box className="settings-section-intro-copy">
+        <Typography className="settings-section-kicker">{eyebrow}</Typography>
+        <Stack direction="row" spacing={0.75} alignItems="center" className="settings-section-title-row">
+          <Typography className="settings-section-title">{title}</Typography>
+          {info ? (
+            <Tooltip title={info} arrow placement="top-start">
+              <IconButton size="small" className="settings-section-info" aria-label={`${title} information`}>
+                <InfoOutlinedIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+          ) : null}
+        </Stack>
+        <Typography className="settings-section-description">{description}</Typography>
+      </Box>
+      {action ? <Box className="settings-section-actions">{action}</Box> : null}
+    </Stack>
+  );
+
+  const renderSettingsInlineCard = ({
+    eyebrow,
+    title,
+    description,
+    tone = "default",
+    action = null,
+    children = null,
+  }: {
+    eyebrow?: string;
+    title: string;
+    description: string;
+    tone?: "default" | "info" | "warning";
+    action?: JSX.Element | null;
+    children?: ReactNode;
+  }) => (
+    <Box className={`settings-inline-card tone-${tone}`}>
+      <Stack
+        className="settings-inline-card-head"
+        direction={{ xs: "column", md: "row" }}
+        justifyContent="space-between"
+        alignItems={{ xs: "flex-start", md: "center" }}
+        spacing={1}
+      >
+        <Box className="settings-inline-card-copy">
+          {eyebrow ? <Typography className="settings-inline-card-kicker">{eyebrow}</Typography> : null}
+          <Typography className="settings-inline-card-title">{title}</Typography>
+          <Typography className="settings-inline-card-description">{description}</Typography>
+        </Box>
+        {action ? <Box className="settings-inline-card-actions">{action}</Box> : null}
+      </Stack>
+      {children ? <Box className="settings-inline-card-body">{children}</Box> : null}
+    </Box>
+  );
+
   const foreverLifecycleRules = [
     { label: "Notifications", value: form.data_lifecycle_notifications_retention_days },
     { label: "Execution traces", value: form.data_lifecycle_execution_trace_retention_days },
@@ -20468,6 +22227,12 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     return Number.isFinite(parsed) && parsed === 0;
   });
   const foreverLifecycleSummary = foreverLifecycleRules.map((rule) => rule.label).join(", ");
+  const dataCleanupEnabled = form.data_lifecycle_cleanup_enabled;
+  const episodeCleanupInputsEnabled = dataCleanupEnabled && form.memory_retention_enabled;
+  const notificationsCleanupInputsEnabled =
+    dataCleanupEnabled && form.data_lifecycle_notifications_cleanup_enabled;
+  const logsCleanupInputsEnabled =
+    dataCleanupEnabled && form.data_lifecycle_logs_cleanup_enabled;
 
   return (
     <Stack spacing={2}>
@@ -20477,88 +22242,113 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         </Alert>
       ) : null}
 
-      <Box className="settings-shell-layout" sx={hideSettingsNav ? { gridTemplateColumns: "1fr !important" } : undefined}>
+      <Box className="settings-shell-layout" sx={{ flex: 1, minHeight: 0, ...(hideSettingsNav ? { gridTemplateColumns: "1fr !important" } : undefined) }}>
         {!hideSettingsNav ? (
-        <Box className="settings-sidebar">
-          <Box className="settings-brand">
-            <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28 }} />
-            <Stack spacing={0.1}>
-              <Typography variant="subtitle2">AgentArk</Typography>
-              <Typography variant="caption" color="text.secondary">
-                Settings
-              </Typography>
-            </Stack>
-          </Box>
-          <Stack spacing={0.2} className="settings-nav-list" sx={{ display: { xs: "none", md: "flex" } }}>
-            {settingsNavGroups.map((group, groupIdx) => (
-              <Box key={`settings-nav-group-${group.id}`}>
-                <Typography className="settings-nav-group-label">
-                  {group.label}
+          <Box className="settings-sidebar">
+            <Box className="settings-brand">
+              <Avatar src={AgentLogo} variant="rounded" sx={{ width: 28, height: 28 }} />
+              <Stack spacing={0.1}>
+                <Typography variant="subtitle2">AgentArk</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Settings
                 </Typography>
-                {group.items.map((item) => (
-                  <Button
-                    key={`settings-nav-${item.value}`}
-                    className={`settings-nav-btn${tab === item.value ? " active" : ""}`}
-                    variant="text"
-                    onClick={() => setTab(item.value)}
-                  >
-                    <span>{item.label}</span>
-                  </Button>
-                ))}
-                {groupIdx < settingsNavGroups.length - 1 ? (
-                  <div className="settings-nav-divider" />
-                ) : null}
-              </Box>
-            ))}
-          </Stack>
-          <Tabs
-            value={tab}
-            onChange={(_, v) => setTab(Number(v) || 0)}
-            variant="scrollable"
-            scrollButtons="auto"
-            sx={{ display: { xs: "flex", md: "none" } }}
-          >
-            {settingsNavActual.map((item) => (
-              <Tab key={`settings-mobile-${item.value}`} value={item.value} label={item.label} />
-            ))}
-          </Tabs>
-        </Box>
+              </Stack>
+            </Box>
+            <Stack spacing={0.2} className="settings-nav-list" sx={{ display: { xs: "none", md: "flex" } }}>
+              {settingsNavGroups.map((group, groupIdx) => (
+                <Box key={`settings-nav-group-${group.id}`}>
+                  <Typography className="settings-nav-group-label">
+                    {group.label}
+                  </Typography>
+                  {group.items.map((item) => (
+                    <Button
+                      key={`settings-nav-${item.value}`}
+                      className={`settings-nav-btn${tab === item.value ? " active" : ""}`}
+                      variant="text"
+                      onClick={() => setTab(item.value)}
+                    >
+                      <span>{item.label}</span>
+                    </Button>
+                  ))}
+                  {groupIdx < settingsNavGroups.length - 1 ? (
+                    <div className="settings-nav-divider" />
+                  ) : null}
+                </Box>
+              ))}
+            </Stack>
+            <Tabs
+              value={tab}
+              onChange={(_, v) => setTab(Number(v) || 0)}
+              variant="scrollable"
+              scrollButtons="auto"
+              sx={{ display: { xs: "flex", md: "none" } }}
+            >
+              {settingsNavActual.map((item) => (
+                <Tab key={`settings-mobile-${item.value}`} value={item.value} label={item.label} />
+              ))}
+            </Tabs>
+          </Box>
         ) : null}
-        <Box className="settings-main">
-          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
-            <Typography variant="subtitle1" sx={{ fontWeight: 600, fontSize: "1rem" }}>
-              {selectedSettingsNav?.label || "Settings"}
-            </Typography>
-            {tabSupportsSave ? (
-              <Stack direction="row" spacing={1} alignItems="center">
+        <Box className={`settings-main${hideSettingsNav ? " settings-main-standalone" : ""}`}>
+          <Stack spacing={2} className="workspace-page-shell settings-page-shell">
+            <Stack
+              direction={{ xs: "column", md: "row" }}
+              justifyContent="space-between"
+              alignItems={{ xs: "stretch", md: "flex-start" }}
+              spacing={1.25}
+              className="workspace-page-header settings-page-header"
+            >
+              <Box className="workspace-page-header-copy">
+                <Typography className="workspace-page-kicker">{selectedSettingsMeta.kicker}</Typography>
+                <Typography className="workspace-page-title">{selectedSettingsNav?.label || "Settings"}</Typography>
+                <Typography className="workspace-page-copy">
+                  {selectedSettingsMeta.description}
+                </Typography>
+              </Box>
+              <Stack direction="row" spacing={1} alignItems="center" justifyContent={{ xs: "flex-start", md: "flex-end" }} useFlexGap flexWrap="wrap">
                 {modelsQ.isFetching && showingModelFallback ? (
                   <Chip size="small" color="warning" variant="outlined" label="Reconnecting..." />
                 ) : null}
-                <Button
-                  size="small"
-                  variant="contained"
-                  onClick={async () => {
-                    setError(null);
-                    setSuccess(null);
-                    try {
-                      await saveMutation.mutateAsync();
-                    } catch (e) {
-                      setError(errMessage(e));
-                    }
-                  }}
-                  disabled={saveMutation.isPending || !effectiveDirty}
-                >
-                  Save
-                </Button>
+                {tab === 9 ? (
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={runArkPulseCheck}
+                    disabled={triggerPulseMutation.isPending || pulseRunning}
+                  >
+                    {triggerPulseMutation.isPending || pulseRunning ? "Running..." : "Run now"}
+                  </Button>
+                ) : null}
+                {tabSupportsSave ? (
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={async () => {
+                      setError(null);
+                      setSuccess(null);
+                      try {
+                        await saveMutation.mutateAsync();
+                      } catch (e) {
+                        setError(errMessage(e));
+                      }
+                    }}
+                    disabled={saveMutation.isPending || !effectiveDirty}
+                  >
+                    Save
+                  </Button>
+                ) : null}
               </Stack>
-            ) : null}
-          </Stack>
+            </Stack>
 
       {tab === 0 ? (
         <Stack spacing={2.5}>
           {/* â”€â”€ Status Overview â”€â”€ */}
           <Box>
-            <Typography className="settings-section-label">Status</Typography>
+            {renderSettingsSectionIntro({
+              eyebrow: "General",
+              title: "Status",
+              description: "Quick readiness snapshot for models, delivery channels, and overall setup completeness.",
+            })}
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", md: "repeat(4, 1fr)" }, gap: 1.5 }}>
               {[
                 {
@@ -20588,13 +22378,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 },
                 {
                   label: "Discord",
-                  tone: !hasDiscordBotToken && !str(settings.discord_webhook_url, "").trim() ? "muted" : discordDeliveryReady ? "success" : "warning",
+                  tone: !hasDiscordBotToken ? "muted" : discordDeliveryReady ? "success" : "warning",
                   status:
-                    !hasDiscordBotToken && !str(settings.discord_webhook_url, "").trim()
+                    !hasDiscordBotToken
                       ? "Not configured"
                       : discordDeliveryReady
                         ? "Ready to deliver"
-                        : "Needs target"
+                        : "Needs scope"
                 },
                 {
                   label: "Matrix",
@@ -20608,8 +22398,18 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 },
                 {
                   label: "WhatsApp",
-                  tone: !hasWhatsAppToken ? "muted" : whatsappDeliveryReady ? "success" : "warning",
-                  status: !hasWhatsAppToken ? "Not configured" : whatsappDeliveryReady ? "Ready to deliver" : "No recipient"
+                  tone:
+                    !hasWhatsAppToken || !hasWhatsAppAppSecret || !hasWhatsAppVerifyToken
+                      ? "muted"
+                      : whatsappDeliveryReady
+                        ? "success"
+                        : "warning",
+                  status:
+                    !hasWhatsAppToken || !hasWhatsAppAppSecret || !hasWhatsAppVerifyToken
+                      ? "Not configured"
+                      : whatsappDeliveryReady
+                        ? "Ready to deliver"
+                        : "No recipient"
                 },
               ].map((s) => (
                 <Box
@@ -20689,7 +22489,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           {/* â”€â”€ Identity â”€â”€ */}
           <Stack spacing={2}>
-            <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Identity</Typography>
+            {renderSettingsSectionIntro({
+              eyebrow: "General",
+              title: "Identity",
+              description: "Core operator-facing defaults for how this AgentArk instance presents itself in conversations and automation.",
+            })}
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
               <TextField label="Bot Name" value={form.bot_name} onChange={(e) => setField("bot_name", e.target.value)} fullWidth size="small" />
               <TextField
@@ -20733,7 +22537,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           {/* â”€â”€ Preferences â”€â”€ */}
           <Stack spacing={2}>
-            <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Preferences</Typography>
+            {renderSettingsSectionIntro({
+              eyebrow: "General",
+              title: "Preferences",
+              description: "Timezone, formatting, and operator defaults used across briefs, reminders, and generated communication.",
+            })}
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
               <Autocomplete
                 freeSolo
@@ -20790,21 +22598,17 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <hr className="settings-divider" />
 
           <Box>
-            <Typography className="settings-section-label">Daily Brief</Typography>
+            {renderSettingsSectionIntro({
+              eyebrow: "General",
+              title: "Daily Brief",
+              description: "Schedule the recurring summary and choose how AgentArk delivers it each day.",
+            })}
             <Stack spacing={1.25}>
-              <Box className="metadata-box">
-                <Stack
-                  direction={{ xs: "column", md: "row" }}
-                  spacing={1.5}
-                  justifyContent="space-between"
-                  alignItems={{ xs: "flex-start", md: "center" }}
-                >
-                  <Stack spacing={0.35}>
-                    <Typography variant="subtitle2">Morning Summary</Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Send a recurring daily brief using your selected timezone.
-                    </Typography>
-                  </Stack>
+              {renderSettingsInlineCard({
+                eyebrow: "Daily brief",
+                title: "Delivery status",
+                description: "Send a recurring summary using your chosen time and timezone.",
+                action: (
                   <FormControlLabel
                     control={
                       <Switch
@@ -20814,8 +22618,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     }
                     label={form.daily_brief_enabled ? "Enabled" : "Disabled"}
                   />
-                </Stack>
-              </Box>
+                )
+              })}
               <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" }, gap: 1.5 }}>
                 <TextField
                   label="Preferred Delivery Time"
@@ -20859,130 +22663,274 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       ) : null}
 
       {tab === 1 ? (
-        <Stack spacing={2} data-tour-target="settings-models">
+        <Stack spacing={1.5} data-tour-target="settings-models" sx={{ minHeight: 0 }}>
           <Box sx={{ minHeight: 0 }}>
-            <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-              <Stack spacing={0.3}>
-                <Typography className="settings-section-label" sx={{ mb: "0 !important" }}>Model Pool</Typography>
-                <Typography variant="caption" color="text.secondary">
-                  Configure multiple models for different roles. Changes apply immediately.
-                </Typography>
-              </Stack>
-              <Button size="small" variant="contained" onClick={openAddModel}>
-                Add Model
-              </Button>
-            </Stack>
+            <Stack spacing={1.5}>
+              <Tabs
+                value={modelsSectionTab}
+                onChange={(_, value) => setModelsSectionTab(value as "pool" | "embeddings")}
+                variant="scrollable"
+                scrollButtons="auto"
+                sx={{
+                  minHeight: 0,
+                  "& .MuiTabs-indicator": {
+                    height: 2,
+                  }
+                }}
+              >
+                <Tab value="pool" label="Model Pool" />
+                <Tab value="embeddings" label="Embeddings" />
+              </Tabs>
 
-            <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={form.smart_routing}
-                    onChange={(e) => setField("smart_routing", e.target.checked)}
-                  />
-                }
-                label="Smart Routing"
-              />
-              <Typography variant="caption" color="text.secondary">
-                When off, the agent uses the primary model for everything.
-              </Typography>
-            </Stack>
+              {modelsSectionTab === "pool" ? (
+                <Box sx={{ minHeight: 0 }}>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Models",
+                    title: "Model Pool",
+                    description: "Configure the models AgentArk uses for primary, fast, code, research, and fallback work.",
+                    action: (
+                      <Button size="small" variant="contained" onClick={openAddModel}>
+                        Add Model
+                      </Button>
+                    ),
+                  })}
 
-            {modelsQ.isLoading && modelSlots.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                Loading models...
-              </Typography>
-            ) : modelsRefreshIssue && modelSlots.length === 0 ? (
-              <Alert severity="warning">
-                Could not refresh model list right now. Please retry in a moment.
-              </Alert>
-            ) : modelSlots.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                No models configured. Add a model to complete setup.
-              </Typography>
-            ) : (
-              <Stack spacing={1}>
-                {showingModelFallback ? (
-                  <Alert severity="info">
-                    Showing last known model list while refresh is in progress.
-                  </Alert>
-                ) : null}
-                <TableContainer className="table-shell">
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Label</TableCell>
-                        <TableCell>Role</TableCell>
-                        <TableCell>Provider</TableCell>
-                        <TableCell>Model</TableCell>
-                        <TableCell>Enabled</TableCell>
-                        <TableCell>API Key</TableCell>
-                        <TableCell align="right">Ops</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {modelSlots.map((slot) => {
-                        const id = str(slot.id, "");
-                        const enabled = toBool(slot.enabled);
-                        return (
-                          <TableRow key={id}>
-                            <TableCell>{str(slot.label, "-")}</TableCell>
-                            <TableCell>{str(slot.role, "-")}</TableCell>
-                            <TableCell>
-                              {str(slot.provider, "-") === "codex-cli"
-                                ? "openai-subscription"
-                                : str(slot.provider, "-")}
-                            </TableCell>
-                            <TableCell sx={{ wordBreak: "break-word" }}>{str(slot.model, "-")}</TableCell>
-                            <TableCell>{enabled ? "yes" : "no"}</TableCell>
-                            <TableCell>{toBool(slot.has_api_key) ? "configured" : "-"}</TableCell>
-                            <TableCell align="right">
-                              <RowOpsMenu
-                                actions={[
-                                  {
-                                    label: "Edit",
-                                    onClick: () => openEditModel(slot)
-                                  },
-                                  {
-                                    label: enabled ? "Disable" : "Enable",
-                                    disabled: toggleModelEnabledMutation.isPending,
-                                    onClick: async () => {
-                                      setError(null);
-                                      try {
-                                        await toggleModelEnabledMutation.mutateAsync(slot);
-                                      } catch (e) {
-                                        setError(errMessage(e));
-                                      }
-                                    }
-                                  },
-                                  {
-                                    label: "Delete",
-                                    tone: "error",
-                                    divider: true,
-                                    disabled: deleteModelMutation.isPending,
-                                    onClick: async () => {
-                                      const ok = window.confirm("Delete this model slot?");
-                                      if (!ok) return;
-                                      setError(null);
-                                      try {
-                                        await deleteModelMutation.mutateAsync(id);
-                                      } catch (e) {
-                                        setError(errMessage(e));
-                                      }
-                                    }
-                                  }
-                                ]}
-                                ariaLabel="Model options"
-                              />
-                            </TableCell>
-                          </TableRow>
-                        );
-                      })}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              </Stack>
-            )}
+                  <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={form.smart_routing}
+                          onChange={(e) => setField("smart_routing", e.target.checked)}
+                        />
+                      }
+                      label="Smart Routing"
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      When off, the agent uses the primary model for everything.
+                    </Typography>
+                  </Stack>
+
+                  {modelsQ.isLoading && modelSlots.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">
+                      Loading models...
+                    </Typography>
+                  ) : modelsRefreshIssue && modelSlots.length === 0 ? (
+                    <Alert severity="warning">
+                      Could not refresh model list right now. Please retry in a moment.
+                    </Alert>
+                  ) : modelSlots.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No models configured. Add a model to complete setup.
+                    </Typography>
+                  ) : (
+                    <Stack spacing={1}>
+                      {showingModelFallback ? (
+                        <Alert severity="info">
+                          Showing last known model list while refresh is in progress.
+                        </Alert>
+                      ) : null}
+                      <TableContainer className="table-shell settings-models-table-shell">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Label</TableCell>
+                              <TableCell>Role</TableCell>
+                              <TableCell>Provider</TableCell>
+                              <TableCell>Model</TableCell>
+                              <TableCell>Enabled</TableCell>
+                              <TableCell>API Key</TableCell>
+                              <TableCell align="right">Ops</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {modelSlots.map((slot) => {
+                              const id = str(slot.id, "");
+                              const enabled = toBool(slot.enabled);
+                              return (
+                                <TableRow key={id}>
+                                  <TableCell>{str(slot.label, "-")}</TableCell>
+                                  <TableCell>{str(slot.role, "-")}</TableCell>
+                                  <TableCell>{str(slot.provider, "-")}</TableCell>
+                                  <TableCell sx={{ wordBreak: "break-word" }}>{str(slot.model, "-")}</TableCell>
+                                  <TableCell>{enabled ? "yes" : "no"}</TableCell>
+                                  <TableCell>{toBool(slot.has_api_key) ? "configured" : "-"}</TableCell>
+                                  <TableCell align="right">
+                                    <RowOpsMenu
+                                      actions={[
+                                        {
+                                          label: "Edit",
+                                          onClick: () => openEditModel(slot)
+                                        },
+                                        {
+                                          label: enabled ? "Disable" : "Enable",
+                                          disabled: toggleModelEnabledMutation.isPending,
+                                          onClick: async () => {
+                                            setError(null);
+                                            try {
+                                              await toggleModelEnabledMutation.mutateAsync(slot);
+                                            } catch (e) {
+                                              setError(errMessage(e));
+                                            }
+                                          }
+                                        },
+                                        {
+                                          label: "Delete",
+                                          tone: "error",
+                                          divider: true,
+                                          disabled: deleteModelMutation.isPending,
+                                          onClick: async () => {
+                                            const ok = window.confirm("Delete this model slot?");
+                                            if (!ok) return;
+                                            setError(null);
+                                            try {
+                                              await deleteModelMutation.mutateAsync(id);
+                                            } catch (e) {
+                                              setError(errMessage(e));
+                                            }
+                                          }
+                                        }
+                                      ]}
+                                      ariaLabel="Model options"
+                                    />
+                                  </TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    </Stack>
+                  )}
+                </Box>
+              ) : (
+                <Stack spacing={1.5}>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Models",
+                    title: "Embeddings",
+                    description: "Choose the backend used for local memory, retrieval, and document embeddings.",
+                  })}
+
+                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={
+                        embeddingsProvider === "local-hf"
+                          ? "Local Hugging Face"
+                          : embeddingsProvider === "ollama"
+                            ? "External Ollama"
+                            : "External Provider"
+                      }
+                    />
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={form.embeddings_model.trim() || "No model selected"}
+                    />
+                    {embeddingsProvider === "openai-compatible" ? (
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color={form.embeddings_api_key.trim() || embeddingsHasApiKey ? "success" : "default"}
+                        label={form.embeddings_api_key.trim() || embeddingsHasApiKey ? "API key configured" : "No API key"}
+                      />
+                    ) : null}
+                  </Stack>
+
+                  {embeddingsStatus ? (
+                    <Alert
+                      severity={
+                        /failed|unavailable|error/i.test(embeddingsStatus)
+                          ? "error"
+                          : /ready/i.test(embeddingsStatus)
+                            ? "success"
+                            : /download|initializ|configured|reachable/i.test(embeddingsStatus)
+                              ? "info"
+                              : "warning"
+                      }
+                    >
+                      {embeddingsStatus}
+                    </Alert>
+                  ) : null}
+
+                  <Grid2 container spacing={1.5}>
+                    <Grid2 size={{ xs: 12, md: 4 }}>
+                      <TextField
+                        label="Provider"
+                        select
+                        value={form.embeddings_provider}
+                        onChange={(e) => setField("embeddings_provider", e.target.value)}
+                        fullWidth
+                        size="small"
+                      >
+                        <MenuItem value="local-hf">Local Hugging Face</MenuItem>
+                        <MenuItem value="openai-compatible">External OpenAI-compatible</MenuItem>
+                        <MenuItem value="ollama">External Ollama</MenuItem>
+                      </TextField>
+                    </Grid2>
+                    <Grid2 size={{ xs: 12, md: 8 }}>
+                      <TextField
+                        label="Embedding Model"
+                        value={form.embeddings_model}
+                        onChange={(e) => setField("embeddings_model", e.target.value)}
+                        fullWidth
+                        size="small"
+                        placeholder="sentence-transformers/all-MiniLM-L6-v2"
+                        helperText={
+                          embeddingsIsLocal
+                            ? "Default local model: sentence-transformers/all-MiniLM-L6-v2"
+                            : embeddingsIsOllama
+                              ? "Example: nomic-embed-text"
+                              : "Use the model name exposed by your external /embeddings provider."
+                        }
+                      />
+                    </Grid2>
+
+                    {embeddingsIsExternal ? (
+                      <Grid2 size={{ xs: 12, md: 8 }}>
+                        <TextField
+                          label={embeddingsIsOllama ? "Base URL" : "Base URL (optional)"}
+                          value={form.embeddings_base_url}
+                          onChange={(e) => setField("embeddings_base_url", e.target.value)}
+                          fullWidth
+                          size="small"
+                          placeholder={
+                            embeddingsIsOllama
+                              ? "http://host.docker.internal:11434"
+                              : "https://api.openai.com/v1"
+                          }
+                          helperText={
+                            embeddingsIsOllama
+                              ? "Point this at a user-managed Ollama server. AgentArk does not bundle Ollama."
+                              : "Leave blank to use the provider default. Set this when using another OpenAI-compatible embeddings endpoint."
+                          }
+                        />
+                      </Grid2>
+                    ) : null}
+
+                    {embeddingsProvider === "openai-compatible" ? (
+                      <Grid2 size={{ xs: 12, md: 4 }}>
+                        <TextField
+                          label="API Key (optional)"
+                          value={form.embeddings_api_key}
+                          onChange={(e) => setField("embeddings_api_key", e.target.value)}
+                          fullWidth
+                          size="small"
+                          type="password"
+                          helperText={embeddingsHasApiKey ? "Leave blank to keep the current key." : "Only required if your external provider needs authentication."}
+                        />
+                      </Grid2>
+                    ) : null}
+                  </Grid2>
+
+                  {embeddingsIsLocal ? (
+                    <Alert severity="info" icon={<InfoOutlinedIcon fontSize="inherit" />}>
+                      Local embeddings download on first use and stay cached inside AgentArk data. No Ollama service is required.
+                    </Alert>
+                  ) : null}
+                </Stack>
+              )}
+            </Stack>
           </Box>
 
           <Dialog open={modelDialogOpen} onClose={() => setModelDialogOpen(false)} fullWidth maxWidth="sm">
@@ -21015,6 +22963,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   onChange={(e) => setModelForm((p) => ({ ...p, provider: e.target.value }))}
                   fullWidth
                 >
+                  <MenuItem value="">Select provider</MenuItem>
                   <MenuItem value="ollama">ollama</MenuItem>
                   <MenuItem value="anthropic">anthropic</MenuItem>
                   <MenuItem value="openai">openai</MenuItem>
@@ -21025,10 +22974,22 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 <Autocomplete
                   freeSolo
                   options={modelOptions}
+                  loading={discoverModelsQ.isFetching}
                   value={modelForm.model}
                   onChange={(_, v) => setModelForm((p) => ({ ...p, model: String(v ?? "") }))}
                   inputValue={modelForm.model}
                   onInputChange={(_, v) => setModelForm((p) => ({ ...p, model: v }))}
+                  renderOption={(props, option) => {
+                    const name = modelOptionNames.get(option);
+                    return (
+                      <li {...props}>
+                        <ListItemText
+                          primary={name || option}
+                          secondary={name && name !== option ? option : undefined}
+                        />
+                      </li>
+                    );
+                  }}
                   renderInput={(params) => (
                     <TextField
                       {...params}
@@ -21036,13 +22997,20 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       fullWidth
                       placeholder={
                         modelForm.provider === "openai-subscription"
-                          ? "Choose OpenAI model"
-                          : "Enter model id"
+                          ? "Choose or enter OpenAI model id"
+                          : "Choose or enter model id"
+                      }
+                      helperText={
+                        modelForm.provider === "openai-compatible" && !modelForm.base_url.trim()
+                          ? "Set a Base URL in Advanced to auto-discover models, or type a model ID manually."
+                          : discoverModelsQ.isFetching
+                            ? "Loading provider models. You can still type any model ID."
+                            : "You can type any model ID even if it is not listed."
                       }
                     />
                   )}
                 />
-                {modelForm.provider === "openai-subscription" || modelForm.provider === "codex-cli" ? (
+                {modelForm.provider === "openai-subscription" ? (
                   <Stack spacing={1}>
                     <Alert severity="info">
                       Connect your OpenAI subscription with browser OAuth. You can reconnect any time, especially if auth expires.
@@ -21183,9 +23151,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         fullWidth
                         helperText={
                           modelForm.provider === "openrouter"
-                            ? `Default: ${OPENROUTER_DEFAULT_BASE_URL}`
+                            ? `Example: ${OPENROUTER_DEFAULT_BASE_URL}`
                             : modelForm.provider === "ollama"
-                              ? `Default: ${OLLAMA_DEFAULT_BASE_URL}`
+                              ? `Example: ${OLLAMA_DEFAULT_BASE_URL}`
                               : "Required for OpenAI-compatible providers."
                         }
                       />
@@ -21228,12 +23196,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         <Grid2 container spacing={1.5} alignItems="stretch">
           <Grid2 size={{ xs: 12, lg: 6 }} sx={{ display: "flex" }}>
             <Box sx={{ minHeight: 0, width: "100%" }}>
-              <Typography className="settings-section-label">
-                Provider Keys
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                Keys are stored encrypted. Leave blank to keep current keys.
-              </Typography>
+              {renderSettingsSectionIntro({
+                eyebrow: "Media",
+                title: "Provider Keys",
+                description: "Keys stay encrypted at rest. Leave fields blank to keep any existing saved secrets.",
+              })}
               <Stack spacing={1.2} sx={{ mt: 1 }}>
                 <TextField label="Replicate API Key" value={form.media_key_replicate} onChange={(e) => setField("media_key_replicate", e.target.value)} fullWidth size="small" type="password" />
                 <TextField label="FAL API Key" value={form.media_key_fal} onChange={(e) => setField("media_key_fal", e.target.value)} fullWidth size="small" type="password" />
@@ -21253,9 +23220,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Grid2 size={{ xs: 12, lg: 6 }} sx={{ display: "flex" }}>
             <Box className="list-shell" sx={{ minHeight: 0, width: "100%" }}>
-              <Typography variant="h6" mb={1}>
-                Defaults
-              </Typography>
+              {renderSettingsSectionIntro({
+                eyebrow: "Media",
+                title: "Defaults",
+                description: "Choose the default and fallback providers AgentArk uses for image and video generation.",
+              })}
               <Stack spacing={1.2}>
                 <TextField label="Default Image Provider" value={form.default_image_provider} onChange={(e) => setField("default_image_provider", e.target.value)} fullWidth size="small" />
                 <TextField label="Image Model" value={form.image_model} onChange={(e) => setField("image_model", e.target.value)} fullWidth size="small" />
@@ -21264,12 +23233,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 <TextField label="Fallback Video Provider" value={form.fallback_video_provider} onChange={(e) => setField("fallback_video_provider", e.target.value)} fullWidth size="small" />
               </Stack>
               <Divider sx={{ my: 2 }} />
-              <Typography variant="h6" mb={1}>
-                Advanced (JSON)
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                Optional JSON mapping provider to key, e.g. {"{\"openai\":\"sk-...\",\"replicate\":\"...\"}"}
-              </Typography>
+              {renderSettingsSectionIntro({
+                eyebrow: "Media",
+                title: "Advanced JSON",
+                description: "Optional raw provider-to-key mapping when you need explicit JSON control over media credentials.",
+              })}
               <TextField
                 label="media_providers JSON"
                 value={form.media_provider_keys_json}
@@ -21290,7 +23258,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             <Stack spacing={2}>
               <Box sx={{ minHeight: 0 }}>
                 <Stack spacing={1}>
-                  <Typography className="settings-section-label">Security & Master Password</Typography>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Security",
+                    title: "Security & Master Password",
+                    description: "Protect operator access, control remote sign-in, and manage the primary instance password.",
+                  })}
                   {securityStatusQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">
                       Loading security status...
@@ -21347,23 +23319,17 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 <Stack spacing={1.25}>
-                  <Stack
-                    direction={{ xs: "column", sm: "row" }}
-                    justifyContent="space-between"
-                    alignItems={{ xs: "flex-start", sm: "center" }}
-                    spacing={1}
-                  >
-                    <Stack spacing={0.4}>
-                      <Typography variant="h6">Remote Access</Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        Start private or public sign-in access only when you need it.
-                      </Typography>
-                    </Stack>
-                    <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                      <Chip size="small" color={tunnelSummaryTone} label={tunnelStateLabel} />
-                      <Chip size="small" variant="outlined" label={tunnelAccessLabel} />
-                    </Stack>
-                  </Stack>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Security",
+                    title: "Remote Access",
+                    description: "Only expose remote sign-in when you need it, and keep the access method and posture visible.",
+                    action: (
+                      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                        <Chip size="small" color={tunnelSummaryTone} label={tunnelStateLabel} />
+                        <Chip size="small" variant="outlined" label={tunnelAccessLabel} />
+                      </Stack>
+                    ),
+                  })}
                 {tunnelQ.isLoading || tunnelProvidersQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">
                     Loading tunnel settings...
@@ -21452,21 +23418,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       ) : null}
                       {str(tunnel.error, "").trim() ? <Alert severity="error">{str(tunnel.error)}</Alert> : null}
                       {tunnelSetupChecks.length > 0 ? (
-                        <Box
-                          sx={{
-                            border: "1px solid rgba(62,143,214,0.18)",
-                            borderRadius: 1,
-                            px: 1.25,
-                            py: 1
-                          }}
-                        >
-                          <Stack spacing={1}>
-                            <Stack spacing={0.35}>
-                              <Typography variant="subtitle2">Setup checklist</Typography>
-                              <Typography variant="caption" color="text.secondary">
-                                Check setup explains exactly what is missing before remote access can start.
-                              </Typography>
-                            </Stack>
+                        renderSettingsInlineCard({
+                          eyebrow: "Remote access",
+                          title: "Before remote access can start",
+                          description: "This checklist shows what is still missing, with the exact fix for each step.",
+                          tone: "info",
+                          children: (
+                            <Stack spacing={1}>
                             {tunnelSetupChecks.map((rawCheck, index) => {
                               const check = asRecord(rawCheck);
                               const status = str(check.status, "info");
@@ -21503,8 +23461,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                                 </Alert>
                               );
                             })}
-                          </Stack>
-                        </Box>
+                            </Stack>
+                          )
+                        })
                       ) : null}
                       {str(tunnel.url, "").trim() ? (
                         <TextField
@@ -21637,20 +23596,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
               <Box className="list-shell" sx={{ minHeight: 0 }}>
                 <Stack spacing={1}>
-                  <Stack
-                    direction={{ xs: "column", sm: "row" }}
-                    justifyContent="space-between"
-                    alignItems={{ xs: "flex-start", sm: "center" }}
-                    spacing={1}
-                  >
-                    <Stack spacing={0.4}>
-                      <Typography variant="h6">Secrets Vault</Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {vaultSummaryText}
-                      </Typography>
-                    </Stack>
-                    <Chip size="small" variant="outlined" label={`${vaultSecrets.length} saved`} />
-                  </Stack>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Security",
+                  title: "Secrets vault",
+                  description: vaultSummaryText,
+                  info:
+                      "Save private keys and tokens here so AgentArk can use them without showing the raw value in normal screens.",
+                    action: <Chip size="small" variant="outlined" label={`${vaultSecrets.length} saved`} />
+                  })}
                   {hasCustomMasterPassword ? (
                     <TextField
                       label="Master password for protected edits"
@@ -21792,24 +23745,25 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Grid2 size={{ xs: 12 }}>
             <Box className="list-shell" sx={{ minHeight: 0 }}>
-              <Stack direction={{ xs: "column", sm: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", sm: "center" }} spacing={1}>
-                <Stack spacing={0.25}>
-                  <Typography variant="h6">Security Logs</Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    Hidden by default. Open the viewer to inspect individual events.
-                  </Typography>
-                </Stack>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  onClick={() => {
-                    setSelectedSecurityLog(null);
-                    setSecurityLogsDialogOpen(true);
-                  }}
-                >
-                  Open Logs
-                </Button>
-              </Stack>
+              {renderSettingsSectionIntro({
+                eyebrow: "Security",
+                title: "Security logs",
+                description: "Hidden by default. Open the viewer to inspect individual events.",
+                info:
+                  "This log records security-related events such as sign-in failures, policy checks, and protection warnings.",
+                action: (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() => {
+                      setSelectedSecurityLog(null);
+                      setSecurityLogsDialogOpen(true);
+                    }}
+                  >
+                    Open Logs
+                  </Button>
+                )
+              })}
             </Box>
           </Grid2>
         </Grid2>
@@ -21817,11 +23771,31 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
       {tab === 5 ? (
         <Stack spacing={2.5}>
+          {restartNotice
+            ? renderSettingsInlineCard({
+                eyebrow: "Restarting",
+                title: "AgentArk is coming back online",
+                description: restartNotice,
+                tone: "info",
+                action: (
+                  <Chip
+                    size="small"
+                    icon={<AutorenewRoundedIcon />}
+                    label="Up to 10 seconds"
+                    color="info"
+                    variant="outlined"
+                  />
+                )
+              })
+            : null}
           {/* â”€â”€ Warning banner â”€â”€ */}
-          <Box className="adv-banner">
-            <span className="adv-banner-icon">&#9888;</span>
-            Advanced settings can impact stability or security. Change only if you understand the effect.
-          </Box>
+          {renderSettingsInlineCard({
+            eyebrow: "Advanced",
+            title: "Use with care",
+            description:
+              "These controls can affect stability, security, or how the product behaves. Change them only if you understand the effect.",
+            tone: "warning"
+          })}
 
           {/* â”€â”€ System Controls group â”€â”€ */}
           <Box className="adv-group">
@@ -21831,7 +23805,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               </div>
               <div>
                 <div className="adv-group-header-title">System Controls</div>
-                <div className="adv-group-header-sub">Core runtime and interface options</div>
+                <div className="adv-group-header-sub">Core runtime and interface options.</div>
               </div>
             </div>
 
@@ -21851,14 +23825,15 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   if (!ok) return;
                   setError(null);
                   setSuccess(null);
+                  setRestartNotice(null);
                   try {
                     await restartMutation.mutateAsync();
-                    setTimeout(() => window.location.reload(), 2000);
+                    void monitorRestartRecovery();
                   } catch (e) {
                     setError(errMessage(e));
                   }
                 }}
-                disabled={restartMutation.isPending}
+                disabled={restartMutation.isPending || !!restartNotice}
                 sx={{ whiteSpace: "nowrap" }}
               >
                 Restart Bot
@@ -21920,45 +23895,36 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               </div>
               <div>
                 <div className="adv-group-header-title">Permissions</div>
-                <div className="adv-group-header-sub">Action approval and auto-approve settings</div>
+                <div className="adv-group-header-sub">Action approval and auto-approve settings.</div>
               </div>
             </div>
 
             {/* Auto-Approve Skills */}
             <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>Auto-Approve Skills</Typography>
             <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-              Select skills that can run without approval. Backend validates and may reject dangerous entries.
+              Select action-name overrides that can run without a separate approval prompt. Dangerous actions stay approval-gated even if typed manually.
             </Typography>
             {(() => {
-              const items = [
-                "web_search",
-                "research",
-                "generate_image",
-                "generate_video",
-                "browse",
-                "file_read",
-                "file_write",
-                "http_get",
-                "shell",
-                "code_execute",
-                "schedule_task",
-                "list_tasks",
-                "clipboard_read",
-                "clipboard_write",
-                "gmail_scan",
-                "gmail_reply"
-              ];
-              const set = new Set(parseCsvList(form.auto_approve_csv));
+              const blockedEntries = findBlockedAutoApproveEntries(form.auto_approve_csv);
+              const set = new Set(sanitizeAutoApproveList(parseCsvList(form.auto_approve_csv)));
               const update = (name: string, checked: boolean) => {
                 const next = new Set(set);
                 if (checked) next.add(name);
                 else next.delete(name);
-                setField("auto_approve_csv", Array.from(next).sort().join(", "));
+                setField(
+                  "auto_approve_csv",
+                  sanitizeAutoApproveList(Array.from(next).sort()).join(", ")
+                );
               };
               return (
                 <>
+                  {blockedEntries.length > 0 ? (
+                    <Alert severity="warning" sx={{ mb: 1.5 }}>
+                      These actions always require approval and will be ignored here: {blockedEntries.map((name) => `\`${name}\``).join(", ")}.
+                    </Alert>
+                  ) : null}
                   <Grid2 container spacing={1}>
-                    {items.map((name) => {
+                    {AUTO_APPROVE_ACTION_OPTIONS.map((name) => {
                       const active = set.has(name);
                       return (
                         <Grid2 key={name} size={{ xs: 6, md: 4, lg: 3 }}>
@@ -21982,6 +23948,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     fullWidth
                     size="small"
                     placeholder="comma separated action names"
+                    helperText="Always blocked here: shell, file_write, code_execute, gmail_send, and similar destructive actions."
                     sx={{ mt: 1.5 }}
                   />
                 </>
@@ -21997,7 +23964,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               </div>
               <div>
                 <div className="adv-group-header-title">API Access</div>
-                <div className="adv-group-header-sub">HTTP API key management</div>
+                <div className="adv-group-header-sub">HTTP API key management.</div>
               </div>
             </div>
 
@@ -22101,29 +24068,69 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <Alert severity={foreverLifecycleRules.length > 0 ? "warning" : "info"}>
             <Stack spacing={0.35}>
               <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                Longer retention means more history, but also more database growth.
+                Data cleanup is enabled by default, but every cleanup category can be disabled.
               </Typography>
               <Typography variant="body2" color="inherit">
                 {foreverLifecycleRules.length > 0
                   ? `Forever is enabled for ${foreverLifecycleSummary}.`
-                  : "Set any retention field below to 0 if you intentionally want to keep that data forever."} Keeping rows forever or far beyond the defaults can increase DB size, slow queries, and make the server feel heavier over time.
+                  : "Set any retention field below to 0 if you intentionally want to keep that data forever."} Keeping rows forever or far beyond the defaults can increase DB size, slow queries, and make the server feel heavier over time. Emergency low-disk protection may still prune episodes even if normal cleanup is off.
               </Typography>
             </Stack>
           </Alert>
 
           <Box className="list-shell">
             <Stack spacing={2}>
-              <Stack spacing={0.45}>
-                <Typography className="settings-section-label">Episode Retention</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Controls pruning for episodic memory. Turning this off keeps all episodes forever.
-                </Typography>
-              </Stack>
+              {renderSettingsSectionIntro({
+                eyebrow: "Lifecycle",
+                title: "Data Cleanup",
+                description: "Master switch for background cleanup, retention pruning, and periodic housekeeping across memory and storage.",
+              })}
               <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
                 <Chip
                   size="small"
-                  color={form.memory_retention_enabled ? "warning" : "default"}
-                  label={form.memory_retention_enabled ? "Pruning enabled" : "Keeping all episodes"}
+                  color={dataCleanupEnabled ? "success" : "default"}
+                  label={dataCleanupEnabled ? "Cleanup active" : "Cleanup paused"}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={form.data_lifecycle_notifications_cleanup_enabled ? "Notifications on" : "Notifications off"}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={form.data_lifecycle_logs_cleanup_enabled ? "Logs & traces on" : "Logs & traces off"}
+                />
+                <Chip
+                  size="small"
+                  variant="outlined"
+                  label={form.memory_retention_enabled ? "Episodes on" : "Episodes off"}
+                />
+              </Stack>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={form.data_lifecycle_cleanup_enabled}
+                    onChange={(e) => setField("data_lifecycle_cleanup_enabled", e.target.checked)}
+                  />
+                }
+                label="Enable data cleanup"
+              />
+            </Stack>
+          </Box>
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              {renderSettingsSectionIntro({
+                eyebrow: "Lifecycle",
+                title: "Episode Retention",
+                description: "Controls pruning for episodic memory. Turning this off disables normal cleanup for this category.",
+              })}
+              <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                <Chip
+                  size="small"
+                  color={episodeCleanupInputsEnabled ? "warning" : "default"}
+                  label={episodeCleanupInputsEnabled ? "Pruning enabled" : "Pruning paused"}
                 />
                 <Chip
                   size="small"
@@ -22144,8 +24151,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 container
                 spacing={1.5}
                 sx={{
-                  opacity: form.memory_retention_enabled ? 1 : 0.55,
-                  pointerEvents: form.memory_retention_enabled ? "auto" : "none",
+                  opacity: episodeCleanupInputsEnabled ? 1 : 0.55,
+                  pointerEvents: episodeCleanupInputsEnabled ? "auto" : "none",
                   transition: "opacity 0.2s"
                 }}
               >
@@ -22265,13 +24272,31 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Box className="list-shell">
             <Stack spacing={2}>
-              <Stack spacing={0.45}>
-                <Typography className="settings-section-label">Notifications</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Controls how long in-product notifications stay in the database.
-                </Typography>
-              </Stack>
-              <Grid2 container spacing={1.5}>
+              {renderSettingsSectionIntro({
+                eyebrow: "Lifecycle",
+                title: "Notifications",
+                description: "Set retention and cleanup cadence for in-product notifications stored by the system.",
+              })}
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={form.data_lifecycle_notifications_cleanup_enabled}
+                    onChange={(e) =>
+                      setField("data_lifecycle_notifications_cleanup_enabled", e.target.checked)
+                    }
+                  />
+                }
+                label="Enable notification cleanup"
+              />
+              <Grid2
+                container
+                spacing={1.5}
+                sx={{
+                  opacity: notificationsCleanupInputsEnabled ? 1 : 0.55,
+                  pointerEvents: notificationsCleanupInputsEnabled ? "auto" : "none",
+                  transition: "opacity 0.2s"
+                }}
+              >
                 <Grid2 size={{ xs: 12, md: 6 }}>
                   <TextField
                     fullWidth
@@ -22306,13 +24331,31 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Box className="list-shell">
             <Stack spacing={2}>
-              <Stack spacing={0.45}>
-                <Typography className="settings-section-label">Logs & Traces</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Retention windows for operational tables. Use 0 only when you really want to keep a category forever.
-                </Typography>
-              </Stack>
-              <Grid2 container spacing={1.5}>
+              {renderSettingsSectionIntro({
+                eyebrow: "Lifecycle",
+                title: "Logs & Traces",
+                description: "Retention windows for operational data. Use 0 only when you intentionally want to keep a category forever.",
+              })}
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={form.data_lifecycle_logs_cleanup_enabled}
+                    onChange={(e) =>
+                      setField("data_lifecycle_logs_cleanup_enabled", e.target.checked)
+                    }
+                  />
+                }
+                label="Enable logs, traces, task, and message cleanup"
+              />
+              <Grid2
+                container
+                spacing={1.5}
+                sx={{
+                  opacity: logsCleanupInputsEnabled ? 1 : 0.55,
+                  pointerEvents: logsCleanupInputsEnabled ? "auto" : "none",
+                  transition: "opacity 0.2s"
+                }}
+              >
                 <Grid2 size={{ xs: 12, md: 4 }}>
                   <TextField
                     fullWidth
@@ -22445,13 +24488,20 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
           <Box className="list-shell">
             <Stack spacing={2}>
-              <Stack spacing={0.45}>
-                <Typography className="settings-section-label">Cleanup Cadence</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Controls how often background cleanup passes run when retention is enabled.
-                </Typography>
-              </Stack>
-              <Grid2 container spacing={1.5}>
+              {renderSettingsSectionIntro({
+                eyebrow: "Lifecycle",
+                title: "Cleanup Cadence",
+                description: "Configure how often housekeeping runs and when idle security cleanup is allowed to start.",
+              })}
+              <Grid2
+                container
+                spacing={1.5}
+                sx={{
+                  opacity: logsCleanupInputsEnabled ? 1 : 0.55,
+                  pointerEvents: logsCleanupInputsEnabled ? "auto" : "none",
+                  transition: "opacity 0.2s"
+                }}
+              >
                 <Grid2 size={{ xs: 12, md: 4 }}>
                   <TextField
                     fullWidth
@@ -22521,6 +24571,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             logsLoading={observabilityLogsQ.isLoading}
             logsError={observabilityLogsQ.error ? errMessage(observabilityLogsQ.error) : null}
             testing={testObservabilityMutation.isPending}
+            embedded
             onValueChange={(next) => {
               if (Object.prototype.hasOwnProperty.call(next, "enabled")) {
                 setField("observability_enabled", !!next.enabled);
@@ -22964,45 +25015,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         />
       ) : null}
 
-      {tab === 9 ? ( 
+      {tab === 9 ? (
         <Stack spacing={2}>
           <Grid2 container spacing={2} alignItems="stretch">
             <Grid2 size={{ xs: 12 }}>
-              <Box className="list-shell" sx={{ minHeight: 0, height: "100%", display: "flex", flexDirection: "column" }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
-                  <Box>
-                    <Typography variant="h6">ArkPulse</Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Diagnostics, onboarding readiness, and runtime health in one place.
-                    </Typography>
-                  </Box>
-                  <Button
-                    size="small"
-                    onClick={async () => {
-                      setError(null);
-                      const baselineEventId = latestPulseEventId;
-                      setPulsePollState({
-                        baselineEventId,
-                        deadlineAt: Date.now() + 2 * 60 * 1000
-                      });
-                      try {
-                        const out = asRecord(await triggerPulseMutation.mutateAsync());
-                        const status = str(out.status, "").toLowerCase();
-                        if (status === "running") {
-                          setSuccess(str(out.message, "ArkPulse is already running."));
-                        } else {
-                          setSuccess(str(out.message, "ArkPulse check started."));
-                        }
-                      } catch (e) {
-                        setPulsePollState(null);
-                        setError(errMessage(e));
-                      }
-                    }}
-                    disabled={triggerPulseMutation.isPending || pulseRunning}
-                  >
-                    {triggerPulseMutation.isPending || pulseRunning ? "Running..." : "Run now"}
-                  </Button>
-                </Stack>
+                <Box className="list-shell" sx={{ minHeight: 0, height: "100%", display: "flex", flexDirection: "column" }}>
                 {pulseQ.error ? <Alert severity="error">{errMessage(pulseQ.error)}</Alert> : null}
                 {!pulseQ.error ? (
                   <Alert severity={pulseRunning ? "info" : pulseHistoryUnavailable || latestPulseFindingsCount > 0 ? "warning" : "success"} sx={{ mb: 1 }}>
@@ -23017,22 +25034,25 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     <Typography variant="body2" color="text.secondary">
                       {pulseHistoryUnavailable ? "Stored ArkPulse history could not be loaded in this runtime." : "No ArkPulse events yet."}
                     </Typography>
-                    <Box className="metadata-box" sx={{ maxHeight: "none" }}>
-                      <Typography variant="caption" color="text.secondary">
-                        What is ArkPulse?
-                      </Typography>
-                      <Stack spacing={0.6} sx={{ mt: 0.75 }}>
-                        <Typography variant="body2" color="text.secondary">
-                          AgentArk's built-in diagnostics run for operational health, safety posture, onboarding readiness, and execution drift.
-                        </Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          Run it after changing models, adding integrations, or when something stops working.
-                        </Typography>
-                        <Typography variant="body2" color="text.secondary">
-                          Every run appears here with findings, fixes, and a health score.
-                        </Typography>
-                      </Stack>
-                    </Box>
+                    {renderSettingsInlineCard({
+                      eyebrow: "ArkPulse",
+                      title: "How this helps",
+                      description: "ArkPulse runs a health check for setup, integrations, safety, and runtime drift.",
+                      tone: "info",
+                      children: (
+                        <Stack spacing={0.6}>
+                          <Typography variant="body2" color="text.secondary">
+                            Run it after changing models, adding integrations, or when something stops working.
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Example: if notifications stop arriving, ArkPulse can point you to the broken setup step.
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Every run appears here with findings, suggested fixes, and a health score.
+                          </Typography>
+                        </Stack>
+                      )
+                    })}
                     <Box sx={{ flex: 1 }} />
                   </Stack>
                 ) : (
@@ -23115,10 +25135,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <Grid2 container spacing={2}>
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>Evolution Status</Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  Current state of the self-evolution engine. When enabled, AgentArk automatically generates and tests improved routing policies.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Learning engine status",
+                  description:
+                    "See whether AgentArk is learning from past work, testing better routing, and preparing changes for promotion.",
+                  info:
+                    "When this is on, AgentArk can learn from completed work, try better routing in the background, and compare it with the current baseline before switching over."
+                })}
                 {evolutionQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading evolution status...</Typography>
                 ) : evolutionQ.error ? (
@@ -23232,10 +25256,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             </Grid2>
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Typography variant="h6" mb={1}>Deploy Guard Default</Typography>
-                <Typography variant="body2" color="text.secondary" mb={1}>
-                  Controls whether apps deployed by the agent require an access guard by default. When OFF, deployed apps are publicly accessible unless the request explicitly sets an access guard.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Default app access guard",
+                  description:
+                    "Choose whether new apps deployed by AgentArk start protected by default or stay open unless the request says otherwise.",
+                  info:
+                    "Turn this on if you want new deployed apps to ask for access by default. Leave it off if apps should stay open unless a request explicitly adds a guard."
+                })}
                 <Stack spacing={1}>
                   <Stack direction="row" spacing={1} alignItems="center">
                     <Typography variant="body2">Current default:</Typography>
@@ -23296,12 +25324,858 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           <Grid2 container spacing={2}>
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Tooltip title="Durable memories consolidated from successful runs, corrections, and captured user facts. This shows what the system has actually learned." arrow placement="top-start">
-                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learned Memory</Typography>
-                </Tooltip>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  Facts, preferences, and operating rules that now guide future responses.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Specialist prompt evolution",
+                  description:
+                    "Track the delegated specialist-role prompt bundle that shapes researcher, coder, analyst, writer, validator, and planner behavior.",
+                  info:
+                    "This bundle covers the built-in specialist role prompts used during delegated work."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading specialist prompt evolution...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Chip
+                        size="small"
+                        color={toBool(evolutionSpecialistPromptCanary.enabled) ? "warning" : "default"}
+                        label={toBool(evolutionSpecialistPromptCanary.enabled) ? "Specialist canary on" : "Specialist canary off"}
+                      />
+                      <Chip
+                        size="small"
+                        color={str(evolution.specialist_prompt_promotion_mode, "none") === "baseline" ? "success" : str(evolution.specialist_prompt_promotion_mode, "none") === "canary" ? "warning" : "default"}
+                        label={`Mode ${str(evolution.specialist_prompt_promotion_mode, "none")}`}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        Rollout: {num(evolutionSpecialistPromptCanary.rollout_percent, 0)}%
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2">Baseline: {str(evolutionSpecialistPromptCanary.baseline_version, "-")}</Typography>
+                    <Typography variant="body2">Candidate: {str(evolutionSpecialistPromptCanary.candidate_version, "-")}</Typography>
+                    <Typography variant="body2">Last specialist promotion: {str(evolution.specialist_prompt_last_promotion_result, "No specialist prompt evolution runs yet")}</Typography>
+                    <Typography variant="body2">
+                      {toBool(evolutionSpecialistPromptCanary.enabled) ? "Experience gate (live)" : "Latest experience gate"}: {str(evolution.specialist_prompt_replay_gate_result, "-")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Optimized roles: {stringList(evolutionSpecialistPromptLastResult.optimized_surfaces).join(", ") || "none yet"}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Latest benchmark score: {percentageLabel(evolutionSpecialistPromptLastResult.best_candidate_score, 0) || percentageLabel(evolutionSpecialistPromptLastResult.baseline_score, 0) || "-"}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Changed roles: {stringList(asRecord(evolutionSpecialistPromptLastResult.diff_summary).changed_roles).join(", ") || "no recent specialist edits"}
+                    </Typography>
+                    {stringList(asRecord(evolutionSpecialistPromptLastResult.diff_summary).change_preview).length > 0 ? (
+                      <Typography variant="caption" color="text.secondary">
+                        Preview: {stringList(asRecord(evolutionSpecialistPromptLastResult.diff_summary).change_preview).join(" | ")}
+                      </Typography>
+                    ) : null}
+                    <Typography variant="caption" color="text.secondary">
+                      Rationale: {stringList(evolutionSpecialistPromptLastResult.notes).join(" | ") || str(evolutionSpecialistPromptLastResult.promotion_gate, "No specialist rationale yet")}
+                    </Typography>
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Specialist impact",
+                  description:
+                    "Estimated live impact from the current specialist prompt candidate versus the baseline.",
+                  info:
+                    "These estimates use recent behavior and resolved experience outcomes tagged with specialist prompt versions."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading specialist impact...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    {stringList(evolutionSpecialistPromptInsights.summary).length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">Not enough specialist prompt canary evidence yet.</Typography>
+                    ) : (
+                      stringList(evolutionSpecialistPromptInsights.summary).map((line, idx) => (
+                        <Typography key={`specialist-summary-${idx}`} variant="body2">{line}</Typography>
+                      ))
+                    )}
+                    <Typography variant="caption" color="text.secondary">
+                      Tool success uplift: {(num(evolutionSpecialistPromptInsights.tool_success_uplift, 0) * 100).toFixed(1)} pts | p95 savings: {evolutionSpecialistPromptInsights.latency_savings_p95_ms == null ? "-" : `${num(evolutionSpecialistPromptInsights.latency_savings_p95_ms, 0)} ms`}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Routing-derived savings are intentionally omitted here because specialist prompts shape delegated work quality, not routing decisions.
+                    </Typography>
+                    {stringList(evolutionSpecialistPromptInsights.regressions).length > 0 ? (
+                      <Alert severity="warning" sx={{ mt: 0.5 }}>
+                        {stringList(evolutionSpecialistPromptInsights.regressions).join(" ")}
+                      </Alert>
+                    ) : null}
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Classifier prompt evolution",
+                  description:
+                    "Track the helper-classifier prompt bundle that shapes early interpretation steps like approvals, action selection, automation intent, and request shape.",
+                  info:
+                    "This bundle covers the helper prompts that decide how a request should be interpreted before the main answer path runs."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading classifier prompt evolution...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Chip
+                        size="small"
+                        color={toBool(evolutionClassifierPromptCanary.enabled) ? "warning" : "default"}
+                        label={toBool(evolutionClassifierPromptCanary.enabled) ? "Classifier canary on" : "Classifier canary off"}
+                      />
+                      <Chip
+                        size="small"
+                        color={str(evolution.classifier_prompt_promotion_mode, "none") === "baseline" ? "success" : str(evolution.classifier_prompt_promotion_mode, "none") === "canary" ? "warning" : "default"}
+                        label={`Mode ${str(evolution.classifier_prompt_promotion_mode, "none")}`}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        Rollout: {num(evolutionClassifierPromptCanary.rollout_percent, 0)}%
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2">Baseline: {str(evolutionClassifierPromptCanary.baseline_version, "-")}</Typography>
+                    <Typography variant="body2">Candidate: {str(evolutionClassifierPromptCanary.candidate_version, "-")}</Typography>
+                    <Typography variant="body2">Last classifier promotion: {str(evolution.classifier_prompt_last_promotion_result, "No classifier prompt evolution runs yet")}</Typography>
+                    <Typography variant="body2">
+                      {toBool(evolutionClassifierPromptCanary.enabled) ? "Experience gate (live)" : "Latest experience gate"}: {str(evolution.classifier_prompt_replay_gate_result, "-")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Optimized surfaces: {stringList(evolutionClassifierPromptLastResult.optimized_surfaces).join(", ") || "none yet"}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Latest benchmark score: {percentageLabel(evolutionClassifierPromptLastResult.best_candidate_score, 0) || percentageLabel(evolutionClassifierPromptLastResult.baseline_score, 0) || "-"}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Changed surfaces: {stringList(asRecord(evolutionClassifierPromptLastResult.diff_summary).changed_surfaces).join(", ") || "no recent classifier edits"}
+                    </Typography>
+                    {stringList(asRecord(evolutionClassifierPromptLastResult.diff_summary).change_preview).length > 0 ? (
+                      <Typography variant="caption" color="text.secondary">
+                        Preview: {stringList(asRecord(evolutionClassifierPromptLastResult.diff_summary).change_preview).join(" | ")}
+                      </Typography>
+                    ) : null}
+                    <Typography variant="caption" color="text.secondary">
+                      Rationale: {stringList(evolutionClassifierPromptLastResult.notes).join(" | ") || str(evolutionClassifierPromptLastResult.promotion_gate, "No classifier rationale yet")}
+                    </Typography>
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Classifier impact",
+                  description:
+                    "Estimated live impact from the current classifier prompt candidate versus the baseline.",
+                  info:
+                    "These estimates use recent behavior and resolved experience outcomes tagged with classifier prompt versions."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading classifier impact...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    {stringList(evolutionClassifierPromptInsights.summary).length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">Not enough classifier prompt canary evidence yet.</Typography>
+                    ) : (
+                      stringList(evolutionClassifierPromptInsights.summary).map((line, idx) => (
+                        <Typography key={`classifier-summary-${idx}`} variant="body2">{line}</Typography>
+                      ))
+                    )}
+                    <Typography variant="caption" color="text.secondary">
+                      Delegation avoided: {num(evolutionClassifierPromptInsights.delegation_avoided, 0).toFixed(1)} | clarification avoided: {num(evolutionClassifierPromptInsights.clarification_avoided, 0).toFixed(1)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Tool success uplift: {(num(evolutionClassifierPromptInsights.tool_success_uplift, 0) * 100).toFixed(1)} pts | direct resolution uplift: {(num(evolutionClassifierPromptInsights.successful_direct_resolution_uplift, 0) * 100).toFixed(1)} pts
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Failed delegation reduction: {(num(evolutionClassifierPromptInsights.failed_delegation_reduction, 0) * 100).toFixed(1)} pts | p95 savings: {evolutionClassifierPromptInsights.latency_savings_p95_ms == null ? "-" : `${num(evolutionClassifierPromptInsights.latency_savings_p95_ms, 0)} ms`}
+                    </Typography>
+                    {stringList(evolutionClassifierPromptInsights.regressions).length > 0 ? (
+                      <Alert severity="warning" sx={{ mt: 0.5 }}>
+                        {stringList(evolutionClassifierPromptInsights.regressions).join(" ")}
+                      </Alert>
+                    ) : null}
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Prompt evolution",
+                  description:
+                    "Track the live prompt bundle canary for routing, primary response, and delegated synthesis, including rollout, gating, and the latest measured outcome.",
+                  info:
+                    "This shows the prompt bundle that AgentArk is testing for router decisions, the main answer path, and delegated-result synthesis, along with the end-to-end experience gate that decides whether it can replace the current baseline."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt evolution...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    <Stack direction="row" spacing={1} alignItems="center" useFlexGap flexWrap="wrap">
+                      <Chip
+                        size="small"
+                        color={toBool(evolutionPromptCanary.enabled) ? "warning" : "default"}
+                        label={toBool(evolutionPromptCanary.enabled) ? "Prompt canary on" : "Prompt canary off"}
+                      />
+                      <Chip
+                        size="small"
+                        color={str(evolution.prompt_promotion_mode, "none") === "baseline" ? "success" : str(evolution.prompt_promotion_mode, "none") === "canary" ? "warning" : "default"}
+                        label={`Mode ${str(evolution.prompt_promotion_mode, "none")}`}
+                      />
+                      <Typography variant="caption" color="text.secondary">
+                        Rollout: {num(evolutionPromptCanary.rollout_percent, 0)}%
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2">Baseline: {str(evolutionPromptCanary.baseline_version, "-")}</Typography>
+                    <Typography variant="body2">Candidate: {str(evolutionPromptCanary.candidate_version, "-")}</Typography>
+                    <Typography variant="body2">Last prompt promotion: {str(evolution.prompt_last_promotion_result, "No prompt evolution runs yet")}</Typography>
+                    <Typography variant="body2">
+                      {toBool(evolutionPromptCanary.enabled) ? "Experience gate (live)" : "Latest experience gate"}: {str(evolution.prompt_replay_gate_result, "-")}
+                    </Typography>
+                    <Typography variant="body2">
+                      Optimized surfaces: {stringList(evolutionPromptLastResult.optimized_surfaces).join(", ") || "none yet"}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Latest benchmark score: {percentageLabel(evolutionPromptLastResult.best_candidate_score, 0) || percentageLabel(evolutionPromptLastResult.baseline_score, 0) || "-"}
+                    </Typography>
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "What changed",
+                  description:
+                    "See the latest prompt bundle edits, which surfaces changed, and the rationale behind the current candidate.",
+                  info:
+                    "This is a compact human-readable view of what the latest prompt candidate changed in the router, primary-response, and delegated-synthesis instructions."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt changes...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    <Typography variant="body2">
+                      Router fields: {stringList(asRecord(evolutionPromptLastResult.diff_summary).router_changed_fields).join(", ") || "no recent router edits"}
+                    </Typography>
+                    <Typography variant="body2">
+                      Primary response fields: {stringList(asRecord(evolutionPromptLastResult.diff_summary).primary_response_changed_fields).join(", ") || "no recent primary-response edits"}
+                    </Typography>
+                    <Typography variant="body2">
+                      Synthesis fields: {stringList(asRecord(evolutionPromptLastResult.diff_summary).delegation_synthesis_changed_fields).join(", ") || "no recent synthesis edits"}
+                    </Typography>
+                    {stringList(asRecord(evolutionPromptLastResult.diff_summary).router_change_preview).length > 0 ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                        Router preview: {stringList(asRecord(evolutionPromptLastResult.diff_summary).router_change_preview).join(" | ")}
+                      </Typography>
+                    ) : null}
+                    {stringList(asRecord(evolutionPromptLastResult.diff_summary).primary_response_change_preview).length > 0 ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                        Primary response preview: {stringList(asRecord(evolutionPromptLastResult.diff_summary).primary_response_change_preview).join(" | ")}
+                      </Typography>
+                    ) : null}
+                    {stringList(asRecord(evolutionPromptLastResult.diff_summary).delegation_synthesis_change_preview).length > 0 ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                        Synthesis preview: {stringList(asRecord(evolutionPromptLastResult.diff_summary).delegation_synthesis_change_preview).join(" | ")}
+                      </Typography>
+                    ) : null}
+                    <Typography variant="body2" color="text.secondary">
+                      Rationale: {stringList(evolutionPromptLastResult.notes).join(" | ") || str(evolutionPromptLastResult.promotion_gate, "No prompt rationale yet")}
+                    </Typography>
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "What it helped",
+                  description:
+                    "Estimated live impact from the current prompt candidate versus the baseline, using recent behavior and experience outcomes.",
+                  info:
+                    "These are operational estimates based on the current prompt baseline and canary traffic. They are meant to show directionality and likely value, not exact business accounting."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt impact...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1}>
+                    {stringList(evolutionPromptInsights.summary).length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">Not enough prompt canary evidence yet.</Typography>
+                    ) : (
+                      stringList(evolutionPromptInsights.summary).map((line, idx) => (
+                        <Typography key={`prompt-summary-${idx}`} variant="body2">{line}</Typography>
+                      ))
+                    )}
+                    <Typography variant="caption" color="text.secondary">
+                      Estimated delegation avoided: {num(evolutionPromptInsights.delegation_avoided, 0).toFixed(1)} | clarification avoided: {num(evolutionPromptInsights.clarification_avoided, 0).toFixed(1)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Tool success uplift: {(num(evolutionPromptInsights.tool_success_uplift, 0) * 100).toFixed(1)} pts | direct resolution uplift: {(num(evolutionPromptInsights.successful_direct_resolution_uplift, 0) * 100).toFixed(1)} pts
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Failed delegation reduction: {(num(evolutionPromptInsights.failed_delegation_reduction, 0) * 100).toFixed(1)} pts | p95 savings: {evolutionPromptInsights.latency_savings_p95_ms == null ? "-" : `${num(evolutionPromptInsights.latency_savings_p95_ms, 0)} ms`}
+                    </Typography>
+                    {stringList(evolutionPromptInsights.regressions).length > 0 ? (
+                      <Alert severity="warning" sx={{ mt: 0.5 }}>
+                        {stringList(evolutionPromptInsights.regressions).join(" ")}
+                      </Alert>
+                    ) : null}
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Prompt metrics",
+                  description:
+                    "Per-version performance for prompt bundles, including experience success, routing behavior, and tool-use patterns.",
+                  info:
+                    "Samples come from recent end-to-end experience runs. Routing and tool-use fields come from the live operational logs tagged with each composite prompt version."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt metrics...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionPromptMetrics.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No prompt metrics yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Version</TableCell>
+                            <TableCell align="right">Samples</TableCell>
+                            <TableCell align="right">Success</TableCell>
+                            <TableCell align="right">Error</TableCell>
+                            <TableCell align="right">Routes</TableCell>
+                            <TableCell align="right">Delegation</TableCell>
+                            <TableCell align="right">Clarify</TableCell>
+                            <TableCell align="right">Tool success</TableCell>
+                            <TableCell align="right">Avg tools</TableCell>
+                            <TableCell align="right">p95</TableCell>
+                          </TableRow>
+                        </TableHead>
+                      <TableBody>
+                        {evolutionPromptMetrics.map((row, idx) => (
+                          <TableRow key={`${str(row.version, "prompt")}-${idx}`}>
+                            <TableCell sx={{ maxWidth: 240 }}>
+                              <Typography variant="body2">{str(row.version, "-")}</Typography>
+                            </TableCell>
+                            <TableCell align="right">{num(row.samples, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{(num(row.error_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{num(row.routing_decisions, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.delegation_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{(num(row.clarification_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{(num(row.tool_success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{num(row.avg_tool_calls_per_request, 0).toFixed(2)}</TableCell>
+                            <TableCell align="right">{row.p95_latency_ms == null ? "-" : num(row.p95_latency_ms, 0)}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Prompt lineage",
+                  description:
+                    "A timeline of prompt-bundle experiments showing what changed, what improved, and whether the candidate was promoted.",
+                  info:
+                    "This history records prompt-bundle mutations for router and synthesis behavior. Benchmark gain is the offline score change before the live canary gate."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt lineage...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionPromptLineage.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No prompt lineage entries found.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Timestamp</TableCell>
+                            <TableCell>Source</TableCell>
+                            <TableCell align="right">Benchmark</TableCell>
+                            <TableCell align="right">Replay</TableCell>
+                            <TableCell>Surfaces</TableCell>
+                            <TableCell>Notes</TableCell>
+                            <TableCell align="right">Promoted</TableCell>
+                          </TableRow>
+                        </TableHead>
+                      <TableBody>
+                        {evolutionPromptLineage.slice().reverse().map((row, idx) => (
+                          <TableRow key={`${str(row.entry_id, "prompt-lineage")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.timestamp_utc, "-")).tip}>
+                              {humanTs(str(row.timestamp_utc, "-")).label}
+                            </TableCell>
+                            <TableCell>{str(row.candidate_source, "-")}</TableCell>
+                            <TableCell align="right">{num(row.score_gain, 0).toFixed(4)}</TableCell>
+                            <TableCell align="right">
+                              {(() => {
+                                if (row.replay_gain != null) {
+                                  return num(row.replay_gain, 0).toFixed(4);
+                                }
+                                if (
+                                  str(row.candidate_version, "") ===
+                                  str(evolutionPromptLastResult.candidate_version, "")
+                                ) {
+                                  const latestReplayGain = evolutionPromptReplayEvaluation.success_gain;
+                                  if (latestReplayGain != null) {
+                                    return num(latestReplayGain, 0).toFixed(4);
+                                  }
+                                }
+                                return "-";
+                              })()}
+                            </TableCell>
+                            <TableCell>{stringList(row.optimized_surfaces).join(", ") || "-"}</TableCell>
+                            <TableCell sx={{ maxWidth: 320 }}>
+                              <Typography variant="caption" color="text.secondary" title={stringList(row.notes).join(" | ")}>
+                                {stringList(row.notes).join(" | ") || "-"}
+                              </Typography>
+                            </TableCell>
+                            <TableCell align="right">{toBool(row.promoted) ? "yes" : "no"}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Recent prompt-tagged runs",
+                  description:
+                    "Recent end-to-end runs carrying composite prompt versions, so you can see which prompt bundle produced which outcome.",
+                  info:
+                    "These are the recent runs that feed prompt promotion decisions. Corrections and failed runs count against the candidate in the prompt experience gate."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading prompt-tagged runs...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionPromptRuns.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No prompt-tagged runs yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Updated</TableCell>
+                          <TableCell>Prompt version</TableCell>
+                          <TableCell>Status</TableCell>
+                          <TableCell>Outcome</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionPromptRuns.map((row, idx) => (
+                          <TableRow key={`${str(row.id, "prompt-run")}-${idx}`}>
+                            <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.updated_at, "-")).tip}>
+                              {humanTs(str(row.updated_at, "-")).label}
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 320 }}>
+                              <Typography variant="body2">{str(row.prompt_version, "-")}</Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {str(row.intent_key, str(row.task_type, str(row.channel, "-")))}
+                              </Typography>
+                            </TableCell>
+                            <TableCell sx={{ whiteSpace: "nowrap" }}>
+                              <Chip
+                                size="small"
+                                color={
+                                  str(row.correction_state, "none") === "corrected"
+                                    ? "warning"
+                                    : str(row.success_state, "failed") === "accepted"
+                                      ? "success"
+                                      : str(row.success_state, "failed") === "provisional"
+                                        ? "info"
+                                        : "default"
+                                }
+                                label={`${str(row.success_state, "-")} / ${str(row.correction_state, "-")}`}
+                              />
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 420 }}>
+                              <Typography variant="body2" color="text.secondary">
+                                {str(row.outcome_summary, str(row.failure_reason, "-"))}
+                              </Typography>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Classifier metrics",
+                  description:
+                    "Per-version performance for helper-classifier prompt bundles, including resolved experience outcomes and routing/tool-use patterns.",
+                  info:
+                    "Samples come from recent resolved runs. Routing and tool-use fields come from operational logs tagged with classifier prompt versions."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading classifier metrics...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionClassifierPromptMetrics.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No classifier prompt metrics yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Version</TableCell>
+                          <TableCell align="right">Samples</TableCell>
+                          <TableCell align="right">Success</TableCell>
+                          <TableCell align="right">Routes</TableCell>
+                          <TableCell align="right">Delegation</TableCell>
+                          <TableCell align="right">Tool success</TableCell>
+                          <TableCell align="right">p95</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionClassifierPromptMetrics.map((row, idx) => (
+                          <TableRow key={`${str(row.version, "classifier-prompt")}-${idx}`}>
+                            <TableCell sx={{ maxWidth: 240 }}>
+                              <Typography variant="body2">{str(row.version, "-")}</Typography>
+                            </TableCell>
+                            <TableCell align="right">{num(row.samples, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{num(row.routing_decisions, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.delegation_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{(num(row.tool_success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{row.p95_latency_ms == null ? "-" : num(row.p95_latency_ms, 0)}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Classifier lineage and runs",
+                  description:
+                    "Recent classifier prompt experiments and the runs that now carry classifier prompt versions.",
+                  info:
+                    "Benchmark gain is the offline score change before the live experience gate. Replay gain reflects the latest classifier-tagged experience comparison when available."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading classifier lineage...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1.5}>
+                    {evolutionClassifierPromptLineage.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">No classifier prompt lineage entries found.</Typography>
+                    ) : (
+                      <TableContainer className="table-shell">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Timestamp</TableCell>
+                              <TableCell>Source</TableCell>
+                              <TableCell align="right">Benchmark</TableCell>
+                              <TableCell align="right">Replay</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {evolutionClassifierPromptLineage.slice(-6).reverse().map((row, idx) => (
+                              <TableRow key={`${str(row.entry_id, "classifier-lineage")}-${idx}`}>
+                                <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.timestamp_utc, "-")).tip}>
+                                  {humanTs(str(row.timestamp_utc, "-")).label}
+                                </TableCell>
+                                <TableCell>{str(row.candidate_source, "-")}</TableCell>
+                                <TableCell align="right">{num(row.score_gain, 0).toFixed(4)}</TableCell>
+                                <TableCell align="right">
+                                  {row.replay_gain != null
+                                    ? num(row.replay_gain, 0).toFixed(4)
+                                    : evolutionClassifierPromptReplayEvaluation.success_gain == null
+                                      ? "-"
+                                      : num(evolutionClassifierPromptReplayEvaluation.success_gain, 0).toFixed(4)}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
+                    {evolutionClassifierPromptRuns.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">No classifier prompt-tagged runs yet.</Typography>
+                    ) : (
+                      <TableContainer className="table-shell">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Updated</TableCell>
+                              <TableCell>Classifier prompt</TableCell>
+                              <TableCell>Status</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {evolutionClassifierPromptRuns.map((row, idx) => (
+                              <TableRow key={`${str(row.id, "classifier-run")}-${idx}`}>
+                                <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.updated_at, "-")).tip}>
+                                  {humanTs(str(row.updated_at, "-")).label}
+                                </TableCell>
+                                <TableCell sx={{ maxWidth: 320 }}>
+                                  <Typography variant="body2">{str(row.classifier_prompt_version, "-")}</Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {str(row.intent_key, str(row.task_type, str(row.channel, "-")))}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                                  <Chip
+                                    size="small"
+                                    color={
+                                      str(row.correction_state, "none") === "corrected"
+                                        ? "warning"
+                                        : str(row.success_state, "failed") === "accepted"
+                                          ? "success"
+                                          : str(row.success_state, "failed") === "provisional"
+                                            ? "info"
+                                            : "default"
+                                    }
+                                    label={`${str(row.success_state, "-")} / ${str(row.correction_state, "-")}`}
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Specialist metrics",
+                  description:
+                    "Per-version performance for specialist-role prompt bundles, including resolved experience outcomes and routing/tool-use patterns.",
+                  info:
+                    "Samples come from recent resolved runs. Routing and tool-use fields come from operational logs tagged with specialist prompt versions."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading specialist metrics...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : evolutionSpecialistPromptMetrics.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary">No specialist prompt metrics yet.</Typography>
+                ) : (
+                  <TableContainer className="table-shell">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Version</TableCell>
+                          <TableCell align="right">Samples</TableCell>
+                          <TableCell align="right">Success</TableCell>
+                          <TableCell align="right">Routes</TableCell>
+                          <TableCell align="right">Delegation</TableCell>
+                          <TableCell align="right">Tool success</TableCell>
+                          <TableCell align="right">p95</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {evolutionSpecialistPromptMetrics.map((row, idx) => (
+                          <TableRow key={`${str(row.version, "specialist-prompt")}-${idx}`}>
+                            <TableCell sx={{ maxWidth: 240 }}>
+                              <Typography variant="body2">{str(row.version, "-")}</Typography>
+                            </TableCell>
+                            <TableCell align="right">{num(row.samples, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{num(row.routing_decisions, 0)}</TableCell>
+                            <TableCell align="right">{(num(row.delegation_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{(num(row.tool_success_rate, 0) * 100).toFixed(1)}%</TableCell>
+                            <TableCell align="right">{row.p95_latency_ms == null ? "-" : num(row.p95_latency_ms, 0)}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                )}
+              </Box>
+            </Grid2>
+
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Specialist lineage and runs",
+                  description:
+                    "Recent specialist prompt experiments and the runs that now carry specialist prompt versions.",
+                  info:
+                    "Benchmark gain is the offline score change before the live experience gate. Replay gain reflects the latest specialist-tagged experience comparison when available."
+                })}
+                {evolutionDevQ.isLoading ? (
+                  <Typography variant="body2" color="text.secondary">Loading specialist lineage...</Typography>
+                ) : evolutionDevQ.error ? (
+                  <Alert severity="error">{errMessage(evolutionDevQ.error)}</Alert>
+                ) : (
+                  <Stack spacing={1.5}>
+                    {evolutionSpecialistPromptLineage.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">No specialist prompt lineage entries found.</Typography>
+                    ) : (
+                      <TableContainer className="table-shell">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Timestamp</TableCell>
+                              <TableCell>Source</TableCell>
+                              <TableCell align="right">Benchmark</TableCell>
+                              <TableCell align="right">Replay</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {evolutionSpecialistPromptLineage.slice(-6).reverse().map((row, idx) => (
+                              <TableRow key={`${str(row.entry_id, "specialist-lineage")}-${idx}`}>
+                                <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.timestamp_utc, "-")).tip}>
+                                  {humanTs(str(row.timestamp_utc, "-")).label}
+                                </TableCell>
+                                <TableCell>{str(row.candidate_source, "-")}</TableCell>
+                                <TableCell align="right">{num(row.score_gain, 0).toFixed(4)}</TableCell>
+                                <TableCell align="right">
+                                  {row.replay_gain != null
+                                    ? num(row.replay_gain, 0).toFixed(4)
+                                    : evolutionSpecialistPromptReplayEvaluation.success_gain == null
+                                      ? "-"
+                                      : num(evolutionSpecialistPromptReplayEvaluation.success_gain, 0).toFixed(4)}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
+                    {evolutionSpecialistPromptRuns.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">No specialist prompt-tagged runs yet.</Typography>
+                    ) : (
+                      <TableContainer className="table-shell">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Updated</TableCell>
+                              <TableCell>Specialist prompt</TableCell>
+                              <TableCell>Status</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {evolutionSpecialistPromptRuns.map((row, idx) => (
+                              <TableRow key={`${str(row.id, "specialist-run")}-${idx}`}>
+                                <TableCell sx={{ whiteSpace: "nowrap" }} title={humanTs(str(row.updated_at, "-")).tip}>
+                                  {humanTs(str(row.updated_at, "-")).label}
+                                </TableCell>
+                                <TableCell sx={{ maxWidth: 320 }}>
+                                  <Typography variant="body2">{str(row.specialist_prompt_version, "-")}</Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {str(row.intent_key, str(row.task_type, str(row.channel, "-")))}
+                                  </Typography>
+                                </TableCell>
+                                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                                  <Chip
+                                    size="small"
+                                    color={
+                                      str(row.correction_state, "none") === "corrected"
+                                        ? "warning"
+                                        : str(row.success_state, "failed") === "accepted"
+                                          ? "success"
+                                          : str(row.success_state, "failed") === "provisional"
+                                            ? "info"
+                                            : "default"
+                                    }
+                                    label={`${str(row.success_state, "-")} / ${str(row.correction_state, "-")}`}
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
+                  </Stack>
+                )}
+              </Box>
+            </Grid2>
+          </Grid2>
+
+          <Grid2 container spacing={2}>
+            <Grid2 size={{ xs: 12, lg: 6 }}>
+              <Box className="list-shell" sx={{ minHeight: 0 }}>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Learned memory",
+                  description: "Facts, preferences, and operating rules that now guide future responses.",
+                  info:
+                    "These are the durable things AgentArk has learned from successful work, corrections, and saved user facts."
+                })}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading learned memory...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -23346,12 +26220,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Tooltip title="Reusable learned procedures distilled from repeated successful runs. Draft patterns are still being validated; active ones are the strongest learned workflows." arrow placement="top-start">
-                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learned Procedures</Typography>
-                </Tooltip>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  Repeatable ways of working the system discovered from successful runs.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Learned procedures",
+                  description: "Repeatable ways of working the system discovered from successful runs.",
+                  info:
+                    "These are repeatable working patterns learned from successful runs. Draft patterns are still being checked, while active ones are ready to use."
+                })}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading learned procedures...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -23403,12 +26278,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
             <Grid2 size={{ xs: 12 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Tooltip title="The most recent normalized experience runs feeding the learning graph. This shows whether runs were accepted, corrected, or failed before consolidation into memory." arrow placement="top-start">
-                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Recent Experience Runs</Typography>
-                </Tooltip>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  The raw evidence the learning system is using before it turns patterns into durable memory.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Recent experience runs",
+                  description: "The raw evidence the learning system is using before it turns patterns into durable memory.",
+                  info:
+                    "These are the recent runs AgentArk is learning from, including whether each one was accepted, corrected, or failed before it becomes durable memory."
+                })}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading recent experience runs...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -23473,12 +26349,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             </Grid2>
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Tooltip title="Draft and approved workflows, strategies, and memory actions generated by the learning system." arrow placement="top-start">
-                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Learning Candidates</Typography>
-                </Tooltip>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  Suggestions created from evidence. These do not become active workflows or strategies until approved.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Draft learning candidates",
+                  description:
+                    "Suggestions created from evidence. These do not become active workflows or strategies until approved.",
+                  info:
+                    "This list shows the new ideas AgentArk has generated from evidence, including workflow, memory, and strategy suggestions."
+                })}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading learning candidates...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -23583,12 +26461,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
             <Grid2 size={{ xs: 12, lg: 6 }}>
               <Box className="list-shell" sx={{ minHeight: 0 }}>
-                <Tooltip title="History of all evolution promotion attempts. Shows when candidates were tested and whether they improved baseline performance." arrow placement="top-start">
-                  <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Lineage</Typography>
-                </Tooltip>
-                <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                  A timeline of experiments showing what changed, what improved, and what was promoted.
-                </Typography>
+                {renderSettingsSectionIntro({
+                  eyebrow: "Evolution",
+                  title: "Policy lineage",
+                  description: "A timeline of experiments showing what changed, what improved, and what was promoted.",
+                  info:
+                    "This history shows which candidate changes were tested over time and whether they performed better than the current baseline."
+                })}
                 {evolutionDevQ.isLoading ? (
                   <Typography variant="body2" color="text.secondary">Loading lineage...</Typography>
                 ) : evolutionDevQ.error ? (
@@ -23628,9 +26507,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               <Grid2 size={{ xs: 12 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
                   <Stack direction={{ xs: "column", md: "row" }} spacing={1} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }}>
-                    <Box>
-                      <Typography variant="h6">Developer Controls</Typography>
-                      <Typography variant="caption" color="text.secondary">Manual overrides for canary deployments and policy management.</Typography>
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      {renderSettingsSectionIntro({
+                        eyebrow: "Evolution",
+                        title: "Developer controls",
+                        description: "Manual overrides for canary deployments and policy management.",
+                        info:
+                          "Use these controls when you need to force a promotion, stop a canary test, or roll back the current baseline policy."
+                      })}
                     </Box>
                     <Stack direction="row" spacing={1}>
                       <Tooltip title="Stop the active canary rollout and route 100% of traffic back to the baseline policy." arrow>
@@ -23706,12 +26590,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
 
               <Grid2 size={{ xs: 12, lg: 6 }}>
                 <Box className="list-shell" sx={{ minHeight: 0 }}>
-                  <Tooltip title="Performance metrics for task-routing strategies. Strategies determine how the agent selects which model or approach to use for each request." arrow placement="top-start">
-                    <Typography variant="h6" mb={1} sx={{ cursor: "help" }}>Strategy Metrics</Typography>
-                  </Tooltip>
-                  <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 1.5 }}>
-                    Advanced diagnostics for routing strategy experiments and canary performance.
-                  </Typography>
+                  {renderSettingsSectionIntro({
+                    eyebrow: "Evolution",
+                    title: "Strategy metrics",
+                    description: "See how routing experiments are performing and whether canary changes are helping.",
+                    info:
+                      "These metrics show how AgentArk decides which model or approach to use, and whether newer routing changes are improving results."
+                  })}
                   {evolutionDevQ.isLoading ? (
                     <Typography variant="body2" color="text.secondary">Loading developer metrics...</Typography>
                   ) : evolutionDevQ.error ? (
@@ -23750,6 +26635,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           ) : null}
         </Stack>
       ) : null}
+        </Stack>
         </Box>
       </Box>
 
@@ -24793,13 +27679,24 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
 
   return (
-    <Stack spacing={1.5} sx={{ pb: 3 }}>
-      <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "stretch", md: "center" }} spacing={1}>
-        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: -0.6, color: "#ecf5ff" }}>
-          Analytics
-        </Typography>
+    <Stack spacing={1.35} className="workspace-page-shell">
+      <Stack
+        direction={{ xs: "column", md: "row" }}
+        justifyContent="space-between"
+        alignItems={{ xs: "stretch", md: "flex-start" }}
+        spacing={1}
+        className="workspace-page-header"
+      >
+        <Box className="workspace-page-header-copy">
+          <Typography className="workspace-page-kicker">Usage</Typography>
+          <Typography className="workspace-page-title">Analytics</Typography>
+          <Typography className="workspace-page-copy">
+            LLM usage, policy performance, and model mix across the selected range.
+          </Typography>
+        </Box>
         <TextField
           select
+          className="workspace-page-select"
           size="small"
           value={activeRange}
           onChange={(e) => {
@@ -24810,7 +27707,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
               handleRangeChange(val);
             }
           }}
-          sx={{ minWidth: 180 }}
+          sx={{ minWidth: 168, flexShrink: 0 }}
         >
           <MenuItem disabled sx={{ fontSize: "0.75rem", opacity: 0.6, py: 0.25 }}>Hours</MenuItem>
           <MenuItem value="1h">1 hour</MenuItem>
@@ -25535,7 +28432,7 @@ function DevicesManager({ autoRefresh }: { autoRefresh: boolean }) {
         onPairNode={async ({ name, platform, capabilities }) => {
           try {
             await api.createNode({ name, platform, capabilities });
-            setNotice({ kind: "success", text: "Node paired in the control plane." });
+            setNotice({ kind: "success", text: "Node paired with AgentArk." });
             await refresh();
           } catch (error) {
             setNotice({ kind: "error", text: errMessage(error) });
@@ -25754,6 +28651,9 @@ export function NativeWorkspace({
   const activeProjectId = useUiStore((s) => s.activeProjectId);
   const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
   const isChat = view === "chat";
+  const isSettingsSurface =
+    view === "settings" ||
+    ["connections", "channels", "routing", "webhooks", "devices", "browser", "gatewayops", "failover", "moltbook", "arkpulse"].includes(view);
   const needsProjects = ["chat", "documents", "memory", "projects"].includes(view);
   const showProjectScopeBar = ["documents", "memory"].includes(view);
   const projectsQ = useQuery({
@@ -25781,7 +28681,7 @@ export function NativeWorkspace({
   return (
     <Box
       sx={{
-        p: { xs: 0.75, md: 1 },
+        p: isChat ? { xs: 0.35, md: 0.45 } : isSettingsSurface ? { xs: 1, md: 1.25 } : { xs: 0.75, md: 1 },
         height: "100%",
         overflow: isChat ? "hidden" : "auto",
         display: "flex",
@@ -25831,6 +28731,12 @@ export function NativeWorkspace({
       ) : null}
       {view === "goals" ? <GoalsManager autoRefresh={autoRefresh} /> : null}
       {view === "autonomy" ? <AutonomyManager autoRefresh={autoRefresh} /> : null}
+      {view === "sentinel" ? (
+        <SentinelPanel
+          autoRefresh={autoRefresh}
+          navigateToView={(nextView, replace) => onNavigateToView?.(nextView, replace)}
+        />
+      ) : null}
       {view === "documents" ? (
         <DocumentsManager autoRefresh={autoRefresh} projects={projects} activeProjectId={activeProjectId} />
       ) : null}

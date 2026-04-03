@@ -34,73 +34,129 @@ export function WelcomeHero({
       prompts && prompts.length > 0
         ? prompts
         : [
-            "Review recent changes and list only the critical risks.",
+            "Give me my morning brief with weather, calendar, top tasks, and anything urgent.",
+            "Remember that I prefer concise answers and send daily updates to Telegram.",
+            "Watch my inbox for urgent client messages and alert me before I miss them.",
+            "Draft a reply to this message and ask before sending it.",
             "Build a small app to track competitor launches and deploy it.",
-            "Import this skill URL and wire up any required secrets.",
-            "Summarize the current project state and name the next decision.",
-            "Inspect active automations and surface anything that needs intervention.",
           ],
     [prompts]
   );
   const [promptIndex, setPromptIndex] = useState(0);
+  const [typedPrompt, setTypedPrompt] = useState("");
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
   const promptSignature = heroPrompts.join("\n");
   const activePrompt = heroPrompts[promptIndex] || heroPrompts[0] || "";
+  const displayPrompt = useMemo(() => {
+    const trimmed = activePrompt.trim();
+    return trimmed.length > 96 ? `${trimmed.slice(0, 93).trimEnd()}\u2026` : trimmed;
+  }, [activePrompt]);
   const activeObjective = currentTaskDesc?.trim()
     ? currentTaskDesc.trim()
     : agentPaused
-      ? "Autonomy is paused. Resume it when you want background tasks and watchers to continue."
-      : "No active objective is pinned. Mission Control is ready for a new directive.";
+      ? "Background help is paused. Resume it when you want briefs, reminders, and automations to continue."
+      : "No focus is pinned yet. Start with a question, a reminder, or your next daily brief.";
+  const objectiveState = currentTaskDesc?.trim() ? "Active now" : agentPaused ? "Paused" : "Ready";
 
   useEffect(() => {
     setPromptIndex(0);
   }, [promptSignature]);
 
   useEffect(() => {
-    if (heroPrompts.length <= 1 || typeof window === "undefined") {
+    if (typeof window === "undefined" || !window.matchMedia) {
       return undefined;
     }
 
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const rotateEveryMs = reduceMotion ? 6400 : 4600;
-    const timer = window.setInterval(() => {
-      setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
-    }, rotateEveryMs);
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const syncPreference = () => {
+      setPrefersReducedMotion(media.matches);
+    };
+    syncPreference();
 
-    return () => window.clearInterval(timer);
-  }, [heroPrompts]);
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", syncPreference);
+      return () => media.removeEventListener("change", syncPreference);
+    }
+
+    media.addListener(syncPreference);
+    return () => media.removeListener(syncPreference);
+  }, []);
+
+  useEffect(() => {
+    setTypedPrompt(prefersReducedMotion ? displayPrompt : "");
+  }, [displayPrompt, prefersReducedMotion]);
+
+  useEffect(() => {
+    if (!displayPrompt || typeof window === "undefined") {
+      return undefined;
+    }
+
+    if (prefersReducedMotion) {
+      if (heroPrompts.length <= 1) {
+        return undefined;
+      }
+
+      const timer = window.setTimeout(() => {
+        setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
+      }, 5600);
+
+      return () => window.clearTimeout(timer);
+    }
+
+    if (typedPrompt.length < displayPrompt.length) {
+      const nextChar = displayPrompt[typedPrompt.length];
+      const delay = /[.,!?]/.test(nextChar) ? 48 : nextChar === " " ? 16 : 24;
+      const timer = window.setTimeout(() => {
+        setTypedPrompt(displayPrompt.slice(0, typedPrompt.length + 1));
+      }, delay);
+
+      return () => window.clearTimeout(timer);
+    }
+
+    if (heroPrompts.length <= 1) {
+      return undefined;
+    }
+
+    const holdMs = Math.max(1800, Math.min(3200, displayPrompt.length * 28));
+    const timer = window.setTimeout(() => {
+      setPromptIndex((prev) => (prev + 1) % heroPrompts.length);
+    }, holdMs);
+
+    return () => window.clearTimeout(timer);
+  }, [displayPrompt, heroPrompts.length, prefersReducedMotion, typedPrompt]);
 
   return (
     <Card
       className="welcome-hero-card mission-panel mission-panel--hero"
       sx={{
         height: "100%",
-        borderRadius: 4,
-        border: "1px solid rgba(108, 156, 212, 0.18)",
+        borderRadius: 3.5,
+        border: "1px solid rgba(108, 156, 212, 0.12)",
         background:
           "radial-gradient(circle at 18% 0%, rgba(47, 212, 255, 0.18), rgba(0,0,0,0) 34%)," +
           "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(8, 18, 33, 0.84))",
-        boxShadow: "0 22px 44px rgba(0, 0, 0, 0.22)",
+        boxShadow: "0 18px 34px rgba(0, 0, 0, 0.16)",
         overflow: "hidden",
       }}
     >
-      <CardContent sx={{ p: { xs: 1.35, md: 1.55 }, position: "relative", height: "100%" }}>
-        <Stack spacing={1.15} className="mission-panel-content" sx={{ position: "relative", zIndex: 1 }}>
-          <Stack spacing={1.15} className="mission-panel-section">
+      <CardContent sx={{ p: { xs: 1.1, md: 1.3 }, position: "relative", height: "100%" }}>
+        <Stack spacing={1.05} className="mission-panel-content" sx={{ position: "relative", zIndex: 1 }}>
+          <Stack spacing={1} className="mission-panel-section">
             <Stack
               direction={{ xs: "column", md: "row" }}
-              spacing={1.2}
+              spacing={1}
               justifyContent="space-between"
               alignItems={{ xs: "flex-start", md: "flex-start" }}
             >
-              <Stack spacing={0.95} sx={{ minWidth: 0, flex: 1 }}>
+              <Stack spacing={0.8} sx={{ minWidth: 0, flex: 1 }}>
                 <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
                   <Box
                     component="img"
                     src="/logo.svg"
                     alt="AgentArk"
                     sx={{
-                      width: { xs: 40, md: 46 },
-                      height: { xs: 40, md: 46 },
+                      width: { xs: 44, md: 52 },
+                      height: { xs: 44, md: 52 },
                       flexShrink: 0,
                       filter: "drop-shadow(0 0 14px rgba(47, 212, 255, 0.22))",
                     }}
@@ -108,146 +164,137 @@ export function WelcomeHero({
                   <Box sx={{ minWidth: 0 }}>
                     <Typography
                       variant="overline"
-                      sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block" }}
+                      sx={{ color: "rgba(142, 191, 234, 0.74)", letterSpacing: "0.12em", display: "block", lineHeight: 1 }}
                     >
-                      Mission Control
+                      AgentArk | Secure Daily Assistant
                     </Typography>
-                    <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.1, letterSpacing: "-0.03em" }}>
-                      Direct the agent from outcomes, not menus.
+                    <Typography
+                      variant="h5"
+                      sx={{
+                        fontWeight: 700,
+                        lineHeight: 1.08,
+                        letterSpacing: "-0.03em",
+                        fontSize: { xs: "1.32rem", md: "1.52rem" },
+                      }}
+                    >
+                      Your secure daily AI assistant, ready before you ask.
                     </Typography>
                   </Box>
                 </Stack>
-                <Typography variant="body2" color="text.secondary" className="mission-card-copy">
-                  This surface should tell you what matters, what the system is doing, and what high-confidence move to make next without drowning you in dashboard chrome.
+                <Typography
+                  variant="body2"
+                  color="text.secondary"
+                  className="mission-card-copy"
+                  noWrap
+                  title="Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it."
+                >
+                  Private by default, useful every day: memory, daily briefings, safe actions, and deeper automation when you want it.
                 </Typography>
               </Stack>
 
               <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                <Chip size="small" color={agentPaused ? "warning" : "success"} label={agentPaused ? "Autonomy Paused" : "Autonomy Active"} />
-                <Chip size="small" label="Outcome-first" />
-                <Chip size="small" label="Operator cockpit" />
+                <Chip
+                  size="small"
+                  color={agentPaused ? "warning" : "success"}
+                  label={agentPaused ? "Background Help Paused" : "Background Help On"}
+                />
+                <Chip size="small" label="Secure first" />
               </Stack>
             </Stack>
 
-            <Box
-              sx={{
-                borderRadius: 3,
-                border: "1px solid rgba(108, 156, 212, 0.18)",
-                background: "rgba(7, 18, 32, 0.58)",
-                px: 1.15,
-                py: 0.95,
-              }}
-            >
-              <Typography
-                variant="caption"
-                sx={{ color: "rgba(137, 213, 255, 0.8)", letterSpacing: "0.08em", textTransform: "uppercase" }}
-              >
-                Active Objective
-              </Typography>
-              <Typography variant="body2" sx={{ mt: 0.35, color: "rgba(225, 239, 255, 0.96)", fontWeight: 600 }}>
-                {activeObjective}
-              </Typography>
-            </Box>
-
-            <Box
-              sx={{
-                borderRadius: 3,
-                border: "1px solid rgba(108, 156, 212, 0.22)",
-                background: "rgba(8, 19, 34, 0.58)",
-                px: 1.05,
-                py: 0.85,
-                display: "grid",
-                gridTemplateColumns: { xs: "1fr", md: "auto minmax(0, 1fr)" },
-                alignItems: "center",
-                columnGap: 0.8,
-                rowGap: 0.45,
-                maxWidth: "100%",
-                minWidth: 0,
-                overflow: "hidden",
-                minHeight: 52,
-              }}
-            >
-              <Typography
-                variant="caption"
-                sx={{
-                  color: "rgba(137, 213, 255, 0.8)",
-                  letterSpacing: "0.08em",
-                  textTransform: "uppercase",
-                  flexShrink: 0,
-                }}
-              >
-                Suggested directive
-              </Typography>
-              <Box
-                sx={{
-                  display: "flex",
-                  alignItems: "center",
-                  minWidth: 0,
-                  flex: 1,
-                  color: "rgba(196, 230, 255, 0.96)",
-                  fontSize: "0.88rem",
-                }}
-              >
-                <Box
-                  component="span"
-                  key={`${promptIndex}-${activePrompt}`}
-                  title={activePrompt}
-                  className="welcome-hero-directive"
-                  sx={{
-                    minWidth: 0,
-                    display: "block",
-                    overflow: "hidden",
-                    whiteSpace: "nowrap",
-                    textOverflow: "ellipsis",
-                  }}
+            <Box className="welcome-hero-command-deck">
+              <Box className="welcome-hero-command-row">
+                <Box className="welcome-hero-command-meta">
+                  <Typography variant="caption" className="welcome-hero-command-label">
+                    Current Focus
+                  </Typography>
+                  <Typography variant="caption" className="welcome-hero-command-state">
+                    {objectiveState}
+                  </Typography>
+                </Box>
+                <Typography
+                  variant="body2"
+                  title={activeObjective}
+                  className="welcome-hero-command-body welcome-hero-command-body--objective"
                 >
-                  {activePrompt}
+                  {activeObjective}
+                </Typography>
+              </Box>
+
+              <Box className="welcome-hero-command-divider" />
+
+              <Box className="welcome-hero-command-row welcome-hero-command-row--directive">
+                <Box className="welcome-hero-command-meta">
+                  <Typography variant="caption" className="welcome-hero-command-label">
+                    Suggested Next Step
+                  </Typography>
+                  <Typography variant="caption" className="welcome-hero-command-state">
+                    Daily use
+                  </Typography>
+                </Box>
+                <Box className="welcome-hero-command-body welcome-hero-command-body--directive">
+                  <Box className="welcome-hero-typewriter-stage" title={activePrompt}>
+                    <Box component="span" className="welcome-hero-typewriter-text">
+                      {prefersReducedMotion ? displayPrompt : typedPrompt}
+                    </Box>
+                    {!prefersReducedMotion ? (
+                      <Box component="span" aria-hidden className="welcome-hero-typewriter-caret" />
+                    ) : null}
+                  </Box>
+                  <Typography variant="caption" className="welcome-hero-command-caption">
+                    Rotates through useful assistant tasks from your routines, recent work, and unattended runs.
+                  </Typography>
                 </Box>
               </Box>
             </Box>
           </Stack>
 
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={0.85} className="mission-panel-footer" sx={{ width: { xs: "100%", sm: "auto" } }}>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={0.8}
+            className="mission-panel-footer welcome-hero-footer"
+            sx={{ width: { xs: "100%", sm: "auto" } }}
+          >
             {onGoChat ? (
               <Button
-                size="medium"
+                size="small"
                 variant="contained"
                 startIcon={<ChatRoundedIcon />}
                 onClick={onGoChat}
               >
-                Open Chat
+                Ask AgentArk
               </Button>
             ) : null}
             {onRunBriefing ? (
               <Button
-                size="medium"
+                size="small"
                 variant="outlined"
                 startIcon={<AutoAwesomeRoundedIcon />}
                 onClick={onRunBriefing}
                 disabled={briefingLoading}
               >
-                {briefingLoading ? "Running..." : "Run Daily Brief"}
+                {briefingLoading ? "Running..." : "Generate Daily Brief"}
               </Button>
             ) : null}
             {onViewTasks ? (
               <Button
-                size="medium"
+                size="small"
                 variant="outlined"
                 startIcon={<ListAltRoundedIcon />}
                 onClick={onViewTasks}
               >
-                Open Task Queue
+                Review Tasks
               </Button>
             ) : null}
             {onTogglePause ? (
               <Button
-                size="medium"
+                size="small"
                 variant="outlined"
                 startIcon={agentPaused ? <PlayCircleOutlineRoundedIcon /> : <PauseCircleOutlineRoundedIcon />}
                 onClick={onTogglePause}
                 disabled={pauseLoading}
               >
-                {agentPaused ? "Resume Autonomy" : "Pause Autonomy"}
+                {agentPaused ? "Resume Background Help" : "Pause Background Help"}
               </Button>
             ) : null}
           </Stack>

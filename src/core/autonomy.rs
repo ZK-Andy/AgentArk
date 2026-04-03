@@ -159,6 +159,24 @@ pub struct AutonomySettings {
     pub arkpulse_unauthorized_channel_threshold: u32,
     #[serde(default = "default_arkpulse_combined_security_threshold")]
     pub arkpulse_combined_security_threshold: u32,
+    #[serde(default)]
+    pub sentinel: SentinelSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentinelSettings {
+    #[serde(default = "default_sentinel_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_sentinel_watch_in_app")]
+    pub watch_in_app: bool,
+    #[serde(default = "default_sentinel_watch_connected_services")]
+    pub watch_connected_services: bool,
+    #[serde(default = "default_sentinel_infer_new_automations")]
+    pub infer_new_automations: bool,
+    #[serde(default = "default_sentinel_confidence_threshold")]
+    pub confidence_threshold: f32,
+    #[serde(default = "default_sentinel_max_proposals_per_scan")]
+    pub max_proposals_per_scan: u32,
 }
 
 fn default_autonomy_mode() -> String {
@@ -185,6 +203,43 @@ fn default_arkpulse_combined_security_threshold() -> u32 {
     120
 }
 
+fn default_sentinel_enabled() -> bool {
+    true
+}
+
+fn default_sentinel_watch_in_app() -> bool {
+    true
+}
+
+fn default_sentinel_watch_connected_services() -> bool {
+    true
+}
+
+fn default_sentinel_infer_new_automations() -> bool {
+    true
+}
+
+fn default_sentinel_confidence_threshold() -> f32 {
+    0.72
+}
+
+fn default_sentinel_max_proposals_per_scan() -> u32 {
+    6
+}
+
+impl Default for SentinelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_sentinel_enabled(),
+            watch_in_app: default_sentinel_watch_in_app(),
+            watch_connected_services: default_sentinel_watch_connected_services(),
+            infer_new_automations: default_sentinel_infer_new_automations(),
+            confidence_threshold: default_sentinel_confidence_threshold(),
+            max_proposals_per_scan: default_sentinel_max_proposals_per_scan(),
+        }
+    }
+}
+
 impl Default for AutonomySettings {
     fn default() -> Self {
         Self {
@@ -207,6 +262,7 @@ impl Default for AutonomySettings {
             arkpulse_unauthorized_channel_threshold:
                 default_arkpulse_unauthorized_channel_threshold(),
             arkpulse_combined_security_threshold: default_arkpulse_combined_security_threshold(),
+            sentinel: SentinelSettings::default(),
         }
     }
 }

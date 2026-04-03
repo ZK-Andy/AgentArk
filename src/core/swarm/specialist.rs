@@ -5,6 +5,7 @@ use crate::actions::ActionDef;
 use crate::core::llm::{LlmClient, LlmProvider};
 use crate::core::orchestra::SubAgentType;
 use crate::core::prompt_policy::delegated_policy_v2_block;
+use crate::memory::MemoryEntry;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -62,10 +63,6 @@ impl SpecialistAgent {
         &self.config
     }
 
-    pub fn llm(&self) -> &LlmClient {
-        &self.llm
-    }
-
     /// Build the system prompt for this specialist
     fn system_prompt(&self) -> String {
         if let Some(ref override_prompt) = self.config.system_prompt_override {
@@ -74,14 +71,41 @@ impl SpecialistAgent {
         self.config.agent_type.system_prompt()
     }
 
-    /// Execute a task using this specialist's LLM
-    pub async fn execute_task(&self, task: &str, context: &str) -> Result<String> {
+    /// Execute a task using this specialist's LLM with an optional
+    /// caller-supplied per-invocation system prompt.
+    pub async fn execute_task_with_prompt(
+        &self,
+        task: &str,
+        context: &str,
+        system_prompt_override: Option<String>,
+    ) -> Result<String> {
+        self.execute_task_with_scope_and_prompt(
+            task,
+            context,
+            &[],
+            &self.available_actions,
+            system_prompt_override,
+        )
+        .await
+    }
+
+    /// Execute a task with task-scoped memories/actions and an optional
+    /// caller-supplied system prompt override for this invocation.
+    pub async fn execute_task_with_scope_and_prompt(
+        &self,
+        task: &str,
+        context: &str,
+        memories: &[MemoryEntry],
+        available_actions: &[ActionDef],
+        system_prompt_override: Option<String>,
+    ) -> Result<String> {
         let system_prompt = format!(
             "{}\n\nYou are part of an agent swarm. Your name is '{}'. \
-             Respond with your analysis/result for the delegated task.\n\
+             Respond with your analysis/result for the delegated task. \
+             Stay inside the delegated task packet and use dependency outputs instead of redoing completed work.\n\
              {}\n\n\
-             Context from coordinator:\n{}",
-            self.system_prompt(),
+             Delegated task packet:\n{}",
+            system_prompt_override.unwrap_or_else(|| self.system_prompt()),
             self.config.name,
             delegated_policy_v2_block(),
             context
@@ -100,8 +124,8 @@ impl SpecialistAgent {
             &request,
             &system_prompt,
             task,
-            &[],
-            &self.available_actions,
+            memories,
+            available_actions,
             Some(60_000),
         )
         .await?;
@@ -134,21 +158,6 @@ impl SwarmAgent for SpecialistAgent {
 
     fn id(&self) -> &AgentId {
         &self.id
-    }
-
-    async fn handle_message(&self, message: SwarmMessage) -> Result<SwarmResponse> {
-        let start = std::time::Instant::now();
-        let context = message.context.unwrap_or_default();
-        let content = self.execute_task(&message.content, &context).await?;
-        let elapsed = start.elapsed().as_millis() as u64;
-
-        Ok(SwarmResponse {
-            agent_id: self.id.clone(),
-            content,
-            confidence: 0.8,
-            tool_calls_made: vec![],
-            execution_time_ms: elapsed,
-        })
     }
 
     fn can_handle(&self, task_description: &str) -> f32 {

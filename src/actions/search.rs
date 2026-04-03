@@ -1,7 +1,6 @@
 //! Web Search Actions
 //!
 //! Supports multiple search backends:
-//! - SearXNG (self-hosted, reliable)
 //! - Serper API (Google results)
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
@@ -30,8 +29,6 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SearchBackend {
-    /// SearXNG self-hosted instance
-    SearXNG { base_url: String },
     /// Serper API (Google results)
     Serper { api_key: String },
     /// Brave Search API
@@ -64,9 +61,6 @@ impl SearchClient {
     /// Perform a web search
     pub async fn search(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
         match &self.backend {
-            SearchBackend::SearXNG { base_url } => {
-                self.search_searxng(base_url, query, num_results).await
-            }
             SearchBackend::Serper { api_key } => {
                 self.search_serper(api_key, query, num_results).await
             }
@@ -79,52 +73,6 @@ impl SearchClient {
             }
             SearchBackend::Lightpanda => self.search_lightpanda(query, num_results).await,
         }
-    }
-
-    /// Search using SearXNG instance
-    async fn search_searxng(
-        &self,
-        base_url: &str,
-        query: &str,
-        num_results: usize,
-    ) -> Result<SearchResponse> {
-        #[derive(Deserialize)]
-        struct SearXNGResponse {
-            results: Vec<SearXNGResult>,
-        }
-
-        #[derive(Deserialize)]
-        struct SearXNGResult {
-            title: String,
-            url: String,
-            content: Option<String>,
-        }
-
-        let url = format!(
-            "{}/search?q={}&format=json&categories=general",
-            base_url.trim_end_matches('/'),
-            urlencoding::encode(query)
-        );
-
-        let response: SearXNGResponse = self.client.get(&url).send().await?.json().await?;
-
-        let results = response
-            .results
-            .into_iter()
-            .take(num_results)
-            .map(|r| SearchResult {
-                title: r.title,
-                url: r.url,
-                snippet: r.content.unwrap_or_default(),
-                source: "searxng".to_string(),
-            })
-            .collect();
-
-        Ok(SearchResponse {
-            query: query.to_string(),
-            results,
-            backend: "searxng".to_string(),
-        })
     }
 
     /// Search using Serper API (Google results)
@@ -647,10 +595,6 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
     // When an explicit backend is requested, use it directly (no fallback)
     if let Some(explicit) = args.backend.as_deref() {
         let backend = match explicit {
-            "searxng" => config
-                .searxng
-                .clone()
-                .ok_or_else(|| anyhow!("SearXNG not configured"))?,
             "serper" => config
                 .serper
                 .clone()
@@ -678,25 +622,25 @@ pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<
     let mut last_err = None;
     for name in &chain {
         if let Some(backend) = config.resolve_backend(name) {
-                let client = SearchClient::new(backend);
-                match client.search(&args.query, args.num_results).await {
-                    Ok(response) if !response.results.is_empty() => {
-                        return Ok(format_search_results(&response));
-                    }
-                    Ok(_) => {
-                        tracing::warn!("Search backend '{}' returned 0 results, trying next", name);
-                        last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
-                    }
-                    Err(e) => {
-                        tracing::warn!("Search backend '{}' failed: {}, trying next", name, e);
-                        last_err = Some(e);
-                    }
+            let client = SearchClient::new(backend);
+            match client.search(&args.query, args.num_results).await {
+                Ok(response) if !response.results.is_empty() => {
+                    return Ok(format_search_results(&response));
                 }
+                Ok(_) => {
+                    tracing::warn!("Search backend '{}' returned 0 results, trying next", name);
+                    last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
+                }
+                Err(e) => {
+                    tracing::warn!("Search backend '{}' failed: {}, trying next", name, e);
+                    last_err = Some(e);
+                }
+            }
         } else {
             tracing::debug!("Search backend '{}' not configured, trying next", name);
         }
 
-    // No chain configured — legacy default: prefer Playwright, fall back to DuckDuckGo
+        // No chain configured — legacy default: prefer Playwright, fall back to DuckDuckGo
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("All search backends failed")))
@@ -720,7 +664,6 @@ fn format_search_results(response: &SearchResponse) -> String {
 /// Search configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
-    pub searxng: Option<SearchBackend>,
     pub serper: Option<SearchBackend>,
     pub brave: Option<SearchBackend>,
     pub playwright: Option<SearchBackend>,
@@ -738,7 +681,6 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            searxng: None,
             serper: None,
             brave: None,
             playwright: None,
@@ -755,7 +697,6 @@ impl SearchConfig {
         match name {
             "playwright" => self.playwright.clone(),
             "serper" => self.serper.clone(),
-            "searxng" => self.searxng.clone(),
             "brave_api" | "brave" => self.brave.clone(),
             "duckduckgo" => Some(SearchBackend::DuckDuckGo),
             "lightpanda" => Some(SearchBackend::Lightpanda),

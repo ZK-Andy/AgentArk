@@ -19,6 +19,28 @@ struct ActionInfo {
     pub file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<ActionReviewInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActionReviewInfo {
+    pub status: String,
+    pub ready: bool,
+    pub allow_execute: bool,
+    pub visible_in_catalog: bool,
+    pub blocked_reason: Option<String>,
+    pub risk_score_10: f32,
+    pub risk_band: String,
+    pub threat_level: String,
+    pub warnings: Vec<String>,
+    pub required_env: Vec<String>,
+    pub missing_env: Vec<String>,
+    pub permissions_needed: Vec<String>,
+    pub requires_auth: bool,
+    pub auth_configured: bool,
+    pub notes: Vec<String>,
+    pub reviewed_at: String,
 }
 
 /// Action content response
@@ -27,6 +49,8 @@ struct ActionContentResponse {
     pub name: String,
     pub content: String,
     pub editable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<ActionReviewInfo>,
 }
 
 /// Action content update request
@@ -67,6 +91,38 @@ pub(super) struct ImportActionRequest {
     pub selected_urls: Option<Vec<String>>,
 }
 
+fn action_review_status_label(status: &crate::runtime::ActionReviewStatus) -> String {
+    match status {
+        crate::runtime::ActionReviewStatus::Ready => "ready",
+        crate::runtime::ActionReviewStatus::NeedsSecrets => "needs_secrets",
+        crate::runtime::ActionReviewStatus::Blocked => "blocked",
+        crate::runtime::ActionReviewStatus::Warning => "warning",
+        crate::runtime::ActionReviewStatus::Unreviewed => "unreviewed",
+    }
+    .to_string()
+}
+
+fn action_review_info(review: crate::runtime::ActionReviewSnapshot) -> ActionReviewInfo {
+    ActionReviewInfo {
+        status: action_review_status_label(&review.status),
+        ready: review.ready,
+        allow_execute: review.allow_execute,
+        visible_in_catalog: review.visible_in_catalog,
+        blocked_reason: review.blocked_reason,
+        risk_score_10: review.risk_score_10,
+        risk_band: review.risk_band,
+        threat_level: review.threat_level,
+        warnings: review.warnings,
+        required_env: review.required_env,
+        missing_env: review.missing_env,
+        permissions_needed: review.permissions_needed,
+        requires_auth: review.requires_auth,
+        auth_configured: review.auth_configured,
+        notes: review.notes,
+        reviewed_at: review.reviewed_at,
+    }
+}
+
 /// List available actions
 pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
     let agent_guard = state.agent.read().await;
@@ -85,6 +141,18 @@ pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
                 // Only System actions are read-only
                 let editable = s.source != ActionSource::System;
                 let enabled = agent_guard.runtime.is_action_enabled(&s.name).await;
+                let review = match agent_guard
+                    .runtime
+                    .refresh_action_review_state(&s.name)
+                    .await
+                {
+                    Ok(Some(review)) => Some(action_review_info(review)),
+                    Ok(None) | Err(_) => agent_guard
+                        .runtime
+                        .get_action_review(&s.name)
+                        .await
+                        .map(action_review_info),
+                };
                 let imported_at = s.file_path.as_deref().and_then(|p| {
                     std::fs::metadata(p)
                         .ok()
@@ -103,6 +171,7 @@ pub(super) async fn list_actions(State(state): State<AppState>) -> Response {
                     enabled,
                     file_path: s.file_path,
                     imported_at,
+                    review,
                 });
             }
 
@@ -138,12 +207,21 @@ pub(super) async fn get_action_content(
             use crate::actions::ActionSource;
             // Custom and Bundled actions are editable (Bundled gets copied to custom on edit)
             let editable = info.source != ActionSource::System;
+            let review = match agent_guard.runtime.refresh_action_review_state(&name).await {
+                Ok(Some(review)) => Some(action_review_info(review)),
+                Ok(None) | Err(_) => agent_guard
+                    .runtime
+                    .get_action_review(&name)
+                    .await
+                    .map(action_review_info),
+            };
             (
                 StatusCode::OK,
                 Json(ActionContentResponse {
                     name: info.name,
                     content,
                     editable,
+                    review,
                 }),
             )
                 .into_response()
@@ -179,11 +257,25 @@ pub(super) async fn update_action_content(
         .update_action_content(&name, &update.content)
         .await
     {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "message": "Skill updated"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            let review = match agent_guard.runtime.refresh_action_review_state(&name).await {
+                Ok(Some(review)) => Some(action_review_info(review)),
+                Ok(None) | Err(_) => agent_guard
+                    .runtime
+                    .get_action_review(&name)
+                    .await
+                    .map(action_review_info),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "message": "Skill updated",
+                    "review": review
+                })),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
@@ -283,7 +375,7 @@ fn unique_push(out: &mut Vec<String>, s: String) {
     }
 }
 
-fn is_clawhub_host(host: &str) -> bool {
+fn is_known_skill_catalog_host(host: &str) -> bool {
     host == "clawhub.ai"
         || host.ends_with(".clawhub.ai")
         || host == "openclaw.ai"
@@ -293,7 +385,7 @@ fn is_clawhub_host(host: &str) -> bool {
 fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
     let mut envs: Vec<String> = Vec::new();
 
-    // OpenClaw-style embedded metadata (JSON-ish) e.g. `"env": ["OPENAI_API_KEY"]`
+    // JSON-style embedded metadata e.g. `"env": ["OPENAI_API_KEY"]`
     let re_env_arr = regex::Regex::new(r#"(?s)"env"\s*:\s*\[([^\]]*)\]"#).ok();
     let re_quoted = regex::Regex::new(r#""([A-Z0-9_]{2,})""#).ok();
     if let (Some(re_env_arr), Some(re_quoted)) = (re_env_arr, re_quoted) {
@@ -308,7 +400,7 @@ fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
         }
     }
 
-    // OpenClaw: `"primaryEnv": "OPENAI_API_KEY"`
+    // Metadata field: `"primaryEnv": "OPENAI_API_KEY"`
     let re_primary = regex::Regex::new(r#""primaryEnv"\s*:\s*"([A-Z0-9_]{2,})""#).ok();
     if let Some(re_primary) = re_primary {
         for cap in re_primary.captures_iter(frontmatter) {
@@ -770,12 +862,29 @@ pub(super) async fn set_action_secrets(
         }
     }
 
+    let agent = state.agent.read().await;
+    match agent.runtime.refresh_action_review_state(&name).await {
+        Ok(Some(review)) if review.allow_execute => {
+            let _ = agent.runtime.set_action_enabled(&name, true).await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                "Failed to refresh security review state for '{}' after saving secrets: {}",
+                name,
+                error
+            );
+        }
+    }
+    drop(agent);
+
     // Return fresh status
     get_action_secrets(State(state), Path(name)).await
 }
 
 pub(super) async fn test_action(
     State(state): State<AppState>,
+    maybe_caller: Option<Extension<crate::actions::ActionCallerPrincipal>>,
     Path(name): Path<String>,
     Json(request): Json<ActionTestRequest>,
 ) -> Response {
@@ -787,7 +896,20 @@ pub(super) async fn test_action(
 
     let result = {
         let agent = state.agent.read().await;
-        match agent.runtime.execute_action(&name, &arguments).await {
+        let caller = maybe_caller.as_ref().map(|Extension(value)| value);
+        match agent
+            .runtime
+            .execute_action_with_context(
+                &name,
+                &arguments,
+                &super::build_direct_action_auth_context(
+                    caller,
+                    crate::actions::ActionExecutionSurface::Api,
+                    true,
+                ),
+            )
+            .await
+        {
             Ok(output) => {
                 if let Some(payload) = crate::runtime::parse_workflow_missing_inputs_marker(&output)
                 {
@@ -1095,7 +1217,7 @@ fn normalize_model_identifier(raw: &str) -> Option<String> {
     Some(candidate)
 }
 
-/// Inject a model field into ACTION.md YAML frontmatter
+/// Inject a model field into SKILL.md YAML frontmatter
 fn inject_model_into_frontmatter(content: &str, model: &str) -> String {
     let model_line = format!("model: {}", model.trim());
     if let Some(stripped) = content.strip_prefix("---") {
@@ -1391,7 +1513,10 @@ async fn fetch_github_contents(
     let validated = validate_import_fetch_url(&api_url).await?;
     let mut req = client
         .get(validated)
-        .header(reqwest::header::USER_AGENT, "AgentArk/1.0")
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::branding::versioned_user_agent(),
+        )
         .header(reqwest::header::ACCEPT, "application/vnd.github+json");
     if let Some(tok) = token {
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", tok));
@@ -1432,7 +1557,7 @@ async fn collect_github_skill_urls(
         for entry in entries {
             if entry.item_type == "file" {
                 let lower = entry.name.to_ascii_lowercase();
-                if lower == "skill.md" || lower == "action.md" {
+                if lower == "skill.md" {
                     let raw = entry.download_url.unwrap_or_else(|| {
                         format!(
                             "https://raw.githubusercontent.com/{}/{}/{}/{}",
@@ -1564,11 +1689,7 @@ async fn collect_github_skill_urls_from_archive(
         }
 
         let lower = in_scope.to_ascii_lowercase();
-        if !(lower.ends_with("/skill.md")
-            || lower.ends_with("/action.md")
-            || lower == "skill.md"
-            || lower == "action.md")
-        {
+        if !(lower.ends_with("/skill.md") || lower == "skill.md") {
             continue;
         }
 
@@ -1629,7 +1750,7 @@ async fn discover_github_collection_urls(
             Ok(urls) if !urls.is_empty() => return Ok(Some(urls)),
             Ok(_) => {
                 last_err = format!(
-                    "No SKILL.md files (or legacy ACTION.md files) were found under '{}/{}@{}:{}'",
+                    "No SKILL.md files were found under '{}/{}@{}:{}'",
                     loc.owner, loc.repo, git_ref, loc.path
                 );
             }
@@ -1642,7 +1763,7 @@ async fn discover_github_collection_urls(
                     Ok(urls) if !urls.is_empty() => return Ok(Some(urls)),
                     Ok(_) => {
                         last_err = format!(
-                            "GitHub API error: {}. Archive fallback found no SKILL.md files (or legacy ACTION.md files) under '{}/{}@{}:{}'",
+                            "GitHub API error: {}. Archive fallback found no SKILL.md files under '{}/{}@{}:{}'",
                             api_err, loc.owner, loc.repo, git_ref, loc.path
                         );
                     }
@@ -1674,9 +1795,8 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
     let canonical_host = parsed.host_str().unwrap_or("").trim();
     let path = parsed.path();
     let lower_url = source_url.to_ascii_lowercase();
-    let is_clawhub = is_clawhub_host(&host);
 
-    if is_clawhub {
+    if is_known_skill_catalog_host(&host) {
         let path_trim = path.trim_matches('/');
         if path_trim.to_ascii_lowercase().ends_with(".md") {
             out.push(source_url.to_string());
@@ -1724,13 +1844,6 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
                     unique_push(
                         &mut out,
                         format!(
-                            "https://{}/api/v1/skills/{}/file?path=ACTION.md",
-                            canonical_host, slug
-                        ),
-                    );
-                    unique_push(
-                        &mut out,
-                        format!(
                             "https://{}/api/v1/skills/{}/file?path=SKILL.md&tag=latest",
                             canonical_host, slug
                         ),
@@ -1742,21 +1855,11 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
                             canonical_host, slug
                         ),
                     );
-                    unique_push(
-                        &mut out,
-                        format!(
-                            "https://{}/api/v1/skills/{}/file?path=ACTION.md&version=latest",
-                            canonical_host, slug
-                        ),
-                    );
                 }
             }
         }
     } else if lower_url.contains("github.com") && lower_url.contains("/blob/") {
-        if lower_url.ends_with(".md")
-            || lower_url.contains("skill.md")
-            || lower_url.contains("action.md")
-        {
+        if lower_url.ends_with(".md") || lower_url.contains("skill.md") {
             out.push(
                 source_url
                     .replace("github.com", "raw.githubusercontent.com")
@@ -1768,7 +1871,6 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
                 .replace("/blob/", "/");
             let base = base.trim_end_matches('/').to_string();
             out.push(format!("{}/SKILL.md", base));
-            out.push(format!("{}/ACTION.md", base));
         }
         out.push(source_url.to_string());
     } else if lower_url.contains("github.com") && lower_url.contains("/tree/") {
@@ -1777,7 +1879,6 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
             .replace("/tree/", "/");
         let base = base.trim_end_matches('/').to_string();
         out.push(format!("{}/SKILL.md", base));
-        out.push(format!("{}/ACTION.md", base));
         out.push(source_url.to_string());
     } else if host == "github.com" {
         let parts: Vec<String> = parsed
@@ -1811,7 +1912,6 @@ fn build_import_candidate_urls(source_url: &str) -> Vec<String> {
                 }
                 let base = base.trim_end_matches('/').to_string();
                 out.push(format!("{}/SKILL.md", base));
-                out.push(format!("{}/ACTION.md", base));
             }
         }
         out.push(source_url.to_string());
@@ -1864,7 +1964,7 @@ pub(crate) async fn import_action_from_content_with_agent(
         segments
             .iter()
             .rev()
-            .find(|s| !s.is_empty() && **s != "ACTION.md" && **s != "SKILL.md" && !s.contains('.'))
+            .find(|s| !s.is_empty() && **s != "SKILL.md" && !s.contains('.'))
             .map(|s| s.to_string())
             .unwrap_or_else(|| "imported-action".to_string())
     };
@@ -1896,15 +1996,8 @@ pub(crate) async fn import_action_from_content_with_agent(
         || trimmed.starts_with("<html")
         || trimmed.starts_with("<!doctype html");
     if looks_like_html {
-        let is_clawhub_page =
-            source_url.contains("clawhub.ai/") || source_url.contains("openclaw.ai/");
-        if is_clawhub_page {
-            return Err(
-                "This ClawHub/OpenClaw URL appears to be a web page, not raw SKILL.md. Import the raw SKILL.md URL instead (or a legacy ACTION.md if that repo still uses the older format).".to_string(),
-            );
-        }
         return Err(
-            "Imported content is HTML, not raw skill markdown. Please provide a raw SKILL.md URL instead (or a legacy ACTION.md URL if that repo still uses the older format)."
+            "Imported content is HTML, not raw skill markdown. Please provide a raw SKILL.md URL."
                 .to_string(),
         );
     }
@@ -2095,15 +2188,14 @@ pub(crate) struct FetchedSkillMarkdown {
 }
 
 #[cfg(test)]
-static TEST_SKILL_FETCH_OVERRIDES:
-    std::sync::OnceLock<std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>>> =
-    std::sync::OnceLock::new();
+static TEST_SKILL_FETCH_OVERRIDES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn test_skill_fetch_overrides(
-) -> &'static std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>> {
-    TEST_SKILL_FETCH_OVERRIDES
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn test_skill_fetch_overrides() -> &'static std::sync::Mutex<HashMap<String, FetchedSkillMarkdown>>
+{
+    TEST_SKILL_FETCH_OVERRIDES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
@@ -2184,21 +2276,6 @@ pub(crate) async fn fetch_skill_markdown_from_url_shared(
     let candidate_source_url = single_url_override.as_deref().unwrap_or(url);
     let urls_to_try = build_import_candidate_urls(candidate_source_url);
     if urls_to_try.is_empty() {
-        if let Ok(parsed) = reqwest::Url::parse(candidate_source_url) {
-            let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-            if is_clawhub_host(&host)
-                && !parsed
-                    .path()
-                    .trim_matches('/')
-                    .to_ascii_lowercase()
-                    .ends_with(".md")
-            {
-                return Err(format!(
-                    "Could not resolve a raw SKILL.md/ACTION.md URL from ClawHub/OpenClaw page URL '{}'. Use the raw file URL instead.",
-                    candidate_source_url
-                ));
-            }
-        }
         return Err(
             "Could not derive any raw skill URL candidates from the provided link.".to_string(),
         );
@@ -2226,28 +2303,15 @@ pub(crate) async fn fetch_skill_markdown_from_url_shared(
     }
 
     let content = content.ok_or_else(|| {
-        if let Ok(parsed) = reqwest::Url::parse(url) {
-            let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
-            if is_clawhub_host(&host)
-                && !parsed
-                    .path()
-                    .trim_matches('/')
-                    .to_ascii_lowercase()
-                    .ends_with(".md")
-            {
-                return format!(
-                    "Failed to resolve a raw SKILL.md/ACTION.md from this ClawHub/OpenClaw page URL. Tried {:?}: {}",
-                    urls_to_try, last_error
-                );
-            }
-        }
         if url.contains("github.com")
             && (url.contains("/blob/") || url.contains("/tree/"))
             && !url.contains(".md")
         {
             format!(
-                "Failed to fetch skill from URL. If this is a GitHub folder/repo, AgentArk now scans for SKILL.md/ACTION.md automatically. Tried {:?}: {}",
-                urls_to_try, last_error
+                "Failed to fetch skill from URL. If this is a GitHub folder/repo, {} now scans for SKILL.md automatically. Tried {:?}: {}",
+                crate::branding::PRODUCT_NAME,
+                urls_to_try,
+                last_error
             )
         } else {
             format!(
@@ -2464,7 +2528,7 @@ pub(super) async fn import_action(
             .into_response();
     }
 
-    // Collection URL support: one GitHub folder/repo URL can contain many SKILL.md/ACTION.md files.
+    // Collection URL support: one GitHub folder/repo URL can contain many SKILL.md files.
     let mut single_url_override: Option<String> = None;
     if let Some(loc) = parse_github_location(url) {
         if loc.directory_hint {
@@ -2645,7 +2709,9 @@ pub(super) async fn delete_action(
     match agent_guard.runtime.delete_action(&name).await {
         Ok(true) => {
             let message = match source {
-                Some(crate::actions::ActionSource::Bundled) => "Bundled skill disabled",
+                Some(crate::actions::ActionSource::Bundled) => {
+                    "Bundled skill deleted from this install"
+                }
                 Some(crate::actions::ActionSource::Custom) => "Custom skill deleted",
                 _ => "Skill updated",
             };

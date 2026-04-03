@@ -3,8 +3,6 @@
 //! This module is intentionally low-risk: it stores JSON payloads in the
 //! existing KV store and exposes simple async CRUD helpers. It does not add
 //! transport, pairing, or command execution logic.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -16,7 +14,6 @@ const INDEX_KEY: &str = "nodes:index";
 const NODE_PREFIX: &str = "nodes:node:";
 const HEARTBEAT_PREFIX: &str = "nodes:heartbeat:";
 const COMMAND_PREFIX: &str = "nodes:command:";
-const GRANT_PREFIX: &str = "nodes:grant:";
 
 fn node_key(node_id: &str) -> String {
     format!("{}{}", NODE_PREFIX, node_id.trim())
@@ -28,14 +25,6 @@ fn heartbeat_key(node_id: &str) -> String {
 
 fn command_key(node_id: &str) -> String {
     format!("{}{}", COMMAND_PREFIX, node_id.trim())
-}
-
-fn grant_key(grant_id: &str) -> String {
-    format!("{}{}", GRANT_PREFIX, grant_id.trim())
-}
-
-fn grant_index_key(node_id: &str) -> String {
-    format!("nodes:grant_index:{}", node_id.trim())
 }
 
 fn normalize_tag_list(values: &[String]) -> Vec<String> {
@@ -95,21 +84,6 @@ pub enum NodeCapability {
     BrowserControl,
     Voice,
     Files,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeGrant {
-    pub id: String,
-    pub node_id: String,
-    pub capability: NodeCapability,
-    pub granted_by: String,
-    pub granted_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(default)]
-    pub reason: String,
-    #[serde(default)]
-    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,17 +204,6 @@ pub struct NodeCommandLogRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodePermissionGrantRequest {
-    pub node_id: String,
-    pub capability: NodeCapability,
-    pub granted_by: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(default)]
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub total: usize,
     pub paired: usize,
@@ -317,14 +280,6 @@ impl NodeControlPlane {
 
     fn command_key(&self, node_id: &str) -> String {
         self.scoped_key(&command_key(node_id))
-    }
-
-    fn grant_key(&self, grant_id: &str) -> String {
-        self.scoped_key(&grant_key(grant_id))
-    }
-
-    fn grant_index_key(&self, node_id: &str) -> String {
-        self.scoped_key(&grant_index_key(node_id))
     }
 
     async fn read_index(&self) -> Result<Vec<String>> {
@@ -407,27 +362,6 @@ impl NodeControlPlane {
             .await
     }
 
-    async fn read_grants(&self, node_id: &str) -> Result<Vec<NodeGrant>> {
-        let entries = self
-            .storage
-            .get(&self.grant_index_key(node_id))
-            .await?
-            .map(|raw| serde_json::from_slice::<Vec<NodeGrant>>(&raw))
-            .transpose()
-            .context("failed to decode node grant index")?
-            .unwrap_or_default();
-        Ok(entries)
-    }
-
-    async fn write_grants(&self, node_id: &str, entries: &[NodeGrant]) -> Result<()> {
-        self.storage
-            .set(
-                &self.grant_index_key(node_id),
-                &serde_json::to_vec(entries)?,
-            )
-            .await
-    }
-
     pub async fn list(&self) -> Result<Vec<PairedNode>> {
         let mut out = Vec::new();
         for node_id in self.read_index().await? {
@@ -436,13 +370,6 @@ impl NodeControlPlane {
             }
         }
         Ok(out)
-    }
-
-    pub async fn get(&self, node_id: &str) -> Result<Option<PairedNode>> {
-        match self.read_node(node_id).await? {
-            Some(node) => self.decorate_node(node).await.map(Some),
-            None => Ok(None),
-        }
     }
 
     pub async fn upsert(&self, request: NodeUpsertRequest) -> Result<PairedNode> {
@@ -454,10 +381,6 @@ impl NodeControlPlane {
             .as_ref()
             .and_then(|node| node.last_heartbeat_at.clone());
         let previous_error = previous.as_ref().and_then(|node| node.last_error.clone());
-        let previous_permissions = previous
-            .as_ref()
-            .map(|node| node.permissions_granted)
-            .unwrap_or(0);
         let previous_commands = previous
             .as_ref()
             .map(|node| node.command_count)
@@ -480,7 +403,7 @@ impl NodeControlPlane {
                 .filter(|value| !value.is_empty()),
             last_heartbeat_at: previous_heartbeat_at,
             last_error: previous_error,
-            permissions_granted: previous_permissions,
+            permissions_granted: 0,
             command_count: previous_commands,
             metadata: stable_json_map(&request.metadata.unwrap_or_default()),
         };
@@ -603,74 +526,8 @@ impl NodeControlPlane {
         Ok(entry)
     }
 
-    pub async fn grant_permission(&self, request: NodePermissionGrantRequest) -> Result<NodeGrant> {
-        let node_id = request.node_id.trim();
-        anyhow::ensure!(!node_id.is_empty(), "node id cannot be empty");
-        let grant = NodeGrant {
-            id: format!("grant-{}-{}", node_id, Utc::now().timestamp_millis()),
-            node_id: node_id.to_string(),
-            capability: request.capability,
-            granted_by: request.granted_by.trim().to_string(),
-            granted_at: Utc::now().to_rfc3339(),
-            expires_at: request.expires_at,
-            reason: request.reason.trim().to_string(),
-            active: true,
-        };
-
-        let mut grants = self.read_grants(node_id).await?;
-        grants.push(grant.clone());
-        self.write_grants(node_id, &grants).await?;
-
-        if let Some(mut node) = self.read_node(node_id).await? {
-            node.permissions_granted = grants.iter().filter(|entry| entry.active).count();
-            self.write_node(&node).await?;
-        }
-
-        self.storage
-            .set(&self.grant_key(&grant.id), &serde_json::to_vec(&grant)?)
-            .await?;
-
-        Ok(grant)
-    }
-
-    pub async fn revoke_permission(&self, grant_id: &str) -> Result<Option<NodeGrant>> {
-        let grant_id = grant_id.trim();
-        if grant_id.is_empty() {
-            return Ok(None);
-        }
-
-        let Some(raw) = self.storage.get(&self.grant_key(grant_id)).await? else {
-            return Ok(None);
-        };
-        let mut grant =
-            serde_json::from_slice::<NodeGrant>(&raw).context("failed to decode node grant")?;
-        grant.active = false;
-        self.storage
-            .set(&self.grant_key(&grant.id), &serde_json::to_vec(&grant)?)
-            .await?;
-
-        let mut grants = self.read_grants(&grant.node_id).await?;
-        for entry in &mut grants {
-            if entry.id == grant.id {
-                entry.active = false;
-            }
-        }
-        self.write_grants(&grant.node_id, &grants).await?;
-
-        if let Some(mut node) = self.read_node(&grant.node_id).await? {
-            node.permissions_granted = grants.iter().filter(|entry| entry.active).count();
-            self.write_node(&node).await?;
-        }
-
-        Ok(Some(grant))
-    }
-
     pub async fn list_commands(&self, node_id: &str) -> Result<Vec<NodeCommandLogEntry>> {
         self.read_command_log(node_id).await
-    }
-
-    pub async fn list_grants(&self, node_id: &str) -> Result<Vec<NodeGrant>> {
-        self.read_grants(node_id).await
     }
 
     pub async fn status(&self) -> Result<NodeControlPlaneStatus> {
@@ -713,12 +570,7 @@ impl NodeControlPlane {
             node.transport = heartbeat.transport;
             node.capabilities = heartbeat.capabilities;
         }
-        node.permissions_granted = self
-            .read_grants(&node.id)
-            .await?
-            .iter()
-            .filter(|g| g.active)
-            .count();
+        node.permissions_granted = 0;
         node.command_count = self.read_command_log(&node.id).await?.len();
         Ok(node)
     }

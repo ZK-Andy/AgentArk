@@ -406,7 +406,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
         </Box>
       ) : (
         <Grid2 container spacing={2} alignItems="stretch">
-          <Grid2 size={{ xs: 12, lg: 4 }}>
+          <Grid2 size={{ xs: 12, md: 5, xl: 4 }}>
             <Stack spacing={1.25}>
               {sessions.map((session) => {
                 const isSelected = session.id === selectedId;
@@ -446,8 +446,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
             </Stack>
           </Grid2>
 
-          <Grid2 size={{ xs: 12, lg: 8 }}>
-            <Box className="list-shell" sx={{ minHeight: 560 }}>
+          <Grid2 size={{ xs: 12, md: 7, xl: 8 }}>
+            <Box className="list-shell" sx={{ minHeight: { xs: 0, md: 520 } }}>
               {!selectedId || detailQ.isLoading ? (
                 <Box sx={{ py: 10, textAlign: "center" }}>
                   <CircularProgress size={28} />
@@ -534,20 +534,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
 
                   {detailTab === "overview" ? (
                     <Stack spacing={1.5}>
-                      <Box className="metadata-box">
-                        <Typography variant="caption" color="text.secondary">
-                          Objective
-                        </Typography>
-                        <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
+                      <Box className="metadata-box micro-surface">
+                        <Typography className="micro-surface-kicker">Session</Typography>
+                        <Typography className="micro-surface-title">Objective</Typography>
+                        <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
                           {selectedSession.objective}
                         </Typography>
                       </Box>
                       {selectedSession.summary ? (
-                        <Box className="metadata-box">
-                          <Typography variant="caption" color="text.secondary">
-                            Session Summary
-                          </Typography>
-                          <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
+                        <Box className="metadata-box micro-surface">
+                          <Typography className="micro-surface-kicker">Session</Typography>
+                          <Typography className="micro-surface-title">Summary</Typography>
+                          <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
                             {selectedSession.summary}
                           </Typography>
                         </Box>
@@ -563,11 +561,10 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                           },
                         ].map((item) => (
                           <Grid2 key={item.label} size={{ xs: 12, md: 4 }}>
-                            <Box className="metadata-box" sx={{ height: "100%" }}>
-                              <Typography variant="caption" color="text.secondary">
-                                {item.label}
-                              </Typography>
-                              <Typography variant="body2" sx={{ mt: 0.75 }}>
+                            <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
+                              <Typography className="micro-surface-kicker">Session</Typography>
+                              <Typography className="micro-surface-title">{item.label}</Typography>
+                              <Typography className="micro-surface-copy">
                                 {item.value}
                               </Typography>
                             </Box>
@@ -584,11 +581,10 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       </Stack>
 
                       {detailQ.data?.session_detail.working_memory ? (
-                        <Box className="metadata-box">
-                          <Typography variant="caption" color="text.secondary">
-                            Working Memory
-                          </Typography>
-                          <Typography variant="body2" sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
+                        <Box className="metadata-box micro-surface">
+                          <Typography className="micro-surface-kicker">Session</Typography>
+                          <Typography className="micro-surface-title">Working memory</Typography>
+                          <Typography className="micro-surface-copy" sx={{ whiteSpace: "pre-wrap" }}>
                             {detailQ.data.session_detail.working_memory}
                           </Typography>
                         </Box>
@@ -609,21 +605,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                   {detailTab === "work" ? (
                     <Grid2 container spacing={1.5}>
                       <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            Linked Tasks
-                          </Typography>
+                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
+                          <Box className="micro-surface-head">
+                            <Typography className="micro-surface-kicker">Session work</Typography>
+                            <Typography className="micro-surface-title">Linked tasks</Typography>
+                            <Typography className="micro-surface-copy">Tasks currently attached to this session.</Typography>
+                          </Box>
                           {detailQ.data?.linked_tasks.length ? (
                             <Stack spacing={0.9}>
                               {detailQ.data.linked_tasks.map((task) => (
                                 <Box
                                   key={task.id}
-                                  sx={{
-                                    p: 1,
-                                    borderRadius: 2,
-                                    border: "1px solid rgba(100,160,230,0.16)",
-                                    background: "rgba(7, 18, 32, 0.48)",
-                                  }}
+                                  className="micro-surface-list-item"
                                 >
                                   <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
                                     <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={task.description}>
@@ -646,21 +639,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       </Grid2>
 
                       <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            Linked Watchers
-                          </Typography>
+                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
+                          <Box className="micro-surface-head">
+                            <Typography className="micro-surface-kicker">Session work</Typography>
+                            <Typography className="micro-surface-title">Linked watchers</Typography>
+                            <Typography className="micro-surface-copy">Watchers currently attached to this session.</Typography>
+                          </Box>
                           {detailQ.data?.linked_watchers.length ? (
                             <Stack spacing={0.9}>
                               {detailQ.data.linked_watchers.map((watcher) => (
                                 <Box
                                   key={watcher.id}
-                                  sx={{
-                                    p: 1,
-                                    borderRadius: 2,
-                                    border: "1px solid rgba(100,160,230,0.16)",
-                                    background: "rgba(7, 18, 32, 0.48)",
-                                  }}
+                                  className="micro-surface-list-item"
                                 >
                                   <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
                                     <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={watcher.description}>
@@ -687,21 +677,18 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                   {detailTab === "trace" ? (
                     <Grid2 container spacing={1.5}>
                       <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            Recent Runs
-                          </Typography>
+                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
+                          <Box className="micro-surface-head">
+                            <Typography className="micro-surface-kicker">Session trace</Typography>
+                            <Typography className="micro-surface-title">Recent runs</Typography>
+                            <Typography className="micro-surface-copy">Latest recorded runs attached to this session.</Typography>
+                          </Box>
                           {detailQ.data?.recent_runs.length ? (
                             <Stack spacing={0.9}>
                               {detailQ.data.recent_runs.map((run) => (
                                 <Box
                                   key={run.id}
-                                  sx={{
-                                    p: 1,
-                                    borderRadius: 2,
-                                    border: "1px solid rgba(100,160,230,0.16)",
-                                    background: "rgba(7, 18, 32, 0.48)",
-                                  }}
+                                  className="micro-surface-list-item"
                                 >
                                   <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
                                     <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={run.title}>
@@ -727,10 +714,12 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       </Grid2>
 
                       <Grid2 size={{ xs: 12, md: 6 }}>
-                        <Box className="metadata-box" sx={{ height: "100%" }}>
-                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            Session Timeline
-                          </Typography>
+                        <Box className="metadata-box micro-surface" sx={{ height: "100%" }}>
+                          <Box className="micro-surface-head">
+                            <Typography className="micro-surface-kicker">Session trace</Typography>
+                            <Typography className="micro-surface-title">Session timeline</Typography>
+                            <Typography className="micro-surface-copy">Important events recorded across the life of this session.</Typography>
+                          </Box>
                           {detailQ.data?.session_detail.events.length ? (
                             <Stack spacing={0.9}>
                               {detailQ.data.session_detail.events
@@ -739,12 +728,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                                 .map((event) => (
                                   <Box
                                     key={event.id}
-                                    sx={{
-                                      p: 1,
-                                      borderRadius: 2,
-                                      border: "1px solid rgba(100,160,230,0.16)",
-                                      background: "rgba(7, 18, 32, 0.48)",
-                                    }}
+                                    className="micro-surface-list-item"
                                   >
                                     <Typography variant="body2" sx={{ fontWeight: 600 }}>
                                       {event.summary}

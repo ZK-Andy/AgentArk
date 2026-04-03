@@ -207,7 +207,12 @@ fn derive_title(title: Option<String>, objective: &str) -> String {
     truncate_text(first_sentence, 96)
 }
 
-fn build_event(kind: &str, summary: &str, detail: Option<String>, actor: Option<&str>) -> BackgroundSessionEvent {
+fn build_event(
+    kind: &str,
+    summary: &str,
+    detail: Option<String>,
+    actor: Option<&str>,
+) -> BackgroundSessionEvent {
     BackgroundSessionEvent {
         id: Uuid::new_v4().to_string(),
         at: Utc::now(),
@@ -370,17 +375,17 @@ impl BackgroundSessionManager {
             .values()
             .filter(|session| {
                 !session.status.is_closed()
-                    && session
-                        .conversation_id
-                        .as_deref()
-                        .map(str::trim)
-                        == Some(conversation_id)
+                    && session.conversation_id.as_deref().map(str::trim) == Some(conversation_id)
             })
             .cloned()
             .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
     }
 
-    pub async fn create(&self, request: BackgroundSessionCreate, actor: Option<&str>) -> BackgroundSession {
+    pub async fn create(
+        &self,
+        request: BackgroundSessionCreate,
+        actor: Option<&str>,
+    ) -> BackgroundSession {
         let now = Utc::now();
         let objective = truncate_text(request.objective.trim(), 600);
         let mut session = BackgroundSession {
@@ -391,7 +396,10 @@ impl BackgroundSessionManager {
             summary: normalize_text_field(request.summary, MAX_TEXT_CHARS),
             current_focus: normalize_text_field(request.current_focus, MAX_TEXT_CHARS),
             waiting_on: normalize_text_field(request.waiting_on, MAX_TEXT_CHARS),
-            next_expected_action: normalize_text_field(request.next_expected_action, MAX_TEXT_CHARS),
+            next_expected_action: normalize_text_field(
+                request.next_expected_action,
+                MAX_TEXT_CHARS,
+            ),
             working_memory: normalize_text_field(request.working_memory, MAX_WORKING_MEMORY_CHARS),
             last_error: None,
             preferred_delivery_channel: normalize_text_field(
@@ -467,7 +475,13 @@ impl BackgroundSessionManager {
                 }
             };
 
-            maybe_update_text(&mut session.summary, request.summary, &mut changed_fields, "summary", MAX_TEXT_CHARS);
+            maybe_update_text(
+                &mut session.summary,
+                request.summary,
+                &mut changed_fields,
+                "summary",
+                MAX_TEXT_CHARS,
+            );
             maybe_update_text(
                 &mut session.current_focus,
                 request.current_focus,
@@ -583,7 +597,9 @@ impl BackgroundSessionManager {
 
             let normalized_conversation =
                 normalize_text_field(conversation_id.map(|value| value.to_string()), 120);
-            if normalized_conversation.is_some() && session.conversation_id != normalized_conversation {
+            if normalized_conversation.is_some()
+                && session.conversation_id != normalized_conversation
+            {
                 session.conversation_id = normalized_conversation;
                 changed = true;
             }
@@ -686,8 +702,7 @@ impl BackgroundSessionManager {
         let updated = {
             let mut sessions = self.sessions.write().await;
             let session = sessions.get_mut(id.trim())?;
-            let normalized =
-                normalize_text_field(channel.map(|value| value.to_string()), 120);
+            let normalized = normalize_text_field(channel.map(|value| value.to_string()), 120);
             if session.preferred_delivery_channel == normalized {
                 return Some(session.clone());
             }
@@ -787,7 +802,11 @@ impl BackgroundSessionManager {
             let mut changed = false;
 
             for task_id in normalize_id_list(task_ids) {
-                if !session.linked_task_ids.iter().any(|existing| existing == &task_id) {
+                if !session
+                    .linked_task_ids
+                    .iter()
+                    .any(|existing| existing == &task_id)
+                {
                     session.linked_task_ids.push(task_id);
                     changed = true;
                 }
@@ -851,7 +870,12 @@ impl BackgroundSessionManager {
             session.last_activity_at = now;
             push_event(
                 &mut session.events,
-                build_event("detached", "Linked work removed from the session.", None, actor),
+                build_event(
+                    "detached",
+                    "Linked work removed from the session.",
+                    None,
+                    actor,
+                ),
             );
             Some(session.clone())
         }?;

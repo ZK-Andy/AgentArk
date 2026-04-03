@@ -4,8 +4,6 @@
 //! sync polling. The module stores sync state and room context in the existing
 //! encrypted KV store so it can be wired into the broader channel system later
 //! without schema churn.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -168,12 +166,6 @@ fn state_key(config: &MatrixTransportConfig) -> String {
     format!("{}{}", MATRIX_STATE_KEY_PREFIX, account_key(config))
 }
 
-fn sanitize_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 async fn load_json<T>(storage: &Storage, key: &str) -> Result<T>
 where
     T: DeserializeOwned + Default,
@@ -315,12 +307,6 @@ fn prune_state(state: &mut MatrixSyncState) {
         .collect();
 }
 
-pub async fn save_config(agent: &Agent, config: &MatrixTransportConfig) -> Result<()> {
-    let raw = serde_json::to_vec(config)?;
-    agent.storage.set(CONFIG_STORAGE_KEY, &raw).await?;
-    Ok(())
-}
-
 pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<MatrixTransportConfig>> {
     if let Ok(Some(raw)) = storage.get(CONFIG_STORAGE_KEY).await {
         if let Ok(config) = serde_json::from_slice::<MatrixTransportConfig>(&raw) {
@@ -362,10 +348,6 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<Matrix
         limit,
         user_agent,
     }))
-}
-
-pub async fn has_configuration(storage: &Storage) -> Result<bool> {
-    Ok(load_config_from_storage(storage).await?.is_some())
 }
 
 async fn load_config(agent: &Agent) -> Result<Option<MatrixTransportConfig>> {
@@ -600,18 +582,6 @@ pub async fn sync_once(
     prune_state(&mut state);
     save_state(&storage, config, &state).await?;
     Ok(summary)
-}
-
-pub async fn sync_loop(
-    agent: &SharedAgent,
-    config: &MatrixTransportConfig,
-    interval: std::time::Duration,
-) -> Result<()> {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        let _ = sync_once(agent, config).await;
-    }
 }
 
 pub async fn serve(

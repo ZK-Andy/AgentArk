@@ -18,12 +18,20 @@ use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use crate::actions::{ActionDef, ActionSource};
+#[cfg(test)]
+use crate::actions::ActionCallerPrincipal;
+use crate::actions::{
+    ActionAuthorization, ActionAuthorizationContext, ActionAuthorizationDecision, ActionDef,
+    ActionExecutionSurface, ActionRiskLevel, ActionSource,
+};
+use crate::clients::{CodeExecuteFilePayload, ExecutorClient, ExecutorClientConfig};
 use crate::core::config::{AgentConfig, SecureConfigManager};
+use crate::core::runtime_image;
 
 /// Runtime configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +48,7 @@ impl Default for RuntimeConfig {
         Self {
             default_sandbox: SandboxMode::Wasm,
             wasm_memory_limit: 256 * 1024 * 1024, // 256MB
-            docker_image: "agentark-sandbox:latest".to_string(),
+            docker_image: runtime_image::default_runtime_image(),
             enable_rollback: true,
             snapshot_dir: PathBuf::from("snapshots"),
         }
@@ -50,7 +58,7 @@ impl Default for RuntimeConfig {
 /// The action runtime that manages execution
 pub struct ActionRuntime {
     config: RuntimeConfig,
-    _sandbox: ActionSandbox,
+    sandbox: ActionSandbox,
     /// Transactions wrapped in Mutex for concurrent access
     transactions: tokio::sync::Mutex<TransactionManager>,
     /// Actions wrapped in RwLock for concurrent access
@@ -58,6 +66,12 @@ pub struct ActionRuntime {
     /// Bundled actions explicitly disabled by user (persisted on disk)
     disabled_actions: tokio::sync::RwLock<HashSet<String>>,
     disabled_actions_file: PathBuf,
+    /// Persisted security/readiness state for all non-builtin actions.
+    action_reviews: tokio::sync::RwLock<HashMap<String, ActionReviewRecord>>,
+    action_reviews_file: PathBuf,
+    /// Bundled actions deleted by user for this install (persisted on disk)
+    removed_bundled_actions: tokio::sync::RwLock<HashSet<String>>,
+    removed_bundled_actions_file: PathBuf,
     actions_dir: PathBuf,
     cli_skills_dir: PathBuf,
     config_dir: PathBuf,
@@ -65,6 +79,8 @@ pub struct ActionRuntime {
     task_queue: Option<std::sync::Arc<tokio::sync::RwLock<crate::core::TaskQueue>>>,
     /// Action security guard for integrity, static analysis, permissions, injection detection
     action_guard: Option<std::sync::Arc<crate::security::ActionGuard>>,
+    /// Actions explicitly auto-approved by the user in Settings > Advanced.
+    auto_approved_actions: std::sync::RwLock<HashSet<String>>,
     /// Shared storage for expense + entity operations
     storage: Option<crate::storage::Storage>,
     /// MCP registry for external tools/resources
@@ -72,18 +88,54 @@ pub struct ActionRuntime {
     /// Plugin registry for third-party HTTP extensions
     plugin_registry:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::plugins::registry::PluginRegistry>>>,
+    #[cfg(feature = "docker")]
+    active_sandbox_containers: tokio::sync::RwLock<HashSet<String>>,
+    #[cfg(feature = "docker")]
+    container_reaper_status: tokio::sync::RwLock<ContainerReaperStatus>,
 }
 
 const LOCAL_APP_HTTP_PORT: u16 = 8990;
 const HTTP_GET_TIMEOUT_SECS: u64 = 10;
 const HTTP_GET_MAX_BODY_BYTES: usize = 1_000_000;
 const MAX_NATIVE_ENV_OVERRIDES: usize = 32;
+const ACTION_REVIEW_HISTORY_LIMIT: usize = 10;
+#[cfg(feature = "docker")]
+const AGENTARK_SANDBOX_LABEL_KEY: &str = "agentark.runtime";
+#[cfg(feature = "docker")]
+const AGENTARK_SANDBOX_LABEL_VALUE: &str = "sandbox";
+
+const BACKGROUND_BLOCKED_ACTIONS: &[&str] = &[
+    "app_delete",
+    "app_stop",
+    "app_restart",
+    "app_deploy",
+    "shell",
+    "code_execute",
+    "browser_auto",
+    "gmail_reply",
+    "calendar_create",
+    "schedule_task",
+    "watch",
+];
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContainerReaperStatus {
+    pub last_run_at: Option<String>,
+    pub last_removed_count: u64,
+    pub total_removed_count: u64,
+    pub last_error: Option<String>,
+}
+
+struct SandboxUploadFile {
+    filename: String,
+    bytes: Vec<u8>,
+}
 
 /// A loaded action ready for execution
 struct LoadedAction {
     info: ActionDef,
     wasm_module: Option<Vec<u8>>,
-    /// Workflow content from SKILL.md (legacy ACTION.md still supported)
+    /// Workflow content from SKILL.md
     workflow_content: Option<String>,
     /// Optional fixed local CLI binding backed by a verified host executable
     cli_binding: Option<CliToolBinding>,
@@ -95,22 +147,38 @@ struct LoadedAction {
     custom_api_binding: Option<CustomApiBinding>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpBinding {
     pub server_id: String,
+    pub server_name: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(default)]
+    pub auth_required: bool,
+    #[serde(default)]
+    pub auth_configured: bool,
     pub kind: McpBindingKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum McpBindingKind {
     Tool { name: String },
     Resource { uri: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginBinding {
     pub plugin_id: String,
     pub action_name: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(default)]
+    pub auth_required: bool,
+    #[serde(default)]
+    pub auth_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +186,10 @@ pub struct CliToolBinding {
     pub executable_path: String,
     #[serde(default)]
     pub verify_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(default)]
+    pub auth_env_exports: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +215,8 @@ pub struct CustomApiBinding {
     pub path: String,
     pub read_only: bool,
     pub secret_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
     pub auth_mode: crate::custom_apis::CustomApiAuthMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
@@ -160,8 +234,104 @@ pub struct CustomApiBinding {
     pub body_required: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionReviewStatus {
+    Ready,
+    NeedsSecrets,
+    Blocked,
+    Warning,
+    Unreviewed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionReviewSnapshot {
+    pub action_name: String,
+    pub source_kind: String,
+    pub reviewed_at: String,
+    pub fingerprint: String,
+    pub status: ActionReviewStatus,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub allow_load: bool,
+    #[serde(default)]
+    pub allow_execute: bool,
+    #[serde(default)]
+    pub visible_in_catalog: bool,
+    #[serde(default)]
+    pub integrity_ok: bool,
+    #[serde(default)]
+    pub threat_level: String,
+    #[serde(default)]
+    pub total_severity: u32,
+    #[serde(default)]
+    pub total_findings: usize,
+    #[serde(default)]
+    pub risk_score_10: f32,
+    #[serde(default)]
+    pub risk_band: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<crate::security::action_guard::AnalysisFinding>,
+    #[serde(default)]
+    pub required_env: Vec<String>,
+    #[serde(default)]
+    pub missing_env: Vec<String>,
+    #[serde(default)]
+    pub permissions_needed: Vec<String>,
+    #[serde(default)]
+    pub requires_auth: bool,
+    #[serde(default)]
+    pub auth_configured: bool,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+impl Default for ActionReviewSnapshot {
+    fn default() -> Self {
+        Self {
+            action_name: String::new(),
+            source_kind: "unknown".to_string(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+            fingerprint: String::new(),
+            status: ActionReviewStatus::Unreviewed,
+            ready: true,
+            allow_load: true,
+            allow_execute: true,
+            visible_in_catalog: true,
+            integrity_ok: true,
+            threat_level: "Clean".to_string(),
+            total_severity: 0,
+            total_findings: 0,
+            risk_score_10: 0.0,
+            risk_band: "secure".to_string(),
+            warnings: Vec::new(),
+            findings: Vec::new(),
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            permissions_needed: Vec::new(),
+            requires_auth: false,
+            auth_configured: true,
+            notes: Vec::new(),
+            blocked_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ActionReviewRecord {
+    current: ActionReviewSnapshot,
+    #[serde(default)]
+    history: Vec<ActionReviewSnapshot>,
+}
+
 pub const WORKFLOW_ACTION_MARKER: &str = "__WORKFLOW_ACTION__:";
 pub const WORKFLOW_MISSING_INPUTS_MARKER: &str = "__WORKFLOW_MISSING_INPUTS__:";
+pub const TOOL_COMPLETION_MARKER: &str = "__TOOL_COMPLETION__:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowMissingInputsPayload {
@@ -188,18 +358,277 @@ pub fn parse_workflow_missing_inputs_marker(output: &str) -> Option<WorkflowMiss
     serde_json::from_str::<WorkflowMissingInputsPayload>(payload).ok()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredToolCompletion {
+    pub tool: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+fn parse_structured_tool_completion(output: &str) -> Option<StructuredToolCompletion> {
+    let payload = output.strip_prefix(TOOL_COMPLETION_MARKER)?;
+    serde_json::from_str::<StructuredToolCompletion>(payload).ok()
+}
+
+fn parse_legacy_tool_completion(
+    output: &str,
+    tool: &str,
+    accepted_prefixes: &[&str],
+) -> Option<StructuredToolCompletion> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let detail = accepted_prefixes.iter().find_map(|prefix| {
+        if lower.starts_with(prefix) {
+            Some(
+                trimmed[prefix.len()..]
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim(),
+            )
+        } else {
+            None
+        }
+    })?;
+
+    Some(StructuredToolCompletion {
+        tool: tool.to_string(),
+        status: "completed".to_string(),
+        detail: if detail.is_empty() {
+            None
+        } else {
+            Some(detail.to_string())
+        },
+    })
+}
+
+pub fn parse_schedule_task_completion(output: &str) -> Option<StructuredToolCompletion> {
+    parse_structured_tool_completion(output)
+        .filter(|completion| completion.tool == "schedule_task")
+        .or_else(|| {
+            parse_legacy_tool_completion(
+                output,
+                "schedule_task",
+                &[
+                    "task scheduled:",
+                    "scheduled task:",
+                    "schedule created:",
+                    "schedule added:",
+                ],
+            )
+        })
+}
+
+pub fn parse_watch_completion(output: &str) -> Option<StructuredToolCompletion> {
+    parse_structured_tool_completion(output)
+        .filter(|completion| completion.tool == "watch")
+        .or_else(|| {
+            parse_legacy_tool_completion(
+                output,
+                "watch",
+                &["watch created:", "watch added:", "watcher created:"],
+            )
+        })
+}
+
 /// Isolation level for ephemeral Docker containers
 #[cfg(feature = "docker")]
 #[derive(Clone, Copy)]
 enum ContainerIsolation {
     /// Strict: read-only root, no network, noexec /tmp. For shell commands.
     Strict,
-    /// Standard: writable fs, network allowed (for pip/npm install), but still
-    /// memory/CPU/PID limited, ephemeral, and auto-removed. For code execution.
+    /// Standard: writable fs, no network egress by default. For code execution.
     Standard,
+    /// Opt-in network-enabled profile for explicit user-approved sandbox execution.
+    StandardWithNetwork,
+}
+
+#[cfg(feature = "docker")]
+impl ContainerIsolation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Standard => "standard",
+            Self::StandardWithNetwork => "standard_with_network",
+        }
+    }
+
+    fn network_access(self) -> bool {
+        matches!(self, Self::StandardWithNetwork)
+    }
+}
+
+struct ActionReviewBuildInput<'a> {
+    action_name: &'a str,
+    source_kind: &'a str,
+    fingerprint: String,
+    verdict: &'a crate::security::action_guard::ActionSecurityVerdict,
+    required_env: Vec<String>,
+    missing_env: Vec<String>,
+    requires_auth: bool,
+    auth_configured: bool,
+    notes: Vec<String>,
 }
 
 impl ActionRuntime {
+    fn sanitize_upload_filename(raw: &str) -> String {
+        let filename: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if filename.is_empty() {
+            "file".to_string()
+        } else {
+            filename
+        }
+    }
+
+    fn inline_code_execute_payloads(
+        arguments: &serde_json::Value,
+    ) -> Result<Vec<SandboxUploadFile>> {
+        let Some(payloads) = arguments
+            .get("file_payloads")
+            .and_then(|value| value.as_array())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut files = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let filename = payload
+                .get("filename")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Each file_payload must include a filename"))?;
+            let bytes_b64 = payload
+                .get("bytes_b64")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Each file_payload must include bytes_b64"))?;
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, bytes_b64)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Invalid base64 file payload for '{}': {}", filename, e)
+                    })?;
+            files.push(SandboxUploadFile {
+                filename: Self::sanitize_upload_filename(filename),
+                bytes,
+            });
+        }
+        Ok(files)
+    }
+
+    async fn collect_code_execute_files(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<Vec<SandboxUploadFile>> {
+        let inline = Self::inline_code_execute_payloads(arguments)?;
+        if !inline.is_empty() {
+            return Ok(inline);
+        }
+        let mut files = Vec::new();
+        if let Some(files_arr) = arguments.get("files").and_then(|v| v.as_array()) {
+            for file_val in files_arr {
+                let upload_id = file_val.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("Each code_execute file reference must be a string upload ID")
+                })?;
+                files.push(self.resolve_upload_for_sandbox(upload_id).await?);
+            }
+        }
+        Ok(files)
+    }
+
+    fn control_plane_executor_client() -> Option<ExecutorClient> {
+        let role = std::env::var("AGENTARK_STACK_ROLE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+        if !matches!(role.as_deref(), Some("control-plane" | "control")) {
+            return None;
+        }
+        let client = ExecutorClient::new(ExecutorClientConfig::from_env()).ok()?;
+        client.bearer_token()?;
+        Some(client)
+    }
+
+    async fn execute_code_remote(&self, arguments: &serde_json::Value) -> Result<String> {
+        let language = arguments["language"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'language' argument"))?
+            .to_string();
+        let code = arguments["code"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?
+            .to_string();
+        let env = arguments
+            .get("env")
+            .and_then(|value| value.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect::<BTreeMap<String, String>>()
+            })
+            .unwrap_or_default();
+        let network_access = arguments
+            .get("network_access")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let file_payloads = self
+            .collect_code_execute_files(arguments)
+            .await?
+            .into_iter()
+            .map(|file| CodeExecuteFilePayload {
+                filename: file.filename,
+                bytes_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    file.bytes,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let executor = Self::control_plane_executor_client()
+            .ok_or_else(|| anyhow::anyhow!("Executor service is not configured"))?;
+        let response = executor
+            .execute_code(&crate::clients::CodeExecuteRequest {
+                language,
+                code,
+                files: Vec::new(),
+                file_payloads,
+                env,
+                network_access,
+            })
+            .await?;
+        if response.status.eq_ignore_ascii_case("ok") {
+            if response.raw.is_object() {
+                return Ok(serde_json::to_string(&response.raw)?);
+            }
+            return Ok(serde_json::to_string(&serde_json::json!({
+                "output": response.output_text.unwrap_or_default(),
+                "error": serde_json::Value::Null,
+                "exit_code": 0,
+                "files": response.output_files,
+            }))?);
+        }
+        if response.raw.is_object() {
+            let error = response
+                .raw
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or(response.message.as_str());
+            anyhow::bail!("{}", error);
+        }
+        anyhow::bail!("{}", response.message);
+    }
+
     fn remap_workspace_alias_path(&self, raw: &str) -> Option<PathBuf> {
         let trimmed = raw.trim();
         const PREFIXES: &[&str] = &["/workspace", "/repo", "/project"];
@@ -209,13 +638,13 @@ impl ActionRuntime {
                     .strip_prefix(**prefix)
                     .is_some_and(|rest| rest.starts_with('/'))
         })?;
-        let cwd = std::env::current_dir().ok()?;
+        let workspace_root = self.workspace_root();
         let suffix = trimmed.strip_prefix(matched).unwrap_or("");
         let relative = suffix.trim_start_matches('/');
         if relative.is_empty() {
-            Some(cwd)
+            Some(workspace_root)
         } else {
-            Some(cwd.join(relative))
+            Some(workspace_root.join(relative))
         }
     }
 
@@ -224,6 +653,7 @@ impl ActionRuntime {
             self.data_dir().to_path_buf(),
             self.actions_dir.clone(),
             self.config_dir.clone(),
+            self.workspace_root(),
         ];
         if let Ok(cwd) = std::env::current_dir() {
             roots.push(cwd);
@@ -339,7 +769,7 @@ impl ActionRuntime {
     }
 
     fn host_is_explicitly_local(host: &str) -> bool {
-        let normalized = host.trim().to_ascii_lowercase();
+        let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized == "localhost" {
             return true;
         }
@@ -437,6 +867,101 @@ impl ActionRuntime {
         Ok(parsed)
     }
 
+    async fn validate_connector_request_url(&self, raw_url: &str) -> Result<reqwest::Url> {
+        let parsed = reqwest::Url::parse(raw_url)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("connector_request only supports http:// and https:// URLs");
+        }
+        if parsed.host_str().is_none() {
+            anyhow::bail!("connector_request requires a URL host");
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("Embedded credentials are not allowed in connector_request URLs");
+        }
+
+        let host = parsed
+            .host_str()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if Self::host_is_explicitly_local(&host) {
+            anyhow::bail!("connector_request cannot target localhost or loopback addresses");
+        }
+        if host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host.ends_with(".home")
+            || host.ends_with(".lan")
+        {
+            anyhow::bail!("connector_request cannot target local network hostnames");
+        }
+
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if !Self::ip_is_public(ip) {
+                anyhow::bail!("connector_request cannot target private or link-local IP addresses");
+            }
+            return Ok(parsed);
+        }
+
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let mut resolved_any = false;
+        for addr in tokio::net::lookup_host((host.as_str(), port)).await? {
+            resolved_any = true;
+            if !Self::ip_is_public(addr.ip()) {
+                anyhow::bail!(
+                    "connector_request cannot target internal address {} resolved from {}",
+                    addr.ip(),
+                    host
+                );
+            }
+        }
+        if !resolved_any {
+            anyhow::bail!("Unable to resolve host '{}'", host);
+        }
+
+        Ok(parsed)
+    }
+
+    async fn resolve_upload_for_sandbox(&self, upload_id: &str) -> Result<SandboxUploadFile> {
+        let normalized_id = uuid::Uuid::parse_str(upload_id.trim())
+            .map_err(|_| anyhow::anyhow!("Invalid upload ID '{}'", upload_id))?
+            .to_string();
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Upload-backed code execution requires storage"))?;
+        let manifest = storage
+            .load_upload_manifest(&normalized_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Upload '{}' was not found", normalized_id))?;
+        let uploads_dir = self.data_dir().join("uploads");
+        let uploads_root = tokio::fs::canonicalize(&uploads_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Upload directory '{}' is not available",
+                    uploads_dir.display()
+                )
+            })?;
+        let resolved = tokio::fs::canonicalize(uploads_root.join(&manifest.stored_name))
+            .await
+            .with_context(|| {
+                format!("Upload payload for '{}' is missing on disk", normalized_id)
+            })?;
+        if !resolved.starts_with(&uploads_root) {
+            anyhow::bail!(
+                "Upload '{}' resolved outside the managed upload directory",
+                normalized_id
+            );
+        }
+        let bytes = tokio::fs::read(&resolved)
+            .await
+            .with_context(|| format!("Failed to read upload payload '{}'", normalized_id))?;
+        let filename: String = manifest.original_name.chars().collect::<String>();
+        let filename = Self::sanitize_upload_filename(&filename);
+        Ok(SandboxUploadFile { filename, bytes })
+    }
+
     fn collect_native_env_overrides(
         arguments: &serde_json::Value,
     ) -> Result<Vec<(String, String)>> {
@@ -523,9 +1048,1252 @@ impl ActionRuntime {
         Ok(())
     }
 
+    fn load_action_reviews(path: &Path) -> HashMap<String, ActionReviewRecord> {
+        let raw = match std::fs::read(path) {
+            Ok(v) => v,
+            Err(_) => return HashMap::new(),
+        };
+        serde_json::from_slice::<HashMap<String, ActionReviewRecord>>(&raw).unwrap_or_default()
+    }
+
+    async fn save_action_reviews(&self) -> Result<()> {
+        let reviews = self.action_reviews.read().await.clone();
+        let raw = serde_json::to_vec_pretty(&reviews)?;
+        tokio::fs::write(&self.action_reviews_file, raw).await?;
+        Ok(())
+    }
+
+    async fn upsert_action_review(&self, review: ActionReviewSnapshot) -> Result<()> {
+        let mut reviews = self.action_reviews.write().await;
+        let entry = reviews
+            .entry(review.action_name.clone())
+            .or_insert_with(ActionReviewRecord::default);
+        if !entry.current.action_name.is_empty()
+            && (entry.current.fingerprint != review.fingerprint
+                || entry.current.status != review.status
+                || entry.current.blocked_reason != review.blocked_reason
+                || entry.current.missing_env != review.missing_env
+                || entry.current.auth_configured != review.auth_configured
+                || entry.current.allow_execute != review.allow_execute)
+        {
+            entry.history.push(entry.current.clone());
+            if entry.history.len() > ACTION_REVIEW_HISTORY_LIMIT {
+                let drop_count = entry.history.len() - ACTION_REVIEW_HISTORY_LIMIT;
+                entry.history.drain(0..drop_count);
+            }
+        }
+        entry.current = review;
+        drop(reviews);
+        self.save_action_reviews().await
+    }
+
+    async fn remove_action_review(&self, name: &str) -> Result<()> {
+        let mut reviews = self.action_reviews.write().await;
+        reviews.remove(name);
+        drop(reviews);
+        self.save_action_reviews().await
+    }
+
+    async fn clear_action_secret_bindings(&self, action_name: &str) -> Result<()> {
+        let manager =
+            SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))?;
+        let prefix = format!("action_envmap:{}:", action_name);
+        manager.update_custom_secrets(|custom| {
+            custom.retain(|key, _| !key.starts_with(&prefix));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    async fn remove_action_reviews<F>(&self, mut predicate: F) -> Result<usize>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut reviews = self.action_reviews.write().await;
+        let before = reviews.len();
+        reviews.retain(|name, _| !predicate(name));
+        let removed = before.saturating_sub(reviews.len());
+        drop(reviews);
+        if removed > 0 {
+            self.save_action_reviews().await?;
+        }
+        Ok(removed)
+    }
+
+    pub async fn get_action_review(&self, name: &str) -> Option<ActionReviewSnapshot> {
+        self.action_reviews
+            .read()
+            .await
+            .get(name)
+            .map(|record| record.current.clone())
+    }
+
+    fn load_removed_bundled_actions(path: &Path) -> HashSet<String> {
+        let raw = match std::fs::read(path) {
+            Ok(v) => v,
+            Err(_) => return HashSet::new(),
+        };
+        serde_json::from_slice::<Vec<String>>(&raw)
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn save_removed_bundled_actions(&self) -> Result<()> {
+        let mut list: Vec<String> = self
+            .removed_bundled_actions
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        list.sort();
+        let raw = serde_json::to_vec_pretty(&list)?;
+        tokio::fs::write(&self.removed_bundled_actions_file, raw).await?;
+        Ok(())
+    }
+
     /// Get the data directory (parent of actions_dir)
     fn data_dir(&self) -> &Path {
         self.actions_dir.parent().unwrap_or(&self.actions_dir)
+    }
+
+    fn workspace_root(&self) -> PathBuf {
+        let configured = std::env::var("AGENTARK_WORKSPACE_ROOT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let fallback = std::env::current_dir()
+            .ok()
+            .unwrap_or_else(|| self.data_dir().to_path_buf());
+        match configured {
+            Some(path) if path.is_absolute() => path,
+            Some(path) => fallback.join(path),
+            None => fallback,
+        }
+    }
+
+    fn action_source_label(source: &ActionSource) -> &'static str {
+        match source {
+            ActionSource::System => "system",
+            ActionSource::Bundled => "bundled",
+            ActionSource::Custom => "custom",
+        }
+    }
+
+    fn is_contextual_review_finding(
+        finding: &crate::security::action_guard::AnalysisFinding,
+    ) -> bool {
+        let lower = finding.matched_text.to_ascii_lowercase();
+        let placeholders = [
+            "your-api-key",
+            "your_api_key",
+            "example",
+            "dummy",
+            "changeme",
+            "replace_me",
+            "test-key",
+            "sample-key",
+        ];
+        let placeholder_like = lower.contains('$')
+            || lower.contains("${")
+            || placeholders.iter().any(|token| lower.contains(token));
+        match finding.category {
+            crate::security::action_guard::FindingCategory::NetworkAccess
+            | crate::security::action_guard::FindingCategory::EnvironmentAccess => true,
+            crate::security::action_guard::FindingCategory::CredentialPattern => placeholder_like,
+            _ => false,
+        }
+    }
+
+    fn compute_review_risk_summary(
+        static_analysis: &crate::security::action_guard::StaticAnalysisResult,
+        blocked: bool,
+    ) -> (f32, String, usize, usize) {
+        let total_findings = static_analysis.findings.len();
+        let contextual_findings = static_analysis
+            .findings
+            .iter()
+            .filter(|f| Self::is_contextual_review_finding(f))
+            .count();
+        let mut score = ((static_analysis.total_severity as f32) / 4.0).min(10.0);
+        let contextual_ratio = if total_findings > 0 {
+            (contextual_findings as f32) / (total_findings as f32)
+        } else {
+            0.0
+        };
+        if contextual_ratio >= 0.75 {
+            score *= 0.65;
+        } else if contextual_ratio >= 0.5 {
+            score *= 0.8;
+        }
+        match static_analysis.threat_level {
+            crate::security::action_guard::ThreatLevel::Malicious => {
+                if contextual_ratio >= 0.8 {
+                    score = score.max(4.0);
+                } else {
+                    score = score.max(8.5);
+                }
+            }
+            crate::security::action_guard::ThreatLevel::Suspicious => {
+                score = score.max(5.0);
+            }
+            crate::security::action_guard::ThreatLevel::Clean => {}
+        }
+        if blocked && contextual_ratio < 0.8 {
+            score = score.max(8.5);
+        } else if blocked {
+            score = score.max(5.0);
+        }
+        let score_10 = ((score.clamp(0.0, 10.0)) * 10.0).round() / 10.0;
+        let band = if score_10 < 5.0 {
+            "secure"
+        } else if score_10 < 8.0 {
+            "review"
+        } else {
+            "risky"
+        };
+        (
+            score_10,
+            band.to_string(),
+            total_findings,
+            contextual_findings,
+        )
+    }
+
+    fn fingerprint_text(parts: &[impl AsRef<str>]) -> String {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part.as_ref().as_bytes());
+            hasher.update(b"\n---\n");
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    fn is_env_var_style_key(key: &str) -> bool {
+        !key.is_empty()
+            && key.len() <= 128
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    fn builtin_env_from_agent_config(cfg: &AgentConfig, env: &str) -> bool {
+        let mut providers: Vec<&crate::core::LlmProvider> = vec![&cfg.llm];
+        if let Some(fallback) = cfg.llm_fallback.as_ref() {
+            providers.push(fallback);
+        }
+        for slot in &cfg.model_pool.slots {
+            if slot.enabled {
+                providers.push(&slot.provider);
+            }
+        }
+        match env {
+            "OPENAI_API_KEY" => providers.into_iter().any(|provider| {
+                matches!(
+                    provider,
+                    crate::core::LlmProvider::OpenAI { api_key, .. } if !api_key.is_empty()
+                )
+            }),
+            "OPENROUTER_API_KEY" => providers.into_iter().any(|provider| {
+                matches!(
+                    provider,
+                    crate::core::LlmProvider::OpenAI {
+                        api_key,
+                        base_url,
+                        ..
+                    } if !api_key.is_empty()
+                        && base_url
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("openrouter")
+                )
+            }),
+            "ANTHROPIC_API_KEY" => providers.into_iter().any(|provider| {
+                matches!(
+                    provider,
+                    crate::core::LlmProvider::Anthropic { api_key, .. } if !api_key.is_empty()
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    fn extract_required_envs_from_frontmatter(frontmatter: &str) -> Vec<String> {
+        let mut envs: Vec<String> = Vec::new();
+        let unique_push = |out: &mut Vec<String>, value: String| {
+            if !out.iter().any(|existing| existing == &value) {
+                out.push(value);
+            }
+        };
+
+        let re_env_arr = regex::Regex::new(r#"(?s)"env"\s*:\s*\[([^\]]*)\]"#).ok();
+        let re_quoted = regex::Regex::new(r#""([A-Z0-9_]{2,})""#).ok();
+        if let (Some(re_env_arr), Some(re_quoted)) = (re_env_arr, re_quoted) {
+            for cap in re_env_arr.captures_iter(frontmatter) {
+                if let Some(inner) = cap.get(1).map(|m| m.as_str()) {
+                    for c in re_quoted.captures_iter(inner) {
+                        if let Some(name) = c.get(1).map(|m| m.as_str()) {
+                            unique_push(&mut envs, name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let re_primary = regex::Regex::new(r#""primaryEnv"\s*:\s*"([A-Z0-9_]{2,})""#).ok();
+        if let Some(re_primary) = re_primary {
+            for cap in re_primary.captures_iter(frontmatter) {
+                if let Some(name) = cap.get(1).map(|m| m.as_str()) {
+                    unique_push(&mut envs, name.to_string());
+                }
+            }
+        }
+
+        let mut in_list = false;
+        for raw in frontmatter.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            if trimmed.starts_with("secrets:")
+                || trimmed.starts_with("env:")
+                || trimmed.starts_with("required_env:")
+            {
+                in_list = true;
+                if let Some(start) = trimmed.find('[') {
+                    if let Some(end) = trimmed.rfind(']') {
+                        if end > start {
+                            let inner = &trimmed[start + 1..end];
+                            for part in inner.split(',') {
+                                let name = part.trim().trim_matches('"').trim_matches('\'');
+                                if Self::is_env_var_style_key(name) {
+                                    unique_push(&mut envs, name.to_string());
+                                }
+                            }
+                        }
+                    }
+                } else if let Some((_k, rhs)) = trimmed.split_once(':') {
+                    let name = rhs.trim().trim_matches('"').trim_matches('\'');
+                    if Self::is_env_var_style_key(name) {
+                        unique_push(&mut envs, name.to_string());
+                    }
+                }
+                continue;
+            }
+            if !raw.starts_with(' ') && !raw.starts_with('\t') && trimmed.contains(':') {
+                in_list = false;
+            }
+            if in_list {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    let name = item.trim().trim_matches('"').trim_matches('\'');
+                    if Self::is_env_var_style_key(name) {
+                        unique_push(&mut envs, name.to_string());
+                    }
+                }
+            }
+        }
+
+        envs
+    }
+
+    fn parse_frontmatter_yaml(frontmatter: &str) -> Option<serde_yaml::Value> {
+        let trimmed = frontmatter.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_yaml::from_str::<serde_yaml::Value>(trimmed).ok()
+    }
+
+    fn extract_auth_profile_id_from_frontmatter(frontmatter: &str) -> Option<String> {
+        let yaml = Self::parse_frontmatter_yaml(frontmatter)?;
+        let root = yaml.as_mapping()?;
+        let direct_keys = ["auth_profile", "auth_profile_id"];
+        for key in direct_keys {
+            if let Some(value) = root
+                .get(serde_yaml::Value::String(key.to_string()))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+        let auth = root.get(serde_yaml::Value::String("auth".to_string()))?;
+        let auth_map = auth.as_mapping()?;
+        for key in ["profile", "profile_id", "id"] {
+            if let Some(value) = auth_map
+                .get(serde_yaml::Value::String(key.to_string()))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+        None
+    }
+
+    fn extract_auth_env_exports_from_frontmatter(frontmatter: &str) -> BTreeMap<String, String> {
+        let mut exports = BTreeMap::new();
+        let Some(yaml) = Self::parse_frontmatter_yaml(frontmatter) else {
+            return exports;
+        };
+        let Some(root) = yaml.as_mapping() else {
+            return exports;
+        };
+        let Some(auth) = root.get(serde_yaml::Value::String("auth".to_string())) else {
+            return exports;
+        };
+        let Some(auth_map) = auth.as_mapping() else {
+            return exports;
+        };
+        let mapping = auth_map
+            .get(serde_yaml::Value::String("env_exports".to_string()))
+            .or_else(|| auth_map.get(serde_yaml::Value::String("exports".to_string())));
+        let Some(mapping) = mapping.and_then(|value| value.as_mapping()) else {
+            return exports;
+        };
+        for (key, value) in mapping {
+            let Some(env_name) = key.as_str().map(str::trim).filter(|item| !item.is_empty()) else {
+                continue;
+            };
+            let Some(source) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            else {
+                continue;
+            };
+            exports.insert(env_name.to_string(), source.to_string());
+        }
+        exports
+    }
+
+    fn env_is_configured_for_action(
+        cfg: &AgentConfig,
+        custom: &std::collections::HashMap<String, String>,
+        action_name: &str,
+        env: &str,
+    ) -> bool {
+        let binding_key = format!("action_envmap:{}:{}", action_name, env);
+        let target = custom.get(&binding_key).map(|s| s.as_str()).unwrap_or(env);
+        if target == "builtin" {
+            return Self::builtin_env_from_agent_config(cfg, env);
+        }
+        crate::core::secrets::has_user_secret(custom, target)
+            || Self::builtin_env_from_agent_config(cfg, env)
+    }
+
+    fn plugin_secret_key(plugin_id: &str) -> String {
+        format!("plugin_sdk_secret:{}", plugin_id.trim())
+    }
+
+    fn build_blocked_review(
+        action_name: &str,
+        source_kind: &str,
+        fingerprint: String,
+        reason: impl Into<String>,
+    ) -> ActionReviewSnapshot {
+        ActionReviewSnapshot {
+            action_name: action_name.to_string(),
+            source_kind: source_kind.to_string(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+            fingerprint,
+            status: ActionReviewStatus::Blocked,
+            ready: false,
+            allow_load: false,
+            allow_execute: false,
+            visible_in_catalog: false,
+            integrity_ok: false,
+            threat_level: "Unknown".to_string(),
+            risk_band: "risky".to_string(),
+            warnings: Vec::new(),
+            findings: Vec::new(),
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            permissions_needed: Vec::new(),
+            requires_auth: false,
+            auth_configured: false,
+            notes: Vec::new(),
+            blocked_reason: Some(reason.into()),
+            ..ActionReviewSnapshot::default()
+        }
+    }
+
+    fn build_review_from_verdict(input: ActionReviewBuildInput<'_>) -> ActionReviewSnapshot {
+        let ActionReviewBuildInput {
+            action_name,
+            source_kind,
+            fingerprint,
+            verdict,
+            required_env,
+            missing_env,
+            requires_auth,
+            auth_configured,
+            notes,
+        } = input;
+        let blocked = !verdict.allow_load;
+        let (risk_score_10, risk_band, total_findings, _contextual_findings) =
+            Self::compute_review_risk_summary(&verdict.static_analysis, blocked);
+        let mut warnings = verdict.warnings.clone();
+        warnings.extend(notes.iter().cloned());
+        let permissions_needed = verdict
+            .permissions_needed
+            .iter()
+            .map(|perm| perm.to_string())
+            .collect::<Vec<_>>();
+        let blocked_reason = if blocked {
+            verdict
+                .warnings
+                .first()
+                .cloned()
+                .or_else(|| Some("Blocked by security review".to_string()))
+        } else if !auth_configured && requires_auth {
+            Some("Required authentication is not configured.".to_string())
+        } else if !missing_env.is_empty() {
+            Some(format!(
+                "Required secrets missing: {}",
+                missing_env.join(", ")
+            ))
+        } else {
+            None
+        };
+        let status = if blocked {
+            ActionReviewStatus::Blocked
+        } else if !auth_configured && requires_auth || !missing_env.is_empty() {
+            ActionReviewStatus::NeedsSecrets
+        } else if !warnings.is_empty() || !permissions_needed.is_empty() || risk_band == "review" {
+            ActionReviewStatus::Warning
+        } else {
+            ActionReviewStatus::Ready
+        };
+        let allow_execute = matches!(
+            status,
+            ActionReviewStatus::Ready | ActionReviewStatus::Warning
+        );
+        ActionReviewSnapshot {
+            action_name: action_name.to_string(),
+            source_kind: source_kind.to_string(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+            fingerprint,
+            status,
+            ready: allow_execute,
+            allow_load: verdict.allow_load,
+            allow_execute,
+            visible_in_catalog: allow_execute,
+            integrity_ok: verdict.integrity_ok,
+            threat_level: format!("{:?}", verdict.static_analysis.threat_level),
+            total_severity: verdict.static_analysis.total_severity,
+            total_findings,
+            risk_score_10,
+            risk_band,
+            warnings,
+            findings: verdict.static_analysis.findings.clone(),
+            required_env,
+            missing_env,
+            permissions_needed,
+            requires_auth,
+            auth_configured,
+            notes,
+            blocked_reason,
+        }
+    }
+
+    fn prune_cli_auth_exported_envs(review: &mut ActionReviewSnapshot, binding: &CliToolBinding) {
+        if binding.auth_env_exports.is_empty() {
+            return;
+        }
+        review
+            .missing_env
+            .retain(|env| !binding.auth_env_exports.contains_key(env));
+    }
+
+    fn reconcile_dynamic_review_state(review: &mut ActionReviewSnapshot) {
+        if matches!(review.status, ActionReviewStatus::Blocked) {
+            review.ready = false;
+            review.allow_execute = false;
+            review.visible_in_catalog = false;
+            return;
+        }
+
+        if !review.missing_env.is_empty() || (review.requires_auth && !review.auth_configured) {
+            review.status = ActionReviewStatus::NeedsSecrets;
+            review.ready = false;
+            review.allow_execute = false;
+            review.visible_in_catalog = false;
+            if review.blocked_reason.is_none() {
+                review.blocked_reason = if !review.missing_env.is_empty() {
+                    Some(format!(
+                        "Required secrets missing: {}",
+                        review.missing_env.join(", ")
+                    ))
+                } else {
+                    Some("Required authentication is not configured.".to_string())
+                };
+            }
+        } else {
+            review.ready = review.allow_load;
+            review.allow_execute = review.allow_load;
+            review.visible_in_catalog = review.allow_load;
+            review.blocked_reason = None;
+            if matches!(
+                review.status,
+                ActionReviewStatus::NeedsSecrets | ActionReviewStatus::Unreviewed
+            ) {
+                review.status = if review.warnings.is_empty() {
+                    ActionReviewStatus::Ready
+                } else {
+                    ActionReviewStatus::Warning
+                };
+            }
+        }
+    }
+
+    async fn compute_missing_required_envs(
+        &self,
+        action_name: &str,
+        required_env: &[String],
+    ) -> Result<Vec<String>> {
+        if required_env.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manager =
+            SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))?;
+        let config = manager.load()?;
+        let secrets = manager.load_secrets()?;
+        let custom = &secrets.custom;
+        let mut missing = Vec::new();
+        for env in required_env {
+            if !Self::env_is_configured_for_action(&config, custom, action_name, env) {
+                missing.push(env.clone());
+            }
+        }
+        Ok(missing)
+    }
+
+    async fn auth_profile_status(&self, auth_profile_id: &str) -> Result<(bool, Vec<String>)> {
+        let storage = self
+            .storage()
+            .ok_or_else(|| anyhow::anyhow!("Storage is unavailable for auth profile lookups"))?;
+        let view =
+            crate::core::auth_profiles::AuthProfileControlPlane::get(&storage, auth_profile_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Auth profile '{}' was not found", auth_profile_id)
+                })?;
+        let mut notes = Vec::new();
+        if let Some(reason) = view.blocked_reason {
+            notes.push(reason);
+        }
+        Ok((view.ready, notes))
+    }
+
+    async fn resolve_auth_profile_http(
+        &self,
+        auth_profile_id: &str,
+    ) -> Result<crate::core::auth_profiles::AuthProfileResolution> {
+        let storage = self
+            .storage()
+            .ok_or_else(|| anyhow::anyhow!("Storage is unavailable for auth profile lookups"))?;
+        crate::core::auth_profiles::AuthProfileControlPlane::resolve_http(&storage, auth_profile_id)
+            .await
+    }
+
+    fn capabilities_frontmatter(capabilities: &[String]) -> String {
+        if capabilities.is_empty() {
+            String::new()
+        } else {
+            format!("permissions: [{}]", capabilities.join(", "))
+        }
+    }
+
+    async fn review_markdown_action(
+        &self,
+        action_dir: &Path,
+        info: &ActionDef,
+        workflow_content: &str,
+        frontmatter: &str,
+    ) -> Result<ActionReviewSnapshot> {
+        let Some(guard) = self.action_guard.as_ref() else {
+            let fingerprint = crate::security::ActionGuard::compute_bundle_hash(action_dir)
+                .unwrap_or_else(|_| Self::fingerprint_text(&[workflow_content]));
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                Self::action_source_label(&info.source),
+                fingerprint,
+                "Action security is unavailable, so user-added skills are not loadable.",
+            ));
+        };
+        let verdict = guard
+            .evaluate_action(action_dir, &info.name, workflow_content, frontmatter)
+            .await?;
+        let required_env = Self::extract_required_envs_from_frontmatter(frontmatter);
+        let missing_env = self
+            .compute_missing_required_envs(&info.name, &required_env)
+            .await?;
+        let auth_profile_id = Self::extract_auth_profile_id_from_frontmatter(frontmatter);
+        let (requires_auth, auth_configured, mut notes) =
+            if let Some(auth_profile_id) = auth_profile_id.as_deref() {
+                let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+                (true, ready, notes)
+            } else {
+                (false, true, Vec::new())
+            };
+        if let Some(auth_profile_id) = auth_profile_id.as_deref() {
+            notes.push(format!("Uses auth profile '{}'.", auth_profile_id));
+        }
+        let fingerprint = crate::security::ActionGuard::compute_bundle_hash(action_dir)
+            .unwrap_or_else(|_| Self::fingerprint_text(&[workflow_content, frontmatter]));
+        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: Self::action_source_label(&info.source),
+            fingerprint,
+            verdict: &verdict,
+            required_env,
+            missing_env,
+            requires_auth,
+            auth_configured,
+            notes,
+        }))
+    }
+
+    async fn review_cli_action(
+        &self,
+        action_dir: &Path,
+        info: &ActionDef,
+        skill_markdown: &str,
+        frontmatter: &str,
+        binding: &CliToolBinding,
+    ) -> Result<ActionReviewSnapshot> {
+        let mut review = self
+            .review_markdown_action(action_dir, info, skill_markdown, frontmatter)
+            .await?;
+        if binding.auth_profile_id.is_some() {
+            Self::prune_cli_auth_exported_envs(&mut review, binding);
+            if binding.auth_env_exports.is_empty() {
+                review.auth_configured = false;
+                review.blocked_reason = Some(
+                    "CLI auth profiles require `auth.env_exports` so credentials can be injected into the subprocess.".to_string(),
+                );
+                let note = "CLI auth profiles require `auth.env_exports` so credentials can be injected into the subprocess.".to_string();
+                if !review.notes.iter().any(|existing| existing == &note) {
+                    review.notes.push(note);
+                }
+            } else {
+                let mut exported_envs =
+                    binding.auth_env_exports.keys().cloned().collect::<Vec<_>>();
+                exported_envs.sort();
+                let note = format!("CLI auth exports: {}.", exported_envs.join(", "));
+                if !review.notes.iter().any(|existing| existing == &note) {
+                    review.notes.push(note);
+                }
+            }
+            Self::reconcile_dynamic_review_state(&mut review);
+        }
+        let executable_ok = std::path::Path::new(&binding.executable_path).is_file();
+        if executable_ok {
+            return Ok(review);
+        }
+        review.status = ActionReviewStatus::NeedsSecrets;
+        review.ready = false;
+        review.allow_execute = false;
+        review.visible_in_catalog = false;
+        review.blocked_reason = Some(format!(
+            "CLI executable '{}' is not present on this machine.",
+            binding.executable_path
+        ));
+        let note =
+            "CLI skills are machine-specific and must be revalidated after reload.".to_string();
+        if !review.notes.iter().any(|existing| existing == &note) {
+            review.notes.push(note);
+        }
+        Ok(review)
+    }
+
+    fn url_review_notes(url_str: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Ok(url) = reqwest::Url::parse(url_str) {
+            if url.scheme() != "https" {
+                notes.push(format!("Remote endpoint '{}' does not use HTTPS.", url_str));
+            }
+            if let Some(host) = url.host_str() {
+                let is_private = if host.eq_ignore_ascii_case("localhost") {
+                    true
+                } else if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    match ip {
+                        std::net::IpAddr::V4(v4) => {
+                            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+                        }
+                        std::net::IpAddr::V6(v6) => {
+                            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+                        }
+                    }
+                } else {
+                    false
+                };
+                if is_private {
+                    notes.push(format!(
+                        "Remote endpoint '{}' resolves to a private or loopback host.",
+                        url_str
+                    ));
+                }
+            }
+        }
+        notes
+    }
+
+    async fn review_plugin_action(
+        &self,
+        info: &ActionDef,
+        binding: &PluginBinding,
+    ) -> Result<ActionReviewSnapshot> {
+        let fingerprint = Self::fingerprint_text(&[
+            info.name.as_str(),
+            info.description.as_str(),
+            &binding.base_url,
+            &serde_json::to_string(&info.input_schema).unwrap_or_default(),
+            &info.capabilities.join(","),
+        ]);
+        let Some(guard) = self.action_guard.as_ref() else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "plugin",
+                fingerprint,
+                "Action security is unavailable, so plugin actions are not loadable.",
+            ));
+        };
+        let mut notes = Self::url_review_notes(&binding.base_url);
+        let auth_configured = if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            notes.push(format!("Uses auth profile '{}'.", auth_profile_id));
+            let (ready, auth_notes) = self.auth_profile_status(auth_profile_id).await?;
+            notes.extend(auth_notes);
+            ready
+        } else {
+            binding.auth_configured
+        };
+        let frontmatter = Self::capabilities_frontmatter(&info.capabilities);
+        let content = format!(
+            "name: {}\nsource: plugin\naction: {}\nbase_url: {}\ndescription: {}\ncapabilities: {}\ninput_schema: {}",
+            info.name,
+            binding.action_name,
+            binding.base_url,
+            info.description,
+            info.capabilities.join(", "),
+            serde_json::to_string_pretty(&info.input_schema).unwrap_or_default()
+        );
+        let verdict = guard
+            .evaluate_inline_action(&info.name, &content, &frontmatter, notes.clone())
+            .await?;
+        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: "plugin",
+            fingerprint,
+            verdict: &verdict,
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            requires_auth: binding.auth_required,
+            auth_configured,
+            notes,
+        }))
+    }
+
+    async fn review_custom_api_action(
+        &self,
+        info: &ActionDef,
+        binding: &CustomApiBinding,
+    ) -> Result<ActionReviewSnapshot> {
+        let fingerprint = Self::fingerprint_text(&[
+            info.name.as_str(),
+            info.description.as_str(),
+            &binding.base_url,
+            &binding.path,
+            &binding.method,
+            &serde_json::to_string(&info.input_schema).unwrap_or_default(),
+            &info.capabilities.join(","),
+        ]);
+        let Some(guard) = self.action_guard.as_ref() else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "custom_api",
+                fingerprint,
+                "Action security is unavailable, so custom API actions are not loadable.",
+            ));
+        };
+        if matches!(
+            binding.auth_mode,
+            crate::custom_apis::CustomApiAuthMode::OAuth2
+        ) && binding.auth_profile_id.is_none()
+        {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "custom_api",
+                fingerprint,
+                "OAuth2 custom API actions require a bound auth profile.",
+            ));
+        }
+        let mut notes = Self::url_review_notes(&binding.base_url);
+        if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            notes.push(format!("Uses auth profile '{}'.", auth_profile_id));
+        }
+        let frontmatter = Self::capabilities_frontmatter(&info.capabilities);
+        let content = format!(
+            "name: {}\nsource: custom_api\napi: {}\noperation: {}\nmethod: {}\nbase_url: {}\npath: {}\nauth_mode: {:?}\ncapabilities: {}\ninput_schema: {}",
+            info.name,
+            binding.api_name,
+            binding.operation_name,
+            binding.method,
+            binding.base_url,
+            binding.path,
+            binding.auth_mode,
+            info.capabilities.join(", "),
+            serde_json::to_string_pretty(&info.input_schema).unwrap_or_default()
+        );
+        let verdict = guard
+            .evaluate_inline_action(&info.name, &content, &frontmatter, notes.clone())
+            .await?;
+        let requires_auth = binding.auth_profile_id.is_some()
+            || !matches!(
+                binding.auth_mode,
+                crate::custom_apis::CustomApiAuthMode::None
+            );
+        let auth_configured = if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            let (ready, auth_notes) = self.auth_profile_status(auth_profile_id).await?;
+            notes.extend(auth_notes);
+            ready
+        } else if requires_auth {
+            let manager =
+                SecureConfigManager::new_with_data_dir(&self.config_dir, Some(self.data_dir()))?;
+            manager
+                .get_custom_secret(&binding.secret_key)?
+                .is_some_and(|value| !value.trim().is_empty())
+        } else {
+            true
+        };
+        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: "custom_api",
+            fingerprint,
+            verdict: &verdict,
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            requires_auth,
+            auth_configured,
+            notes,
+        }))
+    }
+
+    async fn review_mcp_action(
+        &self,
+        info: &ActionDef,
+        binding: &McpBinding,
+    ) -> Result<ActionReviewSnapshot> {
+        let fingerprint = Self::fingerprint_text(&[
+            info.name.as_str(),
+            info.description.as_str(),
+            &binding.server_id,
+            &binding.server_name,
+            &info.capabilities.join(","),
+        ]);
+        let Some(guard) = self.action_guard.as_ref() else {
+            return Ok(Self::build_blocked_review(
+                &info.name,
+                "mcp",
+                fingerprint,
+                "Action security is unavailable, so MCP actions are not loadable.",
+            ));
+        };
+        let frontmatter = Self::capabilities_frontmatter(&info.capabilities);
+        let content = format!(
+            "name: {}\nsource: mcp\nserver_id: {}\nserver_name: {}\nkind: {:?}\ndescription: {}\ncapabilities: {}\ninput_schema: {}",
+            info.name,
+            binding.server_id,
+            binding.server_name,
+            binding.kind,
+            info.description,
+            info.capabilities.join(", "),
+            serde_json::to_string_pretty(&info.input_schema).unwrap_or_default()
+        );
+        let mut warnings = binding.warnings.clone();
+        let auth_configured = if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            warnings.push(format!("Uses auth profile '{}'.", auth_profile_id));
+            let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+            warnings.extend(notes);
+            ready
+        } else {
+            binding.auth_configured
+        };
+        let verdict = guard
+            .evaluate_inline_action(&info.name, &content, &frontmatter, warnings.clone())
+            .await?;
+        Ok(Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: "mcp",
+            fingerprint,
+            verdict: &verdict,
+            required_env: Vec::new(),
+            missing_env: Vec::new(),
+            requires_auth: binding.auth_required,
+            auth_configured,
+            notes: warnings,
+        }))
+    }
+
+    pub async fn refresh_action_review_state(
+        &self,
+        action_name: &str,
+    ) -> Result<Option<ActionReviewSnapshot>> {
+        let loaded = {
+            let actions = self.actions.read().await;
+            actions.get(action_name).map(|action| {
+                (
+                    action.info.clone(),
+                    action.cli_binding.clone(),
+                    action.plugin_binding.clone(),
+                    action.custom_api_binding.clone(),
+                    action.mcp_binding.clone(),
+                )
+            })
+        };
+        let Some((info, cli_binding, plugin_binding, custom_api_binding, mcp_binding)) = loaded
+        else {
+            return Ok(None);
+        };
+        let mut review = match self.get_action_review(action_name).await {
+            Some(review) => review,
+            None => return Ok(None),
+        };
+        if matches!(review.status, ActionReviewStatus::Blocked) {
+            return Ok(Some(review));
+        }
+
+        if !review.required_env.is_empty() {
+            review.missing_env = self
+                .compute_missing_required_envs(action_name, &review.required_env)
+                .await?;
+        }
+
+        let mut cli_executable_missing = None::<String>;
+        if let Some(binding) = cli_binding {
+            if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+                review.requires_auth = true;
+                Self::prune_cli_auth_exported_envs(&mut review, &binding);
+                if binding.auth_env_exports.is_empty() {
+                    review.auth_configured = false;
+                    review.blocked_reason = Some(
+                        "CLI auth profiles require `auth.env_exports` so credentials can be injected into the subprocess.".to_string(),
+                    );
+                    let note = "CLI auth profiles require `auth.env_exports` so credentials can be injected into the subprocess.".to_string();
+                    if !review.notes.iter().any(|existing| existing == &note) {
+                        review.notes.push(note);
+                    }
+                } else {
+                    let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+                    review.auth_configured = ready;
+                    for note in notes {
+                        if !review.notes.iter().any(|existing| existing == &note) {
+                            review.notes.push(note);
+                        }
+                    }
+                    let mut exported_envs =
+                        binding.auth_env_exports.keys().cloned().collect::<Vec<_>>();
+                    exported_envs.sort();
+                    let note = format!("CLI auth exports: {}.", exported_envs.join(", "));
+                    if !review.notes.iter().any(|existing| existing == &note) {
+                        review.notes.push(note);
+                    }
+                }
+            }
+            if !std::path::Path::new(&binding.executable_path).is_file() {
+                cli_executable_missing = Some(binding.executable_path.clone());
+            }
+        }
+
+        if let Some(binding) = plugin_binding {
+            review.requires_auth = binding.auth_required;
+            if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+                let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+                review.auth_configured = ready;
+                for note in notes {
+                    if !review.notes.iter().any(|existing| existing == &note) {
+                        review.notes.push(note);
+                    }
+                }
+            } else if binding.auth_required {
+                let manager = SecureConfigManager::new_with_data_dir(
+                    &self.config_dir,
+                    Some(self.data_dir()),
+                )?;
+                review.auth_configured = manager
+                    .get_custom_secret(&Self::plugin_secret_key(&binding.plugin_id))?
+                    .is_some_and(|value| !value.trim().is_empty());
+            }
+        }
+
+        if let Some(binding) = custom_api_binding {
+            let requires_auth = binding.auth_profile_id.is_some()
+                || !matches!(
+                    binding.auth_mode,
+                    crate::custom_apis::CustomApiAuthMode::None
+                );
+            review.requires_auth = requires_auth;
+            if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+                let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+                review.auth_configured = ready;
+                for note in notes {
+                    if !review.notes.iter().any(|existing| existing == &note) {
+                        review.notes.push(note);
+                    }
+                }
+            } else if requires_auth {
+                let manager = SecureConfigManager::new_with_data_dir(
+                    &self.config_dir,
+                    Some(self.data_dir()),
+                )?;
+                review.auth_configured = manager
+                    .get_custom_secret(&binding.secret_key)?
+                    .is_some_and(|value| !value.trim().is_empty());
+            }
+        }
+
+        if let Some(binding) = mcp_binding {
+            review.requires_auth = binding.auth_required;
+            review.auth_configured =
+                if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+                    let (ready, notes) = self.auth_profile_status(auth_profile_id).await?;
+                    for note in notes {
+                        if !review.notes.iter().any(|existing| existing == &note) {
+                            review.notes.push(note);
+                        }
+                    }
+                    ready
+                } else {
+                    binding.auth_configured
+                };
+        }
+
+        Self::reconcile_dynamic_review_state(&mut review);
+
+        if let Some(executable_path) = cli_executable_missing {
+            review.status = ActionReviewStatus::NeedsSecrets;
+            review.ready = false;
+            review.allow_execute = false;
+            review.visible_in_catalog = false;
+            review.blocked_reason = Some(format!(
+                "CLI executable '{}' is not present on this machine.",
+                executable_path
+            ));
+            let note =
+                "CLI skills are machine-specific and must be revalidated after reload.".to_string();
+            if !review.notes.iter().any(|existing| existing == &note) {
+                review.notes.push(note);
+            }
+        }
+
+        review.source_kind = if info.source == ActionSource::System {
+            review.source_kind
+        } else {
+            Self::action_source_label(&info.source).to_string()
+        };
+        self.upsert_action_review(review.clone()).await?;
+        Ok(Some(review))
+    }
+
+    fn find_project_root_from_path(start: &Path) -> Option<PathBuf> {
+        let mut dir = if start.is_file() {
+            start.parent()?
+        } else {
+            start
+        };
+        loop {
+            if dir.join("Cargo.toml").exists() {
+                return Some(dir.to_path_buf());
+            }
+            dir = dir.parent()?;
+        }
+    }
+
+    fn bundled_skill_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if !path.exists() {
+                return;
+            }
+            let candidate = path.canonicalize().unwrap_or(path);
+            if dirs.iter().any(|existing| existing == &candidate) {
+                return;
+            }
+            dirs.push(candidate);
+        };
+
+        let app_skills_dir = PathBuf::from("/app/skills");
+        push_unique(app_skills_dir);
+
+        if let Ok(cwd) = std::env::current_dir() {
+            push_unique(cwd.join("skills"));
+            if let Some(root) = Self::find_project_root_from_path(&cwd) {
+                push_unique(root.join("skills"));
+            }
+        }
+
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(root) = Self::find_project_root_from_path(&exe) {
+                push_unique(root.join("skills"));
+            }
+        }
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        push_unique(manifest_dir.join("skills"));
+
+        dirs
+    }
+
+    fn is_runtime_owned_bundled_dir(path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        canonical == Path::new("/app/skills")
+    }
+
+    async fn prune_removed_bundled_skill_dirs(&self) -> Result<()> {
+        let removed: Vec<String> = self
+            .removed_bundled_actions
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        if removed.is_empty() {
+            return Ok(());
+        }
+
+        for bundled_dir in self.bundled_skill_dirs() {
+            if !Self::is_runtime_owned_bundled_dir(&bundled_dir) {
+                continue;
+            }
+            for name in &removed {
+                let action_dir = bundled_dir.join(name);
+                if action_dir.exists() {
+                    tokio::fs::remove_dir_all(&action_dir).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_runtime_owned_bundled_skill_dir(&self, name: &str) -> Result<()> {
+        for bundled_dir in self.bundled_skill_dirs() {
+            if !Self::is_runtime_owned_bundled_dir(&bundled_dir) {
+                continue;
+            }
+            let action_dir = bundled_dir.join(name);
+            if action_dir.exists() {
+                tokio::fs::remove_dir_all(&action_dir).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn new(config_dir: &Path, data_dir: &Path) -> Result<Self> {
@@ -547,6 +2315,11 @@ impl ActionRuntime {
         std::fs::create_dir_all(&cli_skills_dir)?;
         let disabled_actions_file = data_dir.join("disabled_actions.json");
         let disabled_actions = Self::load_disabled_actions(&disabled_actions_file);
+        let action_reviews_file = data_dir.join("action_reviews.json");
+        let action_reviews = Self::load_action_reviews(&action_reviews_file);
+        let removed_bundled_actions_file = data_dir.join("removed_bundled_actions.json");
+        let removed_bundled_actions =
+            Self::load_removed_bundled_actions(&removed_bundled_actions_file);
 
         let snapshot_dir = data_dir.join(&config.snapshot_dir);
         std::fs::create_dir_all(&snapshot_dir)?;
@@ -556,19 +2329,28 @@ impl ActionRuntime {
 
         let runtime = Self {
             config,
-            _sandbox: sandbox,
+            sandbox,
             transactions: tokio::sync::Mutex::new(transactions),
             actions: tokio::sync::RwLock::new(HashMap::new()),
             disabled_actions: tokio::sync::RwLock::new(disabled_actions),
             disabled_actions_file,
+            action_reviews: tokio::sync::RwLock::new(action_reviews),
+            action_reviews_file,
+            removed_bundled_actions: tokio::sync::RwLock::new(removed_bundled_actions),
+            removed_bundled_actions_file,
             actions_dir: actions_dir.clone(),
             cli_skills_dir,
             config_dir: config_dir.to_path_buf(),
             task_queue: None,
             action_guard: None,
+            auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
             storage: None,
             mcp_registry: None,
             plugin_registry: None,
+            #[cfg(feature = "docker")]
+            active_sandbox_containers: tokio::sync::RwLock::new(HashSet::new()),
+            #[cfg(feature = "docker")]
+            container_reaper_status: tokio::sync::RwLock::new(ContainerReaperStatus::default()),
         };
 
         Ok(runtime)
@@ -587,9 +2369,23 @@ impl ActionRuntime {
         self.action_guard = Some(guard);
     }
 
+    /// Update the effective action-name overrides that can skip approval prompts.
+    pub fn set_auto_approved_actions(&self, actions: &[String]) {
+        let approved = crate::core::config::sanitize_auto_approve_actions(actions)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if let Ok(mut set) = self.auto_approved_actions.write() {
+            *set = approved;
+        }
+    }
+
     /// Set shared storage reference for expense/entity operations (called from Agent::init)
     pub fn set_storage(&mut self, storage: crate::storage::Storage) {
         self.storage = Some(storage);
+    }
+
+    pub fn storage(&self) -> Option<crate::storage::Storage> {
+        self.storage.clone()
     }
 
     /// Set MCP registry (called from Agent::init)
@@ -608,26 +2404,72 @@ impl ActionRuntime {
         self.plugin_registry = Some(registry);
     }
 
+    pub fn default_sandbox_mode(&self) -> SandboxMode {
+        self.config.default_sandbox.clone()
+    }
+
+    pub fn wasm_memory_limit_bytes(&self) -> u64 {
+        self.config.wasm_memory_limit
+    }
+
+    pub fn docker_image(&self) -> &str {
+        &self.config.docker_image
+    }
+
+    fn action_is_auto_approved(&self, action_name: &str) -> bool {
+        self.auto_approved_actions
+            .read()
+            .map(|set| set.contains(action_name))
+            .unwrap_or(false)
+    }
+
+    async fn unapproved_permissions_for_action(
+        &self,
+        action_name: &str,
+        capabilities: &[String],
+    ) -> Vec<crate::security::action_guard::Permission> {
+        if self.action_is_auto_approved(action_name) {
+            return Vec::new();
+        }
+        let Some(guard) = self.action_guard.as_ref() else {
+            return Vec::new();
+        };
+        let requested = crate::security::ActionGuard::permissions_from_capabilities(capabilities);
+        if requested.is_empty() {
+            return Vec::new();
+        }
+        guard.check_permissions(action_name, &requested).await
+    }
+
+    fn build_permission_requirement_error(
+        action_name: &str,
+        permissions: &[crate::security::action_guard::Permission],
+    ) -> String {
+        let perm_names = permissions
+            .iter()
+            .map(|perm| perm.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let guidance = if crate::core::config::AUTO_APPROVE_BLOCKED.contains(&action_name) {
+            "This action is always approval-gated."
+        } else {
+            "If this action is part of your trusted workflow, add its name to Settings > Advanced > Auto-Approve Skills."
+        };
+        format!(
+            "Action '{}' requires approval before execution because it needs unapproved permissions: {}. {}",
+            action_name, perm_names, guidance
+        )
+    }
+
     /// Load all actions (builtin + bundled + user). Call AFTER set_action_guard.
     pub async fn load_all_actions(&self) -> Result<()> {
         // Load built-in actions
         self.load_builtin_actions().await?;
+        self.prune_removed_bundled_skill_dirs().await?;
 
-        // Load markdown skills from the app's skills directory (bundled with app)
-        let app_skills_dir = std::path::Path::new("/app/skills");
-        if app_skills_dir.exists() {
-            tracing::info!("Loading bundled skills from {:?}", app_skills_dir);
-            self.load_markdown_actions(app_skills_dir, ActionSource::Bundled)
-                .await?;
-        }
-
-        // Also check relative skills dir (for local development).
-        let local_skills_dir = std::env::current_dir()
-            .map(|d| d.join("skills"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("./skills"));
-        if local_skills_dir.exists() && local_skills_dir != app_skills_dir {
-            tracing::info!("Loading local skills from {:?}", local_skills_dir);
-            self.load_markdown_actions(&local_skills_dir, ActionSource::Bundled)
+        for bundled_dir in self.bundled_skill_dirs() {
+            tracing::info!("Loading bundled skills from {:?}", bundled_dir);
+            self.load_markdown_actions(&bundled_dir, ActionSource::Bundled)
                 .await?;
         }
 
@@ -667,6 +2509,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -686,6 +2529,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -714,6 +2558,32 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "document_lookup".to_string(),
+            description: "Search indexed documents and uploaded attachments on demand. Use when a question depends on document contents beyond the small excerpts already visible in the prompt, or when the user references uploaded files, attachments, or explicit doc ids like `doc:<id>`.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The question or search query to run against indexed documents" },
+                    "limit": { "type": "integer", "description": "Maximum number of excerpts to return (default: 6)" },
+                    "doc_ids": {
+                        "type": "array",
+                        "description": "Optional document ids to prioritize, for example [\"abcd1234\", \"efgh5678\"]",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["query"]
+            }),
+            capabilities: vec!["documents".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
@@ -734,6 +2604,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Wasm),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -762,6 +2633,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
@@ -790,6 +2662,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
@@ -818,6 +2691,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
@@ -838,6 +2712,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Docker),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -854,6 +2729,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -872,6 +2748,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+            authorization: Default::default(),
         })
         .await;
 
@@ -892,12 +2769,16 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
         self.register_builtin_action(ActionDef {
             name: "notify_user".to_string(),
-            description: "Return a notification message for internal reminder/scheduler delivery. Use for reminders and nudges that should be delivered through AgentArk's delivery routing instead of an external data source.".to_string(),
+            description: format!(
+                "Return a notification message for internal reminder/scheduler delivery. Use for reminders and nudges that should be delivered through {}'s delivery routing instead of an external data source.",
+                crate::branding::PRODUCT_NAME
+            ),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -917,6 +2798,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         })
         .await;
 
@@ -966,9 +2848,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Background watcher — poll an action until a condition is met, then act
+        // Background watcher â€” poll an action until a condition is met, then act
         // Tunnel control for remote UI access
         self.register_builtin_action(ActionDef {
             name: "tunnel_control".to_string(),
@@ -987,6 +2870,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
         self.register_builtin_action(ActionDef {
             name: "watch".to_string(),
@@ -1001,7 +2885,7 @@ impl ActionRuntime {
                     "condition_contains": { "type": "string", "description": "Trigger when result contains this keyword (case-insensitive)" },
                     "condition_matches": { "type": "string", "description": "Trigger when result matches this regex pattern" },
                     "condition_custom": { "type": "string", "description": "Natural language condition description" },
-                    "on_trigger": { "type": "string", "description": "What to do when condition is met — natural language instructions for the agent" },
+                    "on_trigger": { "type": "string", "description": "What to do when condition is met â€” natural language instructions for the agent" },
                     "interval_secs": { "type": "integer", "description": "Seconds between polls (default: 60)" },
                     "timeout_secs": { "type": "integer", "description": "Max seconds to watch before giving up (default: 86400 = 24 hours)" },
                     "timeout_hours": { "type": "integer", "description": "Convenience timeout override in hours. Supports very large values." },
@@ -1040,6 +2924,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1078,6 +2963,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Generic connector scaffold: pagination + rate-limit + auth-refresh + retries.
@@ -1135,6 +3021,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // First-class pipeline DAG spec compiler.
@@ -1154,6 +3041,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Execute a compiled pipeline with retry/idempotency guards.
@@ -1175,6 +3063,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Typed signal ranking + consensus primitive.
@@ -1203,6 +3092,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Gmail scan
@@ -1223,6 +3113,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1243,6 +3134,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Web search
@@ -1255,7 +3147,7 @@ impl ActionRuntime {
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "num_results": { "type": "integer", "description": "Number of results (default 5)" },
-                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper, searxng" }
+                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper" }
                 },
                 "required": ["query"]
             }),
@@ -1263,6 +3155,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Research
@@ -1275,7 +3168,7 @@ impl ActionRuntime {
                 "properties": {
                     "query": { "type": "string", "description": "Research topic or question" },
                     "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5)" },
-                    "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper, searxng" },
+                    "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
                     "include_sources": { "type": "boolean", "description": "Include source URLs" }
                 },
@@ -1285,20 +3178,22 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Code execution sandbox
         self.register_builtin_action(ActionDef {
             name: "code_execute".to_string(),
-            description: "Execute code in an isolated Docker sandbox. Supports Python, JavaScript, TypeScript, Bash, Ruby, PHP, Perl, Lua, R, Java, C, C++, Go, Rust, Swift, Kotlin, and Jupyter notebooks (.ipynb). Use when the user asks to run, execute, or test code. Dependencies like pip/npm install work automatically. For ML/data science and EDA, use language='jupyter' to create executable notebooks with visualizations — they get executed and returned as downloadable .ipynb files. When the user has attached files, pass their local paths in the 'files' array — they'll be available at /data/<filename> inside the sandbox.".to_string(),
+            description: "Execute code in an isolated Docker sandbox. Supports Python, JavaScript, TypeScript, Bash, Ruby, PHP, Perl, Lua, R, Java, C, C++, Go, Rust, Swift, Kotlin, and Jupyter notebooks (.ipynb). Use when the user asks to run, execute, or test code. Dependencies like pip/npm install work automatically. For ML/data science and EDA, use language='jupyter' to create executable notebooks with visualizations â€” they get executed and returned as downloadable .ipynb files. When the user has attached files through the upload API, pass their upload IDs in the 'files' array â€” they'll be validated and available at /data/<filename> inside the sandbox.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "language": { "type": "string", "description": "Programming language: python, javascript, typescript, bash, ruby, php, perl, lua, r, java, c, cpp, go, rust, swift, kotlin, jupyter. Use 'jupyter' for EDA/ML notebooks with visualizations." },
                     "code": { "type": "string", "description": "Code to execute. For jupyter: provide valid .ipynb JSON content (notebook format). For other languages: plain code. Can include dependency installation. When files are provided, access them at /data/<filename>." },
+                    "network_access": { "type": "boolean", "description": "Whether this sandbox execution may use outbound network access. Default: false. Leave disabled unless the code genuinely needs egress." },
                     "env": { "type": "object", "description": "Optional environment variables (values may include {{secret:...}} / {{env:...}} placeholders).", "additionalProperties": { "type": "string" } },
-                    "files": { "type": "array", "items": { "type": "string" }, "description": "Local file paths of user-attached files to inject into the sandbox at /data/. Pass the 'local_path' values from uploaded files." }
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Upload IDs returned by /api/upload for user-attached files. Each file is validated before being injected into the sandbox at /data/<filename>." }
                 },
                 "required": ["language", "code"]
             }),
@@ -1306,6 +3201,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Docker),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // List tasks/goals/routines
@@ -1323,6 +3219,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1347,6 +3244,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1390,6 +3288,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Browser automation - fetch and extract content from web pages
@@ -1409,6 +3308,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Image generation
@@ -1431,9 +3331,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Action management — create/update/delete/list custom actions via chat
+        // Action management â€” create/update/delete/list custom actions via chat
         self.register_builtin_action(ActionDef {
             name: "manage_actions".to_string(),
             description: "Create, update, delete, or list bundled and user-added actions/skills/workflows. Use when the user wants to inspect their installed skills, add a new action, or modify the action library.".to_string(),
@@ -1465,6 +3366,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1488,9 +3390,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // PDF generation — creates PDF documents from content
+        // PDF generation â€” creates PDF documents from content
         self.register_builtin_action(ActionDef {
             name: "pdf_generate".to_string(),
             description: "Generate a PDF document. Use when asked to create a PDF, report, invoice, or document. Supports styles: report, letter, invoice, plain.".to_string(),
@@ -1509,9 +3412,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Expense tracking — add, list, summarize, delete expenses
+        // Expense tracking â€” add, list, summarize, delete expenses
         self.register_builtin_action(ActionDef {
             name: "expense".to_string(),
             description: "Track expenses and spending. Actions: add (record expense), list (view expenses with optional date/category filter), summary (spending summary by category), delete (remove expense by ID). Use when the user mentions spending, costs, expenses, budget, or purchases.".to_string(),
@@ -1539,9 +3443,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Security logs — query security events from DB
+        // Security logs â€” query security events from DB
         self.register_builtin_action(ActionDef {
             name: "security_logs".to_string(),
             description: "View security event logs. Shows recent security events like injection attempts, auth failures, rate limit breaches. Use when the user asks about security events, attack attempts, or system security status.".to_string(),
@@ -1556,6 +3461,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Audio transcription
@@ -1576,6 +3482,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Weekly review
@@ -1593,6 +3500,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // === Integration-backed actions ===
@@ -1622,6 +3530,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Notion
@@ -1646,6 +3555,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Twitter/X
@@ -1667,6 +3577,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // 1Password
@@ -1690,6 +3601,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Google Places
@@ -1716,6 +3628,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Twilio (Voice & SMS)
@@ -1738,6 +3651,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Ordering & Purchasing
@@ -1761,9 +3675,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Browser automation — full headless browser control with human-in-the-loop
+        // Browser automation â€” full headless browser control with human-in-the-loop
         // Curated connectors
         // Garmin
         self.register_builtin_action(ActionDef {
@@ -1785,6 +3700,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // WHOOP
@@ -1804,6 +3720,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // GA4
@@ -1837,6 +3754,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // GSC
@@ -1860,6 +3778,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Social analytics
@@ -1882,6 +3801,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Moltbook (agent social network)
@@ -1911,6 +3831,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1944,9 +3865,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // Google Calendar — list, create, find free time
+        // Google Calendar â€” list, create, find free time
         self.register_builtin_action(ActionDef {
             name: "calendar_today".to_string(),
             description: "List today's calendar events. Use when the user asks 'what's on my calendar today', 'do I have any meetings', etc.".to_string(),
@@ -1959,6 +3881,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1976,6 +3899,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -1998,6 +3922,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2016,6 +3941,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2033,6 +3959,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2050,6 +3977,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2068,6 +3996,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2084,6 +4013,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2102,6 +4032,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2122,6 +4053,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2142,6 +4074,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2169,6 +4102,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         self.register_builtin_action(ActionDef {
@@ -2195,9 +4129,10 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // SSH — remote server execution (behind feature flag)
+        // SSH â€” remote server execution (behind feature flag)
         #[cfg(feature = "ssh")]
         {
             self.register_builtin_action(ActionDef {
@@ -2216,6 +4151,7 @@ impl ActionRuntime {
                 sandbox_mode: Some(SandboxMode::Native),
                 source: ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             }).await;
 
             self.register_builtin_action(ActionDef {
@@ -2230,6 +4166,7 @@ impl ActionRuntime {
                 sandbox_mode: Some(SandboxMode::Native),
                 source: ActionSource::System,
                 file_path: None,
+            authorization: Default::default(),
             }).await;
         }
 
@@ -2266,12 +4203,17 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
-        // App deployment — write files, start servers, return live URL
+        // App deployment â€” write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
-            description: "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so AgentArk can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For dynamic apps (Python/Node servers), include or infer entry_command. Repo-based deploys default to container runtime unless overridden. Public exposure defaults to enabled (expose_public=true) so the agent can return a tunnel-ready link. Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.".to_string(),
+            description: format!(
+                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, only request a dynamic runtime when it is genuinely needed by setting `runtime_required=true` and providing an `entry_command` (optionally `runtime_reason`). Otherwise the bundle is treated as a static/local app. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard is optional and defaults to false.",
+                crate::branding::PRODUCT_NAME,
+                crate::branding::PRODUCT_NAME
+            ),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2282,7 +4224,10 @@ impl ActionRuntime {
                     },
                     "repo_url": {
                         "type": "string",
-                        "description": "Public Git repository URL to clone and deploy, e.g. https://github.com/org/repo. Use this instead of `files` when the user wants AgentArk to run an existing repo locally."
+                        "description": format!(
+                            "Public Git repository URL to clone and deploy, e.g. https://github.com/org/repo. Use this instead of `files` when the user wants {} to run an existing repo locally.",
+                            crate::branding::PRODUCT_NAME
+                        )
                     },
                     "repo_ref": {
                         "type": "string",
@@ -2304,7 +4249,7 @@ impl ActionRuntime {
                     },
                     "install_command": {
                         "type": "string",
-                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt — a venv is auto-created. Each app runs in its own isolated environment (Python venv or local node_modules). Examples: 'pip install -r requirements.txt', 'npm install'"
+                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt â€” a venv is auto-created. Each app runs in its own isolated environment (Python venv or local node_modules). Examples: 'pip install -r requirements.txt', 'npm install'"
                     },
                     "required_inputs": {
                         "type": "array",
@@ -2345,16 +4290,30 @@ impl ActionRuntime {
                     },
                     "runtime_image": {
                         "type": "string",
-                        "description": "Optional container image used to run the app (default: agentark-sandbox:latest)"
+                        "description": format!(
+                            "Optional container image used to run the app. Defaults to the installed {} image when available; use this only to override with a dedicated runner image.",
+                            crate::branding::PRODUCT_NAME
+                        )
                     },
                     "runtime_preference": {
                         "type": "string",
                         "enum": ["local", "container"],
-                        "description": "Preferred runtime for dynamic apps. Default: container when Docker is configured for AgentArk, otherwise local."
+                        "description": format!(
+                            "Preferred runtime for dynamic apps. Default: container when Docker is configured for {}, otherwise local.",
+                            crate::branding::PRODUCT_NAME
+                        )
+                    },
+                    "runtime_required": {
+                        "type": "boolean",
+                        "description": "Set true only when the generated bundle genuinely needs a long-lived server/runtime. Default: false."
+                    },
+                    "runtime_reason": {
+                        "type": "string",
+                        "description": "Optional short explanation of why a dynamic runtime is needed for this generated bundle."
                     },
                     "expose_public": {
                         "type": "boolean",
-                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: true."
+                        "description": "Whether to expose the app on the configured remote-access provider when available. Default: false."
                     },
                     "access_guard": {
                         "type": "boolean",
@@ -2374,25 +4333,13 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
-
-        // NOTE: Remotion video_generate action disabled.
-        // Limitations that need addressing before re-enabling:
-        //   - No TTS/speech integration — videos are visual-only
-        //   - No video player in chat UI — only download links
-        //   - No validation of LLM-generated React/Remotion code
-        //   - 141MB image size overhead for Remotion template + node_modules
-        //   - Requires Chromium for rendering (already in Playwright image)
-        // To re-enable: uncomment this block and the Remotion Dockerfile sections.
-        // self.register_builtin_action(ActionDef {
-        //     name: "video_generate".to_string(),
-        //     ...
-        // }).await;
 
         // Provider-based text/image-to-video generation (Runway/Luma/Fal/Veo/etc.)
         self.register_builtin_action(ActionDef {
             name: "generate_video".to_string(),
-            description: "Generate a normal AI video via configured video providers (Runway, Luma, Fal, Sora, Veo, etc.). Use for general text-to-video or image-to-video requests when no custom Remotion coding is needed. If the user specifically asks for product showcase/scripted animation with custom scenes, use video_generate instead. If unclear, ask which mode they want.".to_string(),
+            description: "Generate an AI video via configured video providers (Runway, Luma, Fal, Sora, Veo, etc.) for text-to-video or image-to-video requests.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2410,12 +4357,16 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         // Self-evolve - policy-first self-improvement
         self.register_builtin_action(ActionDef {
             name: "self_evolve".to_string(),
-            description: "Evolve AgentArk behavior with an auditable promotion loop. Default mode is policy/strategy evolution (benchmark, lineage archive, statistical gating, canary rollout with replay gate, optional promotion). Code evolution is disabled by default and requires explicit allow_code_writes=true.".to_string(),
+            description: format!(
+                "Evolve {} behavior with an auditable promotion loop. Default mode is policy/strategy evolution (benchmark, lineage archive, statistical gating, canary rollout with replay gate, optional promotion). Code evolution is disabled by default and requires explicit allow_code_writes=true.",
+                crate::branding::PRODUCT_NAME
+            ),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2471,12 +4422,278 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
+        authorization: Default::default(),
         }).await;
 
         Ok(())
     }
 
+    fn normalize_action_definition(info: ActionDef) -> ActionDef {
+        let mut normalized = info;
+        normalized.authorization = Self::merged_authorization_for_action(&normalized);
+        normalized
+    }
+
+    fn merged_authorization_for_action(info: &ActionDef) -> ActionAuthorization {
+        let defaults = Self::default_authorization_for_action(info);
+        let mut authorization = info.authorization.clone();
+        if matches!(authorization.risk_level, ActionRiskLevel::None) {
+            authorization.risk_level = defaults.risk_level;
+        }
+        if !authorization.requires_auth {
+            authorization.requires_auth = defaults.requires_auth;
+        }
+        if authorization.allowed_roles.is_empty() {
+            authorization.allowed_roles = defaults.allowed_roles;
+        }
+        if authorization.rate_limit.is_none() {
+            authorization.rate_limit = defaults.rate_limit;
+        }
+        if !authorization.human_approval.required {
+            authorization.human_approval.required = defaults.human_approval.required;
+        }
+        authorization
+    }
+
+    fn default_authorization_for_action(info: &ActionDef) -> ActionAuthorization {
+        let lowered = info.name.trim().to_ascii_lowercase();
+        let dangerous = Self::action_has_dangerous_capabilities(&info.capabilities);
+        let background_sensitive =
+            BACKGROUND_BLOCKED_ACTIONS.contains(&lowered.as_str()) || dangerous;
+
+        if background_sensitive {
+            return ActionAuthorization {
+                risk_level: ActionRiskLevel::High,
+                requires_auth: true,
+                ..Default::default()
+            };
+        }
+
+        ActionAuthorization::default()
+    }
+
+    fn action_has_dangerous_capabilities(capabilities: &[String]) -> bool {
+        capabilities.iter().any(|cap| {
+            matches!(
+                crate::security::action_guard::ActionGuard::permission_risk(
+                    &crate::security::action_guard::ActionGuard::parse_permission(cap)
+                ),
+                crate::security::action_guard::PermissionRisk::Dangerous
+            )
+        })
+    }
+
+    fn is_background_surface(surface: &ActionExecutionSurface) -> bool {
+        matches!(
+            surface,
+            ActionExecutionSurface::Automation | ActionExecutionSurface::Background
+        )
+    }
+
+    fn risk_rank(level: &ActionRiskLevel) -> u8 {
+        match level {
+            ActionRiskLevel::None => 0,
+            ActionRiskLevel::Low => 1,
+            ActionRiskLevel::Medium => 2,
+            ActionRiskLevel::High => 3,
+            ActionRiskLevel::Critical => 4,
+        }
+    }
+
+    fn truncate_audit_text(raw: &str, max_chars: usize) -> String {
+        let redacted = crate::security::redact_pii(raw);
+        let mut truncated = redacted.chars().take(max_chars).collect::<String>();
+        if redacted.chars().count() > max_chars {
+            truncated.push_str("...");
+        }
+        truncated
+    }
+
+    fn normalize_optional_audit_text(raw: Option<&str>, max_chars: usize) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::truncate_audit_text(value, max_chars))
+    }
+
+    async fn log_authorization_audit(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        authorization: &ActionAuthorization,
+        auth_context: &ActionAuthorizationContext,
+        decision: &ActionAuthorizationDecision,
+    ) {
+        let Some(storage) = self.storage() else {
+            return;
+        };
+        let principal_payload = auth_context.principal.as_ref().map(|principal| {
+            serde_json::json!({
+                "user_id": principal.user_id,
+                "role": principal.role,
+                "auth_source": principal.auth_source,
+                "trusted": principal.trusted,
+            })
+        });
+        let payload = serde_json::json!({
+            "surface": auth_context.surface.as_key(),
+            "direct_user_intent": auth_context.direct_user_intent,
+            "principal": principal_payload,
+            "authorization": authorization,
+            "decision": {
+                "allowed": decision.allowed,
+                "reason": decision.reason,
+                "matched_role": decision.matched_role,
+                "rate_limit_key": decision.rate_limit_key,
+            }
+        });
+        let arguments_text = serde_json::to_string(arguments)
+            .ok()
+            .map(|value| Self::truncate_audit_text(&value, 1200));
+        let payload_text = serde_json::to_string(&payload)
+            .ok()
+            .map(|value| Self::truncate_audit_text(&value, 2000));
+        let row = crate::storage::entities::operational_log::Model {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            trace_id: None,
+            conversation_id: None,
+            channel: Self::truncate_audit_text(auth_context.surface.as_key(), 64),
+            event_type: "tool_authorization".to_string(),
+            success: decision.allowed,
+            outcome: Self::truncate_audit_text(
+                if decision.allowed {
+                    "allowed"
+                } else {
+                    "blocked"
+                },
+                64,
+            ),
+            tool_name: Some(Self::truncate_audit_text(action_name, 128)),
+            latency_ms: None,
+            arguments: arguments_text,
+            payload: payload_text,
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: None,
+            model_slot: Self::normalize_optional_audit_text(
+                auth_context
+                    .principal
+                    .as_ref()
+                    .map(|principal| principal.auth_source.as_str()),
+                128,
+            ),
+        };
+        if let Err(error) = storage.insert_operational_log(&row).await {
+            tracing::debug!("Failed to insert authorization audit log: {}", error);
+        }
+    }
+
+    pub async fn authorize_action_invocation(
+        &self,
+        action_name: &str,
+        action_def: Option<&ActionDef>,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<ActionAuthorizationDecision> {
+        let authorization = action_def
+            .map(Self::merged_authorization_for_action)
+            .unwrap_or_default();
+
+        let decision = match auth_context.surface {
+            ActionExecutionSurface::Internal | ActionExecutionSurface::Test => {
+                ActionAuthorizationDecision::allow(
+                    "Internal execution bypassed the interactive permission gate.",
+                )
+            }
+            _ if auth_context.direct_user_intent
+                && matches!(
+                    auth_context.surface,
+                    ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+                )
+                && auth_context
+                    .principal
+                    .as_ref()
+                    .is_some_and(|principal| principal.trusted) =>
+            {
+                ActionAuthorizationDecision::allow(format!(
+                    "Tool '{}' is allowed because this is a direct authenticated user request.",
+                    action_name
+                ))
+            }
+            _ if Self::is_background_surface(&auth_context.surface)
+                && Self::risk_rank(&authorization.risk_level)
+                    >= Self::risk_rank(&ActionRiskLevel::High) =>
+            {
+                ActionAuthorizationDecision::deny(format!(
+                    "Tool '{}' is blocked in background or automation runs. Start it from a direct authenticated chat or API request instead.",
+                    action_name
+                ))
+            }
+            _ if authorization.requires_auth
+                && !auth_context
+                    .principal
+                    .as_ref()
+                    .is_some_and(|principal| principal.trusted) =>
+            {
+                ActionAuthorizationDecision::deny(format!(
+                    "Tool '{}' requires a trusted local session. Run it from the authenticated UI or API instead of a background or anonymous context.",
+                    action_name
+                ))
+            }
+            _ if !authorization.allowed_roles.is_empty() => {
+                let Some(principal) = auth_context.principal.as_ref() else {
+                    let decision = ActionAuthorizationDecision::deny(format!(
+                        "Tool '{}' requires an authorized local session with role access.",
+                        action_name
+                    ));
+                    self.log_authorization_audit(
+                        action_name,
+                        arguments,
+                        &authorization,
+                        auth_context,
+                        &decision,
+                    )
+                    .await;
+                    return Ok(decision);
+                };
+                let matched_role = authorization
+                    .allowed_roles
+                    .iter()
+                    .find(|role| role.eq_ignore_ascii_case(principal.role.as_str()))
+                    .cloned();
+                if let Some(role) = matched_role {
+                    let mut decision = ActionAuthorizationDecision::allow(format!(
+                        "Tool '{}' is allowed for the current trusted local session.",
+                        action_name
+                    ));
+                    decision.matched_role = Some(role);
+                    decision
+                } else {
+                    ActionAuthorizationDecision::deny(format!(
+                        "Tool '{}' is not allowed for the current local session role '{}'.",
+                        action_name, principal.role
+                    ))
+                }
+            }
+            _ => ActionAuthorizationDecision::allow(format!(
+                "Tool '{}' is allowed for this request.",
+                action_name
+            )),
+        };
+
+        self.log_authorization_audit(
+            action_name,
+            arguments,
+            &authorization,
+            auth_context,
+            &decision,
+        )
+        .await;
+        Ok(decision)
+    }
+
     async fn register_builtin_action(&self, info: ActionDef) {
+        let info = Self::normalize_action_definition(info);
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2491,8 +4708,9 @@ impl ActionRuntime {
         );
     }
 
-    /// Register an action with workflow content (from SKILL.md or legacy ACTION.md)
+    /// Register an action with workflow content from SKILL.md
     async fn register_workflow_action(&self, info: ActionDef, workflow: String) {
+        let info = Self::normalize_action_definition(info);
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2508,6 +4726,7 @@ impl ActionRuntime {
     }
 
     async fn register_cli_action(&self, info: ActionDef, binding: CliToolBinding) {
+        let info = Self::normalize_action_definition(info);
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2524,6 +4743,8 @@ impl ActionRuntime {
 
     /// Register an MCP-backed action (external tool/resource)
     pub async fn register_mcp_action(&self, info: ActionDef, binding: McpBinding) {
+        let info = Self::normalize_action_definition(info);
+        let review = self.review_mcp_action(&info, &binding).await;
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2536,10 +4757,22 @@ impl ActionRuntime {
                 custom_api_binding: None,
             },
         );
+        match review {
+            Ok(review) => {
+                if let Err(error) = self.upsert_action_review(review).await {
+                    tracing::warn!("Failed to persist MCP action review state: {}", error);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("Failed to review MCP action during registration: {}", error);
+            }
+        }
     }
 
     /// Register a plugin-backed action
     pub async fn register_plugin_action(&self, info: ActionDef, binding: PluginBinding) {
+        let info = Self::normalize_action_definition(info);
+        let review = self.review_plugin_action(&info, &binding).await;
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2552,10 +4785,25 @@ impl ActionRuntime {
                 custom_api_binding: None,
             },
         );
+        match review {
+            Ok(review) => {
+                if let Err(error) = self.upsert_action_review(review).await {
+                    tracing::warn!("Failed to persist plugin action review state: {}", error);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to review plugin action during registration: {}",
+                    error
+                );
+            }
+        }
     }
 
     /// Register an imported custom API action.
     pub async fn register_custom_api_action(&self, info: ActionDef, binding: CustomApiBinding) {
+        let info = Self::normalize_action_definition(info);
+        let review = self.review_custom_api_action(&info, &binding).await;
         self.actions.write().await.insert(
             info.name.clone(),
             LoadedAction {
@@ -2568,6 +4816,22 @@ impl ActionRuntime {
                 custom_api_binding: Some(binding),
             },
         );
+        match review {
+            Ok(review) => {
+                if let Err(error) = self.upsert_action_review(review).await {
+                    tracing::warn!(
+                        "Failed to persist custom API action review state: {}",
+                        error
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to review custom API action during registration: {}",
+                    error
+                );
+            }
+        }
     }
 
     fn build_cli_action_input_schema(action_name: &str) -> serde_json::Value {
@@ -2611,6 +4875,7 @@ impl ActionRuntime {
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::Custom,
             file_path: Some(skill_path.to_string_lossy().to_string()),
+        authorization: Default::default(),
         }
     }
 
@@ -2651,16 +4916,37 @@ impl ActionRuntime {
         tokio::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?).await?;
 
         let info = Self::build_cli_action_def(&manifest, &skill_path);
+        if let Some(ref guard) = self.action_guard {
+            if let Err(error) = guard.resign_action(&skill_dir, skill_name).await {
+                tracing::warn!("Failed to sign CLI skill '{}': {}", skill_name, error);
+            }
+        }
+        let (_parsed, workflow_content, frontmatter) = self
+            .parse_action_md(&skill_path, ActionSource::Custom)
+            .await?;
         let binding = CliToolBinding {
             executable_path: manifest.executable_path.clone(),
             verify_args: manifest.verify_args.clone(),
+            auth_profile_id: Self::extract_auth_profile_id_from_frontmatter(&frontmatter),
+            auth_env_exports: Self::extract_auth_env_exports_from_frontmatter(&frontmatter),
         };
+        let review = self
+            .review_cli_action(&skill_dir, &info, &workflow_content, &frontmatter, &binding)
+            .await?;
         self.register_cli_action(info, binding).await;
+        self.upsert_action_review(review.clone()).await?;
         tracing::info!(
             "Installed CLI skill '{}' backed by {}",
             skill_name,
             manifest.executable_path
         );
+        if !review.allow_execute {
+            tracing::warn!(
+                "CLI skill '{}' installed in blocked/unready state: {:?}",
+                skill_name,
+                review.blocked_reason
+            );
+        }
         Ok(())
     }
 
@@ -2712,11 +4998,32 @@ impl ActionRuntime {
             };
 
             let info = Self::build_cli_action_def(&manifest, &skill_path);
+            let parsed = match self
+                .parse_action_md(&skill_path, ActionSource::Custom)
+                .await
+            {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to parse CLI skill markdown {:?}: {}",
+                        skill_path,
+                        error
+                    );
+                    continue;
+                }
+            };
+            let (_parsed_info, workflow_content, frontmatter) = parsed;
             let binding = CliToolBinding {
                 executable_path: manifest.executable_path.clone(),
                 verify_args: manifest.verify_args.clone(),
+                auth_profile_id: Self::extract_auth_profile_id_from_frontmatter(&frontmatter),
+                auth_env_exports: Self::extract_auth_env_exports_from_frontmatter(&frontmatter),
             };
+            let review = self
+                .review_cli_action(&path, &info, &workflow_content, &frontmatter, &binding)
+                .await?;
             self.register_cli_action(info, binding).await;
+            self.upsert_action_review(review).await?;
         }
 
         Ok(())
@@ -2724,54 +5031,114 @@ impl ActionRuntime {
 
     /// Remove all MCP-backed actions
     pub async fn unregister_mcp_actions(&self) -> usize {
-        let mut actions = self.actions.write().await;
-        let before = actions.len();
-        actions.retain(|_, a| a.mcp_binding.is_none());
-        before.saturating_sub(actions.len())
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| action.mcp_binding.is_some())
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| a.mcp_binding.is_none());
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
     }
 
     /// Remove MCP-backed actions for a specific server
     pub async fn unregister_mcp_actions_for_server(&self, server_id: &str) -> usize {
-        let mut actions = self.actions.write().await;
-        let before = actions.len();
-        actions.retain(|_, a| {
-            if let Some(binding) = &a.mcp_binding {
-                binding.server_id != server_id
-            } else {
-                true
-            }
-        });
-        before.saturating_sub(actions.len())
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| {
+                    action
+                        .mcp_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.server_id == server_id)
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| {
+                if let Some(binding) = &a.mcp_binding {
+                    binding.server_id != server_id
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
     }
 
     /// Remove all plugin-backed actions
     pub async fn unregister_plugin_actions(&self) -> usize {
-        let mut actions = self.actions.write().await;
-        let before = actions.len();
-        actions.retain(|_, a| a.plugin_binding.is_none());
-        before.saturating_sub(actions.len())
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| action.plugin_binding.is_some())
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| a.plugin_binding.is_none());
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
     }
 
     /// Remove plugin-backed actions for a specific plugin
     pub async fn unregister_plugin_actions_for_plugin(&self, plugin_id: &str) -> usize {
-        let mut actions = self.actions.write().await;
-        let before = actions.len();
-        actions.retain(|_, a| {
-            if let Some(binding) = &a.plugin_binding {
-                binding.plugin_id != plugin_id
-            } else {
-                true
-            }
-        });
-        before.saturating_sub(actions.len())
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| {
+                    action
+                        .plugin_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.plugin_id == plugin_id)
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| {
+                if let Some(binding) = &a.plugin_binding {
+                    binding.plugin_id != plugin_id
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
     }
 
     /// Remove all imported custom API actions.
     pub async fn unregister_custom_api_actions(&self) -> usize {
-        let mut actions = self.actions.write().await;
-        let before = actions.len();
-        actions.retain(|_, a| a.custom_api_binding.is_none());
-        before.saturating_sub(actions.len())
+        let removed_names = {
+            let mut actions = self.actions.write().await;
+            let removed = actions
+                .iter()
+                .filter(|(_, action)| action.custom_api_binding.is_some())
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            actions.retain(|_, a| a.custom_api_binding.is_none());
+            removed
+        };
+        let _ = self
+            .remove_action_reviews(|name| removed_names.iter().any(|n| n == name))
+            .await;
+        removed_names.len()
     }
 
     fn resolve_optional_cli_cwd(&self, raw: Option<&str>) -> Result<Option<PathBuf>> {
@@ -2791,6 +5158,7 @@ impl ActionRuntime {
 
     async fn execute_cli_action(
         &self,
+        action_name: &str,
         binding: CliToolBinding,
         arguments: &serde_json::Value,
     ) -> Result<String> {
@@ -2822,11 +5190,70 @@ impl ActionRuntime {
             .clamp(1, 300);
         let cwd =
             self.resolve_optional_cli_cwd(arguments.get("cwd").and_then(|value| value.as_str()))?;
+        let review = self
+            .get_action_review(action_name)
+            .await
+            .unwrap_or_default();
+        let mut injected_env = BTreeMap::new();
+        if !review.required_env.is_empty() {
+            let required_secret_env = review
+                .required_env
+                .iter()
+                .filter(|env| !binding.auth_env_exports.contains_key(*env))
+                .cloned()
+                .collect::<Vec<_>>();
+            let placeholder_map = required_secret_env
+                .iter()
+                .map(|env| {
+                    (
+                        env.clone(),
+                        serde_json::Value::String(format!("{{{{env:{}}}}}", env)),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            if !placeholder_map.is_empty() {
+                let resolved = self.resolve_secret_placeholders(
+                    action_name,
+                    &serde_json::Value::Object(placeholder_map),
+                )?;
+                if let Some(obj) = resolved.as_object() {
+                    for env in &required_secret_env {
+                        if let Some(value) = obj.get(env).and_then(|value| value.as_str()) {
+                            injected_env.insert(env.clone(), value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            if binding.auth_env_exports.is_empty() {
+                anyhow::bail!(
+                    "CLI auth profile '{}' is bound but no auth.env_exports mapping is declared.",
+                    auth_profile_id
+                );
+            }
+            let storage = self.storage().ok_or_else(|| {
+                anyhow::anyhow!("Storage is unavailable for auth profile lookups")
+            })?;
+            let auth_exports =
+                crate::core::auth_profiles::AuthProfileControlPlane::resolve_env_exports(
+                    &storage,
+                    auth_profile_id,
+                    &binding.auth_env_exports,
+                )
+                .await?;
+            for (key, value) in auth_exports {
+                injected_env.insert(key, value);
+            }
+        }
 
         let mut command = tokio::process::Command::new(executable);
         command.args(&args);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
+        }
+        for (key, value) in injected_env {
+            command.env(key, value);
         }
         if stdin_text.is_some() {
             command.stdin(std::process::Stdio::piped());
@@ -2874,6 +5301,15 @@ impl ActionRuntime {
         }
 
         if output.status.success() {
+            if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+                if let Some(storage) = self.storage() {
+                    let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                        &storage,
+                        auth_profile_id,
+                    )
+                    .await;
+                }
+            }
             Ok(combined)
         } else {
             Err(anyhow::anyhow!(
@@ -2894,7 +5330,30 @@ impl ActionRuntime {
         action_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String> {
-        let (sandbox_mode, cli_binding, mcp_binding, plugin_binding, custom_api_binding, source) = {
+        self.execute_action_with_context(
+            action_name,
+            arguments,
+            &ActionAuthorizationContext::default(),
+        )
+        .await
+    }
+
+    pub async fn execute_action_with_context(
+        &self,
+        action_name: &str,
+        arguments: &serde_json::Value,
+        auth_context: &ActionAuthorizationContext,
+    ) -> Result<String> {
+        let (
+            sandbox_mode,
+            cli_binding,
+            mcp_binding,
+            plugin_binding,
+            custom_api_binding,
+            source,
+            capabilities,
+            info,
+        ) = {
             let actions = self.actions.read().await;
             let action = actions
                 .get(action_name)
@@ -2910,8 +5369,37 @@ impl ActionRuntime {
                 action.plugin_binding.clone(),
                 action.custom_api_binding.clone(),
                 action.info.source.clone(),
+                action.info.capabilities.clone(),
+                action.info.clone(),
             )
         };
+
+        let authorization_decision = self
+            .authorize_action_invocation(action_name, Some(&info), arguments, auth_context)
+            .await?;
+        if !authorization_decision.allowed {
+            anyhow::bail!("{}", authorization_decision.reason);
+        }
+
+        match self.refresh_action_review_state(action_name).await? {
+            Some(review) => {
+                if !review.allow_execute {
+                    anyhow::bail!(
+                        "{}",
+                        review.blocked_reason.unwrap_or_else(|| {
+                            format!("Action '{}' is not ready to execute.", action_name)
+                        })
+                    );
+                }
+            }
+            None if source != ActionSource::System => {
+                anyhow::bail!(
+                    "Action '{}' has no persisted security review and cannot execute.",
+                    action_name
+                );
+            }
+            None => {}
+        }
 
         if source != ActionSource::System {
             let disabled = self.disabled_actions.read().await;
@@ -2933,12 +5421,24 @@ impl ActionRuntime {
             ));
         }
 
+        let unapproved_permissions = self
+            .unapproved_permissions_for_action(action_name, &capabilities)
+            .await;
+        if !unapproved_permissions.is_empty() {
+            anyhow::bail!(
+                "{}",
+                Self::build_permission_requirement_error(action_name, &unapproved_permissions)
+            );
+        }
+
         // Resolve secrets at execution time so they never appear in LLM-visible
         // tool-call arguments or execution traces.
         let resolved_args = self.resolve_secret_placeholders(action_name, arguments)?;
 
         if let Some(binding) = cli_binding {
-            return self.execute_cli_action(binding, &resolved_args).await;
+            return self
+                .execute_cli_action(action_name, binding, &resolved_args)
+                .await;
         }
 
         if let Some(binding) = mcp_binding {
@@ -3320,6 +5820,18 @@ impl ActionRuntime {
                 pairs.append_pair(key, value);
             }
         }
+        let auth_overlay = if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            Some(
+                self.resolve_auth_profile_http(auth_profile_id)
+                    .await?
+                    .overlay,
+            )
+        } else {
+            None
+        };
+        if let Some(overlay) = auth_overlay.as_ref() {
+            overlay.apply_to_url(&mut url);
+        }
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -3359,52 +5871,56 @@ impl ActionRuntime {
             request = request.header(key, value);
         }
 
-        request = match binding.auth_mode {
-            crate::custom_apis::CustomApiAuthMode::None
-            | crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => request,
-            crate::custom_apis::CustomApiAuthMode::Bearer
-            | crate::custom_apis::CustomApiAuthMode::OAuth2 => {
-                let token = secret.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Auth secret '{}' is not configured for '{}'",
-                        binding.secret_key,
-                        binding.api_name
-                    )
-                })?;
-                let header_name = binding.auth_header.as_deref().unwrap_or("Authorization");
-                if header_name.eq_ignore_ascii_case("authorization") {
-                    request.bearer_auth(token.trim())
-                } else {
-                    request.header(header_name, format!("Bearer {}", token.trim()))
+        request = if let Some(overlay) = auth_overlay.as_ref() {
+            overlay.apply_to_request_builder(request)?
+        } else {
+            match binding.auth_mode {
+                crate::custom_apis::CustomApiAuthMode::None
+                | crate::custom_apis::CustomApiAuthMode::ApiKeyQuery => request,
+                crate::custom_apis::CustomApiAuthMode::Bearer
+                | crate::custom_apis::CustomApiAuthMode::OAuth2 => {
+                    let token = secret.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Auth secret '{}' is not configured for '{}'",
+                            binding.secret_key,
+                            binding.api_name
+                        )
+                    })?;
+                    let header_name = binding.auth_header.as_deref().unwrap_or("Authorization");
+                    if header_name.eq_ignore_ascii_case("authorization") {
+                        request.bearer_auth(token.trim())
+                    } else {
+                        request.header(header_name, format!("Bearer {}", token.trim()))
+                    }
                 }
-            }
-            crate::custom_apis::CustomApiAuthMode::ApiKeyHeader => {
-                let token = secret.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Auth secret '{}' is not configured for '{}'",
-                        binding.secret_key,
-                        binding.api_name
+                crate::custom_apis::CustomApiAuthMode::ApiKeyHeader => {
+                    let token = secret.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Auth secret '{}' is not configured for '{}'",
+                            binding.secret_key,
+                            binding.api_name
+                        )
+                    })?;
+                    let header_name = binding
+                        .auth_name
+                        .as_deref()
+                        .or(binding.auth_header.as_deref())
+                        .unwrap_or("X-API-Key");
+                    request.header(header_name, token.trim())
+                }
+                crate::custom_apis::CustomApiAuthMode::Basic => {
+                    let password = secret.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Auth secret '{}' is not configured for '{}'",
+                            binding.secret_key,
+                            binding.api_name
+                        )
+                    })?;
+                    request.basic_auth(
+                        binding.auth_username.clone().unwrap_or_default(),
+                        Some(password.trim().to_string()),
                     )
-                })?;
-                let header_name = binding
-                    .auth_name
-                    .as_deref()
-                    .or(binding.auth_header.as_deref())
-                    .unwrap_or("X-API-Key");
-                request.header(header_name, token.trim())
-            }
-            crate::custom_apis::CustomApiAuthMode::Basic => {
-                let password = secret.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Auth secret '{}' is not configured for '{}'",
-                        binding.secret_key,
-                        binding.api_name
-                    )
-                })?;
-                request.basic_auth(
-                    binding.auth_username.clone().unwrap_or_default(),
-                    Some(password.trim().to_string()),
-                )
+                }
             }
         };
 
@@ -3440,6 +5956,7 @@ impl ActionRuntime {
         } else {
             rendered
         };
+        let rendered = crate::security::redact_secret_input(&rendered).text;
         if !status.is_success() {
             return Err(anyhow::anyhow!(
                 "Custom API '{}' returned HTTP {}:\n{}",
@@ -3447,6 +5964,15 @@ impl ActionRuntime {
                 status,
                 rendered
             ));
+        }
+        if let Some(auth_profile_id) = binding.auth_profile_id.as_deref() {
+            if let Some(storage) = self.storage() {
+                let _ = crate::core::auth_profiles::AuthProfileControlPlane::mark_used(
+                    &storage,
+                    auth_profile_id,
+                )
+                .await;
+            }
         }
         Ok(format!(
             "{} {} succeeded.\n{}",
@@ -3608,7 +6134,7 @@ impl ActionRuntime {
                 ))
             }
             "watch" => {
-                // Return a marker — actual watcher creation is handled by Agent::handle_watch
+                // Return a marker â€” actual watcher creation is handled by Agent::handle_watch
                 let desc = arguments
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -3668,47 +6194,6 @@ impl ActionRuntime {
                 let config = build_search_config(&self.config_dir).await;
                 crate::actions::research::execute_research(&args, &config).await
             }
-            "video-frames" => {
-                // This action requires ffmpeg - check arguments
-                let video = arguments
-                    .get("video")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'video' path argument"))?;
-                let time = arguments
-                    .get("time")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("00:00:00");
-                let output = arguments
-                    .get("out")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("{}_frame.jpg", video.trim_end_matches(".mp4")));
-
-                // Execute ffmpeg
-                let output_result = tokio::process::Command::new("ffmpeg")
-                    .args([
-                        "-ss",
-                        time,
-                        "-i",
-                        video,
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "2",
-                        &output,
-                        "-y",
-                    ])
-                    .output()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to run ffmpeg: {}", e))?;
-
-                if output_result.status.success() {
-                    Ok(format!("Frame extracted to: {}", output))
-                } else {
-                    let stderr = String::from_utf8_lossy(&output_result.stderr);
-                    Err(anyhow::anyhow!("ffmpeg failed: {}", stderr))
-                }
-            }
             "code_execute" => {
                 // Native fallback for code execution (when Docker mode falls through)
                 self.execute_code_native(arguments).await
@@ -3724,7 +6209,9 @@ impl ActionRuntime {
 
                 // Fetch the page
                 let client = reqwest::Client::builder()
-                    .user_agent("AgentArk/0.1 (AI Agent Browser)")
+                    .user_agent(crate::branding::user_agent_with_suffix(
+                        "(AI Agent Browser)",
+                    ))
                     .timeout(std::time::Duration::from_secs(30))
                     .redirect(reqwest::redirect::Policy::limited(5))
                     .build()
@@ -4018,7 +6505,7 @@ print("PDF generated: {out_str}")
                         let mut total = 0.0f64;
                         for e in &expenses {
                             output.push_str(&format!(
-                                "- [{}] {} {} — {} ({}){}\n",
+                                "- [{}] {} {} â€” {} ({}){}\n",
                                 e.id,
                                 e.currency,
                                 e.amount,
@@ -4251,7 +6738,10 @@ print(result["text"])
                 let now_utc = chrono::Utc::now();
                 if let Some(timezone_name) = timezone_name {
                     let timezone = timezone_name.parse::<chrono_tz::Tz>().map_err(|_| {
-                        anyhow::anyhow!("Invalid timezone '{}'. Expected an IANA name such as Asia/Kolkata.", timezone_name)
+                        anyhow::anyhow!(
+                            "Invalid timezone '{}'. Expected an IANA name such as Asia/Kolkata.",
+                            timezone_name
+                        )
                     })?;
                     let local = now_utc.with_timezone(&timezone);
                     Ok(format!(
@@ -4312,11 +6802,6 @@ print(result["text"])
             "ssh" => crate::actions::ssh::ssh_execute(&self.config_dir, arguments).await,
             #[cfg(feature = "ssh")]
             "ssh_connections" => crate::actions::ssh::ssh_list_connections(&self.config_dir).await,
-            // Video generation via Remotion
-            "video_generate" => {
-                crate::actions::video::video_generate(&self.config_dir, self.data_dir(), arguments)
-                    .await
-            }
             // Handle workflow actions - return marker for agent to process with LLM
             other => {
                 let actions = self.actions.read().await;
@@ -4582,11 +7067,13 @@ print(result["text"])
         if spec.url.trim().is_empty() {
             return Err(anyhow::anyhow!("connector_request requires non-empty url"));
         }
+        self.validate_connector_request_url(&spec.url).await?;
 
         let retry = spec.retry.normalized();
         let timeout_secs = spec.timeout_secs.clamp(1, 300);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
@@ -5593,7 +8080,7 @@ print(result["text"])
                         if let Some(ref v) = verdict {
                             if !v.warnings.is_empty() {
                                 msg.push_str(&format!(
-                                    "\n⚠️ Security warnings: {}",
+                                    "\nâš ï¸ Security warnings: {}",
                                     v.warnings.join(", ")
                                 ));
                             }
@@ -5766,26 +8253,201 @@ print(result["text"])
         }
     }
 
+    pub async fn docker_available(&self) -> bool {
+        #[cfg(feature = "docker")]
+        {
+            match Self::connect_docker() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = self;
+            true
+        }
+    }
+
+    #[cfg(feature = "docker")]
+    fn docker_security_opts() -> Vec<String> {
+        let mut opts = vec!["no-new-privileges:true".to_string()];
+        if let Ok(profile) = std::env::var("AGENTARK_DOCKER_SECCOMP_PROFILE") {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                opts.push(format!("seccomp={}", trimmed));
+            }
+        }
+        if let Ok(profile) = std::env::var("AGENTARK_DOCKER_APPARMOR_PROFILE") {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                opts.push(format!("apparmor={}", trimmed));
+            }
+        }
+        opts
+    }
+
+    #[cfg(feature = "docker")]
+    fn sandbox_container_labels(
+        action_name: &str,
+        isolation: ContainerIsolation,
+    ) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                AGENTARK_SANDBOX_LABEL_KEY.to_string(),
+                AGENTARK_SANDBOX_LABEL_VALUE.to_string(),
+            ),
+            ("agentark.action".to_string(), action_name.to_string()),
+            (
+                "agentark.isolation".to_string(),
+                isolation.label().to_string(),
+            ),
+            (
+                "agentark.network_access".to_string(),
+                if isolation.network_access() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+            ),
+            (
+                "agentark.created_at".to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            ),
+        ])
+    }
+
+    #[cfg(feature = "docker")]
+    async fn remember_active_container(&self, id: &str) {
+        let mut active = self.active_sandbox_containers.write().await;
+        active.insert(id.to_string());
+        crate::metrics::set_active_containers(active.len());
+    }
+
+    #[cfg(feature = "docker")]
+    async fn forget_active_container(&self, id: &str) {
+        let mut active = self.active_sandbox_containers.write().await;
+        active.remove(id);
+        crate::metrics::set_active_containers(active.len());
+    }
+
+    #[cfg(feature = "docker")]
+    async fn update_container_reaper_status(&self, removed: u64, error: Option<String>) {
+        let mut status = self.container_reaper_status.write().await;
+        status.last_run_at = Some(chrono::Utc::now().to_rfc3339());
+        status.last_removed_count = removed;
+        status.total_removed_count = status.total_removed_count.saturating_add(removed);
+        status.last_error = error;
+    }
+
+    pub async fn active_container_count(&self) -> usize {
+        #[cfg(feature = "docker")]
+        {
+            return self.active_sandbox_containers.read().await.len();
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            0
+        }
+    }
+
+    pub async fn container_reaper_status(&self) -> ContainerReaperStatus {
+        #[cfg(feature = "docker")]
+        {
+            return self.container_reaper_status.read().await.clone();
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            ContainerReaperStatus::default()
+        }
+    }
+
+    pub async fn reconcile_orphan_containers(&self) -> Result<u64> {
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker() {
+                Ok(docker) => docker,
+                Err(error) => {
+                    let message = error.to_string();
+                    self.update_container_reaper_status(0, Some(message.clone()))
+                        .await;
+                    crate::metrics::record_container_sweeper_run("error", 0);
+                    return Err(error);
+                }
+            };
+
+            let filters = HashMap::from([(
+                "label".to_string(),
+                vec![format!(
+                    "{}={}",
+                    AGENTARK_SANDBOX_LABEL_KEY, AGENTARK_SANDBOX_LABEL_VALUE
+                )],
+            )]);
+            let containers = docker
+                .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+                    all: true,
+                    filters,
+                    ..Default::default()
+                }))
+                .await?;
+            let active = self.active_sandbox_containers.read().await.clone();
+            let mut removed = 0u64;
+            for container in containers {
+                let Some(id) = container.id.as_deref() else {
+                    continue;
+                };
+                if active.contains(id) {
+                    continue;
+                }
+                Self::force_remove_container(&docker, id).await;
+                removed = removed.saturating_add(1);
+            }
+            self.update_container_reaper_status(removed, None).await;
+            crate::metrics::record_container_sweeper_run("ok", removed);
+            Ok(removed)
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            Ok(0)
+        }
+    }
+
+    fn docker_required_error(action_name: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Docker is required for '{}' execution but is not available",
+            action_name
+        )
+    }
+
     /// Execute an action in Docker sandbox
     async fn execute_docker(
         &self,
         action_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String> {
+        if action_name == "code_execute" {
+            if let Some(_executor) = Self::control_plane_executor_client() {
+                return self.execute_code_remote(arguments).await;
+            }
+        }
         #[cfg(feature = "docker")]
         {
-            // Check Docker availability first — fall back to native if unavailable
+            // Check Docker availability first â€” fall back to native if unavailable
             let docker_available = Self::connect_docker().is_ok();
 
             if !docker_available {
-                tracing::warn!("Docker not available (socket not found), falling back to native execution for '{}'", action_name);
-                return self.execute_native(action_name, arguments).await;
+                tracing::warn!(
+                    "Docker not available for '{}'; refusing unsandboxed fallback execution",
+                    action_name
+                );
+                return Err(Self::docker_required_error(action_name));
             }
 
             match action_name {
                 "shell" => {
                     const PUBLIC_SHELL_SANDBOX_IMAGE: &str = "alpine:3.20";
                     self.run_isolated_container(
+                        action_name,
                         PUBLIC_SHELL_SANDBOX_IMAGE,
                         vec![
                             "sh".to_string(),
@@ -5808,13 +8470,8 @@ print(result["text"])
 
         #[cfg(not(feature = "docker"))]
         {
-            // Fall back to native sandboxed execution when Docker is not available
-            if action_name == "code_execute" {
-                return self.execute_code_native(arguments).await;
-            }
-            Err(anyhow::anyhow!(
-                "Docker support not enabled. Recompile with --features docker"
-            ))
+            let _ = arguments;
+            Err(Self::docker_required_error(action_name))
         }
     }
 
@@ -5828,7 +8485,7 @@ print(result["text"])
         let _ = docker
             .stop_container(id, Some(bollard::container::StopContainerOptions { t: 0 }))
             .await;
-        // Force remove — deletes container, volumes, and anonymous volumes
+        // Force remove â€” deletes container, volumes, and anonymous volumes
         let _ = docker
             .remove_container(
                 id,
@@ -5881,10 +8538,11 @@ print(result["text"])
 
     /// Run a command in a fully isolated, ephemeral Docker container.
     /// Automatically pulls the image if not available locally.
-    /// Container is ALWAYS destroyed after execution — no leftovers.
+    /// Container is ALWAYS destroyed after execution â€” no leftovers.
     #[cfg(feature = "docker")]
     async fn run_isolated_container(
         &self,
+        action_name: &str,
         image: &str,
         cmd: Vec<String>,
         env: Option<Vec<String>>,
@@ -5892,108 +8550,273 @@ print(result["text"])
         isolation: ContainerIsolation,
     ) -> Result<String> {
         let docker = Self::connect_docker()?;
+        let isolation_label = isolation.label();
+        let network_access = isolation.network_access();
 
         // Auto-pull image if not available
         Self::ensure_image(&docker, image).await?;
 
+        let security_opt = Self::docker_security_opts();
         let host_config = match isolation {
-            ContainerIsolation::Strict => {
-                // Full lockdown: no network, read-only root, noexec /tmp
-                bollard::models::HostConfig {
-                    memory: Some(256 * 1024 * 1024),
-                    memory_swap: Some(256 * 1024 * 1024),
-                    cpu_period: Some(100_000),
-                    cpu_quota: Some(50_000),
-                    pids_limit: Some(64),
-                    network_mode: Some("none".to_string()),
-                    readonly_rootfs: Some(true),
-                    tmpfs: Some(HashMap::from([(
-                        "/tmp".to_string(),
-                        "size=64M,noexec".to_string(),
-                    )])),
-                    auto_remove: Some(false),
-                    ..Default::default()
-                }
-            }
-            ContainerIsolation::Standard => {
-                // Allows pip/npm install: writable fs, network enabled, but still
-                // resource-limited and ephemeral (destroyed after execution)
-                bollard::models::HostConfig {
-                    memory: Some(512 * 1024 * 1024), // 512MB for installs
-                    memory_swap: Some(512 * 1024 * 1024),
-                    cpu_period: Some(100_000),
-                    cpu_quota: Some(50_000),
-                    pids_limit: Some(128), // More PIDs for package managers
-                    auto_remove: Some(false),
-                    ..Default::default()
-                }
-            }
+            ContainerIsolation::Strict => bollard::models::HostConfig {
+                memory: Some(256 * 1024 * 1024),
+                memory_swap: Some(256 * 1024 * 1024),
+                cpu_period: Some(100_000),
+                cpu_quota: Some(50_000),
+                pids_limit: Some(64),
+                network_mode: Some("none".to_string()),
+                readonly_rootfs: Some(true),
+                tmpfs: Some(HashMap::from([(
+                    "/tmp".to_string(),
+                    "size=64M,noexec".to_string(),
+                )])),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(security_opt.clone()),
+                auto_remove: Some(false),
+                ..Default::default()
+            },
+            ContainerIsolation::Standard => bollard::models::HostConfig {
+                memory: Some(512 * 1024 * 1024),
+                memory_swap: Some(512 * 1024 * 1024),
+                cpu_period: Some(100_000),
+                cpu_quota: Some(50_000),
+                pids_limit: Some(128),
+                network_mode: Some("none".to_string()),
+                tmpfs: Some(HashMap::from([(
+                    "/tmp".to_string(),
+                    "size=128M".to_string(),
+                )])),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(security_opt.clone()),
+                auto_remove: Some(false),
+                ..Default::default()
+            },
+            ContainerIsolation::StandardWithNetwork => bollard::models::HostConfig {
+                memory: Some(512 * 1024 * 1024),
+                memory_swap: Some(512 * 1024 * 1024),
+                cpu_period: Some(100_000),
+                cpu_quota: Some(50_000),
+                pids_limit: Some(128),
+                tmpfs: Some(HashMap::from([(
+                    "/tmp".to_string(),
+                    "size=128M".to_string(),
+                )])),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(security_opt),
+                auto_remove: Some(false),
+                ..Default::default()
+            },
         };
 
-        let network_disabled = matches!(isolation, ContainerIsolation::Strict);
+        let network_disabled = !network_access;
 
         let container_config = bollard::container::Config {
             image: Some(image.to_string()),
             cmd: Some(cmd),
             env,
+            labels: Some(Self::sandbox_container_labels(action_name, isolation)),
             host_config: Some(host_config),
             network_disabled: Some(network_disabled),
             working_dir: Some("/tmp".to_string()),
             ..Default::default()
         };
 
+        let create_started = std::time::Instant::now();
         let container = docker
             .create_container::<String, String>(None, container_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create container: {}", e))?;
+            .await;
+        let container = match container {
+            Ok(container) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "create",
+                    isolation_label,
+                    network_access,
+                    "ok",
+                    create_started.elapsed(),
+                );
+                container
+            }
+            Err(e) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "create",
+                    isolation_label,
+                    network_access,
+                    "error",
+                    create_started.elapsed(),
+                );
+                crate::metrics::observe_container_run(
+                    action_name,
+                    isolation_label,
+                    network_access,
+                    "error",
+                );
+                return Err(anyhow::anyhow!("Failed to create container: {}", e));
+            }
+        };
 
         let container_id = container.id.clone();
+        self.remember_active_container(&container_id).await;
         tracing::info!(
-            "Created isolated container {} for code execution",
-            &container_id[..12.min(container_id.len())]
+            "Created isolated container {} for {}",
+            &container_id[..12.min(container_id.len())],
+            action_name
         );
 
-        // Start container — if this fails, clean up immediately
+        // Start container â€” if this fails, clean up immediately
+        let start_started = std::time::Instant::now();
         if let Err(e) = docker.start_container::<String>(&container_id, None).await {
+            crate::metrics::observe_container_lifecycle(
+                action_name,
+                "start",
+                isolation_label,
+                network_access,
+                "error",
+                start_started.elapsed(),
+            );
+            let cleanup_started = std::time::Instant::now();
             Self::force_remove_container(&docker, &container_id).await;
+            crate::metrics::observe_container_lifecycle(
+                action_name,
+                "cleanup",
+                isolation_label,
+                network_access,
+                "ok",
+                cleanup_started.elapsed(),
+            );
+            self.forget_active_container(&container_id).await;
+            crate::metrics::observe_container_run(
+                action_name,
+                isolation_label,
+                network_access,
+                "error",
+            );
             return Err(anyhow::anyhow!("Failed to start container: {}", e));
         }
+        crate::metrics::observe_container_lifecycle(
+            action_name,
+            "start",
+            isolation_label,
+            network_access,
+            "ok",
+            start_started.elapsed(),
+        );
 
-        // Wait for container by polling inspect (more reliable than wait_container stream)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let exit_code = loop {
-            if std::time::Instant::now() > deadline {
+        let wait_started = std::time::Instant::now();
+        let exit_code = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            docker
+                .wait_container(
+                    &container_id,
+                    None::<bollard::container::WaitContainerOptions<String>>,
+                )
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        {
+            Ok(Ok(statuses)) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "wait",
+                    isolation_label,
+                    network_access,
+                    "ok",
+                    wait_started.elapsed(),
+                );
+                let code = statuses
+                    .last()
+                    .map(|status| status.status_code)
+                    .unwrap_or(0);
+                tracing::debug!(
+                    "Container {} exited with code {}",
+                    &container_id[..12.min(container_id.len())],
+                    code
+                );
+                code
+            }
+            Ok(Err(bollard::errors::Error::DockerContainerWaitError { code, error })) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "wait",
+                    isolation_label,
+                    network_access,
+                    "error",
+                    wait_started.elapsed(),
+                );
+                if !error.trim().is_empty() {
+                    tracing::debug!(
+                        "Container {} exited with wait error {}: {}",
+                        &container_id[..12.min(container_id.len())],
+                        code,
+                        error
+                    );
+                }
+                code
+            }
+            Ok(Err(e)) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "wait",
+                    isolation_label,
+                    network_access,
+                    "error",
+                    wait_started.elapsed(),
+                );
+                let cleanup_started = std::time::Instant::now();
                 Self::force_remove_container(&docker, &container_id).await;
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "cleanup",
+                    isolation_label,
+                    network_access,
+                    "ok",
+                    cleanup_started.elapsed(),
+                );
+                self.forget_active_container(&container_id).await;
+                crate::metrics::observe_container_run(
+                    action_name,
+                    isolation_label,
+                    network_access,
+                    "error",
+                );
+                return Err(anyhow::anyhow!("Container wait failed: {}", e));
+            }
+            Err(_) => {
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "wait",
+                    isolation_label,
+                    network_access,
+                    "timeout",
+                    wait_started.elapsed(),
+                );
+                let cleanup_started = std::time::Instant::now();
+                Self::force_remove_container(&docker, &container_id).await;
+                crate::metrics::observe_container_lifecycle(
+                    action_name,
+                    "cleanup",
+                    isolation_label,
+                    network_access,
+                    "ok",
+                    cleanup_started.elapsed(),
+                );
+                self.forget_active_container(&container_id).await;
+                crate::metrics::observe_container_run(
+                    action_name,
+                    isolation_label,
+                    network_access,
+                    "timeout",
+                );
                 return Err(anyhow::anyhow!(
                     "Code execution timed out after {} seconds",
                     timeout_secs
                 ));
             }
-
-            match docker.inspect_container(&container_id, None).await {
-                Ok(info) => {
-                    let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-                    if !running {
-                        let code = info.state.as_ref().and_then(|s| s.exit_code).unwrap_or(-1);
-                        tracing::debug!(
-                            "Container {} exited with code {}",
-                            &container_id[..12.min(container_id.len())],
-                            code
-                        );
-                        break code;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to inspect container: {:?}", e);
-                    Self::force_remove_container(&docker, &container_id).await;
-                    return Err(anyhow::anyhow!("Container inspection failed: {}", e));
-                }
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         };
 
         // Collect stdout and stderr before cleanup
+        let logs_started = std::time::Instant::now();
         let logs = docker
             .logs::<String>(
                 &container_id,
@@ -6006,9 +8829,27 @@ print(result["text"])
             .try_collect::<Vec<_>>()
             .await
             .unwrap_or_default();
+        crate::metrics::observe_container_lifecycle(
+            action_name,
+            "logs",
+            isolation_label,
+            network_access,
+            "ok",
+            logs_started.elapsed(),
+        );
 
-        // Always destroy the container — no leftovers
+        // Always destroy the container â€” no leftovers
+        let cleanup_started = std::time::Instant::now();
         Self::force_remove_container(&docker, &container_id).await;
+        crate::metrics::observe_container_lifecycle(
+            action_name,
+            "cleanup",
+            isolation_label,
+            network_access,
+            "ok",
+            cleanup_started.elapsed(),
+        );
+        self.forget_active_container(&container_id).await;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -6029,6 +8870,12 @@ print(result["text"])
             "error": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr.clone()) },
             "exit_code": exit_code,
         });
+        crate::metrics::observe_container_run(
+            action_name,
+            isolation_label,
+            network_access,
+            if exit_code == 0 { "ok" } else { "error" },
+        );
 
         Ok(serde_json::to_string(&result)?)
     }
@@ -6083,7 +8930,7 @@ print(result["text"])
             "kotlin" | "kt"
                 => Some(("zenika/kotlin:latest", "kt", Some("kotlinc {file} -include-runtime -d /tmp/out.jar 2>/dev/null"), "java -jar /tmp/out.jar")),
 
-            // Jupyter notebook — execute in-place and output results
+            // Jupyter notebook â€” execute in-place and output results
             "jupyter" | "notebook" | "ipynb"
                 => Some(("python:3-slim", "ipynb",
                     Some("PIP_ROOT_USER_ACTION=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 pip install -q jupyter nbconvert nbformat matplotlib pandas numpy scikit-learn seaborn 2>/dev/null"),
@@ -6096,7 +8943,7 @@ print(result["text"])
     /// Detect non-stdlib Python imports and return a pip install command.
     /// Scans `import X` and `from X import` statements, filters out stdlib modules.
     fn detect_python_deps(code: &str) -> String {
-        // Python stdlib modules (comprehensive but not exhaustive — errs on side of not installing)
+        // Python stdlib modules (comprehensive but not exhaustive â€” errs on side of not installing)
         const STDLIB: &[&str] = &[
             "abc",
             "aifc",
@@ -6473,8 +9320,8 @@ print(result["text"])
     }
 
     /// Execute code in an isolated Docker container.
-    /// Supports any language with a Docker image — auto-pulls if needed.
-    /// Container is ephemeral — fully destroyed after execution.
+    /// Supports any language with a Docker image â€” auto-pulls if needed.
+    /// Container is ephemeral â€” fully destroyed after execution.
     /// Output files (images, CSVs, etc.) are extracted before container cleanup.
     #[cfg(feature = "docker")]
     async fn execute_code_docker(&self, arguments: &serde_json::Value) -> Result<String> {
@@ -6487,7 +9334,7 @@ print(result["text"])
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?;
 
         // Strip Jupyter magic commands (!pip, !apt, !conda, %pip, %conda, etc.)
-        // LLMs often generate these in regular Python scripts — our auto-dependency
+        // LLMs often generate these in regular Python scripts â€” our auto-dependency
         // detection handles installs, so these lines are unnecessary and cause SyntaxError.
         let code = if matches!(language.as_str(), "python" | "python3" | "py") {
             let cleaned: Vec<&str> = code_raw
@@ -6525,34 +9372,27 @@ print(result["text"])
             file_path
         };
 
-        // Build file injection commands for user-attached files
-        // Files are read from host, base64-encoded, and decoded into /data/ inside container
+        // Build file injection commands for uploaded files.
+        // Upload IDs are resolved through storage, validated against the managed uploads root,
+        // then base64-encoded and decoded into /data/ inside the container.
+        let sandbox_files = self.collect_code_execute_files(arguments).await?;
         let mut file_inject_cmds = String::new();
-        if let Some(files_arr) = arguments.get("files").and_then(|v| v.as_array()) {
+        if !sandbox_files.is_empty() {
             file_inject_cmds.push_str("mkdir -p /data && ");
-            for file_val in files_arr {
-                if let Some(local_path) = file_val.as_str() {
-                    let path = std::path::Path::new(local_path);
-                    // Validate path exists and get filename
-                    if let Ok(data) = tokio::fs::read(path).await {
-                        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-                        let data_b64 = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data,
-                        );
-                        file_inject_cmds.push_str(&format!(
-                            "echo '{}' | base64 -d > /data/{} && ",
-                            data_b64, filename
-                        ));
-                        tracing::info!(
-                            "Injecting file into container: {} ({} bytes)",
-                            filename,
-                            data.len()
-                        );
-                    } else {
-                        tracing::warn!("Could not read attached file: {}", local_path);
-                    }
-                }
+            for upload in sandbox_files {
+                let data_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &upload.bytes,
+                );
+                file_inject_cmds.push_str(&format!(
+                    "echo '{}' | base64 -d > /data/{} && ",
+                    data_b64, upload.filename
+                ));
+                tracing::info!(
+                    "Injecting uploaded file into container: {} ({} bytes)",
+                    upload.filename,
+                    upload.bytes.len()
+                );
             }
         }
 
@@ -6621,14 +9461,24 @@ print(result["text"])
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty());
+        let network_access = arguments
+            .get("network_access")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let isolation = if network_access {
+            ContainerIsolation::StandardWithNetwork
+        } else {
+            ContainerIsolation::Standard
+        };
 
         let raw_result = self
             .run_isolated_container(
+                "code_execute",
                 image,
                 vec!["sh".to_string(), "-c".to_string(), shell_cmd],
                 env_vec,
                 timeout,
-                ContainerIsolation::Standard,
+                isolation,
             )
             .await?;
 
@@ -6638,6 +9488,14 @@ print(result["text"])
 
         let exec_id = uuid::Uuid::new_v4().to_string();
         let output_dir = self.data_dir().join("outputs").join(&exec_id);
+        tokio::fs::create_dir_all(&output_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create output directory '{}'",
+                    output_dir.display()
+                )
+            })?;
 
         let (user_output, saved_files) = if let Some(marker_pos) =
             output.find("__AGENTARK_OUTPUT_FILES__")
@@ -6649,13 +9507,13 @@ print(result["text"])
 
             // Save the code file first so user can download it
             {
-                let _ = tokio::fs::create_dir_all(&output_dir).await;
                 let code_filename = format!("code.{}", ext);
                 let code_path = output_dir.join(&code_filename);
-                if tokio::fs::write(&code_path, code).await.is_ok() {
-                    saved.push(format!("/api/outputs/{}/{}", exec_id, code_filename));
-                    tracing::debug!("Saved code file: {}", code_path.display());
-                }
+                tokio::fs::write(&code_path, code).await.with_context(|| {
+                    format!("Failed to save code artifact '{}'", code_path.display())
+                })?;
+                saved.push(format!("/api/outputs/{}/{}", exec_id, code_filename));
+                tracing::debug!("Saved code file: {}", code_path.display());
             }
 
             // Extract output files from container stdout
@@ -6685,14 +9543,14 @@ print(result["text"])
 
             (user_output, saved)
         } else {
-            // No file marker found — still save the code file
+            // No file marker found â€” still save the code file
             let mut saved = Vec::new();
-            let _ = tokio::fs::create_dir_all(&output_dir).await;
             let code_filename = format!("code.{}", ext);
             let code_path = output_dir.join(&code_filename);
-            if tokio::fs::write(&code_path, code).await.is_ok() {
-                saved.push(format!("/api/outputs/{}/{}", exec_id, code_filename));
-            }
+            tokio::fs::write(&code_path, code).await.with_context(|| {
+                format!("Failed to save code artifact '{}'", code_path.display())
+            })?;
+            saved.push(format!("/api/outputs/{}/{}", exec_id, code_filename));
             (output.to_string(), saved)
         };
 
@@ -6787,25 +9645,68 @@ print(result["text"])
     /// Non-system actions honor the disabled set; integration-backed system actions honor
     /// the integration enable/disable toggle.
     pub async fn list_enabled_actions(&self) -> Result<Vec<ActionDef>> {
-        let actions = self.actions.read().await;
         let disabled = self.disabled_actions.read().await;
-        Ok(actions
+        let actions = self
+            .actions
+            .read()
+            .await
             .values()
-            .filter(|loaded| {
-                if loaded.info.source == ActionSource::System {
-                    self.is_builtin_integration_action_enabled(&loaded.info.name)
-                } else {
-                    !disabled.contains(loaded.info.name.as_str())
-                }
-            })
             .map(|loaded| loaded.info.clone())
-            .collect())
+            .collect::<Vec<_>>();
+        drop(disabled);
+        let mut enabled = Vec::new();
+        for action in actions {
+            if action.source == ActionSource::System
+                && !self.is_builtin_integration_action_enabled(&action.name)
+            {
+                continue;
+            }
+            if action.source != ActionSource::System
+                && self
+                    .disabled_actions
+                    .read()
+                    .await
+                    .contains(action.name.as_str())
+            {
+                continue;
+            }
+            if let Some(review) = self.refresh_action_review_state(&action.name).await? {
+                if !review.visible_in_catalog {
+                    continue;
+                }
+            } else if action.source != ActionSource::System {
+                continue;
+            }
+            enabled.push(action);
+        }
+        Ok(enabled)
     }
 
     /// Returns true if an action is enabled (not in the disabled set).
     pub async fn is_action_enabled(&self, name: &str) -> bool {
-        let disabled = self.disabled_actions.read().await;
-        !disabled.contains(name)
+        let action = {
+            let actions = self.actions.read().await;
+            actions.get(name).map(|loaded| loaded.info.clone())
+        };
+        let Some(action) = action else {
+            return false;
+        };
+        if action.source == ActionSource::System
+            && !self.is_builtin_integration_action_enabled(name)
+        {
+            return false;
+        }
+        if action.source != ActionSource::System {
+            let disabled = self.disabled_actions.read().await;
+            if disabled.contains(name) {
+                return false;
+            }
+        }
+        match self.refresh_action_review_state(name).await {
+            Ok(Some(review)) => review.allow_execute,
+            Ok(None) => action.source == ActionSource::System,
+            Err(_) => false,
+        }
     }
 
     /// Enable or disable an action without deleting it.
@@ -6821,6 +9722,25 @@ print(result["text"])
 
         if source == ActionSource::System {
             return Ok(false);
+        }
+
+        if enabled {
+            match self.refresh_action_review_state(name).await? {
+                Some(review) => {
+                    if !review.allow_execute {
+                        anyhow::bail!(
+                            "{}",
+                            review.blocked_reason.unwrap_or_else(|| {
+                                format!("Action '{}' is not ready to enable.", name)
+                            })
+                        );
+                    }
+                }
+                None => anyhow::bail!(
+                    "Action '{}' has no persisted security review and cannot be enabled.",
+                    name
+                ),
+            }
         }
 
         {
@@ -6870,90 +9790,85 @@ print(result["text"])
         if skill_md.exists() {
             return Some(skill_md);
         }
-        let legacy_action_md = dir.join("ACTION.md");
-        if legacy_action_md.exists() {
-            return Some(legacy_action_md);
-        }
         None
     }
 
     /// Update action content - for bundled actions, creates a custom copy first
     pub async fn update_action_content(&self, name: &str, content: &str) -> Result<bool> {
-        let actions = self.actions.read().await;
-        if let Some(action) = actions.get(name) {
-            // System actions cannot be edited
+        let (source, file_path) = {
+            let actions = self.actions.read().await;
+            let Some(action) = actions.get(name) else {
+                return Ok(false);
+            };
             if action.info.source == ActionSource::System {
                 return Ok(false);
             }
+            (action.info.source.clone(), action.info.file_path.clone())
+        };
 
-            // For Bundled actions, create a custom copy in the data directory
-            if action.info.source == ActionSource::Bundled {
-                drop(actions); // Release lock before async file I/O
+        let (action_dir, action_file, action_source) = if source == ActionSource::Bundled {
+            let custom_action_dir = self.actions_dir.join(name);
+            tokio::fs::create_dir_all(&custom_action_dir).await?;
+            (
+                custom_action_dir.clone(),
+                Self::preferred_skill_markdown_path(&custom_action_dir),
+                ActionSource::Custom,
+            )
+        } else if let Some(file_path) = file_path {
+            let action_file = PathBuf::from(file_path);
+            let action_dir = action_file
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.actions_dir.join(name));
+            (action_dir, action_file, ActionSource::Custom)
+        } else {
+            return Ok(false);
+        };
 
-                // Create custom action directory
-                let custom_action_dir = self.actions_dir.join(name);
-                tokio::fs::create_dir_all(&custom_action_dir).await?;
-
-                // Write content to custom location
-                let custom_action_file = Self::preferred_skill_markdown_path(&custom_action_dir);
-                tokio::fs::write(&custom_action_file, content).await?;
-
-                // Re-sign the action manifest after edit
-                if let Some(ref guard) = self.action_guard {
-                    if let Err(e) = guard.resign_action(&custom_action_dir, name).await {
-                        tracing::warn!("Failed to re-sign action '{}': {}", name, e);
-                    }
-                }
-
-                tracing::info!(
-                    "Created custom copy of bundled action '{}' at {:?}",
-                    name,
-                    custom_action_file
-                );
-
-                // Update the in-memory action to point to the new custom location
-                let mut actions = self.actions.write().await;
-                if let Some(action) = actions.get_mut(name) {
-                    action.info.source = ActionSource::Custom;
-                    action.info.file_path = Some(custom_action_file.to_string_lossy().to_string());
-                    action.workflow_content = Some(content.to_string());
-                }
-
-                return Ok(true);
-            }
-
-            // Custom actions - edit in place and update in-memory
-            if let Some(ref file_path) = action.info.file_path {
-                let fp = file_path.clone();
-                drop(actions); // Release lock before async file I/O
-                tokio::fs::write(&fp, content).await?;
-
-                // Re-sign the action manifest after edit
-                let action_dir = std::path::Path::new(&fp)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
-                if let Some(ref guard) = self.action_guard {
-                    if let Err(e) = guard.resign_action(action_dir, name).await {
-                        tracing::warn!("Failed to re-sign action '{}': {}", name, e);
-                    }
-                }
-
-                // Re-parse and update in-memory action
-                if let Ok((new_info, new_content, _frontmatter)) = self
-                    .parse_action_md(std::path::Path::new(&fp), ActionSource::Custom)
-                    .await
-                {
-                    let mut actions = self.actions.write().await;
-                    if let Some(action) = actions.get_mut(name) {
-                        action.info = new_info;
-                        action.workflow_content = Some(new_content);
-                    }
-                }
-
-                return Ok(true);
+        tokio::fs::write(&action_file, content).await?;
+        if let Some(ref guard) = self.action_guard {
+            if let Err(error) = guard.resign_action(&action_dir, name).await {
+                tracing::warn!("Failed to re-sign action '{}': {}", name, error);
             }
         }
-        Ok(false)
+
+        let (new_info, new_content, frontmatter) = self
+            .parse_action_md(&action_file, action_source.clone())
+            .await?;
+        let review = self
+            .review_markdown_action(&action_dir, &new_info, &new_content, &frontmatter)
+            .await?;
+
+        {
+            let mut actions = self.actions.write().await;
+            if let Some(action) = actions.get_mut(name) {
+                action.info = new_info;
+                action.info.source = action_source;
+                action.info.file_path = Some(action_file.to_string_lossy().to_string());
+                action.workflow_content = Some(new_content);
+            }
+        }
+
+        self.upsert_action_review(review.clone()).await?;
+        if review.allow_execute {
+            let mut disabled = self.disabled_actions.write().await;
+            if disabled.remove(name) {
+                drop(disabled);
+                self.save_disabled_actions().await?;
+            }
+        } else {
+            let mut disabled = self.disabled_actions.write().await;
+            if disabled.insert(name.to_string()) {
+                drop(disabled);
+                self.save_disabled_actions().await?;
+            }
+        }
+
+        tracing::info!(
+            "Updated action '{}' and refreshed security review state",
+            name
+        );
+        Ok(true)
     }
 
     /// Create a new custom action with security verification
@@ -6965,6 +9880,9 @@ print(result["text"])
         content: &str,
         force: bool,
     ) -> Result<Option<crate::security::action_guard::ActionSecurityVerdict>> {
+        let guard = self.action_guard.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Action security is unavailable, so importing new skills is disabled.")
+        })?;
         let action_dir = self.actions_dir.join(name);
         tokio::fs::create_dir_all(&action_dir).await?;
 
@@ -6972,13 +9890,72 @@ print(result["text"])
         tokio::fs::write(&action_file, content).await?;
 
         // Sign the new action manifest
-        if let Some(ref guard) = self.action_guard {
-            if let Err(e) = guard.resign_action(&action_dir, name).await {
-                tracing::warn!("Failed to sign new action '{}': {}", name, e);
-            }
+        if let Err(e) = guard.resign_action(&action_dir, name).await {
+            tracing::warn!("Failed to sign new action '{}': {}", name, e);
         }
 
-        // Immediately register into runtime (no restart needed)
+        let (info, workflow_content, frontmatter) = self
+            .parse_action_md(&action_file, ActionSource::Custom)
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to parse action: {}", error))?;
+        let verdict = guard
+            .evaluate_action(&action_dir, name, &workflow_content, &frontmatter)
+            .await?;
+        let required_env = Self::extract_required_envs_from_frontmatter(&frontmatter);
+        let missing_env = self
+            .compute_missing_required_envs(&info.name, &required_env)
+            .await?;
+        let fingerprint = crate::security::ActionGuard::compute_bundle_hash(&action_dir)
+            .unwrap_or_else(|_| Self::fingerprint_text(&[&workflow_content, &frontmatter]));
+        let mut review = Self::build_review_from_verdict(ActionReviewBuildInput {
+            action_name: &info.name,
+            source_kind: Self::action_source_label(&info.source),
+            fingerprint,
+            verdict: &verdict,
+            required_env,
+            missing_env,
+            requires_auth: false,
+            auth_configured: true,
+            notes: Vec::new(),
+        });
+        let blocked = !verdict.allow_load;
+
+        if blocked && !force {
+            tracing::warn!(
+                "New action '{}' BLOCKED by security guard: {:?}",
+                name,
+                verdict.warnings
+            );
+            let _ = tokio::fs::remove_dir_all(&action_dir).await;
+            self.remove_action_review(name).await?;
+            return Ok(Some(verdict));
+        }
+
+        for warning in &verdict.warnings {
+            tracing::warn!("Action '{}': {}", name, warning);
+        }
+        if blocked && force {
+            tracing::warn!("Action '{}' force-loaded despite security warnings", name);
+            review.status = ActionReviewStatus::Warning;
+            review.ready = true;
+            review.allow_execute = true;
+            review.visible_in_catalog = true;
+            review.blocked_reason = None;
+            review
+                .notes
+                .push("Security review was explicitly overridden during import.".to_string());
+        }
+
+        self.register_workflow_action(info, workflow_content).await;
+        self.upsert_action_review(review).await?;
+        tracing::info!(
+            "Created and registered action '{}' at {:?}",
+            name,
+            action_file
+        );
+        Ok(Some(verdict))
+
+        /* Legacy duplicate import path removed.
         match self
             .parse_action_md(&action_file, ActionSource::Custom)
             .await
@@ -6993,7 +9970,7 @@ print(result["text"])
                         Ok(v) => Some(v),
                         Err(e) => {
                             tracing::warn!(
-                                "Security check failed for new action '{}': {} — loading anyway",
+                                "Security check failed for new action '{}': {} â€” loading anyway",
                                 name,
                                 e
                             );
@@ -7040,6 +10017,7 @@ print(result["text"])
                 Err(anyhow::anyhow!("Failed to parse action: {}", e))
             }
         }
+        */
     }
 
     fn capability_acquire_required_inputs(arguments: &serde_json::Value) -> Vec<String> {
@@ -7958,6 +10936,9 @@ required:{required_block}
         name: &str,
         content: &str,
     ) -> Result<Option<crate::security::action_guard::ActionSecurityVerdict>> {
+        let guard = self.action_guard.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Action security is unavailable, so skill preview is disabled.")
+        })?;
         let preview_dir = self.actions_dir.join(format!(
             ".preview-{}-{}",
             name,
@@ -7973,26 +10954,10 @@ required:{required_block}
             .map_err(|e| anyhow::anyhow!("Failed to parse action preview: {}", e));
 
         let verdict = match parsed {
-            Ok((_info, workflow_content, frontmatter)) => {
-                if let Some(ref guard) = self.action_guard {
-                    match guard
-                        .evaluate_action(&preview_dir, name, &workflow_content, &frontmatter)
-                        .await
-                    {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Security check failed for action preview '{}': {}",
-                                name,
-                                e
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
+            Ok((_info, workflow_content, frontmatter)) => guard
+                .evaluate_action(&preview_dir, name, &workflow_content, &frontmatter)
+                .await
+                .map(Some),
             Err(e) => {
                 let _ = tokio::fs::remove_dir_all(&preview_dir).await;
                 return Err(e);
@@ -8000,12 +10965,12 @@ required:{required_block}
         };
 
         let _ = tokio::fs::remove_dir_all(&preview_dir).await;
-        Ok(verdict)
+        verdict
     }
 
     /// Delete/disable an action.
     /// - Custom actions: deleted from disk and runtime.
-    /// - Bundled actions: persisted as disabled and removed from runtime.
+    /// - Bundled actions: deleted from runtime-owned bundled directories for this install.
     /// - System actions: cannot be deleted/disabled.
     pub async fn delete_action(&self, name: &str) -> Result<bool> {
         let (source, file_path) = {
@@ -8019,12 +10984,22 @@ required:{required_block}
         match source {
             ActionSource::System => Ok(false),
             ActionSource::Bundled => {
+                self.delete_runtime_owned_bundled_skill_dir(name).await?;
+                {
+                    let mut removed = self.removed_bundled_actions.write().await;
+                    removed.insert(name.to_string());
+                }
                 {
                     let mut disabled = self.disabled_actions.write().await;
-                    disabled.insert(name.to_string());
+                    disabled.remove(name);
                 }
+                self.save_removed_bundled_actions().await?;
                 self.save_disabled_actions().await?;
-                tracing::info!("Disabled bundled action '{}'", name);
+                self.clear_action_secret_bindings(name).await?;
+                self.remove_action_review(name).await?;
+                let mut actions = self.actions.write().await;
+                actions.remove(name);
+                tracing::info!("Deleted bundled action '{}' for this install", name);
                 Ok(true)
             }
             ActionSource::Custom => {
@@ -8037,6 +11012,13 @@ required:{required_block}
                         }
                     }
                 }
+                {
+                    let mut disabled = self.disabled_actions.write().await;
+                    disabled.remove(name);
+                }
+                self.save_disabled_actions().await?;
+                self.clear_action_secret_bindings(name).await?;
+                self.remove_action_review(name).await?;
                 let mut actions = self.actions.write().await;
                 actions.remove(name);
                 tracing::info!("Deleted custom action '{}'", name);
@@ -8460,7 +11442,7 @@ required:{required_block}
     }
 
     /// Load markdown-defined actions from a directory
-    /// Looks for SKILL.md files in subdirectories, with ACTION.md as a legacy fallback.
+    /// Looks for SKILL.md files in subdirectories.
     /// These are registered as workflow actions for LLM-driven execution
     pub async fn load_markdown_actions(&self, dir: &Path, source: ActionSource) -> Result<()> {
         if !dir.exists() {
@@ -8489,6 +11471,15 @@ required:{required_block}
             match self.parse_action_md(&md_file, source.clone()).await {
                 Ok((info, workflow_content, frontmatter)) => {
                     if source == ActionSource::Bundled {
+                        let removed = self.removed_bundled_actions.read().await;
+                        if removed.contains(&info.name) {
+                            tracing::info!(
+                                "Skipped deleted bundled action '{}' from {:?}",
+                                info.name,
+                                md_file
+                            );
+                            continue;
+                        }
                         let disabled = self.disabled_actions.read().await;
                         if disabled.contains(&info.name) {
                             tracing::info!(
@@ -8499,7 +11490,27 @@ required:{required_block}
                         }
                     }
 
-                    // Run security evaluation if action guard is set
+                    let review = self
+                        .review_markdown_action(&path, &info, &workflow_content, &frontmatter)
+                        .await?;
+                    for warning in &review.warnings {
+                        tracing::warn!("Action '{}': {}", info.name, warning);
+                    }
+                    if !review.allow_execute {
+                        tracing::warn!(
+                            "Loaded action '{}' in blocked/unready state: {:?}",
+                            info.name,
+                            review.blocked_reason
+                        );
+                    }
+
+                    tracing::info!("Loaded workflow action '{}' from {:?}", info.name, md_file);
+                    self.register_workflow_action(info.clone(), workflow_content.clone())
+                        .await;
+                    self.upsert_action_review(review).await?;
+                    continue;
+
+                    /* Legacy duplicate security-evaluation path removed.
                     if let Some(ref guard) = self.action_guard {
                         match guard
                             .evaluate_action(&path, &info.name, &workflow_content, &frontmatter)
@@ -8520,7 +11531,7 @@ required:{required_block}
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "Security check failed for '{}': {} — loading anyway",
+                                    "Security check failed for '{}': {} â€” loading anyway",
                                     info.name,
                                     e
                                 );
@@ -8530,6 +11541,7 @@ required:{required_block}
 
                     tracing::info!("Loaded workflow action '{}' from {:?}", info.name, md_file);
                     self.register_workflow_action(info, workflow_content).await;
+                    */
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load action from {:?}: {}", md_file, e);
@@ -8540,8 +11552,7 @@ required:{required_block}
         Ok(())
     }
 
-    /// Parse a SKILL.md file to extract action information and full content
-    /// Legacy ACTION.md files are also accepted.
+    /// Parse a SKILL.md file to extract action information and full content.
     /// Returns (ActionDef, full_workflow_content, frontmatter_text)
     async fn parse_action_md(
         &self,
@@ -8612,6 +11623,7 @@ required:{required_block}
             sandbox_mode: Some(SandboxMode::Native),
             source,
             file_path: Some(path.to_string_lossy().to_string()),
+            authorization: Default::default(),
         };
 
         // Return the info, full content, and frontmatter for security evaluation
@@ -8626,16 +11638,16 @@ required:{required_block}
     ) -> Result<String> {
         use wasmtime::*;
 
-        let engine = Engine::default();
+        let engine = self.sandbox.engine();
 
-        // Create a basic store without WASI for simple modules
-        let mut store = Store::new(&engine, ());
+        // Create a basic store without WASI for simple modules, but enforce configured limits.
+        let mut store = self.sandbox.new_store();
 
         // Compile the module
-        let module = Module::new(&engine, wasm_bytes)?;
+        let module = Module::new(engine, wasm_bytes)?;
 
         // Create a linker and instantiate
-        let linker = Linker::new(&engine);
+        let linker = Linker::new(engine);
         let instance = linker.instantiate(&mut store, &module)?;
 
         // Try to find entry points
@@ -8744,6 +11756,61 @@ mod tests {
     use super::*;
     use crate::integrations::integration_enabled_key;
 
+    #[test]
+    fn parse_schedule_task_completion_accepts_legacy_and_structured_markers() {
+        let legacy =
+            parse_schedule_task_completion("Task scheduled: backup | Schedule: cron:0 9 * * *")
+                .expect("legacy schedule text should parse");
+        assert_eq!(legacy.tool, "schedule_task");
+        assert_eq!(legacy.status, "completed");
+        assert!(legacy
+            .detail
+            .as_deref()
+            .expect("legacy schedule detail")
+            .contains("backup"));
+
+        let structured = format!(
+            "{}{}",
+            TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "schedule_task",
+                "status": "completed",
+                "detail": "Task scheduled"
+            })
+        );
+        let structured = parse_schedule_task_completion(&structured)
+            .expect("structured schedule marker should parse");
+        assert_eq!(structured.tool, "schedule_task");
+        assert_eq!(structured.status, "completed");
+    }
+
+    #[test]
+    fn parse_watch_completion_accepts_legacy_and_structured_markers() {
+        let legacy = parse_watch_completion("Watch created: inbox changes")
+            .expect("legacy watch text should parse");
+        assert_eq!(legacy.tool, "watch");
+        assert_eq!(legacy.status, "completed");
+        assert!(legacy
+            .detail
+            .as_deref()
+            .expect("legacy watch detail")
+            .contains("inbox"));
+
+        let structured = format!(
+            "{}{}",
+            TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "watch",
+                "status": "completed",
+                "detail": "Watch created"
+            })
+        );
+        let structured =
+            parse_watch_completion(&structured).expect("structured watch marker should parse");
+        assert_eq!(structured.tool, "watch");
+        assert_eq!(structured.status, "completed");
+    }
+
     #[tokio::test]
     async fn app_management_schemas_avoid_top_level_combinators() {
         let temp = tempfile::tempdir().unwrap();
@@ -8843,6 +11910,37 @@ mod tests {
         assert!(ActionRuntime::loopback_http_get_allowed(&url).is_ok());
     }
 
+    #[tokio::test]
+    async fn connector_request_rejects_local_and_private_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
+
+        let localhost = runtime
+            .validate_connector_request_url("http://127.0.0.1:8990/health")
+            .await
+            .unwrap_err();
+        assert!(
+            localhost.to_string().contains("localhost")
+                || localhost.to_string().contains("loopback")
+        );
+
+        let private_ip = runtime
+            .validate_connector_request_url("http://10.0.0.8/internal")
+            .await
+            .unwrap_err();
+        assert!(private_ip.to_string().contains("private"));
+    }
+
+    #[test]
+    fn docker_unavailable_error_fails_closed() {
+        let shell_error = ActionRuntime::docker_required_error("shell").to_string();
+        let code_error = ActionRuntime::docker_required_error("code_execute").to_string();
+
+        assert!(shell_error.contains("Docker is required"));
+        assert!(shell_error.contains("shell"));
+        assert!(code_error.contains("code_execute"));
+    }
+
     #[test]
     fn native_env_overrides_block_runtime_control_keys() {
         let args = serde_json::json!({
@@ -8855,32 +11953,74 @@ mod tests {
     }
 
     #[test]
-    fn workspace_alias_paths_remap_to_current_dir() {
+    fn workspace_alias_paths_remap_to_workspace_root() {
         let runtime = ActionRuntime {
             config: RuntimeConfig::default(),
-            _sandbox: ActionSandbox::new(&RuntimeConfig::default()).unwrap(),
+            sandbox: ActionSandbox::new(&RuntimeConfig::default()).unwrap(),
             transactions: tokio::sync::Mutex::new(TransactionManager::new(PathBuf::from(
                 "snapshots",
             ))),
             actions: tokio::sync::RwLock::new(HashMap::new()),
             disabled_actions: tokio::sync::RwLock::new(HashSet::new()),
             disabled_actions_file: PathBuf::from("./disabled_actions.json"),
+            action_reviews: tokio::sync::RwLock::new(HashMap::new()),
+            action_reviews_file: PathBuf::from("./action_reviews.json"),
+            removed_bundled_actions: tokio::sync::RwLock::new(HashSet::new()),
+            removed_bundled_actions_file: PathBuf::from("./removed_bundled_actions.json"),
             actions_dir: PathBuf::from("./skills"),
             cli_skills_dir: PathBuf::from("./cli_skills"),
             config_dir: PathBuf::from("."),
+            auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
             task_queue: None,
             action_guard: None,
             storage: None,
             mcp_registry: None,
             plugin_registry: None,
+            #[cfg(feature = "docker")]
+            active_sandbox_containers: tokio::sync::RwLock::new(HashSet::new()),
+            #[cfg(feature = "docker")]
+            container_reaper_status: tokio::sync::RwLock::new(ContainerReaperStatus::default()),
         };
-        let cwd = std::env::current_dir().unwrap();
+        let workspace_root = runtime.workspace_root();
         assert_eq!(
             runtime
                 .absolutize_tool_path("/workspace/demo/index.html")
                 .unwrap(),
-            cwd.join("demo").join("index.html")
+            workspace_root.join("demo").join("index.html")
         );
+    }
+
+    #[test]
+    fn find_project_root_from_path_walks_up_to_cargo_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("target").join("release");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let exe_path = nested.join(if cfg!(windows) {
+            "agentark.exe"
+        } else {
+            "agentark"
+        });
+        std::fs::write(&exe_path, "").unwrap();
+
+        let detected = ActionRuntime::find_project_root_from_path(&exe_path)
+            .expect("project root should be detected");
+        assert_eq!(detected, root);
+    }
+
+    #[test]
+    fn runtime_owned_bundled_dir_requires_app_skills() {
+        assert!(ActionRuntime::is_runtime_owned_bundled_dir(Path::new(
+            "/app/skills"
+        )));
+        assert!(!ActionRuntime::is_runtime_owned_bundled_dir(Path::new(
+            "./skills"
+        )));
     }
 
     #[test]
@@ -8964,5 +12104,127 @@ version: "1.2.3"
         };
         let output = runtime.execute_action("echo-cli", &args).await.unwrap();
         assert!(output.contains("ready"));
+    }
+
+    async fn runtime_for_authorization_tests() -> ActionRuntime {
+        let temp = tempfile::tempdir().unwrap();
+        ActionRuntime::new(temp.path(), temp.path()).await.unwrap()
+    }
+
+    async fn action_def_by_name(runtime: &ActionRuntime, name: &str) -> ActionDef {
+        runtime
+            .list_actions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|action| action.name == name)
+            .expect("action should exist")
+    }
+
+    #[tokio::test]
+    async fn trusted_chat_allows_high_risk_builtin_actions() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "code_execute").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "code_execute",
+                Some(&action),
+                &serde_json::json!({}),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Chat,
+                    direct_user_intent: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(decision.allowed);
+    }
+
+    #[tokio::test]
+    async fn trusted_api_allows_high_risk_builtin_actions() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "shell").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "shell",
+                Some(&action),
+                &serde_json::json!({ "command": "pwd" }),
+                &ActionAuthorizationContext {
+                    principal: Some(ActionCallerPrincipal::local_admin("test")),
+                    surface: ActionExecutionSurface::Api,
+                    direct_user_intent: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(decision.allowed);
+    }
+
+    #[tokio::test]
+    async fn background_blocks_high_risk_builtin_actions() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "app_deploy").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "app_deploy",
+                Some(&action),
+                &serde_json::json!({}),
+                &ActionAuthorizationContext {
+                    principal: None,
+                    surface: ActionExecutionSurface::Background,
+                    direct_user_intent: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("background or automation"));
+    }
+
+    #[tokio::test]
+    async fn read_only_background_actions_still_work() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "file_read").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "file_read",
+                Some(&action),
+                &serde_json::json!({ "path": "README.md" }),
+                &ActionAuthorizationContext {
+                    principal: None,
+                    surface: ActionExecutionSurface::Background,
+                    direct_user_intent: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(decision.allowed);
+    }
+
+    #[tokio::test]
+    async fn api_without_principal_blocks_high_risk_actions() {
+        let runtime = runtime_for_authorization_tests().await;
+        let action = action_def_by_name(&runtime, "shell").await;
+        let decision = runtime
+            .authorize_action_invocation(
+                "shell",
+                Some(&action),
+                &serde_json::json!({ "command": "pwd" }),
+                &ActionAuthorizationContext {
+                    principal: None,
+                    surface: ActionExecutionSurface::Api,
+                    direct_user_intent: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("trusted local session"));
     }
 }

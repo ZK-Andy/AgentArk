@@ -82,6 +82,8 @@ pub struct CustomApiConfig {
     pub enabled: bool,
     pub auth_mode: CustomApiAuthMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_name: Option<String>,
@@ -154,6 +156,8 @@ pub struct CustomApiUpsertRequest {
     #[serde(default)]
     pub auth_mode: Option<CustomApiAuthMode>,
     #[serde(default)]
+    pub auth_profile_id: Option<String>,
+    #[serde(default)]
     pub auth_header: Option<String>,
     #[serde(default)]
     pub auth_name: Option<String>,
@@ -200,28 +204,33 @@ pub async fn list_custom_apis(
     let manager = SecureConfigManager::new_with_data_dir(config_dir, Some(data_dir))?;
     let mut rows = load_configs(storage).await?;
     rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    Ok(rows
-        .into_iter()
-        .map(|config| {
-            let secret_configured = manager
+    let mut views = Vec::with_capacity(rows.len());
+    for config in rows {
+        let secret_configured = if let Some(auth_profile_id) = config.auth_profile_id.as_deref() {
+            crate::core::auth_profiles::AuthProfileControlPlane::get(storage, auth_profile_id)
+                .await?
+                .is_some_and(|profile| profile.ready)
+        } else {
+            manager
                 .get_custom_secret(&custom_api_secret_key(&config.id))
                 .ok()
                 .flatten()
-                .is_some_and(|value| !value.trim().is_empty());
-            let test_action_name = find_testable_action(&config);
-            let action_count = config
-                .operations
-                .iter()
-                .filter(|op| op.draft.enabled)
-                .count();
-            CustomApiView {
-                config,
-                secret_configured,
-                action_count,
-                test_action_name,
-            }
-        })
-        .collect())
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        let test_action_name = find_testable_action(&config);
+        let action_count = config
+            .operations
+            .iter()
+            .filter(|op| op.draft.enabled)
+            .count();
+        views.push(CustomApiView {
+            config,
+            secret_configured,
+            action_count,
+            test_action_name,
+        });
+    }
+    Ok(views)
 }
 
 pub async fn preview_custom_api(request: CustomApiPreviewRequest) -> Result<CustomApiPreview> {
@@ -301,6 +310,24 @@ pub async fn upsert_custom_api(
             .map(|item| item.auth_mode)
             .unwrap_or_default()
     });
+    let auth_profile_id = clean_optional_string(request.auth_profile_id.as_deref()).or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|item| item.auth_profile_id.clone())
+    });
+    if matches!(auth_mode, CustomApiAuthMode::OAuth2) && auth_profile_id.is_none() {
+        anyhow::bail!(
+            "OAuth2 custom APIs require an auth_profile_id bound to a real OAuth auth profile."
+        );
+    }
+    if let Some(profile_id) = auth_profile_id.as_deref() {
+        if crate::core::auth_profiles::AuthProfileControlPlane::get(storage, profile_id)
+            .await?
+            .is_none()
+        {
+            anyhow::bail!("Auth profile '{}' was not found.", profile_id);
+        }
+    }
     let auth_header = clean_optional_string(request.auth_header.as_deref())
         .or_else(|| existing.as_ref().and_then(|item| item.auth_header.clone()));
     let auth_name = clean_optional_string(request.auth_name.as_deref())
@@ -334,7 +361,10 @@ pub async fn upsert_custom_api(
     let secret_configured = manager
         .get_custom_secret(&custom_api_secret_key(&id))?
         .is_some_and(|value| !value.trim().is_empty());
-    if !matches!(auth_mode, CustomApiAuthMode::None) && !secret_configured {
+    if auth_profile_id.is_none()
+        && !matches!(auth_mode, CustomApiAuthMode::None)
+        && !secret_configured
+    {
         anyhow::bail!("This auth mode requires a secret or token.");
     }
 
@@ -345,6 +375,7 @@ pub async fn upsert_custom_api(
         base_url,
         enabled: request.enabled.unwrap_or(true),
         auth_mode,
+        auth_profile_id,
         auth_header,
         auth_name,
         auth_username,
@@ -413,8 +444,17 @@ pub async fn test_custom_api(
     let tested_at = chrono::Utc::now().to_rfc3339();
     let execution = runtime.execute_action(&action_name, &json!({})).await;
     let (ok, detail) = match execution {
-        Ok(detail) => (true, clip_chars(&detail, 1_500)),
-        Err(error) => (false, clip_chars(&error.to_string(), 1_500)),
+        Ok(detail) => (
+            true,
+            clip_chars(&crate::security::redact_secret_input(&detail).text, 1_500),
+        ),
+        Err(error) => (
+            false,
+            clip_chars(
+                &crate::security::redact_secret_input(&error.to_string()).text,
+                1_500,
+            ),
+        ),
     };
 
     configs[index].last_tested_at = Some(tested_at);
@@ -479,6 +519,7 @@ async fn register_config(runtime: &ActionRuntime, config: &CustomApiConfig) -> R
                     sandbox_mode: Some(SandboxMode::Native),
                     source: ActionSource::System,
                     file_path: None,
+                    authorization: Default::default(),
                 },
                 CustomApiBinding {
                     api_id: config.id.clone(),
@@ -490,6 +531,7 @@ async fn register_config(runtime: &ActionRuntime, config: &CustomApiConfig) -> R
                     path: operation.draft.path.clone(),
                     read_only: operation.draft.read_only,
                     secret_key: custom_api_secret_key(&config.id),
+                    auth_profile_id: config.auth_profile_id.clone(),
                     auth_mode: config.auth_mode,
                     auth_header: config.auth_header.clone(),
                     auth_name: config.auth_name.clone(),
@@ -1205,6 +1247,7 @@ mod tests {
                 base_url: "http://127.0.0.1:9".to_string(),
                 enabled: Some(true),
                 auth_mode: Some(CustomApiAuthMode::None),
+                auth_profile_id: None,
                 auth_header: None,
                 auth_name: None,
                 auth_username: None,

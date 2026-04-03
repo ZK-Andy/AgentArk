@@ -17,6 +17,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -602,7 +603,8 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
           This is the ingress view. Tasks and Trace show what the agent actually executed after a webhook matched.
         </Typography>
         {eventsQ.error ? <Alert severity="error">{errMessage(eventsQ.error)}</Alert> : null}
-        <Table size="small">
+        <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
+        <Table size="small" sx={{ minWidth: 760 }}>
           <TableHead>
             <TableRow>
               <TableCell>When</TableCell>
@@ -645,6 +647,7 @@ export function WebhooksPanel({ autoRefresh }: WebhooksPanelProps) {
             )}
           </TableBody>
         </Table>
+        </TableContainer>
       </Stack>
     </Stack>
   );

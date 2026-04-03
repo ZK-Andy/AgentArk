@@ -366,7 +366,7 @@ export function DevicesControlPanel({
                     Pair node
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    This currently registers a device record in the control plane. A real iPhone/macOS pairing
+                    This currently registers a device record in AgentArk. A real iPhone/macOS pairing
                     handshake is not implemented yet.
                   </Typography>
                   <TextField label="Node name" size="small" value={draftName} onChange={(event) => setDraftName(event.target.value)} />

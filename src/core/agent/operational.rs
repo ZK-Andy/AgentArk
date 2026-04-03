@@ -14,6 +14,8 @@ pub(crate) struct OperationalEvent<'a> {
     pub strategy_version: Option<&'a str>,
     pub policy_version: Option<&'a str>,
     pub prompt_version: Option<&'a str>,
+    pub classifier_prompt_version: Option<&'a str>,
+    pub specialist_prompt_version: Option<&'a str>,
     pub model_slot: Option<&'a str>,
 }
 
@@ -61,7 +63,33 @@ impl Agent {
                 .map(|s| Self::sanitize_operational_text(&s, 1200))
         });
         let payload_text = event.payload.and_then(|v| {
-            serde_json::to_string(v)
+            let mut payload = v.clone();
+            if event.classifier_prompt_version.is_some()
+                || event.specialist_prompt_version.is_some()
+            {
+                let mut object = match payload {
+                    serde_json::Value::Object(obj) => obj,
+                    other => {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("payload".to_string(), other);
+                        obj
+                    }
+                };
+                if let Some(version) = event.classifier_prompt_version {
+                    object.insert(
+                        "classifier_prompt_version".to_string(),
+                        serde_json::Value::String(version.to_string()),
+                    );
+                }
+                if let Some(version) = event.specialist_prompt_version {
+                    object.insert(
+                        "specialist_prompt_version".to_string(),
+                        serde_json::Value::String(version.to_string()),
+                    );
+                }
+                payload = serde_json::Value::Object(object);
+            }
+            serde_json::to_string(&payload)
                 .ok()
                 .map(|s| Self::sanitize_operational_text(&s, 2000))
         });
@@ -100,7 +128,40 @@ impl Agent {
         Some(value)
     }
 
+    async fn load_prompt_bundle_by_key(
+        &self,
+        key: &str,
+    ) -> Option<crate::core::self_evolve::PromptBundleProfile> {
+        let raw = self.storage.get(key).await.ok().flatten()?;
+        crate::core::self_evolve::prompt_evolution::parse_prompt_bundle_profile(&raw)
+    }
+
+    async fn load_classifier_prompt_bundle_by_key(
+        &self,
+        key: &str,
+    ) -> Option<crate::core::self_evolve::ClassifierPromptBundleProfile> {
+        let raw = self.storage.get(key).await.ok().flatten()?;
+        crate::core::self_evolve::classifier_prompt_evolution::parse_classifier_prompt_bundle_profile(&raw)
+    }
+
+    async fn load_specialist_prompt_bundle_by_key(
+        &self,
+        key: &str,
+    ) -> Option<crate::core::self_evolve::SpecialistPromptBundleProfile> {
+        let raw = self.storage.get(key).await.ok().flatten()?;
+        crate::core::self_evolve::specialist_prompt_evolution::parse_specialist_prompt_bundle_profile(&raw)
+    }
+
     fn strategy_seed_for_message(message: &str) -> String {
+        let normalized = message.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            "_empty".to_string()
+        } else {
+            normalized
+        }
+    }
+
+    fn prompt_seed_for_message(message: &str) -> String {
         let normalized = message.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             "_empty".to_string()
@@ -199,6 +260,133 @@ impl Agent {
             &profile, &task_type,
         )?;
         Some((block, strategy_version, task_type))
+    }
+
+    pub(crate) async fn active_prompt_bundle_for_message(
+        &self,
+        message: &str,
+    ) -> crate::core::self_evolve::PromptBundleProfile {
+        let mut selected = self
+            .load_prompt_bundle_by_key(crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY)
+            .await
+            .unwrap_or_default();
+
+        let canary_state_raw = self
+            .storage
+            .get(crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = canary_state_raw {
+            if let Ok(state) = serde_json::from_slice::<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            >(&raw)
+            {
+                if state.enabled
+                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                        &Self::prompt_seed_for_message(message),
+                        state.rollout_percent,
+                    )
+                {
+                    if let Some(canary) = self
+                        .load_prompt_bundle_by_key(
+                            crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        )
+                        .await
+                    {
+                        selected = canary;
+                    }
+                }
+            }
+        }
+
+        selected
+    }
+
+    pub(crate) async fn active_classifier_prompt_bundle_for_message(
+        &self,
+        message: &str,
+    ) -> crate::core::self_evolve::ClassifierPromptBundleProfile {
+        let mut selected = self
+            .load_classifier_prompt_bundle_by_key(
+                crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_KEY,
+            )
+            .await
+            .unwrap_or_default();
+
+        let canary_state_raw = self
+            .storage
+            .get(crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = canary_state_raw {
+            if let Ok(state) = serde_json::from_slice::<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            >(&raw)
+            {
+                if state.enabled
+                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                        &Self::prompt_seed_for_message(message),
+                        state.rollout_percent,
+                    )
+                {
+                    if let Some(canary) = self
+                        .load_classifier_prompt_bundle_by_key(
+                            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        )
+                        .await
+                    {
+                        selected = canary;
+                    }
+                }
+            }
+        }
+
+        selected
+    }
+
+    pub(crate) async fn active_specialist_prompt_bundle_for_message(
+        &self,
+        message: &str,
+    ) -> crate::core::self_evolve::SpecialistPromptBundleProfile {
+        let mut selected = self
+            .load_specialist_prompt_bundle_by_key(
+                crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+            )
+            .await
+            .unwrap_or_default();
+
+        let canary_state_raw = self
+            .storage
+            .get(crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = canary_state_raw {
+            if let Ok(state) = serde_json::from_slice::<
+                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+            >(&raw)
+            {
+                if state.enabled
+                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
+                        &Self::prompt_seed_for_message(message),
+                        state.rollout_percent,
+                    )
+                {
+                    if let Some(canary) = self
+                        .load_specialist_prompt_bundle_by_key(
+                            crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                        )
+                        .await
+                    {
+                        selected = canary;
+                    }
+                }
+            }
+        }
+
+        selected
     }
 }
 

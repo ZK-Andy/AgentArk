@@ -10,8 +10,7 @@ pub struct Model {
     pub id: String,
     pub content: String,
     pub context: String,
-    #[sea_orm(column_type = "Blob", nullable)]
-    pub embedding: Option<Vec<u8>>,
+    pub embedding: Option<PgVector>,
     pub timestamp: String,
     #[sea_orm(default_value = false)]
     pub consolidated: bool,

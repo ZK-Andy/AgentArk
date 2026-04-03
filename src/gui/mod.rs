@@ -15,14 +15,14 @@ pub async fn run(agent: Agent) -> Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("AgentArk"),
+            .with_title(crate::branding::PRODUCT_NAME),
         ..Default::default()
     };
 
     let app = AgentArkApp::new(agent);
 
     eframe::run_native(
-        "AgentArk",
+        crate::branding::PRODUCT_NAME,
         options,
         Box::new(|cc| {
             // Configure fonts and style
@@ -43,14 +43,18 @@ pub async fn run_setup_wizard(agent: Agent) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 500.0])
-            .with_title("AgentArk Setup"),
+            .with_title(format!("{} Setup", crate::branding::PRODUCT_NAME)),
         ..Default::default()
     };
 
     let app = views::SetupWizard::new(agent);
 
-    eframe::run_native("AgentArk Setup", options, Box::new(|_cc| Ok(Box::new(app))))
-        .map_err(|e| anyhow::anyhow!("Setup wizard error: {}", e))?;
+    eframe::run_native(
+        &format!("{} Setup", crate::branding::PRODUCT_NAME),
+        options,
+        Box::new(|_cc| Ok(Box::new(app))),
+    )
+    .map_err(|e| anyhow::anyhow!("Setup wizard error: {}", e))?;
 
     Ok(())
 }

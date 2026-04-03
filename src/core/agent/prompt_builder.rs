@@ -57,8 +57,9 @@ impl Agent {
     pub(crate) async fn build_system_prompt(
         &self,
         memories: &[crate::memory::MemoryEntry],
+        prompt_bundle: Option<&crate::core::self_evolve::PromptBundleProfile>,
     ) -> Result<String> {
-        let bot_name = &self.config.name;
+        let bot_name = crate::branding::PRODUCT_NAME;
         let personality = &self.config.personality;
 
         let style_desc = match personality.as_str() {
@@ -98,13 +99,13 @@ impl Agent {
 - Never hardcode secrets into generated code or tool arguments. Use secret storage or sensitive runtime inputs.
 - Keep retries bounded. State or enforce a maximum attempt count and stop at the cap.
 - Be honest about uncertainty. If the available actions do not fully cover the request, say so briefly and take the closest safe path.
-- Lightweight saved user facts may already be included later in this prompt. Richer semantic memory, saved items, and durable knowledge are not prefetched; if prior context outside the visible prompt may affect the answer, use the relevant memory action from the catalog before answering.
+- A small set of high-confidence memories or document excerpts may already be included later in this prompt, along with lightweight saved user facts. Richer semantic memory, saved items, durable knowledge, and the full document library are not fully prefetched; if prior context or uploaded files outside the visible prompt may affect the answer, use the relevant memory or document action from the catalog before answering.
 - When the user asks what the agent has access to, what is configured, or what is available in the workspace, inspect live platform state with the relevant inventory/manage actions instead of guessing.
 - Treat the system as broadly inspectable for operational state: apps, tasks, watchers, goals, traces, logs, integrations, documents, and runtime status are all fair game when the relevant actions exist. Never reveal raw keys, tokens, passwords, or secret values.
 - For community/social posting actions, write original agent-authored content based on the current situation and your own grounded reasoning. Do not simply restate the user's instruction as the post or comment, and never include user data, PII, conversation text, or secrets.
 - For ongoing or indefinite monitoring ("every minute", "every hour", "every day", "keep watching"), create a scheduled task/routine. Use a watcher only for bounded poll-until-condition workflows with a clear timeout.
 - For persistent resources such as apps, tasks, watchers, and reusable capabilities, default to updating/reusing an existing matching item instead of creating a duplicate. Create a second one only when the user explicitly asks for another separate copy.
-- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. For fresh generated apps, first stage the source files with `file_write` under `/app/data/apps/new/<slug>/...`, then continue to deployment from those staged files. Do not rely on inline generated `app_deploy.files` as the only source of truth for a new app build. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so AgentArk can clone, inspect the README/manifests, and stand it up as a managed app. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
+- If the user asks to build, create, deploy, or run a live/public app or service and `app_deploy` exists in the action catalog, use `app_deploy` as the primary execution path instead of starting with `shell`. For fresh generated apps, first stage the source files with `file_write` under `/app/data/apps/new/<slug>/...`, then continue to deployment from those staged files. Do not rely on inline generated `app_deploy.files` as the only source of truth for a new app build. If the user provides a repo URL or asks to deploy/run an existing repo locally, emit `app_deploy` with `repo_url` (plus `repo_ref`, `repo_subdir`, `service_mode` when useful) so {product_name} can clone, inspect the README/manifests, and stand it up as a managed app. If the request also asks for recurring execution and `schedule_task` exists, use `schedule_task` after deployment instead of claiming scheduling is unavailable.
 - Use `browser_auto` only to interact with an existing website or web UI. Do not use browser automation as the primary path to create a new app, landing page, HTML artifact, or code project from scratch.
 - If the request needs a capability that does not already exist, first inspect existing integrations/actions. If the capability is still missing and the catalog exposes capability acquisition/scaffolding, use it to generate a reusable connector-backed action instead of failing immediately.
 
@@ -121,11 +122,47 @@ impl Agent {
 - Ground claims in the provided context, memories, artifacts, and tool outputs.
 "#,
             bot_name = bot_name,
+            product_name = crate::branding::PRODUCT_NAME,
             style_desc = style_desc,
         );
 
         prompt.push('\n');
-        prompt.push_str(crate::core::prompt_policy::global_policy_v2_block());
+        prompt.push_str(&crate::core::prompt_policy::global_policy_v2_block());
+
+        if let Some(bundle) = prompt_bundle {
+            let primary_response_prompt =
+                crate::core::self_evolve::prompt_evolution::render_primary_response_system_prompt(
+                    bundle,
+                );
+            if !primary_response_prompt.trim().is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&primary_response_prompt);
+            }
+        }
+
+        let effective_auto_approved =
+            crate::core::config::sanitize_auto_approve_actions(&self.config.auto_approve);
+        if !effective_auto_approved.is_empty() {
+            let preview = effective_auto_approved
+                .iter()
+                .take(10)
+                .map(|name| format!("`{}`", name))
+                .collect::<Vec<_>>();
+            let remaining = effective_auto_approved.len().saturating_sub(preview.len());
+            prompt.push_str("\n## Approval Overrides\n");
+            prompt.push_str(&format!(
+                "- The user has auto-approved these actions in Settings > Advanced: {}{}.\n",
+                preview.join(", "),
+                if remaining > 0 {
+                    format!(" (+{} more)", remaining)
+                } else {
+                    String::new()
+                }
+            ));
+            prompt.push_str(
+                "- Other actions can still require approval based on the current safety and permission checks.\n",
+            );
+        }
 
         if !memories.is_empty() {
             prompt.push_str("\n## Relevant Memories\n");
@@ -219,6 +256,8 @@ impl Agent {
             .ok()
             .map(|dir| dir.display().to_string())
             .unwrap_or_else(|| ".".to_string());
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
         let cpu_count = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(0);
@@ -229,7 +268,10 @@ impl Agent {
             docker_host.is_some() || std::path::Path::new("/var/run/docker.sock").exists();
         let managed_apps_root = std::path::Path::new("/app/data/apps").exists();
         lines.push(format!(
-            "- Operating context: running inside AgentArk from workspace `{}`{}.",
+            "- Operating context: running inside {} on `{}/{}` from workspace `{}`{}.",
+            crate::branding::PRODUCT_NAME,
+            os,
+            arch,
             cwd,
             if cpu_count > 0 {
                 format!(" with {} logical CPU(s) visible", cpu_count)
@@ -294,6 +336,12 @@ impl Agent {
         }
         if actions.iter().any(|action| action.name == "memory_lookup") {
             surfaces.push("durable memory");
+        }
+        if actions
+            .iter()
+            .any(|action| action.name == "document_lookup")
+        {
+            surfaces.push("indexed documents");
         }
         if !surfaces.is_empty() {
             lines.push(format!(
@@ -442,7 +490,7 @@ impl Agent {
         prompt
     }
 
-    /// Build a prompt that asks the LLM to produce a structured execution plan.
+    /* Obsolete planning helper removed from compilation.
     pub(crate) fn build_planning_prompt(
         user_message: &str,
         available_actions: &[crate::actions::ActionDef],
@@ -478,6 +526,7 @@ impl Agent {
         (system, user)
     }
 
+    */
     pub(crate) async fn persist_app_preview_screenshot(
         &self,
         app_id: &str,

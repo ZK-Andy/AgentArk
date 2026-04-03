@@ -13,7 +13,7 @@ import {
   Typography,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useUiStore } from "../store/uiStore";
@@ -24,10 +24,19 @@ import { buildAttentionItems } from "./NeedsAttentionInbox";
 import { TodaysHighlights } from "./TodaysHighlights";
 import { SmartSuggestions } from "./SmartSuggestions";
 import { ActivityFeed } from "./ActivityFeed";
-import type { BackgroundSessionSummary, RecommendedSkill, Task } from "../types";
+import { SuggestionRunDialog, type SuggestionRunState } from "./SuggestionRunDialog";
+import type {
+  AutonomyActionExecutionResponse,
+  BackgroundSessionSummary,
+  RecommendedSkill,
+  Task,
+  TraceSummary,
+  Notification,
+} from "../types";
 
 const REFRESH_MS = 8000;
 const ACTIVE_TASK_STALE_MS = 24 * 60 * 60 * 1000;
+type JsonRecord = Record<string, unknown>;
 type PausePhase = "idle" | "stopping" | "stopped" | "resuming" | "resumed";
 type AutomationObject = {
   id: string;
@@ -66,8 +75,28 @@ type AutomationRun = {
   view: string;
 };
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+type DailyBriefRunDialogState = {
+  outcome: "running" | "success" | "error";
+  title: string;
+  detail: string;
+  brief: string;
+  triggered_at: string;
+  result?: Record<string, unknown>;
+};
+
+function asRecord(value: unknown): JsonRecord {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
+}
+
+function pickRecords(value: unknown, key: string): JsonRecord[] {
+  const root = asRecord(value);
+  const items = root[key];
+  if (!Array.isArray(items)) return [];
+  return items.filter((item) => item && typeof item === "object" && !Array.isArray(item)) as JsonRecord[];
+}
+
+function str(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
 }
 
 function pickAutomationObjects(raw: unknown): AutomationObject[] {
@@ -113,23 +142,169 @@ function formatAutomationTime(value?: string | null): string {
 }
 
 function targetViewForAutomation(item: AutomationObject): string {
-  if (item.view) return item.view;
-  if (item.kind === "integration") return "settings";
-  if (item.kind === "watcher") return "watchers";
-  return item.kind;
+  const explicitView = String(item.view || "").trim();
+  if (explicitView) return explicitView;
+  const kind = String(item.kind || "").toLowerCase();
+  if (kind === "integration") return "settings";
+  if (kind === "watcher") return "watchers";
+  if (kind === "task") return "tasks";
+  if (kind === "app") return "apps";
+  if (kind === "session") return "sessions";
+  return "trace";
 }
 
 function targetViewForAutomationRun(item: AutomationRun): string {
-  if (item.view) return item.view;
-  if (item.kind === "watcher") return "watchers";
-  if (item.kind === "task") return "tasks";
-  if (item.kind === "app") return "apps";
+  const explicitView = String(item.view || "").trim();
+  if (explicitView) return explicitView;
+  const kind = String(item.kind || "").toLowerCase();
+  if (kind === "watcher") return "watchers";
+  if (kind === "task") return "tasks";
+  if (kind === "app") return "apps";
+  if (kind === "integration") return "settings";
+  if (kind === "session") return "sessions";
   return "trace";
 }
 
 function errMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message;
   return "Request failed.";
+}
+
+function humanTs(value: string): { label: string; tip: string } {
+  const raw = (value || "").trim();
+  if (!raw) return { label: "-", tip: "" };
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return { label: raw, tip: raw };
+  return {
+    label: date.toLocaleString(),
+    tip: date.toISOString()
+  };
+}
+
+function traceStepColor(stepType: string): "default" | "success" | "warning" | "error" | "info" {
+  const normalized = stepType.trim().toLowerCase();
+  if (["success", "completed", "done"].includes(normalized)) return "success";
+  if (["warning", "pending", "queued", "approval"].includes(normalized)) return "warning";
+  if (["error", "failed", "failure"].includes(normalized)) return "error";
+  if (["action", "tool", "thinking"].includes(normalized)) return "info";
+  return "default";
+}
+
+function buildSuggestionTraceConsoleView(step: JsonRecord): { detail: string; dataText: string } {
+  const detail = str(step.detail, str(step.title, "")).trim();
+  const data = step.data;
+  if (typeof data === "string") {
+    return { detail, dataText: data.trim() };
+  }
+  if (data && typeof data === "object") {
+    return { detail, dataText: JSON.stringify(data, null, 2) };
+  }
+  return { detail, dataText: "" };
+}
+
+function summarizeSuggestedRun(skill: RecommendedSkill, out: AutonomyActionExecutionResponse): string {
+  const result = asRecord(out.result);
+  const resultStatus = str(result.status, out.status).trim().toLowerCase();
+  if (resultStatus === "queued_for_approval") {
+    return `Queued "${skill.title}" for approval.`;
+  }
+  const message = str(out.message, "").trim();
+  if (message) return message;
+  const response = str(result.response, "").trim();
+  if (response) return response;
+  const brief = str(result.brief, "").trim();
+  if (brief) return "Generated a daily brief and attempted delivery.";
+  const taskId = str(result.task_id, "").trim();
+  if (taskId) {
+    return result.reused_existing === true ? `Reused existing task ${taskId}.` : `Created task ${taskId}.`;
+  }
+  return `Ran "${skill.title}".`;
+}
+
+function isDailyBriefSignal(value: unknown): boolean {
+  const text = String(value || "").toLowerCase();
+  return (
+    text.includes("daily brief") ||
+    text.includes("daily briefing") ||
+    text.includes("daily command brief")
+  );
+}
+
+function pickDailyBriefNotification(
+  notifications: Notification[],
+  triggeredAt?: string
+): Notification | null {
+  const triggeredMs = Date.parse(triggeredAt || "");
+  const matching = notifications.filter((item) => {
+    const source = String(item.source || "").toLowerCase();
+    return (
+      source.includes("daily_brief") ||
+      isDailyBriefSignal(item.title) ||
+      isDailyBriefSignal(item.body)
+    );
+  });
+  if (matching.length === 0) return null;
+  if (Number.isFinite(triggeredMs)) {
+    const near = matching.find((item) => Date.parse(item.created_at || "") >= triggeredMs - 60_000);
+    if (near) return near;
+  }
+  return matching[0] || null;
+}
+
+function pickDailyBriefTrace(traces: TraceSummary[], triggeredAt?: string): TraceSummary | null {
+  const triggeredMs = Date.parse(triggeredAt || "");
+  const matching = traces.filter((trace) => isDailyBriefSignal(trace.message_preview) || isDailyBriefSignal(trace.channel));
+  if (matching.length === 0) return null;
+  if (Number.isFinite(triggeredMs)) {
+    const near = matching.find((trace) => Date.parse(trace.started_at || "") >= triggeredMs - 60_000);
+    if (near) return near;
+  }
+  return matching[0] || null;
+}
+
+function pickDailyBriefAutomationRun(runs: AutomationRun[], triggeredAt?: string): AutomationRun | null {
+  const triggeredMs = Date.parse(triggeredAt || "");
+  const matching = runs.filter((run) => {
+    return (
+      isDailyBriefSignal(run.title) ||
+      isDailyBriefSignal(run.summary) ||
+      isDailyBriefSignal(run.action) ||
+      isDailyBriefSignal(run.trigger)
+    );
+  });
+  if (matching.length === 0) return null;
+  if (Number.isFinite(triggeredMs)) {
+    const near = matching.find((run) => Date.parse(run.started_at || "") >= triggeredMs - 60_000);
+    if (near) return near;
+  }
+  return matching[0] || null;
+}
+
+function parseDailyBriefRunResponse(
+  out: AutonomyActionExecutionResponse,
+  triggeredAt: string
+): DailyBriefRunDialogState {
+  const result = out.result && typeof out.result === "object" ? out.result : {};
+  const brief = String(result.brief || "").trim();
+  const executionStatus = String(result.status || out.status || "").trim();
+  const title =
+    executionStatus === "queued_for_approval"
+      ? "Daily Brief queued for approval"
+      : "Daily Brief generated";
+  const detail =
+    executionStatus === "queued_for_approval"
+      ? "AgentArk queued the brief-related action for approval. Review it in Tasks."
+      : out.queued
+        ? "AgentArk accepted the request and queued the run. Evidence will appear below as it lands."
+        : "AgentArk generated the brief, logged an in-app notification, and attempted delivery to your preferred channel.";
+  return {
+    outcome: "success",
+    title,
+    detail,
+    brief,
+    triggered_at: triggeredAt,
+    result,
+  };
 }
 
 function isFreshInProgressTask(task: Task): boolean {
@@ -157,12 +332,16 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const [pauseTarget, setPauseTarget] = useState<"pause" | "resume" | null>(null);
   const [inventoryOpen, setInventoryOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
+  const [dailyBriefDialogOpen, setDailyBriefDialogOpen] = useState(false);
+  const [dailyBriefRun, setDailyBriefRun] = useState<DailyBriefRunDialogState | null>(null);
+  const [suggestionRun, setSuggestionRun] = useState<SuggestionRunState | null>(null);
+  const [suggestionRunOpen, setSuggestionRunOpen] = useState(false);
+  const [suggestionRunMinimized, setSuggestionRunMinimized] = useState(false);
 
   // --- Data hooks ---
   const tasksQ = useQuery({ queryKey: ["tasks"], queryFn: api.getTasks, refetchInterval: interval });
   const traceQ = useQuery({ queryKey: ["trace"], queryFn: api.getTrace, refetchInterval: interval });
   const briefingQ = useQuery({ queryKey: ["briefing"], queryFn: api.getBriefing, refetchInterval: interval });
-  const nudgesQ = useQuery({ queryKey: ["nudges"], queryFn: api.getNudges, refetchInterval: interval });
   const notificationsQ = useQuery({ queryKey: ["notifications"], queryFn: api.getNotifications, refetchInterval: interval });
   const securityQ = useQuery({
     queryKey: ["security-logs-dashboard"],
@@ -196,13 +375,22 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     refetchInterval: interval,
     staleTime: 10_000,
   });
+  const suggestionTraceId = (suggestionRun?.traceId || "").trim();
+  const suggestionTraceQ = useQuery({
+    queryKey: ["overview-suggestion-trace", suggestionTraceId],
+    queryFn: () => api.rawGet(`/trace/${encodeURIComponent(suggestionTraceId)}`),
+    enabled: !!suggestionTraceId && suggestionRunOpen,
+    refetchInterval:
+      suggestionRunOpen && !!suggestionTraceId && suggestionRun?.status === "running" ? REFRESH_MS : false,
+  });
 
   // --- Derived data ---
   const tasks = Array.isArray(tasksQ.data) ? tasksQ.data : [];
   const traces = traceQ.data?.history || [];
   const notifications = Array.isArray(notificationsQ.data) ? notificationsQ.data : [];
   const securityLogs = (securityQ.data as { logs?: Array<{ event_type: string; severity: string; message: string }> })?.logs || [];
-  const nudges = nudgesQ.data?.nudges || [];
+  const suggestionTrace = asRecord(suggestionTraceQ.data);
+  const suggestionTraceSteps = pickRecords(suggestionTraceQ.data, "steps");
   const automationObjects = useMemo(() => pickAutomationObjects(automationQ.data), [automationQ.data]);
   const automationPreview = automationObjects.slice(0, 8);
   const automationRuns = useMemo(() => pickAutomationRuns(automationRunsQ.data), [automationRunsQ.data]);
@@ -248,6 +436,18 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       return status.includes("failed") || status.includes("error");
     });
   }, [automationRuns]);
+  const latestDailyBriefNotification = useMemo(
+    () => pickDailyBriefNotification(notifications, dailyBriefRun?.triggered_at),
+    [notifications, dailyBriefRun?.triggered_at]
+  );
+  const latestDailyBriefTrace = useMemo(
+    () => pickDailyBriefTrace(traces, dailyBriefRun?.triggered_at),
+    [traces, dailyBriefRun?.triggered_at]
+  );
+  const latestDailyBriefAutomationRun = useMemo(
+    () => pickDailyBriefAutomationRun(automationRuns, dailyBriefRun?.triggered_at),
+    [automationRuns, dailyBriefRun?.triggered_at]
+  );
   const heroPrompts = useMemo(() => {
     const prompts: string[] = [];
     const seen = new Set<string>();
@@ -261,7 +461,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       (value || "")
         .replace(/\s+/g, " ")
         .trim()
-        .slice(0, 110);
+        .slice(0, 92);
 
     pushPrompt(
       currentTask
@@ -294,16 +494,11 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const hasLlmConfigured = useMemo(() => {
     if (!settingsQ.data) return true; // Assume OK while loading
     const settings = settingsQ.data as Record<string, unknown>;
-    // Check various possible fields for LLM configuration
     const pool = settings.model_pool || settings.llm_pool || settings.models;
     if (Array.isArray(pool)) return pool.length > 0;
-    const provider = settings.llm_provider || settings.provider;
-    if (provider && String(provider).trim()) return true;
-    const apiKey = settings.openai_api_key || settings.anthropic_api_key || settings.api_key;
-    if (apiKey && String(apiKey).trim()) return true;
-    // If we got settings but no LLM-related fields exist, it might be structured differently
-    // Be conservative: only flag if settings loaded successfully and look clearly empty
-    return Object.keys(settings).length === 0 ? false : true;
+    const provider = String(settings.llm_provider ?? settings.provider ?? "").trim();
+    const model = String(settings.llm_model ?? settings.model ?? "").trim();
+    return provider.length > 0 && model.length > 0;
   }, [settingsQ.data]);
 
   const autonomySettings = useMemo(() => {
@@ -340,29 +535,49 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
   const executeSkillMutation = useMutation({
     mutationFn: api.executeRecommendedSkill,
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["nudges"] });
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["trace"] });
     },
   });
-  const nudgeFeedbackMutation = useMutation({
-    mutationFn: ({ id, action }: { id: string; action: "dismiss" | "snooze" }) =>
-      api.feedbackNudge(id, { action, snooze_minutes: action === "snooze" ? 24 * 60 : undefined }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["nudges"] }),
-  });
   const runBriefingMutation = useMutation({
     mutationFn: () =>
       api.executeRecommendedSkill({
         id: "daily_brief_now",
-        title: "Run Daily Brief",
+        title: "Generate Daily Brief",
         skill_kind: "daily_brief_now",
         payload: {},
       } as RecommendedSkill),
-    onSuccess: async () => {
+    onMutate: () => {
+      const triggeredAt = new Date().toISOString();
+      setDailyBriefRun({
+        outcome: "running",
+        title: "Generating Daily Brief",
+        detail: "AgentArk is building the brief, logging the run, and checking whether it can deliver it to your preferred channel.",
+        brief: "",
+        triggered_at: triggeredAt,
+      });
+      setDailyBriefDialogOpen(true);
+    },
+    onSuccess: async (out) => {
+      const triggeredAt = new Date().toISOString();
       await queryClient.invalidateQueries({ queryKey: ["briefing"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["trace"] });
+      await queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      await queryClient.invalidateQueries({ queryKey: ["notifications-count"] });
+      setDailyBriefRun(parseDailyBriefRunResponse(out, triggeredAt));
+      setDailyBriefDialogOpen(true);
+    },
+    onError: (error) => {
+      setDailyBriefRun({
+        outcome: "error",
+        title: "Daily Brief failed",
+        detail: errMessage(error),
+        brief: "",
+        triggered_at: new Date().toISOString(),
+      });
+      setDailyBriefDialogOpen(true);
     },
   });
   const pauseMutation = useMutation({
@@ -395,6 +610,79 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
       setPausePhase("idle");
     }
   }
+
+  async function handleExecuteSuggestedSkill(skill: RecommendedSkill) {
+    const startedAt = new Date().toISOString();
+    setSuggestionRun({
+      title: skill.title || "Suggested run",
+      status: "running",
+      summary: `Starting "${skill.title || "suggested run"}"...`,
+      startedAt,
+    });
+    setSuggestionRunOpen(true);
+    setSuggestionRunMinimized(false);
+
+    try {
+      const out = await executeSkillMutation.mutateAsync(skill);
+      const traceId = str(out.trace_id, str(asRecord(out.result).trace_id, "")).trim();
+      const summary = summarizeSuggestedRun(skill, out);
+      const resultStatus = str(asRecord(out.result).status, out.status).trim().toLowerCase();
+      const finalStatus: SuggestionRunState["status"] =
+        resultStatus === "queued_for_approval" || !traceId ? "completed" : "running";
+      setSuggestionRun({
+        title: skill.title || "Suggested run",
+        status: finalStatus,
+        summary,
+        traceId: traceId || undefined,
+        startedAt,
+        completedAt: finalStatus === "completed" ? new Date().toISOString() : undefined,
+      });
+    } catch (error) {
+      setSuggestionRun({
+        title: skill.title || "Suggested run",
+        status: "error",
+        summary: errMessage(error),
+        startedAt,
+        completedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  useEffect(() => {
+    if (!suggestionRun?.traceId) return;
+    if (suggestionTraceQ.isLoading || suggestionTraceQ.error || !Object.keys(suggestionTrace).length) return;
+    const traceStatus = str(suggestionTrace.status, suggestionRun.status).trim().toLowerCase();
+    const lastStep = suggestionTraceSteps[suggestionTraceSteps.length - 1] || {};
+    const consoleView = buildSuggestionTraceConsoleView(lastStep);
+    const nextStatus: SuggestionRunState["status"] =
+      traceStatus === "completed"
+        ? "completed"
+        : traceStatus === "failed" || traceStatus === "error" || traceStatus === "warning"
+          ? "error"
+          : "running";
+    const nextSummary =
+      str(suggestionTrace.response, "").trim() || consoleView.detail || suggestionRun.summary;
+    const nextStartedAt = str(suggestionTrace.started_at, suggestionRun.startedAt || "");
+    const nextCompletedAt = str(suggestionTrace.completed_at, suggestionRun.completedAt || "");
+    if (
+      nextStatus !== suggestionRun.status ||
+      nextSummary !== suggestionRun.summary ||
+      nextStartedAt !== (suggestionRun.startedAt || "") ||
+      nextCompletedAt !== (suggestionRun.completedAt || "")
+    ) {
+      setSuggestionRun((current) =>
+        current
+          ? {
+              ...current,
+              status: nextStatus,
+              summary: nextSummary,
+              startedAt: nextStartedAt || current.startedAt,
+              completedAt: nextCompletedAt || current.completedAt,
+            }
+          : current
+      );
+    }
+  }, [suggestionRun, suggestionTrace, suggestionTraceQ.isLoading, suggestionTraceQ.error, suggestionTraceSteps]);
 
   const hasErrors = !!(
     tasksQ.error ||
@@ -430,6 +718,7 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
     [tasks, notifications, securityLogs, settingsQ.isLoading, hasLlmConfigured]
   );
   const showAttentionPanel = attentionItems.length > 0;
+  const showActiveSessionsPanel = activeBackgroundSessions.length > 0;
   const showActivityFeed = traces.length > 0;
   const automationHeadline =
     automationSurfaceTotal > 0
@@ -492,30 +781,28 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                   </Typography>
                 </Box>
                 <Button variant="outlined" size="small" onClick={() => navigateToView("tasks")}>
-                  Open Task Queue
+                  Review Tasks
                 </Button>
-              </Stack>
-            </Box>
+                </Stack>
+              </Box>
           )}
 
-          <Box className="overview-inline-note">
-            <Stack spacing={1}>
-              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
-                <Box>
-                  <Typography variant="overline" className="overview-inline-note__kicker">
-                    Active Sessions
-                  </Typography>
-                  <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.94)", fontWeight: 600 }}>
-                    {activeBackgroundSessions.length > 0
-                      ? `${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`
-                      : "No background sessions are currently active."}
-                  </Typography>
-                </Box>
-                <Button variant="outlined" size="small" onClick={() => navigateToView("sessions")}>
-                  Open Sessions
-                </Button>
-              </Stack>
-              {activeBackgroundSessions.length > 0 ? (
+          {showActiveSessionsPanel ? (
+            <Box className="overview-inline-note overview-inline-note--sessions">
+              <Stack spacing={1}>
+                <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ xs: "flex-start", sm: "center" }} justifyContent="space-between">
+                  <Box>
+                    <Typography variant="overline" className="overview-inline-note__kicker">
+                      Active Sessions
+                    </Typography>
+                    <Typography variant="body2" sx={{ color: "rgba(225, 239, 255, 0.94)", fontWeight: 600 }}>
+                      {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`}
+                    </Typography>
+                  </Box>
+                  <Button variant="outlined" size="small" onClick={() => navigateToView("sessions")}>
+                    Open Sessions
+                  </Button>
+                </Stack>
                 <Stack spacing={0.75}>
                   {activeBackgroundSessions.slice(0, 3).map((session) => (
                     <Stack
@@ -527,8 +814,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                         px: 0.9,
                         py: 0.75,
                         borderRadius: 2.5,
-                        background: "rgba(7, 18, 32, 0.42)",
-                        border: "1px solid rgba(108, 156, 212, 0.1)",
+                        background: "rgba(7, 18, 32, 0.38)",
+                        border: "1px solid rgba(108, 156, 212, 0.08)",
                       }}
                     >
                       <Chip size="small" label={session.status.replace(/_/g, " ")} color={automationStatusColor(session.status)} />
@@ -543,9 +830,9 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                     </Stack>
                   ))}
                 </Stack>
-              ) : null}
-            </Stack>
-          </Box>
+              </Stack>
+            </Box>
+          ) : null}
 
           <Box className={`overview-bento-grid ${showActivityFeed ? "overview-bento-grid--three" : "overview-bento-grid--two"}`}>
             <Box className="overview-panel-slot">
@@ -680,12 +967,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           />
           <SmartSuggestions
             briefing={briefingQ.data}
-            nudges={nudges}
-            onExecuteSkill={(skill) => executeSkillMutation.mutate(skill)}
-            onSnooze={(id) => nudgeFeedbackMutation.mutate({ id, action: "snooze" })}
-            onDismiss={(id) => nudgeFeedbackMutation.mutate({ id, action: "dismiss" })}
+            onExecuteSkill={handleExecuteSuggestedSkill}
             executing={executeSkillMutation.isPending}
-            feedbackPending={nudgeFeedbackMutation.isPending}
           />
         </Box>
       </Box>
@@ -873,6 +1156,212 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
           <Button onClick={() => setActivityOpen(false)}>Close</Button>
         </DialogActions>
       </Dialog>
+
+      <Dialog
+        open={dailyBriefDialogOpen}
+        onClose={() => setDailyBriefDialogOpen(false)}
+        maxWidth="md"
+        fullWidth
+        PaperProps={{
+          sx: {
+            background: "rgba(10, 15, 28, 0.97)",
+            border: "1px solid rgba(47, 212, 255, 0.18)",
+            backdropFilter: "blur(20px)",
+          },
+        }}
+      >
+        <DialogTitle sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Box>
+            <Typography variant="h6">{dailyBriefRun?.title || "Daily Brief"}</Typography>
+            <Typography variant="body2" color="text.secondary">
+              See what AgentArk generated, what it attempted, and the nearest runtime evidence.
+            </Typography>
+          </Box>
+          <IconButton size="small" onClick={() => setDailyBriefDialogOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          {dailyBriefRun ? (
+            <Stack spacing={1.5}>
+              <Alert
+                severity={
+                  dailyBriefRun.outcome === "success"
+                    ? "success"
+                    : dailyBriefRun.outcome === "running"
+                      ? "info"
+                      : "error"
+                }
+              >
+                {dailyBriefRun.detail}
+              </Alert>
+              {dailyBriefRun.outcome === "running" ? (
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <CircularProgress size={18} />
+                  <Typography variant="body2">Running daily brief now...</Typography>
+                </Stack>
+              ) : null}
+
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                <Chip
+                  size="small"
+                  label={
+                    dailyBriefRun.outcome === "running"
+                      ? "Running"
+                      : dailyBriefRun.outcome === "success"
+                        ? "Run completed"
+                        : "Run failed"
+                  }
+                />
+                {latestDailyBriefNotification ? <Chip size="small" color="info" label="Notification logged" /> : null}
+                {latestDailyBriefTrace ? (
+                  <Chip size="small" color={automationStatusColor(latestDailyBriefTrace.status)} label={`Trace: ${latestDailyBriefTrace.status || "recorded"}`} />
+                ) : null}
+                {latestDailyBriefAutomationRun ? (
+                  <Chip
+                    size="small"
+                    color={automationStatusColor(latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "")}
+                    label={`Automation: ${latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "recorded"}`}
+                  />
+                ) : null}
+              </Stack>
+
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
+                  What AgentArk did
+                </Typography>
+                <Stack spacing={0.45}>
+                  <Typography variant="body2">- Built a fresh daily brief from current tasks, recent activity, and connected data.</Typography>
+                  <Typography variant="body2">- Logged a `Daily Command Brief` notification inside AgentArk.</Typography>
+                  <Typography variant="body2">- Attempted delivery to your preferred briefing channel if one is configured.</Typography>
+                </Stack>
+              </Box>
+
+              {dailyBriefRun.brief ? (
+                <Box>
+                  <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
+                    Generated brief
+                  </Typography>
+                  <Box
+                    sx={{
+                      p: 1.25,
+                      borderRadius: 2,
+                      border: "1px solid rgba(108, 156, 212, 0.16)",
+                      background: "rgba(7, 14, 28, 0.72)",
+                    }}
+                  >
+                    <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                      {dailyBriefRun.brief}
+                    </Typography>
+                  </Box>
+                </Box>
+              ) : null}
+
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
+                  Observed evidence
+                </Typography>
+                <Stack spacing={1}>
+                  {latestDailyBriefNotification ? (
+                    <Box className="action-row">
+                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                        In-app notification
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        {formatAutomationTime(latestDailyBriefNotification.created_at)}
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.35 }}>
+                        {latestDailyBriefNotification.body}
+                      </Typography>
+                    </Box>
+                  ) : null}
+
+                  {latestDailyBriefTrace ? (
+                    <Box className="action-row">
+                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          Latest related trace
+                        </Typography>
+                        <Chip
+                          size="small"
+                          label={latestDailyBriefTrace.status || "-"}
+                          color={automationStatusColor(latestDailyBriefTrace.status || "")}
+                        />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        Started: {formatAutomationTime(latestDailyBriefTrace.started_at)}
+                        {typeof latestDailyBriefTrace.duration_ms === "number" ? ` | ${latestDailyBriefTrace.duration_ms}ms` : ""}
+                        {typeof latestDailyBriefTrace.step_count === "number" ? ` | ${latestDailyBriefTrace.step_count} step${latestDailyBriefTrace.step_count === 1 ? "" : "s"}` : ""}
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.35 }}>
+                        {latestDailyBriefTrace.message_preview}
+                      </Typography>
+                    </Box>
+                  ) : null}
+
+                  {latestDailyBriefAutomationRun ? (
+                    <Box className="action-row">
+                      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          Related automation run
+                        </Typography>
+                        <Chip
+                          size="small"
+                          label={latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "-"}
+                          color={automationStatusColor(latestDailyBriefAutomationRun.current_status || latestDailyBriefAutomationRun.status || "")}
+                        />
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        Started: {formatAutomationTime(latestDailyBriefAutomationRun.started_at)}
+                      </Typography>
+                      <Typography variant="body2" sx={{ mt: 0.35 }}>
+                        {latestDailyBriefAutomationRun.summary || latestDailyBriefAutomationRun.title}
+                      </Typography>
+                    </Box>
+                  ) : null}
+
+                  {!latestDailyBriefNotification && !latestDailyBriefTrace && !latestDailyBriefAutomationRun ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No related runtime evidence has landed yet. If a delivery channel is configured, it may still arrive shortly.
+                    </Typography>
+                  ) : null}
+                </Stack>
+              </Box>
+
+              {briefingQ.data ? (
+                <Typography variant="caption" color="text.secondary">
+                  Current briefing snapshot timestamp: {String((briefingQ.data as { generated_at?: string }).generated_at || "-")}
+                </Typography>
+              ) : null}
+            </Stack>
+          ) : null}
+        </DialogContent>
+      <DialogActions>
+        <Button onClick={() => navigateToView("trace")}>Open Trace</Button>
+        <Button onClick={() => navigateToView("tasks")}>Open Tasks</Button>
+        <Button onClick={() => setDailyBriefDialogOpen(false)}>Close</Button>
+      </DialogActions>
+      </Dialog>
+
+      <SuggestionRunDialog
+        run={suggestionRun}
+        open={suggestionRunOpen}
+        minimized={suggestionRunMinimized}
+        trace={suggestionTrace}
+        traceSteps={suggestionTraceSteps}
+        traceLoading={suggestionTraceQ.isLoading}
+        traceError={suggestionTraceQ.error}
+        detailError={null}
+        acceptedOutcomes={[]}
+        onClose={() => setSuggestionRunOpen(false)}
+        onMinimize={() => setSuggestionRunMinimized(true)}
+        onRestore={() => setSuggestionRunMinimized(false)}
+        onOpenWorkspacePanel={(view) => navigateToView(view)}
+        getConsoleView={(step) => buildSuggestionTraceConsoleView(step)}
+        getTraceStepColor={traceStepColor}
+        humanTs={humanTs}
+        errMessage={errMessage}
+      />
 
       <Dialog
         open={pauseDialogOpen}

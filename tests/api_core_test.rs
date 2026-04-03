@@ -1,12 +1,15 @@
-//! Core API integration tests for AgentArk
+//! Live API smoke tests for AgentArk.
 //!
-//! Tests run against a live server at localhost:8990.
+//! These are opt-in smoke checks against a live server at localhost:8990.
+//! Set `AGENTARK_RUN_LIVE_SMOKES=1` to enable them.
 //! Start the server before running: docker compose up -d --build
 //!
 //! Auth: Set AGENTARK_TEST_API_KEY to a valid API key, or start the server
 //! with AGENTARK_INSECURE_NO_AUTH=true to bypass authentication.
 //!
-//! Run with: cargo test --test api_core_test
+//! Run with: AGENTARK_RUN_LIVE_SMOKES=1 cargo test --features live-smoke-tests --test api_core_test
+
+mod live_smoke;
 
 const BASE_URL: &str = "http://localhost:8990";
 
@@ -52,8 +55,15 @@ async fn server_allows_no_auth() -> bool {
 
 macro_rules! skip_if_no_server {
     () => {
+        if !live_smoke::live_smoke_enabled() {
+            eprintln!(
+                "SKIP: live smoke tests are disabled. Set {}=1 to enable.",
+                live_smoke::LIVE_SMOKE_ENV
+            );
+            return;
+        }
         if !server_available().await {
-            eprintln!("SKIP: Server not running at {}", BASE_URL);
+            eprintln!("SKIP: live smoke server not running at {}", BASE_URL);
             return;
         }
     };
@@ -102,7 +112,7 @@ async fn test_notifications_count() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["total"].is_number());
+    assert!(body["unread"].is_number());
 }
 
 #[tokio::test]
@@ -127,7 +137,7 @@ async fn test_notifications_mark_all_read() {
         .await
         .unwrap();
     let count_body: serde_json::Value = count_resp.json().await.unwrap();
-    assert_eq!(count_body["total"].as_u64().unwrap(), 0);
+    assert_eq!(count_body["unread"].as_u64().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -184,7 +194,8 @@ async fn test_task_create() {
         .post(format!("{}/tasks", BASE_URL))
         .json(&serde_json::json!({
             "description": "Integration test task — safe to delete",
-            "schedule": "manual"
+            "action": "notes_log",
+            "arguments": {}
         }))
         .send()
         .await
@@ -192,7 +203,7 @@ async fn test_task_create() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"].as_str().unwrap(), "ok");
-    assert!(body["task_id"].is_string());
+    assert!(body["id"].is_string());
 }
 
 // ==================== Chat Tests ====================
@@ -287,13 +298,15 @@ async fn test_master_password_status() {
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(format!("{}/security/master-password/status", BASE_URL))
+        .get(format!("{}/security/status", BASE_URL))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["is_set"].is_boolean());
+    assert!(body["master_password_set"].is_boolean());
+    assert!(body["custom_master_password_set"].is_boolean());
+    assert!(body["encryption_mode"].is_string());
 }
 
 // ==================== Autonomy Tests ====================
@@ -312,18 +325,18 @@ async fn test_autonomy_briefing() {
 }
 
 #[tokio::test]
-async fn test_autonomy_nudges() {
+async fn test_autonomy_sentinel_feed() {
     skip_if_no_server!();
     skip_if_no_auth!();
     let client = authed_client();
     let resp = client
-        .get(format!("{}/autonomy/nudges", BASE_URL))
+        .get(format!("{}/autonomy/sentinel/feed", BASE_URL))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["nudges"].is_array());
+    assert!(body.is_object());
 }
 
 #[tokio::test]

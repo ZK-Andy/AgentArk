@@ -12,7 +12,6 @@ pub const GOOGLE_WORKSPACE_BUNDLES_KEY: &str = "google_workspace_bundles";
 pub const GOOGLE_WORKSPACE_PENDING_BUNDLES_KEY: &str = "google_workspace_pending_bundles";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const OAUTH_REDIRECT_URI: &str = "http://localhost:8990/oauth/callback";
 const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const DOCS_API_BASE: &str = "https://docs.googleapis.com/v1";
 const SHEETS_API_BASE: &str = "https://sheets.googleapis.com/v4";
@@ -73,13 +72,6 @@ pub struct GoogleWorkspaceTokens {
     pub granted_scopes: Vec<String>,
     #[serde(default)]
     pub granted_bundles: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyGoogleTokens {
-    access_token: String,
-    refresh_token: String,
-    expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,7 +298,7 @@ pub fn parse_credentials_value(value: &serde_json::Value) -> Result<GoogleWorksp
 }
 
 fn manager(config_dir: &Path) -> Result<crate::core::config::SecureConfigManager> {
-    crate::core::config::SecureConfigManager::new(config_dir).map_err(Into::into)
+    crate::core::config::SecureConfigManager::new(config_dir)
 }
 
 fn env_primary_workspace_client_config() -> Option<GoogleWorkspaceClientConfig> {
@@ -448,7 +440,7 @@ pub fn request_additional_bundles(config_dir: &Path, bundles: &[String]) -> Resu
 }
 
 pub fn oauth_redirect_uri() -> &'static str {
-    OAUTH_REDIRECT_URI
+    "http://localhost:8990/oauth/callback"
 }
 
 pub fn load_saved_workspace_client_config(
@@ -761,7 +753,8 @@ async fn run_gws_command_with_options(
     let output = command.output().await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow!(
-                "gws CLI is not installed in this AgentArk runtime. Rebuild the runtime image with Google Workspace CLI support."
+                "gws CLI is not installed in this {} runtime. Rebuild the runtime image with Google Workspace CLI support.",
+                crate::branding::PRODUCT_NAME
             )
         } else {
             anyhow!("Failed to launch gws CLI: {}", error)
@@ -845,7 +838,7 @@ fn trim_frontmatter_value(value: &str) -> String {
 
 fn parse_gws_skill_metadata(path: &Path, raw: &str) -> Option<GwsSkillMetadata> {
     let frontmatter = if let Some(stripped) = raw.strip_prefix("---") {
-        stripped.splitn(2, "---").next().unwrap_or("")
+        stripped.split("---").next().unwrap_or("")
     } else {
         ""
     };
@@ -944,78 +937,6 @@ pub fn save_workspace_tokens(config_dir: &Path, tokens: &GoogleWorkspaceTokens) 
     write_secret_json(config_dir, GOOGLE_WORKSPACE_TOKENS_KEY, tokens)
 }
 
-fn legacy_token_secret_key(bundle: &str) -> Option<&'static str> {
-    match bundle {
-        "gmail" => Some("gmail_tokens"),
-        "calendar" => Some("calendar_tokens"),
-        _ => None,
-    }
-}
-
-fn load_legacy_tokens(config_dir: &Path, bundle: &str) -> Result<Option<LegacyGoogleTokens>> {
-    let Some(secret_key) = legacy_token_secret_key(bundle) else {
-        return Ok(None);
-    };
-    read_secret_json::<LegacyGoogleTokens>(config_dir, secret_key)
-}
-
-async fn legacy_access_token_for_bundle(config_dir: &Path, bundle: &str) -> Result<Option<String>> {
-    let Some(mut tokens) = load_legacy_tokens(config_dir, bundle)? else {
-        return Ok(None);
-    };
-    if tokens.refresh_token.trim().is_empty() {
-        return Ok(None);
-    }
-    if tokens.expires_at > Utc::now().timestamp() + 60 {
-        return Ok(Some(tokens.access_token));
-    }
-    refresh_legacy_bundle_token(config_dir, bundle, &mut tokens).await?;
-    Ok(Some(tokens.access_token))
-}
-
-async fn refresh_legacy_bundle_token(
-    config_dir: &Path,
-    bundle: &str,
-    tokens: &mut LegacyGoogleTokens,
-) -> Result<()> {
-    let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
-        anyhow!(
-            "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
-        )
-    })?;
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let params = [
-        ("client_id", client.client_id.as_str()),
-        ("client_secret", client.client_secret.as_str()),
-        ("refresh_token", tokens.refresh_token.as_str()),
-        ("grant_type", "refresh_token"),
-    ];
-    let response = http_client.post(TOKEN_URL).form(&params).send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Failed to refresh legacy Google token for {} ({}): {}",
-            bundle,
-            status,
-            body
-        ));
-    }
-    let token: TokenResponse = response.json().await?;
-    tokens.access_token = token.access_token;
-    tokens.expires_at = Utc::now().timestamp() + token.expires_in;
-    if let Some(refresh_token) = token.refresh_token {
-        if !refresh_token.trim().is_empty() {
-            tokens.refresh_token = refresh_token;
-        }
-    }
-    let secret_key = legacy_token_secret_key(bundle)
-        .ok_or_else(|| anyhow!("Unsupported Google bundle '{}'", bundle))?;
-    write_secret_json(config_dir, secret_key, tokens)
-}
-
 pub fn selected_and_pending_bundles(config_dir: &Path) -> Result<Vec<String>> {
     let mut bundles = BTreeSet::new();
     for bundle in load_saved_bundles(config_dir)? {
@@ -1031,23 +952,34 @@ pub fn selected_and_pending_bundles(config_dir: &Path) -> Result<Vec<String>> {
     }
 }
 
-pub fn build_auth_url(config_dir: &Path, state_token: &str) -> Result<String> {
+pub fn build_auth_url(
+    config_dir: &Path,
+    state_token: &str,
+    code_challenge: &str,
+    redirect_uri: &str,
+) -> Result<String> {
     let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
         anyhow!("Google OAuth client is not configured yet. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google.")
     })?;
     let bundles = selected_and_pending_bundles(config_dir)?;
     let scopes = scopes_for_bundles(&bundles).join(" ");
     Ok(format!(
-        "{base}?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scope}&state={state}&access_type=offline&prompt=consent&include_granted_scopes=true",
+        "{base}?client_id={client_id}&redirect_uri={redirect}&response_type=code&scope={scope}&state={state}&access_type=offline&prompt=consent&include_granted_scopes=true&code_challenge={challenge}&code_challenge_method=S256",
         base = OAUTH_AUTH_URL,
         client_id = urlencoding::encode(&client.client_id),
-        redirect = urlencoding::encode(OAUTH_REDIRECT_URI),
+        redirect = urlencoding::encode(redirect_uri),
         scope = urlencoding::encode(&scopes),
         state = urlencoding::encode(state_token),
+        challenge = urlencoding::encode(code_challenge),
     ))
 }
 
-pub async fn exchange_code(config_dir: &Path, code: &str) -> Result<GoogleWorkspaceTokens> {
+pub async fn exchange_code(
+    config_dir: &Path,
+    redirect_uri: &str,
+    code: &str,
+    pkce_verifier: Option<&str>,
+) -> Result<GoogleWorkspaceTokens> {
     let client = load_workspace_client_config(config_dir)?.ok_or_else(|| {
         anyhow!(
             "Google OAuth client is not configured. Open Integrations > Google Workspace, enter the client ID and client secret, then continue with Google."
@@ -1056,13 +988,16 @@ pub async fn exchange_code(config_dir: &Path, code: &str) -> Result<GoogleWorksp
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
-    let params = [
-        ("client_id", client.client_id.as_str()),
-        ("client_secret", client.client_secret.as_str()),
-        ("code", code),
-        ("redirect_uri", OAUTH_REDIRECT_URI),
-        ("grant_type", "authorization_code"),
+    let mut params = vec![
+        ("client_id", client.client_id.clone()),
+        ("client_secret", client.client_secret.clone()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("grant_type", "authorization_code".to_string()),
     ];
+    if let Some(verifier) = pkce_verifier {
+        params.push(("code_verifier", verifier.to_string()));
+    }
     let response = http_client.post(TOKEN_URL).form(&params).send().await?;
     if !response.status().is_success() {
         let status = response.status();
@@ -1170,26 +1105,9 @@ async fn refresh_workspace_token(
 }
 
 pub fn granted_bundles(config_dir: &Path) -> Result<Vec<String>> {
-    if let Some(tokens) = load_workspace_tokens(config_dir)? {
-        return Ok(tokens.granted_bundles);
-    }
-
-    let manager = manager(config_dir)?;
-    let mut granted = BTreeSet::new();
-    for (bundle, key) in [("gmail", "gmail_tokens"), ("calendar", "calendar_tokens")] {
-        let Some(raw) = manager.get_custom_secret(key)? else {
-            continue;
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
-        if parsed
-            .get("refresh_token")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            granted.insert(bundle.to_string());
-        }
-    }
-    Ok(granted.into_iter().collect())
+    Ok(load_workspace_tokens(config_dir)?
+        .map(|tokens| tokens.granted_bundles)
+        .unwrap_or_default())
 }
 
 pub fn missing_selected_bundles(config_dir: &Path) -> Result<Vec<String>> {
@@ -1214,17 +1132,6 @@ pub async fn ensure_access_token_for_bundles(
         .filter_map(|bundle| normalize_bundle_id(bundle))
         .collect::<Vec<_>>();
     let granted = granted_bundles(config_dir)?;
-    if normalized.len() == 1
-        && granted
-            .iter()
-            .any(|granted_bundle| granted_bundle == &normalized[0])
-    {
-        if let Some(legacy_access_token) =
-            legacy_access_token_for_bundle(config_dir, &normalized[0]).await?
-        {
-            return Ok(legacy_access_token);
-        }
-    }
     let missing = normalized
         .iter()
         .filter(|bundle| {
@@ -1269,7 +1176,8 @@ pub async fn gws_help(arguments: &serde_json::Value) -> Result<String> {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("auth"))
     {
         return Err(anyhow!(
-            "gws auth commands are not exposed through AgentArk. Use the Google Workspace integration popup for sign-in."
+            "gws auth commands are not exposed through {}. Use the Google Workspace integration popup for sign-in.",
+            crate::branding::PRODUCT_NAME
         ));
     }
     run_gws_command(None, &argv, &[], false).await
@@ -1306,7 +1214,8 @@ pub async fn gws_command(config_dir: &Path, arguments: &serde_json::Value) -> Re
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("auth"))
     {
         return Err(anyhow!(
-            "gws auth commands are not exposed through AgentArk. Use the Google Workspace integration popup for sign-in."
+            "gws auth commands are not exposed through {}. Use the Google Workspace integration popup for sign-in.",
+            crate::branding::PRODUCT_NAME
         ));
     }
     let mut required_bundles = BTreeSet::new();
@@ -1543,7 +1452,11 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
                     .timeout(std::time::Duration::from_secs(15))
                     .build()?;
                 let response = client
-                    .get(format!("{}/documents/{}", docs_api_base(config_dir), args.document_id))
+                    .get(format!(
+                        "{}/documents/{}",
+                        docs_api_base(config_dir),
+                        args.document_id
+                    ))
                     .bearer_auth(access_token)
                     .send()
                     .await?;
@@ -1559,7 +1472,11 @@ pub async fn docs_read(config_dir: &Path, arguments: &serde_json::Value) -> Resu
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
         let response = client
-            .get(format!("{}/documents/{}", docs_api_base(config_dir), args.document_id))
+            .get(format!(
+                "{}/documents/{}",
+                docs_api_base(config_dir),
+                args.document_id
+            ))
             .bearer_auth(access_token)
             .send()
             .await?;
@@ -2149,7 +2066,7 @@ name: gws-docs
 description: "Read and write Google Docs."
 metadata:
   version: 0.22.3
-  openclaw:
+  agentark:
     cliHelp: "gws docs --help"
 ---
 

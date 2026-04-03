@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 // Types
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Manifest stored as `action.manifest.json` alongside SKILL.md (or legacy ACTION.md)
+/// Manifest stored as `action.manifest.json` alongside SKILL.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionManifest {
     pub action_name: String,
@@ -126,7 +126,7 @@ pub struct InjectionScanResult {
 }
 
 /// Combined security verdict for an action
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionSecurityVerdict {
     pub integrity_ok: bool,
     pub static_analysis: StaticAnalysisResult,
@@ -178,16 +178,38 @@ impl ActionGuard {
         })
     }
 
+    fn verifying_key_from_did(did: &str) -> Result<VerifyingKey> {
+        let multibase = did
+            .strip_prefix("did:key:z")
+            .ok_or_else(|| anyhow!("Unsupported publisher DID '{}'", did))?;
+        let decoded = bs58::decode(multibase)
+            .into_vec()
+            .map_err(|e| anyhow!("Invalid publisher DID '{}': {}", did, e))?;
+        if decoded.len() != 34 || decoded[0] != 0xed || decoded[1] != 0x01 {
+            return Err(anyhow!(
+                "Unsupported publisher DID multicodec for '{}'",
+                did
+            ));
+        }
+        let key_bytes: [u8; 32] = decoded[2..]
+            .try_into()
+            .map_err(|_| anyhow!("Invalid publisher DID key length for '{}'", did))?;
+        VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| anyhow!("Invalid publisher DID verifying key '{}': {}", did, e))
+    }
+
     // ─── Pillar 1: Integrity Verification ────────────────────────────
 
     /// Compute SHA-256 hash of all files in the action directory (deterministic)
     pub fn compute_bundle_hash(action_dir: &Path) -> Result<String> {
         let mut hasher = Sha256::new();
 
-        let mut files: Vec<PathBuf> = std::fs::read_dir(action_dir)?
+        let mut files: Vec<PathBuf> = walkdir::WalkDir::new(action_dir)
+            .follow_links(false)
+            .into_iter()
             .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -196,11 +218,16 @@ impl ActionGuard {
             })
             .collect();
 
-        // Sort by filename for deterministic ordering
-        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        // Sort by normalized relative path for deterministic ordering.
+        files.sort_by(|a, b| {
+            let ra = a.strip_prefix(action_dir).unwrap_or(a);
+            let rb = b.strip_prefix(action_dir).unwrap_or(b);
+            ra.cmp(rb)
+        });
 
         for file in &files {
-            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let relative = file.strip_prefix(action_dir).unwrap_or(file);
+            let name = relative.to_string_lossy().replace('\\', "/");
             hasher.update(name.as_bytes());
             hasher.update(b":");
             let content = std::fs::read(file)?;
@@ -243,7 +270,7 @@ impl ActionGuard {
         Ok(Some(manifest))
     }
 
-    /// Verify integrity of an action bundle. Auto-signs legacy actions.
+    /// Verify integrity of an action bundle. Unsigned legacy actions fail closed.
     pub async fn verify_integrity(&self, action_dir: &Path, action_name: &str) -> Result<bool> {
         let current_hash = Self::compute_bundle_hash(action_dir)?;
 
@@ -269,7 +296,7 @@ impl ActionGuard {
                         .try_into()
                         .map_err(|_| anyhow!("Invalid signature length"))?,
                 );
-                let verifying_key: VerifyingKey = (&self.signing_key).into();
+                let verifying_key = Self::verifying_key_from_did(&manifest.publisher_did)?;
                 if verifying_key
                     .verify(manifest.bundle_hash.as_bytes(), &signature)
                     .is_err()
@@ -282,10 +309,12 @@ impl ActionGuard {
             }
             None => {
                 // Legacy action — auto-sign on first load
-                let manifest = self.sign_manifest(action_name, &current_hash);
-                Self::write_manifest(&manifest, action_dir).await?;
-                tracing::info!("Action '{}' signed on first load (legacy)", action_name);
-                Ok(true)
+                tracing::warn!(
+                    "Action '{}' integrity FAILED: missing action.manifest.json",
+                    action_name
+                );
+                let _ = current_hash;
+                Ok(false)
             }
         }
     }
@@ -685,6 +714,20 @@ impl ActionGuard {
         Vec::new()
     }
 
+    /// Parse permissions directly from capability/action names already loaded into memory.
+    pub fn permissions_from_capabilities(capabilities: &[String]) -> Vec<Permission> {
+        let mut seen = HashSet::new();
+        let mut parsed = Vec::new();
+        for capability in capabilities {
+            let perm = Self::parse_permission(capability);
+            let key = perm.to_string();
+            if seen.insert(key) {
+                parsed.push(perm);
+            }
+        }
+        parsed
+    }
+
     /// Classify permission risk
     pub fn permission_risk(perm: &Permission) -> PermissionRisk {
         match perm {
@@ -850,11 +893,41 @@ impl ActionGuard {
                 ok
             }
             Err(e) => {
-                warnings.push(format!("Integrity check error: {} — allowing", e));
-                true // degrade gracefully
+                warnings.push(format!("Integrity check error: {} - blocking", e));
+                false
             }
         };
 
+        self.evaluate_review_payload(action_name, content, frontmatter, integrity_ok, warnings)
+            .await
+    }
+
+    /// Evaluate action-like content that does not have a persisted local bundle.
+    /// This keeps the same static-analysis / injection / permission model wired into
+    /// dynamic sources such as plugins, custom APIs, and MCP registrations.
+    pub async fn evaluate_inline_action(
+        &self,
+        action_name: &str,
+        content: &str,
+        frontmatter: &str,
+        mut warnings: Vec<String>,
+    ) -> Result<ActionSecurityVerdict> {
+        warnings.push(
+            "This action is backed by dynamic/runtime configuration, so local bundle integrity signing is unavailable."
+                .to_string(),
+        );
+        self.evaluate_review_payload(action_name, content, frontmatter, true, warnings)
+            .await
+    }
+
+    async fn evaluate_review_payload(
+        &self,
+        action_name: &str,
+        content: &str,
+        frontmatter: &str,
+        integrity_ok: bool,
+        mut warnings: Vec<String>,
+    ) -> Result<ActionSecurityVerdict> {
         // 2. Static analysis
         let static_analysis = self.analyze_content(content);
         match static_analysis.threat_level {
@@ -941,9 +1014,11 @@ mod tests {
 
     fn make_guard() -> ActionGuard {
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let mut multicodec_key = vec![0xed, 0x01];
+        multicodec_key.extend_from_slice(&signing_key.verifying_key().to_bytes());
         ActionGuard {
             signing_key,
-            agent_did: "did:key:test".to_string(),
+            agent_did: format!("did:key:z{}", bs58::encode(&multicodec_key).into_string()),
             _data_dir: PathBuf::from("/tmp"),
             static_patterns: ActionGuard::build_static_patterns(),
             injection_patterns: ActionGuard::build_injection_patterns(),
@@ -1049,12 +1124,82 @@ mod tests {
 
         assert_eq!(manifest.action_name, "test-action");
         assert_eq!(manifest.bundle_hash, hash);
-        assert_eq!(manifest.publisher_did, "did:key:test");
+        assert_eq!(manifest.publisher_did, guard.agent_did);
 
         // Verify signature
         let sig_bytes = hex::decode(&manifest.signature).unwrap();
         let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
         let verifying_key: VerifyingKey = (&guard.signing_key).into();
         assert!(verifying_key.verify(hash.as_bytes(), &signature).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_integrity_rejects_missing_manifest() {
+        let guard = make_guard();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# test\n").unwrap();
+
+        let ok = guard
+            .verify_integrity(temp.path(), "test-action")
+            .await
+            .unwrap();
+        assert!(!ok);
+        assert!(!temp.path().join("action.manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_verify_integrity_accepts_manifest_signed_by_other_publisher_did() {
+        let local_guard = make_guard();
+        let publisher_key = SigningKey::from_bytes(&[2u8; 32]);
+        let mut multicodec_key = vec![0xed, 0x01];
+        multicodec_key.extend_from_slice(&publisher_key.verifying_key().to_bytes());
+        let publisher_did = format!("did:key:z{}", bs58::encode(&multicodec_key).into_string());
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# test\n").unwrap();
+        let hash = ActionGuard::compute_bundle_hash(temp.path()).unwrap();
+        let signature = publisher_key.sign(hash.as_bytes());
+        let manifest = ActionManifest {
+            action_name: "test-action".to_string(),
+            bundle_hash: hash,
+            publisher_did,
+            signature: hex::encode(signature.to_bytes()),
+            signed_at: Utc::now(),
+            manifest_version: 1,
+        };
+        ActionGuard::write_manifest(&manifest, temp.path())
+            .await
+            .unwrap();
+
+        let ok = local_guard
+            .verify_integrity(temp.path(), "test-action")
+            .await
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn test_verify_integrity_rejects_invalid_publisher_did() {
+        let guard = make_guard();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("SKILL.md"), "# test\n").unwrap();
+        let hash = ActionGuard::compute_bundle_hash(temp.path()).unwrap();
+        let manifest = ActionManifest {
+            action_name: "test-action".to_string(),
+            bundle_hash: hash.clone(),
+            publisher_did: "did:key:not-real".to_string(),
+            signature: guard.sign_manifest("test-action", &hash).signature,
+            signed_at: Utc::now(),
+            manifest_version: 1,
+        };
+        ActionGuard::write_manifest(&manifest, temp.path())
+            .await
+            .unwrap();
+
+        let err = guard
+            .verify_integrity(temp.path(), "test-action")
+            .await
+            .expect_err("invalid publisher DID should fail");
+        assert!(err.to_string().contains("publisher DID"));
     }
 }

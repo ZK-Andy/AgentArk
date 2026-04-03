@@ -7,9 +7,11 @@
 //! API reference: https://developers.facebook.com/docs/whatsapp/cloud-api
 
 use anyhow::{anyhow, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use url::Url;
 
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
 use crate::core::{Agent, TaskStatus};
@@ -143,12 +145,14 @@ const API_BASE: &str = "https://graph.facebook.com/v18.0";
 /// The actual limit is 4096 characters for text body messages.
 const MAX_MESSAGE_LEN: usize = 4096;
 
+pub const EMBEDDED_BRIDGE_URL: &str = "http://127.0.0.1:8999";
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 /// Connection mode: Baileys (QR scan) or Meta Business Cloud API.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppMode {
     /// Baileys bridge — scan QR code, no Meta account needed.
@@ -156,6 +160,17 @@ pub enum WhatsAppMode {
     Baileys,
     /// Meta Business Cloud API — production-grade, requires Business account.
     CloudApi,
+}
+
+/// Runtime ownership for the Baileys bridge path.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhatsAppBridgeRuntime {
+    /// AgentArk manages a bundled localhost bridge process.
+    #[default]
+    Embedded,
+    /// AgentArk talks to a separately managed bridge over HTTP.
+    External,
 }
 
 /// Configuration for the WhatsApp channel (supports both Baileys and Cloud API).
@@ -177,14 +192,30 @@ pub struct WhatsAppChannelConfig {
     #[serde(default)]
     pub phone_number_id: String,
 
+    /// App secret used to verify Cloud API webhook signatures.
+    #[serde(default)]
+    pub app_secret: String,
+
     /// Token used to verify the webhook endpoint during initial setup.
     #[serde(default)]
     pub verify_token: String,
 
     // ---- Baileys bridge fields ----
-    /// URL of the embedded Baileys bridge (default: http://127.0.0.1:8999).
+    /// Runtime ownership for the Baileys bridge path.
+    ///
+    /// Older configs may omit this and infer the runtime from `bridge_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_runtime: Option<WhatsAppBridgeRuntime>,
+
+    /// URL of the Baileys bridge. Embedded mode always uses the fixed localhost
+    /// bridge address; external mode uses this configured URL.
     #[serde(default = "default_bridge_url")]
     pub bridge_url: String,
+
+    /// Optional access token for bridge requests (external mode, or embedded for
+    /// future hardening parity with other bridge-backed channels).
+    #[serde(default)]
+    pub bridge_token: String,
 
     // ---- Shared fields ----
     /// If non-empty, only messages from these phone numbers (E.164 format,
@@ -198,11 +229,128 @@ pub struct WhatsAppChannelConfig {
 }
 
 fn default_bridge_url() -> String {
-    "http://127.0.0.1:8999".to_string()
+    EMBEDDED_BRIDGE_URL.to_string()
 }
 
 fn default_dm_policy() -> String {
     "pairing".to_string()
+}
+
+pub fn is_loopback_bridge_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    match Url::parse(trimmed) {
+        Ok(url) => match url.host_str().map(|host| host.to_ascii_lowercase()) {
+            Some(host) => matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]"),
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+pub fn infer_bridge_runtime_from_url(value: &str) -> WhatsAppBridgeRuntime {
+    if is_loopback_bridge_url(value) {
+        WhatsAppBridgeRuntime::Embedded
+    } else {
+        WhatsAppBridgeRuntime::External
+    }
+}
+
+impl WhatsAppChannelConfig {
+    pub fn bridge_runtime(&self) -> WhatsAppBridgeRuntime {
+        self.bridge_runtime
+            .unwrap_or_else(|| infer_bridge_runtime_from_url(&self.bridge_url))
+    }
+
+    pub fn uses_embedded_bridge(&self) -> bool {
+        self.mode == WhatsAppMode::Baileys
+            && self.bridge_runtime() == WhatsAppBridgeRuntime::Embedded
+    }
+
+    pub fn uses_external_bridge(&self) -> bool {
+        self.mode == WhatsAppMode::Baileys
+            && self.bridge_runtime() == WhatsAppBridgeRuntime::External
+    }
+
+    pub fn effective_bridge_url(&self) -> Result<String> {
+        match self.bridge_runtime() {
+            WhatsAppBridgeRuntime::Embedded => Ok(default_bridge_url()),
+            WhatsAppBridgeRuntime::External => {
+                let trimmed = self.bridge_url.trim().trim_end_matches('/');
+                if trimmed.is_empty() {
+                    Err(anyhow!("WhatsApp external bridge URL is missing"))
+                } else {
+                    Ok(trimmed.to_string())
+                }
+            }
+        }
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn hmac_sha256_hex(secret: &str, body: &[u8]) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key = secret.as_bytes().to_vec();
+    if key.len() > BLOCK_SIZE {
+        let mut hasher = Sha256::new();
+        hasher.update(&key);
+        key = hasher.finalize().to_vec();
+    }
+    if key.len() < BLOCK_SIZE {
+        key.resize(BLOCK_SIZE, 0);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for (index, byte) in key.iter().enumerate() {
+        ipad[index] ^= byte;
+        opad[index] ^= byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(body);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    hex::encode(outer.finalize())
+}
+
+pub fn verify_cloud_api_request_signature(
+    config: &WhatsAppChannelConfig,
+    raw_body: &[u8],
+    signature: Option<&str>,
+) -> Result<()> {
+    let app_secret = config.app_secret.trim();
+    if app_secret.is_empty() {
+        return Err(anyhow!(
+            "WhatsApp app secret is required for Cloud API webhooks"
+        ));
+    }
+    let provided = signature
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("WhatsApp signature header is required"))?;
+    let expected = format!("sha256={}", hmac_sha256_hex(app_secret, raw_body));
+    if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+        return Err(anyhow!("WhatsApp webhook signature verification failed"));
+    }
+    Ok(())
 }
 
 fn normalize_whatsapp_sender(value: &str) -> String {
@@ -689,19 +837,18 @@ pub async fn send_message_to_recipient(
 async fn send_via_bridge(config: &WhatsAppChannelConfig, to: &str, text: &str) -> Result<()> {
     let formatted = format_for_whatsapp(text);
     let client = http_client();
-    let url = format!("{}/send", config.bridge_url);
+    let url = format!("{}/send", config.effective_bridge_url()?);
 
     let body = serde_json::json!({
         "to": to,
         "text": formatted
     });
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let mut request = client.post(&url).header("Content-Type", "application/json");
+    if !config.bridge_token.trim().is_empty() {
+        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+    }
+    let resp = request.json(&body).send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -724,19 +871,18 @@ async fn send_presence(
     presence_type: &str,
 ) -> Result<()> {
     let client = http_client();
-    let url = format!("{}/presence", config.bridge_url);
+    let url = format!("{}/presence", config.effective_bridge_url()?);
 
     let body = serde_json::json!({
         "to": to,
         "type": presence_type
     });
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let mut request = client.post(&url).header("Content-Type", "application/json");
+    if !config.bridge_token.trim().is_empty() {
+        request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+    }
+    let resp = request.json(&body).send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -820,6 +966,30 @@ pub async fn verify_webhook(
 ///
 /// Returns `"ok"` on success (Meta expects a 200 response quickly).
 pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Result<String> {
+    let is_baileys = body.get("_source").and_then(|value| value.as_str()) == Some("baileys");
+    let config = {
+        let agent_read = agent.read().await;
+        agent_read
+            .config
+            .whatsapp
+            .clone()
+            .ok_or_else(|| anyhow!("WhatsApp is not configured"))?
+    };
+
+    match (is_baileys, config.mode) {
+        (true, WhatsAppMode::Baileys) | (false, WhatsAppMode::CloudApi) => {}
+        (true, _) => {
+            return Err(anyhow!(
+                "WhatsApp bridge payload rejected because the channel is not in Baileys mode"
+            ));
+        }
+        (false, _) => {
+            return Err(anyhow!(
+                "WhatsApp Cloud API payload rejected because the channel is not in Cloud API mode"
+            ));
+        }
+    }
+
     // Navigate to the first message in the payload.
     let message = body
         .get("entry")
@@ -856,38 +1026,6 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
         tracing::warn!("WhatsApp webhook: message has no sender, ignoring");
         return Ok("ok".to_string());
     }
-
-    // ---- Authorization check ----
-    let is_baileys = body.get("_source").and_then(|v| v.as_str()) == Some("baileys");
-
-    let config = {
-        let agent_read = agent.read().await;
-        agent_read.config.whatsapp.clone()
-    };
-
-    let config = match config {
-        Some(c) => c,
-        None if is_baileys => {
-            // Baileys bridge runs inside the container (trusted localhost) —
-            // allow messages even without explicit WhatsApp config in settings.
-            tracing::info!(
-                "WhatsApp: accepting Baileys message (bridge is trusted, no config needed)"
-            );
-            WhatsAppChannelConfig {
-                mode: WhatsAppMode::Baileys,
-                access_token: String::new(),
-                phone_number_id: String::new(),
-                verify_token: String::new(),
-                bridge_url: "http://127.0.0.1:8999".to_string(),
-                dm_policy: "open".to_string(),
-                allowed_numbers: vec![],
-            }
-        }
-        None => {
-            tracing::warn!("WhatsApp webhook received but channel not configured");
-            return Ok("ok".to_string());
-        }
-    };
 
     if !config.allowed_numbers.is_empty() && !config.allowed_numbers.iter().any(|n| n == from) {
         tracing::warn!(
@@ -994,8 +1132,10 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
                 from.as_bytes().iter().map(|b| *b as u64).sum::<u64>() % 1000000
             );
             let pairing_msg = format!(
-                "Hello! I'm AgentArk.\n\nFor security, new contacts must be approved before I can act here.\nAsk the owner to approve this sender in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run:\n\n_/approve {}_\n\nYour pairing code: *{}*",
-                from, code
+                "Hello! I'm {}.\n\nFor security, new contacts must be approved before I can act here.\nAsk the owner to approve this sender in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run:\n\n_/approve {}_\n\nYour pairing code: *{}*",
+                crate::branding::PRODUCT_NAME,
+                from,
+                code
             );
             let _ = send_reply(&config, from, &pairing_msg).await;
             let normalized_from = normalize_whatsapp_sender(from);
@@ -1010,7 +1150,8 @@ pub async fn handle_webhook(agent: SharedAgent, body: &serde_json::Value) -> Res
                     .await;
                 if created_new {
                     let body = format!(
-                        "A new WhatsApp sender needs approval before AgentArk will act.\nSender: {}\nMessage: {}\nApprove it in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run /approve {}.",
+                        "A new WhatsApp sender needs approval before {} will act.\nSender: {}\nMessage: {}\nApprove it in Settings -> Connected Systems -> Sender Verification, or from a trusted WhatsApp chat run /approve {}.",
+                        crate::branding::PRODUCT_NAME,
                         from,
                         text.chars().take(180).collect::<String>(),
                         from
@@ -1209,18 +1350,20 @@ pub async fn send_video(
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(video_bytes);
             let client = http_client();
-            let url = format!("{}/send-video", config.bridge_url);
+            let url = format!("{}/send-video", config.effective_bridge_url()?);
             let body = serde_json::json!({
                 "to": phone_number,
                 "video": b64,
                 "caption": caption,
             });
-            let resp = client
+            let mut request = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            if !config.bridge_token.trim().is_empty() {
+                request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+            }
+            let resp = request.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let error_body = resp.text().await.unwrap_or_default();
@@ -1274,18 +1417,20 @@ pub async fn send_image(
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
             let client = http_client();
-            let url = format!("{}/send-image", config.bridge_url);
+            let url = format!("{}/send-image", config.effective_bridge_url()?);
             let body = serde_json::json!({
                 "to": phone_number,
                 "image": b64,
                 "caption": caption,
             });
-            let resp = client
+            let mut request = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+                .json(&body);
+            if !config.bridge_token.trim().is_empty() {
+                request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
+            }
+            let resp = request.send().await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let error_body = resp.text().await.unwrap_or_default();
@@ -1746,5 +1891,70 @@ mod tests {
 
         let result = verify_webhook(&params, "my_token").await;
         assert!(result.is_err());
+    }
+
+    fn test_cloud_config() -> WhatsAppChannelConfig {
+        WhatsAppChannelConfig {
+            mode: WhatsAppMode::CloudApi,
+            access_token: "token".to_string(),
+            phone_number_id: "phone-id".to_string(),
+            app_secret: "topsecret".to_string(),
+            verify_token: "verify".to_string(),
+            bridge_runtime: Some(WhatsAppBridgeRuntime::Embedded),
+            bridge_url: default_bridge_url(),
+            bridge_token: String::new(),
+            allowed_numbers: vec![],
+            dm_policy: default_dm_policy(),
+        }
+    }
+
+    #[test]
+    fn infer_bridge_runtime_defaults_to_embedded_for_loopback() {
+        assert_eq!(
+            infer_bridge_runtime_from_url("http://127.0.0.1:8999"),
+            WhatsAppBridgeRuntime::Embedded
+        );
+        assert_eq!(
+            infer_bridge_runtime_from_url("http://localhost:8999"),
+            WhatsAppBridgeRuntime::Embedded
+        );
+    }
+
+    #[test]
+    fn infer_bridge_runtime_uses_external_for_non_loopback_urls() {
+        assert_eq!(
+            infer_bridge_runtime_from_url("https://bridge.example.com"),
+            WhatsAppBridgeRuntime::External
+        );
+    }
+
+    #[test]
+    fn test_verify_cloud_api_request_signature_success() {
+        let raw_body = br#"{"entry":[{"changes":[{"value":{"messages":[]}}]}]}"#;
+        let config = test_cloud_config();
+        let signature = format!("sha256={}", hmac_sha256_hex(&config.app_secret, raw_body));
+        assert!(verify_cloud_api_request_signature(&config, raw_body, Some(&signature)).is_ok());
+    }
+
+    #[test]
+    fn test_verify_cloud_api_request_signature_rejects_missing_secret() {
+        let raw_body = br#"{}"#;
+        let mut config = test_cloud_config();
+        config.app_secret.clear();
+        let error = verify_cloud_api_request_signature(&config, raw_body, Some("sha256=abc"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("app secret"));
+    }
+
+    #[test]
+    fn test_verify_cloud_api_request_signature_rejects_tampered_payload() {
+        let raw_body = br#"{"entry":[{"changes":[{"value":{"messages":[]}}]}]}"#;
+        let tampered_body = br#"{"entry":[{"changes":[{"value":{"messages":[{"id":"1"}]}}]}]}"#;
+        let config = test_cloud_config();
+        let signature = format!("sha256={}", hmac_sha256_hex(&config.app_secret, raw_body));
+        assert!(
+            verify_cloud_api_request_signature(&config, tampered_body, Some(&signature)).is_err()
+        );
     }
 }

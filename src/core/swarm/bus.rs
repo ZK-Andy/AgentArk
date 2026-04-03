@@ -44,6 +44,7 @@ impl MessageBus {
     }
 
     /// Send a directed message to a specific agent
+    #[cfg(test)]
     pub async fn send(&self, message: SwarmMessage) -> anyhow::Result<()> {
         let mailboxes = self.mailboxes.read().await;
         if let Some(tx) = mailboxes.get(&message.to) {
@@ -61,6 +62,7 @@ impl MessageBus {
     }
 
     /// Subscribe to system events
+    #[cfg(test)]
     pub fn subscribe_events(&self) -> broadcast::Receiver<SwarmEvent> {
         self.event_tx.subscribe()
     }

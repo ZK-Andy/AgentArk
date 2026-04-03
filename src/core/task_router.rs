@@ -16,11 +16,13 @@ use super::config::{ModelRole, ModelSlot};
 use super::intent::{action_intent_score, preferred_direct_action_name};
 use super::llm::LlmClient;
 use super::orchestra::SubAgentType;
-use super::prompt_policy::{delegated_policy_v2_block, synthesis_policy_v2_block};
+use super::prompt_policy::delegated_policy_v2_block;
 use super::swarm::agent_trait::SwarmAgent;
 use super::swarm::specialist::SpecialistAgent;
-use super::{DegradationNote, DelegationStatus, FailureKind};
+use super::swarm::{SwarmActivityAgent, SwarmActivityTracker};
+use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
+use crate::core::queue_stream_event;
 use crate::memory::MemoryEntry;
 
 fn compact_text(text: &str, max_chars: usize) -> String {
@@ -29,6 +31,277 @@ fn compact_text(text: &str, max_chars: usize) -> String {
     } else {
         format!("{}...", text.chars().take(max_chars).collect::<String>())
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DelegatedDependencyPacket {
+    sequence: usize,
+    agent_name: String,
+    agent_role: String,
+    task: String,
+    status: String,
+    output_summary: String,
+    failure_kind: Option<String>,
+    next_action_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DelegatedMemoryPacket {
+    memory_type: String,
+    content: String,
+    timestamp: String,
+    relevance_score: f32,
+    importance: f32,
+    final_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DelegatedActionPacket {
+    name: String,
+    description: String,
+    role: String,
+    integration_class: String,
+    side_effect_level: String,
+    requires_auth: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DelegatedTaskPacket {
+    delegation_id: String,
+    agent_id: String,
+    agent_name: String,
+    agent_role: String,
+    assignment_index: usize,
+    total_assignments: usize,
+    original_request: String,
+    assigned_task: String,
+    coordinator_notes: String,
+    dependency_outputs: Vec<DelegatedDependencyPacket>,
+    relevant_memories: Vec<DelegatedMemoryPacket>,
+    action_scope: Vec<DelegatedActionPacket>,
+    execution_contract: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedDelegationPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<String>,
+    #[serde(default)]
+    agent_name: String,
+    #[serde(default)]
+    agent_role: String,
+    #[serde(default)]
+    model_name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    latest_update: String,
+    #[serde(default)]
+    is_specialist: bool,
+    #[serde(default)]
+    depends_on: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_action_hint: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<String>,
+    #[serde(default)]
+    sequence: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
+impl DelegatedTaskPacket {
+    fn render_markdown(&self) -> String {
+        let dependency_section = if self.dependency_outputs.is_empty() {
+            "No completed dependencies were provided.".to_string()
+        } else {
+            self.dependency_outputs
+                .iter()
+                .map(|dep| {
+                    let failure_suffix = dep
+                        .failure_kind
+                        .as_ref()
+                        .map(|kind| format!(" | failure={kind}"))
+                        .unwrap_or_default();
+                    let next_step = dep
+                        .next_action_hint
+                        .as_ref()
+                        .map(|hint| format!("\n  Next-step hint: {}", compact_text(hint, 180)))
+                        .unwrap_or_default();
+                    format!(
+                        "- Step {}: {} · {} [{}]\n  Task: {}\n  Output: {}{}{}",
+                        dep.sequence,
+                        dep.agent_name,
+                        dep.agent_role,
+                        dep.status,
+                        compact_text(&dep.task, 220),
+                        compact_text(&dep.output_summary, 320),
+                        failure_suffix,
+                        next_step
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let memory_section = if self.relevant_memories.is_empty() {
+            "No relevant memory snippets were attached.".to_string()
+        } else {
+            self.relevant_memories
+                .iter()
+                .map(|memory| {
+                    format!(
+                        "- {} | score {:.2} | importance {:.2}\n  {}",
+                        memory.memory_type,
+                        memory.final_score,
+                        memory.importance,
+                        compact_text(&memory.content, 260)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let action_section = if self.action_scope.is_empty() {
+            "No task-scoped actions were attached.".to_string()
+        } else {
+            self.action_scope
+                .iter()
+                .map(|action| {
+                    let auth = if action.requires_auth {
+                        "auth required"
+                    } else {
+                        "no auth"
+                    };
+                    format!(
+                        "- `{}` [{} / {} / {} / {}] {}\n  {}",
+                        action.name,
+                        action.role,
+                        action.integration_class,
+                        action.side_effect_level,
+                        auth,
+                        "",
+                        compact_text(&action.description, 220)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let contract_section = self
+            .execution_contract
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "## Delegated Task Packet\n\
+- Delegation id: `{}`\n\
+- Agent: {} · {}\n\
+- Assignment: {}/{}\n\n\
+## Original Request\n{}\n\n\
+## Assigned Task\n{}\n\n\
+## Coordinator Notes\n{}\n\n\
+## Dependency Outputs\n{}\n\n\
+## Relevant Memory\n{}\n\n\
+## Allowed Actions\n{}\n\n\
+## Execution Contract\n{}",
+            self.delegation_id,
+            self.agent_name,
+            self.agent_role,
+            self.assignment_index,
+            self.total_assignments,
+            compact_text(&self.original_request, 900),
+            compact_text(&self.assigned_task, 700),
+            compact_text(&self.coordinator_notes, 700),
+            dependency_section,
+            memory_section,
+            action_section,
+            contract_section
+        )
+    }
+}
+
+fn summarize_memory_type(memory: &MemoryEntry) -> &'static str {
+    match &memory.memory_type {
+        crate::memory::MemoryType::Episodic { .. } => "episodic",
+        crate::memory::MemoryType::Semantic { .. } => "semantic",
+        crate::memory::MemoryType::Procedural { .. } => "procedural",
+    }
+}
+
+fn delegation_row_id(delegation_id: &str, agent_id: &str) -> String {
+    format!("{delegation_id}::{agent_id}")
+}
+
+fn parse_persisted_delegation_payload(raw: Option<&str>) -> PersistedDelegationPayload {
+    serde_json::from_str::<PersistedDelegationPayload>(raw.unwrap_or_default()).unwrap_or_default()
+}
+
+fn parse_persisted_failure_kind(raw: Option<&str>) -> Option<FailureKind> {
+    match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "transient_transport" => Some(FailureKind::TransientTransport),
+        "rate_limited" => Some(FailureKind::RateLimited),
+        "authentication" => Some(FailureKind::Authentication),
+        "configuration" => Some(FailureKind::Configuration),
+        "context_window_exceeded" => Some(FailureKind::ContextWindowExceeded),
+        "schema_mismatch" => Some(FailureKind::SchemaMismatch),
+        "tool_contract_failure" => Some(FailureKind::ToolContractFailure),
+        "capability_bound" => Some(FailureKind::CapabilityBound),
+        "upstream_provider" => Some(FailureKind::UpstreamProvider),
+        "timeout" => Some(FailureKind::Timeout),
+        "missing_input" => Some(FailureKind::MissingInput),
+        "internal_post_process" => Some(FailureKind::InternalPostProcess),
+        "delegation_failed" => Some(FailureKind::DelegationFailed),
+        "panic" => Some(FailureKind::Panic),
+        "unknown" => Some(FailureKind::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_persisted_delegation_status(raw: &str) -> Option<DelegationStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "completed" => Some(DelegationStatus::Completed),
+        "partial" => Some(DelegationStatus::Partial),
+        "failed" => Some(DelegationStatus::Failed),
+        "timed_out" => Some(DelegationStatus::TimedOut),
+        "panicked" => Some(DelegationStatus::Panicked),
+        _ => None,
+    }
+}
+
+fn is_resume_reusable_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "partial"
+    )
+}
+
+fn memory_overlap_bonus(task_lower: &str, content_lower: &str) -> f32 {
+    if task_lower.is_empty() || content_lower.is_empty() {
+        return 0.0;
+    }
+    if content_lower.contains(task_lower) {
+        return 0.35;
+    }
+    let overlap = task_lower
+        .split_whitespace()
+        .filter(|word| word.len() > 3 && content_lower.contains(word))
+        .count();
+    (overlap as f32 * 0.06).min(0.30)
 }
 
 fn classify_agent_failure(error_text: &str) -> (DelegationStatus, FailureKind, String) {
@@ -231,67 +504,110 @@ fn build_fallback_delegation_response(
     }
 }
 
-const AUTO_AGENT_SCIENTIST_NAMES: &[&str] = &[
-    "Curie",
-    "Turing",
-    "Hopper",
-    "Einstein",
-    "Tesla",
-    "Faraday",
-    "Noether",
-    "Sagan",
-    "Kepler",
-    "Galileo",
-    "Darwin",
-    "Feynman",
-    "Hubble",
-    "Maxwell",
-    "Lovelace",
-    "Bohr",
-    "Franklin",
-    "Planck",
-    "Copernicus",
-    "Mendel",
-    "Raman",
-    "Hawking",
-    "Meitner",
-    "Pasteur",
-    "Newton",
-    "Shannon",
-    "Babbage",
-    "Euler",
-    "Leavitt",
-    "Goodall",
-    "Carson",
-    "Chandrasekhar",
-    "Wu",
-    "Boyle",
-    "Archimedes",
-    "Kapitsa",
-];
+const RESEARCHER_CALLSIGNS: &[&str] = &["Orbit", "Beacon", "Drift"];
+const CODER_CALLSIGNS: &[&str] = &["Forge", "Vector", "Patch"];
+const ANALYST_CALLSIGNS: &[&str] = &["Atlas", "Prism", "Ledger"];
+const WRITER_CALLSIGNS: &[&str] = &["Quill", "Echo", "Verse"];
+const VALIDATOR_CALLSIGNS: &[&str] = &["Aegis", "Sentinel", "Vanta"];
+const PLANNER_CALLSIGNS: &[&str] = &["Helix", "Orion", "Northstar"];
+const CUSTOM_CALLSIGNS: &[&str] = &["Nova", "Relay", "Flux"];
 
-fn scientist_name_for_index(index: usize) -> String {
-    AUTO_AGENT_SCIENTIST_NAMES[index % AUTO_AGENT_SCIENTIST_NAMES.len()].to_string()
-}
-
-fn fallback_scientist_name(agent_type: &SubAgentType) -> &'static str {
+fn cool_name_pool(agent_type: &SubAgentType) -> &'static [&'static str] {
     match agent_type {
-        SubAgentType::Researcher => "Curie",
-        SubAgentType::Coder => "Turing",
-        SubAgentType::Analyst => "Noether",
-        SubAgentType::Writer => "Sagan",
-        SubAgentType::Validator => "Franklin",
-        SubAgentType::Planner => "Kepler",
-        SubAgentType::Custom { .. } => "Faraday",
+        SubAgentType::Researcher => RESEARCHER_CALLSIGNS,
+        SubAgentType::Coder => CODER_CALLSIGNS,
+        SubAgentType::Analyst => ANALYST_CALLSIGNS,
+        SubAgentType::Writer => WRITER_CALLSIGNS,
+        SubAgentType::Validator => VALIDATOR_CALLSIGNS,
+        SubAgentType::Planner => PLANNER_CALLSIGNS,
+        SubAgentType::Custom { .. } => CUSTOM_CALLSIGNS,
     }
 }
 
-fn display_name_for_specialist(name: &str, agent_type: &SubAgentType) -> String {
+pub fn cool_name_for_auto_agent(index: usize, agent_type: &SubAgentType) -> String {
+    let pool = cool_name_pool(agent_type);
+    pool[index % pool.len()].to_string()
+}
+
+fn has_generic_agent_name(name: &str, agent_type: &SubAgentType) -> bool {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(&agent_type.name()) {
-        fallback_scientist_name(agent_type).to_string()
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case(&agent_type.name())
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "agent" | "specialist" | "worker" | "sub-agent" | "subagent"
+        )
+}
+
+pub fn display_name_for_specialist(name: &str, agent_type: &SubAgentType) -> String {
+    let trimmed = name.trim();
+    if has_generic_agent_name(trimmed, agent_type) {
+        cool_name_for_auto_agent(0, agent_type)
     } else {
         trimmed.to_string()
+    }
+}
+
+fn delegation_payload(
+    kind: &str,
+    delegation_id: &str,
+    summary: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = match extra {
+        serde_json::Value::Object(obj) => obj,
+        other => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("payload".to_string(), other);
+            obj
+        }
+    };
+    payload.insert("kind".to_string(), serde_json::json!(kind));
+    payload.insert(
+        "delegation_id".to_string(),
+        serde_json::json!(delegation_id.to_string()),
+    );
+    payload.insert("chat_visible".to_string(), serde_json::json!(true));
+    payload.insert("summary".to_string(), serde_json::json!(summary));
+    serde_json::Value::Object(payload)
+}
+
+fn emit_delegation_event(
+    token_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+    kind: &str,
+    delegation_id: &str,
+    content: impl Into<String>,
+    extra: serde_json::Value,
+) {
+    let Some(tx) = token_tx else {
+        return;
+    };
+    let content = content.into();
+    queue_stream_event(
+        tx,
+        StreamEvent::ToolProgress {
+            name: "delegation".to_string(),
+            content: content.clone(),
+            payload: Some(delegation_payload(kind, delegation_id, &content, extra)),
+        },
+    );
+}
+
+fn agent_status_summary(result: &AgentExecResult) -> String {
+    let base = format!(
+        "{} [{}] {}",
+        result
+            .agent_name
+            .as_deref()
+            .unwrap_or(result.agent_type.as_str()),
+        result.agent_type,
+        result.status.as_str()
+    );
+    let detail = compact_text(&result.content, 180);
+    if detail.is_empty() {
+        base
+    } else {
+        format!("{} - {}", base, detail)
     }
 }
 
@@ -359,13 +675,14 @@ impl SubAgentSpec {
 }
 
 /// Result of task routing
+#[allow(clippy::large_enum_variant)]
 pub enum TaskRouterResult {
     /// Simple query — caller should do a direct LLM call
     Direct,
     /// Medium query without delegation — use parallel thinking
     UseParallelThinking,
     /// Delegated to auto-spawned agents — here are the results
-    Delegated(DelegatedResult),
+    Delegated(Box<DelegatedResult>),
 }
 
 /// Result from delegated multi-agent execution
@@ -374,9 +691,7 @@ pub struct DelegatedResult {
     /// Final synthesized response (includes tool calls when returned by the LLM)
     pub final_response: super::llm::LlmResponse,
     /// Per-agent results for trace visibility
-    pub _agent_results: Vec<AgentExecResult>,
-    /// Total wall-clock time in milliseconds
-    pub _total_time_ms: u64,
+    pub agent_results: Vec<AgentExecResult>,
     /// Whether delegation completed fully or only partially succeeded.
     pub delegation_status: DelegationStatus,
     /// Degradation notes that should be surfaced to the caller.
@@ -386,6 +701,8 @@ pub struct DelegatedResult {
 /// Result from a single agent execution (for trace)
 #[derive(Debug, Clone)]
 pub struct AgentExecResult {
+    /// Stable identifier for this delegated agent execution.
+    pub agent_id: String,
     /// Agent type name
     pub agent_type: String,
     /// Task that was assigned
@@ -442,14 +759,22 @@ pub struct TaskRouter {
 type SpecialistRegistry = Arc<RwLock<HashMap<super::swarm::AgentId, Arc<SpecialistAgent>>>>;
 
 pub struct TaskRouterExecuteContext<'a> {
+    pub delegation_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub channel: Option<&'a str>,
     pub message: &'a str,
     pub system_prompt: &'a str,
+    pub prompt_bundle: &'a crate::core::self_evolve::PromptBundleProfile,
+    pub specialist_prompt_bundle: &'a crate::core::self_evolve::SpecialistPromptBundleProfile,
     pub model_pool: &'a HashMap<String, (ModelSlot, LlmClient)>,
     pub primary_llm: &'a LlmClient,
     pub specialists: &'a Option<SpecialistRegistry>,
     pub memories: &'a [MemoryEntry],
     pub actions: &'a [ActionDef],
     pub trace: &'a Arc<RwLock<super::agent::ExecutionTrace>>,
+    pub token_tx: Option<&'a tokio::sync::mpsc::Sender<StreamEvent>>,
+    pub swarm_activity: Option<&'a Arc<SwarmActivityTracker>>,
+    pub storage: Option<&'a crate::storage::Storage>,
 }
 
 impl TaskRouter {
@@ -463,14 +788,22 @@ impl TaskRouter {
         decision: &RoutingDecision,
         ctx: TaskRouterExecuteContext<'_>,
     ) -> Result<TaskRouterResult> {
+        let delegation_id = ctx.delegation_id;
+        let conversation_id = ctx.conversation_id;
+        let channel = ctx.channel;
         let message = ctx.message;
         let system_prompt = ctx.system_prompt;
+        let prompt_bundle = ctx.prompt_bundle;
+        let specialist_prompt_bundle = ctx.specialist_prompt_bundle;
         let model_pool = ctx.model_pool;
         let primary_llm = ctx.primary_llm;
         let specialists = ctx.specialists;
         let memories = ctx.memories;
         let actions = ctx.actions;
         let trace = ctx.trace;
+        let token_tx = ctx.token_tx;
+        let swarm_activity = ctx.swarm_activity;
+        let storage = ctx.storage;
         // Simple queries — no delegation
         if !decision.needs_delegation {
             return match decision.complexity {
@@ -485,11 +818,33 @@ impl TaskRouter {
         }
 
         let start = std::time::Instant::now();
+        if let Some(tracker) = swarm_activity {
+            tracker
+                .start_run(
+                    delegation_id,
+                    message,
+                    conversation_id,
+                    channel,
+                    decision.sub_agents.len(),
+                )
+                .await;
+        }
+        emit_delegation_event(
+            token_tx,
+            "delegation_started",
+            delegation_id,
+            format!("Starting {} delegated agents.", decision.sub_agents.len()),
+            serde_json::json!({
+                "status": "running",
+                "agent_count": decision.sub_agents.len(),
+                "request": compact_text(message, 200),
+            }),
+        );
 
         // Build assignments: for each spec, find a specialist or pick model from pool
         let mut assignments: Vec<AgentAssignment> = Vec::new();
 
-        for spec in &decision.sub_agents {
+        for (index, spec) in decision.sub_agents.iter().enumerate() {
             let agent_type = spec.resolve_agent_type();
 
             // Try to find a matching user-configured specialist
@@ -501,6 +856,8 @@ impl TaskRouter {
             };
 
             if let Some((name, specialist)) = specialist_match {
+                let display_name = display_name_for_specialist(&name, &agent_type);
+                let agent_id = specialist.id().to_string();
                 // Trace: specialist matched
                 {
                     let mut t = trace.write().await;
@@ -514,17 +871,60 @@ impl TaskRouter {
                         duration_ms: None,
                     });
                 }
+                if let Some(tracker) = swarm_activity {
+                    tracker
+                        .upsert_agent(
+                            delegation_id,
+                            SwarmActivityAgent {
+                                id: agent_id.clone(),
+                                agent_name: display_name.clone(),
+                                agent_role: agent_type.name(),
+                                model_name: specialist.model_name(),
+                                task: spec.task.clone(),
+                                status: "assigned".to_string(),
+                                summary: "Matched to a configured specialist.".to_string(),
+                                latest_update: "Waiting to start.".to_string(),
+                                is_specialist: true,
+                                depends_on: spec.depends_on.clone(),
+                                started_at: None,
+                                completed_at: None,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                                elapsed_ms: None,
+                            },
+                        )
+                        .await;
+                }
+                emit_delegation_event(
+                    token_tx,
+                    "delegation_assignment",
+                    delegation_id,
+                    format!("Assigned {}.", display_name),
+                    serde_json::json!({
+                        "agent_id": agent_id.clone(),
+                        "agent_name": display_name.clone(),
+                        "agent_role": agent_type.name(),
+                        "model_name": specialist.model_name(),
+                        "task": spec.task.clone(),
+                        "is_specialist": true,
+                        "depends_on": spec.depends_on.clone(),
+                        "sequence": index + 1,
+                        "status": "assigned",
+                    }),
+                );
                 assignments.push(AgentAssignment {
+                    agent_id,
                     spec: spec.clone(),
                     agent_type: agent_type.clone(),
-                    display_name: display_name_for_specialist(&name, &agent_type),
+                    display_name,
+                    model_name: specialist.model_name(),
                     kind: AssignmentKind::Specialist(specialist),
                 });
             } else {
                 // Auto-spawn: select LLM from model pool
                 let llm = self.select_llm_for_spec(spec, &agent_type, model_pool, primary_llm);
                 let model_name = llm.model_name().to_string();
-                let auto_agent_name = scientist_name_for_index(assignments.len());
+                let auto_agent_name = cool_name_for_auto_agent(assignments.len(), &agent_type);
+                let agent_id = format!("{}:agent:{}", delegation_id, index + 1);
                 // Trace: auto-spawning
                 {
                     let mut t = trace.write().await;
@@ -543,10 +943,52 @@ impl TaskRouter {
                         duration_ms: None,
                     });
                 }
+                if let Some(tracker) = swarm_activity {
+                    tracker
+                        .upsert_agent(
+                            delegation_id,
+                            SwarmActivityAgent {
+                                id: agent_id.clone(),
+                                agent_name: auto_agent_name.clone(),
+                                agent_role: agent_type.name(),
+                                model_name: model_name.clone(),
+                                task: spec.task.clone(),
+                                status: "assigned".to_string(),
+                                summary: "Prepared as an on-demand helper agent.".to_string(),
+                                latest_update: "Waiting to start.".to_string(),
+                                is_specialist: false,
+                                depends_on: spec.depends_on.clone(),
+                                started_at: None,
+                                completed_at: None,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                                elapsed_ms: None,
+                            },
+                        )
+                        .await;
+                }
+                emit_delegation_event(
+                    token_tx,
+                    "delegation_assignment",
+                    delegation_id,
+                    format!("Prepared {}.", auto_agent_name),
+                    serde_json::json!({
+                        "agent_id": agent_id.clone(),
+                        "agent_name": auto_agent_name.clone(),
+                        "agent_role": agent_type.name(),
+                        "model_name": model_name,
+                        "task": spec.task.clone(),
+                        "is_specialist": false,
+                        "depends_on": spec.depends_on.clone(),
+                        "sequence": index + 1,
+                        "status": "assigned",
+                    }),
+                );
                 assignments.push(AgentAssignment {
+                    agent_id,
                     spec: spec.clone(),
                     agent_type: agent_type.clone(),
                     display_name: auto_agent_name,
+                    model_name: llm.model_name().to_string(),
                     kind: AssignmentKind::Ephemeral(llm),
                 });
             }
@@ -554,7 +996,21 @@ impl TaskRouter {
 
         // Execute assignments respecting dependencies
         let results = self
-            .execute_assignments(&assignments, system_prompt, memories, actions, trace)
+            .execute_assignments(
+                delegation_id,
+                &assignments,
+                message,
+                system_prompt,
+                specialist_prompt_bundle,
+                memories,
+                actions,
+                trace,
+                token_tx,
+                swarm_activity,
+                conversation_id,
+                channel,
+                storage,
+            )
             .await?;
 
         let delegation_status = summarize_delegation_status(&results);
@@ -579,17 +1035,57 @@ impl TaskRouter {
                 t.steps.push(super::agent::ExecutionStep {
                     icon: "[fallback]".to_string(),
                     title: "Delegation Fallback Summary".to_string(),
-                    detail:
-                        "All delegated paths degraded, so AgentArk returned a best-effort summary."
-                            .to_string(),
+                    detail: format!(
+                        "All delegated paths degraded, so {} returned a best-effort summary.",
+                        crate::branding::PRODUCT_NAME
+                    ),
                     step_type: "warning".to_string(),
                     data: None,
                     timestamp: chrono::Utc::now(),
                     duration_ms: None,
                 });
             }
+            if let Some(tracker) = swarm_activity {
+                tracker
+                    .update_run_status(
+                        delegation_id,
+                        "degraded",
+                        "No delegated paths completed cleanly; returning a best-effort summary.",
+                    )
+                    .await;
+            }
+            emit_delegation_event(
+                token_tx,
+                "delegation_synthesis_started",
+                delegation_id,
+                "No delegated paths completed cleanly; using the fallback summary.".to_string(),
+                serde_json::json!({
+                    "status": "degraded",
+                    "completed_paths": completed_paths,
+                }),
+            );
             build_fallback_delegation_response(message, &results)
         } else {
+            if let Some(tracker) = swarm_activity {
+                tracker
+                    .update_run_status(
+                        delegation_id,
+                        "synthesizing",
+                        "Combining delegated outputs into one answer.",
+                    )
+                    .await;
+            }
+            emit_delegation_event(
+                token_tx,
+                "delegation_synthesis_started",
+                delegation_id,
+                format!("Synthesizing {} delegated result(s).", completed_paths),
+                serde_json::json!({
+                    "status": "synthesizing",
+                    "completed_paths": completed_paths,
+                    "agent_count": results.len(),
+                }),
+            );
             let aggregate_result = if results.len() == 1 {
                 if let Some(resp) = results[0].llm_response.clone() {
                     Ok(resp)
@@ -600,6 +1096,7 @@ impl TaskRouter {
                         primary_llm,
                         message,
                         system_prompt,
+                        prompt_bundle,
                         &results,
                         memories,
                         actions,
@@ -628,6 +1125,7 @@ impl TaskRouter {
                     primary_llm,
                     message,
                     system_prompt,
+                    prompt_bundle,
                     &results,
                     memories,
                     actions,
@@ -649,7 +1147,10 @@ impl TaskRouter {
                         t.steps.push(super::agent::ExecutionStep {
                             icon: "[fallback]".to_string(),
                             title: "Delegation Synthesis Fallback".to_string(),
-                            detail: "The primary synthesis pass failed, so AgentArk returned a best-effort summary.".to_string(),
+                            detail: format!(
+                                "The primary synthesis pass failed, so {} returned a best-effort summary.",
+                                crate::branding::PRODUCT_NAME
+                            ),
                             step_type: "warning".to_string(),
                             data: Some(error_text),
                             timestamp: chrono::Utc::now(),
@@ -678,6 +1179,21 @@ impl TaskRouter {
         }
 
         let total_time_ms = start.elapsed().as_millis() as u64;
+        let completion_status = if degradation.is_empty() {
+            "completed"
+        } else if completed_paths > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        let completion_summary = if degradation.is_empty() {
+            format!("Completed {} delegated agents successfully.", results.len())
+        } else {
+            format!(
+                "Delegated execution finished with status {}.",
+                delegation_status.as_str()
+            )
+        };
 
         // Trace: complete
         {
@@ -720,14 +1236,30 @@ impl TaskRouter {
                 duration_ms: Some(total_time_ms),
             });
         }
+        emit_delegation_event(
+            token_tx,
+            "delegation_completed",
+            delegation_id,
+            completion_summary.clone(),
+            serde_json::json!({
+                "status": completion_status,
+                "delegation_status": delegation_status.as_str(),
+                "agent_count": results.len(),
+                "elapsed_ms": total_time_ms,
+            }),
+        );
+        if let Some(tracker) = swarm_activity {
+            tracker
+                .complete_run(delegation_id, completion_status, &completion_summary)
+                .await;
+        }
 
-        Ok(TaskRouterResult::Delegated(DelegatedResult {
+        Ok(TaskRouterResult::Delegated(Box::new(DelegatedResult {
             final_response,
-            _agent_results: results,
-            _total_time_ms: total_time_ms,
+            agent_results: results,
             delegation_status,
             degradation,
-        }))
+        })))
     }
 
     /// Find a user-configured specialist that matches the task
@@ -832,18 +1364,400 @@ impl TaskRouter {
         selected
     }
 
+    /// Keep delegated memory context compact and task-relevant.
+    fn select_memories_for_task(&self, task: &str, memories: &[MemoryEntry]) -> Vec<MemoryEntry> {
+        let task_lower = task.to_ascii_lowercase();
+        let mut scored: Vec<(f32, MemoryEntry)> = memories
+            .iter()
+            .map(|memory| {
+                let content_lower = memory.content.to_ascii_lowercase();
+                let score = memory.final_score.max(memory.relevance_score)
+                    + (memory.importance * 0.20)
+                    + memory_overlap_bonus(&task_lower, &content_lower);
+                (score, memory.clone())
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored
+            .into_iter()
+            .take(4)
+            .map(|(_, memory)| memory)
+            .collect()
+    }
+
+    fn summarize_action_scope(&self, actions: &[ActionDef]) -> Vec<DelegatedActionPacket> {
+        actions
+            .iter()
+            .take(6)
+            .map(|action| {
+                let meta = action.planner_metadata();
+                DelegatedActionPacket {
+                    name: action.name.clone(),
+                    description: action.description.clone(),
+                    role: format!("{:?}", meta.role).to_ascii_lowercase(),
+                    integration_class: format!("{:?}", meta.integration_class).to_ascii_lowercase(),
+                    side_effect_level: format!("{:?}", meta.side_effect_level).to_ascii_lowercase(),
+                    requires_auth: meta.requires_auth,
+                }
+            })
+            .collect()
+    }
+
+    fn summarize_memory_scope(&self, memories: &[MemoryEntry]) -> Vec<DelegatedMemoryPacket> {
+        memories
+            .iter()
+            .take(4)
+            .map(|memory| DelegatedMemoryPacket {
+                memory_type: summarize_memory_type(memory).to_string(),
+                content: compact_text(&memory.content, 240),
+                timestamp: memory.timestamp.to_rfc3339(),
+                relevance_score: memory.relevance_score,
+                importance: memory.importance,
+                final_score: memory.final_score,
+            })
+            .collect()
+    }
+
+    fn build_dependency_scope(
+        &self,
+        assignment: &AgentAssignment,
+        assignments: &[AgentAssignment],
+        results: &[Option<AgentExecResult>],
+    ) -> Vec<DelegatedDependencyPacket> {
+        assignment
+            .spec
+            .depends_on
+            .iter()
+            .filter_map(|&dep| {
+                let result = results.get(dep)?.as_ref()?;
+                let prior_assignment = assignments.get(dep)?;
+                Some(DelegatedDependencyPacket {
+                    sequence: dep + 1,
+                    agent_name: result
+                        .agent_name
+                        .clone()
+                        .unwrap_or_else(|| prior_assignment.display_name.clone()),
+                    agent_role: result.agent_type.clone(),
+                    task: result.task.clone(),
+                    status: result.status.as_str().to_string(),
+                    output_summary: compact_text(&result.content, 320),
+                    failure_kind: result
+                        .failure_kind
+                        .as_ref()
+                        .map(|kind| format!("{:?}", kind)),
+                    next_action_hint: result.next_action_hint.clone(),
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_task_packet(
+        &self,
+        delegation_id: &str,
+        assignment_index: usize,
+        total_assignments: usize,
+        original_request: &str,
+        coordinator_notes: &str,
+        assignment: &AgentAssignment,
+        dependency_scope: Vec<DelegatedDependencyPacket>,
+        memory_scope: &[MemoryEntry],
+        action_scope: &[ActionDef],
+    ) -> DelegatedTaskPacket {
+        DelegatedTaskPacket {
+            delegation_id: delegation_id.to_string(),
+            agent_id: assignment.agent_id.clone(),
+            agent_name: assignment.display_name.clone(),
+            agent_role: assignment.agent_type.name(),
+            assignment_index: assignment_index + 1,
+            total_assignments,
+            original_request: compact_text(original_request, 1000),
+            assigned_task: assignment.spec.task.clone(),
+            coordinator_notes: compact_text(coordinator_notes, 900),
+            dependency_outputs: dependency_scope,
+            relevant_memories: self.summarize_memory_scope(memory_scope),
+            action_scope: self.summarize_action_scope(action_scope),
+            execution_contract: vec![
+                "Stay within the assigned task and do not expand scope on your own."
+                    .to_string(),
+                "Use dependency outputs as upstream truth unless they conflict with the user request."
+                    .to_string(),
+                "Prefer the attached scoped actions and do not assume unrelated tools are available."
+                    .to_string(),
+                "Return the highest-signal result for your task, including risks or missing follow-up if relevant."
+                    .to_string(),
+            ],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_checkpoint_payload(
+        &self,
+        request: &str,
+        assignment: &AgentAssignment,
+        status: &str,
+        summary: &str,
+        latest_update: &str,
+        content: Option<&str>,
+        elapsed_ms: Option<u64>,
+        conversation_id: Option<&str>,
+        channel: Option<&str>,
+        failure_kind: Option<&FailureKind>,
+        next_action_hint: Option<&str>,
+        artifacts: &[String],
+        sequence: usize,
+    ) -> PersistedDelegationPayload {
+        PersistedDelegationPayload {
+            request: Some(compact_text(request, 220)),
+            agent_name: assignment.display_name.clone(),
+            agent_role: assignment.agent_type.name(),
+            model_name: assignment.model_name.clone(),
+            status: status.to_string(),
+            content: content
+                .map(|value| compact_text(value, 3_200))
+                .unwrap_or_default(),
+            summary: compact_text(summary, 320),
+            latest_update: compact_text(latest_update, 320),
+            is_specialist: matches!(&assignment.kind, AssignmentKind::Specialist(_)),
+            depends_on: assignment.spec.depends_on.clone(),
+            elapsed_ms,
+            conversation_id: conversation_id.map(str::to_string),
+            channel: channel.map(str::to_string),
+            failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+            next_action_hint: next_action_hint.map(|value| compact_text(value, 240)),
+            artifacts: artifacts
+                .iter()
+                .map(|artifact| compact_text(artifact, 140))
+                .collect(),
+            sequence: sequence + 1,
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_assignment_checkpoint(
+        &self,
+        storage: &crate::storage::Storage,
+        delegation_id: &str,
+        conversation_id: Option<&str>,
+        channel: Option<&str>,
+        request: &str,
+        sequence: usize,
+        assignment: &AgentAssignment,
+        status: &str,
+        summary: &str,
+        latest_update: &str,
+        content: Option<&str>,
+        elapsed_ms: Option<u64>,
+        failure_kind: Option<&FailureKind>,
+        next_action_hint: Option<&str>,
+        confidence: Option<f32>,
+        artifacts: &[String],
+        completed_at: Option<String>,
+    ) -> Result<()> {
+        let row = crate::storage::entities::swarm_delegation::Model {
+            id: delegation_row_id(delegation_id, &assignment.agent_id),
+            parent_task_id: Some(delegation_id.to_string()),
+            agent_id: assignment.agent_id.clone(),
+            task_description: assignment.spec.task.clone(),
+            result: Some(serde_json::to_string(&self.build_checkpoint_payload(
+                request,
+                assignment,
+                status,
+                summary,
+                latest_update,
+                content,
+                elapsed_ms,
+                conversation_id,
+                channel,
+                failure_kind,
+                next_action_hint,
+                artifacts,
+                sequence,
+            ))?),
+            success: if matches!(status, "completed" | "partial") {
+                1
+            } else {
+                0
+            },
+            confidence,
+            execution_time_ms: elapsed_ms.map(|value| value.min(i32::MAX as u64) as i32),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at,
+        };
+        storage.upsert_swarm_delegation(&row).await
+    }
+
+    fn checkpoint_result_from_row(
+        &self,
+        row: &crate::storage::entities::swarm_delegation::Model,
+    ) -> Option<AgentExecResult> {
+        let payload = parse_persisted_delegation_payload(row.result.as_deref());
+        if row.completed_at.is_none() || !is_resume_reusable_status(&payload.status) {
+            return None;
+        }
+        let status = parse_persisted_delegation_status(&payload.status)?;
+        let content = if payload.content.trim().is_empty() {
+            payload.summary.trim().to_string()
+        } else {
+            payload.content.trim().to_string()
+        };
+        Some(AgentExecResult {
+            agent_id: row.agent_id.clone(),
+            agent_type: if payload.agent_role.trim().is_empty() {
+                "Agent".to_string()
+            } else {
+                payload.agent_role.trim().to_string()
+            },
+            task: row.task_description.clone(),
+            is_specialist: payload.is_specialist,
+            agent_name: if payload.agent_name.trim().is_empty() {
+                Some(row.agent_id.clone())
+            } else {
+                Some(payload.agent_name.trim().to_string())
+            },
+            model_name: if payload.model_name.trim().is_empty() {
+                "-".to_string()
+            } else {
+                payload.model_name.trim().to_string()
+            },
+            content,
+            llm_response: None,
+            execution_time_ms: payload
+                .elapsed_ms
+                .or_else(|| row.execution_time_ms.map(|value| value.max(0) as u64))
+                .unwrap_or_default(),
+            status,
+            failure_kind: parse_persisted_failure_kind(payload.failure_kind.as_deref()),
+            next_action_hint: payload.next_action_hint,
+            confidence: row.confidence,
+            artifacts: payload.artifacts,
+        })
+    }
+
     /// Execute all assignments, respecting dependency ordering
+    #[allow(clippy::too_many_arguments)]
     async fn execute_assignments(
         &self,
+        delegation_id: &str,
         assignments: &[AgentAssignment],
-        system_prompt: &str,
+        original_request: &str,
+        coordinator_notes: &str,
+        specialist_prompt_bundle: &crate::core::self_evolve::SpecialistPromptBundleProfile,
         memories: &[MemoryEntry],
         actions: &[ActionDef],
         trace: &Arc<RwLock<super::agent::ExecutionTrace>>,
+        token_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
+        swarm_activity: Option<&Arc<SwarmActivityTracker>>,
+        conversation_id: Option<&str>,
+        channel: Option<&str>,
+        storage: Option<&crate::storage::Storage>,
     ) -> Result<Vec<AgentExecResult>> {
         let n = assignments.len();
         let mut results: Vec<Option<AgentExecResult>> = vec![None; n];
         let mut completed: Vec<bool> = vec![false; n];
+
+        if let Some(storage) = storage {
+            match storage
+                .get_swarm_delegations_for_parent(delegation_id)
+                .await
+            {
+                Ok(existing_rows) => {
+                    let existing_by_agent_id = existing_rows
+                        .into_iter()
+                        .map(|row| (row.agent_id.clone(), row))
+                        .collect::<HashMap<_, _>>();
+                    for (idx, assignment) in assignments.iter().enumerate() {
+                        let Some(row) = existing_by_agent_id.get(&assignment.agent_id) else {
+                            continue;
+                        };
+                        let Some(restored) = self.checkpoint_result_from_row(row) else {
+                            continue;
+                        };
+                        if let Some(tracker) = swarm_activity {
+                            tracker
+                                .update_agent(
+                                    delegation_id,
+                                    &restored.agent_id,
+                                    restored.status.as_str(),
+                                    &compact_text(&restored.content, 220),
+                                    Some("Restored previously completed delegated work."),
+                                    Some(restored.execution_time_ms),
+                                )
+                                .await;
+                        }
+                        emit_delegation_event(
+                            token_tx,
+                            "delegation_agent_completed",
+                            delegation_id,
+                            format!(
+                                "{} restored from the previous run state.",
+                                restored
+                                    .agent_name
+                                    .as_deref()
+                                    .unwrap_or(restored.agent_type.as_str())
+                            ),
+                            serde_json::json!({
+                                "agent_id": restored.agent_id.clone(),
+                                "agent_name": restored.agent_name.clone().unwrap_or_default(),
+                                "agent_role": restored.agent_type.clone(),
+                                "model_name": restored.model_name.clone(),
+                                "task": restored.task.clone(),
+                                "status": restored.status.as_str(),
+                                "elapsed_ms": restored.execution_time_ms,
+                                "is_specialist": restored.is_specialist,
+                                "restored": true,
+                            }),
+                        );
+                        results[idx] = Some(restored);
+                        completed[idx] = true;
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "Failed to load swarm delegation checkpoints for '{}': {}",
+                    delegation_id,
+                    error
+                ),
+            }
+        }
+
+        if let Some(storage) = storage {
+            for (idx, assignment) in assignments.iter().enumerate() {
+                if completed[idx] {
+                    continue;
+                }
+                if let Err(error) = self
+                    .persist_assignment_checkpoint(
+                        storage,
+                        delegation_id,
+                        conversation_id,
+                        channel,
+                        original_request,
+                        idx,
+                        assignment,
+                        "assigned",
+                        "Delegated assignment queued.",
+                        "Waiting to start.",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to persist queued delegation checkpoint '{}' for '{}': {}",
+                        assignment.agent_id,
+                        delegation_id,
+                        error
+                    );
+                }
+            }
+        }
 
         loop {
             // Find assignments whose dependencies are all satisfied
@@ -869,56 +1783,179 @@ impl TaskRouter {
                 return Err(anyhow!("Circular dependency in sub-agent specs"));
             }
 
-            // Build context from completed dependencies
-            let dep_contexts: Vec<(usize, String)> = ready
-                .iter()
-                .map(|&idx| {
-                    let ctx: String = assignments[idx]
-                        .spec
-                        .depends_on
-                        .iter()
-                        .filter_map(|&dep| {
-                            results[dep]
-                                .as_ref()
-                                .map(|r| compact_text(&r.content, 1200))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    (idx, ctx)
-                })
-                .collect();
-
             // Execute ready assignments in parallel
             let mut handles = Vec::new();
-            for (idx, context) in dep_contexts {
+            for idx in ready {
                 let assignment = &assignments[idx];
+                let agent_id = assignment.agent_id.clone();
                 let task = assignment.spec.task.clone();
                 let agent_type = assignment.agent_type.clone();
                 let display_name = assignment.display_name.clone();
-                // Keep delegated context compact to control token costs.
-                let sys_prompt = compact_text(system_prompt, 2200);
-                let ctx = context;
-                let mems: Vec<MemoryEntry> = memories.to_vec();
+                let dependency_scope =
+                    self.build_dependency_scope(assignment, assignments, &results);
+                let packet_dependency_count = dependency_scope.len();
+                let mems: Vec<MemoryEntry> = self.select_memories_for_task(&task, memories);
                 let acts: Vec<ActionDef> = self.select_actions_for_task(&task, actions);
+                let packet = self.build_task_packet(
+                    delegation_id,
+                    idx,
+                    assignments.len(),
+                    original_request,
+                    coordinator_notes,
+                    assignment,
+                    dependency_scope,
+                    &mems,
+                    &acts,
+                );
+                let ctx = packet.render_markdown();
                 let timeout = self.config.agent_timeout_secs;
+                let dependency_count = assignment.spec.depends_on.len();
+                let memory_count = mems.len();
+                let action_count = acts.len();
+                if let Some(storage) = storage {
+                    if let Err(error) = self
+                        .persist_assignment_checkpoint(
+                            storage,
+                            delegation_id,
+                            conversation_id,
+                            channel,
+                            original_request,
+                            idx,
+                            assignment,
+                            "running",
+                            "Delegated agent is running.",
+                            "Starting delegated work.",
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            &[],
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to persist running delegation checkpoint '{}' for '{}': {}",
+                            assignment.agent_id,
+                            delegation_id,
+                            error
+                        );
+                    }
+                }
+                if let Some(tracker) = swarm_activity {
+                    tracker
+                        .update_agent(
+                            delegation_id,
+                            &agent_id,
+                            "running",
+                            "Starting delegated work.",
+                            Some("Delegated agent is now running."),
+                            None,
+                        )
+                        .await;
+                }
+                emit_delegation_event(
+                    token_tx,
+                    "delegation_agent_started",
+                    delegation_id,
+                    format!("{} is working.", display_name),
+                    serde_json::json!({
+                        "agent_id": agent_id.clone(),
+                        "agent_name": display_name.clone(),
+                        "agent_role": agent_type.name(),
+                        "task": task.clone(),
+                        "depends_on": assignment.spec.depends_on.clone(),
+                        "status": "running",
+                        "dependency_count": dependency_count,
+                        "resolved_dependency_count": packet_dependency_count,
+                        "memory_count": memory_count,
+                        "action_count": action_count,
+                        "context_mode": "packet_v1",
+                    }),
+                );
+                let (heartbeat_stop_tx, mut heartbeat_stop_rx) = tokio::sync::watch::channel(false);
+                let heartbeat_tx = token_tx.cloned();
+                let heartbeat_tracker = swarm_activity.cloned();
+                let heartbeat_delegation_id = delegation_id.to_string();
+                let heartbeat_agent_id = agent_id.clone();
+                let heartbeat_agent_name = display_name.clone();
+                let heartbeat_agent_role = agent_type.name();
+                let heartbeat_task = task.clone();
+                let heartbeat_handle = tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    loop {
+                        tokio::select! {
+                            changed = heartbeat_stop_rx.changed() => {
+                                if changed.is_err() || *heartbeat_stop_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(8)) => {
+                                let elapsed_ms = started.elapsed().as_millis() as u64;
+                                if let Some(tracker) = heartbeat_tracker.as_ref() {
+                                    tracker
+                                        .update_agent(
+                                            &heartbeat_delegation_id,
+                                            &heartbeat_agent_id,
+                                            "running",
+                                            "Still working on delegated task.",
+                                            Some("Delegated agent is still working."),
+                                            Some(elapsed_ms),
+                                        )
+                                        .await;
+                                }
+                                emit_delegation_event(
+                                    heartbeat_tx.as_ref(),
+                                    "delegation_agent_progress",
+                                    &heartbeat_delegation_id,
+                                    format!("{} is still working.", heartbeat_agent_name),
+                                    serde_json::json!({
+                                        "agent_id": heartbeat_agent_id.clone(),
+                                        "agent_name": heartbeat_agent_name.clone(),
+                                        "agent_role": heartbeat_agent_role.clone(),
+                                        "task": heartbeat_task.clone(),
+                                        "status": "running",
+                                        "elapsed_ms": elapsed_ms,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                });
 
                 match &assignment.kind {
                     AssignmentKind::Specialist(specialist) => {
                         let specialist = specialist.clone();
+                        let agent_id = agent_id.clone();
+                        let specialist_system_prompt =
+                            crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
+                                specialist_prompt_bundle,
+                                &agent_type,
+                            );
                         handles.push((
                             idx,
                             true,
+                            heartbeat_stop_tx,
+                            heartbeat_handle,
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
                                 let result = tokio::time::timeout(
                                     std::time::Duration::from_secs(timeout),
-                                    specialist.execute_task(&task, &ctx),
+                                    specialist.execute_task_with_scope_and_prompt(
+                                        &task,
+                                        &ctx,
+                                        &mems,
+                                        &acts,
+                                        Some(specialist_system_prompt),
+                                    ),
                                 )
                                 .await;
                                 let elapsed = start.elapsed().as_millis() as u64;
                                 let model = specialist.model_name();
                                 match result {
                                     Ok(Ok(content)) => Ok(AgentExecResult {
+                                        agent_id,
                                         agent_type: agent_type.name(),
                                         task,
                                         is_specialist: true,
@@ -943,19 +1980,25 @@ impl TaskRouter {
                     }
                     AssignmentKind::Ephemeral(llm) => {
                         let llm = llm.clone();
+                        let agent_id = agent_id.clone();
                         let model_name = llm.model_name().to_string();
-                        handles.push((idx, false, tokio::spawn(async move {
+                        let delegated_system_prompt =
+                            crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
+                                specialist_prompt_bundle,
+                                &agent_type,
+                            );
+                        handles.push((
+                            idx,
+                            false,
+                            heartbeat_stop_tx,
+                            heartbeat_handle,
+                            tokio::spawn(async move {
                                 let start = std::time::Instant::now();
                                 let prompt = format!(
-                                    "{}\n\n## Inherited Policy\n{}\n\n## Coordinator Context\n{}\n\n## Context from Previous Steps\n{}",
-                                    agent_type.system_prompt(),
+                                    "{}\n\n## Delegated Policy\n{}\n\n{}",
+                                    delegated_system_prompt,
                                     delegated_policy_v2_block(),
-                                    sys_prompt,
-                                    if ctx.is_empty() {
-                                        "No previous context.".to_string()
-                                    } else {
-                                        ctx
-                                    }
+                                    ctx
                                 );
                                 let result = tokio::time::timeout(
                                     std::time::Duration::from_secs(timeout),
@@ -965,6 +2008,7 @@ impl TaskRouter {
                                 let elapsed = start.elapsed().as_millis() as u64;
                                 match result {
                                     Ok(Ok(resp)) => Ok(AgentExecResult {
+                                        agent_id,
                                         agent_type: agent_type.name(),
                                         task,
                                         is_specialist: false,
@@ -982,15 +2026,18 @@ impl TaskRouter {
                                     Ok(Err(e)) => Err(anyhow!("Agent error: {}", e)),
                                     Err(_) => Err(anyhow!("Agent timed out after {}s", timeout)),
                                 }
-                            })));
+                            }),
+                        ));
                     }
                 }
             }
 
             // Collect results
-            for (idx, is_specialist, handle) in handles {
+            for (idx, is_specialist, heartbeat_stop_tx, heartbeat_handle, handle) in handles {
+                let _ = heartbeat_stop_tx.send(true);
                 match handle.await {
                     Ok(Ok(result)) => {
+                        let _ = heartbeat_handle.await;
                         // Trace: agent completed
                         {
                             let mut t = trace.write().await;
@@ -1023,20 +2070,81 @@ impl TaskRouter {
                                 duration_ms: Some(result.execution_time_ms),
                             });
                         }
+                        if let Some(tracker) = swarm_activity {
+                            tracker
+                                .update_agent(
+                                    delegation_id,
+                                    &result.agent_id,
+                                    "completed",
+                                    &compact_text(&result.content, 220),
+                                    Some("Delegated work completed."),
+                                    Some(result.execution_time_ms),
+                                )
+                                .await;
+                        }
+                        emit_delegation_event(
+                            token_tx,
+                            "delegation_agent_completed",
+                            delegation_id,
+                            agent_status_summary(&result),
+                            serde_json::json!({
+                                "agent_id": result.agent_id.clone(),
+                                "agent_name": result.agent_name.clone().unwrap_or_default(),
+                                "agent_role": result.agent_type.clone(),
+                                "model_name": result.model_name.clone(),
+                                "task": result.task.clone(),
+                                "status": "completed",
+                                "elapsed_ms": result.execution_time_ms,
+                                "is_specialist": result.is_specialist,
+                            }),
+                        );
+                        if let Some(storage) = storage {
+                            if let Err(error) = self
+                                .persist_assignment_checkpoint(
+                                    storage,
+                                    delegation_id,
+                                    conversation_id,
+                                    channel,
+                                    original_request,
+                                    idx,
+                                    &assignments[idx],
+                                    result.status.as_str(),
+                                    "Delegated work completed.",
+                                    &compact_text(&result.content, 220),
+                                    Some(&result.content),
+                                    Some(result.execution_time_ms),
+                                    result.failure_kind.as_ref(),
+                                    result.next_action_hint.as_deref(),
+                                    result.confidence,
+                                    &result.artifacts,
+                                    Some(chrono::Utc::now().to_rfc3339()),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to persist completed delegation checkpoint '{}' for '{}': {}",
+                                    assignments[idx].agent_id,
+                                    delegation_id,
+                                    error
+                                );
+                            }
+                        }
                         results[idx] = Some(result);
                         completed[idx] = true;
                     }
                     Ok(Err(e)) => {
+                        let _ = heartbeat_handle.await;
                         tracing::warn!("Agent {} failed: {}", idx, e);
                         let (status, failure_kind, next_action_hint) =
                             classify_agent_failure(&e.to_string());
                         // Create a failure result so we can continue
                         results[idx] = Some(AgentExecResult {
+                            agent_id: assignments[idx].agent_id.clone(),
                             agent_type: assignments[idx].agent_type.name(),
                             task: assignments[idx].spec.task.clone(),
                             is_specialist,
                             agent_name: Some(assignments[idx].display_name.clone()),
-                            model_name: "failed".to_string(),
+                            model_name: assignments[idx].model_name.clone(),
                             content: format!("Agent failed: {}", e),
                             llm_response: None,
                             execution_time_ms: 0,
@@ -1046,16 +2154,78 @@ impl TaskRouter {
                             confidence: None,
                             artifacts: Vec::new(),
                         });
+                        if let Some(result) = results[idx].as_ref() {
+                            if let Some(tracker) = swarm_activity {
+                                tracker
+                                    .update_agent(
+                                        delegation_id,
+                                        &result.agent_id,
+                                        result.status.as_str(),
+                                        &compact_text(&result.content, 220),
+                                        Some("Delegated work failed."),
+                                        None,
+                                    )
+                                    .await;
+                            }
+                            emit_delegation_event(
+                                token_tx,
+                                "delegation_agent_failed",
+                                delegation_id,
+                                agent_status_summary(result),
+                                serde_json::json!({
+                                    "agent_id": result.agent_id.clone(),
+                                    "agent_name": result.agent_name.clone().unwrap_or_default(),
+                                    "agent_role": result.agent_type.clone(),
+                                    "task": result.task.clone(),
+                                    "status": result.status.as_str(),
+                                    "reason": result.failure_kind.as_ref().map(|kind| format!("{:?}", kind)),
+                                    "is_specialist": result.is_specialist,
+                                }),
+                            );
+                            if let Some(storage) = storage {
+                                if let Err(error) = self
+                                    .persist_assignment_checkpoint(
+                                        storage,
+                                        delegation_id,
+                                        conversation_id,
+                                        channel,
+                                        original_request,
+                                        idx,
+                                        &assignments[idx],
+                                        result.status.as_str(),
+                                        "Delegated work failed.",
+                                        &compact_text(&result.content, 220),
+                                        Some(&result.content),
+                                        None,
+                                        result.failure_kind.as_ref(),
+                                        result.next_action_hint.as_deref(),
+                                        result.confidence,
+                                        &result.artifacts,
+                                        Some(chrono::Utc::now().to_rfc3339()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist failed delegation checkpoint '{}' for '{}': {}",
+                                        assignments[idx].agent_id,
+                                        delegation_id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
                         completed[idx] = true;
                     }
                     Err(e) => {
+                        let _ = heartbeat_handle.await;
                         tracing::error!("Agent {} panicked: {}", idx, e);
                         results[idx] = Some(AgentExecResult {
+                            agent_id: assignments[idx].agent_id.clone(),
                             agent_type: assignments[idx].agent_type.name(),
                             task: assignments[idx].spec.task.clone(),
                             is_specialist,
                             agent_name: Some(assignments[idx].display_name.clone()),
-                            model_name: "panicked".to_string(),
+                            model_name: assignments[idx].model_name.clone(),
                             content: format!("Agent panicked: {}", e),
                             llm_response: None,
                             execution_time_ms: 0,
@@ -1068,6 +2238,66 @@ impl TaskRouter {
                             confidence: None,
                             artifacts: Vec::new(),
                         });
+                        if let Some(result) = results[idx].as_ref() {
+                            if let Some(tracker) = swarm_activity {
+                                tracker
+                                    .update_agent(
+                                        delegation_id,
+                                        &result.agent_id,
+                                        result.status.as_str(),
+                                        &compact_text(&result.content, 220),
+                                        Some("Delegated work panicked."),
+                                        None,
+                                    )
+                                    .await;
+                            }
+                            emit_delegation_event(
+                                token_tx,
+                                "delegation_agent_failed",
+                                delegation_id,
+                                agent_status_summary(result),
+                                serde_json::json!({
+                                    "agent_id": result.agent_id.clone(),
+                                    "agent_name": result.agent_name.clone().unwrap_or_default(),
+                                    "agent_role": result.agent_type.clone(),
+                                    "task": result.task.clone(),
+                                    "status": result.status.as_str(),
+                                    "reason": "panic",
+                                    "is_specialist": result.is_specialist,
+                                }),
+                            );
+                            if let Some(storage) = storage {
+                                if let Err(error) = self
+                                    .persist_assignment_checkpoint(
+                                        storage,
+                                        delegation_id,
+                                        conversation_id,
+                                        channel,
+                                        original_request,
+                                        idx,
+                                        &assignments[idx],
+                                        result.status.as_str(),
+                                        "Delegated work panicked.",
+                                        &compact_text(&result.content, 220),
+                                        Some(&result.content),
+                                        None,
+                                        result.failure_kind.as_ref(),
+                                        result.next_action_hint.as_deref(),
+                                        result.confidence,
+                                        &result.artifacts,
+                                        Some(chrono::Utc::now().to_rfc3339()),
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist panicked delegation checkpoint '{}' for '{}': {}",
+                                        assignments[idx].agent_id,
+                                        delegation_id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
                         completed[idx] = true;
                     }
                 }
@@ -1083,6 +2313,7 @@ impl TaskRouter {
         llm: &LlmClient,
         original_task: &str,
         _base_system_prompt: &str,
+        prompt_bundle: &crate::core::self_evolve::PromptBundleProfile,
         results: &[AgentExecResult],
         memories: &[MemoryEntry],
         actions: &[ActionDef],
@@ -1150,20 +2381,13 @@ impl TaskRouter {
             .join("\n\n---\n\n");
         results_text = compact_text(&results_text, 9000);
 
-        let prompt = format!(
-            "Synthesize specialist outputs into one final user answer.\n\n\
-            Original task:\n{}\n\n\
-            Specialist outputs:\n{}\n\n\
-            Requirements:\n\
-            - Do not mention agents or synthesis.\n\
-            - If the task maps cleanly to an available action, emit that tool call with complete arguments.\n\
-            - If the task targets the current workspace or framework itself, prefer local code, file, or shell actions over deploying a separate artifact.\n\
-            - Any retry/repair plan must explicitly state a maximum attempts cap.\n\
-            - If any delegated path failed, timed out, or panicked, state what completed and what still needs follow-up.\n\
-            - Include a compact evidence summary for actions used.\n\
-            - Keep the response concise and practical.",
-            compact_text(original_task, 1200),
-            results_text
+        let compact_original_task = compact_text(original_task, 1200);
+        let prompt = crate::core::self_evolve::prompt_evolution::render_synthesis_user_prompt(
+            prompt_bundle,
+            &crate::core::self_evolve::prompt_evolution::SynthesisPromptRenderInputs {
+                original_task: &compact_original_task,
+                results_text: &results_text,
+            },
         );
 
         let mut wanted_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1190,14 +2414,10 @@ impl TaskRouter {
             .cloned()
             .collect();
 
-        let synth_system_prompt = format!(
-            "You are AgentArk. Return only the final user-facing answer. \
-Use tool calls when required by the task and prefer the clearest semantic action match from the available actions. \
-For requests about the current workspace/framework itself, prefer local code, file, and shell actions over deployment actions. \
-Any retry/repair loop must declare an explicit max attempts cap and stop when reached. \
-Be concise and action-oriented.\n\n{}",
-            synthesis_policy_v2_block()
-        );
+        let synth_system_prompt =
+            crate::core::self_evolve::prompt_evolution::render_synthesis_system_prompt(
+                prompt_bundle,
+            );
 
         llm.chat(&synth_system_prompt, &prompt, memories, &filtered_actions)
             .await
@@ -1205,8 +2425,12 @@ Be concise and action-oriented.\n\n{}",
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::memory::MemoryType;
+    use chrono::Utc;
+    use uuid::Uuid;
 
     fn degraded_result(status: DelegationStatus) -> AgentExecResult {
         let failure_kind = match status {
@@ -1215,6 +2439,7 @@ mod tests {
             _ => FailureKind::DelegationFailed,
         };
         AgentExecResult {
+            agent_id: "agent:test".to_string(),
             agent_type: "planner".to_string(),
             task: "do something".to_string(),
             is_specialist: false,
@@ -1235,6 +2460,7 @@ mod tests {
     fn summarize_delegation_status_returns_partial_when_some_paths_succeed() {
         let results = vec![
             AgentExecResult {
+                agent_id: "agent:coder".to_string(),
                 agent_type: "coder".to_string(),
                 task: "ship".to_string(),
                 is_specialist: false,
@@ -1278,6 +2504,7 @@ mod tests {
             "Ship the feature",
             &[
                 AgentExecResult {
+                    agent_id: "agent:coder".to_string(),
                     agent_type: "coder".to_string(),
                     task: "implement".to_string(),
                     is_specialist: false,
@@ -1312,14 +2539,111 @@ mod tests {
             .contains("couldn't complete the delegated execution cleanly"));
         assert!(response.content.contains("Still needs follow-up"));
     }
+
+    #[test]
+    fn delegated_task_packet_render_includes_scoped_context_sections() {
+        let packet = DelegatedTaskPacket {
+            delegation_id: "run-123".to_string(),
+            agent_id: "agent-1".to_string(),
+            agent_name: "Forge".to_string(),
+            agent_role: "Coder".to_string(),
+            assignment_index: 2,
+            total_assignments: 3,
+            original_request: "Implement the pgvector-backed memory lookup path.".to_string(),
+            assigned_task: "Patch the retrieval layer and validate the query path.".to_string(),
+            coordinator_notes: "Keep the change local to the current workspace.".to_string(),
+            dependency_outputs: vec![DelegatedDependencyPacket {
+                sequence: 1,
+                agent_name: "Helix".to_string(),
+                agent_role: "Planner".to_string(),
+                task: "Break the work into execution steps.".to_string(),
+                status: "completed".to_string(),
+                output_summary: "Identified retrieval wiring and validation as the critical path."
+                    .to_string(),
+                failure_kind: None,
+                next_action_hint: None,
+            }],
+            relevant_memories: vec![DelegatedMemoryPacket {
+                memory_type: "semantic".to_string(),
+                content: "The memory layer now uses Postgres plus pgvector embeddings.".to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                relevance_score: 0.91,
+                importance: 0.78,
+                final_score: 0.88,
+            }],
+            action_scope: vec![DelegatedActionPacket {
+                name: "file_write".to_string(),
+                description: "Write changes to a workspace file.".to_string(),
+                role: "mutation".to_string(),
+                integration_class: "filesystem".to_string(),
+                side_effect_level: "write".to_string(),
+                requires_auth: false,
+            }],
+            execution_contract: vec!["Stay within the assigned task.".to_string()],
+        };
+
+        let rendered = packet.render_markdown();
+        assert!(rendered.contains("## Delegated Task Packet"));
+        assert!(rendered.contains("## Dependency Outputs"));
+        assert!(rendered.contains("## Relevant Memory"));
+        assert!(rendered.contains("## Allowed Actions"));
+        assert!(rendered.contains("Forge"));
+        assert!(rendered.contains("file_write"));
+    }
+
+    #[test]
+    fn select_memories_for_task_prefers_overlap_with_task_text() {
+        let router = TaskRouter::new(TaskRouterConfig::default());
+        let memories = vec![
+            MemoryEntry {
+                id: Uuid::new_v4(),
+                content: "Unrelated brainstorming note about vacation photos.".to_string(),
+                memory_type: MemoryType::Semantic {
+                    confidence: 0.9,
+                    sources: vec![],
+                },
+                timestamp: Utc::now(),
+                relevance_score: 0.85,
+                importance: 0.9,
+                recency_score: 0.8,
+                final_score: 0.88,
+                access_count: 1,
+            },
+            MemoryEntry {
+                id: Uuid::new_v4(),
+                content: "The pgvector retrieval path uses similarity search in Postgres."
+                    .to_string(),
+                memory_type: MemoryType::Semantic {
+                    confidence: 0.9,
+                    sources: vec![],
+                },
+                timestamp: Utc::now(),
+                relevance_score: 0.60,
+                importance: 0.6,
+                recency_score: 0.5,
+                final_score: 0.62,
+                access_count: 1,
+            },
+        ];
+
+        let selected = router
+            .select_memories_for_task("Fix the pgvector retrieval path in Postgres.", &memories);
+
+        assert_eq!(
+            selected.first().map(|memory| memory.content.as_str()),
+            Some("The pgvector retrieval path uses similarity search in Postgres.")
+        );
+    }
 }
 
 // -- Internal types --
 
 struct AgentAssignment {
+    agent_id: String,
     spec: SubAgentSpec,
     agent_type: SubAgentType,
     display_name: String,
+    model_name: String,
     kind: AssignmentKind,
 }
 

@@ -3,13 +3,14 @@
 //! These guidelines teach the LLM how to write code that conforms
 //! to AgentArk's conventions, patterns, and security requirements.
 
-/// Returns the full AgentArk coding guidelines as a static string.
+/// Returns the full AgentArk coding guidelines.
 /// Injected into the inner agent's system prompt so generated code
 /// follows project conventions exactly.
-pub fn coding_guidelines() -> &'static str {
-    r#"# AgentArk Coding Guidelines
+pub fn coding_guidelines() -> String {
+    crate::branding::render_template(
+        r#"# __PRODUCT_NAME__ Coding Guidelines
 
-You are modifying AgentArk's own codebase. Follow these conventions EXACTLY.
+You are modifying __PRODUCT_NAME__'s own codebase. Follow these conventions EXACTLY.
 
 ## Project Structure
 
@@ -109,7 +110,7 @@ impl Integration for MyConnector {
     }
     async fn execute(&self, action: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
         match action {
-            "list_items" => { /* implementation */ Ok(serde_json::json!({})) }
+            "list_items" => Ok(serde_json::json!({})),
             _ => Err(anyhow::anyhow!("Unknown action: {}", action)),
         }
     }
@@ -117,7 +118,7 @@ impl Integration for MyConnector {
 }
 ```
 
-2. Register in `src/integrations/mod.rs` → `register_default_integrations()`:
+2. Register in `src/integrations/mod.rs` in `register_default_integrations()`:
 ```rust
 let my = my_service::MyConnector::new_with_config_dir(config_dir.clone());
 self.integrations.insert("my_service".to_string(), Box::new(my));
@@ -144,11 +145,11 @@ impl ToolHandler for MyToolHandler {
 }
 ```
 
-2. Register in `default_tool_handlers()` — BEFORE `RuntimeToolHandler` (the catch-all).
+2. Register in `default_tool_handlers()` before `RuntimeToolHandler` (the catch-all).
 3. Add `"my_tool"` to `IntegrationToolHandler.can_handle()` exclusion list.
 4. Implement `handle_my_tool_call()` in `src/core/agent/tool_execution.rs`.
 5. Add tool description in `src/core/agent/prompt_builder.rs`.
-6. Register `ActionDef` in `src/runtime/mod.rs` → `load_builtin_actions()`.
+6. Register `ActionDef` in `src/runtime/mod.rs` in `load_builtin_actions()`.
 
 ## Frontend Conventions
 
@@ -160,20 +161,21 @@ impl ToolHandler for MyToolHandler {
 
 ## Security Rules (MANDATORY)
 
-1. **No hardcoded credentials** — Use `SecureConfigManager` or env vars.
-2. **Validate all inputs** — Check types, bounds, and formats before use.
-3. **No shell injection** — Use `tokio::process::Command` with argument arrays, NEVER string interpolation for commands.
-4. **Timeouts on HTTP** — Always set `.timeout(Duration::from_secs(30))` on `reqwest` calls.
-5. **Error propagation** — Use `?` operator, never swallow errors silently.
-6. **No unsafe** — Zero tolerance for `unsafe` blocks.
-7. **Secret handling** — Use `{{secret:KEY_NAME}}` placeholder pattern resolved at runtime.
+1. **No hardcoded credentials**: Use `SecureConfigManager` or env vars.
+2. **Validate all inputs**: Check types, bounds, and formats before use.
+3. **No shell injection**: Use `tokio::process::Command` with argument arrays, NEVER string interpolation for commands.
+4. **Timeouts on HTTP**: Always set `.timeout(Duration::from_secs(30))` on `reqwest` calls.
+5. **Error propagation**: Use `?`, never swallow errors silently.
+6. **No unsafe**: Zero tolerance for `unsafe` blocks.
+7. **Secret handling**: Use `{{secret:KEY_NAME}}` placeholder pattern resolved at runtime.
 
 ## Build & Verify Commands
 
 After making changes, run these in order:
-1. `cargo check` — Fast syntax/type validation
-2. `cargo clippy -- -D warnings` — Lint (deny warnings)
-3. `cargo test` — Unit tests
-4. `cd frontend && npm run build` — Frontend bundle (if TS/TSX changed)
-"#
+1. `cargo check` for fast syntax and type validation.
+2. `cargo clippy -- -D warnings` for linting.
+3. `cargo test` for unit tests.
+4. `cd frontend && npm run build` if TS/TSX changed.
+"#,
+    )
 }

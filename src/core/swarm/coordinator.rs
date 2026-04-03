@@ -173,6 +173,7 @@ impl SwarmManager {
         coordinator_llm: &LlmClient,
         _memories: &[crate::memory::MemoryEntry],
         _actions: &[ActionDef],
+        specialist_prompt_bundle: Option<&crate::core::self_evolve::SpecialistPromptBundleProfile>,
     ) -> Result<SwarmDelegationResult> {
         let start = std::time::Instant::now();
         let specialists = self.specialists.read().await;
@@ -245,7 +246,15 @@ impl SwarmManager {
                     agent_id: id.clone(),
                 });
 
-                let result = specialist.execute_task(task, context).await;
+                let system_prompt_override = specialist_prompt_bundle.map(|bundle| {
+                    crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
+                        bundle,
+                        &specialist.config().agent_type,
+                    )
+                });
+                let result = specialist
+                    .execute_task_with_prompt(task, context, system_prompt_override)
+                    .await;
 
                 self.registry.update_status(&id, AgentStatus::Idle).await;
 
@@ -283,6 +292,12 @@ impl SwarmManager {
                 let sub_task = sub_task.clone();
                 let context = context.to_string();
                 let agent_id = agent_id.clone();
+                let system_prompt_override = specialist_prompt_bundle.map(|bundle| {
+                    crate::core::self_evolve::specialist_prompt_evolution::render_specialist_role_prompt(
+                        bundle,
+                        &specialist.config().agent_type,
+                    )
+                });
                 let registry = &self.registry;
                 let bus = &self.bus;
                 let task_id = Uuid::new_v4();
@@ -297,7 +312,11 @@ impl SwarmManager {
                     let task_start = std::time::Instant::now();
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(60),
-                        specialist.execute_task(&sub_task, &context),
+                        specialist.execute_task_with_prompt(
+                            &sub_task,
+                            &context,
+                            system_prompt_override,
+                        ),
                     )
                     .await;
 

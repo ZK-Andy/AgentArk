@@ -332,6 +332,7 @@ fn descriptor_metadata(
     }))
 }
 
+#[allow(unreachable_patterns)]
 fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor> {
     let telegram = config.telegram.as_ref();
     let slack = config.slack.as_ref();
@@ -339,6 +340,12 @@ fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor
     let matrix = config.matrix.as_ref();
     let teams = config.teams.as_ref();
     let whatsapp = config.whatsapp.as_ref();
+    let google_chat = config.google_chat.as_ref();
+    let signal = config.signal.as_ref();
+    let imessage = config.imessage.as_ref();
+    let line = config.line.as_ref();
+    let wechat = config.wechat.as_ref();
+    let qq = config.qq.as_ref();
 
     let telegram_configured = telegram
         .map(|cfg| !cfg.bot_token.trim().is_empty())
@@ -348,6 +355,12 @@ fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor
     let matrix_configured = matrix.map(matrix_channel_ready).unwrap_or(false);
     let teams_configured = teams.map(teams_channel_ready).unwrap_or(false);
     let whatsapp_configured = whatsapp.map(channel_ready).unwrap_or(false);
+    let google_chat_configured = google_chat.map(google_chat_channel_ready).unwrap_or(false);
+    let signal_configured = signal.map(signal_channel_ready).unwrap_or(false);
+    let imessage_configured = imessage.map(imessage_channel_ready).unwrap_or(false);
+    let line_configured = line.map(line_channel_ready).unwrap_or(false);
+    let wechat_configured = wechat.map(wechat_channel_ready).unwrap_or(false);
+    let qq_configured = qq.map(qq_channel_ready).unwrap_or(false);
     let whatsapp_mode = whatsapp.map(|cfg| match cfg.mode {
         crate::channels::whatsapp::WhatsAppMode::CloudApi => "cloud_api".to_string(),
         crate::channels::whatsapp::WhatsAppMode::Baileys => "baileys".to_string(),
@@ -383,7 +396,7 @@ fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor
         })),
     }];
 
-    let registry = crate::channels::gateway::ChannelGatewayRegistry::new();
+    let registry = crate::channels::gateway::ChannelGatewayRegistry::with_config(Some(config));
     channels.extend(registry.list_statuses().into_iter().map(|view| {
         let descriptor = view.descriptor;
         let runtime = view.status;
@@ -414,8 +427,10 @@ fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor
                 id,
                 kind: "webchat".to_string(),
                 name: descriptor.display_name,
-                description: "External embedded web chat surface backed by the AgentArk gateway."
-                    .to_string(),
+                description: format!(
+                    "External embedded web chat surface backed by the {} gateway.",
+                    crate::branding::PRODUCT_NAME
+                ),
                 status: "missing_config".to_string(),
                 enabled: false,
                 configured: false,
@@ -598,6 +613,168 @@ fn default_channel_catalog(config: &AgentConfig) -> Vec<GatewayChannelDescriptor
                 capabilities,
                 metadata,
             },
+            crate::channels::gateway::ChannelKind::GoogleChat => GatewayChannelDescriptor {
+                id,
+                kind: "google_chat".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if google_chat_configured {
+                    "connected".to_string()
+                } else if google_chat.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: google_chat.is_some(),
+                configured: google_chat_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("workspace_api".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
+            crate::channels::gateway::ChannelKind::Signal => GatewayChannelDescriptor {
+                id,
+                kind: "signal".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if signal_configured {
+                    "connected".to_string()
+                } else if signal.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: signal.is_some(),
+                configured: signal_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("bridge".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
+            crate::channels::gateway::ChannelKind::IMessage => GatewayChannelDescriptor {
+                id,
+                kind: "imessage".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if imessage_configured {
+                    "connected".to_string()
+                } else if imessage.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: imessage.is_some(),
+                configured: imessage_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("bridge".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
+            crate::channels::gateway::ChannelKind::Line => GatewayChannelDescriptor {
+                id,
+                kind: "line".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if line_configured {
+                    "connected".to_string()
+                } else if line.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: line.is_some(),
+                configured: line_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("webhook_api".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
+            crate::channels::gateway::ChannelKind::WeChat => GatewayChannelDescriptor {
+                id,
+                kind: "wechat".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if wechat_configured {
+                    "connected".to_string()
+                } else if wechat.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: wechat.is_some(),
+                configured: wechat_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("bridge".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
+            crate::channels::gateway::ChannelKind::Qq => GatewayChannelDescriptor {
+                id,
+                kind: "qq".to_string(),
+                name: descriptor.display_name,
+                description: descriptor.summary,
+                status: if qq_configured {
+                    "connected".to_string()
+                } else if qq.is_some() {
+                    "missing_token".to_string()
+                } else {
+                    "missing_config".to_string()
+                },
+                enabled: qq.is_some(),
+                configured: qq_configured,
+                supports_pairing: true,
+                supports_threads,
+                supports_groups,
+                supports_broadcast,
+                delivery_mode: Some("bridge".to_string()),
+                account_count: 0,
+                route_count: 0,
+                connected_account_count: 0,
+                last_error: runtime.last_error,
+                docs_url: descriptor.docs_url,
+                capabilities,
+                metadata,
+            },
             _ => GatewayChannelDescriptor {
                 id: id.clone(),
                 kind: id,
@@ -655,10 +832,16 @@ fn channel_ready(config: &crate::channels::whatsapp::WhatsAppChannelConfig) -> b
     match config.mode {
         crate::channels::whatsapp::WhatsAppMode::CloudApi => {
             !config.access_token.trim().is_empty()
+                && !config.app_secret.trim().is_empty()
                 && !config.phone_number_id.trim().is_empty()
                 && !config.verify_token.trim().is_empty()
         }
-        crate::channels::whatsapp::WhatsAppMode::Baileys => !config.bridge_url.trim().is_empty(),
+        crate::channels::whatsapp::WhatsAppMode::Baileys => match config.bridge_runtime() {
+            crate::channels::whatsapp::WhatsAppBridgeRuntime::Embedded => true,
+            crate::channels::whatsapp::WhatsAppBridgeRuntime::External => {
+                !config.bridge_url.trim().is_empty()
+            }
+        },
     }
 }
 
@@ -667,7 +850,7 @@ fn slack_channel_ready(config: &crate::channels::slack::SlackChannelConfig) -> b
 }
 
 fn discord_channel_ready(config: &crate::channels::discord::DiscordChannelConfig) -> bool {
-    !config.bot_token.trim().is_empty() || !config.webhook_url.trim().is_empty()
+    !config.bot_token.trim().is_empty()
 }
 
 fn matrix_channel_ready(config: &crate::channels::matrix::MatrixTransportConfig) -> bool {
@@ -683,6 +866,37 @@ fn teams_channel_ready(config: &crate::channels::teams::TeamsTransportConfig) ->
             .bot_app_id
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn google_chat_channel_ready(
+    config: &crate::channels::google_chat::GoogleChatChannelConfig,
+) -> bool {
+    !config.access_token.trim().is_empty()
+        && !config.verify_token.trim().is_empty()
+        && config
+            .space
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn signal_channel_ready(config: &crate::channels::signal::SignalChannelConfig) -> bool {
+    !config.bridge_url.trim().is_empty() && !config.bridge_token.trim().is_empty()
+}
+
+fn imessage_channel_ready(config: &crate::channels::imessage::IMessageChannelConfig) -> bool {
+    !config.bridge_url.trim().is_empty() && !config.bridge_token.trim().is_empty()
+}
+
+fn line_channel_ready(config: &crate::channels::line::LineChannelConfig) -> bool {
+    !config.channel_access_token.trim().is_empty() && !config.channel_secret.trim().is_empty()
+}
+
+fn wechat_channel_ready(config: &crate::channels::wechat::WeChatChannelConfig) -> bool {
+    !config.bridge_url.trim().is_empty() && !config.bridge_token.trim().is_empty()
+}
+
+fn qq_channel_ready(config: &crate::channels::qq::QqChannelConfig) -> bool {
+    !config.bridge_url.trim().is_empty() && !config.bridge_token.trim().is_empty()
 }
 
 pub async fn load_channels(

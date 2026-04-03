@@ -2,8 +2,6 @@
 //!
 //! This module provides self-contained config, delivery, and ingestion
 //! helpers for later channel-tree wiring.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Result};
 use futures::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -77,8 +75,6 @@ struct DiscordAuthor {
     id: String,
     #[serde(default)]
     bot: Option<bool>,
-    #[serde(default)]
-    username: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,10 +135,6 @@ struct DiscordGatewayBotResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct DiscordGatewayReadyUser {
     id: String,
-    #[serde(default)]
-    bot: Option<bool>,
-    #[serde(default)]
-    username: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,16 +207,6 @@ pub async fn load_config_from_storage(storage: &Storage) -> Result<Option<Discor
         guild_id,
         application_id,
     }))
-}
-
-pub async fn has_configuration(storage: &Storage) -> Result<bool> {
-    Ok(load_config_from_storage(storage).await?.is_some())
-}
-
-pub async fn save_config(agent: &Agent, config: &DiscordChannelConfig) -> Result<()> {
-    let raw = serde_json::to_vec(config)?;
-    agent.storage.set(CONFIG_STORAGE_KEY, &raw).await?;
-    Ok(())
 }
 
 async fn load_destination(agent: &Agent) -> Result<Option<DiscordDestinationContext>> {
@@ -433,10 +415,6 @@ async fn resolve_destination(
     ))
 }
 
-fn parse_message_create(body: &[u8]) -> Result<DiscordMessageCreate> {
-    Ok(serde_json::from_slice(body)?)
-}
-
 fn should_process_message(message: &DiscordMessageCreate) -> bool {
     if message.content.trim().is_empty() {
         return false;
@@ -450,6 +428,39 @@ fn should_process_message(message: &DiscordMessageCreate) -> bool {
         }
     }
     true
+}
+
+fn matches_configured_scope(message: &DiscordMessageCreate, config: &DiscordChannelConfig) -> bool {
+    if let Some(guild_id) = config
+        .guild_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if message.guild_id.as_deref().map(str::trim) != Some(guild_id) {
+            return false;
+        }
+    }
+
+    if let Some(thread_id) = config
+        .default_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return message.channel_id.trim() == thread_id;
+    }
+
+    let channel_id = config.default_channel_id.trim();
+    if !channel_id.is_empty() {
+        return message.channel_id.trim() == channel_id;
+    }
+
+    config
+        .guild_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
 }
 
 fn gateway_ws_url(base: &str) -> String {
@@ -539,8 +550,8 @@ async fn send_gateway_identify(
             "intents": (1u64 << 0) | (1u64 << 9) | (1u64 << 12) | (1u64 << 15),
             "properties": {
                 "$os": std::env::consts::OS,
-                "$browser": "AgentArk",
-                "$device": "AgentArk"
+                "$browser": crate::branding::PRODUCT_NAME,
+                "$device": crate::branding::PRODUCT_NAME
             },
             "large_threshold": 50,
             "compress": false,
@@ -614,10 +625,30 @@ async fn handle_message_create_event(
         }
     }
 
+    let config = {
+        let agent = agent.read().await;
+        load_config(&agent).await?
+    }
+    .ok_or_else(|| anyhow!("Discord is not configured"))?;
+    if config.bot_token.trim().is_empty() {
+        return Err(anyhow!(
+            "Discord bot token is required for inbound gateway messages"
+        ));
+    }
+    if !matches_configured_scope(&message, &config) {
+        tracing::debug!(
+            "Discord message ignored because it is outside the configured guild/channel scope"
+        );
+        return Ok(());
+    }
+
     let context = DiscordDestinationContext {
         channel_id: message.channel_id.clone(),
         guild_id: message.guild_id.clone(),
-        thread_id: None,
+        thread_id: config
+            .default_thread_id
+            .clone()
+            .filter(|thread_id| thread_id.trim() == message.channel_id.trim()),
         message_id: Some(message.id.clone()),
         webhook_url: None,
     };
@@ -646,8 +677,8 @@ async fn handle_message_create_event(
     }
 
     let agent = agent.read().await;
-    let _ = send_message_to_destination(&agent, &context, &reply).await;
-    let _ = save_runtime_state(&agent, &state).await;
+    send_message_to_destination(&agent, &context, &reply).await?;
+    save_runtime_state(&agent, &state).await?;
     Ok(())
 }
 
@@ -694,59 +725,6 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
     send_message_to_destination(agent, &destination, text).await?;
     persist_destination(agent, &destination).await?;
     Ok(())
-}
-
-/// Ingest a Discord message-create style payload and hand it to the agent.
-///
-/// Returns `Some(response)` when the message was processed and `None` when the
-/// payload should be ignored.
-pub async fn handle_message_create(agent: SharedAgent, raw_body: &[u8]) -> Result<Option<String>> {
-    let payload = parse_message_create(raw_body)?;
-    if !should_process_message(&payload) {
-        return Ok(None);
-    }
-
-    if let Some(author) = &payload.author {
-        if author.bot.unwrap_or(false) {
-            return Ok(None);
-        }
-    }
-
-    let self_user_id = {
-        let agent = agent.read().await;
-        load_self_user_id(&agent).await
-    };
-    if let (Some(author), Some(self_user_id)) = (&payload.author, self_user_id.as_deref()) {
-        if author.id == self_user_id {
-            return Ok(None);
-        }
-    }
-
-    let context = DiscordDestinationContext {
-        channel_id: payload.channel_id.clone(),
-        guild_id: payload.guild_id.clone(),
-        thread_id: None,
-        message_id: Some(payload.id.clone()),
-        webhook_url: None,
-    };
-    let conversation_id = discord_conversation_id(&context);
-    let content = payload.content.clone();
-
-    let response = {
-        let agent = agent.read().await;
-        persist_destination(&agent, &context).await?;
-        agent
-            .process_message_with_meta(&content, "discord", Some(&conversation_id), None)
-            .await
-            .map(Agent::render_plain_channel_response)?
-    };
-
-    if !response.trim().is_empty() {
-        let agent = agent.read().await;
-        send_message_to_destination(&agent, &context, &response).await?;
-    }
-
-    Ok(Some(response))
 }
 
 pub async fn run_gateway(agent: SharedAgent) -> Result<()> {
@@ -989,10 +967,46 @@ mod tests {
             author: Some(DiscordAuthor {
                 id: "3".to_string(),
                 bot: Some(true),
-                username: Some("bot".to_string()),
             }),
             webhook_id: None,
         };
         assert!(!should_process_message(&message));
+    }
+
+    #[test]
+    fn matches_configured_scope_for_exact_channel() {
+        let config = DiscordChannelConfig {
+            bot_token: "token".to_string(),
+            default_channel_id: "chan-1".to_string(),
+            ..Default::default()
+        };
+        let message = DiscordMessageCreate {
+            id: "1".to_string(),
+            channel_id: "chan-1".to_string(),
+            guild_id: Some("guild-1".to_string()),
+            content: "hello".to_string(),
+            author: None,
+            webhook_id: None,
+        };
+        assert!(matches_configured_scope(&message, &config));
+    }
+
+    #[test]
+    fn rejects_messages_outside_configured_scope() {
+        let config = DiscordChannelConfig {
+            bot_token: "token".to_string(),
+            guild_id: Some("guild-1".to_string()),
+            default_channel_id: "chan-1".to_string(),
+            ..Default::default()
+        };
+        let message = DiscordMessageCreate {
+            id: "1".to_string(),
+            channel_id: "chan-2".to_string(),
+            guild_id: Some("guild-2".to_string()),
+            content: "hello".to_string(),
+            author: None,
+            webhook_id: None,
+        };
+        assert!(!matches_configured_scope(&message, &config));
     }
 }

@@ -21,8 +21,8 @@ pub enum SandboxMode {
 
 /// Action execution sandbox
 pub struct ActionSandbox {
-    _wasm_engine: wasmtime::Engine,
-    _memory_limit: u64,
+    wasm_engine: wasmtime::Engine,
+    memory_limit: usize,
 }
 
 impl ActionSandbox {
@@ -30,8 +30,21 @@ impl ActionSandbox {
         let engine = wasmtime::Engine::default();
 
         Ok(Self {
-            _wasm_engine: engine,
-            _memory_limit: config.wasm_memory_limit,
+            wasm_engine: engine,
+            memory_limit: config.wasm_memory_limit as usize,
         })
+    }
+
+    pub fn engine(&self) -> &wasmtime::Engine {
+        &self.wasm_engine
+    }
+
+    pub fn new_store(&self) -> wasmtime::Store<wasmtime::StoreLimits> {
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(self.memory_limit)
+            .build();
+        let mut store = wasmtime::Store::new(&self.wasm_engine, limits);
+        store.limiter(|limits| limits);
+        store
     }
 }

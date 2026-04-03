@@ -1,11 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 const AUTOMATION_RUNS_LIMIT: usize = 600;
 const AUTOMATION_MAX_ATTEMPTS_CAP: u32 = 12;
 const AUTOMATION_MAX_STALL_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
+const AUTOMATION_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+const AUTOMATION_REGEX_DFA_SIZE_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AutomationOriginContext {
@@ -417,7 +419,13 @@ pub fn validate_result(validation: &AutomationValidation, output: &str) -> bool 
             .pattern
             .as_ref()
             .or(normalized.text.as_ref())
-            .and_then(|pattern| Regex::new(pattern).ok())
+            .and_then(|pattern| {
+                RegexBuilder::new(pattern)
+                    .size_limit(AUTOMATION_REGEX_SIZE_LIMIT)
+                    .dfa_size_limit(AUTOMATION_REGEX_DFA_SIZE_LIMIT)
+                    .build()
+                    .ok()
+            })
             .map(|regex| {
                 regex.is_match(&validation_target_text(
                     &normalized,

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc::Sender, RwLock};
 
-use crate::core::{Agent, ExecutionTrace, StreamEvent, ToolCall};
+use crate::core::{queue_stream_event, Agent, ExecutionTrace, StreamEvent, ToolCall};
 
 pub struct ToolHandlerContext<'a> {
     pub trace_ref: &'a Arc<RwLock<ExecutionTrace>>,
@@ -41,6 +41,7 @@ pub struct AppStopToolHandler;
 pub struct AppDeleteToolHandler;
 pub struct AppDeployToolHandler;
 pub struct MemoryLookupToolHandler;
+pub struct DocumentLookupToolHandler;
 pub struct GoalManageToolHandler;
 pub struct ListWatchersToolHandler;
 pub struct ListIntegrationsToolHandler;
@@ -198,19 +199,25 @@ impl ToolHandler for IntegrationToolHandler {
         ctx: &ToolHandlerContext<'_>,
     ) -> Result<Option<String>> {
         if let Some(tx) = ctx.stream_tx {
-            let _ = tx.try_send(StreamEvent::ToolStart {
-                name: call.name.clone(),
-                payload: None,
-            });
+            queue_stream_event(
+                tx,
+                StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    payload: None,
+                },
+            );
         }
         let allowed = agent.safety.is_allowed(&call.name, &call.arguments).await?;
         if !allowed {
             let blocked = format!("Tool '{}' blocked by safety policy", call.name);
             if let Some(tx) = ctx.stream_tx {
-                let _ = tx.try_send(StreamEvent::ToolResult {
-                    name: call.name.clone(),
-                    content: blocked.clone(),
-                });
+                queue_stream_event(
+                    tx,
+                    StreamEvent::ToolResult {
+                        name: call.name.clone(),
+                        content: blocked.clone(),
+                    },
+                );
             }
             return Ok(Some(blocked));
         }
@@ -418,6 +425,29 @@ impl ToolHandler for MemoryLookupToolHandler {
 }
 
 #[async_trait]
+impl ToolHandler for DocumentLookupToolHandler {
+    fn id(&self) -> &'static str {
+        "document_lookup"
+    }
+
+    fn can_handle(&self, _agent: &Agent, call: &ToolCall, _ctx: &ToolHandlerContext<'_>) -> bool {
+        call.name == "document_lookup"
+    }
+
+    async fn handle(
+        &self,
+        agent: &Agent,
+        call: &ToolCall,
+        ctx: &ToolHandlerContext<'_>,
+    ) -> Result<Option<String>> {
+        let out = agent
+            .handle_document_lookup_tool_call(call, ctx.stream_tx, ctx.project_id)
+            .await?;
+        Ok(Some(out))
+    }
+}
+
+#[async_trait]
 impl ToolHandler for GoalManageToolHandler {
     fn id(&self) -> &'static str {
         "goal_manage"
@@ -531,6 +561,7 @@ pub fn default_tool_handlers() -> Vec<Box<dyn ToolHandler>> {
         Box::new(AppDeleteToolHandler),
         Box::new(AppDeployToolHandler),
         Box::new(MemoryLookupToolHandler),
+        Box::new(DocumentLookupToolHandler),
         Box::new(GoalManageToolHandler),
         Box::new(ListWatchersToolHandler),
         Box::new(ListIntegrationsToolHandler),

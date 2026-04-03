@@ -1,10 +1,13 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Health & Status @smoke @api", () => {
-  test("GET /health returns OK", async ({ request }) => {
+  test("GET /health returns structured runtime status", async ({ request }) => {
     const res = await request.get("/health");
     expect(res.status()).toBe(200);
-    expect(await res.text()).toBe("OK");
+    const body = await res.json();
+    expect(body).toHaveProperty("status", "ok");
+    expect(body).toHaveProperty("mode", "health");
+    expect(body).toHaveProperty("checks");
   });
 
   test("GET /status returns agent status", async ({ request }) => {

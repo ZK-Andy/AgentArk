@@ -13,6 +13,7 @@
 use crate::crypto::KeyManager;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 /// Secure OAuth token container
@@ -87,6 +88,18 @@ impl OAuthTokens {
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.refresh_token.as_ref().map(|t| t.as_str())
     }
+
+    pub fn expires_at(&self) -> Option<i64> {
+        self.expires_at
+    }
+
+    pub fn token_type(&self) -> &str {
+        &self.token_type
+    }
+
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
 }
 
 /// Internal struct for serialization ONLY - never expose to API
@@ -133,20 +146,89 @@ pub struct OAuthConfig {
     pub token_url: String,
     pub redirect_uri: String,
     pub scopes: Vec<String>,
+    pub extra_auth_params: BTreeMap<String, String>,
+    pub extra_token_params: BTreeMap<String, String>,
+    pub prompt: Option<String>,
+    pub access_type: Option<String>,
+}
+
+pub struct OAuthConfigInput {
+    pub client_id: String,
+    pub client_secret: String,
+    pub auth_url: String,
+    pub token_url: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+    pub extra_auth_params: BTreeMap<String, String>,
+    pub extra_token_params: BTreeMap<String, String>,
+    pub prompt: Option<String>,
+    pub access_type: Option<String>,
 }
 
 impl OAuthConfig {
+    pub fn from_input(input: OAuthConfigInput) -> Self {
+        Self {
+            client_id: input.client_id,
+            client_secret: Zeroizing::new(input.client_secret),
+            auth_url: input.auth_url,
+            token_url: input.token_url,
+            redirect_uri: input.redirect_uri,
+            scopes: input.scopes,
+            extra_auth_params: input.extra_auth_params,
+            extra_token_params: input.extra_token_params,
+            prompt: input.prompt,
+            access_type: input.access_type,
+        }
+    }
+
     /// Generate the authorization URL for user to visit
     pub fn auth_url(&self, state: &str) -> String {
+        self.auth_url_with_pkce(state, None)
+    }
+
+    pub fn auth_url_with_pkce(&self, state: &str, code_challenge: Option<&str>) -> String {
         let scopes = self.scopes.join(" ");
-        format!(
-            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
-            self.auth_url,
-            urlencoding::encode(&self.client_id),
-            urlencoding::encode(&self.redirect_uri),
-            urlencoding::encode(&scopes),
-            urlencoding::encode(state)
-        )
+        let mut url = reqwest::Url::parse(&self.auth_url)
+            .unwrap_or_else(|_| reqwest::Url::parse("http://invalid.local/").expect("valid url"));
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("client_id", &self.client_id);
+            pairs.append_pair("redirect_uri", &self.redirect_uri);
+            pairs.append_pair("response_type", "code");
+            if !scopes.trim().is_empty() {
+                pairs.append_pair("scope", &scopes);
+            }
+            pairs.append_pair("state", state);
+            if let Some(access_type) = self
+                .access_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                pairs.append_pair("access_type", access_type);
+            }
+            if let Some(prompt) = self
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                pairs.append_pair("prompt", prompt);
+            }
+            if let Some(challenge) = code_challenge
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                pairs.append_pair("code_challenge", challenge);
+                pairs.append_pair("code_challenge_method", "S256");
+            }
+            for (key, value) in &self.extra_auth_params {
+                if !key.trim().is_empty() && !value.trim().is_empty() {
+                    pairs.append_pair(key, value);
+                }
+            }
+        }
+        url.into()
     }
 
     /// Get client secret for internal use only
@@ -172,14 +254,38 @@ impl OAuthClient {
     /// Exchange authorization code for tokens
     /// SECURITY: Tokens returned are in secure container, never logged
     pub async fn exchange_code(&self, config: &OAuthConfig, code: &str) -> Result<OAuthTokens> {
+        self.exchange_code_with_pkce(config, code, None).await
+    }
+
+    /// Exchange authorization code for tokens, optionally with PKCE verifier.
+    pub async fn exchange_code_with_pkce(
+        &self,
+        config: &OAuthConfig,
+        code: &str,
+        pkce_verifier: Option<&str>,
+    ) -> Result<OAuthTokens> {
         // SECURITY: Using form encoding, not logging the request
-        let params = [
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret()),
-            ("code", code),
-            ("redirect_uri", config.redirect_uri.as_str()),
-            ("grant_type", "authorization_code"),
+        let mut params = vec![
+            ("client_id".to_string(), config.client_id.clone()),
+            (
+                "client_secret".to_string(),
+                config.client_secret().to_string(),
+            ),
+            ("code".to_string(), code.to_string()),
+            ("redirect_uri".to_string(), config.redirect_uri.clone()),
+            ("grant_type".to_string(), "authorization_code".to_string()),
         ];
+        if let Some(verifier) = pkce_verifier
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(("code_verifier".to_string(), verifier.to_string()));
+        }
+        for (key, value) in &config.extra_token_params {
+            if !key.trim().is_empty() && !value.trim().is_empty() {
+                params.push((key.clone(), value.clone()));
+            }
+        }
 
         let response = self
             .http
@@ -226,12 +332,20 @@ impl OAuthClient {
         config: &OAuthConfig,
         refresh_token: &str,
     ) -> Result<OAuthTokens> {
-        let params = [
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
+        let mut params = vec![
+            ("client_id".to_string(), config.client_id.clone()),
+            (
+                "client_secret".to_string(),
+                config.client_secret().to_string(),
+            ),
+            ("refresh_token".to_string(), refresh_token.to_string()),
+            ("grant_type".to_string(), "refresh_token".to_string()),
         ];
+        for (key, value) in &config.extra_token_params {
+            if !key.trim().is_empty() && !value.trim().is_empty() {
+                params.push((key.clone(), value.clone()));
+            }
+        }
 
         let response = self
             .http
@@ -359,6 +473,10 @@ mod tests {
             token_url: "https://oauth2.googleapis.com/token".to_string(),
             redirect_uri: "http://localhost:8990/oauth/callback".to_string(),
             scopes: vec!["https://www.googleapis.com/auth/calendar".to_string()],
+            extra_auth_params: BTreeMap::new(),
+            extra_token_params: BTreeMap::new(),
+            prompt: Some("consent".to_string()),
+            access_type: Some("offline".to_string()),
         };
 
         let url = config.auth_url("test_state");

@@ -11,8 +11,9 @@
 //!
 //! All loops run inside a single tokio task with staggered intervals.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -72,9 +73,18 @@ pub fn is_pulse_running() -> bool {
 }
 
 async fn sentinel_under_load(agent: &SharedAgent) -> bool {
-    let pending_tasks = {
+    let (tasks, watcher_manager, browser_sessions, app_registry) = {
         let agent_guard = agent.read().await;
-        let tasks = agent_guard.tasks.read().await;
+        (
+            agent_guard.tasks.clone(),
+            agent_guard.watcher_manager.clone(),
+            agent_guard.browser_sessions.clone(),
+            agent_guard.app_registry.clone(),
+        )
+    };
+
+    let pending_tasks = {
+        let tasks = tasks.read().await;
         tasks
             .all()
             .iter()
@@ -87,28 +97,19 @@ async fn sentinel_under_load(agent: &SharedAgent) -> bool {
             .count()
     };
 
-    let (watcher_count, browser_sessions) = {
-        let agent_guard = agent.read().await;
-        let watchers = agent_guard
-            .watcher_manager
-            .list()
-            .await
-            .into_iter()
-            .filter(|w| matches!(w.status, crate::core::watcher::WatcherStatus::Active))
-            .count();
-        (watchers, agent_guard.browser_sessions.active_count())
-    };
-
-    let running_apps = {
-        let agent_guard = agent.read().await;
-        agent_guard
-            .app_registry
-            .list()
-            .await
-            .into_iter()
-            .filter(|v| v.get("running").and_then(|x| x.as_bool()).unwrap_or(false))
-            .count()
-    };
+    let watcher_count = watcher_manager
+        .list()
+        .await
+        .into_iter()
+        .filter(|w| matches!(w.status, crate::core::watcher::WatcherStatus::Active))
+        .count();
+    let browser_sessions = browser_sessions.active_count();
+    let running_apps = app_registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|v| v.get("running").and_then(|x| x.as_bool()).unwrap_or(false))
+        .count();
 
     pending_tasks > 25 || watcher_count > 30 || browser_sessions >= 2 || running_apps > 12
 }
@@ -251,6 +252,11 @@ const ARKPULSE_CRITICAL_LAST_SENT_KEY: &str = "arkpulse_critical_last_sent_v1";
 const ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS: i64 = 24 * 3600;
 pub const SENTINEL_SCHEDULER_HEARTBEAT_KEY: &str = "sentinel_scheduler_heartbeat_v1";
 pub const SENTINEL_WATCHER_HEARTBEAT_KEY: &str = "sentinel_watcher_heartbeat_v1";
+pub const SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY: &str = "sentinel_integration_sync_heartbeat_v1";
+pub const SENTINEL_CONSOLIDATION_HEARTBEAT_KEY: &str = "sentinel_consolidation_heartbeat_v1";
+pub const SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY: &str = "sentinel_approval_expiry_heartbeat_v1";
+pub const SENTINEL_ARKPULSE_HEARTBEAT_KEY: &str = "sentinel_arkpulse_heartbeat_v1";
+pub const SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY: &str = "sentinel_auto_analysis_heartbeat_v1";
 
 fn normalize_arkpulse_alert_signature(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(240));
@@ -278,6 +284,13 @@ async fn should_emit_arkpulse_critical_notification(
 ) -> bool {
     let signature = normalize_arkpulse_alert_signature(alert_text);
     let now_ts = chrono::Utc::now().timestamp();
+    let last_sig = storage
+        .get(ARKPULSE_CRITICAL_LAST_SIG_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .unwrap_or_default();
     let last_sent_ts = storage
         .get(ARKPULSE_CRITICAL_LAST_SENT_KEY)
         .await
@@ -293,9 +306,10 @@ async fn should_emit_arkpulse_critical_notification(
         0
     };
 
-    // Hard cap: emit at most one ArkPulse critical notification every 24h,
-    // regardless of message/signature variance.
-    if elapsed < ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS {
+    if !signature.is_empty()
+        && signature == last_sig
+        && elapsed < ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS
+    {
         return false;
     }
 
@@ -373,32 +387,39 @@ fn public_base_url_is_local(base_url: &str) -> bool {
 
 /// Append a pulse event to the persistent log (capped at MAX_PULSE_EVENTS)
 async fn log_pulse_event(agent: &Agent, event: PulseEvent) {
-    let mut events: Vec<PulseEvent> = match agent.storage.get_encrypted(PULSE_LOG_KEY).await {
-        Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-        _ => Vec::new(),
+    migrate_legacy_pulse_log(agent).await;
+
+    let Some(row) = pulse_event_to_row(&event) else {
+        tracing::warn!("ArkPulse event could not be serialized for persistent storage");
+        return;
     };
-    events.push(event);
-    events = prune_pulse_events(events);
-    if let Ok(json) = serde_json::to_vec(&events) {
-        let _ = agent.storage.set_encrypted(PULSE_LOG_KEY, &json).await;
+    if let Err(error) = agent.storage.insert_arkpulse_event(&row).await {
+        tracing::warn!("Failed to persist ArkPulse event row: {}", error);
+        return;
     }
+    prune_pulse_event_rows(&agent.storage).await;
 }
 
 /// Get the ArkPulse log from storage
 pub async fn get_pulse_log(agent: &Agent) -> Vec<PulseEvent> {
-    let raw = crate::storage::legacy_recovery::load_json_vec_with_legacy_key_recovery(
-        &agent.storage,
-        &agent.config_dir,
-        PULSE_LOG_KEY,
-    )
-    .await;
-    let pruned = prune_pulse_events(raw.clone());
-    if pruned.len() != raw.len() {
-        if let Ok(json) = serde_json::to_vec(&pruned) {
-            let _ = agent.storage.set_encrypted(PULSE_LOG_KEY, &json).await;
+    migrate_legacy_pulse_log(agent).await;
+
+    match agent
+        .storage
+        .list_arkpulse_events(MAX_PULSE_EVENTS as u64)
+        .await
+    {
+        Ok(rows) => {
+            let mut events: Vec<PulseEvent> =
+                rows.into_iter().filter_map(pulse_event_from_row).collect();
+            events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+            events
+        }
+        Err(error) => {
+            tracing::warn!("Failed to load ArkPulse event rows: {}", error);
+            Vec::new()
         }
     }
-    pruned
 }
 
 fn prune_pulse_events(mut events: Vec<PulseEvent>) -> Vec<PulseEvent> {
@@ -420,7 +441,129 @@ struct AppEndpoint {
     title: String,
     is_static: bool,
     access_url: String,
+    access_key: Option<String>,
     app_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct PulseDoctorContext {
+    storage: crate::storage::Storage,
+    data_dir: PathBuf,
+    app_registry: crate::actions::app::AppRegistry,
+    config: crate::core::config::AgentConfig,
+    embedding_client: Option<Arc<crate::core::EmbeddingClient>>,
+    model_pool: HashMap<String, (crate::core::config::ModelSlot, crate::core::LlmClient)>,
+    primary_model_id: String,
+    llm: crate::core::LlmClient,
+    api_key: Option<String>,
+}
+
+fn pulse_event_storage_id(event: &PulseEvent) -> String {
+    let mut hasher = DefaultHasher::new();
+    event.timestamp.hash(&mut hasher);
+    event.status.hash(&mut hasher);
+    event.message.hash(&mut hasher);
+    event.summary.hash(&mut hasher);
+    event.flags.hash(&mut hasher);
+    event.overdue_tasks.hash(&mut hasher);
+    event.failed_tasks.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("arkpulse-{hash:016x}")
+}
+
+fn pulse_event_to_row(event: &PulseEvent) -> Option<crate::storage::arkpulse_event::Model> {
+    let flags_json = serde_json::to_string(&event.flags).ok()?;
+    let details_json = serde_json::to_string(&event.details).ok()?;
+    Some(crate::storage::arkpulse_event::Model {
+        id: pulse_event_storage_id(event),
+        timestamp: event.timestamp.clone(),
+        status: event.status.clone(),
+        message: event.message.clone(),
+        summary: event.summary.clone(),
+        flags_json,
+        overdue_tasks: event.overdue_tasks.min(i32::MAX as usize) as i32,
+        failed_tasks: event.failed_tasks.min(i32::MAX as usize) as i32,
+        details_json,
+    })
+}
+
+fn pulse_event_from_row(row: crate::storage::arkpulse_event::Model) -> Option<PulseEvent> {
+    Some(PulseEvent {
+        timestamp: row.timestamp,
+        status: row.status,
+        message: row.message,
+        summary: row.summary,
+        flags: serde_json::from_str(&row.flags_json).ok()?,
+        overdue_tasks: row.overdue_tasks.max(0) as usize,
+        failed_tasks: row.failed_tasks.max(0) as usize,
+        details: serde_json::from_str(&row.details_json).ok()?,
+    })
+}
+
+async fn prune_pulse_event_rows(storage: &crate::storage::Storage) {
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::days(MAX_PULSE_EVENT_AGE_DAYS)).to_rfc3339();
+    if let Err(error) = storage.delete_arkpulse_events_before(&cutoff).await {
+        tracing::warn!("Failed to prune stale ArkPulse rows: {}", error);
+    }
+    match storage
+        .list_arkpulse_event_ids_beyond_latest(MAX_PULSE_EVENTS as u64)
+        .await
+    {
+        Ok(extra_ids) if !extra_ids.is_empty() => {
+            if let Err(error) = storage.delete_arkpulse_events_by_ids(&extra_ids).await {
+                tracing::warn!("Failed to prune excess ArkPulse rows: {}", error);
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!("Failed to enumerate excess ArkPulse rows: {}", error);
+        }
+    }
+}
+
+async fn migrate_legacy_pulse_log(agent: &Agent) {
+    let existing_rows = match agent.storage.count_arkpulse_events().await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!("Failed to count ArkPulse history rows: {}", error);
+            return;
+        }
+    };
+    if existing_rows > 0 {
+        return;
+    }
+
+    let Some(bytes) = agent
+        .storage
+        .get_encrypted(PULSE_LOG_KEY)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(raw_events) = serde_json::from_slice::<Vec<PulseEvent>>(&bytes) else {
+        return;
+    };
+    let events = prune_pulse_events(raw_events);
+    if events.is_empty() {
+        let _ = agent.storage.delete(PULSE_LOG_KEY).await;
+        return;
+    }
+
+    for event in &events {
+        let Some(row) = pulse_event_to_row(event) else {
+            tracing::warn!("Skipping legacy ArkPulse event migration due to serialization failure");
+            return;
+        };
+        if let Err(error) = agent.storage.insert_arkpulse_event(&row).await {
+            tracing::warn!("Failed to migrate legacy ArkPulse event row: {}", error);
+            return;
+        }
+    }
+    prune_pulse_event_rows(&agent.storage).await;
+    let _ = agent.storage.delete(PULSE_LOG_KEY).await;
 }
 
 static RE_AWS_ACCESS_KEY: Lazy<Regex> =
@@ -543,7 +686,7 @@ fn strip_access_key(access_url: &str) -> String {
     };
     let filtered: Vec<(String, String)> = parsed
         .query_pairs()
-        .filter(|(key, _)| key != "key")
+        .filter(|(key, _)| key != "key" && key != "grant")
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
     if filtered.is_empty() {
@@ -629,6 +772,12 @@ fn parse_app_endpoints(raw: &[serde_json::Value], data_dir: &Path) -> Vec<AppEnd
                 app_dir: data_dir.join("apps").join(&id),
                 id,
                 access_url,
+                access_key: row
+                    .get("access_key")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
             })
         })
         .collect()
@@ -906,7 +1055,7 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
             format!("Found {}", app.app_dir.join(".env").display()),
             "Environment files in deployed app directories are easy to leak by misconfiguration.",
             format!(
-                "cd {} && mv .env ../.env.backup && rotate exposed keys",
+                "cd {} && mv .env .env.backup && rotate exposed keys",
                 app.app_dir.display()
             ),
         );
@@ -1007,7 +1156,10 @@ async fn run_attack_surface_checks(
                 "Control plane probe failed",
                 e.to_string(),
                 "Local HTTP control plane unreachable for safety probes.",
-                "Verify AgentArk HTTP server is running on port 8990".to_string(),
+                format!(
+                    "Verify {} HTTP server is running on port 8990",
+                    crate::branding::PRODUCT_NAME
+                ),
             );
             return;
         }
@@ -1269,17 +1421,17 @@ async fn run_runtime_hardening_checks(
             .iter()
             .filter_map(|h| h.to_str().ok().map(|s| s.to_string()))
             .collect();
-        if let Some(session_cookie) = cookie_headers
-            .iter()
-            .find(|c| c.to_ascii_lowercase().contains("agentark_session="))
-        {
+        if let Some(session_cookie) = cookie_headers.iter().find(|c| {
+            c.to_ascii_lowercase()
+                .contains(&format!("{}=", crate::branding::SESSION_COOKIE_NAME))
+        }) {
             let lower = session_cookie.to_ascii_lowercase();
             if !lower.contains("httponly") || !lower.contains("samesite") {
                 push_finding!(
                     findings,
                     "high",
                     "runtime_hardening",
-                    "agentark_session cookie",
+                    &format!("{} cookie", crate::branding::SESSION_COOKIE_NAME),
                     "Session cookie missing hardening flags",
                     session_cookie.clone(),
                     "Session cookie can be exposed to script or cross-site abuse.",
@@ -1299,7 +1451,11 @@ async fn run_runtime_hardening_checks(
         "..%252F..%252FCargo.toml",
     ];
     for app in app_endpoints.iter().filter(|a| a.is_static) {
-        let Some(key) = parse_access_key(&app.access_url) else {
+        let Some(key) = app
+            .access_key
+            .clone()
+            .or_else(|| parse_access_key(&app.access_url))
+        else {
             continue;
         };
         for payload in traversal_payloads {
@@ -1369,13 +1525,13 @@ async fn run_runtime_hardening_checks(
 }
 
 async fn run_resource_checks(
-    agent: &Agent,
+    ctx: &PulseDoctorContext,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
     security_thresholds: ArkPulseSecurityThresholds,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    match agent.storage.database_size_bytes().await {
+    match ctx.storage.database_size_bytes().await {
         Ok(Some(size_bytes)) => {
             let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
             if size_mb > 1024.0 {
@@ -1483,7 +1639,11 @@ async fn run_resource_checks(
     }
 }
 
-async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut Vec<DoctorFinding>) {
+async fn run_data_safety_checks(
+    storage: &crate::storage::Storage,
+    data_dir: &Path,
+    findings: &mut Vec<DoctorFinding>,
+) {
     let backup_dir = data_dir.join("backups");
     if !backup_dir.exists() {
         push_internal_finding!(
@@ -1536,7 +1696,7 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
         }
     }
 
-    match agent.storage.latest_migration_version().await {
+    match storage.latest_migration_version().await {
         Ok(Some(version)) => {
             if version < 1 {
                 push_finding!(
@@ -1552,16 +1712,8 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
             }
         }
         Ok(None) => {
-            push_finding!(
-                findings,
-                "critical",
-                "data_safety",
-                "postgres schema",
-                "Migration state missing",
-                "schema_migrations table returned no version".to_string(),
-                "The Postgres schema may be uninitialized or partially applied.",
-                "Re-run the bootstrap/migration path against Postgres".to_string(),
-            );
+            // Postgres bootstrap currently does not persist schema versions in a migrations table.
+            // Treat actual table discovery as the authoritative readiness signal instead.
         }
         Err(e) => {
             push_finding!(
@@ -1589,8 +1741,9 @@ async fn run_data_safety_checks(agent: &Agent, data_dir: &Path, findings: &mut V
         "run_checkpoints",
         "tool_attempts",
         "watchers",
+        "arkpulse_events",
     ];
-    match agent.storage.database_table_names().await {
+    match storage.database_table_names().await {
         Ok(tables) => {
             let table_set: HashSet<String> = tables.into_iter().collect();
             let missing: Vec<&str> = required_tables
@@ -1832,7 +1985,10 @@ async fn run_app_health_checks(
             }
         }
 
-        let access_key = parse_access_key(&app.access_url);
+        let access_key = app
+            .access_key
+            .clone()
+            .or_else(|| parse_access_key(&app.access_url));
         let sanitized_access_url = strip_access_key(&app.access_url);
         let root_url = format!("{}{}", effective_http_base, sanitized_access_url);
         let started = Instant::now();
@@ -1990,19 +2146,19 @@ async fn run_app_health_checks(
 }
 
 async fn run_doctor_checks(
-    agent: &Agent,
+    ctx: &PulseDoctorContext,
     http_client: &reqwest::Client,
     deployed_apps: &[AppPulseInfo],
     security: Option<&crate::core::SecuritySnapshot>,
     security_thresholds: ArkPulseSecurityThresholds,
 ) -> Vec<DoctorFinding> {
     let mut findings: Vec<DoctorFinding> = Vec::new();
-    let data_dir = agent.data_dir().to_path_buf();
-    let app_rows = agent.app_registry.list().await;
+    let data_dir = ctx.data_dir.clone();
+    let app_rows = ctx.app_registry.list().await;
     let app_endpoints = parse_app_endpoints(&app_rows, &data_dir);
     let (http_base, ws_base) = control_plane_bases();
     let has_deployed_apps = !deployed_apps.is_empty();
-    let configured_public_base_url = agent
+    let configured_public_base_url = ctx
         .config
         .public_apps
         .base_url
@@ -2011,14 +2167,13 @@ async fn run_doctor_checks(
         .filter(|value| !value.is_empty())
         .map(|configured| configured.trim_end_matches('/').to_string());
     let app_probe_base_url = configured_public_base_url.clone().or_else(|| {
-        agent
-            .config
+        ctx.config
             .public_apps
             .bind_addr
             .as_deref()
             .and_then(default_http_base_for_bind_addr)
     });
-    let api_key = agent.api_key.as_deref();
+    let api_key = ctx.api_key.as_deref();
 
     run_attack_surface_checks(
         http_client,
@@ -2031,14 +2186,14 @@ async fn run_doctor_checks(
     .await;
     run_runtime_hardening_checks(http_client, &http_base, &app_endpoints, &mut findings).await;
     run_resource_checks(
-        agent,
+        ctx,
         deployed_apps,
         security,
         security_thresholds,
         &mut findings,
     )
     .await;
-    run_data_safety_checks(agent, &data_dir, &mut findings).await;
+    run_data_safety_checks(&ctx.storage, &data_dir, &mut findings).await;
     run_policy_compliance_checks(&mut findings);
 
     for app in &app_endpoints {
@@ -2085,14 +2240,13 @@ pub struct SentinelConfig {
     pub approval_expiry_interval: u64,
     /// How often to run ArkPulse (seconds, 0 = disabled)
     pub pulse_interval: u64,
-    /// How often to check if Mem0 cleanup should run (seconds).
-    /// Actual cleanup only runs once per month when the server is idle.
-    pub mem0_cleanup_check_interval: u64,
     /// How often to check for unused deployed apps (seconds).
     /// Notifications sent once per day per unused app.
     pub unused_app_check_interval: u64,
     /// How often to run proactive autonomy analysis scans (seconds).
     pub auto_analysis_interval: u64,
+    /// How often to reconcile orphaned sandbox containers (seconds).
+    pub container_reaper_interval: u64,
 }
 
 impl Default for SentinelConfig {
@@ -2107,10 +2261,10 @@ impl Default for SentinelConfig {
             pattern_induction_interval: 900,
             candidate_generation_interval: 1200,
             approval_expiry_interval: 300,
-            pulse_interval: 1800,              // 30 minutes
-            mem0_cleanup_check_interval: 3600, // Check hourly, but only run monthly when idle
-            unused_app_check_interval: 3600,   // Check hourly, notify once daily per unused app
-            auto_analysis_interval: 900,       // 15 minutes
+            pulse_interval: 1800,            // 30 minutes
+            unused_app_check_interval: 3600, // Check hourly, notify once daily per unused app
+            auto_analysis_interval: 1800,    // 30 minutes
+            container_reaper_interval: 300,  // 5 minutes
         }
     }
 }
@@ -2199,6 +2353,7 @@ pub fn start(
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                         break;
                     }
+                    record_loop_heartbeat(&agent, SENTINEL_INTEGRATION_SYNC_HEARTBEAT_KEY).await;
                     if is_agent_autonomy_paused(&agent).await {
                         continue;
                     }
@@ -2231,6 +2386,10 @@ pub fn start(
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
+                record_loop_heartbeat(&agent, SENTINEL_CONSOLIDATION_HEARTBEAT_KEY).await;
+                if is_agent_autonomy_paused(&agent).await {
+                    continue;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "consolidation",
@@ -2257,6 +2416,9 @@ pub fn start(
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
+                }
+                if is_agent_autonomy_paused(&agent).await {
+                    continue;
                 }
                 run_with_busy_deferral(
                     &agent,
@@ -2285,6 +2447,9 @@ pub fn start(
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
+                if is_agent_autonomy_paused(&agent).await {
+                    continue;
+                }
                 run_with_busy_deferral(
                     &agent,
                     "pattern_induction",
@@ -2311,6 +2476,9 @@ pub fn start(
             loop {
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
+                }
+                if is_agent_autonomy_paused(&agent).await {
+                    continue;
                 }
                 run_with_busy_deferral(
                     &agent,
@@ -2340,6 +2508,7 @@ pub fn start(
                 if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                     break;
                 }
+                record_loop_heartbeat(&agent, SENTINEL_APPROVAL_EXPIRY_HEARTBEAT_KEY).await;
                 run_approval_expiry(&agent).await;
             }
         })
@@ -2362,6 +2531,7 @@ pub fn start(
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                         break;
                     }
+                    record_loop_heartbeat(&agent, SENTINEL_ARKPULSE_HEARTBEAT_KEY).await;
                     if is_agent_autonomy_paused(&agent).await {
                         continue;
                     }
@@ -2398,6 +2568,7 @@ pub fn start(
                     if !tick_or_shutdown(&mut interval, &mut shutdown).await {
                         break;
                     }
+                    record_loop_heartbeat(&agent, SENTINEL_AUTO_ANALYSIS_HEARTBEAT_KEY).await;
                     if is_agent_autonomy_paused(&agent).await {
                         continue;
                     }
@@ -2423,57 +2594,7 @@ pub fn start(
         });
     }
 
-    // ── Mem0 Memory Decay Cleanup (monthly, idle-only) ─────────────────
-    handles.push({
-        let agent = agent.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            // Wait for startup to settle
-            if !sleep_or_shutdown(std::time::Duration::from_secs(300), &mut shutdown).await {
-                return;
-            }
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                config.mem0_cleanup_check_interval,
-            ));
-            interval.tick().await; // Skip first tick
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
-                    break;
-                }
-                run_with_busy_deferral(
-                    &agent,
-                    "mem0_cleanup",
-                    MAINTENANCE_DEFER_MINUTES,
-                    MAINTENANCE_MAX_DEFERS,
-                    || {
-                        let agent = agent.clone();
-                        async move { run_mem0_cleanup(&agent).await }
-                    },
-                )
-                .await;
-            }
-        })
-    });
-
-    // Mem0 retry queue drain (frequent, lightweight)
-    handles.push({
-        let agent = agent.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            if !sleep_or_shutdown(std::time::Duration::from_secs(30), &mut shutdown).await {
-                return;
-            }
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
-            interval.tick().await;
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
-                    break;
-                }
-                run_mem0_retry_drain(&agent).await;
-            }
-        })
-    });
-
+    // ── Vector memory cleanup (monthly, idle-only) ──────────────────────
     // ── Unused App Notifications ────────────────────────────────────────
     // Episodic memory retention cleanup (safe-by-default, idle-only, bounded).
     handles.push({
@@ -2540,6 +2661,34 @@ pub fn start(
         })
     });
 
+    if config.container_reaper_interval > 0 {
+        handles.push({
+            let agent = agent.clone();
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
+                    return;
+                }
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    config.container_reaper_interval,
+                ));
+                interval.tick().await;
+                loop {
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
+                    let agent_guard = agent.read().await;
+                    if let Err(error) = agent_guard.runtime.reconcile_orphan_containers().await {
+                        tracing::warn!(
+                            "ArkSentinel: sandbox container reconciliation failed: {}",
+                            error
+                        );
+                    }
+                }
+            })
+        });
+    }
+
     // ── Security Log Cleanup (every 15 days, idle-only) ─────────────────
     handles.push({
         let agent = agent.clone();
@@ -2571,7 +2720,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, mem0_cleanup=monthly",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, consolidation={}s, experience_learning={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -2590,6 +2739,11 @@ pub fn start(
         },
         if config.auto_analysis_interval > 0 {
             config.auto_analysis_interval.to_string()
+        } else {
+            "off".to_string()
+        },
+        if config.container_reaper_interval > 0 {
+            config.container_reaper_interval.to_string()
         } else {
             "off".to_string()
         },
@@ -2745,9 +2899,15 @@ async fn run_watchers(agent: &SharedAgent) {
             let agent = agent.read().await;
             match tokio::time::timeout(
                 Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
-                agent
-                    .runtime
-                    .execute_action(&watcher.poll_action, &watcher.poll_arguments),
+                agent.runtime.execute_action_with_context(
+                    &watcher.poll_action,
+                    &watcher.poll_arguments,
+                    &crate::actions::ActionAuthorizationContext {
+                        principal: None,
+                        surface: crate::actions::ActionExecutionSurface::Background,
+                        direct_user_intent: false,
+                    },
+                ),
             )
             .await
             {
@@ -2838,6 +2998,71 @@ async fn run_watchers(agent: &SharedAgent) {
 // Memory Consolidation
 // ═══════════════════════════════════════════════════════════════════════════
 
+static BACKGROUND_LEARNING_LLM_CONSOLIDATION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^Consolidated (?P<episodes>\d+) episodes into (?P<facts>\d+) facts \(skipped (?P<dupes>\d+) dupes, (?P<quality>\d+) low-quality\)\.?(?: (?P<rest>.*))?$",
+    )
+    .expect("valid background learning summary regex")
+});
+
+async fn persist_background_learning_job_result(
+    storage: &crate::storage::Storage,
+    update: crate::channels::http::BackgroundLearningJobUpdate,
+) {
+    channels::http::record_background_learning_job_result(storage, &update).await;
+}
+
+fn background_learning_job_update(
+    key: &str,
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: chrono::DateTime<chrono::Utc>,
+    summary: String,
+    changed: bool,
+    stats: serde_json::Value,
+) -> crate::channels::http::BackgroundLearningJobUpdate {
+    crate::channels::http::BackgroundLearningJobUpdate {
+        key: key.to_string(),
+        status: status.to_string(),
+        started_at: Some(started_at.to_rfc3339()),
+        completed_at: Some(completed_at.to_rfc3339()),
+        summary,
+        changed,
+        stats,
+    }
+}
+
+fn parse_background_learning_memory_stats(summary: &str) -> serde_json::Value {
+    if let Some(caps) = BACKGROUND_LEARNING_LLM_CONSOLIDATION_RE.captures(summary) {
+        let episodes = caps
+            .name("episodes")
+            .and_then(|value| value.as_str().parse::<usize>().ok())
+            .unwrap_or(0);
+        let facts = caps
+            .name("facts")
+            .and_then(|value| value.as_str().parse::<usize>().ok())
+            .unwrap_or(0);
+        let dupes = caps
+            .name("dupes")
+            .and_then(|value| value.as_str().parse::<usize>().ok())
+            .unwrap_or(0);
+        let quality = caps
+            .name("quality")
+            .and_then(|value| value.as_str().parse::<usize>().ok())
+            .unwrap_or(0);
+        return serde_json::json!({
+            "episodes_processed": episodes,
+            "facts_created": facts,
+            "duplicates_skipped": dupes,
+            "low_quality_skipped": quality,
+        });
+    }
+
+    serde_json::json!({
+        "summary": summary,
+    })
+}
+
 async fn run_integration_sync(agent: &SharedAgent) {
     let shared_agent = agent.clone();
     let ctx = {
@@ -2850,66 +3075,264 @@ async fn run_integration_sync(agent: &SharedAgent) {
 }
 
 async fn run_consolidation(agent: &SharedAgent) {
-    let agent = agent.read().await;
-    let llm = agent.llm.clone();
-    match agent.memory.run_llm_consolidation(&llm).await {
+    let started_at = chrono::Utc::now();
+    let (storage, result) = {
+        let agent = agent.read().await;
+        let llm = agent.llm.clone();
+        let storage = agent.storage.clone();
+        let result = agent.memory.run_llm_consolidation(&llm).await;
+        (storage, result)
+    };
+    let completed_at = chrono::Utc::now();
+    match result {
         Ok(summary) => {
-            if !summary.contains("No unconsolidated") {
+            let changed = !summary.contains("No unconsolidated");
+            if changed {
                 tracing::info!("ArkSentinel: auto-consolidation: {}", summary);
             }
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "memory_consolidation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    summary.clone(),
+                    changed,
+                    parse_background_learning_memory_stats(&summary),
+                ),
+            )
+            .await;
         }
-        Err(e) => tracing::debug!("ArkSentinel: consolidation skipped: {}", e),
+        Err(e) => {
+            let summary = format!("Memory consolidation skipped: {}", e);
+            tracing::debug!("ArkSentinel: consolidation skipped: {}", e);
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "memory_consolidation",
+                    "failed",
+                    started_at,
+                    completed_at,
+                    summary,
+                    false,
+                    serde_json::json!({
+                        "error": e.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
     }
 }
 
 async fn run_experience_consolidation_job(agent: &SharedAgent) {
+    let started_at = chrono::Utc::now();
     let storage = {
         let agent = agent.read().await;
         agent.storage.clone()
     };
     match crate::core::learning::run_experience_consolidation(&storage).await {
         Ok(processed) if processed > 0 => {
+            let completed_at = chrono::Utc::now();
             tracing::info!(
                 "ArkSentinel: experience consolidation processed {} run(s)",
                 processed
             );
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "experience_consolidation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    format!(
+                        "Consolidated {} experience run(s) into reusable learning.",
+                        processed
+                    ),
+                    true,
+                    serde_json::json!({
+                        "experience_runs_processed": processed,
+                    }),
+                ),
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(error) => tracing::debug!("ArkSentinel: experience consolidation skipped: {}", error),
+        Ok(_) => {
+            let completed_at = chrono::Utc::now();
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "experience_consolidation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    "No experience runs were ready for consolidation.".to_string(),
+                    false,
+                    serde_json::json!({
+                        "experience_runs_processed": 0,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            let completed_at = chrono::Utc::now();
+            tracing::debug!("ArkSentinel: experience consolidation skipped: {}", error);
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "experience_consolidation",
+                    "failed",
+                    started_at,
+                    completed_at,
+                    format!("Experience consolidation skipped: {}", error),
+                    false,
+                    serde_json::json!({
+                        "error": error.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
     }
 }
 
 async fn run_pattern_induction_job(agent: &SharedAgent) {
+    let started_at = chrono::Utc::now();
     let storage = {
         let agent = agent.read().await;
         agent.storage.clone()
     };
     match crate::core::learning::run_pattern_induction(&storage).await {
         Ok(processed) if processed > 0 => {
+            let completed_at = chrono::Utc::now();
             tracing::info!(
                 "ArkSentinel: pattern induction updated {} pattern(s)",
                 processed
             );
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "pattern_induction",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    format!("Updated {} reusable pattern(s).", processed),
+                    true,
+                    serde_json::json!({
+                        "patterns_updated": processed,
+                    }),
+                ),
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(error) => tracing::debug!("ArkSentinel: pattern induction skipped: {}", error),
+        Ok(_) => {
+            let completed_at = chrono::Utc::now();
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "pattern_induction",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    "No reusable patterns were ready for induction.".to_string(),
+                    false,
+                    serde_json::json!({
+                        "patterns_updated": 0,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            let completed_at = chrono::Utc::now();
+            tracing::debug!("ArkSentinel: pattern induction skipped: {}", error);
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "pattern_induction",
+                    "failed",
+                    started_at,
+                    completed_at,
+                    format!("Pattern induction skipped: {}", error),
+                    false,
+                    serde_json::json!({
+                        "error": error.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
     }
 }
 
 async fn run_candidate_generation_job(agent: &SharedAgent) {
+    let started_at = chrono::Utc::now();
     let storage = {
         let agent = agent.read().await;
         agent.storage.clone()
     };
     match crate::core::learning::run_candidate_generation(&storage).await {
         Ok(processed) if processed > 0 => {
+            let completed_at = chrono::Utc::now();
             tracing::info!(
                 "ArkSentinel: candidate generation updated {} draft(s)",
                 processed
             );
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "candidate_generation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    format!("Prepared {} candidate draft(s).", processed),
+                    true,
+                    serde_json::json!({
+                        "candidates_generated": processed,
+                    }),
+                ),
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(error) => tracing::debug!("ArkSentinel: candidate generation skipped: {}", error),
+        Ok(_) => {
+            let completed_at = chrono::Utc::now();
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "candidate_generation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    "No candidate drafts were ready for generation.".to_string(),
+                    false,
+                    serde_json::json!({
+                        "candidates_generated": 0,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            let completed_at = chrono::Utc::now();
+            tracing::debug!("ArkSentinel: candidate generation skipped: {}", error);
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "candidate_generation",
+                    "failed",
+                    started_at,
+                    completed_at,
+                    format!("Candidate generation skipped: {}", error),
+                    false,
+                    serde_json::json!({
+                        "error": error.to_string(),
+                    }),
+                ),
+            )
+            .await;
+        }
     }
 }
 
@@ -3032,7 +3455,7 @@ async fn is_agent_autonomy_paused(agent: &SharedAgent) -> bool {
         guard.storage.clone()
     };
     let settings = load_autonomy_settings_snapshot(&storage).await;
-    settings.agent_paused
+    settings.agent_paused || settings.autonomy_mode.eq_ignore_ascii_case("off")
 }
 
 fn is_security_incident(
@@ -3243,10 +3666,26 @@ pub async fn run_pulse(agent: &SharedAgent) {
         .build()
         .unwrap_or_default();
 
-    let storage = {
+    let (pulse_ctx, tasks, watcher_manager, security_events) = {
         let agent_guard = agent.read().await;
-        agent_guard.storage.clone()
+        (
+            PulseDoctorContext {
+                storage: agent_guard.storage.clone(),
+                data_dir: agent_guard.data_dir.clone(),
+                app_registry: agent_guard.app_registry.clone(),
+                config: agent_guard.config.clone(),
+                embedding_client: agent_guard.embedding_client.clone(),
+                model_pool: agent_guard.model_pool.clone(),
+                primary_model_id: agent_guard.primary_model_id.clone(),
+                llm: agent_guard.llm.clone(),
+                api_key: agent_guard.api_key.clone(),
+            },
+            agent_guard.tasks.clone(),
+            agent_guard.watcher_manager.clone(),
+            agent_guard.security_events.clone(),
+        )
     };
+    let storage = pulse_ctx.storage.clone();
     let now_marker = chrono::Utc::now().to_rfc3339();
     let _ = storage
         .set(ARKPULSE_LAST_RUN_AT_KEY, now_marker.as_bytes())
@@ -3254,10 +3693,11 @@ pub async fn run_pulse(agent: &SharedAgent) {
     let security_thresholds = load_arkpulse_security_thresholds(&storage).await;
 
     let (overdue_tasks, failed_tasks, approaching_goals, brief_channel, details, deployed_apps) = {
-        let agent = agent.read().await;
         let now = chrono::Utc::now();
-        let tasks = agent.tasks.read().await;
-        let all_tasks = tasks.all();
+        let all_tasks = {
+            let tasks = tasks.read().await;
+            tasks.all().to_vec()
+        };
 
         // Task counts
         let pending = all_tasks
@@ -3331,45 +3771,45 @@ pub async fn run_pulse(agent: &SharedAgent) {
             .collect();
 
         // Watcher count
-        let active_watchers = agent.watcher_manager.list().await.len();
+        let active_watchers = watcher_manager.list().await.len();
 
         // ── Health checks ────────────────────────────────────────────────
         let mut health_checks = Vec::new();
 
-        // Mem0 bridge
-        let mem0_url = format!("{}/health", agent.config.mem0.bridge_url);
-        let mem0_check = match http_client.get(&mem0_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                let memories = body.get("memories").and_then(|v| v.as_u64()).unwrap_or(0);
-                HealthCheck {
-                    service: "Mem0".to_string(),
+        // Postgres-backed pgvector retrieval
+        let episode_count = pulse_ctx.storage.count_episodes().await.unwrap_or(0) as usize;
+        let fact_count = pulse_ctx.storage.count_facts(None).await.unwrap_or(0) as usize;
+        let total_memories = episode_count.saturating_add(fact_count);
+        let pgvector_retrieval_check = if let Some(client) = pulse_ctx.embedding_client.as_ref() {
+            match client.health_check().await {
+                Ok(message) => HealthCheck {
+                    service: "Postgres pgvector retrieval".to_string(),
                     status: "ok".to_string(),
-                    message: format!("{} memories", memories),
-                }
+                    message: format!(
+                        "{} | {} episodes, {} facts",
+                        message, episode_count, fact_count
+                    ),
+                },
+                Err(error) => HealthCheck {
+                    service: "Postgres pgvector retrieval".to_string(),
+                    status: "warn".to_string(),
+                    message: format!(
+                        "Dense retrieval backend unavailable: {} | {} episodes, {} facts",
+                        error, episode_count, fact_count
+                    ),
+                },
             }
-            Ok(resp) => HealthCheck {
-                service: "Mem0".to_string(),
-                status: "error".to_string(),
-                message: format!("HTTP {}", resp.status()),
-            },
-            Err(e) => HealthCheck {
-                service: "Mem0".to_string(),
-                status: "error".to_string(),
-                message: format!("{}", e),
-            },
-        };
-        let total_memories = if mem0_check.status == "ok" {
-            mem0_check
-                .message
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(0)
         } else {
-            0
+            HealthCheck {
+                service: "Postgres pgvector retrieval".to_string(),
+                status: "warn".to_string(),
+                message: format!(
+                    "Lexical-only retrieval | {} episodes, {} facts",
+                    episode_count, fact_count
+                ),
+            }
         };
-        health_checks.push(mem0_check);
+        health_checks.push(pgvector_retrieval_check);
 
         // Playwright bridge
         let pw_url = std::env::var("PLAYWRIGHT_BRIDGE_URL")
@@ -3391,7 +3831,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         // LLM connectivity (report the currently active slot from model pool)
         let llm_check = {
             // Prefer enabled Primary from config order, then primary_model_id, then any enabled slot.
-            let selected_slot_id = agent
+            let selected_slot_id = pulse_ctx
                 .config
                 .model_pool
                 .slots
@@ -3399,31 +3839,33 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 .find(|s| {
                     s.enabled
                         && matches!(s.role, crate::core::config::ModelRole::Primary)
-                        && agent.model_pool.contains_key(&s.id)
+                        && pulse_ctx.model_pool.contains_key(&s.id)
                 })
                 .map(|s| s.id.clone())
                 .or_else(|| {
-                    if !agent.primary_model_id.is_empty()
-                        && agent.model_pool.contains_key(&agent.primary_model_id)
+                    if !pulse_ctx.primary_model_id.is_empty()
+                        && pulse_ctx
+                            .model_pool
+                            .contains_key(&pulse_ctx.primary_model_id)
                     {
-                        Some(agent.primary_model_id.clone())
+                        Some(pulse_ctx.primary_model_id.clone())
                     } else {
                         None
                     }
                 })
                 .or_else(|| {
-                    agent
+                    pulse_ctx
                         .config
                         .model_pool
                         .slots
                         .iter()
-                        .find(|s| s.enabled && agent.model_pool.contains_key(&s.id))
+                        .find(|s| s.enabled && pulse_ctx.model_pool.contains_key(&s.id))
                         .map(|s| s.id.clone())
                 })
-                .or_else(|| agent.model_pool.keys().next().cloned());
+                .or_else(|| pulse_ctx.model_pool.keys().next().cloned());
 
             if let Some(slot_id) = selected_slot_id {
-                if let Some((slot, client)) = agent.model_pool.get(&slot_id) {
+                if let Some((slot, client)) = pulse_ctx.model_pool.get(&slot_id) {
                     let provider_label = match &slot.provider {
                         crate::core::LlmProvider::Anthropic { .. } => "anthropic".to_string(),
                         crate::core::LlmProvider::Ollama { .. } => "ollama".to_string(),
@@ -3477,14 +3919,14 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 HealthCheck {
                     service: "LLM".to_string(),
                     status: "ok".to_string(),
-                    message: agent.llm.model_name().to_string(),
+                    message: pulse_ctx.llm.model_name().to_string(),
                 }
             }
         };
         health_checks.push(llm_check);
 
         // ── Security snapshot ────────────────────────────────────────────
-        let sec_snapshot = agent.security_events.snapshot_and_reset();
+        let sec_snapshot = security_events.snapshot();
 
         // Persist security events to DB if any occurred
         if sec_snapshot.has_events() {
@@ -3515,9 +3957,11 @@ pub async fn run_pulse(agent: &SharedAgent) {
                     "Unauthorized channel attempts",
                 ),
             ];
-            for (event_type, severity, count, desc) in &events {
-                if *count > 0 {
-                    let log = crate::storage::security_log::Model {
+            let logs: Vec<crate::storage::security_log::Model> = events
+                .iter()
+                .filter(|(_, _, count, _)| *count > 0)
+                .map(
+                    |(event_type, severity, count, desc)| crate::storage::security_log::Model {
                         id: uuid::Uuid::new_v4().to_string(),
                         event_type: event_type.to_string(),
                         severity: severity.to_string(),
@@ -3525,22 +3969,30 @@ pub async fn run_pulse(agent: &SharedAgent) {
                         source: Some("arkpulse".to_string()),
                         count: (*count).min(i32::MAX as u64) as i32,
                         created_at: now_str.clone(),
-                    };
-                    if let Err(e) = agent.storage.insert_security_log(&log).await {
-                        tracing::debug!("Failed to persist security log: {}", e);
-                    }
+                    },
+                )
+                .collect();
+            match pulse_ctx.storage.insert_security_logs(&logs).await {
+                Ok(()) => {
+                    security_events.commit_snapshot(&sec_snapshot);
+                    tracing::info!(
+                        "ArkPulse security: injections={}, auth_fail={}, rate_limit={}, unauth={}",
+                        sec_snapshot.injection_attempts,
+                        sec_snapshot.auth_failures,
+                        sec_snapshot.rate_limit_hits,
+                        sec_snapshot.unauthorized_channel_attempts,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to persist ArkPulse security logs; counters retained for retry: {}",
+                        error
+                    );
                 }
             }
-            tracing::info!(
-                "ArkPulse security: injections={}, auth_fail={}, rate_limit={}, unauth={}",
-                sec_snapshot.injection_attempts,
-                sec_snapshot.auth_failures,
-                sec_snapshot.rate_limit_hits,
-                sec_snapshot.unauthorized_channel_attempts,
-            );
         }
 
-        let channel = agent
+        let channel = pulse_ctx
             .storage
             .get("daily_brief_channel")
             .await
@@ -3551,7 +4003,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
 
         // Deployed apps health snapshot
         let now_ts = chrono::Utc::now();
-        let app_snapshots = agent.app_registry.pulse_snapshot().await;
+        let app_snapshots = pulse_ctx.app_registry.pulse_snapshot().await;
         let deployed_apps: Vec<AppPulseInfo> = app_snapshots
             .iter()
             .map(|s| AppPulseInfo {
@@ -3570,7 +4022,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
             None
         };
         let doctor_findings = run_doctor_checks(
-            &agent,
+            &pulse_ctx,
             &http_client,
             &deployed_apps,
             security_snapshot.as_ref(),
@@ -3706,7 +4158,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
         };
         let agent_guard = agent.read().await;
         log_pulse_event(&agent_guard, event).await;
-        tracing::info!("ArkPulse: non-critical signals recorded, no user notification sent");
+        tracing::debug!("ArkPulse: non-critical signals recorded, no user notification sent");
         return;
     }
 
@@ -3740,12 +4192,12 @@ pub async fn run_pulse(agent: &SharedAgent) {
             .emit_notification("ArkPulse Critical", &alert_text, "error", "arkpulse")
             .await;
     } else if should_notify_user {
-        tracing::info!(
+        tracing::debug!(
             "ArkPulse: suppressed duplicate critical notification within {}s cooldown",
             ARKPULSE_CRITICAL_NOTIFY_COOLDOWN_SECS
         );
     } else {
-        tracing::info!(
+        tracing::debug!(
             "ArkPulse: alert recorded without user notification (below ultra-severe threshold)"
         );
     }
@@ -3767,12 +4219,12 @@ pub async fn run_pulse(agent: &SharedAgent) {
             brief_channel
         );
     } else if should_notify_user {
-        tracing::info!(
+        tracing::debug!(
             "ArkPulse: duplicate critical alert not pushed to preferred channel ({})",
             brief_channel
         );
     } else {
-        tracing::info!(
+        tracing::debug!(
             "ArkPulse: preferred-channel notification skipped (below ultra-severe threshold) ({})",
             brief_channel
         );
@@ -3780,7 +4232,7 @@ pub async fn run_pulse(agent: &SharedAgent) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Mem0 Memory Decay Cleanup — prune stale ephemeral memories, keep core facts
+// Vector memory cleanup — prune stale ephemeral memories, keep core facts
 // Runs once per month, only when server is idle (no recent activity).
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -3801,7 +4253,10 @@ async fn run_security_log_cleanup(agent: &SharedAgent) {
         (storage, lifecycle, lc, la)
     };
 
-    if lifecycle.security_log_retention_days == 0 {
+    if !lifecycle.cleanup_enabled
+        || !lifecycle.logs_cleanup_enabled
+        || lifecycle.security_log_retention_days == 0
+    {
         return;
     }
 
@@ -3930,19 +4385,9 @@ async fn run_unused_app_check(agent: &SharedAgent) {
     }
 }
 
-async fn run_mem0_retry_drain(agent: &SharedAgent) {
-    let drained = {
-        let agent_guard = agent.read().await;
-        agent_guard.flush_mem0_retry_queue(8).await
-    };
-    if drained > 0 {
-        tracing::debug!("Mem0 retry queue drained {} entries", drained);
-    }
-}
-
 // =====================================================================
-// Episodic Memory Retention Cleanup (safe-by-default)
-// - Disabled by default (memory.retention_enabled=false)
+// Episodic Memory Retention Cleanup
+// - Fresh installs enable normal retention by default; users can disable it.
 // - Only runs when episode count exceeds memory.max_episodes
 // - Only deletes low-importance, low-access episodes
 // - Strongly prefers deleting only consolidated episodes
@@ -4025,11 +4470,13 @@ fn collect_protected_episode_ids_from_fact_sources(
 }
 
 async fn run_episode_retention_cleanup(agent: &SharedAgent) {
-    let (storage, mem_cfg, last_activity, data_dir) = {
+    let (storage, mem_cfg, lifecycle, last_activity, data_dir) = {
         let agent_guard = agent.read().await;
+        let storage = agent_guard.storage.clone();
         (
-            agent_guard.storage.clone(),
+            storage.clone(),
             agent_guard.config.memory.clone(),
+            load_data_lifecycle_settings(&storage).await,
             agent_guard.last_activity_at(),
             agent_guard.data_dir().to_path_buf(),
         )
@@ -4040,9 +4487,9 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
         .map(|b| b <= EPISODE_RETENTION_EMERGENCY_MIN_FREE_BYTES)
         .unwrap_or(false);
 
-    // Normal retention can remain disabled by default; emergency mode still activates
+    // Global cleanup controls disable normal retention, but emergency mode still activates
     // under real disk pressure to avoid hard outages.
-    if !mem_cfg.retention_enabled && !emergency_mode {
+    if (!lifecycle.cleanup_enabled || !mem_cfg.retention_enabled) && !emergency_mode {
         return;
     }
 
@@ -4216,112 +4663,5 @@ async fn run_episode_retention_cleanup(agent: &SharedAgent) {
                 tracing::debug!("Episode retention cleanup failed: {}", e);
             }
         }
-    }
-}
-
-const MEM0_CLEANUP_KEY: &str = "mem0_last_cleanup";
-const MEM0_SCOPE_INDEX_KEY: &str = "mem0_scope_index";
-/// Minimum 30 days between cleanups
-const MEM0_CLEANUP_INTERVAL_SECS: i64 = 30 * 24 * 3600;
-/// Only run if no user activity in the last 10 minutes
-const MEM0_IDLE_THRESHOLD_SECS: i64 = 600;
-/// Bound each Mem0 scope cleanup to avoid hanging the sentinel loop.
-const MEM0_CLEANUP_SCOPE_TIMEOUT_SECS: u64 = 180;
-
-async fn run_mem0_cleanup(agent: &SharedAgent) {
-    // Quick non-blocking check: is mem0 available?
-    let (mem0, storage, last_cleanup_bytes, last_activity) = {
-        let agent_guard = agent.read().await;
-        if !agent_guard.mem0.is_available() {
-            return;
-        }
-        let lc = agent_guard
-            .storage
-            .get(MEM0_CLEANUP_KEY)
-            .await
-            .unwrap_or(None);
-        let la = agent_guard.last_activity_at();
-        (
-            agent_guard.mem0.clone(),
-            agent_guard.storage.clone(),
-            lc,
-            la,
-        )
-    };
-    // Drop the lock immediately; never hold it during cleanup
-
-    // Check if enough time has passed since last cleanup (monthly)
-    let now = chrono::Utc::now();
-    if let Some(bytes) = last_cleanup_bytes {
-        if let Ok(ts_str) = String::from_utf8(bytes) {
-            if let Ok(last_ts) = ts_str.parse::<chrono::DateTime<chrono::Utc>>() {
-                if (now - last_ts).num_seconds() < MEM0_CLEANUP_INTERVAL_SECS {
-                    return; // Not yet time
-                }
-            }
-        }
-    }
-
-    // Check if server is idle (no recent user messages)
-    if let Some(last) = last_activity {
-        if (now - last).num_seconds() < MEM0_IDLE_THRESHOLD_SECS {
-            return; // Server is busy, skip
-        }
-    }
-
-    tracing::info!("Mem0 monthly cleanup starting (server idle)...");
-
-    let mut scopes = storage
-        .get(MEM0_SCOPE_INDEX_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_slice::<Vec<String>>(&raw).ok())
-        .unwrap_or_default();
-    if scopes.is_empty() {
-        scopes.push("channel:web".to_string());
-    }
-
-    let mut total_deleted = 0usize;
-    let mut last_remaining = 0usize;
-    let mut last_core_facts = 0usize;
-    let mut had_error = false;
-    for scope in scopes {
-        match tokio::time::timeout(
-            Duration::from_secs(MEM0_CLEANUP_SCOPE_TIMEOUT_SECS),
-            mem0.cleanup(&scope),
-        )
-        .await
-        {
-            Ok(Ok(r)) => {
-                total_deleted += r.deleted;
-                last_remaining = r.remaining;
-                last_core_facts = r.core_facts;
-            }
-            Ok(Err(e)) => {
-                had_error = true;
-                tracing::debug!("Mem0 cleanup failed for scope '{}': {}", scope, e);
-            }
-            Err(_) => {
-                had_error = true;
-                tracing::warn!(
-                    "Mem0 cleanup timed out for scope '{}' after {}s",
-                    scope,
-                    MEM0_CLEANUP_SCOPE_TIMEOUT_SECS
-                );
-            }
-        }
-    }
-
-    if !had_error {
-        tracing::info!(
-            "Mem0 cleanup done: pruned {} memories ({} remaining, {} core facts)",
-            total_deleted,
-            last_remaining,
-            last_core_facts
-        );
-        let _ = storage
-            .set(MEM0_CLEANUP_KEY, chrono::Utc::now().to_rfc3339().as_bytes())
-            .await;
     }
 }

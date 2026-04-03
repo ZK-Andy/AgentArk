@@ -102,7 +102,6 @@ export function TodaysHighlights({ tasks, traces }: Props) {
     };
   }, [tasks, traces]);
 
-  const timeSavedMin = completedToday * 10;
   const todayAnalytics = todayAnalyticsQ.data as LlmAnalyticsResponse | undefined;
   const analytics30d = analytics30dQ.data as LlmAnalyticsResponse | undefined;
   const todayUsageRows = [
@@ -120,6 +119,10 @@ export function TodaysHighlights({ tasks, traces }: Props) {
     (todayAnalytics?.totals?.total_tokens ?? 0) > 0 ||
     (todayAnalytics?.totals?.cost_usd ?? 0) > 0;
   const noTodayData = completedToday === 0 && todayTraceCount === 0 && !todayUsagePresent;
+  const activitySummary =
+    completedToday > 0 || todayTraceCount > 0
+      ? `${formatCompact(completedToday)} completed tasks and ${formatCompact(todayTraceCount)} trace runs recorded today.`
+      : "Completion and runtime totals will appear here as work lands.";
   const summaryCards = noTodayData
     ? fallbackRows
     : [
@@ -135,10 +138,10 @@ export function TodaysHighlights({ tasks, traces }: Props) {
 
   return (
     <Card className="mission-panel mission-panel--adaptive">
-      <CardContent sx={{ p: 1.55, display: "flex", flexDirection: "column" }}>
+      <CardContent sx={{ p: 1.3, display: "flex", flexDirection: "column" }}>
         <Stack spacing={1.15} className="mission-panel-content">
           <Box>
-            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+            <Typography variant="body1" sx={{ fontWeight: 700 }}>
               Operational Summary
             </Typography>
             <Typography variant="body2" color="text.secondary">
@@ -245,9 +248,7 @@ export function TodaysHighlights({ tasks, traces }: Props) {
           </Box>
 
           <Typography variant="caption" color="text.secondary" display="block">
-            {timeSavedMin > 0
-              ? `Estimated operator time reclaimed today: ~${timeSavedMin} min`
-              : "Time reclaimed will appear here as automated work completes."}
+            {activitySummary}
           </Typography>
         </Stack>
       </CardContent>
