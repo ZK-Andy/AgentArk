@@ -235,6 +235,8 @@ Local `docker compose build` produces the same full-runtime image profile used b
 docker compose up -d --build
 ```
 
+By default, the local Compose build tags the image as `agentark:dev`. Override it with `AGENTARK_IMAGE=...` if you want a different local tag.
+
 Compose-managed installs reuse the installed AgentArk image as the default runtime/app image. The default path does not expect a separate `agentark-sandbox` image; only set `AGENTARK_RUNTIME_IMAGE` if you intentionally want a different runner image.
 
 If you want a lighter self-built image, use build args to disable specific components:

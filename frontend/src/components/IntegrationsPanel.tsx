@@ -351,6 +351,20 @@ type ChannelSettingsForm = {
   whatsapp_allowed_numbers_csv: string;
 };
 
+type MessagingChannelEnabledField =
+  | "telegram_enabled"
+  | "slack_enabled"
+  | "discord_enabled"
+  | "matrix_enabled"
+  | "teams_enabled"
+  | "google_chat_enabled"
+  | "signal_enabled"
+  | "imessage_enabled"
+  | "line_enabled"
+  | "wechat_enabled"
+  | "qq_enabled"
+  | "whatsapp_enabled";
+
 type IntegrationSyncFormState = {
   enabled: boolean;
   poll_interval_minutes: string;
@@ -966,7 +980,7 @@ export function IntegrationsPanel({
     whatsapp_verify_token: "",
     whatsapp_bridge_token: "",
     whatsapp_bridge_url: "",
-    whatsapp_dm_policy: "all",
+    whatsapp_dm_policy: "pairing",
     whatsapp_allowed_numbers_csv: ""
   });
   // NOTE: Integrations are long-lived connectors. URL imports belong to Skills.
@@ -1843,6 +1857,7 @@ export function IntegrationsPanel({
   };
 
   const openTelegramSetup = (enableIfDisabled = false) => {
+    setNotice(null);
     if (enableIfDisabled && !channelForm.telegram_enabled) {
       setChannelField("telegram_enabled", true);
     }
@@ -1929,6 +1944,81 @@ export function IntegrationsPanel({
   const openSearchSetup = () => {
     setSearchSetupOpen(true);
   };
+
+  const saveChannelDialog = async (onClose: () => void) => {
+    try {
+      await saveChannelsMutation.mutateAsync(channelForm);
+      onClose();
+    } catch {
+      // Error alert handled by mutation + top-level notice.
+    }
+  };
+
+  const disconnectChannel = async (
+    label: string,
+    enabledField: MessagingChannelEnabledField,
+    onClose: () => void
+  ) => {
+    if (
+      !window.confirm(
+        `Disconnect ${label}? This will disable the channel and remove its saved configuration.`
+      )
+    ) {
+      return;
+    }
+    const previousForm = channelForm;
+    const wasDirty = channelsDirty;
+    const nextForm = { ...channelForm, [enabledField]: false } as ChannelSettingsForm;
+    setNotice(null);
+    setChannelsDirty(true);
+    setChannelForm(nextForm);
+    try {
+      await saveChannelsMutation.mutateAsync(nextForm);
+      onClose();
+    } catch {
+      setChannelForm(previousForm);
+      setChannelsDirty(wasDirty);
+    }
+  };
+
+  const renderMessagingDialogActions = ({
+    onClose,
+    onDisconnect,
+    disconnectVisible = false,
+    disconnectLabel = "Disconnect"
+  }: {
+    onClose: () => void;
+    onDisconnect?: () => void | Promise<void>;
+    disconnectVisible?: boolean;
+    disconnectLabel?: string;
+  }) => (
+    <DialogActions>
+      {disconnectVisible ? (
+        <Button
+          color="warning"
+          onClick={() => {
+            void onDisconnect?.();
+          }}
+          disabled={saveChannelsMutation.isPending}
+        >
+          {disconnectLabel}
+        </Button>
+      ) : null}
+      <Box sx={{ flex: 1 }} />
+      <Button onClick={onClose} disabled={saveChannelsMutation.isPending}>
+        Cancel
+      </Button>
+      <Button
+        variant="contained"
+        disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
+        onClick={() => {
+          void saveChannelDialog(onClose);
+        }}
+      >
+        {saveChannelsMutation.isPending ? "Saving..." : "Save"}
+      </Button>
+    </DialogActions>
+  );
 
   const messagingSetups = [
     {
@@ -2072,8 +2162,7 @@ export function IntegrationsPanel({
   ).length;
   const messagingAttentionCount = messagingSetups.length - messagingReadyCount;
 
-  const saveChannelsMutation = useMutation({
-    mutationFn: async () => {
+  const persistChannelSettings = async (form: ChannelSettingsForm) => {
       const payload: Record<string, unknown> = {
         llm_provider: str(settings.llm_provider, ""),
         llm_model: str(settings.llm_model, ""),
@@ -2083,141 +2172,157 @@ export function IntegrationsPanel({
         llm_fallback_model: settings.llm_fallback_model ?? null,
         llm_fallback_base_url: settings.llm_fallback_base_url ?? null,
         llm_fallback_api_key: null,
-        search_primary: channelForm.search_primary.trim() || null,
-        search_fallback1: channelForm.search_fallback1.trim() || null,
-        search_fallback2: channelForm.search_fallback2.trim() || null,
-        search_serper_key: channelForm.search_serper_key.trim() || null,
-        search_brave_key: channelForm.search_brave_key.trim() || null,
-        telegram_enabled: !!channelForm.telegram_enabled,
-        telegram_bot_token: channelForm.telegram_bot_token.trim() || null,
-        telegram_allowed_users: parseTelegramUsers(channelForm.telegram_allowed_users_csv),
-        slack_enabled: !!channelForm.slack_enabled,
-        slack_bot_token: channelForm.slack_bot_token.trim() || null,
-        slack_signing_secret: channelForm.slack_signing_secret.trim() || null,
-        slack_api_base_url: channelForm.slack_api_base_url.trim() || null,
-        slack_default_channel_id: channelForm.slack_default_channel_id.trim() || null,
-        slack_default_thread_ts: channelForm.slack_default_thread_ts.trim() || null,
-        slack_workspace_id: channelForm.slack_workspace_id.trim() || null,
-        slack_workspace_name: channelForm.slack_workspace_name.trim() || null,
-        discord_enabled: !!channelForm.discord_enabled,
-        discord_bot_token: channelForm.discord_bot_token.trim() || null,
-        discord_webhook_url: channelForm.discord_webhook_url.trim() || null,
-        discord_api_base_url: channelForm.discord_api_base_url.trim() || null,
-        discord_default_channel_id: channelForm.discord_default_channel_id.trim() || null,
-        discord_default_thread_id: channelForm.discord_default_thread_id.trim() || null,
-        discord_guild_id: channelForm.discord_guild_id.trim() || null,
-        discord_application_id: channelForm.discord_application_id.trim() || null,
-        matrix_enabled: !!channelForm.matrix_enabled,
-        matrix_homeserver_url: channelForm.matrix_homeserver_url.trim() || null,
-        matrix_access_token: channelForm.matrix_access_token.trim() || null,
-        matrix_user_id: channelForm.matrix_user_id.trim() || null,
-        matrix_device_id: channelForm.matrix_device_id.trim() || null,
-        matrix_account_id: channelForm.matrix_account_id.trim() || null,
-        matrix_default_room_id: channelForm.matrix_default_room_id.trim() || null,
-        matrix_sync_timeout_ms: Number(channelForm.matrix_sync_timeout_ms) || null,
-        matrix_limit: Number(channelForm.matrix_limit) || null,
-        matrix_user_agent: channelForm.matrix_user_agent.trim() || null,
-        teams_enabled: !!channelForm.teams_enabled,
-        teams_service_url: channelForm.teams_service_url.trim() || null,
-        teams_access_token: channelForm.teams_access_token.trim() || null,
-        teams_bot_app_id: channelForm.teams_bot_app_id.trim() || null,
-        teams_bot_name: channelForm.teams_bot_name.trim() || null,
-        teams_tenant_id: channelForm.teams_tenant_id.trim() || null,
-        teams_team_id: channelForm.teams_team_id.trim() || null,
-        teams_channel_id: channelForm.teams_channel_id.trim() || null,
-        teams_chat_id: channelForm.teams_chat_id.trim() || null,
-        teams_graph_base_url: channelForm.teams_graph_base_url.trim() || null,
-        teams_delivery_mode: channelForm.teams_delivery_mode,
-        teams_timeout_secs: Number(channelForm.teams_timeout_secs) || null,
-        teams_user_agent: channelForm.teams_user_agent.trim() || null,
-        google_chat_enabled: !!channelForm.google_chat_enabled,
-        google_chat_access_token: channelForm.google_chat_access_token.trim() || null,
-        google_chat_verify_token: channelForm.google_chat_verify_token.trim() || null,
-        google_chat_api_base_url: channelForm.google_chat_api_base_url.trim() || null,
-        google_chat_space: channelForm.google_chat_space.trim() || null,
-        google_chat_thread_key: channelForm.google_chat_thread_key.trim() || null,
-        google_chat_app_id: channelForm.google_chat_app_id.trim() || null,
-        google_chat_bot_name: channelForm.google_chat_bot_name.trim() || null,
-        signal_enabled: !!channelForm.signal_enabled,
-        signal_bridge_token: channelForm.signal_bridge_token.trim() || null,
-        signal_bridge_url: channelForm.signal_bridge_url.trim() || null,
-        signal_default_recipient: channelForm.signal_default_recipient.trim() || null,
-        signal_default_group_id: channelForm.signal_default_group_id.trim() || null,
-        imessage_enabled: !!channelForm.imessage_enabled,
-        imessage_bridge_token: channelForm.imessage_bridge_token.trim() || null,
-        imessage_bridge_url: channelForm.imessage_bridge_url.trim() || null,
-        imessage_default_chat_id: channelForm.imessage_default_chat_id.trim() || null,
-        imessage_default_handle: channelForm.imessage_default_handle.trim() || null,
-        line_enabled: !!channelForm.line_enabled,
-        line_channel_access_token: channelForm.line_channel_access_token.trim() || null,
-        line_channel_secret: channelForm.line_channel_secret.trim() || null,
-        line_api_base_url: channelForm.line_api_base_url.trim() || null,
-        line_default_target: channelForm.line_default_target.trim() || null,
-        line_user_agent: channelForm.line_user_agent.trim() || null,
-        wechat_enabled: !!channelForm.wechat_enabled,
-        wechat_bridge_token: channelForm.wechat_bridge_token.trim() || null,
-        wechat_bridge_url: channelForm.wechat_bridge_url.trim() || null,
-        wechat_default_target_id: channelForm.wechat_default_target_id.trim() || null,
-        qq_enabled: !!channelForm.qq_enabled,
-        qq_bridge_token: channelForm.qq_bridge_token.trim() || null,
-        qq_bridge_url: channelForm.qq_bridge_url.trim() || null,
-        qq_default_target_id: channelForm.qq_default_target_id.trim() || null,
-        whatsapp_enabled: !!channelForm.whatsapp_enabled,
-        whatsapp_mode: channelForm.whatsapp_mode,
+        search_primary: form.search_primary.trim() || null,
+        search_fallback1: form.search_fallback1.trim() || null,
+        search_fallback2: form.search_fallback2.trim() || null,
+        search_serper_key: form.search_serper_key.trim() || null,
+        search_brave_key: form.search_brave_key.trim() || null,
+        telegram_enabled: !!form.telegram_enabled,
+        telegram_bot_token: form.telegram_bot_token.trim() || null,
+        telegram_allowed_users: parseTelegramUsers(form.telegram_allowed_users_csv),
+        slack_enabled: !!form.slack_enabled,
+        slack_bot_token: form.slack_bot_token.trim() || null,
+        slack_signing_secret: form.slack_signing_secret.trim() || null,
+        slack_api_base_url: form.slack_api_base_url.trim() || null,
+        slack_default_channel_id: form.slack_default_channel_id.trim() || null,
+        slack_default_thread_ts: form.slack_default_thread_ts.trim() || null,
+        slack_workspace_id: form.slack_workspace_id.trim() || null,
+        slack_workspace_name: form.slack_workspace_name.trim() || null,
+        discord_enabled: !!form.discord_enabled,
+        discord_bot_token: form.discord_bot_token.trim() || null,
+        discord_webhook_url: form.discord_webhook_url.trim() || null,
+        discord_api_base_url: form.discord_api_base_url.trim() || null,
+        discord_default_channel_id: form.discord_default_channel_id.trim() || null,
+        discord_default_thread_id: form.discord_default_thread_id.trim() || null,
+        discord_guild_id: form.discord_guild_id.trim() || null,
+        discord_application_id: form.discord_application_id.trim() || null,
+        matrix_enabled: !!form.matrix_enabled,
+        matrix_homeserver_url: form.matrix_homeserver_url.trim() || null,
+        matrix_access_token: form.matrix_access_token.trim() || null,
+        matrix_user_id: form.matrix_user_id.trim() || null,
+        matrix_device_id: form.matrix_device_id.trim() || null,
+        matrix_account_id: form.matrix_account_id.trim() || null,
+        matrix_default_room_id: form.matrix_default_room_id.trim() || null,
+        matrix_sync_timeout_ms: Number(form.matrix_sync_timeout_ms) || null,
+        matrix_limit: Number(form.matrix_limit) || null,
+        matrix_user_agent: form.matrix_user_agent.trim() || null,
+        teams_enabled: !!form.teams_enabled,
+        teams_service_url: form.teams_service_url.trim() || null,
+        teams_access_token: form.teams_access_token.trim() || null,
+        teams_bot_app_id: form.teams_bot_app_id.trim() || null,
+        teams_bot_name: form.teams_bot_name.trim() || null,
+        teams_tenant_id: form.teams_tenant_id.trim() || null,
+        teams_team_id: form.teams_team_id.trim() || null,
+        teams_channel_id: form.teams_channel_id.trim() || null,
+        teams_chat_id: form.teams_chat_id.trim() || null,
+        teams_graph_base_url: form.teams_graph_base_url.trim() || null,
+        teams_delivery_mode: form.teams_delivery_mode,
+        teams_timeout_secs: Number(form.teams_timeout_secs) || null,
+        teams_user_agent: form.teams_user_agent.trim() || null,
+        google_chat_enabled: !!form.google_chat_enabled,
+        google_chat_access_token: form.google_chat_access_token.trim() || null,
+        google_chat_verify_token: form.google_chat_verify_token.trim() || null,
+        google_chat_api_base_url: form.google_chat_api_base_url.trim() || null,
+        google_chat_space: form.google_chat_space.trim() || null,
+        google_chat_thread_key: form.google_chat_thread_key.trim() || null,
+        google_chat_app_id: form.google_chat_app_id.trim() || null,
+        google_chat_bot_name: form.google_chat_bot_name.trim() || null,
+        signal_enabled: !!form.signal_enabled,
+        signal_bridge_token: form.signal_bridge_token.trim() || null,
+        signal_bridge_url: form.signal_bridge_url.trim() || null,
+        signal_default_recipient: form.signal_default_recipient.trim() || null,
+        signal_default_group_id: form.signal_default_group_id.trim() || null,
+        imessage_enabled: !!form.imessage_enabled,
+        imessage_bridge_token: form.imessage_bridge_token.trim() || null,
+        imessage_bridge_url: form.imessage_bridge_url.trim() || null,
+        imessage_default_chat_id: form.imessage_default_chat_id.trim() || null,
+        imessage_default_handle: form.imessage_default_handle.trim() || null,
+        line_enabled: !!form.line_enabled,
+        line_channel_access_token: form.line_channel_access_token.trim() || null,
+        line_channel_secret: form.line_channel_secret.trim() || null,
+        line_api_base_url: form.line_api_base_url.trim() || null,
+        line_default_target: form.line_default_target.trim() || null,
+        line_user_agent: form.line_user_agent.trim() || null,
+        wechat_enabled: !!form.wechat_enabled,
+        wechat_bridge_token: form.wechat_bridge_token.trim() || null,
+        wechat_bridge_url: form.wechat_bridge_url.trim() || null,
+        wechat_default_target_id: form.wechat_default_target_id.trim() || null,
+        qq_enabled: !!form.qq_enabled,
+        qq_bridge_token: form.qq_bridge_token.trim() || null,
+        qq_bridge_url: form.qq_bridge_url.trim() || null,
+        qq_default_target_id: form.qq_default_target_id.trim() || null,
+        whatsapp_enabled: !!form.whatsapp_enabled,
+        whatsapp_mode: form.whatsapp_mode,
         whatsapp_bridge_runtime:
-          channelForm.whatsapp_mode === "baileys" ? channelForm.whatsapp_bridge_runtime : null,
-        whatsapp_access_token: channelForm.whatsapp_access_token.trim() || null,
-        whatsapp_app_secret: channelForm.whatsapp_app_secret.trim() || null,
-        whatsapp_phone_number_id: channelForm.whatsapp_phone_number_id.trim() || null,
-        whatsapp_verify_token: channelForm.whatsapp_verify_token.trim() || null,
+          form.whatsapp_mode === "baileys" ? form.whatsapp_bridge_runtime : null,
+        whatsapp_access_token: form.whatsapp_access_token.trim() || null,
+        whatsapp_app_secret: form.whatsapp_app_secret.trim() || null,
+        whatsapp_phone_number_id: form.whatsapp_phone_number_id.trim() || null,
+        whatsapp_verify_token: form.whatsapp_verify_token.trim() || null,
         whatsapp_bridge_token:
-          channelForm.whatsapp_mode === "baileys" &&
-          channelForm.whatsapp_bridge_runtime === "external"
-            ? channelForm.whatsapp_bridge_token.trim() || null
+          form.whatsapp_mode === "baileys" &&
+          form.whatsapp_bridge_runtime === "external"
+            ? form.whatsapp_bridge_token.trim() || null
             : null,
         whatsapp_bridge_url:
-          channelForm.whatsapp_mode === "baileys" &&
-          channelForm.whatsapp_bridge_runtime === "external"
-            ? channelForm.whatsapp_bridge_url.trim() || null
+          form.whatsapp_mode === "baileys" &&
+          form.whatsapp_bridge_runtime === "external"
+            ? form.whatsapp_bridge_url.trim() || null
             : null,
-        whatsapp_dm_policy: channelForm.whatsapp_dm_policy.trim() || null,
-        whatsapp_allowed_numbers: parseCsvList(channelForm.whatsapp_allowed_numbers_csv)
+        whatsapp_dm_policy: form.whatsapp_dm_policy.trim() || null,
+        whatsapp_allowed_numbers: parseCsvList(form.whatsapp_allowed_numbers_csv)
       };
       await api.rawPost("/settings", payload);
-      return api.rawPost("/sender-verification/settings", {
-        google_chat_policy: channelForm.google_chat_trust_policy.trim() || "open",
-        google_chat_allowed_senders: parseCsvList(channelForm.google_chat_allowed_senders_csv),
-        signal_policy: channelForm.signal_trust_policy.trim() || "open",
-        signal_allowed_senders: parseCsvList(channelForm.signal_allowed_senders_csv),
-        imessage_policy: channelForm.imessage_trust_policy.trim() || "open",
-        imessage_allowed_senders: parseCsvList(channelForm.imessage_allowed_senders_csv),
-        line_policy: channelForm.line_trust_policy.trim() || "open",
-        line_allowed_senders: parseCsvList(channelForm.line_allowed_senders_csv),
-        slack_policy: channelForm.slack_trust_policy.trim() || "open",
-        slack_allowed_senders: parseCsvList(channelForm.slack_allowed_senders_csv),
-        teams_policy: channelForm.teams_trust_policy.trim() || "open",
-        teams_allowed_senders: parseCsvList(channelForm.teams_allowed_senders_csv),
-        whatsapp_policy: channelForm.whatsapp_dm_policy.trim() || "pairing",
-        whatsapp_allowed_senders: parseCsvList(channelForm.whatsapp_allowed_numbers_csv),
-        wechat_policy: channelForm.wechat_trust_policy.trim() || "open",
-        wechat_allowed_senders: parseCsvList(channelForm.wechat_allowed_senders_csv),
-        qq_policy: channelForm.qq_trust_policy.trim() || "open",
-        qq_allowed_senders: parseCsvList(channelForm.qq_allowed_senders_csv)
-      });
-    },
-    onSuccess: async () => {
-      setNotice({ kind: "success", text: "Channel settings saved." });
-      await Promise.allSettled([
-        settingsQ.refetch(),
-        channelsQ.refetch(),
-        senderVerificationQ.refetch(),
-        telegramStatusQ.refetch(),
-        channelForm.whatsapp_enabled && channelForm.whatsapp_mode === "baileys"
-          ? waBridgeQ.refetch()
-          : Promise.resolve(null),
-        queryClient.invalidateQueries({ queryKey: ["gateway-channels"] })
-      ]);
-      setChannelsDirty(false);
+
+      const senderVerificationPayload: Record<string, unknown> = {
+        google_chat_policy: form.google_chat_trust_policy.trim() || "open",
+        google_chat_allowed_senders: parseCsvList(form.google_chat_allowed_senders_csv),
+        signal_policy: form.signal_trust_policy.trim() || "open",
+        signal_allowed_senders: parseCsvList(form.signal_allowed_senders_csv),
+        imessage_policy: form.imessage_trust_policy.trim() || "open",
+        imessage_allowed_senders: parseCsvList(form.imessage_allowed_senders_csv),
+        line_policy: form.line_trust_policy.trim() || "open",
+        line_allowed_senders: parseCsvList(form.line_allowed_senders_csv),
+        slack_policy: form.slack_trust_policy.trim() || "open",
+        slack_allowed_senders: parseCsvList(form.slack_allowed_senders_csv),
+        teams_policy: form.teams_trust_policy.trim() || "open",
+        teams_allowed_senders: parseCsvList(form.teams_allowed_senders_csv),
+        wechat_policy: form.wechat_trust_policy.trim() || "open",
+        wechat_allowed_senders: parseCsvList(form.wechat_allowed_senders_csv),
+        qq_policy: form.qq_trust_policy.trim() || "open",
+        qq_allowed_senders: parseCsvList(form.qq_allowed_senders_csv)
+      };
+
+      if (form.whatsapp_enabled) {
+        senderVerificationPayload.whatsapp_policy =
+          form.whatsapp_dm_policy.trim() || "pairing";
+        senderVerificationPayload.whatsapp_allowed_senders = parseCsvList(
+          form.whatsapp_allowed_numbers_csv
+        );
+      }
+
+      return api.rawPost("/sender-verification/settings", senderVerificationPayload);
+  };
+
+  const handleChannelsSaved = async (savedForm: ChannelSettingsForm) => {
+    setNotice({ kind: "success", text: "Channel settings saved." });
+    await Promise.allSettled([
+      settingsQ.refetch(),
+      channelsQ.refetch(),
+      senderVerificationQ.refetch(),
+      telegramStatusQ.refetch(),
+      savedForm.whatsapp_enabled && savedForm.whatsapp_mode === "baileys"
+        ? waBridgeQ.refetch()
+        : Promise.resolve(null),
+      queryClient.invalidateQueries({ queryKey: ["gateway-channels"] })
+    ]);
+    setChannelsDirty(false);
+  };
+
+  const saveChannelsMutation = useMutation({
+    mutationFn: persistChannelSettings,
+    onSuccess: async (_data, savedForm) => {
+      await handleChannelsSaved(savedForm);
     },
     onError: (err) => {
       setNotice({ kind: "error", text: asErrorMessage(err) });
@@ -4505,13 +4610,8 @@ export function IntegrationsPanel({
           <Button
             variant="contained"
             disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setSearchSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
+            onClick={() => {
+              void saveChannelDialog(() => setSearchSetupOpen(false));
             }}
           >
             {saveChannelsMutation.isPending ? "Saving..." : "Save"}
@@ -4525,6 +4625,7 @@ export function IntegrationsPanel({
         <DialogTitle>Telegram Setup</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={1.5}>
+            {notice?.kind === "error" ? <Alert severity="error">{notice.text}</Alert> : null}
             <Typography variant="body2" color="text.secondary">
               Add your Telegram bot token and optional allowed user IDs. This controls who can use your bot.
             </Typography>
@@ -4578,25 +4679,12 @@ export function IntegrationsPanel({
             />
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setTelegramSetupOpen(false)} disabled={saveChannelsMutation.isPending}>
-            Cancel
-          </Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setTelegramSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setTelegramSetupOpen(false),
+          disconnectVisible: channelForm.telegram_enabled,
+          onDisconnect: () =>
+            disconnectChannel("Telegram", "telegram_enabled", () => setTelegramSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -4664,23 +4752,11 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setSlackSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setSlackSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setSlackSetupOpen(false),
+          disconnectVisible: channelForm.slack_enabled,
+          onDisconnect: () => disconnectChannel("Slack", "slack_enabled", () => setSlackSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -4728,23 +4804,12 @@ export function IntegrationsPanel({
             <TextField fullWidth size="small" label="API Base URL" value={channelForm.discord_api_base_url} onChange={(e) => setChannelField("discord_api_base_url", e.target.value)} />
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDiscordSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setDiscordSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setDiscordSetupOpen(false),
+          disconnectVisible: channelForm.discord_enabled,
+          onDisconnect: () =>
+            disconnectChannel("Discord", "discord_enabled", () => setDiscordSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -4796,23 +4861,11 @@ export function IntegrationsPanel({
             <TextField fullWidth size="small" label="User Agent" value={channelForm.matrix_user_agent} onChange={(e) => setChannelField("matrix_user_agent", e.target.value)} />
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setMatrixSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setMatrixSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setMatrixSetupOpen(false),
+          disconnectVisible: channelForm.matrix_enabled,
+          onDisconnect: () => disconnectChannel("Matrix", "matrix_enabled", () => setMatrixSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -4884,23 +4937,11 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setTeamsSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setTeamsSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setTeamsSetupOpen(false),
+          disconnectVisible: channelForm.teams_enabled,
+          onDisconnect: () => disconnectChannel("Teams", "teams_enabled", () => setTeamsSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -4970,23 +5011,12 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setGoogleChatSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setGoogleChatSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setGoogleChatSetupOpen(false),
+          disconnectVisible: channelForm.google_chat_enabled,
+          onDisconnect: () =>
+            disconnectChannel("Google Chat", "google_chat_enabled", () => setGoogleChatSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5044,23 +5074,12 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setSignalSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setSignalSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setSignalSetupOpen(false),
+          disconnectVisible: channelForm.signal_enabled,
+          onDisconnect: () =>
+            disconnectChannel("Signal", "signal_enabled", () => setSignalSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5118,23 +5137,12 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setImessageSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setImessageSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setImessageSetupOpen(false),
+          disconnectVisible: channelForm.imessage_enabled,
+          onDisconnect: () =>
+            disconnectChannel("iMessage", "imessage_enabled", () => setImessageSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5202,23 +5210,11 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setLineSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setLineSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setLineSetupOpen(false),
+          disconnectVisible: channelForm.line_enabled,
+          onDisconnect: () => disconnectChannel("LINE", "line_enabled", () => setLineSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5273,23 +5269,12 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setWechatSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setWechatSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setWechatSetupOpen(false),
+          disconnectVisible: channelForm.wechat_enabled,
+          onDisconnect: () =>
+            disconnectChannel("WeChat", "wechat_enabled", () => setWechatSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5344,23 +5329,11 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setQqSetupOpen(false)} disabled={saveChannelsMutation.isPending}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setQqSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setQqSetupOpen(false),
+          disconnectVisible: channelForm.qq_enabled,
+          onDisconnect: () => disconnectChannel("QQ", "qq_enabled", () => setQqSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 
@@ -5601,25 +5574,13 @@ export function IntegrationsPanel({
             })}
           </Stack>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setWhatsAppSetupOpen(false)} disabled={saveChannelsMutation.isPending}>
-            Cancel
-          </Button>
-          <Button
-            variant="contained"
-            disabled={saveChannelsMutation.isPending || settingsQ.isLoading}
-            onClick={async () => {
-              try {
-                await saveChannelsMutation.mutateAsync();
-                setWhatsAppSetupOpen(false);
-              } catch {
-                // Error alert handled by mutation + top-level notice.
-              }
-            }}
-          >
-            {saveChannelsMutation.isPending ? "Saving..." : "Save"}
-          </Button>
-        </DialogActions>
+        {renderMessagingDialogActions({
+          onClose: () => setWhatsAppSetupOpen(false),
+          disconnectVisible: channelForm.whatsapp_enabled,
+          disconnectLabel: "Disconnect Channel",
+          onDisconnect: () =>
+            disconnectChannel("WhatsApp", "whatsapp_enabled", () => setWhatsAppSetupOpen(false))
+        })}
       </Dialog>
       ) : null}
 

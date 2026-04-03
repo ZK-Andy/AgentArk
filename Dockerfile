@@ -18,7 +18,7 @@
 # AgentArk now ships as a single full-runtime image. This is the image profile
 # used by docker compose and the published GHCR release image.
 #
-#   docker build -t agentark:local .
+#   docker build -t agentark:dev .
 #
 # OPTIONAL LIGHTER SELF-BUILDS
 # =============================================================================
@@ -26,7 +26,7 @@
 # If you are building only for yourself and want to trim features locally, you
 # can still disable individual runtimes with build args:
 #
-#   docker build -t agentark:local \
+#   docker build -t agentark:dev \
 #     --build-arg INSTALL_PLAYWRIGHT_RUNTIME=false \
 #     --build-arg INSTALL_TAILSCALE=false \
 #     --build-arg INSTALL_CLOUDFLARED=false \
