@@ -2296,13 +2296,6 @@ function formatBytes(value: unknown): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-function generateConversationId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
 function sanitizeWorkspaceAppSnapshot(value: unknown): JsonRecord | null {
   const source = asRecord(value);
   const next: JsonRecord = {};
@@ -5712,6 +5705,7 @@ function ChatManager({
   const streamingStepsRef = useRef<JsonRecord[]>([]);
   const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
+  const conversationIdRef = useRef<string | null>(conversationId);
   const previousInlineSidebarsRef = useRef({
     conversations: viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH,
     activity: viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH
@@ -5908,6 +5902,10 @@ function ChatManager({
     streamingSteps,
     effectiveProjectId
   ]);
+
+  useEffect(() => {
+    conversationIdRef.current = conversationId;
+  }, [conversationId]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !conversationId) return;
@@ -8240,7 +8238,7 @@ function ChatManager({
     const requestedConversationOverride = (opts?.conversationIdOverride || "").trim();
     const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
     const targetConversationId =
-      requestedConversationOverride || conversationId || (isResumeMode ? "" : generateConversationId());
+      requestedConversationOverride || conversationId || "";
     const targetProjectId = requestedProjectOverride || effectiveProjectId || "";
     let activeMessage = isResumeMode
       ? ""
@@ -8331,7 +8329,7 @@ function ChatManager({
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
 
-    if (conversationId !== targetConversationId) {
+    if (targetConversationId && conversationId !== targetConversationId) {
       setConversationId(targetConversationId);
     }
     const initialPendingSnapshot: ChatPendingRunSnapshot = {
@@ -8366,6 +8364,10 @@ function ChatManager({
           storeChatPendingRunSnapshot(next);
           return next;
         });
+        if (!conversationIdRef.current) {
+          setConversationPage(0);
+          setConversationId(cid);
+        }
         return;
       }
       if (runId) {
@@ -8488,7 +8490,7 @@ function ChatManager({
             {
               message: payloadMessage,
               channel: "web",
-              conversation_id: targetConversationId,
+              conversation_id: targetConversationId || undefined,
               project_id: targetProjectId || undefined,
               deep_research: deepResearch,
               plan_confirmation_mode: deepResearch ? "before_execution" : undefined,
@@ -9059,6 +9061,19 @@ function ChatManager({
         ? "awaiting_confirmation"
         : "running";
   const pendingSnapshotMode = pendingRunSnapshot?.mode === "resume" ? "resume" : "fresh";
+  const hasFocusedDraftStream =
+    !conversationId &&
+    pendingSnapshotMode === "fresh" &&
+    pendingSnapshotPhase === "running" &&
+    Boolean(pendingRunSnapshot) &&
+    (
+      isStreaming ||
+      !!pendingUserMessage ||
+      !!streamingResponse.trim() ||
+      streamingProgressMessages.length > 0 ||
+      streamingSteps.length > 0
+    );
+  const hasLivePendingThread = hasPendingSnapshotForConversation || hasFocusedDraftStream;
   const hasRecoveredStream =
     !isStreamingForCurrentConversation &&
     hasPendingSnapshotForConversation &&
@@ -9083,15 +9098,21 @@ function ChatManager({
     str(lastMsg?.role, "").toLowerCase() === "assistant";
   // Show streaming bubble while streaming OR while waiting for final message to land
   const showStreamingAssistant =
-    isStreamingForCurrentConversation || (hasRecoveredStream && !finalMessageLanded);
+    isStreamingForCurrentConversation ||
+    hasFocusedDraftStream ||
+    (hasRecoveredStream && !finalMessageLanded);
   const visiblePendingUserMessage =
-    hasPendingSnapshotForConversation &&
+    hasLivePendingThread &&
     pendingSnapshotMode === "fresh" &&
     pendingSnapshotPhase === "running"
       ? pendingUserMessage
       : null;
-  const visibleFailedUserMessage = hasPendingSnapshotForConversation ? failedUserMessage : null;
-  const visibleStreamingResponse = hasPendingSnapshotForConversation ? streamingResponse : "";
+  const visibleFailedUserMessage =
+    hasPendingSnapshotForConversation ||
+    (!conversationId && !isStreaming && !!failedUserMessage && messages.length === 0)
+      ? failedUserMessage
+      : null;
+  const visibleStreamingResponse = hasLivePendingThread ? streamingResponse : "";
   const streamingResearchReport = showStreamingAssistant
     ? parseResearchReport(visibleStreamingResponse)
     : null;
@@ -9107,7 +9128,7 @@ function ChatManager({
     !hasPendingSnapshotForConversation && conversationId
       ? completedProgressMessagesByConversation[conversationId] || null
       : null;
-  const visibleStreamingProgressMessages = hasPendingSnapshotForConversation
+  const visibleStreamingProgressMessages = hasLivePendingThread
     ? streamingProgressMessages
     : completedProgressSnapshot?.messages || []
       ;
@@ -9149,8 +9170,9 @@ function ChatManager({
   }, [messages, pendingSnapshotStartedAt, showStreamingAssistant]);
   const hasLiveThreadActivity = Boolean(
     visiblePendingUserMessage ||
+    visibleFailedUserMessage ||
     isStreamingForCurrentConversation ||
-    hasPendingSnapshotForConversation ||
+    hasLivePendingThread ||
     visibleStreamingResponse.trim()
   );
   const hasRenderableThread = messages.length > 0 || hasLiveThreadActivity;
@@ -9474,6 +9496,16 @@ function ChatManager({
   const showConversationSidebarInline = showConversationSidebar && canInlineConversationSidebar;
   const showWorkspacePanelDrawer = showWorkspacePanel && !canInlineWorkspacePanel;
   const showConversationSidebarDrawer = showConversationSidebar && !canInlineConversationSidebar;
+  const conversationListError = convQ.error;
+  const messagesError = messagesQ.error;
+  const messagesErrorText = errMessage(messagesError);
+  const draftConversationMissing =
+    !!conversationId &&
+    !messages.length &&
+    !sidebarConversationIds.has(conversationId) &&
+    normalizeChatError(messagesErrorText).toLowerCase() === "conversation not found";
+  const visibleConversationListError = conversationListError;
+  const visibleMessagesError = draftConversationMissing ? null : messagesError;
   const chatErrorLower = (chatError || "").toLowerCase();
   const chatErrorNormalized = chatError ? normalizeChatError(chatError).toLowerCase() : "";
   const apiKeyActionNeeded =
@@ -9485,6 +9517,8 @@ function ChatManager({
       /api.?key.*required/.test(chatErrorLower) ||
       /api.?key.*required/.test(chatErrorNormalized) ||
       /^unauthorized\b/.test(chatErrorLower));
+  const visibleConversationError =
+    visibleConversationListError || visibleMessagesError || (chatError && !apiKeyActionNeeded);
   const extractedKeyHints =
     chatError?.match(/\b[A-Z][A-Z0-9_]{2,}\b/g)?.filter((v) => /KEY|TOKEN|SECRET/.test(v)) ?? [];
   const suggestedSecretKey = extractedKeyHints[0] || secretHelperKey;
@@ -10406,9 +10440,9 @@ function ChatManager({
           )}
         </Box>
 
-        {convQ.error || messagesQ.error || (chatError && !apiKeyActionNeeded) ? (
+        {visibleConversationError ? (
           <Alert severity="error" sx={{ mt: 1 }}>
-            {normalizeChatError(chatError || errMessage(convQ.error || messagesQ.error))}
+            {normalizeChatError(chatError || errMessage(visibleConversationListError || visibleMessagesError))}
           </Alert>
         ) : null}
         {apiKeyActionNeeded ? (
@@ -10478,7 +10512,7 @@ function ChatManager({
             </Stack>
           </Box>
         ) : null}
-        {chatNotice && !(convQ.error || messagesQ.error || chatError) ? (
+        {chatNotice && !visibleConversationListError && !visibleMessagesError && !chatError ? (
           <Alert severity="info" sx={{ mt: 1 }}>
             {chatNotice}
           </Alert>
