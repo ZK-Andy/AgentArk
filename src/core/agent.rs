@@ -6828,6 +6828,12 @@ fn build_notify_user_action_arguments(
 const CALENDAR_AGENTARK_REMINDER_FIELD: &str = "agentark_reminder";
 const DEFAULT_CALENDAR_AGENTARK_REMINDER_MINUTES: i64 = 15;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalendarAgentArkReminderMode {
+    CreatedCalendarEvent,
+    CalendarWriteFallback,
+}
+
 fn calendar_agentark_reminder_enabled(arguments: &serde_json::Value) -> bool {
     let Some(value) = arguments.get(CALENDAR_AGENTARK_REMINDER_FIELD) else {
         return true;
@@ -6852,39 +6858,111 @@ fn calendar_agentark_reminder_minutes(arguments: &serde_json::Value) -> i64 {
         .clamp(1, 24 * 60)
 }
 
-fn calendar_create_default_push_reminder_call(
+fn calendar_write_failure_allows_agentark_reminder_fallback(
+    batch: &tool_execution::ToolExecutionBatch,
+    index: usize,
+) -> bool {
+    let outcome_text = batch
+        .outcomes
+        .get(index)
+        .map(|outcome| {
+            [
+                outcome.content.as_str(),
+                outcome.error.as_deref().unwrap_or_default(),
+            ]
+            .join(" ")
+        })
+        .unwrap_or_default();
+    let output_text = batch
+        .outputs
+        .get(index)
+        .map(|output| output.content.as_str())
+        .unwrap_or_default();
+    let combined = [outcome_text.as_str(), output_text].join(" ");
+    response_indicates_permission_requirement(&combined)
+        || response_indicates_credentials_requirement(&combined)
+        || response_indicates_integration_requirement(&combined)
+}
+
+fn calendar_create_agentark_reminder_calls(
     tool_calls: &[crate::core::llm::ToolCall],
     prior_tool_calls: &[crate::core::llm::ToolCall],
     batch: &tool_execution::ToolExecutionBatch,
-) -> Option<crate::core::llm::ToolCall> {
+) -> Vec<crate::core::llm::ToolCall> {
+    calendar_create_agentark_reminder_calls_with_mode(
+        tool_calls,
+        prior_tool_calls,
+        batch,
+        CalendarAgentArkReminderMode::CreatedCalendarEvent,
+    )
+}
+
+fn calendar_create_agentark_reminder_fallback_calls(
+    tool_calls: &[crate::core::llm::ToolCall],
+    prior_tool_calls: &[crate::core::llm::ToolCall],
+    batch: &tool_execution::ToolExecutionBatch,
+) -> Vec<crate::core::llm::ToolCall> {
+    calendar_create_agentark_reminder_calls_with_mode(
+        tool_calls,
+        prior_tool_calls,
+        batch,
+        CalendarAgentArkReminderMode::CalendarWriteFallback,
+    )
+}
+
+fn calendar_create_agentark_reminder_calls_with_mode(
+    tool_calls: &[crate::core::llm::ToolCall],
+    prior_tool_calls: &[crate::core::llm::ToolCall],
+    batch: &tool_execution::ToolExecutionBatch,
+    mode: CalendarAgentArkReminderMode,
+) -> Vec<crate::core::llm::ToolCall> {
     if prior_tool_calls
         .iter()
         .chain(tool_calls.iter())
         .any(|call| call.name.eq_ignore_ascii_case("schedule_task"))
     {
-        return None;
+        return Vec::new();
     }
 
+    let mut reminders = Vec::new();
     for (index, call) in tool_calls.iter().enumerate() {
-        if !call.name.eq_ignore_ascii_case("calendar_create")
-            || !tool_batch_output_succeeded(batch, index)
-        {
+        if !call.name.eq_ignore_ascii_case("calendar_create") {
+            continue;
+        }
+        let should_schedule = match mode {
+            CalendarAgentArkReminderMode::CreatedCalendarEvent => {
+                tool_batch_output_succeeded(batch, index)
+            }
+            CalendarAgentArkReminderMode::CalendarWriteFallback => {
+                tool_batch_output_failed(batch, index)
+                    && calendar_write_failure_allows_agentark_reminder_fallback(batch, index)
+            }
+        };
+        if !should_schedule {
             continue;
         }
         if !calendar_agentark_reminder_enabled(&call.arguments) {
-            return None;
+            continue;
         }
 
-        let start = call
+        let Some(start) = call
             .arguments
             .get("start")
             .and_then(|value| value.as_str())
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        else {
+            continue;
+        };
         let event_start = start.with_timezone(&chrono::Utc);
         let minutes_before = calendar_agentark_reminder_minutes(&call.arguments);
-        let reminder_at = event_start - chrono::Duration::minutes(minutes_before);
+        let reminder_at = match mode {
+            CalendarAgentArkReminderMode::CreatedCalendarEvent => {
+                event_start - chrono::Duration::minutes(minutes_before)
+            }
+            CalendarAgentArkReminderMode::CalendarWriteFallback => event_start,
+        };
         if reminder_at <= chrono::Utc::now() {
-            return None;
+            continue;
         }
 
         let summary = call
@@ -6894,21 +6972,32 @@ fn calendar_create_default_push_reminder_call(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("Calendar event");
-        let message = format!(
-            "{} starts in {} minute{}.",
-            summary,
-            minutes_before,
-            if minutes_before == 1 { "" } else { "s" }
-        );
-        return Some(crate::core::llm::ToolCall {
-            id: format!("calendar_reminder_{}", uuid::Uuid::new_v4()),
+        let (task, title, message) = match mode {
+            CalendarAgentArkReminderMode::CreatedCalendarEvent => (
+                format!("Reminder for calendar event: {}", summary),
+                "Upcoming meeting".to_string(),
+                format!(
+                    "{} starts in {} minute{}.",
+                    summary,
+                    minutes_before,
+                    if minutes_before == 1 { "" } else { "s" }
+                ),
+            ),
+            CalendarAgentArkReminderMode::CalendarWriteFallback => (
+                format!("Reminder for event: {}", summary),
+                "Event reminder".to_string(),
+                format!("{} is due now.", summary),
+            ),
+        };
+        reminders.push(crate::core::llm::ToolCall {
+            id: format!("calendar_agentark_reminder_{}", uuid::Uuid::new_v4()),
             name: "schedule_task".to_string(),
             arguments: serde_json::json!({
-                "task": format!("Reminder for calendar event: {}", summary),
+                "task": task,
                 "at": reminder_at.to_rfc3339(),
                 "action": "notify_user",
                 "action_arguments": {
-                    "title": "Upcoming meeting",
+                    "title": title,
                     "message": message,
                     "report_to": "push"
                 },
@@ -6922,7 +7011,7 @@ fn calendar_create_default_push_reminder_call(
         });
     }
 
-    None
+    reminders
 }
 
 fn build_current_time_action_arguments(
@@ -23115,6 +23204,67 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                 });
                 break;
             }
+            let calendar_fallback_reminder_calls =
+                calendar_create_agentark_reminder_fallback_calls(
+                    &tool_calls,
+                    &prior_executed_tool_calls,
+                    &tool_batch,
+                );
+            if !calendar_fallback_reminder_calls.is_empty() {
+                let reminder_count = calendar_fallback_reminder_calls.len();
+                {
+                    let mut trace = trace_ref.write().await;
+                    trace.steps.push(ExecutionStep {
+                        icon: "[bell]".to_string(),
+                        title: "Calendar Fallback Reminders".to_string(),
+                        detail: format!(
+                            "Calendar write was unavailable, so scheduled {} AgentArk reminder{} instead.",
+                            reminder_count,
+                            if reminder_count == 1 { "" } else { "s" }
+                        ),
+                        step_type: "info".to_string(),
+                        data: Some(serde_json::Value::Array(
+                            calendar_fallback_reminder_calls
+                                .iter()
+                                .map(|call| call.arguments.clone())
+                                .collect(),
+                        )
+                        .to_string()),
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: None,
+                    });
+                }
+                if let Some(tx) = token_tx.as_ref() {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::ToolProgress {
+                            name: "schedule_task".to_string(),
+                            content: format!(
+                                "Calendar write needs additional setup. Scheduling {} AgentArk reminder{} instead.",
+                                reminder_count,
+                                if reminder_count == 1 { "" } else { "s" }
+                            ),
+                            payload: Some(serde_json::json!({
+                                "kind": "calendar_write_fallback_reminders",
+                                "count": reminder_count,
+                            })),
+                        },
+                    );
+                }
+                llm_response = crate::core::llm::LlmResponse {
+                    content: format!(
+                        "Continue by scheduling {} AgentArk reminder{} because the calendar write requires additional setup.",
+                        reminder_count,
+                        if reminder_count == 1 { "" } else { "s" }
+                    ),
+                    tool_calls: calendar_fallback_reminder_calls,
+                    reasoning: None,
+                    usage: None,
+                    provider: llm_response.provider.clone(),
+                    model: llm_response.model.clone(),
+                };
+                continue;
+            }
             let deterministic_tool_blocker = tool_batch
                 .outputs
                 .iter()
@@ -23283,28 +23433,47 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                 }
             }
 
-            if let Some(reminder_call) = calendar_create_default_push_reminder_call(
+            let reminder_calls = calendar_create_agentark_reminder_calls(
                 &tool_calls,
                 &prior_executed_tool_calls,
                 &tool_batch,
-            ) {
-                let reminder_at = reminder_call
-                    .arguments
-                    .get("at")
+            );
+            if !reminder_calls.is_empty() {
+                let reminder_count = reminder_calls.len();
+                let reminder_at = reminder_calls
+                    .first()
+                    .and_then(|call| call.arguments.get("at"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("the reminder time")
                     .to_string();
+                let reminder_times = reminder_calls
+                    .iter()
+                    .filter_map(|call| call.arguments.get("at").and_then(|value| value.as_str()))
+                    .collect::<Vec<_>>();
+                let reminder_times_text = if reminder_times.is_empty() {
+                    reminder_at.clone()
+                } else {
+                    reminder_times.join(", ")
+                };
                 {
                     let mut trace = trace_ref.write().await;
                     trace.steps.push(ExecutionStep {
                         icon: "[bell]".to_string(),
                         title: "Default Meeting Reminder".to_string(),
                         detail: format!(
-                            "Scheduled the default AgentArk push reminder for {}.",
-                            reminder_at
+                            "Scheduled {} default AgentArk push reminder{} for {}.",
+                            reminder_count,
+                            if reminder_count == 1 { "" } else { "s" },
+                            reminder_times_text
                         ),
                         step_type: "info".to_string(),
-                        data: Some(reminder_call.arguments.to_string()),
+                        data: Some(serde_json::Value::Array(
+                            reminder_calls
+                                .iter()
+                                .map(|call| call.arguments.clone())
+                                .collect(),
+                        )
+                        .to_string()),
                         timestamp: chrono::Utc::now(),
                         duration_ms: None,
                     });
@@ -23314,21 +23483,31 @@ Do not ask for JSON. Do not claim deployment is unavailable unless `app_deploy` 
                         tx,
                         StreamEvent::ToolProgress {
                             name: "schedule_task".to_string(),
-                            content:
+                            content: if reminder_count == 1 {
                                 "Calendar event created. Scheduling the default push reminder."
-                                    .to_string(),
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "Calendar events created. Scheduling {} default push reminders.",
+                                    reminder_count
+                                )
+                            },
                             payload: Some(serde_json::json!({
                                 "kind": "calendar_default_reminder",
                                 "at": reminder_at,
+                                "count": reminder_count,
                             })),
                         },
                     );
                 }
                 llm_response = crate::core::llm::LlmResponse {
-                    content:
-                        "Continue by scheduling the default push reminder for the new calendar event."
-                            .to_string(),
-                    tool_calls: vec![reminder_call],
+                    content: format!(
+                        "Continue by scheduling {} default push reminder{} for the new calendar event{}.",
+                        reminder_count,
+                        if reminder_count == 1 { "" } else { "s" },
+                        if reminder_count == 1 { "" } else { "s" }
+                    ),
+                    tool_calls: reminder_calls,
                     reasoning: None,
                     usage: None,
                     provider: llm_response.provider.clone(),
@@ -38024,6 +38203,27 @@ mod tests {
         }
     }
 
+    fn failed_test_tool_batch(
+        name: &str,
+        content: &str,
+    ) -> crate::core::agent::tool_execution::ToolExecutionBatch {
+        crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![crate::core::agent::tool_execution::ToolCallOutput {
+                name: name.to_string(),
+                content: content.to_string(),
+            }],
+            outcomes: vec![crate::core::ToolOutcome {
+                name: name.to_string(),
+                content: content.to_string(),
+                status: crate::core::ToolOutcomeStatus::NeedsInput,
+                failure_class: Some("integration".to_string()),
+                retryable: false,
+                side_effect_level: "write".to_string(),
+                error: Some(content.to_string()),
+            }],
+        }
+    }
+
     #[test]
     fn calendar_create_synthesizes_structured_agentark_push_reminder() {
         let start = chrono::Utc::now() + chrono::Duration::hours(2);
@@ -38038,8 +38238,9 @@ mod tests {
         );
         let batch = successful_test_tool_batch("calendar_create", "Event created");
 
-        let reminder =
-            calendar_create_default_push_reminder_call(&[call], &[], &batch).expect("reminder");
+        let reminders = calendar_create_agentark_reminder_calls(&[call], &[], &batch);
+        assert_eq!(reminders.len(), 1);
+        let reminder = reminders.first().expect("reminder");
 
         assert_eq!(reminder.name, "schedule_task");
         assert_eq!(
@@ -38067,6 +38268,104 @@ mod tests {
     }
 
     #[test]
+    fn calendar_create_synthesizes_reminder_for_each_event() {
+        let start = chrono::Utc::now() + chrono::Duration::hours(2);
+        let calls = vec![
+            test_tool_call(
+                "calendar_create",
+                serde_json::json!({
+                    "summary": "Meeting with Steve",
+                    "start": start.to_rfc3339(),
+                    "end": (start + chrono::Duration::minutes(30)).to_rfc3339(),
+                }),
+            ),
+            test_tool_call(
+                "calendar_create",
+                serde_json::json!({
+                    "summary": "Meeting with Elon",
+                    "start": (start + chrono::Duration::hours(1)).to_rfc3339(),
+                    "end": (start + chrono::Duration::hours(1) + chrono::Duration::minutes(30)).to_rfc3339(),
+                }),
+            ),
+        ];
+        let batch = crate::core::agent::tool_execution::ToolExecutionBatch {
+            outputs: vec![
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "calendar_create".to_string(),
+                    content: "Event created".to_string(),
+                },
+                crate::core::agent::tool_execution::ToolCallOutput {
+                    name: "calendar_create".to_string(),
+                    content: "Event created".to_string(),
+                },
+            ],
+            outcomes: vec![
+                crate::core::ToolOutcome {
+                    name: "calendar_create".to_string(),
+                    content: "Event created".to_string(),
+                    status: crate::core::ToolOutcomeStatus::Success,
+                    failure_class: None,
+                    retryable: false,
+                    side_effect_level: "write".to_string(),
+                    error: None,
+                },
+                crate::core::ToolOutcome {
+                    name: "calendar_create".to_string(),
+                    content: "Event created".to_string(),
+                    status: crate::core::ToolOutcomeStatus::Success,
+                    failure_class: None,
+                    retryable: false,
+                    side_effect_level: "write".to_string(),
+                    error: None,
+                },
+            ],
+        };
+
+        let reminders = calendar_create_agentark_reminder_calls(&calls, &[], &batch);
+
+        assert_eq!(reminders.len(), 2);
+        assert!(reminders.iter().all(|call| call.name == "schedule_task"));
+    }
+
+    #[test]
+    fn calendar_create_falls_back_to_agentark_reminder_when_workspace_needs_access() {
+        let start = chrono::Utc::now() + chrono::Duration::hours(2);
+        let call = test_tool_call(
+            "calendar_create",
+            serde_json::json!({
+                "summary": "Meeting with Steve",
+                "start": start.to_rfc3339(),
+                "end": (start + chrono::Duration::minutes(30)).to_rfc3339(),
+            }),
+        );
+        let batch = failed_test_tool_batch(
+            "calendar_create",
+            "Google Workspace needs additional access for Calendar. Reconnect the integration to grant those bundles.",
+        );
+
+        let reminders = calendar_create_agentark_reminder_fallback_calls(&[call], &[], &batch);
+
+        assert_eq!(reminders.len(), 1);
+        let reminder = reminders.first().expect("reminder");
+        assert_eq!(reminder.name, "schedule_task");
+        assert_eq!(
+            reminder
+                .arguments
+                .get("action")
+                .and_then(|value| value.as_str()),
+            Some("notify_user")
+        );
+        let at = reminder
+            .arguments
+            .get("at")
+            .and_then(|value| value.as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .expect("valid reminder time")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(at, start);
+    }
+
+    #[test]
     fn calendar_create_respects_structured_agentark_reminder_opt_out() {
         let start = chrono::Utc::now() + chrono::Duration::hours(2);
         let call = test_tool_call(
@@ -38080,7 +38379,7 @@ mod tests {
         );
         let batch = successful_test_tool_batch("calendar_create", "Event created");
 
-        assert!(calendar_create_default_push_reminder_call(&[call], &[], &batch).is_none());
+        assert!(calendar_create_agentark_reminder_calls(&[call], &[], &batch).is_empty());
     }
 
     #[test]

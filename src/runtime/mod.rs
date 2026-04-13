@@ -3449,7 +3449,7 @@ print(json.dumps({
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
-            description: "Schedule or update a recurring/one-time task. Use `task_id` when the user is changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use 'cron' for recurring minute-or-lower-frequency schedules (e.g., daily at 9am = '0 9 * * *') or 'at' for one-time (ISO timestamp). For monitoring intervals below 60 seconds, use `watch` with `interval_secs` instead.".to_string(),
+            description: "Schedule or update a recurring/one-time AgentArk task. Use this for date/time reminders and notifications that do not require writing to an external calendar. Use `task_id` when the user is changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use 'cron' for recurring minute-or-lower-frequency schedules (e.g., daily at 9am = '0 9 * * *') or 'at' for one-time (ISO timestamp). For monitoring intervals below 60 seconds, use `watch` with `interval_secs` instead.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4827,7 +4827,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "calendar_create".to_string(),
-            description: "Create a new calendar event. Use when asked to schedule a meeting, set up a meeting, add an event, book an appointment, or block time. AgentArk schedules its own default push reminder separately unless the user says not to remind them.".to_string(),
+            description: "Create a new Google Calendar event. Use only when the user wants an external calendar entry, meeting invite, appointment, or blocked time. For plain reminders or date notifications, use `schedule_task` with `notify_user` instead. AgentArk schedules its own default push reminder separately unless the user says not to remind them.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",

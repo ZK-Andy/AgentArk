@@ -266,6 +266,7 @@ Rules:
 - Prefer actions that directly inspect, operate on, modify, or validate the user's target.
 - If the user asks to build/create/deploy/run a live or public app/service and `app_deploy` is available, include `app_deploy` and prefer it over `shell`. For fresh generated app builds, also include `file_write` so the agent stages files under `/app/data/apps/new/<slug>/...` before the final deploy.
 - If that request also asks for recurring or scheduled execution and `schedule_task` is available, include `schedule_task` too.
+- If the user asks for a date/time reminder or notification and does not clearly require an external calendar write, include `schedule_task` and prefer it over workspace calendar mutation.
 - If the request refers to an existing artifact, file, deployment, or running system, prefer operational actions over topical/domain workflows that merely share keywords.
 - When recent artifact context is provided, treat it as the default target for short follow-up change requests unless the user clearly switches topics or asks to build a different artifact.
 - For fix/debug/repair requests about an existing deployed app, do not include `app_deploy` unless the user explicitly asks to rebuild, replace, or redeploy that app from scratch.
