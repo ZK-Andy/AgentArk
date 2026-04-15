@@ -159,7 +159,7 @@ impl SetupWizard {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new("[+] Cognitive Memory").strong());
-                            ui.small("Episodic, semantic & procedural");
+                            ui.small("Learned facts, preferences & knowledge");
                         });
                         ui.add_space(20.0);
                         ui.vertical(|ui| {
@@ -856,6 +856,7 @@ impl SetupWizard {
             firecrawl: None,
             searxng: None,
             playwright: None, // Auto-detected at runtime via bridge health check
+            lightpanda_available: true,
             primary: None,
             fallback1: None,
             fallback2: None,

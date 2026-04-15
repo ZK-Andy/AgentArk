@@ -39,6 +39,14 @@ pub struct DataLifecycleSettings {
     pub llm_usage_retention_days: u64,
     #[serde(default = "default_terminal_task_retention_days")]
     pub terminal_task_retention_days: u64,
+    #[serde(default = "default_execution_run_retention_days")]
+    pub execution_run_retention_days: u64,
+    #[serde(default = "default_background_session_retention_days")]
+    pub background_session_retention_days: u64,
+    #[serde(default = "default_browser_session_retention_days")]
+    pub browser_session_retention_days: u64,
+    #[serde(default = "default_automation_run_retention_days")]
+    pub automation_run_retention_days: u64,
     #[serde(default = "default_message_retention_days")]
     pub message_retention_days: u64,
     #[serde(default = "default_experience_run_retention_days")]
@@ -103,6 +111,22 @@ fn default_terminal_task_retention_days() -> u64 {
     90
 }
 
+fn default_execution_run_retention_days() -> u64 {
+    90
+}
+
+fn default_background_session_retention_days() -> u64 {
+    90
+}
+
+fn default_browser_session_retention_days() -> u64 {
+    30
+}
+
+fn default_automation_run_retention_days() -> u64 {
+    90
+}
+
 fn default_message_retention_days() -> u64 {
     365
 }
@@ -155,6 +179,10 @@ impl Default for DataLifecycleSettings {
             swarm_delegation_retention_days: default_swarm_delegation_retention_days(),
             llm_usage_retention_days: default_llm_usage_retention_days(),
             terminal_task_retention_days: default_terminal_task_retention_days(),
+            execution_run_retention_days: default_execution_run_retention_days(),
+            background_session_retention_days: default_background_session_retention_days(),
+            browser_session_retention_days: default_browser_session_retention_days(),
+            automation_run_retention_days: default_automation_run_retention_days(),
             message_retention_days: default_message_retention_days(),
             experience_run_retention_days: default_experience_run_retention_days(),
             experience_edge_retention_days: default_experience_edge_retention_days(),
@@ -185,6 +213,15 @@ impl DataLifecycleSettings {
         self.llm_usage_retention_days = self.llm_usage_retention_days.min(MAX_RETENTION_DAYS);
         self.terminal_task_retention_days =
             self.terminal_task_retention_days.min(MAX_RETENTION_DAYS);
+        self.execution_run_retention_days =
+            self.execution_run_retention_days.min(MAX_RETENTION_DAYS);
+        self.background_session_retention_days = self
+            .background_session_retention_days
+            .min(MAX_RETENTION_DAYS);
+        self.browser_session_retention_days =
+            self.browser_session_retention_days.min(MAX_RETENTION_DAYS);
+        self.automation_run_retention_days =
+            self.automation_run_retention_days.min(MAX_RETENTION_DAYS);
         self.message_retention_days = self.message_retention_days.min(MAX_RETENTION_DAYS);
         self.experience_run_retention_days =
             self.experience_run_retention_days.min(MAX_RETENTION_DAYS);

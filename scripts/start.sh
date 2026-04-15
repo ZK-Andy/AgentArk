@@ -26,17 +26,60 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# Create .env from example if it doesn't exist
-if [ ! -f .env ]; then
-    if [ -f .env.example ]; then
+ensure_postgres_password() {
+    if [ ! -f .env ] && [ -f .env.example ]; then
         cp .env.example .env
     fi
-fi
+
+    if [ -f .env ] && grep -Eq '^AGENTARK_POSTGRES_PASSWORD=.+$' .env; then
+        return 0
+    fi
+
+    local generated=""
+    if command -v openssl >/dev/null 2>&1; then
+        generated="$(openssl rand -hex 24 2>/dev/null || true)"
+    fi
+    if [ -z "$generated" ] && [ -r /dev/urandom ]; then
+        generated="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+    fi
+    if [ -z "$generated" ]; then
+        echo -e "${RED}Failed to generate a local Postgres password.${NC}"
+        return 1
+    fi
+
+    if [ -f .env ] && grep -q '^AGENTARK_POSTGRES_PASSWORD=' .env; then
+        sed -i.bak "s/^AGENTARK_POSTGRES_PASSWORD=.*/AGENTARK_POSTGRES_PASSWORD=$generated/" .env
+        rm -f .env.bak
+    else
+        printf '\nAGENTARK_POSTGRES_PASSWORD=%s\n' "$generated" >> .env
+    fi
+
+    echo -e "${GREEN}Generated a local Postgres password and saved it to .env${NC}"
+}
+
+verify_lightpanda_runtime() {
+    local attempts=20
+
+    echo -e "${CYAN}Verifying bundled Lightpanda runtime...${NC}"
+    while [ "$attempts" -gt 0 ]; do
+        if docker compose exec -T agentark-control sh -lc 'command -v lightpanda >/dev/null 2>&1' >/dev/null 2>&1; then
+            echo -e "${GREEN}Lightpanda is available inside the AgentArk runtime.${NC}"
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+
+    echo -e "${RED}Lightpanda is missing from the bundled AgentArk runtime. Update or rebuild before relying on the free search fallback.${NC}"
+    return 1
+}
 
 case "${1:-start}" in
     start)
+        ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk...${NC}"
         docker compose up -d
+        verify_lightpanda_runtime
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
@@ -82,8 +125,10 @@ case "${1:-start}" in
             echo ""
         fi
 
+        ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
         AGENTARK_TUNNEL=true docker compose up -d
+        verify_lightpanda_runtime
         echo ""
         echo -e "${GREEN}AgentArk is starting with secure tunnel!${NC}"
         echo ""
@@ -115,19 +160,24 @@ case "${1:-start}" in
     restart)
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
         docker compose restart
+        verify_lightpanda_runtime
         ;;
     logs)
         docker compose logs -f
         ;;
     update)
+        ensure_postgres_password || exit 1
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
         docker compose pull
         docker compose up -d
+        verify_lightpanda_runtime
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     build)
+        ensure_postgres_password || exit 1
         echo -e "${YELLOW}Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...${NC}"
         AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+        verify_lightpanda_runtime
         echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
     backup)

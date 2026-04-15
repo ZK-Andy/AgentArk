@@ -327,7 +327,7 @@ export function WorkspaceHub({
                   <Chip size="small" label={`${traces.length} traces`} />
                     <Chip size="small" color={unreadCount > 0 ? "warning" : "default"} label={`${unreadCount} alerts`} />
                 </Stack>
-                <Divider sx={{ borderColor: "rgba(108, 156, 212, 0.12)" }} />
+                <Divider sx={{ borderColor: "var(--surface-border)" }} />
                 <Stack spacing={0.65}>
                   <Typography variant="caption" sx={{
                     color: "text.secondary"
@@ -414,8 +414,8 @@ export function WorkspaceHub({
             sx: {
               width: { xs: "100%", md: 640 },
               maxWidth: "100vw",
-              borderLeft: "1px solid rgba(108, 156, 212, 0.18)",
-              background: "linear-gradient(160deg, rgba(9, 21, 39, 0.97), rgba(7, 16, 30, 0.9))",
+              borderLeft: "1px solid var(--surface-border)",
+              background: "var(--surface-bg-elevated)",
             },
           }
         }}
@@ -429,7 +429,7 @@ export function WorkspaceHub({
               justifyContent: "space-between",
               px: 1.5,
               py: 1.2,
-              borderBottom: "1px solid rgba(108, 156, 212, 0.14)"
+              borderBottom: "1px solid var(--surface-border)"
             }}>
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="subtitle1" sx={{ fontWeight: 650 }} noWrap>

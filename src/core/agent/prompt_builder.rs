@@ -56,7 +56,7 @@ impl Agent {
     /// Build the generic system prompt. Request-specific action metadata is appended later.
     pub(crate) async fn build_system_prompt(
         &self,
-        memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         prompt_bundle: Option<&crate::core::self_evolve::PromptBundleProfile>,
     ) -> Result<String> {
         let bot_name = crate::branding::PRODUCT_NAME;
@@ -111,7 +111,7 @@ impl Agent {
 - Never hardcode secrets into generated code or tool arguments. Use secret storage or sensitive runtime inputs.
 - Keep retries bounded. State or enforce a maximum attempt count and stop at the cap.
 - Be honest about uncertainty. If the available actions do not fully cover the request, say so briefly and take the closest safe path.
-- A small set of high-confidence memories or document excerpts may already be included later in this prompt, along with lightweight saved user facts. Richer semantic memory, saved items, durable knowledge, and the full document library are not fully prefetched; if prior context or uploaded files outside the visible prompt may affect the answer, use the relevant memory or document action from the catalog before answering.
+- Saved user facts and document excerpts may already be included later in this prompt. Richer durable memory, saved items, durable knowledge, and the full document library are not fully prefetched; if prior context or uploaded files outside the visible prompt may affect the answer, use the relevant memory or document action from the catalog before answering.
 - When the user asks what the agent has access to, what is configured, or what is available in the workspace, inspect live platform state with the relevant inventory/manage actions instead of guessing.
 - When the user asks about AgentArk internal pages or system surfaces such as ArkPulse, Sentinel, Evolution, Moltbook, Trace, or operator health, inspect the live internal state with `agentark_inspect` instead of answering from generic product-help prose.
 - When a DB-backed internal question needs more detail, use `postgres_schema_inspect` first and then `postgres_query_readonly` with structured arguments. Do not invent table or column names, and do not use raw SQL.
@@ -196,13 +196,6 @@ impl Agent {
             prompt.push_str(
                 "- Other actions can still require approval based on the current safety and permission checks.\n",
             );
-        }
-
-        if !memories.is_empty() {
-            prompt.push_str("\n## Relevant Memories\n");
-            for mem in memories {
-                prompt.push_str(&format!("- {}\n", safe_truncate(&mem.content, 200)));
-            }
         }
 
         {

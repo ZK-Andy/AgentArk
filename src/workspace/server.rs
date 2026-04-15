@@ -131,7 +131,7 @@ fn authorize_internal(
     token: Option<&str>,
 ) -> Result<(), StatusCode> {
     let Some(expected) = token.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let provided = headers
         .get(header::AUTHORIZATION)

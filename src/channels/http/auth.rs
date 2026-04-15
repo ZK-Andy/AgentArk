@@ -309,6 +309,19 @@ fn valid_ui_session_request_context(
     request_has_ui_referer(headers)
 }
 
+pub(super) async fn is_verified_ui_session_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    deployment_mode: crate::core::config::DeploymentMode,
+) -> bool {
+    if !valid_ui_session_request_context(headers, addr, deployment_mode) {
+        return false;
+    }
+
+    has_valid_ui_session_cookie(state, headers).await
+}
+
 fn is_container_host_gateway_ip(ip: IpAddr) -> bool {
     static CONTAINER_GATEWAY_IP: OnceLock<Option<IpAddr>> = OnceLock::new();
     *CONTAINER_GATEWAY_IP.get_or_init(detect_container_default_gateway_ip) == Some(ip)
@@ -494,8 +507,13 @@ pub(super) async fn auth_middleware(
     // If API key is missing, fail closed.
     let Some(expected_key) = expected_key else {
         if state.deployment_mode == crate::core::config::DeploymentMode::TrustedLocal
-            && valid_ui_session_request_context(request.headers(), addr, state.deployment_mode)
-            && has_valid_ui_session_cookie(&state, request.headers()).await
+            && is_verified_ui_session_request(
+                &state,
+                request.headers(),
+                addr,
+                state.deployment_mode,
+            )
+            .await
         {
             request
                 .extensions_mut()
@@ -556,8 +574,7 @@ pub(super) async fn auth_middleware(
             .into_response();
     }
 
-    if has_valid_ui_session_cookie(&state, request.headers()).await
-        && valid_ui_session_request_context(request.headers(), addr, state.deployment_mode)
+    if is_verified_ui_session_request(&state, request.headers(), addr, state.deployment_mode).await
     {
         request
             .extensions_mut()

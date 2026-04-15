@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::actions::ActionDef;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct RankedCapabilityAction {
     pub action: ActionDef,
@@ -9,16 +10,82 @@ pub struct RankedCapabilityAction {
     pub second_score: f32,
 }
 
-fn tokenize(value: &str) -> HashSet<String> {
+fn normalized_text(value: &str) -> String {
     value
         .to_ascii_lowercase()
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
-        .collect::<String>()
+        .collect()
+}
+
+fn tokenize(value: &str) -> HashSet<String> {
+    normalized_text(value)
         .split_whitespace()
         .filter(|token| token.len() >= 2)
         .map(ToString::to_string)
         .collect()
+}
+
+fn char_ngrams(value: &str, width: usize) -> HashSet<String> {
+    let compact = normalized_text(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return HashSet::new();
+    }
+    let chars = compact.chars().collect::<Vec<_>>();
+    if chars.len() <= width {
+        return [compact].into_iter().collect();
+    }
+    (0..=chars.len().saturating_sub(width))
+        .map(|index| chars[index..index + width].iter().collect::<String>())
+        .collect()
+}
+
+fn jaccard_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let overlap = left.intersection(right).count() as f32;
+    let union = left.union(right).count() as f32;
+    if union <= 0.0 {
+        0.0
+    } else {
+        overlap / union
+    }
+}
+
+fn token_similarity(left: &str, right: &str) -> f32 {
+    if left == right {
+        return 1.0;
+    }
+    let min_len = left.len().min(right.len()) as f32;
+    let max_len = left.len().max(right.len()) as f32;
+    if max_len <= 0.0 {
+        return 0.0;
+    }
+    if left.starts_with(right) || right.starts_with(left) {
+        return (0.75 + (min_len / max_len) * 0.25).clamp(0.0, 1.0);
+    }
+    let left_ngrams = char_ngrams(left, 3);
+    let right_ngrams = char_ngrams(right, 3);
+    jaccard_similarity(&left_ngrams, &right_ngrams)
+}
+
+fn soft_token_overlap(left: &HashSet<String>, right: &HashSet<String>) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    left.iter()
+        .map(|left_token| {
+            right
+                .iter()
+                .map(|right_token| token_similarity(left_token, right_token))
+                .fold(0.0f32, f32::max)
+        })
+        .sum::<f32>()
+        / left.len() as f32
 }
 
 fn schema_tokens(value: &serde_json::Value, out: &mut HashSet<String>) {
@@ -46,13 +113,19 @@ fn planner_metadata_tokens(action: &ActionDef) -> HashSet<String> {
     tokenize(&serde_json::to_string(&metadata).unwrap_or_else(|_| format!("{:?}", metadata)))
 }
 
-fn action_tokens(action: &ActionDef) -> HashSet<String> {
-    let mut tokens = tokenize(&format!(
-        "{} {} {}",
+fn action_descriptor_text(action: &ActionDef) -> String {
+    format!(
+        "{} {} {} {} {}",
         action.name,
         action.description,
-        action.capabilities.join(" ")
-    ));
+        action.capabilities.join(" "),
+        serde_json::to_string(&action.input_schema).unwrap_or_default(),
+        serde_json::to_string(&action.planner_metadata()).unwrap_or_default(),
+    )
+}
+
+fn action_tokens(action: &ActionDef) -> HashSet<String> {
+    let mut tokens = tokenize(&action_descriptor_text(action));
     schema_tokens(&action.input_schema, &mut tokens);
     tokens.extend(planner_metadata_tokens(action));
     tokens
@@ -76,17 +149,34 @@ pub fn score_action_intent_with_reasons(message: &str, action: &ActionDef) -> (f
     } else {
         overlap_count / action_tokens.len() as f32
     };
+    let fuzzy_request_coverage = soft_token_overlap(&request_tokens, &action_tokens);
+    let fuzzy_action_coverage = soft_token_overlap(&action_tokens, &request_tokens);
+    let request_ngrams = char_ngrams(message, 3);
+    let action_ngrams = char_ngrams(&action_descriptor_text(action), 3);
+    let trigram_similarity = jaccard_similarity(&request_ngrams, &action_ngrams);
 
     let mut reasons = Vec::new();
     if overlap_count > 0.0 {
         reasons.push(format!("catalog metadata overlap {:.0}", overlap_count));
     }
+    if fuzzy_request_coverage >= 0.18 || fuzzy_action_coverage >= 0.18 {
+        reasons.push(format!(
+            "fuzzy intent overlap {:.2}",
+            ((fuzzy_request_coverage + fuzzy_action_coverage) / 2.0)
+        ));
+    }
+    if trigram_similarity >= 0.12 {
+        reasons.push(format!("phrase similarity {:.2}", trigram_similarity));
+    }
 
-    let score = (request_coverage + action_coverage) / 2.0;
+    let exact_score = (request_coverage + action_coverage) / 2.0;
+    let fuzzy_score = (fuzzy_request_coverage + fuzzy_action_coverage) / 2.0;
+    let score = exact_score * 0.4 + fuzzy_score * 0.4 + trigram_similarity * 0.2;
 
     (score.clamp(0.0, 1.0), reasons)
 }
 
+#[cfg(test)]
 pub fn ranked_action_candidates(
     message: &str,
     all_actions: &[ActionDef],
@@ -167,5 +257,29 @@ mod tests {
             ranked_action_candidates("Please handle alpha beta gamma", &actions, &HashSet::new());
 
         assert_eq!(ranked[0].action.name, "custom_action_alpha");
+    }
+
+    #[test]
+    fn scorer_handles_typos_and_paraphrase_without_exact_token_overlap() {
+        let actions = vec![
+            action(
+                "watch",
+                "Monitor a source repeatedly and alert on changes",
+                &["watcher"],
+            ),
+            action(
+                "app_deploy",
+                "Build, deploy, and expose an application",
+                &["app_hosting"],
+            ),
+        ];
+
+        let ranked = ranked_action_candidates(
+            "montior this every 10 sec and tell me when something changes",
+            &actions,
+            &HashSet::new(),
+        );
+
+        assert_eq!(ranked[0].action.name, "watch");
     }
 }

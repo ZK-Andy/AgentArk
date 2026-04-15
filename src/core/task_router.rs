@@ -24,7 +24,7 @@ use super::swarm::{AgentAccessScope, SwarmActivityAgent, SwarmActivityTracker};
 use super::{DegradationNote, DelegationStatus, FailureKind, StreamEvent};
 use crate::actions::ActionDef;
 use crate::core::queue_stream_event;
-use crate::memory::MemoryEntry;
+use crate::core::PromptMemory;
 
 fn compact_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
@@ -348,12 +348,8 @@ impl DelegatedTaskPacket {
     }
 }
 
-fn summarize_memory_type(memory: &MemoryEntry) -> &'static str {
-    match &memory.memory_type {
-        crate::memory::MemoryType::Episodic { .. } => "episodic",
-        crate::memory::MemoryType::Semantic { .. } => "semantic",
-        crate::memory::MemoryType::Procedural { .. } => "procedural",
-    }
+fn summarize_memory_type(memory: &PromptMemory) -> &str {
+    memory.memory_type.as_str()
 }
 
 fn delegation_row_id(delegation_id: &str, agent_id: &str) -> String {
@@ -932,7 +928,7 @@ pub struct TaskRouterExecuteContext<'a> {
     pub model_pool: &'a HashMap<String, (ModelSlot, LlmClient)>,
     pub primary_llm: &'a LlmClient,
     pub specialists: &'a Option<SpecialistRegistry>,
-    pub memories: &'a [MemoryEntry],
+    pub memories: &'a [PromptMemory],
     pub actions: &'a [ActionDef],
     pub action_scope_hints: &'a HashMap<String, crate::runtime::ActionScopeHint>,
     pub trace: &'a Arc<RwLock<super::agent::ExecutionTrace>>,
@@ -1603,9 +1599,9 @@ impl TaskRouter {
     }
 
     /// Keep delegated memory context compact and task-relevant.
-    fn select_memories_for_task(&self, task: &str, memories: &[MemoryEntry]) -> Vec<MemoryEntry> {
+    fn select_memories_for_task(&self, task: &str, memories: &[PromptMemory]) -> Vec<PromptMemory> {
         let task_lower = task.to_ascii_lowercase();
-        let mut scored: Vec<(f32, MemoryEntry)> = memories
+        let mut scored: Vec<(f32, PromptMemory)> = memories
             .iter()
             .map(|memory| {
                 let content_lower = memory.content.to_ascii_lowercase();
@@ -1642,7 +1638,7 @@ impl TaskRouter {
             .collect()
     }
 
-    fn summarize_memory_scope(&self, memories: &[MemoryEntry]) -> Vec<DelegatedMemoryPacket> {
+    fn summarize_memory_scope(&self, memories: &[PromptMemory]) -> Vec<DelegatedMemoryPacket> {
         memories
             .iter()
             .take(4)
@@ -1700,7 +1696,7 @@ impl TaskRouter {
         coordinator_notes: &str,
         assignment: &AgentAssignment,
         dependency_scope: Vec<DelegatedDependencyPacket>,
-        memory_scope: &[MemoryEntry],
+        memory_scope: &[PromptMemory],
         action_scope: &[ActionDef],
     ) -> DelegatedTaskPacket {
         DelegatedTaskPacket {
@@ -1883,7 +1879,7 @@ impl TaskRouter {
         original_request: &str,
         coordinator_notes: &str,
         specialist_prompt_bundle: &crate::core::self_evolve::SpecialistPromptBundleProfile,
-        memories: &[MemoryEntry],
+        memories: &[PromptMemory],
         actions: &[ActionDef],
         action_scope_hints: &HashMap<String, crate::runtime::ActionScopeHint>,
         trace: &Arc<RwLock<super::agent::ExecutionTrace>>,
@@ -2149,7 +2145,7 @@ impl TaskRouter {
                 let dependency_scope =
                     self.build_dependency_scope(assignment, assignments, &results);
                 let packet_dependency_count = dependency_scope.len();
-                let mems: Vec<MemoryEntry> = self.select_memories_for_task(&task, memories);
+                let mems: Vec<PromptMemory> = self.select_memories_for_task(&task, memories);
                 let acts: Vec<ActionDef> = match &assignment.kind {
                     AssignmentKind::Specialist(specialist) => self.select_actions_for_specialist(
                         &task,
@@ -2743,7 +2739,7 @@ impl TaskRouter {
         _base_system_prompt: &str,
         prompt_bundle: &crate::core::self_evolve::PromptBundleProfile,
         results: &[AgentExecResult],
-        memories: &[MemoryEntry],
+        memories: &[PromptMemory],
         actions: &[ActionDef],
     ) -> Result<super::llm::LlmResponse> {
         let mut results_text: String = results
@@ -2856,9 +2852,7 @@ impl TaskRouter {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryType;
     use chrono::Utc;
-    use uuid::Uuid;
 
     fn degraded_result(status: DelegationStatus) -> AgentExecResult {
         let failure_kind = match status {
@@ -3023,34 +3017,22 @@ mod tests {
     fn select_memories_for_task_prefers_overlap_with_task_text() {
         let router = TaskRouter::new(TaskRouterConfig::default());
         let memories = vec![
-            MemoryEntry {
-                id: Uuid::new_v4(),
+            PromptMemory {
                 content: "Unrelated brainstorming note about vacation photos.".to_string(),
-                memory_type: MemoryType::Semantic {
-                    confidence: 0.9,
-                    sources: vec![],
-                },
+                memory_type: "learned_fact".to_string(),
                 timestamp: Utc::now(),
                 relevance_score: 0.85,
                 importance: 0.9,
-                recency_score: 0.8,
                 final_score: 0.88,
-                access_count: 1,
             },
-            MemoryEntry {
-                id: Uuid::new_v4(),
+            PromptMemory {
                 content: "The pgvector retrieval path uses similarity search in Postgres."
                     .to_string(),
-                memory_type: MemoryType::Semantic {
-                    confidence: 0.9,
-                    sources: vec![],
-                },
+                memory_type: "knowledge".to_string(),
                 timestamp: Utc::now(),
                 relevance_score: 0.60,
                 importance: 0.6,
-                recency_score: 0.5,
                 final_score: 0.62,
-                access_count: 1,
             },
         ];
 

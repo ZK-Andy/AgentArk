@@ -431,7 +431,7 @@ fn queue_stream_event(token_tx: &Sender<StreamEvent>, event: StreamEvent) {
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
             let fallback_tx = token_tx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/core/llm.rs:434", async move {
                 let _ = fallback_tx.send(event).await;
             });
         }
@@ -1747,7 +1747,7 @@ impl LlmClient {
         &self,
         system_prompt: &str,
         user_message: &str,
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
     ) -> Result<LlmResponse> {
         self.chat_with_history_for_helper(
@@ -1784,7 +1784,7 @@ impl LlmClient {
         &self,
         system_prompt: &str,
         user_message: &str,
-        memories: &[crate::memory::MemoryEntry],
+        memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
@@ -1807,7 +1807,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
     ) -> Result<LlmResponse> {
         self.chat_with_history_for_helper(
@@ -1827,7 +1827,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
@@ -1850,7 +1850,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
@@ -1874,7 +1874,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         policy: &crate::security::ModelPrivacyConfig,
         allow_sensitive_context: bool,
@@ -2638,7 +2638,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
     ) -> Result<LlmResponse> {
@@ -2661,7 +2661,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
         policy: &crate::security::ModelPrivacyConfig,
@@ -2686,7 +2686,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
         policy: &crate::security::ModelPrivacyConfig,
@@ -2712,7 +2712,7 @@ impl LlmClient {
         system_prompt: &str,
         user_message: &str,
         history: &[ConversationMessage],
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         actions: &[crate::actions::ActionDef],
         token_tx: Sender<StreamEvent>,
         policy: &crate::security::ModelPrivacyConfig,

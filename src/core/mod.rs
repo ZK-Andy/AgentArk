@@ -33,13 +33,16 @@ pub mod orchestra;
 pub mod pipeline;
 pub mod planner;
 pub mod product_help;
+pub mod prompt_memory;
 pub mod prompt_policy;
 pub mod request_shape;
 pub mod runtime_image;
+pub mod release_updates;
 pub mod secrets;
 pub mod self_evolve;
 pub mod self_tune;
 pub mod sender_verification;
+pub mod spawn;
 pub mod swarm;
 mod task;
 pub mod task_router;
@@ -112,5 +115,6 @@ pub use nodes::{
     NodeUpsertRequest, PairedNode,
 };
 pub use planner::{ExecutionPlan, PlanPromptMode, PlanStep, PlanStepStatus, PlanSubstep};
+pub use prompt_memory::PromptMemory;
 pub use request_shape::RequestShapeAssessment;
 pub use task::{status_for_task_approval, Task, TaskApproval, TaskQueue, TaskStatus};

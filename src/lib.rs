@@ -2,7 +2,7 @@
 //!
 //! Features:
 //! - Daily briefs, reminders, and channel delivery
-//! - Cognitive memory (episodic/semantic/procedural)
+//! - Durable memory for learned facts, preferences, user data, and knowledge
 //! - Secure secrets, approvals, and cryptographic execution proofs
 //! - Sandboxed action execution (WASM + Docker)
 //! - Optional power features like tasks, apps, and sub-agents
@@ -24,7 +24,6 @@ mod hooks;
 mod identity;
 mod integrations;
 mod mcp;
-mod memory;
 mod metrics;
 mod plugins;
 mod proofs;
@@ -1632,7 +1631,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     let http_handle = {
         let agent = agent.clone();
         let shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/lib.rs:1634", async move {
             if let Err(e) = channels::http::serve(agent, shutdown).await {
                 tracing::error!("HTTP server error: {}", e);
             }
@@ -1643,7 +1642,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     let matrix_handle = {
         let agent = agent.clone();
         let shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/lib.rs:1645", async move {
             if let Err(e) = channels::matrix::serve(agent, shutdown).await {
                 tracing::error!("Matrix runtime error: {}", e);
             }
@@ -1653,7 +1652,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     // Start Discord gateway runtime if configured
     let discord_handle = {
         let agent = agent.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/lib.rs:1655", async move {
             if let Err(e) = channels::discord::run_gateway(agent).await {
                 tracing::error!("Discord runtime error: {}", e);
             }
@@ -1664,7 +1663,7 @@ async fn run_headless(agent: core::Agent) -> Result<()> {
     #[cfg(feature = "telegram")]
     let telegram_handle = {
         let agent = agent.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/lib.rs:1666", async move {
             if let Err(e) = channels::telegram::serve(agent).await {
                 tracing::error!("Telegram bot error: {}", e);
             }

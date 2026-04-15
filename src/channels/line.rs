@@ -96,14 +96,7 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    crate::security::constant_time_eq(left, right)
 }
 
 fn hmac_sha256_base64(secret: &str, body: &[u8]) -> String {
@@ -201,15 +194,19 @@ async fn send_message_to_destination(
         "{}/v2/bot/message/push",
         trim_trailing_slashes(&config.api_base_url)
     );
-    let response = http_client()?
-        .post(&url)
-        .bearer_auth(&config.channel_access_token)
-        .json(&json!({
-            "to": destination.target,
-            "messages": [{ "type": "text", "text": text }],
-        }))
-        .send()
-        .await?;
+    let client = http_client()?;
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "line",
+        "push_message",
+        client
+            .post(&url)
+            .bearer_auth(&config.channel_access_token)
+            .json(&json!({
+                "to": destination.target,
+                "messages": [{ "type": "text", "text": text }],
+            })),
+    )
+    .await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

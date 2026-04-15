@@ -212,6 +212,10 @@ pub enum ModelHealthScope {
     Session,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// A single model slot in the pool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSlot {
@@ -1188,9 +1192,7 @@ impl SecureConfigManager {
     }
 
     fn default_runtime_agent_config() -> AgentConfig {
-        let mut config = AgentConfig::default();
-        config.memory.retention_enabled = true;
-        config
+        AgentConfig::default()
     }
 
     fn recovery_dir(config_dir: &Path) -> PathBuf {
@@ -2803,9 +2805,9 @@ impl SecureConfigManager {
     }
 
     fn generate_http_api_key() -> String {
-        use rand::RngCore;
+        use rand::Rng;
         let mut key_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+        rand::rng().fill(&mut key_bytes);
         base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_bytes)
     }
 
@@ -2947,10 +2949,6 @@ fn default_docker_image() -> String {
     runtime_image::default_runtime_image()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
@@ -2964,90 +2962,14 @@ impl Default for SandboxConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    #[serde(default = "default_max_episodes")]
-    pub max_episodes: usize,
     #[serde(default)]
     pub embedding_model: String,
-    /// Optional retention pruning for episodic episodes.
-    /// Fresh installs enable it conservatively; configs without this field deserialize as false.
-    #[serde(default = "default_false")]
-    pub retention_enabled: bool,
-    /// Minimum age (days) before an episode is eligible for pruning.
-    #[serde(default = "default_retention_min_age_days")]
-    pub retention_min_age_days: u64,
-    /// Always keep at least the N newest episodes (regardless of age).
-    #[serde(default = "default_retention_keep_last")]
-    pub retention_keep_last: usize,
-    /// Only prune episodes with importance <= this value (0.0-1.0).
-    #[serde(default = "default_retention_max_importance")]
-    pub retention_max_importance: f32,
-    /// Only prune episodes with access_count <= this value.
-    #[serde(default = "default_retention_max_access_count")]
-    pub retention_max_access_count: i32,
-    /// Require finalized episodes for pruning (strongly recommended).
-    #[serde(default = "default_true")]
-    pub retention_require_consolidated: bool,
-    /// Minimum days between retention runs.
-    #[serde(default = "default_retention_run_interval_days")]
-    pub retention_run_interval_days: u64,
-    /// Only run retention if no user activity in the last N seconds.
-    #[serde(default = "default_retention_idle_threshold_secs")]
-    pub retention_idle_threshold_secs: u64,
-    /// Maximum number of episodes to delete per run (rate limiter).
-    #[serde(default = "default_retention_max_delete_per_run")]
-    pub retention_max_delete_per_run: u64,
-}
-
-fn default_max_episodes() -> usize {
-    10000
-}
-
-fn default_false() -> bool {
-    false
-}
-
-fn default_retention_min_age_days() -> u64 {
-    180
-}
-
-fn default_retention_keep_last() -> usize {
-    2500
-}
-
-fn default_retention_max_importance() -> f32 {
-    0.6
-}
-
-fn default_retention_max_access_count() -> i32 {
-    1
-}
-
-fn default_retention_run_interval_days() -> u64 {
-    7
-}
-
-fn default_retention_idle_threshold_secs() -> u64 {
-    600
-}
-
-fn default_retention_max_delete_per_run() -> u64 {
-    500
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            max_episodes: default_max_episodes(),
             embedding_model: String::new(),
-            retention_enabled: default_false(),
-            retention_min_age_days: default_retention_min_age_days(),
-            retention_keep_last: default_retention_keep_last(),
-            retention_max_importance: default_retention_max_importance(),
-            retention_max_access_count: default_retention_max_access_count(),
-            retention_require_consolidated: default_true(),
-            retention_run_interval_days: default_retention_run_interval_days(),
-            retention_idle_threshold_secs: default_retention_idle_threshold_secs(),
-            retention_max_delete_per_run: default_retention_max_delete_per_run(),
         }
     }
 }

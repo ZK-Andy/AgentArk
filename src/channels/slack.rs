@@ -145,14 +145,7 @@ fn now_unix_seconds() -> Result<u64> {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    crate::security::constant_time_eq(left, right)
 }
 
 fn slack_hmac_sha256_hex(secret: &str, data: &[u8]) -> String {
@@ -405,12 +398,15 @@ async fn slack_api_post_message(
         body["thread_ts"] = Value::String(thread_ts.to_string());
     }
 
-    let response = client
-        .post(&url)
-        .bearer_auth(&config.bot_token)
-        .json(&body)
-        .send()
-        .await?;
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "slack",
+        "chat.postMessage",
+        client
+            .post(&url)
+            .bearer_auth(&config.bot_token)
+            .json(&body),
+    )
+    .await?;
 
     let status = response.status();
     let payload = response

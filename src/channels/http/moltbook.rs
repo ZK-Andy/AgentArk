@@ -2231,7 +2231,7 @@ pub(super) async fn run_moltbook_now(State(state): State<AppState>) -> Json<serd
     };
 
     let state_for_run = state.clone();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http/moltbook.rs:2234", async move {
         let _ = run_moltbook_cycle_with_guard(&state_for_run, "manual", run_guard).await;
     });
 

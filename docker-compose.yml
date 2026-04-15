@@ -48,7 +48,7 @@ services:
     environment:
       - POSTGRES_DB=${AGENTARK_POSTGRES_DB:-agentark}
       - POSTGRES_USER=${AGENTARK_POSTGRES_USER:-agentark}
-      - POSTGRES_PASSWORD=${AGENTARK_POSTGRES_PASSWORD:-agentark}
+      - POSTGRES_PASSWORD=${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}
     ports:
       - "127.0.0.1:${AGENTARK_POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -100,7 +100,7 @@ services:
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
-      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
       - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
@@ -109,6 +109,7 @@ services:
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_PUBLIC_APP_BIND=${AGENTARK_PUBLIC_APP_BIND:-0.0.0.0:8992}
       - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
+      - AGENTARK_RELEASE_REPO=${AGENTARK_RELEASE_REPO:-agentark-ai/AgentArk}
       - AGENTARK_STACK_ROLE=control
       - AGENTARK_EXECUTOR_URL=http://agentark-executor:8991
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992
@@ -155,7 +156,7 @@ services:
       - AGENTARK_CONFIG=/app/config
       - AGENTARK_DATA=/app/data
       - AGENTARK_WORKSPACE_ROOT=${AGENTARK_WORKSPACE_ROOT:-/workspace/agentark}
-      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:-agentark}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
+      - AGENTARK_DATABASE_URL=postgres://${AGENTARK_POSTGRES_USER:-agentark}:${AGENTARK_POSTGRES_PASSWORD:?run scripts/start.sh or scripts/start.bat to generate a local Postgres password}@postgres:5432/${AGENTARK_POSTGRES_DB:-agentark}
       - AGENTARK_DB_MAX_CONNECTIONS=${AGENTARK_DB_MAX_CONNECTIONS:-20}
       - AGENTARK_DB_CONNECT_TIMEOUT_SECS=${AGENTARK_DB_CONNECT_TIMEOUT_SECS:-5}
       - AGENTARK_DB_STATEMENT_TIMEOUT_MS=${AGENTARK_DB_STATEMENT_TIMEOUT_MS:-30000}
@@ -164,6 +165,7 @@ services:
       - AGENTARK_BIND=0.0.0.0:8990
       - AGENTARK_EXECUTOR_BIND=0.0.0.0:8991
       - AGENTARK_SELF_IMAGE=${AGENTARK_IMAGE:-ghcr.io/agentark-ai/agentark:latest}
+      - AGENTARK_RELEASE_REPO=${AGENTARK_RELEASE_REPO:-agentark-ai/AgentArk}
       - AGENTARK_STACK_ROLE=executor
       - AGENTARK_CONTROL_URL=http://agentark-control:8990
       - AGENTARK_WORKSPACE_URL=http://agentark-workspace:8992

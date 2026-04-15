@@ -778,8 +778,16 @@ export function MoltbookManager({ autoRefresh }: { autoRefresh: boolean }) {
         eyebrow="Core"
         title="Moltbook"
         description="Federated agent-to-agent participation, schedule, and run history for Moltbook."
+        sx={{
+          "& .workspace-page-header": {
+            alignItems: { xs: "stretch", md: "center" }
+          },
+          "& .workspace-page-header-actions": {
+            alignSelf: { xs: "stretch", md: "center" }
+          }
+        }}
         actions={
-          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
             <Chip size="small" color={connectionChip.color} label={connectionChip.label} />
             <Chip size="small" variant="outlined" color={dirty ? "warning" : "default"} label={dirty ? "Unsaved changes" : "Saved"} />
             <Button size="small" variant="outlined" onClick={runNow} disabled={!form.moltbook_enabled || runBusy || runMutation.isPending}>

@@ -3098,7 +3098,7 @@ print(json.dumps({
                 "properties": {
                     "query": { "type": "string", "description": "What memory or prior context to look up" },
                     "limit": { "type": "integer", "description": "Maximum number of memory hits to return (default: 5)" },
-                    "include_semantic": { "type": "boolean", "description": "Include semantic memory matches (default: true)" },
+                    "include_semantic": { "type": "boolean", "description": "Include learned semantic facts and constraints from durable memory (default: true)" },
                     "include_structured": { "type": "boolean", "description": "Include structured preferences, user data, and knowledge base context (default: true)" },
                     "include_procedures": { "type": "boolean", "description": "Include learned procedural patterns and workflow guidance (default: true)" },
                     "include_lessons": { "type": "boolean", "description": "Include learned lessons and operating constraints (default: true)" },
@@ -3864,7 +3864,10 @@ print(json.dumps({
                     "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5, or 12 when depth='deep')" },
                     "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
-                    "include_sources": { "type": "boolean", "description": "Include source URLs" }
+                    "include_sources": { "type": "boolean", "description": "Include source URLs" },
+                    "min_primary_sources": { "type": "integer", "description": "Minimum number of primary-source-like results to include when available. Deep research defaults to 2." },
+                    "freshness_window_days": { "type": "integer", "description": "Optional freshness window in days for preferring dated, recent evidence." },
+                    "followup_rounds": { "type": "integer", "description": "Extra follow-up search rounds to close evidence gaps, fetch primary sources, and investigate contradictions. Deep research defaults to 2." }
                 },
                 "required": ["query"]
             }),
@@ -10104,8 +10107,8 @@ print(result["text"])
             if span <= 0 {
                 backoff_ms.max(25)
             } else {
-                let mut rng = rand::thread_rng();
-                let jitter = rng.gen_range(-span..=span);
+                let mut rng = rand::rng();
+                let jitter = rng.random_range(-span..=span);
                 ((backoff_ms as i64 + jitter).max(25)) as u64
             }
         };
@@ -14695,9 +14698,9 @@ pub(crate) fn save_persisted_search_config(
 }
 
 /// Build search config: loads user settings from persistent settings storage,
-/// injects API-backed secrets, auto-detects Playwright for explicit opt-in use,
-/// and applies the default Lightpanda -> DuckDuckGo -> none chain only when no
-/// chain is saved.
+/// injects API-backed secrets, auto-detects runtime-provided builtins such as
+/// Lightpanda and the Playwright bridge, and applies the default free fallback
+/// chain only when no chain is saved.
 pub(crate) async fn build_search_config(
     config_dir: &Path,
     storage: Option<&crate::storage::Storage>,
@@ -14798,6 +14801,17 @@ pub(crate) async fn build_search_config(
                 config.firecrawl = None;
             }
         }
+    }
+
+    config.lightpanda_available = crate::integrations::lightpanda::is_available();
+    if config.lightpanda_available {
+        if let Some(path) = crate::integrations::lightpanda::binary_path() {
+            tracing::debug!("Lightpanda available at {}", path.display());
+        }
+    } else {
+        tracing::warn!(
+            "Lightpanda binary not found in this runtime; free search fallback will skip it"
+        );
     }
 
     // Auto-detect Playwright bridge if not already set so explicit browser-backed

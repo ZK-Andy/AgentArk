@@ -10,6 +10,7 @@ import {
   Checkbox,
   Chip,
   CircularProgress,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -104,8 +105,6 @@ import type {
   ArkPulseRunFixRequest,
   BackgroundSessionSummary,
   LlmAnalyticsResponse,
-  MemoryMaintenanceReviewResponse,
-  RunMemoryMaintenanceRequest,
   SkillImportResponse,
   Task,
   TraceOperationalEvent,
@@ -154,6 +153,8 @@ const WebhooksPanel = lazy(() =>
 );
 
 const REFRESH_MS = 8000;
+const EVOLUTION_DEV_QUERY_LIMIT = 250;
+const EVOLUTION_DEV_REFRESH_MS = 30000;
 function WorkspaceLazyPanel({
   children,
   message = "Loading panel..."
@@ -181,9 +182,9 @@ function WorkspaceLazyPanel({
 const WORKSPACE_HEADER_ACTION_GROUP_SX = {
   p: 0.45,
   borderRadius: "8px",
-  border: "1px solid rgba(108, 156, 212, 0.12)",
-  background: "linear-gradient(180deg, rgba(9, 19, 35, 0.72), rgba(7, 15, 28, 0.62))",
-  boxShadow: "inset 0 1px 0 rgba(148, 199, 245, 0.04)"
+  border: "1px solid var(--surface-border)",
+  background: "rgba(255,255,255,0.02)",
+  boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)"
 } as const;
 const WORKSPACE_HEADER_PRIMARY_BUTTON_SX = {
   minHeight: 32,
@@ -201,11 +202,11 @@ const WORKSPACE_HEADER_SECONDARY_BUTTON_SX = {
   textTransform: "none",
   boxShadow: "none",
   color: "rgba(231, 239, 251, 0.94)",
-  borderColor: "rgba(108, 156, 212, 0.22)",
+  borderColor: "var(--surface-border)",
   background: "rgba(255,255,255,0.02)",
   "&:hover": {
-    borderColor: "rgba(108, 156, 212, 0.36)",
-    background: "rgba(88, 174, 255, 0.08)"
+    borderColor: "var(--surface-border-strong)",
+    background: "var(--button-bg-subtle-hover)"
   }
 } as const;
 const IMPORT_RISK_POLICY = {
@@ -237,6 +238,7 @@ const CHAT_BACKGROUND_RUN_STORAGE_KEY = "agentark.chat.backgroundRun";
 const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
 const CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY = "agentark.chat.workspaceSnapshots";
 const CHAT_PENDING_RUN_TTL_MS = 45 * 60 * 1000;
+const CHAT_BACKGROUND_RUN_SNAPSHOTS_MAX = 12;
 const CHAT_WORKSPACE_SNAPSHOT_TTL_MS = 12 * 60 * 60 * 1000;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_CONVERSATIONS = 10;
 const CHAT_WORKSPACE_SNAPSHOT_MAX_FILES = 24;
@@ -248,10 +250,17 @@ const CHAT_INLINE_CONVERSATIONS_MIN_WIDTH = 1600;
 const CHAT_INLINE_ACTIVITY_MIN_WIDTH = 1820;
 const TASK_INPUT_NEEDED_MARKER = "__INPUT_NEEDED__:";
 const RESTART_NOTICE_DURATION_MS = 10_000;
+const UPDATE_NOTICE_DURATION_MS = 120_000;
 const CHAT_LAUNCH_RUN_EVENT = "agentark.chat.launch-run";
 const CHAT_RUN_STATUS_EVENT = "agentark.chat.run-status";
 const CHAT_CONVERSATIONS_PAGE_SIZE = 20;
 const CHAT_STARRED_LIMIT = 3;
+
+type RestartNoticeState = {
+  text: string;
+  durationMs: number;
+  etaLabel: string;
+};
 const AUTO_APPROVE_BLOCKED_ACTIONS = [
   "shell",
   "bash",
@@ -296,6 +305,8 @@ type ChatPendingRunSnapshot = {
   streamingSteps?: JsonRecord[];
   failedUserMessage?: string;
 };
+
+type ChatPendingRunSnapshotMap = Record<string, ChatPendingRunSnapshot>;
 
 type ChatWorkspaceSnapshot = {
   conversationId: string;
@@ -1008,6 +1019,28 @@ type PlanConfirmationState = {
   messageId: string | null;
 };
 
+function isDeepResearchPlanSource(source: string | null | undefined): boolean {
+  return str(source, "").trim().toLowerCase() === "deep_research";
+}
+
+function planConfirmationSourceValue(source: string | null | undefined): string {
+  return isDeepResearchPlanSource(source) ? "deep_research" : "execution";
+}
+
+function planConfirmationDisplayLabel(source: string | null | undefined): string {
+  return isDeepResearchPlanSource(source) ? "Deep research plan" : "Execution plan";
+}
+
+function planConfirmationOutlineLabel(source: string | null | undefined): string {
+  return isDeepResearchPlanSource(source) ? "Research outline" : "Execution outline";
+}
+
+function planConfirmationPlanningNote(source: string | null | undefined): string {
+  return isDeepResearchPlanSource(source)
+    ? "Building the outline before any research starts."
+    : "Building the outline before any work starts.";
+}
+
 type ToolProgressPresentation = {
   title: string;
   detail: string;
@@ -1316,7 +1349,6 @@ function activityStepIndicatesPlanExecution(step: JsonRecord): boolean {
 function shouldKeepPlanInApprovalState(
   plan: ExecutionPlanState | null,
   steps: JsonRecord[],
-  latestAssistantText: string,
   pendingMode: ChatPendingRunMode
 ): boolean {
   if (!plan || pendingMode === "resume") return false;
@@ -1352,7 +1384,7 @@ function shouldKeepPlanInApprovalState(
     }
     return true;
   }
-  return looksLikeRedundantPlanPreviewMessage(latestAssistantText);
+  return activityStepsHaveExecutionPlanContext(trimmedSteps);
 }
 
 function extractExecutionPlanFromTraceSteps(steps: JsonRecord[]): ExecutionPlanState | null {
@@ -1381,20 +1413,42 @@ function extractExecutionPlanFromTraceSteps(steps: JsonRecord[]): ExecutionPlanS
   return null;
 }
 
-function looksLikeRedundantPlanPreviewMessage(content: string): boolean {
-  const normalized = content.trim().toLowerCase();
-  if (!normalized) return false;
-  return (
-    normalized.includes("your deep research plan is ready") ||
-    normalized.includes("execution plan for the deep research pass") ||
-    normalized.includes("please review. reply start to run the research") ||
-    normalized.includes("press start to continue") ||
-    normalized.includes("execution plan id:")
+function activityStepsRepresentAwaitingPlanConfirmation(steps: JsonRecord[]): boolean {
+  const trimmedSteps = [...steps];
+  while (trimmedSteps.length > 0) {
+    const candidate = trimmedSteps[trimmedSteps.length - 1];
+    const title = str(candidate.title, "").trim().toLowerCase();
+    const icon = str(candidate.icon, "").trim().toLowerCase();
+    const detail = str(candidate.detail, "").trim().toLowerCase();
+    const stepType = str(candidate.step_type, str(candidate.type, "")).trim().toLowerCase();
+    const isHeartbeat =
+      title.includes("still working") ||
+      icon === "wait" ||
+      stepType.includes("still work") ||
+      stepType.includes("heartbeat") ||
+      (stepType.includes("thinking") && detail.includes("no new output") && detail.includes("idle"));
+    if (!isHeartbeat) break;
+    trimmedSteps.pop();
+  }
+  return shouldKeepPlanInApprovalState(
+    extractExecutionPlanFromTraceSteps(trimmedSteps),
+    trimmedSteps,
+    "fresh"
   );
 }
 
-function extractExecutionPlanFailureFromTraceSteps(steps: JsonRecord[]): string {
-  const hasPlanContext = steps.some((step) => {
+function extractPlanConfirmationSourceFromSteps(steps: JsonRecord[]): string {
+  for (const step of [...steps].reverse()) {
+    const stepType = str(step.step_type, str(step.type, "")).trim().toLowerCase();
+    if (stepType !== "plan_ready_for_confirmation") continue;
+    const source = str(step.source, "").trim();
+    if (source) return planConfirmationSourceValue(source);
+  }
+  return "";
+}
+
+function activityStepsHaveExecutionPlanContext(steps: JsonRecord[]): boolean {
+  return steps.some((step) => {
     const title = str(step.title, "").trim().toLowerCase();
     const stepType = str(step.step_type, "").trim().toLowerCase();
     return (
@@ -1402,11 +1456,15 @@ function extractExecutionPlanFailureFromTraceSteps(steps: JsonRecord[]): string 
       stepType === "plan_revised" ||
       stepType === "plan_ready_for_confirmation" ||
       stepType === "plan_step_update" ||
+      stepType === "plan_unavailable" ||
       title === "execution plan" ||
-      title === "execution plan revised"
+      title === "execution plan revised" ||
+      title === "execution plan unavailable"
     );
   });
-  if (!hasPlanContext) return "";
+}
+
+function extractExecutionPlanFailureFromTraceSteps(steps: JsonRecord[]): string {
   for (const step of [...steps].reverse()) {
     const title = str(step.title, "").trim().toLowerCase();
     const stepType = str(step.step_type, "").trim().toLowerCase();
@@ -1414,6 +1472,7 @@ function extractExecutionPlanFailureFromTraceSteps(steps: JsonRecord[]): string 
       return str(step.detail, "");
     }
   }
+  if (!activityStepsHaveExecutionPlanContext(steps)) return "";
   return "";
 }
 
@@ -1437,6 +1496,40 @@ function extractLatestRunStatusSummary(
     };
   }
   return null;
+}
+
+function isTerminalDeepResearchFailureStatus(status: string): boolean {
+  const normalized = (status || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return [
+    "failed",
+    "platform_failed",
+    "service_unavailable",
+    "degraded",
+    "hard_service_outage"
+  ].includes(normalized);
+}
+
+function isSearchBackendSetupIssue(text: string): boolean {
+  const normalized = (text || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return false;
+  const searchContext =
+    /\b(search|research|sources?|backend|provider)\b/.test(normalized) ||
+    normalized.includes("no usable sources");
+  if (!searchContext) return false;
+  return (
+    normalized.includes("no search backend") ||
+    normalized.includes("search backend") && normalized.includes("not configured") ||
+    normalized.includes("no usable sources") ||
+    normalized.includes("all search angles failed") ||
+    normalized.includes("available search backends") ||
+    normalized.includes("configure serper") ||
+    normalized.includes("brave search api") ||
+    normalized.includes("searxng")
+  );
 }
 
 type ImportCallback = (summary: SkillImportSummary) => Promise<void> | void;
@@ -1863,6 +1956,235 @@ function tunnelCheckLabel(status: unknown): string {
   return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
+type ActivityPayloadView = {
+  kind: "json" | "text";
+  badgeLabel: string;
+  headerLabel: string;
+  preview: string;
+  body: string;
+  lineCount: number;
+};
+
+type ActivityTimelineCard = {
+  id: string;
+  index: number;
+  tone: string;
+  kind: string;
+  label: string;
+  detail: string;
+  detailFull: string;
+  summary: string;
+  rawDetailFull: string;
+  payloadView: ActivityPayloadView | null;
+  isHeartbeat: boolean;
+  time: string;
+};
+
+const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
+  "kind",
+  "status",
+  "tool_name",
+  "name",
+  "agent_name",
+  "agent_role",
+  "task",
+  "title",
+  "file",
+  "path",
+  "url",
+  "summary",
+  "error"
+];
+
+const ACTIVITY_PAYLOAD_INTERNAL_KEYS = new Set([
+  "__streamKey",
+  "conversation_id",
+  "conversationId",
+  "cid",
+  "run_id",
+  "runId",
+  "task_id",
+  "taskId",
+  "trace_id",
+  "traceId",
+  "time",
+  "timestamp",
+  "ts",
+  "plan_id",
+  "plan_revision",
+  "plan_step_id",
+  "plan_step_title"
+]);
+
+const ACTIVITY_PAYLOAD_FORCE_SHOW_KEYS = new Set([
+  "kind",
+  "payload",
+  "result",
+  "degradation",
+  "response",
+  "steps",
+  "files",
+  "content",
+  "raw_content",
+  "text",
+  "error"
+]);
+
+function formatActivityToolName(name: string): string {
+  const normalized = (name || "").trim().toLowerCase();
+  if (!normalized) return "Tool";
+  const direct: Record<string, string> = {
+    app_deploy: "App deploy",
+    build_check: "Build check",
+    run_tests: "Test run",
+    lint_check: "Lint check",
+    source_read: "Read files",
+    source_write: "Write files",
+    source_edit: "Edit files",
+    source_list: "List files",
+    source_search: "Search files",
+    frontend_build: "Frontend build",
+    schedule_task: "Schedule task",
+    browse: "Open web page",
+    web_search: "Web search"
+  };
+  if (direct[normalized]) return direct[normalized];
+  return normalized
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+function tryParseActivityJson(raw: string): unknown | null {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return null;
+  if (
+    !((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]")))
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function formatActivityPayloadValue(value: unknown): string {
+  if (value == null) return "null";
+  if (typeof value === "string") {
+    const trimmed = value.trim().replace(/\s+/g, " ");
+    if (!trimmed) return '""';
+    return trimmed.length > 44 ? `${trimmed.slice(0, 41).trimEnd()}...` : trimmed;
+  }
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function summarizeActivityPayloadPreview(value: unknown): string {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "Empty list";
+    const first = value[0];
+    const firstRecord = asRecord(first);
+    if (Object.keys(firstRecord).length > 0) {
+      const preview = summarizeActivityPayloadPreview(firstRecord);
+      return `${value.length} item${value.length === 1 ? "" : "s"}${preview ? ` - ${preview}` : ""}`;
+    }
+    const firstValue = formatActivityPayloadValue(first);
+    return `${value.length} item${value.length === 1 ? "" : "s"}${firstValue ? ` - ${firstValue}` : ""}`;
+  }
+  const record = asRecord(value);
+  const keys = Object.keys(record);
+  if (keys.length === 0) return formatActivityPayloadValue(value);
+  const ordered = [
+    ...ACTIVITY_PAYLOAD_PREVIEW_PRIORITY.filter((key) => key in record),
+    ...keys.filter((key) => !ACTIVITY_PAYLOAD_PREVIEW_PRIORITY.includes(key))
+  ];
+  const parts: string[] = [];
+  for (const key of ordered) {
+    if (parts.length >= 3) break;
+    if (ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key)) continue;
+    const formatted = formatActivityPayloadValue(record[key]);
+    if (!formatted) continue;
+    parts.push(`${key}: ${formatted}`);
+  }
+  const remaining = keys.filter((key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key)).length - parts.length;
+  if (remaining > 0) {
+    parts.push(`+${remaining} more`);
+  }
+  return parts.join(" | ");
+}
+
+function shouldTreatAsRawActivityText(text: string): boolean {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return false;
+  if (tryParseActivityJson(trimmed) != null) return true;
+  if (looksLikeHtmlPayload(trimmed) || looksLikeSourcePayload(trimmed)) return true;
+  if (trimmed.length >= 220) return true;
+  return trimmed.length >= 140 && (/[\r\n]/.test(trimmed) || /[{}[\]<>;]/.test(trimmed));
+}
+
+function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
+  if (value == null) return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = tryParseActivityJson(trimmed);
+    if (parsed != null) {
+      return buildActivityPayloadView(parsed);
+    }
+    if (!shouldTreatAsRawActivityText(trimmed)) return null;
+    return {
+      kind: "text",
+      badgeLabel: "Output",
+      headerLabel: "Detailed output",
+      preview: summarizeActivityPayloadPreview(trimmed),
+      body: trimmed,
+      lineCount: trimmed.split(/\r?\n/).length
+    };
+  }
+
+  const asArray = Array.isArray(value) ? value : null;
+  const asObject = asRecord(value);
+  const hasObjectContent = Object.keys(asObject).length > 0;
+  if (!asArray && !hasObjectContent) return null;
+
+  const body = JSON.stringify(value, null, 2);
+  if (!body) return null;
+  const keys = hasObjectContent ? Object.keys(asObject) : [];
+  const visibleKeys = keys.filter((key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key));
+  const hasNested =
+    (asArray?.length ?? 0) > 0 ||
+    visibleKeys.some((key) => {
+      const entry = asObject[key];
+      return Array.isArray(entry) || (!!entry && typeof entry === "object");
+    });
+  const shouldShow =
+    Boolean(asArray) ||
+    hasNested ||
+    visibleKeys.length > 4 ||
+    body.length > 220 ||
+    keys.some((key) => ACTIVITY_PAYLOAD_FORCE_SHOW_KEYS.has(key));
+  if (!shouldShow) return null;
+
+  return {
+    kind: "json",
+    badgeLabel: "Data",
+    headerLabel: "Structured data",
+    preview: summarizeActivityPayloadPreview(value),
+    body,
+    lineCount: body.split(/\r?\n/).length
+  };
+}
+
+function buildActivityPayloadViewFromSources(...values: unknown[]): ActivityPayloadView | null {
+  for (const value of values) {
+    const payloadView = buildActivityPayloadView(value);
+    if (payloadView) return payloadView;
+  }
+  return null;
+}
+
 function compactUnknown(value: unknown, maxLen = 2200): string {
   if (value == null) return "";
   if (typeof value === "string") return value.trim().slice(0, maxLen);
@@ -1915,32 +2237,75 @@ function looksLikeSourcePayload(text: string): boolean {
 function summarizeJsonActivityPayload(value: unknown): string {
   if (Array.isArray(value)) {
     return value.length === 0
-      ? "Returned empty list."
-      : `Returned list with ${value.length} item${value.length === 1 ? "" : "s"}.`;
+      ? "No items were returned."
+      : `Collected ${value.length} item${value.length === 1 ? "" : "s"}.`;
   }
   const obj = asRecord(value);
   const keys = Object.keys(obj);
-  if (keys.length === 0) return "Returned empty object.";
+  if (keys.length === 0) return "Received an empty result.";
+
+  const kind = str(obj.kind, "").trim().toLowerCase();
+  const status = str(obj.status, "").trim();
+  const summary = str(obj.summary, "").trim();
+  const error = str(obj.error, "").trim();
+  const toolName = str(obj.tool_name, str(obj.name, "")).trim();
+  if (kind === "tool_dispatch") {
+    const toolLabel = formatActivityToolName(toolName);
+    const preview = summarizeActivityPayloadPreview(obj);
+    return preview ? `Prepared ${toolLabel} input. ${preview}.` : `Prepared ${toolLabel} input.`;
+  }
+  if (kind === "phase_status") {
+    const label = str(obj.label, "Working").trim() || "Working";
+    const detail = str(obj.detail, "").trim();
+    return detail ? `${label}. ${detail}` : `${label}.`;
+  }
+  if (kind === "console_chunk") {
+    const stream = str(obj.stream, "console").trim() || "console";
+    const stage = str(obj.stage, "").trim();
+    return `${stage ? `${stage} ` : ""}${stream} output received.`;
+  }
+  if (kind === "argument_stream") {
+    const stage = str(obj.stage, "").trim();
+    const toolLabel = formatActivityToolName(toolName);
+    const stageLabel = stage.replace(/[_-]+/g, " ").trim();
+    if (stageLabel) return `Preparing ${toolLabel} input (${stageLabel}).`;
+    return `Preparing ${toolLabel} input.`;
+  }
+  if (kind.startsWith("delegation_")) {
+    const agentName = str(obj.agent_name, "Agent").trim() || "Agent";
+    const agentRole = str(obj.agent_role, "").trim();
+    const subject = agentRole ? `${agentName} - ${agentRole}` : agentName;
+    if (summary) return `${subject}. ${summary}`;
+    return `${subject} shared a progress update.`;
+  }
+  if (status && summary) {
+    return `${status.charAt(0).toUpperCase()}${status.slice(1)}. ${summary}`;
+  }
+  if (error) {
+    return summarizeActivityDetail(error) || "Returned error details.";
+  }
 
   const apps = Array.isArray(obj.apps) ? asRecords(obj.apps) : [];
   const matchedApp = asRecord(obj.matched_app);
   if (apps.length > 0 || Object.keys(matchedApp).length > 0) {
-    const matchedTitle = str(matchedApp.title, "").trim();
-    if (matchedTitle) {
-      return `Matched ${Math.max(apps.length, 1)} app${Math.max(apps.length, 1) === 1 ? "" : "s"}; selected ${matchedTitle}.`;
+  const matchedTitle = str(matchedApp.title, "").trim();
+  if (matchedTitle) {
+      return `Found ${Math.max(apps.length, 1)} app match${Math.max(apps.length, 1) === 1 ? "" : "es"} and selected ${matchedTitle}.`;
     }
-    return `Matched ${apps.length} app${apps.length === 1 ? "" : "s"} and loaded app metadata.`;
+    return `Found ${apps.length} app match${apps.length === 1 ? "" : "es"} and loaded the app details.`;
   }
 
   const title = str(obj.title, "").trim();
   const fileBytes = num(obj.file_bytes, -1);
   if (title && fileBytes >= 0) {
-    return `Loaded metadata for ${title} (${formatBytes(fileBytes)}).`;
+    return `Loaded ${title} details (${formatBytes(fileBytes)}).`;
   }
 
+  const preview = summarizeActivityPayloadPreview(obj);
+  if (preview) return `Collected details: ${preview}.`;
   const visibleKeys = keys.slice(0, 4).join(", ");
   const remaining = keys.length > 4 ? `, +${keys.length - 4} more` : "";
-  return `Returned structured data: ${visibleKeys}${remaining}.`;
+  return `Collected details: ${visibleKeys}${remaining}.`;
 }
 
 function summarizeActivityDetail(detail: string): string {
@@ -1962,16 +2327,16 @@ function summarizeActivityDetail(detail: string): string {
   if (looksLikeHtmlPayload(trimmed)) {
     const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
     const title = titleMatch?.[1]?.trim();
-    return title ? `Read HTML document: ${title}.` : "Read HTML document.";
+    return title ? `Reviewed HTML document: ${title}.` : "Reviewed HTML document.";
   }
 
   if (looksLikeSourcePayload(trimmed)) {
     const lineCount = trimmed.split(/\r?\n/).length;
-    return `Read source file contents (${lineCount} line${lineCount === 1 ? "" : "s"}).`;
+    return `Reviewed source contents (${lineCount} line${lineCount === 1 ? "" : "s"}).`;
   }
 
   if (trimmed.length > 240 && /[{}[\]<>;]/.test(trimmed)) {
-    return "Returned verbose tool output.";
+    return "Received detailed output.";
   }
 
   return trimmed;
@@ -2073,8 +2438,8 @@ function buildToolProgressPresentation(
     const chars = Math.max(0, num(payloadObj.chars, 0));
     const elapsedSecs = Math.max(0, num(payloadObj.elapsed_secs, 0));
     const streamKey = str(payloadObj.stream_key, `argument-stream:${name || "tool"}`);
-    const toolLabel = (name || "tool").replace(/[_-]+/g, " ").trim() || "tool";
-    let title = `Preparing ${toolLabel}`;
+    const toolLabel = formatActivityToolName(name || "tool");
+    let title = `Preparing ${toolLabel} input`;
     if (stage === "payload_build" && name === "app_deploy") {
       title = "Generating deploy payload";
     } else if (stage === "payload_repair" && name === "app_deploy") {
@@ -2158,7 +2523,7 @@ function buildToolProgressPresentation(
   }
 
   return {
-    title: `Tool progress: ${name || "tool"}`,
+    title: `Running ${formatActivityToolName(name || "tool")}`,
     detail: detail || preview
   };
 }
@@ -2187,6 +2552,141 @@ type SwarmChatRun = {
   updatedAtIndex: number;
   agents: SwarmChatAgent[];
 };
+
+function activityToneColor(kind: string, tone: string): string {
+  if (kind === "Issue") return "var(--activity-tone-issue)";
+  if (kind === "Done") return "var(--activity-tone-done)";
+  if (kind === "Running") return "var(--activity-tone-running)";
+  if (kind === "Planning") return "var(--activity-tone-planning)";
+  if (tone === "tone-error") return "var(--activity-tone-issue)";
+  if (tone === "tone-success") return "var(--activity-tone-done)";
+  if (tone === "tone-action") return "var(--activity-tone-running)";
+  if (tone === "tone-thinking") return "var(--activity-tone-planning)";
+  return "var(--activity-tone-default)";
+}
+
+function activityKindDisplayLabel(kind: string): string {
+  const normalized = (kind || "").trim().toLowerCase();
+  if (normalized === "running") return "Working";
+  if (normalized === "planning") return "Thinking";
+  if (normalized === "issue") return "Attention";
+  return kind || "Update";
+}
+
+function ActivityPayloadDisclosure({
+  payload,
+  expanded,
+  onToggle,
+  controlsId
+}: {
+  payload: ActivityPayloadView;
+  expanded: boolean;
+  onToggle: () => void;
+  controlsId: string;
+}) {
+  return (
+    <Box className={`activity-payload-shell${expanded ? " is-expanded" : ""}`}>
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        className="activity-payload-head"
+        sx={{
+          alignItems: { xs: "stretch", sm: "center" },
+          justifyContent: "space-between",
+          gap: 0.75
+        }}
+      >
+        <Stack direction="row" spacing={0.75} className="activity-payload-preview" sx={{ alignItems: "center", minWidth: 0 }}>
+          <span className={`activity-payload-chip activity-payload-chip-${payload.kind}`}>{payload.badgeLabel}</span>
+          <Typography variant="caption" className="activity-payload-preview-text" title={payload.preview || payload.headerLabel}>
+            {payload.preview || payload.headerLabel}
+          </Typography>
+        </Stack>
+        <Button
+          size="small"
+          variant="text"
+          className="activity-payload-toggle"
+          aria-expanded={expanded}
+          aria-controls={controlsId}
+          onClick={onToggle}
+          endIcon={
+            <ArrowDropDownRoundedIcon
+              className={`activity-payload-toggle-icon${expanded ? " is-expanded" : ""}`}
+            />
+          }
+        >
+          {expanded ? "Hide data" : "Show data"}
+        </Button>
+      </Stack>
+      <Collapse in={expanded} mountOnEnter unmountOnExit>
+        <Box id={controlsId} className="activity-payload-body">
+          <Typography variant="caption" className="activity-payload-body-label">
+            {payload.headerLabel} - {payload.lineCount} line{payload.lineCount === 1 ? "" : "s"}
+          </Typography>
+          <Box component="pre" className="activity-payload-pre">
+            {payload.body}
+          </Box>
+        </Box>
+      </Collapse>
+    </Box>
+  );
+}
+
+function ActivityTimelineRow({
+  row,
+  isActive,
+  payloadExpanded,
+  onTogglePayload
+}: {
+  row: ActivityTimelineCard;
+  isActive: boolean;
+  payloadExpanded: boolean;
+  onTogglePayload: () => void;
+}) {
+  const lineTone = activityToneColor(row.kind, row.tone);
+  const summary = row.summary || row.detailFull || row.detail || "";
+  const payloadId = `activity-payload-${row.id}`.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  return (
+    <Box className={`term-line activity-timeline-row${isActive ? " term-line-active" : ""}`}>
+      <span className="term-prompt" style={{ color: lineTone }}>-</span>
+      <Box className="term-content activity-row-content">
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          className="activity-row-head"
+          sx={{
+            alignItems: { xs: "flex-start", sm: "flex-start" },
+            justifyContent: "space-between",
+            gap: 0.75
+          }}
+        >
+          <Box className="activity-row-copy">
+            <div className="term-label activity-row-label" style={{ color: lineTone }}>
+              {row.label}
+            </div>
+            <Stack direction="row" spacing={0.75} useFlexGap className="activity-row-meta" sx={{ flexWrap: "wrap" }}>
+              <span className={`activity-kind-pill activity-kind-pill-${(row.kind || "update").toLowerCase()}`}>
+                {activityKindDisplayLabel(row.kind)}
+              </span>
+              {row.time ? (
+                <span className="activity-row-time">{formatTraceStepTime(row.time)}</span>
+              ) : null}
+            </Stack>
+          </Box>
+        </Stack>
+        {summary ? (
+          <div className="term-detail activity-row-summary">{summary}</div>
+        ) : null}
+        {row.payloadView ? (
+          <ActivityPayloadDisclosure
+            payload={row.payloadView}
+            expanded={payloadExpanded}
+            onToggle={onTogglePayload}
+            controlsId={payloadId}
+          />
+        ) : null}
+      </Box>
+    </Box>
+  );
+}
 
 function normalizeSwarmStatus(status: unknown): string {
   const normalized = str(status, "").trim().toLowerCase();
@@ -2423,10 +2923,14 @@ function buildSwarmRunsFromStreamingSteps(
 
 function SwarmActivityPanel({
   runs,
-  interrupted = false
+  interrupted = false,
+  expandedPayloads,
+  onTogglePayload
 }: {
   runs: SwarmChatRun[];
   interrupted?: boolean;
+  expandedPayloads: Set<string>;
+  onTogglePayload: (id: string) => void;
 }) {
   if (runs.length === 0) return null;
   const totalAgents = runs.reduce((sum, run) => sum + Math.max(run.agentCount, run.agents.length), 0);
@@ -2436,14 +2940,12 @@ function SwarmActivityPanel({
       sx={{
         mt: 1.5,
         p: 1.5,
-        borderRadius: "8px",
+        borderRadius: "var(--surface-radius-lg)",
         border: interrupted
-          ? "1px solid rgba(255, 171, 64, 0.28)"
-          : "1px solid rgba(90, 180, 255, 0.20)",
-        background: interrupted
-          ? "linear-gradient(180deg, rgba(255, 171, 64, 0.10) 0%, rgba(17, 24, 39, 0.82) 100%)"
-          : "linear-gradient(180deg, rgba(67, 153, 255, 0.12) 0%, rgba(16, 24, 40, 0.82) 100%)",
-        boxShadow: "none"
+          ? "1px solid var(--activity-panel-border-warning)"
+          : "1px solid var(--activity-panel-border)",
+        background: "var(--activity-panel-bg)",
+        boxShadow: "var(--surface-shadow-soft)"
       }}
     >
       <Stack spacing={1.4}>
@@ -2484,14 +2986,19 @@ function SwarmActivityPanel({
           </Stack>
         </Stack>
 
-        {runs.map((run) => (
+        {runs.map((run) => {
+          const runSummary = summarizeActivityDetail(
+            run.summary || `${run.agents.length} delegated agents tracked.`
+          );
+          return (
           <Box
             key={run.id}
             sx={{
               p: 1.25,
-              borderRadius: "8px",
-              background: "rgba(6, 11, 23, 0.52)",
-              border: "1px solid rgba(255,255,255,0.06)"
+              borderRadius: "var(--surface-radius)",
+              background: "var(--activity-subpanel-bg)",
+              border: "1px solid var(--surface-border)",
+              boxShadow: "var(--micro-surface-shadow)"
             }}
           >
             <Stack spacing={1.2}>
@@ -2503,17 +3010,18 @@ function SwarmActivityPanel({
                   gap: 1
                 }}>
                 <Box sx={{ minWidth: 0 }}>
-                  <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }} className="swarm-run-request">
                     {run.request || "Delegated run"}
                   </Typography>
                   <Typography
                     variant="caption"
+                    className="swarm-run-summary"
                     sx={{
                       color: "text.secondary",
                       display: "block",
                       mt: 0.35
                     }}>
-                    {run.summary || `${run.agents.length} delegated agents tracked.`}
+                    {runSummary || `${run.agents.length} delegated agents tracked.`}
                   </Typography>
                 </Box>
                 <Stack direction="row" spacing={0.75} useFlexGap sx={{
@@ -2533,15 +3041,28 @@ function SwarmActivityPanel({
               </Stack>
 
               <Grid2 container spacing={1}>
-                {run.agents.map((agent) => (
+                {run.agents.map((agent) => {
+                  const agentPayloadId = `swarm:${run.id}:${agent.id}`;
+                  const agentPayloadView = buildActivityPayloadViewFromSources(
+                    agent.latestUpdate,
+                    agent.summary
+                  );
+                  const agentUpdate = summarizeActivityDetail(
+                    agent.latestUpdate || agent.summary || "Waiting for the next update."
+                  );
+                  const payloadControlsId = `swarm-payload-${agentPayloadId}`.replace(
+                    /[^a-zA-Z0-9_-]+/g,
+                    "-"
+                  );
+                  return (
                   <Grid2 key={agent.id} size={{ xs: 12, xl: 6 }}>
                     <Box
                       sx={{
                         height: "100%",
                         p: 1.1,
-                        borderRadius: "8px",
-                        border: "1px solid rgba(255,255,255,0.06)",
-                        background: "rgba(255,255,255,0.025)"
+                        borderRadius: "var(--surface-radius)",
+                        border: "1px solid var(--surface-border)",
+                        background: "var(--micro-surface-item-bg)"
                       }}
                     >
                       <Stack spacing={0.8}>
@@ -2584,23 +3105,33 @@ function SwarmActivityPanel({
                           </Stack>
                         </Stack>
                         {agent.task ? (
-                          <Typography variant="body2" sx={{ color: "rgba(229, 236, 246, 0.94)" }}>
+                          <Typography variant="body2" className="swarm-agent-task" sx={{ color: "var(--button-text)" }}>
                             {agent.task}
                           </Typography>
                         ) : null}
-                        <Typography variant="caption" sx={{
+                        <Typography variant="caption" className="swarm-agent-update" sx={{
                           color: "text.secondary"
                         }}>
-                          {agent.latestUpdate || agent.summary || "Waiting for the next update."}
+                          {agentUpdate || "Waiting for the next update."}
                         </Typography>
+                        {agentPayloadView ? (
+                          <ActivityPayloadDisclosure
+                            payload={agentPayloadView}
+                            expanded={expandedPayloads.has(agentPayloadId)}
+                            onToggle={() => onTogglePayload(agentPayloadId)}
+                            controlsId={payloadControlsId}
+                          />
+                        ) : null}
                       </Stack>
                     </Box>
                   </Grid2>
-                ))}
+                  );
+                })}
               </Grid2>
             </Stack>
           </Box>
-        ))}
+          );
+        })}
       </Stack>
     </Box>
   );
@@ -3016,6 +3547,58 @@ function clearChatWorkspaceSnapshot(conversationId: string): void {
   saveStoredChatWorkspaceSnapshots(snapshots);
 }
 
+function normalizeChatPendingRunSnapshot(raw: unknown): ChatPendingRunSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const parsed = raw as Partial<ChatPendingRunSnapshot>;
+  const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+  const startedAt = typeof parsed.startedAt === "number" ? parsed.startedAt : 0;
+  if (!conversationId || startedAt <= 0) return null;
+  if (Date.now() - startedAt > CHAT_PENDING_RUN_TTL_MS) return null;
+  const streamingResponse =
+    typeof parsed.streamingResponse === "string"
+      ? parsed.streamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS)
+      : "";
+    const streamingSteps = Array.isArray(parsed.streamingSteps)
+      ? asRecords(parsed.streamingSteps)
+          .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+          .map((rawStep) => {
+            const normalized: JsonRecord = {};
+            const icon = str(rawStep.icon, "").trim();
+            const title = str(rawStep.title, "").trim();
+            const detail = str(rawStep.detail, "").trim();
+            const stepType = str(rawStep.step_type, "").trim();
+            const source = str(rawStep.source, "").trim();
+            const data = compactUnknown(rawStep.data, 800);
+            if (icon) normalized.icon = icon.slice(0, 64);
+            if (title) normalized.title = title.slice(0, 220);
+            if (detail) normalized.detail = detail.slice(0, 900);
+            if (stepType) normalized.step_type = stepType.slice(0, 80);
+            if (source) normalized.source = source.slice(0, 80);
+            if (data) normalized.data = data;
+            return normalized;
+          })
+      : [];
+  return {
+    conversationId,
+    message: typeof parsed.message === "string" ? parsed.message : "",
+    projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
+    startedAt,
+    runId: typeof parsed.runId === "string" ? parsed.runId : "",
+    mode: parsed.mode === "resume" ? "resume" : "fresh",
+    phase:
+      parsed.phase === "interrupted"
+        ? "interrupted"
+        : parsed.phase === "awaiting_confirmation"
+          ? "awaiting_confirmation"
+          : "running",
+    taskId: typeof parsed.taskId === "string" ? parsed.taskId : "",
+    streamingResponse,
+    streamingSteps,
+    failedUserMessage:
+      typeof parsed.failedUserMessage === "string" ? parsed.failedUserMessage : ""
+  };
+}
+
 function loadChatStoredRunSnapshot(storageKey: string): ChatPendingRunSnapshot | null {
   if (typeof window === "undefined") return null;
   try {
@@ -3023,60 +3606,11 @@ function loadChatStoredRunSnapshot(storageKey: string): ChatPendingRunSnapshot |
       window.localStorage.getItem(storageKey) ??
       window.sessionStorage.getItem(storageKey);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<ChatPendingRunSnapshot>;
-    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
-    const startedAt = typeof parsed.startedAt === "number" ? parsed.startedAt : 0;
-    if (!conversationId || startedAt <= 0) {
-      window.localStorage.removeItem(storageKey);
-      window.sessionStorage.removeItem(storageKey);
-      return null;
-    }
-    if (Date.now() - startedAt > CHAT_PENDING_RUN_TTL_MS) {
-      window.localStorage.removeItem(storageKey);
-      window.sessionStorage.removeItem(storageKey);
-      return null;
-    }
-    const streamingResponse =
-      typeof parsed.streamingResponse === "string"
-        ? parsed.streamingResponse.slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS)
-        : "";
-    const streamingSteps = Array.isArray(parsed.streamingSteps)
-      ? asRecords(parsed.streamingSteps)
-          .slice(-CHAT_PENDING_STREAM_STEPS_MAX)
-          .map((raw) => {
-            const normalized: JsonRecord = {};
-            const icon = str(raw.icon, "").trim();
-            const title = str(raw.title, "").trim();
-            const detail = str(raw.detail, "").trim();
-            const stepType = str(raw.step_type, "").trim();
-            const data = compactUnknown(raw.data, 800);
-            if (icon) normalized.icon = icon.slice(0, 64);
-            if (title) normalized.title = title.slice(0, 220);
-            if (detail) normalized.detail = detail.slice(0, 900);
-            if (stepType) normalized.step_type = stepType.slice(0, 80);
-            if (data) normalized.data = data;
-            return normalized;
-          })
-      : [];
-    return {
-      conversationId,
-      message: typeof parsed.message === "string" ? parsed.message : "",
-      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
-      startedAt,
-      runId: typeof parsed.runId === "string" ? parsed.runId : "",
-      mode: parsed.mode === "resume" ? "resume" : "fresh",
-      phase:
-        parsed.phase === "interrupted"
-          ? "interrupted"
-          : parsed.phase === "awaiting_confirmation"
-            ? "awaiting_confirmation"
-            : "running",
-      taskId: typeof parsed.taskId === "string" ? parsed.taskId : "",
-      streamingResponse,
-      streamingSteps,
-      failedUserMessage:
-        typeof parsed.failedUserMessage === "string" ? parsed.failedUserMessage : ""
-    };
+    const normalized = normalizeChatPendingRunSnapshot(JSON.parse(raw));
+    if (normalized) return normalized;
+    window.localStorage.removeItem(storageKey);
+    window.sessionStorage.removeItem(storageKey);
+    return null;
   } catch {
     return null;
   }
@@ -3122,16 +3656,71 @@ function loadChatPendingRunSnapshot(): ChatPendingRunSnapshot | null {
   return loadChatStoredRunSnapshot(CHAT_PENDING_RUN_STORAGE_KEY);
 }
 
-function loadChatBackgroundRunSnapshot(): ChatPendingRunSnapshot | null {
-  return loadChatStoredRunSnapshot(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+function loadChatBackgroundRunSnapshots(): ChatPendingRunSnapshotMap {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw =
+      window.localStorage.getItem(CHAT_BACKGROUND_RUN_STORAGE_KEY) ??
+      window.sessionStorage.getItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    const snapshots: ChatPendingRunSnapshotMap = {};
+    const addSnapshot = (candidate: unknown, fallbackConversationId = "") => {
+      const normalized = normalizeChatPendingRunSnapshot(candidate);
+      const conversationId = normalized?.conversationId || fallbackConversationId.trim();
+      if (!normalized || !conversationId) return;
+      snapshots[conversationId] = {
+        ...normalized,
+        conversationId
+      };
+    };
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as Record<string, unknown>;
+      if (typeof record.conversationId === "string") {
+        addSnapshot(parsed);
+      } else {
+        for (const [conversationId, value] of Object.entries(record)) {
+          addSnapshot(value, conversationId);
+        }
+      }
+    }
+    return snapshots;
+  } catch {
+    return {};
+  }
 }
 
 function storeChatPendingRunSnapshot(snapshot: ChatPendingRunSnapshot | null): void {
   storeChatStoredRunSnapshot(CHAT_PENDING_RUN_STORAGE_KEY, snapshot);
 }
 
-function storeChatBackgroundRunSnapshot(snapshot: ChatPendingRunSnapshot | null): void {
-  storeChatStoredRunSnapshot(CHAT_BACKGROUND_RUN_STORAGE_KEY, snapshot);
+function storeChatBackgroundRunSnapshots(snapshots: ChatPendingRunSnapshotMap): void {
+  if (typeof window === "undefined") return;
+  try {
+    const trimmedEntries = Object.entries(snapshots)
+      .filter(([conversationId, snapshot]) => {
+        const normalizedConversationId = conversationId.trim();
+        return (
+          !!normalizedConversationId &&
+          !!snapshot &&
+          snapshot.conversationId.trim() === normalizedConversationId
+        );
+      })
+      .sort((a, b) => b[1].startedAt - a[1].startedAt)
+      .slice(0, CHAT_BACKGROUND_RUN_SNAPSHOTS_MAX);
+    if (trimmedEntries.length === 0) {
+      window.localStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+      window.sessionStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(
+      CHAT_BACKGROUND_RUN_STORAGE_KEY,
+      JSON.stringify(Object.fromEntries(trimmedEntries))
+    );
+    window.sessionStorage.removeItem(CHAT_BACKGROUND_RUN_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 function storeChatStoredRunSnapshot(storageKey: string, snapshot: ChatPendingRunSnapshot | null): void {
@@ -3160,6 +3749,14 @@ function clearChatStoredRunSnapshotForConversation(storageKey: string, conversat
   } catch {
     // Ignore storage failures.
   }
+}
+
+function clearChatStoredBackgroundRunSnapshot(conversationId: string): void {
+  if (!conversationId || typeof window === "undefined") return;
+  const snapshots = loadChatBackgroundRunSnapshots();
+  if (!snapshots[conversationId]) return;
+  delete snapshots[conversationId];
+  storeChatBackgroundRunSnapshots(snapshots);
 }
 
 function storeChatPendingLaunch(snapshot: ChatPendingLaunch | null): void {
@@ -3991,6 +4588,181 @@ function parseResearchReport(text: string): ResearchReportPreview | null {
     contradictionCount,
     content: normalized
   };
+}
+
+function collectAssistantExportParagraphs(text: string): string[] {
+  return stripMarkdownDecorations(text)
+    .split(/\n{2,}/)
+    .map((block) => block.replace(/\s+/g, " ").trim())
+    .filter((block) => block.length > 0);
+}
+
+function shortenAssistantExportText(text: string, maxChars = 220): string {
+  const normalized = (text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function deriveAssistantExportHeading(
+  content: string,
+  report: ResearchReportPreview | null,
+  headingHint: string,
+  prompt: string,
+  conversationTitle: string
+): string {
+  const explicitHeading = str(report?.title, headingHint).trim();
+  if (explicitHeading) return explicitHeading;
+
+  const lines = (content || "").replace(/\r\n/g, "\n").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const markdownHeading = trimmed.match(/^#{1,6}\s+(.+)$/);
+    if (markdownHeading) {
+      const candidate = markdownHeading[1].trim();
+      if (candidate.length >= 8 && candidate.length <= 140) {
+        return candidate;
+      }
+      continue;
+    }
+    if (
+      trimmed.length >= 8 &&
+      trimmed.length <= 120 &&
+      !/[.!?]$/.test(trimmed) &&
+      !trimmed.includes("|")
+    ) {
+      return trimmed;
+    }
+  }
+
+  const fallback = prompt || conversationTitle || "AgentArk report";
+  return shortenAssistantExportText(fallback, 110) || "AgentArk report";
+}
+
+function buildAssistantExportSummaryBullets(
+  content: string,
+  report: ResearchReportPreview | null,
+  plan: ExecutionPlanState | null,
+  planFailure: string
+): string[] {
+  const seen = new Set<string>();
+  const bullets: string[] = [];
+  const push = (value: string) => {
+    const cleaned = shortenAssistantExportText(value, 240);
+    if (!cleaned) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    bullets.push(cleaned);
+  };
+
+  if (report) {
+    push(report.summaryPreview || report.summary);
+    report.keyFindings.slice(0, 3).forEach(push);
+  } else {
+    const paragraphs = collectAssistantExportParagraphs(content);
+    paragraphs.slice(0, 2).forEach(push);
+    const recommendationParagraph = paragraphs.find((paragraph) => /\brecommend/i.test(paragraph));
+    if (recommendationParagraph) {
+      push(recommendationParagraph);
+    }
+  }
+
+  if (plan?.steps.length) {
+    push(
+      `${plan.steps.length} execution step${plan.steps.length === 1 ? "" : "s"} captured before or during the run.`
+    );
+  } else if (planFailure) {
+    push(`Execution planning was unavailable: ${planFailure}`);
+  }
+
+  return bullets.slice(0, 4);
+}
+
+function stripDuplicateAssistantExportHeading(content: string, heading: string): string {
+  const lines = (content || "").replace(/\r\n/g, "\n").split("\n");
+  const headingKey = stripMarkdownDecorations(heading).replace(/\s+/g, " ").trim().toLowerCase();
+  let firstNonEmptyIndex = -1;
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    if (lines[idx].trim()) {
+      firstNonEmptyIndex = idx;
+      break;
+    }
+  }
+  if (firstNonEmptyIndex < 0) return "";
+  const firstLineKey = stripMarkdownDecorations(lines[firstNonEmptyIndex])
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (headingKey && headingKey === firstLineKey) {
+    lines.splice(firstNonEmptyIndex, 1);
+  }
+  return lines.join("\n").trim();
+}
+
+function formatAssistantExportBody(content: string, heading: string): string {
+  const deduped = stripDuplicateAssistantExportHeading(content, heading);
+  const lines = deduped.replace(/\r\n/g, "\n").split("\n");
+  const formatted = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return "";
+    const numberedSection = trimmed.match(/^(\d+)\.\s+(.{3,140})$/);
+    if (numberedSection) {
+      return `## ${numberedSection[2].trim()}`;
+    }
+    return line;
+  });
+  return formatted.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function formatExecutionPlanStatusLabel(status: string): string {
+  const normalized = str(status, "").trim().toLowerCase();
+  if (!normalized) return "pending";
+  return normalized.replace(/_/g, " ");
+}
+
+function buildExecutionPlanExportSection(
+  plan: ExecutionPlanState | null,
+  planFailure: string,
+  traceId: string
+): string[] {
+  const lines: string[] = ["## Execution Plan", ""];
+  if (plan?.steps.length) {
+    if (plan.summary.trim()) {
+      lines.push(plan.summary.trim(), "");
+    }
+    plan.steps.forEach((step, index) => {
+      const title = step.title.trim() || `Step ${index + 1}`;
+      const status = formatExecutionPlanStatusLabel(step.status);
+      lines.push(`${index + 1}. **${title}** (${status})`);
+      if (step.description.trim()) {
+        lines.push(`   ${step.description.trim()}`);
+      }
+      step.substeps.forEach((substep) => {
+        const subTitle = substep.title.trim() || `Substep ${substep.id}`;
+        const subStatus = formatExecutionPlanStatusLabel(substep.status);
+        const subDescription = substep.description.trim();
+        lines.push(`   - ${subTitle}${subStatus ? ` (${subStatus})` : ""}`);
+        if (subDescription) {
+          lines.push(`     ${subDescription}`);
+        }
+      });
+      lines.push("");
+    });
+    return lines;
+  }
+  if (planFailure) {
+    lines.push(planFailure, "");
+    return lines;
+  }
+  lines.push(
+    traceId
+      ? "No pre-execution plan was captured in the trace for this reply."
+      : "No trace id was attached to this reply, so plan details were unavailable.",
+    ""
+  );
+  return lines;
 }
 
 function researchReportMetaLabel(report: ResearchReportPreview): string {
@@ -6460,6 +7232,324 @@ function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAc
   );
 }
 
+type ChatStarterCategoryId =
+  | "build"
+  | "watch"
+  | "background"
+  | "research"
+  | "swarm"
+  | "browser"
+  | "security"
+  | "advanced";
+
+type ChatStarterExample = {
+  id: string;
+  title: string;
+  summary: string;
+  prompt: string;
+  category: ChatStarterCategoryId;
+  defaultVisible?: boolean;
+  deepResearch?: boolean;
+};
+
+const CHAT_STARTER_CATEGORY_META: Record<
+  ChatStarterCategoryId,
+  { label: string; description: string }
+> = {
+  build: {
+    label: "Build & deploy",
+    description: "Ship apps, dashboards, pages, and local deployments from chat."
+  },
+  watch: {
+    label: "Watchers & dashboards",
+    description: "Monitor live sources, refresh feeds, and publish useful views."
+  },
+  background: {
+    label: "Background sessions",
+    description: "Keep reminders, follow-ups, and monitoring in one durable session."
+  },
+  research: {
+    label: "Deep research",
+    description: "Run slower, source-backed analysis with a reviewable research plan."
+  },
+  swarm: {
+    label: "Swarm",
+    description: "Split structured work across multiple agents and return one answer."
+  },
+  browser: {
+    label: "Playwright browser automation",
+    description: "Drive the browser, pause for user choices, and inspect pages step by step."
+  },
+  security: {
+    label: "Access & permissions",
+    description: "Check granted tools, connected access, and fallback behavior without overreaching."
+  },
+  advanced: {
+    label: "Advanced",
+    description: "Internal operator prompts for ArkPulse, ArkSentinel, ArkEvolve, trace diagnostics, and system inspection."
+  }
+};
+
+const CHAT_STARTER_CATEGORY_ORDER: ChatStarterCategoryId[] = [
+  "build",
+  "watch",
+  "background",
+  "research",
+  "swarm",
+  "browser",
+  "security"
+];
+
+const CHAT_STARTER_EXAMPLES: ChatStarterExample[] = [
+  {
+    id: "finance-dashboard",
+    title: "Build a finance tracker",
+    summary: "Create a personal finance dashboard with budgets, charts, CSV import/export, SQLite, and a local link.",
+    prompt:
+      "Build me a personal finance tracker dashboard with budgets, charts, CSV import/export, dark mode, mobile support, local SQLite storage, and deploy it locally with a link.",
+    category: "build",
+    defaultVisible: true
+  },
+  {
+    id: "deploy-github-repo",
+    title: "Deploy a GitHub repo locally",
+    summary: "Clone a public repo, run it, and make it available from this machine.",
+    prompt:
+      "Deploy this GitHub repo locally and make it available with a working link: https://github.com/mdn/beginner-html-site-styled",
+    category: "build"
+  },
+  {
+    id: "hn-ai-dashboard",
+    title: "Monitor Hacker News AI stories",
+    summary: "Check top stories every few minutes, summarize strong AI items, and keep a live dashboard updated.",
+    prompt:
+      "Monitor Hacker News top stories every 5 minutes. For stories with 100+ points that mention AI, LLM, or agents, summarize them in 2 sentences, save them to a feed page, and deploy a live dashboard with links.",
+    category: "watch"
+  },
+  {
+    id: "arxiv-rl-feed",
+    title: "Track arXiv ML papers",
+    summary: "Watch recent ML, reinforcement learning, and time-series papers and keep a public feed fresh.",
+    prompt:
+      "Build a static page that refreshes every 10 seconds, pulls the latest arXiv papers, and highlights machine learning, reinforcement learning, time series modeling, and novel approaches.",
+    category: "watch"
+  },
+  {
+    id: "pricing-monitor",
+    title: "Track model pricing changes",
+    summary: "Keep an ongoing session that checks major AI pricing and notifies me only if something changes.",
+    prompt:
+      "Keep monitoring OpenAI, Anthropic, Google AI, and Perplexity pricing in the background. Check twice a day and notify me in app only if pricing or plan tiers change.",
+    category: "background",
+    defaultVisible: true
+  },
+  {
+    id: "reply-tracker",
+    title: "Track replies in one session",
+    summary: "Follow a thread, keep reminders together, and summarize status in the same background session.",
+    prompt:
+      "Track replies from Acme about the partnership proposal in the background. Keep all follow-ups, reminders, and status in one session.",
+    category: "background"
+  },
+  {
+    id: "india-ai-research",
+    title: "Research India AI strategy",
+    summary: "Produce a source-backed view on AI investment, compute, risks, and policy options.",
+    prompt:
+      "Research whether India should aggressively expand domestic AI research investment, frontier-model infrastructure, and public AI compute between 2026 and 2040, including capacity, strategy choices, economic upside, risks, global comparisons, and realistic policy options.",
+    category: "research",
+    defaultVisible: true,
+    deepResearch: true
+  },
+  {
+    id: "next-feature-research",
+    title: "Compare what to build next",
+    summary: "Evaluate product directions with market reasoning, delivery risk, customer impact, and one recommendation.",
+    prompt:
+      "Compare whether we should build invoice OCR, approval workflows, or audit trails next. I want market reasoning, delivery risk, customer impact, and a final recommendation.",
+    category: "research",
+    deepResearch: true
+  },
+  {
+    id: "approval-workflows-launch",
+    title: "Plan a launch with multiple agents",
+    summary: "Break buyer pain points, positioning, rollout, risks, and metrics into a single operator-ready plan.",
+    prompt:
+      "Use multiple agents for this. We run a B2B SaaS for finance teams and need a launch plan for approval workflows, including buyer pain points, positioning, rollout, risks, and success metrics.",
+    category: "swarm"
+  },
+  {
+    id: "trial-to-paid-swarm",
+    title: "Improve trial-to-paid conversion",
+    summary: "Use swarm to find likely causes, propose experiments, define metrics, and call out implementation risks.",
+    prompt:
+      "Use swarm. We need a plan to improve trial-to-paid conversion for our SaaS. Analyze likely causes, propose experiments, define metrics, and identify implementation risks.",
+    category: "swarm"
+  },
+  {
+    id: "wikipedia-pause",
+    title: "Drive the browser and pause",
+    summary: "Navigate a site, stop at the right point, and wait for my choice before continuing.",
+    prompt:
+      "Open https://www.wikipedia.org, search for OpenAI, go to the article, and when you get there stop and ask me whether I should inspect the History section or the Products section.",
+    category: "browser"
+  },
+  {
+    id: "hn-login",
+    title: "Open a login flow",
+    summary: "Go to a login page and handle the browser steps directly inside the task.",
+    prompt:
+      "Go to https://news.ycombinator.com/login and log in for me.",
+    category: "browser"
+  },
+  {
+    id: "kaggle-skill",
+    title: "Read a skill page first",
+    summary: "Fetch a skill file, inspect the flow, and tell me what it requires before taking action.",
+    prompt:
+      "Fetch and read https://www.kaggle.com/static/experimental/sae/SKILL.md, then tell me what the registration and exam flow requires before you continue.",
+    category: "browser"
+  },
+  {
+    id: "google-workspace-tools",
+    title: "Check Google Workspace access",
+    summary: "Inspect which Google Workspace tools are actually available right now.",
+    prompt:
+      "What tools do you currently have for Google Workspace?",
+    category: "security"
+  },
+  {
+    id: "drive-roadmap",
+    title: "Find a Drive file if granted",
+    summary: "Search Drive for a file by name and only succeed if access is really available.",
+    prompt:
+      "Find my Drive file named roadmap.",
+    category: "security"
+  },
+  {
+    id: "places-fallback",
+    title: "Check fallback routing",
+    summary: "Use public search when a connected Places integration is not available.",
+    prompt:
+      "List flight schools near Madhyamgram, Kolkata.",
+    category: "security"
+  },
+  {
+    id: "arkpulse-latest-run",
+    title: "What was ArkPulse latest run?",
+    summary: "Inspect the latest ArkPulse run and summarize the main result.",
+    prompt:
+      "What was ArkPulse latest run?",
+    category: "advanced"
+  },
+  {
+    id: "recent-evolution",
+    title: "What does recent evolution say?",
+    summary: "Summarize recent evolution activity and how the current state looks.",
+    prompt:
+      "What does recent evolution say and how does it look?",
+    category: "advanced"
+  },
+  {
+    id: "sentinel-observations",
+    title: "Show recent sentinel observations",
+    summary: "Inspect recent sentinel observations and call out anything worth attention.",
+    prompt:
+      "Show me recent sentinel observations and anything worth attention.",
+    category: "advanced"
+  },
+  {
+    id: "moltbook-lately",
+    title: "What has Moltbook done lately?",
+    summary: "Review recent Moltbook activity and summarize what it has been doing.",
+    prompt:
+      "What has Moltbook done lately?",
+    category: "advanced"
+  },
+  {
+    id: "latest-trace",
+    title: "Inspect the latest trace",
+    summary: "Read the newest trace and tell me what failed or looks odd.",
+    prompt:
+      "Show me the latest trace and tell me what failed or looks odd.",
+    category: "advanced"
+  },
+  {
+    id: "last-5-traces",
+    title: "Compare the last 5 traces",
+    summary: "Check recent execution traces and identify which tool is failing most.",
+    prompt:
+      "Look at the last 5 execution traces and tell me which tool is failing most.",
+    category: "advanced"
+  },
+  {
+    id: "duplicate-reminders",
+    title: "Find duplicate reminder tasks",
+    summary: "Inspect recent reminder tasks and tell me if duplicates exist.",
+    prompt:
+      "Find recent reminder tasks and tell me if there are duplicates.",
+    category: "advanced"
+  },
+  {
+    id: "arkpulse-running",
+    title: "Check whether ArkPulse is running",
+    summary: "Inspect AgentArk directly and determine whether ArkPulse is running right now.",
+    prompt:
+      "Without guessing, inspect AgentArk and tell me whether ArkPulse is running right now.",
+    category: "advanced"
+  },
+  {
+    id: "trace-by-id",
+    title: "Inspect a trace by ID",
+    summary: "Take a specific trace ID and summarize the failure path precisely.",
+    prompt:
+      "Inspect the trace with id <paste-id-from-trace-page> and summarize the failure path.",
+    category: "advanced"
+  },
+  {
+    id: "schedule-task-logs",
+    title: "Find failed schedule_task logs",
+    summary: "Use the live database if needed and avoid guessing table names while tracing failures.",
+    prompt:
+      "Use the live database if needed, but do not guess table names: find the newest failed operational logs related to schedule_task.",
+    category: "advanced"
+  },
+  {
+    id: "evolution-awaiting-review",
+    title: "Find learning awaiting review",
+    summary: "Inspect what evolution learned recently that still needs review.",
+    prompt:
+      "What has evolution learned recently that is still awaiting review?",
+    category: "advanced"
+  },
+  {
+    id: "arkpulse-vs-traces",
+    title: "Compare ArkPulse warnings with traces",
+    summary: "Check whether recent ArkPulse warnings line up with recent trace failures.",
+    prompt:
+      "Compare recent ArkPulse warnings with recent trace failures and tell me if they line up.",
+    category: "advanced"
+  }
+];
+
+const CHAT_STARTER_DEFAULT_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
+  (example) => example.defaultVisible
+);
+
+const CHAT_STARTER_EXPANDED_SECTIONS = CHAT_STARTER_CATEGORY_ORDER
+  .map((categoryId) => ({
+    id: categoryId,
+    ...CHAT_STARTER_CATEGORY_META[categoryId],
+    items: CHAT_STARTER_EXAMPLES.filter(
+      (example) => example.category === categoryId && !example.defaultVisible
+    )
+  }))
+  .filter((section) => section.items.length > 0);
+
+const CHAT_STARTER_ADVANCED_EXAMPLES = CHAT_STARTER_EXAMPLES.filter(
+  (example) => example.category === "advanced"
+);
+
 function ChatManager({
   autoRefresh,
   isActive,
@@ -6503,8 +7593,11 @@ function ChatManager({
     () => typeof window !== "undefined" && window.innerWidth >= 2000
   );
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
+  const [starterLibraryExpanded, setStarterLibraryExpanded] = useState(false);
+  const [starterAdvancedExpanded, setStarterAdvancedExpanded] = useState(false);
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
+  const [expandedActivityPayloads, setExpandedActivityPayloads] = useState<Set<string>>(new Set());
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">("reuse");
   const [secretHelperKey, setSecretHelperKey] = useState("OPENAI_API_KEY");
   const [secretHelperValue, setSecretHelperValue] = useState("");
@@ -6526,13 +7619,19 @@ function ChatManager({
   const [lastRunSteps, setLastRunSteps] = useState<JsonRecord[]>([]);
   const [conversationMenuAnchor, setConversationMenuAnchor] = useState<HTMLElement | null>(null);
   const [conversationMenuTarget, setConversationMenuTarget] = useState<JsonRecord | null>(null);
+  const [postDeleteConversationFallback, setPostDeleteConversationFallback] = useState<{
+    deletedId: string;
+    preferredId: string | null;
+  } | null>(null);
   const [pendingRunSnapshot, setPendingRunSnapshot] = useState<ChatPendingRunSnapshot | null>(
     () => loadChatPendingRunSnapshot()
   );
-  const [backgroundRunSnapshot, setBackgroundRunSnapshot] = useState<ChatPendingRunSnapshot | null>(
-    () => loadChatBackgroundRunSnapshot()
+  const [backgroundRunSnapshots, setBackgroundRunSnapshots] = useState<ChatPendingRunSnapshotMap>(
+    () => loadChatBackgroundRunSnapshots()
   );
-  const chatBackgroundRefresh = isStreaming || pendingRunSnapshot !== null || backgroundRunSnapshot !== null;
+  const chatBackgroundRefresh =
+    isStreaming || pendingRunSnapshot !== null || Object.keys(backgroundRunSnapshots).length > 0;
+  const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef(0);
   const threadRef = useRef<HTMLDivElement | null>(null);
@@ -6546,6 +7645,8 @@ function ChatManager({
   const streamingStepKeySeqRef = useRef(1);
   const workspaceActivityRef = useRef<HTMLDivElement | null>(null);
   const conversationIdRef = useRef<string | null>(conversationId);
+  const pendingRunSnapshotRef = useRef<ChatPendingRunSnapshot | null>(pendingRunSnapshot);
+  const streamingResponseRef = useRef(streamingResponse);
   const previousInlineSidebarsRef = useRef({
     conversations: viewportWidth >= CHAT_INLINE_CONVERSATIONS_MIN_WIDTH,
     activity: viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH
@@ -6609,9 +7710,16 @@ function ChatManager({
     0,
     CHAT_STARRED_LIMIT
   );
-  const sidebarConversationIds = useMemo(
-    () => new Set([...starredConversations, ...conversations].map((conv) => str(conv.id, ""))),
+  const orderedSidebarConversationIds = useMemo(
+    () =>
+      [...starredConversations, ...conversations]
+        .map((conv) => str(conv.id, "").trim())
+        .filter(Boolean),
     [starredConversations, conversations]
+  );
+  const sidebarConversationIds = useMemo(
+    () => new Set(orderedSidebarConversationIds),
+    [orderedSidebarConversationIds]
   );
   const conversationListTotal = Math.max(0, num(conversationsPayload.total, conversations.length));
   const conversationListLimit = Math.max(
@@ -6683,6 +7791,14 @@ function ChatManager({
   });
 
   const messages = conversationId ? pickRecords(messagesQ.data, "messages") : [];
+  const selectedConversationErrorText = errMessage(selectedConversationQ.error)
+    .replace(/^error:\s*/i, "")
+    .trim()
+    .toLowerCase();
+  const selectedConversationNotFound =
+    !!conversationId &&
+    !sidebarConversationIds.has(conversationId) &&
+    selectedConversationErrorText === "conversation not found";
   const latestAssistantTraceId = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const candidate = messages[i];
@@ -6718,11 +7834,13 @@ function ChatManager({
         const title = str(step.title, "").trim();
         const detail = str(step.detail, "").trim();
         const stepType = str(step.step_type, "").trim();
+        const source = str(step.source, "").trim();
         const data = compactUnknown(step.data, 800);
         if (icon) compacted.icon = icon.slice(0, 64);
         if (title) compacted.title = title.slice(0, 220);
         if (detail) compacted.detail = detail.slice(0, 900);
         if (stepType) compacted.step_type = stepType.slice(0, 80);
+        if (source) compacted.source = source.slice(0, 80);
         if (data) compacted.data = data;
         return compacted;
       });
@@ -6746,6 +7864,14 @@ function ChatManager({
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
+
+  useEffect(() => {
+    pendingRunSnapshotRef.current = pendingRunSnapshot;
+  }, [pendingRunSnapshot]);
+
+  useEffect(() => {
+    streamingResponseRef.current = streamingResponse;
+  }, [streamingResponse]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !conversationId) return;
@@ -6909,6 +8035,49 @@ function ChatManager({
   ]);
 
   useEffect(() => {
+    if (!postDeleteConversationFallback) return;
+    if (conversationId && conversationId !== postDeleteConversationFallback.deletedId) {
+      setPostDeleteConversationFallback(null);
+      return;
+    }
+    if (conversationId) return;
+    const availableIds = orderedSidebarConversationIds.filter(
+      (id) => id !== postDeleteConversationFallback.deletedId
+    );
+    if (availableIds.length > 0) {
+      const nextConversationId =
+        postDeleteConversationFallback.preferredId &&
+        availableIds.includes(postDeleteConversationFallback.preferredId)
+          ? postDeleteConversationFallback.preferredId
+          : availableIds[0];
+      setPostDeleteConversationFallback(null);
+      openConversationById(nextConversationId);
+      return;
+    }
+    if (!convQ.isFetching && conversationListTotal === 0) {
+      setPostDeleteConversationFallback(null);
+    }
+  }, [
+    postDeleteConversationFallback,
+    conversationId,
+    orderedSidebarConversationIds,
+    convQ.isFetching,
+    conversationListTotal
+  ]);
+
+  useEffect(() => {
+    if (!conversationId || pendingRunSnapshot) return;
+    const restoredSnapshot = backgroundRunSnapshots[conversationId];
+    if (!restoredSnapshot) return;
+    const nextBackgroundSnapshots = { ...backgroundRunSnapshots };
+    delete nextBackgroundSnapshots[conversationId];
+    setBackgroundRunSnapshots(nextBackgroundSnapshots);
+    storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
+    setPendingRunSnapshot(restoredSnapshot);
+    storeChatPendingRunSnapshot(restoredSnapshot);
+  }, [conversationId, pendingRunSnapshot, backgroundRunSnapshots]);
+
+  useEffect(() => {
     if (!pendingRunSnapshot) return;
     if (conversationId !== pendingRunSnapshot.conversationId) return;
     if (pendingRunSnapshot.phase === "awaiting_confirmation" || pendingRunSnapshot.phase === "interrupted") return;
@@ -6932,7 +8101,6 @@ function ChatManager({
       shouldKeepPlanInApprovalState(
         restoredPlan,
         preservedSteps,
-        str(latestMessage?.content, ""),
         pendingRunSnapshot.mode === "resume" ? "resume" : "fresh"
       )
     ) {
@@ -7024,6 +8192,18 @@ function ChatManager({
     return normalized
       .replace(/[_-]+/g, " ")
       .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  };
+
+  const toggleExpandedActivityPayload = (id: string) => {
+    setExpandedActivityPayloads((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
   };
 
   const toolStartCopy = (name: string): { label: string; detail: string } => {
@@ -7273,7 +8453,7 @@ function ChatManager({
     const stepType = str(step.step_type, "");
     if (stepType !== "plan_step_update") return;
     if (
-      planConfirmation?.source === "deep_research" ||
+      !!str(planConfirmation?.source, "").trim() ||
       pendingRunSnapshot?.phase === "running" ||
       pendingRunSnapshot?.phase === "awaiting_confirmation"
     ) {
@@ -7627,7 +8807,7 @@ function ChatManager({
     };
   };
 
-  const buildStepCard = (step: JsonRecord, index: number) => {
+  const buildStepCard = (step: JsonRecord, index: number): ActivityTimelineCard => {
     const stepType = str(step.step_type, str(step.type, "step")).toLowerCase();
     const title = str(step.title, "").trim();
     const fullDetail = extractStepDetailText(step, 2800);
@@ -7696,6 +8876,9 @@ function ChatManager({
       detailFull = "";
     }
     const stableId = getStreamingStepStableKey(step);
+    const rawDetailFull = humanDetailRaw ? (fullDetail || rawDetail) : "";
+    const payloadView = buildActivityPayloadViewFromSources(rawDetailFull, step.data);
+    const summary = detailFull || detail;
     return {
       id: stableId || `${time || "live"}-${index}-${label}`,
       index,
@@ -7704,7 +8887,9 @@ function ChatManager({
       label,
       detail,
       detailFull,
-      rawDetailFull: humanDetailRaw ? (fullDetail || rawDetail) : "",
+      summary,
+      rawDetailFull,
+      payloadView,
       isHeartbeat: isHeartbeatStreamingStep(step),
       time
     };
@@ -7728,7 +8913,9 @@ function ChatManager({
         label,
         detail: rawDetail ? simplifyConsoleDetail(rawDetail) : "",
         detailFull: "",
+        summary: rawDetail ? simplifyConsoleDetail(rawDetail) : "",
         rawDetailFull: rawDetail,
+        payloadView: buildActivityPayloadViewFromSources(rawDetail, record.data),
         isHeartbeat: false,
         time: str(record.time, "")
       };
@@ -7740,8 +8927,8 @@ function ChatManager({
     [streamingSteps]
   );
   const pickPrimaryActivityCard = (
-    cards: Array<ReturnType<typeof buildStepCard>>
-  ): ReturnType<typeof buildStepCard> | null => {
+    cards: ActivityTimelineCard[]
+  ): ActivityTimelineCard | null => {
     if (cards.length === 0) return null;
     const last = cards[cards.length - 1];
     if (!last.isHeartbeat) return last;
@@ -7758,7 +8945,7 @@ function ChatManager({
   }, [streamingTraceCards]);
 
   const traceSummaryText = (
-    cards: Array<ReturnType<typeof buildStepCard>>,
+    cards: ActivityTimelineCard[],
     opts?: { loading?: boolean; streaming?: boolean; error?: string }
   ) => {
     if (opts?.error) return "Activity details unavailable.";
@@ -7840,30 +9027,30 @@ function ChatManager({
     }
   };
 
+  const getTraceStepsForExport = async (traceId: string): Promise<JsonRecord[]> => {
+    if (!traceId) return [];
+    if (traceStepsById[traceId]) {
+      return traceStepsById[traceId];
+    }
+    try {
+      const payload = await api.rawGet(`/trace/${encodeURIComponent(traceId)}`);
+      const steps = parseTraceSteps(payload);
+      setTraceStepsById((prev) => ({ ...prev, [traceId]: steps }));
+      return steps;
+    } catch {
+      return [];
+    }
+  };
+
   const detachStreamingRunToBackground = () => {
     if ((!isStreaming && !streamLockRef.current) || !pendingRunSnapshot) return false;
-    if (
-      backgroundRunSnapshot &&
-      backgroundRunSnapshot.conversationId &&
-      backgroundRunSnapshot.conversationId !== pendingRunSnapshot.conversationId
-    ) {
-      setChatError("Another background research thread is already preserved. Return to it before backgrounding a second one.");
+    const backgroundSnapshot = movePendingRunSnapshotToBackground();
+    if (!backgroundSnapshot) {
+      setChatError("This chat has not been attached to a conversation yet. Wait a moment, then try again.");
       return false;
     }
-    const backgroundSnapshot: ChatPendingRunSnapshot = {
-      ...pendingRunSnapshot,
-      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
-      taskId: activeChatTaskIdRef.current || pendingRunSnapshot.taskId || "",
-      streamingResponse: (streamingResponse || pendingRunSnapshot.streamingResponse || "")
-        .slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
-      streamingSteps: trimTrailingHeartbeatSteps(
-        streamingStepsRef.current.length > 0 ? streamingStepsRef.current : streamingSteps
-      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
-    };
     backgroundDetachRef.current = true;
     streamAbortRef.current?.abort();
-    setBackgroundRunSnapshot(backgroundSnapshot);
-    storeChatBackgroundRunSnapshot(backgroundSnapshot);
     setPendingRunSnapshot(null);
     storeChatPendingRunSnapshot(null);
     setChatNotice("Moved the active research run to the background. You can keep chatting elsewhere.");
@@ -7885,10 +9072,24 @@ function ChatManager({
     return true;
   };
 
-  const startNewConversation = () => {
-    if (isStreaming && hasPendingSnapshotForConversation) {
-      detachStreamingRunToBackground();
+  const startNewConversation = (options?: { preserveCurrentRun?: boolean }) => {
+    const preserveCurrentRun = options?.preserveCurrentRun ?? true;
+    if (preserveCurrentRun && isStreaming && hasPendingSnapshotForConversation) {
+      if (!detachStreamingRunToBackground()) return;
+    } else if (preserveCurrentRun && pendingRunSnapshot?.conversationId) {
+      movePendingRunSnapshotToBackground();
     }
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    stopRequestedRef.current = false;
+    backgroundDetachRef.current = false;
+    activeChatTaskIdRef.current = null;
+    reattachedRunIdRef.current = "";
+    streamLockRef.current = false;
+    setIsStreaming(false);
+    setIsStoppingStream(false);
+    setPendingRunSnapshot(null);
+    storeChatPendingRunSnapshot(null);
     if (typeof window !== "undefined") {
       try {
         window.sessionStorage.removeItem(CHAT_LAST_CONVERSATION_STORAGE_KEY);
@@ -7948,7 +9149,9 @@ function ChatManager({
     setChatError(null);
     if (conversationId === id) return;
     if (isStreaming && hasPendingSnapshotForConversation) {
-      detachStreamingRunToBackground();
+      if (!detachStreamingRunToBackground()) return;
+    } else if (pendingRunSnapshot?.conversationId && pendingRunSnapshot.conversationId !== id) {
+      movePendingRunSnapshotToBackground();
     }
     lastWorkspaceRestoreSeedRef.current = "";
     setPlanConfirmation(null);
@@ -7983,14 +9186,16 @@ function ChatManager({
     const restoredSnapshot =
       pendingRunSnapshot?.conversationId === id
         ? pendingRunSnapshot
-        : backgroundRunSnapshot?.conversationId === id
-          ? backgroundRunSnapshot
+        : backgroundRunSnapshots[id]
+          ? backgroundRunSnapshots[id]
           : null;
-    if (restoredSnapshot && restoredSnapshot === backgroundRunSnapshot) {
+    if (restoredSnapshot && backgroundRunSnapshots[id]) {
+      const nextBackgroundSnapshots = { ...backgroundRunSnapshots };
+      delete nextBackgroundSnapshots[id];
+      setBackgroundRunSnapshots(nextBackgroundSnapshots);
+      storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
       setPendingRunSnapshot(restoredSnapshot);
       storeChatPendingRunSnapshot(restoredSnapshot);
-      setBackgroundRunSnapshot(null);
-      storeChatBackgroundRunSnapshot(null);
     }
     if (restoredSnapshot?.conversationId === id) {
       if (restoredSnapshot.message) {
@@ -8011,6 +9216,51 @@ function ChatManager({
       }
     }
   };
+
+  const getConversationFallbackAfterDelete = (deletedId: string): string | null => {
+    const orderedIds = orderedSidebarConversationIds.filter(Boolean);
+    if (orderedIds.length === 0) return null;
+    const deletedIndex = orderedIds.findIndex((id) => id === deletedId);
+    const remainingIds = orderedIds.filter((id) => id !== deletedId);
+    if (remainingIds.length === 0) return null;
+    if (deletedIndex < 0) return remainingIds[0];
+    return remainingIds[Math.min(deletedIndex, remainingIds.length - 1)] || remainingIds[0];
+  };
+
+  useEffect(() => {
+    if (!selectedConversationNotFound || !conversationId || postDeleteConversationFallback) return;
+    if (
+      pendingRunSnapshot ||
+      isStreaming ||
+      pendingUserMessage ||
+      failedUserMessage ||
+      streamingResponse ||
+      messages.length > 0
+    ) {
+      return;
+    }
+    const preferredFallbackId = getConversationFallbackAfterDelete(conversationId);
+    setPostDeleteConversationFallback({
+      deletedId: conversationId,
+      preferredId: preferredFallbackId
+    });
+    startNewConversation({ preserveCurrentRun: false });
+    setChatNotice(
+      preferredFallbackId
+        ? "That chat is no longer available. Loaded another conversation."
+        : "That chat is no longer available."
+    );
+  }, [
+    selectedConversationNotFound,
+    conversationId,
+    postDeleteConversationFallback,
+    pendingRunSnapshot,
+    isStreaming,
+    pendingUserMessage,
+    failedUserMessage,
+    streamingResponse,
+    messages.length
+  ]);
 
   const queueAttachedFiles = (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -8299,28 +9549,63 @@ function ChatManager({
       const report = parseResearchReport(normalizedContent);
       const prompt = (previousUserPrompt || "").trim();
       const conversationTitle = str(selectedConversation?.title, "").trim() || "research";
-      const heading = report?.title || headingHint || prompt || conversationTitle || "research";
-      const safe = heading.replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase() || "research";
+      const cleanTraceId = str(traceId, "").trim();
+      const traceSteps = cleanTraceId ? await getTraceStepsForExport(cleanTraceId) : [];
+      const exportPlan = extractExecutionPlanFromTraceSteps(traceSteps);
+      const exportPlanFailure = extractExecutionPlanFailureFromTraceSteps(traceSteps).trim();
+      const heading = deriveAssistantExportHeading(
+        normalizedContent,
+        report,
+        str(headingHint, "").trim(),
+        prompt,
+        conversationTitle
+      );
+      const summaryBullets = buildAssistantExportSummaryBullets(
+        normalizedContent,
+        report,
+        exportPlan,
+        exportPlanFailure
+      );
+      const detailedResponse = formatAssistantExportBody(normalizedContent, heading);
+      const safe = heading
+        .replace(/[^\w.-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .toLowerCase()
+        .slice(0, 96) || "research";
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const cleanTimestamp = str(timestamp, "").trim();
-      const cleanTraceId = str(traceId, "").trim();
       const lines: string[] = [];
       lines.push(`# ${heading}`);
-      if (conversationId) lines.push(`conversation_id: ${conversationId}`);
-      if (cleanTimestamp) lines.push(`assistant_timestamp: ${cleanTimestamp}`);
-      if (cleanTraceId) lines.push(`trace_id: ${cleanTraceId}`);
-      lines.push(`exported_at: ${new Date().toISOString()}`);
       lines.push("");
+      lines.push("> Exported from AgentArk.");
+      lines.push("");
+      if (summaryBullets.length > 0) {
+        lines.push("## Executive Summary");
+        lines.push("");
+        summaryBullets.forEach((bullet) => lines.push(`- ${bullet}`));
+        lines.push("");
+      }
+      lines.push(...buildExecutionPlanExportSection(exportPlan, exportPlanFailure, cleanTraceId));
       if (prompt) {
-        lines.push("## Prompt");
+        lines.push("## Request");
         lines.push(prompt);
         lines.push("");
       }
-      lines.push("## Response");
-      lines.push(normalizedContent);
+      lines.push("## Report Details");
+      lines.push("");
+      lines.push("| Field | Value |");
+      lines.push("| --- | --- |");
+      lines.push(`| Conversation | ${conversationId || "Not available"} |`);
+      lines.push(`| Assistant time | ${cleanTimestamp || "Not available"} |`);
+      lines.push(`| Trace id | ${cleanTraceId || "Not available"} |`);
+      lines.push(`| Exported at | ${new Date().toISOString()} |`);
+      lines.push("");
+      lines.push("## Detailed Response");
+      lines.push("");
+      lines.push(detailedResponse || normalizedContent);
       lines.push("");
       downloadTextFile(`${safe}-${stamp}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
-      setChatNotice("Reply exported.");
+      setChatNotice("Report exported.");
     } catch (err) {
       setChatError(normalizeChatError(errMessage(err)));
     }
@@ -8525,12 +9810,12 @@ function ChatManager({
             <CircularProgress size={16} thickness={5} className="chat-plan-confirmation-spinner" />
             <Box sx={{ minWidth: 0 }}>
               <Typography variant="body2" className="chat-plan-confirmation-title">
-                Preparing research plan
+                Preparing {planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}
               </Typography>
             </Box>
           </Stack>
           <Typography variant="caption" className="chat-plan-confirmation-inline-note">
-            Building the outline before any research starts.
+            {planConfirmationPlanningNote(planConfirmation?.source)}
           </Typography>
         </Stack>
       ) : (
@@ -8549,12 +9834,12 @@ function ChatManager({
                       summary: e.target.value
                     }))
                   }
-                  placeholder="Add a short research title"
+                  placeholder="Add a short plan title"
                   fullWidth
                 />
               ) : (
                 <Typography variant="body1" className="chat-plan-confirmation-headline">
-                  {planConfirmationSummaryText || "Research outline"}
+                  {planConfirmationSummaryText || planConfirmationOutlineLabel(planConfirmation?.source)}
                 </Typography>
               )}
             </Box>
@@ -8788,7 +10073,7 @@ function ChatManager({
                   }}>
                   <Box sx={{ minWidth: 0, flex: 1 }}>
                     <Typography variant="body1" className="chat-plan-confirmation-headline">
-                      {str(livePlan?.summary, planConfirmationSummaryText || "Research outline")}
+                      {str(livePlan?.summary, planConfirmationSummaryText || planConfirmationOutlineLabel(planConfirmation?.source))}
                     </Typography>
                   </Box>
                   <Typography
@@ -8933,12 +10218,27 @@ function ChatManager({
   const deleteConversationMutation = useMutation({
     mutationFn: (id: string) => api.rawDelete(`/conversations/${encodeURIComponent(id)}`),
     onSuccess: async (_data, id) => {
+      const deletedActiveConversation = conversationId === id;
+      const preferredFallbackId = deletedActiveConversation
+        ? getConversationFallbackAfterDelete(id)
+        : null;
       clearChatWorkspaceSnapshot(id);
       clearChatStoredRunSnapshotForConversation(CHAT_PENDING_RUN_STORAGE_KEY, id);
-      clearChatStoredRunSnapshotForConversation(CHAT_BACKGROUND_RUN_STORAGE_KEY, id);
+      clearChatStoredBackgroundRunSnapshot(id);
       setPendingRunSnapshot((prev) => (prev?.conversationId === id ? null : prev));
-      setBackgroundRunSnapshot((prev) => (prev?.conversationId === id ? null : prev));
-      if (conversationId === id) startNewConversation();
+      setBackgroundRunSnapshots((prev) => {
+        if (!prev[id]) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      if (deletedActiveConversation) {
+        setPostDeleteConversationFallback({
+          deletedId: id,
+          preferredId: preferredFallbackId
+        });
+        startNewConversation({ preserveCurrentRun: false });
+      }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["chat-messages", id] });
       setChatNotice("Chat deleted.");
@@ -8953,7 +10253,7 @@ function ChatManager({
     const shouldDelete = typeof window === "undefined" ? true : window.confirm("Delete this chat and all its messages?");
     if (!shouldDelete) return;
     setChatError(null);
-    const taskIds = [pendingRunSnapshot, backgroundRunSnapshot]
+    const taskIds = [pendingRunSnapshot, backgroundRunSnapshots[id] || null]
       .flatMap((snapshot) =>
         snapshot && snapshot.conversationId === id ? [str(snapshot.taskId, "").trim()] : []
       )
@@ -9006,29 +10306,31 @@ function ChatManager({
             justifyContent: "space-between",
             alignItems: "center"
           }}>
-          <Box sx={{ minWidth: 0, flex: 1 }}>
-            <div className="conversation-card-title" title={title}>
-              {title}
-            </div>
-            {(() => {
-              const updatedAt = str(conv.updated_at, "");
-              if (!updatedAt) return null;
-              const parsed = formatChatTimestamp(updatedAt);
-              return (
-                <Typography
-                  variant="caption"
-                  title={parsed.tooltip}
-                  sx={{
-                    color: "text.secondary",
-                    display: "block",
-                    mt: 0.15,
-                    opacity: 0.88
-                  }}>
-                  {parsed.label}
-                </Typography>
-              );
-            })()}
-          </Box>
+          <Tooltip title={title} placement="top-start" enterDelay={250}>
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <div className="conversation-card-title">
+                {title}
+              </div>
+              {(() => {
+                const updatedAt = str(conv.updated_at, "");
+                if (!updatedAt) return null;
+                const parsed = formatChatTimestamp(updatedAt);
+                return (
+                  <Typography
+                    variant="caption"
+                    title={parsed.tooltip}
+                    sx={{
+                      color: "text.secondary",
+                      display: "block",
+                      mt: 0.15,
+                      opacity: 0.88
+                    }}>
+                    {parsed.label}
+                  </Typography>
+                );
+              })()}
+            </Box>
+          </Tooltip>
           <Stack direction="row" spacing={0.25} sx={{
             alignItems: "center"
           }}>
@@ -9163,7 +10465,7 @@ function ChatManager({
   };
 
   const countMeaningfulActivityCards = (
-    cards: Array<ReturnType<typeof buildStepCard>>
+    cards: ActivityTimelineCard[]
   ): number => {
     const nonHeartbeat = cards.filter((card) => !card.isHeartbeat).length;
     return nonHeartbeat > 0 ? nonHeartbeat : cards.length;
@@ -9257,33 +10559,26 @@ function ChatManager({
     if (stepType === "plan_ready_for_confirmation") {
       const nextPlan = normalizeExecutionPlanState(normalizedIncomingStep.plan);
       const taskId = str(normalizedIncomingStep.task_id, "").trim();
+      const planSource = planConfirmationSourceValue(str(normalizedIncomingStep.source, "").trim());
       setExecutionPlan(nextPlan);
       setExecutionPlanFailure("");
       setExecutionPlanExpanded(false);
       setPlanConfirmation({
         stage: "awaiting_confirmation",
         taskId: taskId || null,
-        source: str(normalizedIncomingStep.source, "deep_research").trim() || "deep_research",
+        source: planSource,
         originalPlan: nextPlan,
         draft: createPlanConfirmationDraft(nextPlan),
         editing: false,
         messageId: null
       });
       markPendingRunAwaitingPlanConfirmation(taskId);
-      setChatNotice("Deep research plan ready. Review it, then Start or Cancel.");
+      setChatNotice(`${planConfirmationDisplayLabel(planSource)} ready. Review it, then Start or Cancel.`);
     }
     if (stepType === "plan_unavailable") {
       setExecutionPlan(null);
       setExecutionPlanFailure(str(normalizedIncomingStep.detail, "Structured planning was unavailable."));
-      setPlanConfirmation((prev) =>
-        prev
-          ? {
-              ...prev,
-              stage: "failed",
-              editing: false
-            }
-          : prev
-      );
+      setPlanConfirmation(null);
     }
     if (stepType === "plan_step_update" && typeof normalizedIncomingStep.step_id === "number") {
       const sid = normalizedIncomingStep.step_id as number;
@@ -9719,6 +11014,46 @@ function ChatManager({
     });
   };
 
+  const reattachToolHandlersRef = useRef({
+    onToolStart: handleStreamToolStart,
+    onToolResult: handleStreamToolResult,
+    onToolProgress: handleStreamToolProgress
+  });
+
+  useEffect(() => {
+    reattachToolHandlersRef.current = {
+      onToolStart: handleStreamToolStart,
+      onToolResult: handleStreamToolResult,
+      onToolProgress: handleStreamToolProgress
+    };
+  }, [handleStreamToolStart, handleStreamToolResult, handleStreamToolProgress]);
+
+  const buildArchivedPendingRunSnapshot = (): ChatPendingRunSnapshot | null => {
+    if (!pendingRunSnapshot?.conversationId) return null;
+    return {
+      ...pendingRunSnapshot,
+      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
+      taskId: activeChatTaskIdRef.current || pendingRunSnapshot.taskId || "",
+      streamingResponse: (streamingResponse || pendingRunSnapshot.streamingResponse || "")
+        .slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS),
+      streamingSteps: trimTrailingHeartbeatSteps(
+        streamingStepsRef.current.length > 0 ? streamingStepsRef.current : streamingSteps
+      ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+    };
+  };
+
+  const movePendingRunSnapshotToBackground = (): ChatPendingRunSnapshot | null => {
+    const archivedSnapshot = buildArchivedPendingRunSnapshot();
+    if (!archivedSnapshot) return null;
+    const nextBackgroundSnapshots = {
+      ...backgroundRunSnapshots,
+      [archivedSnapshot.conversationId]: archivedSnapshot
+    };
+    setBackgroundRunSnapshots(nextBackgroundSnapshots);
+    storeChatBackgroundRunSnapshots(nextBackgroundSnapshots);
+    return archivedSnapshot;
+  };
+
   const runStreamingChat = async (
     message: string,
     files: File[] = [],
@@ -9739,6 +11074,41 @@ function ChatManager({
     const targetConversationId =
       requestedConversationOverride || conversationId || "";
     const targetProjectId = requestedProjectOverride || effectiveProjectId || "";
+    const preservedResumeSnapshot =
+      isResumeMode && targetConversationId
+        ? (() => {
+            const activeSnapshot = pendingRunSnapshotRef.current;
+            if (
+              activeSnapshot &&
+              activeSnapshot.conversationId === targetConversationId &&
+              (!resumeTaskId || !activeSnapshot.taskId || activeSnapshot.taskId === resumeTaskId)
+            ) {
+              return activeSnapshot;
+            }
+            const backgroundSnapshot = backgroundRunSnapshots[targetConversationId];
+            if (
+              backgroundSnapshot &&
+              backgroundSnapshot.conversationId === targetConversationId &&
+              (!resumeTaskId || !backgroundSnapshot.taskId || backgroundSnapshot.taskId === resumeTaskId)
+            ) {
+              return backgroundSnapshot;
+            }
+            return null;
+          })()
+        : null;
+    const preservedResumeResponse = preservedResumeSnapshot
+      ? str(preservedResumeSnapshot.streamingResponse, "").slice(
+          0,
+          CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS
+        )
+      : "";
+    const preservedResumeSteps = preservedResumeSnapshot
+      ? trimTrailingHeartbeatSteps(
+          asRecords(preservedResumeSnapshot.streamingSteps).map((step) =>
+            ensureActivityStepTime(step)
+          )
+        ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
+      : [];
     let activeMessage = isResumeMode
       ? ""
       : message.trim() ||
@@ -9808,8 +11178,9 @@ function ChatManager({
         /^\s*use current (llm|model) (key|config)(?:\s+for\s+.+)?\s*$/i.test(activeMessage));
     setPendingUserMessage(!isResumeMode && !sensitiveMessage ? activeMessage : null);
     setFailedUserMessage(null);
-    setStreamingResponse("");
-    setStreamingSteps([]);
+    setStreamingResponse(preservedResumeResponse);
+    setStreamingSteps(preservedResumeSteps);
+    streamingStepsRef.current = preservedResumeSteps;
     if (isResumeMode && planOverride) {
       setExecutionPlan(planOverride);
       setExecutionPlanFailure("");
@@ -9843,15 +11214,17 @@ function ChatManager({
     }
     const initialPendingSnapshot: ChatPendingRunSnapshot = {
       conversationId: targetConversationId,
-      message: !isResumeMode && !sensitiveMessage ? activeMessage : "",
+      message: !isResumeMode && !sensitiveMessage
+        ? activeMessage
+        : str(preservedResumeSnapshot?.message, ""),
       projectId: targetProjectId,
       startedAt: Date.now(),
       runId: "",
       mode: isResumeMode ? "resume" : "fresh",
       phase: "running",
       taskId: resumeTaskId,
-      streamingResponse: "",
-      streamingSteps: [],
+      streamingResponse: preservedResumeResponse,
+      streamingSteps: preservedResumeSteps,
       failedUserMessage: ""
     };
     storeChatPendingRunSnapshot(initialPendingSnapshot);
@@ -9860,7 +11233,7 @@ function ChatManager({
     let resolvedConversationId = targetConversationId;
     let payloadMessage = activeMessage;
     let streamError: string | null = null;
-    let latestStreamingResponse = "";
+    let latestStreamingResponse = preservedResumeResponse;
     const absorbConversationId = (payload: unknown) => {
       const obj = asRecord(payload);
       const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, "")));
@@ -9983,7 +11356,7 @@ function ChatManager({
             setChatNotice(`Task ${statusLabel}: ${description}`);
             if (
               (status === "paused" || status === "awaiting_approval") &&
-              (deepResearch || Boolean(planOverride) || planConfirmation?.source === "deep_research")
+              (deepResearch || Boolean(planOverride) || !!str(planConfirmation?.source, "").trim())
             ) {
               markPendingRunAwaitingPlanConfirmation(taskId);
             }
@@ -10074,7 +11447,7 @@ function ChatManager({
             setChatNotice(`Task ${statusLabel}: ${description}`);
             if (
               (status === "paused" || status === "awaiting_approval") &&
-              (deepResearch || Boolean(planOverride) || planConfirmation?.source === "deep_research")
+              (deepResearch || Boolean(planOverride) || !!str(planConfirmation?.source, "").trim())
             ) {
               markPendingRunAwaitingPlanConfirmation(taskId);
             }
@@ -10110,10 +11483,43 @@ function ChatManager({
       backgroundDetachRef.current = false;
       const wasStopped = stopRequestedRef.current && !streamError;
       const finalTaskId = activeChatTaskIdRef.current || resumeTaskId || "";
+      const completedStreamingSteps = trimTrailingHeartbeatSteps(streamingStepsRef.current);
+      const latestRunStatusFromStream = extractLatestRunStatusSummary(completedStreamingSteps);
+      const hadUsablePlanInStream =
+        completedStreamingSteps.some((step) => {
+          const stepType = str(step.step_type, "").trim().toLowerCase();
+          return (
+            stepType === "plan_generated" ||
+            stepType === "plan_revised" ||
+            stepType === "plan_ready_for_confirmation" ||
+            stepType === "plan_step_update"
+          );
+        }) ||
+        !!extractExecutionPlanFromTraceSteps(completedStreamingSteps);
+      const explicitPlanningFailure =
+        extractExecutionPlanFailureFromTraceSteps(completedStreamingSteps).trim();
+      const terminalPlanningFailure =
+        !detachedToBackground &&
+        !wasStopped &&
+        deepResearch &&
+        !isResumeMode &&
+        !planOverride &&
+        !hadUsablePlanInStream &&
+        (Boolean(streamError) ||
+          Boolean(explicitPlanningFailure) ||
+          isTerminalDeepResearchFailureStatus(str(latestRunStatusFromStream?.status, "")));
+      const terminalPlanningFailureDetail =
+        explicitPlanningFailure ||
+        str(latestRunStatusFromStream?.detail, "").trim() ||
+        streamError ||
+        "Deep research could not prepare a usable plan.";
       if (streamError) {
         setChatError(streamError);
         setPlanConfirmation((prev) => {
           if (!prev) return prev;
+          if (terminalPlanningFailure) {
+            return null;
+          }
           if (isResumeMode && planOverride) {
             return {
               ...prev,
@@ -10130,6 +11536,9 @@ function ChatManager({
         if (!sensitiveMessage && !isResumeMode) {
           setFailedUserMessage(activeMessage);
         }
+      } else if (terminalPlanningFailure) {
+        setExecutionPlanFailure(terminalPlanningFailureDetail);
+        setPlanConfirmation(null);
       }
       await queryClient.invalidateQueries({ queryKey: ["chat-conversations"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
@@ -10139,6 +11548,13 @@ function ChatManager({
       await queryClient.invalidateQueries({ queryKey: ["swarm-delegations"] });
       if (!detachedToBackground && !streamError && !wasStopped) {
         setFailedUserMessage(null);
+        if (
+          !!str(planConfirmation?.source, "").trim() &&
+          pendingSnapshotPhase !== "awaiting_confirmation" &&
+          pendingSnapshotPhase !== "interrupted"
+        ) {
+          setPlanConfirmation(null);
+        }
         const candidateConversationId = resolvedConversationId || targetConversationId;
         if (candidateConversationId) {
           try {
@@ -10216,14 +11632,41 @@ function ChatManager({
           streamingStepsRef.current = [];
           setStreamingResponse("");
         }
-      } else if (streamError) {
-        storeChatPendingRunSnapshot(null);
-        setPendingRunSnapshot(null);
-        setPendingUserMessage(null);
-        setStreamingSteps([]); setExecutionPlan(null); setExecutionPlanFailure("");
-        setExecutionPlanExpanded(false);
-        streamingStepsRef.current = [];
-        setStreamingResponse("");
+      } else if (streamError || terminalPlanningFailure) {
+        if (streamError && isResumeMode && preservedResumeSnapshot) {
+          const restoredInterruptedSnapshot: ChatPendingRunSnapshot = {
+            ...preservedResumeSnapshot,
+            conversationId: resolvedConversationId || targetConversationId,
+            projectId: targetProjectId || preservedResumeSnapshot.projectId || "",
+            taskId: finalTaskId || preservedResumeSnapshot.taskId || "",
+            phase: "interrupted",
+            streamingResponse: preservedResumeResponse,
+            streamingSteps: preservedResumeSteps
+          };
+          storeChatPendingRunSnapshot(restoredInterruptedSnapshot);
+          setPendingRunSnapshot(restoredInterruptedSnapshot);
+          setPendingUserMessage(null);
+          setStreamingSteps(preservedResumeSteps);
+          setExecutionPlan(null);
+          setExecutionPlanFailure("");
+          setExecutionPlanExpanded(false);
+          streamingStepsRef.current = preservedResumeSteps;
+          setStreamingResponse(preservedResumeResponse);
+        } else {
+          storeChatPendingRunSnapshot(null);
+          setPendingRunSnapshot(null);
+          setPendingUserMessage(null);
+          setStreamingSteps([]);
+          setExecutionPlan(null);
+          if (terminalPlanningFailure) {
+            setExecutionPlanFailure(terminalPlanningFailureDetail);
+          } else {
+            setExecutionPlanFailure("");
+          }
+          setExecutionPlanExpanded(false);
+          streamingStepsRef.current = [];
+          setStreamingResponse("");
+        }
       }
       streamAbortRef.current = null;
       activeChatTaskIdRef.current = null;
@@ -10235,25 +11678,30 @@ function ChatManager({
     return !streamError;
   };
 
+  const reattachRunId = str(pendingRunSnapshot?.runId, "").trim();
+  const reattachConversationId = str(pendingRunSnapshot?.conversationId, "").trim();
+  const reattachPhase = str(pendingRunSnapshot?.phase, "").trim().toLowerCase();
+  const reattachTaskId = str(pendingRunSnapshot?.taskId, "").trim();
+
   useEffect(() => {
-    const runId = str(pendingRunSnapshot?.runId, "").trim();
-    const pendingConversationId = str(pendingRunSnapshot?.conversationId, "").trim();
+    const runId = reattachRunId;
+    const pendingConversationId = reattachConversationId;
     if (!runId || !pendingConversationId) return;
-    if (pendingRunSnapshot?.phase === "interrupted" || pendingRunSnapshot?.phase === "awaiting_confirmation") return;
+    if (reattachPhase === "interrupted" || reattachPhase === "awaiting_confirmation") return;
     if (!conversationId || conversationId !== pendingConversationId) return;
     if (isStreaming || streamLockRef.current) return;
     if (reattachedRunIdRef.current === runId) return;
 
     reattachedRunIdRef.current = runId;
     const abortController = new AbortController();
-    let latestStreamingResponse = streamingResponse;
+    let latestStreamingResponse = streamingResponseRef.current;
 
     const absorbRunPayload = (payload: unknown) => {
       const obj = asRecord(payload);
       const cid = str(obj.conversation_id, str(obj.cid, str(obj.conversationId, pendingConversationId)));
       const nextRunId = str(obj.run_id, runId);
       setPendingRunSnapshot((prev) => {
-        const base = prev ?? pendingRunSnapshot ?? {
+        const base = prev ?? pendingRunSnapshotRef.current ?? {
           conversationId: cid,
           message: "",
           projectId: effectiveProjectId || "",
@@ -10300,9 +11748,11 @@ function ChatManager({
         absorbRunPayload(step);
         pushStreamingStep(step);
       },
-      onToolStart: handleStreamToolStart,
-      onToolResult: handleStreamToolResult,
-      onToolProgress: handleStreamToolProgress,
+      onToolStart: (name, payload) => reattachToolHandlersRef.current.onToolStart(name, payload),
+      onToolResult: (name, content, payload) =>
+        reattachToolHandlersRef.current.onToolResult(name, content, payload),
+      onToolProgress: (name, content, payload) =>
+        reattachToolHandlersRef.current.onToolProgress(name, content, payload),
       onContent: (payload) => {
         const text = str(payload.content, "");
         if (text) {
@@ -10325,7 +11775,10 @@ function ChatManager({
               reason: normalizedError
             }
           });
-          markPendingRunInterrupted(str(pendingRunSnapshot?.taskId, ""), latestStreamingResponse);
+          markPendingRunInterrupted(
+            reattachTaskId || str(pendingRunSnapshotRef.current?.taskId, ""),
+            latestStreamingResponse
+          );
           setPlanConfirmation((prev) =>
             prev
               ? {
@@ -10346,8 +11799,9 @@ function ChatManager({
     }).finally(() => {
       if (!abortController.signal.aborted) {
         setChatNotice(null);
-        if (!latestStreamingResponse && str(pendingRunSnapshot?.streamingResponse, "")) {
-          setStreamingResponse(str(pendingRunSnapshot?.streamingResponse, ""));
+        const preservedResponse = str(pendingRunSnapshotRef.current?.streamingResponse, "");
+        if (!latestStreamingResponse && preservedResponse) {
+          setStreamingResponse(preservedResponse);
         }
       }
     });
@@ -10359,15 +11813,14 @@ function ChatManager({
       }
     };
   }, [
-    pendingRunSnapshot,
+    reattachRunId,
+    reattachConversationId,
+    reattachPhase,
+    reattachTaskId,
     conversationId,
     isStreaming,
-    streamingResponse,
     effectiveProjectId,
-    queryClient,
-    handleStreamToolStart,
-    handleStreamToolResult,
-    handleStreamToolProgress
+    queryClient
   ]);
 
   const handleStopStreaming = async () => {
@@ -10442,7 +11895,7 @@ function ChatManager({
     }
     try {
       await api.cancelTask(taskId);
-      setChatNotice("Deep research plan canceled.");
+      setChatNotice(`${planConfirmationDisplayLabel(planConfirmation?.source)} canceled.`);
       clearPlanConfirmationPreviewState();
       await queryClient.invalidateQueries({ queryKey: ["tasks"] });
       await queryClient.invalidateQueries({ queryKey: ["tasks-manager"] });
@@ -10513,8 +11966,8 @@ function ChatManager({
       clearPlanConfirmationPreviewState();
       setChatNotice(
         deepResearchEnabled
-          ? "Updating the deep research plan..."
-          : "Discarding the paused deep research plan and sending your message..."
+          ? `Updating the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
+          : `Discarding the paused ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()} and sending your message...`
       );
     }
 
@@ -10714,7 +12167,6 @@ function ChatManager({
       shouldKeepPlanInApprovalState(
         restoredPlan,
         pendingSteps,
-        str(lastMsg?.content, ""),
         pendingSnapshotMode
       )
     ) {
@@ -10903,20 +12355,6 @@ function ChatManager({
         </Box>
       </Box>
     ));
-  const starterPrompts = [
-    {
-      label: "Send me a daily brief",
-      prompt: "Every weekday at 9am, send me a daily brief with weather, calendar, urgent email, and overdue tasks."
-    },
-    {
-      label: "Watch something for me",
-      prompt: "Watch my inbox for urgent client messages and alert me if I don't reply within 2 hours."
-    },
-    {
-      label: "Deploy an app from chat",
-      prompt: "Build me a simple landing page and deploy it with a public URL."
-    }
-  ];
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const latestAssistantMessageText = str(
     [...messages].reverse().find((m) => str(m.role, "").toLowerCase() === "assistant")?.content,
@@ -10964,6 +12402,7 @@ function ChatManager({
   const displayedExecutionPlanFailure = executionPlanFailure || persistedExecutionPlanFailure;
   const hasVisibleExecutionPlanContext =
     displayedExecutionPlan.length > 0 ||
+    !!displayedExecutionPlanFailure ||
     (planConfirmation?.originalPlan?.steps?.length ?? 0) > 0 ||
     (persistedExecutionPlan?.steps?.length ?? 0) > 0;
   const visibleExecutionPlanFailure = hasVisibleExecutionPlanContext ? displayedExecutionPlanFailure : "";
@@ -11010,17 +12449,53 @@ function ChatManager({
   );
   const planConfirmationDepthCue = isAwaitingPlanConfirmation
     ? planConfirmationEnabledCount > 0
-      ? `Will expand these ${planConfirmationEnabledCount} approved step${planConfirmationEnabledCount === 1 ? "" : "s"} into detailed live research work after you press Start.`
-      : "Select at least one step to continue the deep research run."
+      ? `Will expand these ${planConfirmationEnabledCount} approved step${planConfirmationEnabledCount === 1 ? "" : "s"} into live execution after you press Start.`
+      : "Select at least one step to continue."
     : isRunningPlanConfirmation
-      ? "This is the approved plan. Live substeps and status updates should stay attached here while the research runs."
-    : isCompletedPlanConfirmation
+      ? "This is the approved plan. Live substeps and status updates should stay attached here while the run executes."
+      : isCompletedPlanConfirmation
       ? "This is the approved plan with the final execution progress merged into it."
-    : isFailedPlanConfirmation
+      : isFailedPlanConfirmation
       ? "This is the approved plan with the latest execution state preserved from the failed run."
-    : isInterruptedPlanConfirmation
+      : isInterruptedPlanConfirmation
       ? "This run was interrupted. The approved plan and the last saved progress are preserved here."
-    : "Preparing a compact, source-backed research outline.";
+    : "Preparing a structured execution outline.";
+
+  const resizeComposerTextarea = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
+  };
+
+  const applyStarterExample = (example: ChatStarterExample) => {
+    setPrompt(example.prompt);
+    setDeepResearchEnabled(Boolean(example.deepResearch));
+    setChatError(null);
+    setChatNotice(null);
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        const el = composerTextareaRef.current;
+        if (!el) return;
+        el.focus();
+        const end = example.prompt.length;
+        try {
+          el.setSelectionRange(end, end);
+        } catch {
+          // Ignore selection errors on browsers that do not support it here.
+        }
+        resizeComposerTextarea(el);
+      });
+    }
+  };
+
+  useLayoutEffect(() => {
+    resizeComposerTextarea(composerTextareaRef.current);
+  }, [prompt]);
+
+  useEffect(() => {
+    if (starterLibraryExpanded) return;
+    setStarterAdvancedExpanded(false);
+  }, [starterLibraryExpanded]);
 
   useEffect(() => {
     if (!planConfirmation || planConfirmation.stage === "planning") return;
@@ -11064,14 +12539,12 @@ function ChatManager({
       shouldKeepPlanInApprovalState(
         executionPlan,
         approvalRepairSourceSteps,
-        latestAssistantMessageText,
         pendingSnapshotMode
       ),
     [
       approvalRepairSourceSteps,
       executionPlan,
       hasPendingSnapshotForConversation,
-      latestAssistantMessageText,
       pendingSnapshotMode,
       pendingSnapshotPhase
     ]
@@ -11096,7 +12569,10 @@ function ChatManager({
       return {
         stage: "awaiting_confirmation",
         taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
-        source: prev?.source || "deep_research",
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
         originalPlan: nextOriginalPlan,
         draft: nextDraft,
         editing: false,
@@ -11104,6 +12580,7 @@ function ChatManager({
       };
     });
   }, [
+    approvalRepairSourceSteps,
     executionPlan,
     pendingRunSnapshot?.taskId,
     pendingSnapshotPhase,
@@ -11114,6 +12591,10 @@ function ChatManager({
   useEffect(() => {
     if (!executionPlan || pendingSnapshotPhase !== "awaiting_confirmation") return;
     const resolvedTaskId = str(pendingRunSnapshot?.taskId, "").trim() || null;
+    const inferredSource =
+      planConfirmation?.source ||
+      extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+      "execution";
     const needsRepair =
       !planConfirmation ||
       planConfirmation.stage === "planning" ||
@@ -11127,7 +12608,7 @@ function ChatManager({
       return {
         stage: "awaiting_confirmation",
         taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
-        source: prev?.source || "deep_research",
+        source: prev?.source || inferredSource,
         originalPlan: nextOriginalPlan,
         draft: nextDraft,
         editing: false,
@@ -11135,9 +12616,9 @@ function ChatManager({
       };
     });
     if (planConfirmation?.stage !== "awaiting_confirmation") {
-      setChatNotice("Deep research plan ready. Review it, edit it, or ask for changes below.");
+      setChatNotice(`${planConfirmationDisplayLabel(inferredSource)} ready. Review it, edit it, or ask for changes below.`);
     }
-  }, [executionPlan, pendingRunSnapshot?.taskId, pendingSnapshotPhase, planConfirmation]);
+  }, [approvalRepairSourceSteps, executionPlan, pendingRunSnapshot?.taskId, pendingSnapshotPhase, planConfirmation]);
 
   useEffect(() => {
     if (!executionPlan || pendingSnapshotPhase !== "interrupted" || !hasPendingSnapshotForConversation) {
@@ -11157,7 +12638,10 @@ function ChatManager({
       return {
         stage: "interrupted",
         taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
-        source: prev?.source || "deep_research",
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
         originalPlan: nextOriginalPlan,
         draft: nextDraft,
         editing: false,
@@ -11194,7 +12678,10 @@ function ChatManager({
       return {
         stage: "running",
         taskId: str(prev?.taskId, resolvedTaskId || "").trim() || null,
-        source: prev?.source || "deep_research",
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(approvalRepairSourceSteps) ||
+          "execution",
         originalPlan: nextOriginalPlan,
         draft: createPlanConfirmationDraft(nextOriginalPlan),
         editing: false,
@@ -11202,6 +12689,7 @@ function ChatManager({
       };
     });
   }, [
+    approvalRepairSourceSteps,
     executionPlan,
     hasPendingSnapshotForConversation,
     pendingRunSnapshot?.taskId,
@@ -11280,13 +12768,14 @@ function ChatManager({
     for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
       const candidate = asRecord(messages[idx]);
       if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
-      const content = str(candidate.content, "");
-      if (!looksLikeRedundantPlanPreviewMessage(content)) continue;
+      const traceId = str(candidate.trace_id, "").trim();
+      const traceSteps = traceId ? traceStepsById[traceId] || [] : [];
+      if (traceSteps.length === 0) continue;
+      if (!activityStepsRepresentAwaitingPlanConfirmation(traceSteps)) continue;
       return str(candidate.id, String(idx)).trim() || null;
     }
     return null;
-  }, [messages]);
-  const hasDeepResearchPlanContext = !!deepResearchPlanPreviewMessageId;
+  }, [messages, traceStepsById]);
   const workspaceSteps = useMemo(() => {
     const compressed = compressActivitySteps(workspaceStepsSource);
     if (
@@ -11297,6 +12786,14 @@ function ChatManager({
     }
     return compressed;
   }, [workspaceStepsSource, pendingSnapshotPhase, planConfirmation?.stage]);
+  const hasDeepResearchPlanContext = Boolean(
+    !!str(planConfirmation?.source, "").trim() ||
+    pendingSnapshotPhase === "awaiting_confirmation" ||
+    (displayedExecutionPlan.length > 0 &&
+      (activityStepsHaveExecutionPlanContext(workspaceStepsSource) ||
+        pendingSnapshotPhase === "interrupted")) ||
+    deepResearchPlanPreviewMessageId
+  );
   const swarmActivityRuns = useMemo(
     () =>
       buildSwarmRunsFromStreamingSteps(workspaceSteps, {
@@ -11315,7 +12812,7 @@ function ChatManager({
       const traceId = str(message.trace_id, "").trim();
       if (traceId) expanded.add(traceId);
     });
-    const out: Record<string, Array<ReturnType<typeof buildStepCard>>> = {};
+    const out: Record<string, ActivityTimelineCard[]> = {};
     expanded.forEach((traceId) => {
       const steps = traceStepsById[traceId] || [];
       out[traceId] = steps.map((step, idx) => safeBuildStepCard(step, idx));
@@ -11345,7 +12842,7 @@ function ChatManager({
       rows.push({
         label: row.label,
         status,
-        detail: row.detail || "",
+        detail: row.summary || row.detail || "",
         time: row.time || "",
         tone: row.tone
       });
@@ -11511,11 +13008,13 @@ function ChatManager({
       /api.?key.*required/.test(chatErrorLower) ||
       /api.?key.*required/.test(chatErrorNormalized) ||
       /^unauthorized\b/.test(chatErrorLower));
+  const searchIssueText = [
+    chatError || "",
+    executionPlanFailure || "",
+    latestRunStatusSummary?.detail || ""
+  ].filter(Boolean).join("\n");
   const searchSetupActionNeeded =
-    !!chatError &&
-    /configure serper or brave search api for reliable research/i.test(
-      normalizeChatError(chatError)
-    );
+    isSearchBackendSetupIssue(searchIssueText);
   const visibleConversationError =
     visibleConversationListError ||
     visibleMessagesError ||
@@ -11546,13 +13045,14 @@ function ChatManager({
     !currentWorkspaceIssue &&
     workspaceCards.length > 0 &&
     latestWorkspaceCard?.kind === "Done";
+  const activityUpdateCountLabel = `${workspaceCards.length} update${workspaceCards.length === 1 ? "" : "s"}`;
   const progressSummary = !progressRows.length
     ? "No activity yet"
     : showStreamingAssistant
-      ? `${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
+      ? activityUpdateCountLabel
       : hasCompletedWorkspaceRun
-        ? `Run completed - ${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`
-        : `${workspaceCards.length} log line${workspaceCards.length === 1 ? "" : "s"}`;
+        ? `Run completed - ${activityUpdateCountLabel}`
+        : activityUpdateCountLabel;
   const executionPlanCompletedCount = displayedExecutionPlan.filter((step) => step.status === "completed").length;
   const executionPlanActiveCount = displayedExecutionPlan.filter((step) => step.status === "running").length;
   const executionPlanFailedCount = displayedExecutionPlan.filter((step) => step.status === "failed").length;
@@ -11773,7 +13273,6 @@ function ChatManager({
     const anchoredMessageId = str(deepResearchPlanPreviewMessageId, "").trim() || null;
     const needsRepair =
       !planConfirmation ||
-      planConfirmation.source !== "deep_research" ||
       planConfirmation.stage !== restoredDeepResearchStage ||
       !planConfirmation.originalPlan ||
       !planConfirmation.draft ||
@@ -11784,7 +13283,10 @@ function ChatManager({
       return {
         stage: restoredDeepResearchStage,
         taskId: str(prev?.taskId, "").trim() || null,
-        source: "deep_research",
+        source:
+          prev?.source ||
+          extractPlanConfirmationSourceFromSteps(workspaceStepsSource) ||
+          "execution",
         originalPlan: nextOriginalPlan,
         draft: createPlanConfirmationDraft(nextOriginalPlan),
         editing: false,
@@ -11796,7 +13298,8 @@ function ChatManager({
     displayedExecutionPlanState,
     hasDeepResearchPlanContext,
     planConfirmation,
-    restoredDeepResearchStage
+    restoredDeepResearchStage,
+    workspaceStepsSource
   ]);
 
   const composerLockedForPlanConfirmation = isPlanningDeepResearch;
@@ -11833,15 +13336,6 @@ function ChatManager({
       });
     }
 
-    if (showStreamingAssistant || hasPendingSnapshotForConversation || activeConversationSession) {
-      rows.push({
-        label: "Run",
-        value: workspaceStatusCopy.line1.replace(/^Status:\s*/i, "").trim() || "Running",
-        detail: workspaceStatusCopy.line2,
-        tone: workspaceStatusCopy.tone === "warning" ? "warning" : "live"
-      });
-    }
-
     if (activeWorkspaceApp) {
       rows.push({
         label: "Runtime",
@@ -11871,16 +13365,12 @@ function ChatManager({
     activeWorkspaceApp,
     activeWorkspaceAppId,
     activeWorkspaceAppTitle,
-    activeConversationSession,
     apiKeyActionNeeded,
-    hasPendingSnapshotForConversation,
     previewUrl,
     publicPreviewUrl,
     runtimeSummary.label,
     runtimeSummary.tone,
     safetyPolicyBlocked,
-    showStreamingAssistant,
-    workspaceStatusCopy.line1,
     workspaceStatusCopy.line2
   ]);
 
@@ -11910,7 +13400,7 @@ function ChatManager({
             size="small"
             variant="outlined"
             className="chat-toolbar-btn"
-            onClick={startNewConversation}
+            onClick={() => startNewConversation()}
           >
             New chat
           </Button>
@@ -12109,10 +13599,6 @@ function ChatManager({
             ))}
           </Box>
         ) : null}
-        {swarmActivityRuns.length > 0 ? (
-          <SwarmActivityPanel runs={swarmActivityRuns} interrupted={showInterruptedRunCard} />
-        ) : null}
-
         <Box className="term-shell">
           <Box className="term-titlebar">
             <Typography variant="caption" className="term-titlebar-text">
@@ -12147,28 +13633,15 @@ function ChatManager({
               workspaceCards.map((row, idx) => {
                 const isLast = idx === workspaceCards.length - 1;
                 const isActive = isLast && isStreamingForCurrentConversation;
-                const lineTone =
-                  row.kind === "Issue"
-                    ? "var(--danger, #ff7a7a)"
-                    : row.kind === "Done"
-                      ? "var(--success, #74f7bf)"
-                      : row.kind === "Running"
-                        ? "var(--accent-strong, #7fe7ff)"
-                        : row.kind === "Planning"
-                          ? "var(--warning, #ffd36a)"
-                          : "rgba(191, 222, 255, 0.92)";
+                const payloadKey = `live:${row.id}`;
                 return (
-                  <Box key={`activity-${row.id}`} className={`term-line${isActive ? " term-line-active" : ""}`}>
-                    <span className="term-prompt" style={{ color: lineTone }}>-</span>
-                    <Box className="term-content">
-                      <div className="term-label" style={{ color: lineTone }}>
-                        {row.time ? `[${formatTraceStepTime(row.time)}] ` : ""}{row.label}
-                      </div>
-                      {(row.detailFull || row.detail) ? (
-                        <div className="term-detail">{row.detailFull || row.detail || ""}</div>
-                      ) : null}
-                    </Box>
-                  </Box>
+                  <ActivityTimelineRow
+                    key={`activity-${row.id}`}
+                    row={row}
+                    isActive={isActive}
+                    payloadExpanded={expandedActivityPayloads.has(payloadKey)}
+                    onTogglePayload={() => toggleExpandedActivityPayload(payloadKey)}
+                  />
                 );
               })
             )}
@@ -12486,8 +13959,7 @@ function ChatManager({
                 size="small"
                 variant="outlined"
                 className="chat-toolbar-btn"
-                onClick={startNewConversation}
-                disabled={isStreaming}
+                onClick={() => startNewConversation()}
               >
                 New chat
               </Button>
@@ -12591,29 +14063,148 @@ function ChatManager({
                     ? "Send one message and AgentArk will turn this draft into a working run."
                     : "Start from the result, not the implementation details. The workspace is shaped to keep that request centered."}
                 </Typography>
-                <Stack
-                  direction="row"
-                  spacing={0.75}
-                  useFlexGap
-                  sx={{
-                    flexWrap: "wrap",
-                    justifyContent: "center"
-                  }}>
-                  {starterPrompts.map((item) => (
+                <Box className="chat-starter-shell">
+                  <Typography variant="caption" className="chat-starter-caption">
+                    Start from one of the common task shapes below. The message lands in the composer so you can edit it before sending.
+                  </Typography>
+                  <Box className="chat-starter-grid">
+                    {CHAT_STARTER_DEFAULT_EXAMPLES.map((item) => {
+                      const categoryMeta = CHAT_STARTER_CATEGORY_META[item.category];
+                      return (
+                        <Button
+                          key={item.id}
+                          variant="outlined"
+                          className="chat-starter-card"
+                          onClick={() => applyStarterExample(item)}
+                        >
+                          <Box className="chat-starter-card-body">
+                            <Box className="chat-starter-card-meta">
+                              <span className="chat-starter-tag">{categoryMeta.label}</span>
+                              {item.deepResearch && item.category !== "research" ? (
+                                <span className="chat-starter-tag research">Deep research</span>
+                              ) : null}
+                            </Box>
+                            <Typography component="span" className="chat-starter-card-title">
+                              {item.title}
+                            </Typography>
+                            <Typography component="span" className="chat-starter-card-copy">
+                              {item.summary}
+                            </Typography>
+                          </Box>
+                        </Button>
+                      );
+                    })}
+                  </Box>
+                  <Box className="chat-starter-actions">
                     <Button
-                      key={item.label}
                       size="small"
-                      variant="outlined"
-                      className="chat-quick-cmd-btn"
-                      onClick={() => {
-                        setPrompt(item.prompt);
-                        setChatError(null);
-                      }}
+                      variant="text"
+                      className="chat-starter-toggle"
+                      endIcon={
+                        <ExpandMoreIcon
+                          sx={{
+                            transform: starterLibraryExpanded ? "rotate(180deg)" : "rotate(0deg)",
+                            transition: "transform 0.16s ease"
+                          }}
+                        />
+                      }
+                      onClick={() => setStarterLibraryExpanded((prev) => !prev)}
                     >
-                      {item.label}
+                      {starterLibraryExpanded ? "Show fewer" : "More examples"}
                     </Button>
-                  ))}
-                </Stack>
+                  </Box>
+                  {starterLibraryExpanded ? (
+                    <Box className="chat-starter-library">
+                      {CHAT_STARTER_EXPANDED_SECTIONS.map((section) => (
+                        <Box key={section.id} className="chat-starter-section">
+                          <Box className="chat-starter-section-head">
+                            <Typography variant="overline" className="chat-starter-section-title">
+                              {section.label}
+                            </Typography>
+                            <Typography variant="caption" className="chat-starter-section-copy">
+                              {section.description}
+                            </Typography>
+                          </Box>
+                          <Box className="chat-starter-grid chat-starter-grid-expanded">
+                            {section.items.map((item) => (
+                              <Button
+                                key={item.id}
+                                variant="outlined"
+                                className="chat-starter-card"
+                                onClick={() => applyStarterExample(item)}
+                              >
+                                <Box className="chat-starter-card-body">
+                                  {item.deepResearch ? (
+                                    <Box className="chat-starter-card-meta">
+                                      <span className="chat-starter-tag research">Deep research</span>
+                                    </Box>
+                                  ) : null}
+                                  <Typography component="span" className="chat-starter-card-title">
+                                    {item.title}
+                                  </Typography>
+                                  <Typography component="span" className="chat-starter-card-copy">
+                                    {item.summary}
+                                  </Typography>
+                                </Box>
+                              </Button>
+                            ))}
+                          </Box>
+                        </Box>
+                      ))}
+                      {CHAT_STARTER_ADVANCED_EXAMPLES.length > 0 ? (
+                        <Box className="chat-starter-advanced">
+                          <Box className="chat-starter-section-head">
+                            <Typography variant="overline" className="chat-starter-section-title">
+                              {CHAT_STARTER_CATEGORY_META.advanced.label}
+                            </Typography>
+                            <Typography variant="caption" className="chat-starter-section-copy">
+                              {CHAT_STARTER_CATEGORY_META.advanced.description}
+                            </Typography>
+                          </Box>
+                          <Box className="chat-starter-advanced-actions">
+                            <Button
+                              size="small"
+                              variant="text"
+                              className="chat-starter-toggle"
+                              endIcon={
+                                <ExpandMoreIcon
+                                  sx={{
+                                    transform: starterAdvancedExpanded ? "rotate(180deg)" : "rotate(0deg)",
+                                    transition: "transform 0.16s ease"
+                                  }}
+                                />
+                              }
+                              onClick={() => setStarterAdvancedExpanded((prev) => !prev)}
+                            >
+                              {starterAdvancedExpanded ? "Hide advanced" : "Show advanced"}
+                            </Button>
+                          </Box>
+                          {starterAdvancedExpanded ? (
+                            <Box className="chat-starter-grid chat-starter-grid-expanded">
+                              {CHAT_STARTER_ADVANCED_EXAMPLES.map((item) => (
+                                <Button
+                                  key={item.id}
+                                  variant="outlined"
+                                  className="chat-starter-card"
+                                  onClick={() => applyStarterExample(item)}
+                                >
+                                  <Box className="chat-starter-card-body">
+                                    <Typography component="span" className="chat-starter-card-title">
+                                      {item.title}
+                                    </Typography>
+                                    <Typography component="span" className="chat-starter-card-copy">
+                                      {item.summary}
+                                    </Typography>
+                                  </Box>
+                                </Button>
+                              ))}
+                            </Box>
+                          ) : null}
+                        </Box>
+                      ) : null}
+                    </Box>
+                  ) : null}
+                </Box>
               </Box>
             ) : (
             <Stack spacing={1.5}>
@@ -12645,7 +14236,10 @@ function ChatManager({
                 const hasTrace = !isUser && !!traceId;
                 const traceLoading = hasTrace ? Boolean(traceLoadingById[traceId]) : false;
                 const traceError = hasTrace ? str(traceErrorById[traceId], "").trim() : "";
+                const messageTotalTokens = !isUser ? num(message.total_tokens, 0) : 0;
                 const rawTraceSteps = hasTrace ? traceStepsById[traceId] || [] : [];
+                const traceShowsAwaitingPlanConfirmation =
+                  rawTraceSteps.length > 0 && activityStepsRepresentAwaitingPlanConfirmation(rawTraceSteps);
                 const traceExpanded = Boolean(messageTraceOpen[messageId]);
                 const traceCards = traceExpanded && hasTrace ? expandedTraceCardsById[traceId] || [] : [];
                 const traceSummary = traceSummaryFromSteps(rawTraceSteps, { loading: traceLoading, error: traceError });
@@ -12656,7 +14250,7 @@ function ChatManager({
                   showPlanConfirmationCard &&
                   !isPlanConfirmationMessage &&
                   isAssistant &&
-                  looksLikeRedundantPlanPreviewMessage(renderedContent)
+                  traceShowsAwaitingPlanConfirmation
                 ) {
                   return null;
                 }
@@ -12697,7 +14291,9 @@ function ChatManager({
                                   color: "text.secondary"
                                 }}
                               >
-                                {isUser ? "You" : "AgentArk"}{ts ? ` | ${ts.label}` : ""}
+                                {isUser ? "You" : "AgentArk"}
+                                {ts ? ` | ${ts.label}` : ""}
+                                {messageTotalTokens > 0 ? ` | ${messageTotalTokens.toLocaleString()} tokens` : ""}
                               </Typography>
                               <Stack direction="row" spacing={0.25} sx={{
                                 alignItems: "center"
@@ -12830,7 +14426,12 @@ function ChatManager({
                             This run was stopped before a full reply was sent.
                           </Typography>
                         )}
-                      <SwarmActivityPanel runs={swarmActivityRuns} interrupted />
+                      <SwarmActivityPanel
+                        runs={swarmActivityRuns}
+                        interrupted
+                        expandedPayloads={expandedActivityPayloads}
+                        onTogglePayload={toggleExpandedActivityPayload}
+                      />
                       <Box>
                         <Button
                           size="small"
@@ -12896,7 +14497,11 @@ function ChatManager({
                             <span />
                           </div>
                         )}
-                        <SwarmActivityPanel runs={swarmActivityRuns} />
+                        <SwarmActivityPanel
+                          runs={swarmActivityRuns}
+                          expandedPayloads={expandedActivityPayloads}
+                          onTogglePayload={toggleExpandedActivityPayload}
+                        />
                       </>
                     )}
                   </Box>
@@ -13153,51 +14758,63 @@ function ChatManager({
         <Box className={`chat-composer-shell${shouldShowExecutionPlanWarning ? " has-plan" : ""}`}>
           {shouldShowExecutionPlanWarning ? (
             <Box className="chat-composer-plan-warning">
-              <Stack direction="row" spacing={1.1} sx={{
-                alignItems: "flex-start"
-              }}>
-                <Box className="chat-composer-plan-icon status-failed">
-                  {renderExecutionPlanStatusIcon("failed")}
-                </Box>
-                <Box sx={{ minWidth: 0, flex: 1 }}>
-                  <Stack
-                    direction="row"
-                    spacing={0.8}
-                    useFlexGap
-                    sx={{
-                      alignItems: "center",
-                      flexWrap: "wrap"
-                    }}>
-                    <Typography variant="caption" className="chat-composer-plan-kicker">
-                      Planner
+              <Stack spacing={1}>
+                <Stack direction="row" spacing={1.1} sx={{
+                  alignItems: "flex-start"
+                }}>
+                  <Box className="chat-composer-plan-icon status-failed">
+                    {renderExecutionPlanStatusIcon("failed")}
+                  </Box>
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    <Stack
+                      direction="row"
+                      spacing={0.8}
+                      useFlexGap
+                      sx={{
+                        alignItems: "center",
+                        flexWrap: "wrap"
+                      }}>
+                      <Typography variant="caption" className="chat-composer-plan-kicker">
+                        Planner
+                      </Typography>
+                      <Typography variant="caption" className="chat-composer-plan-status">
+                        Planner offline
+                      </Typography>
+                    </Stack>
+                    <Typography variant="caption" className="chat-composer-plan-summary">
+                      {visibleExecutionPlanFailure}
                     </Typography>
-                    <Typography variant="caption" className="chat-composer-plan-status">
-                      Planner offline
-                    </Typography>
-                  </Stack>
-                  <Typography variant="caption" className="chat-composer-plan-summary">
-                    {visibleExecutionPlanFailure}
-                  </Typography>
-                </Box>
+                  </Box>
+                </Stack>
+                {searchSetupActionNeeded ? (
+                  <Box>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      onClick={() => onNavigateToView?.("search")}
+                    >
+                      Open Search Settings
+                    </Button>
+                  </Box>
+                ) : null}
               </Stack>
             </Box>
           ) : null}
           <textarea
+            ref={composerTextareaRef}
             className="chat-composer-textarea"
             placeholder={
               composerLockedForPlanConfirmation
-                ? "Preparing the Deep research plan..."
+                ? `Preparing the ${planConfirmationDisplayLabel(planConfirmation?.source).toLowerCase()}...`
                 : isAwaitingPlanConfirmation
                   ? "Ask for changes to the plan, or press Start / Cancel."
-                : "Message (Enter to send, Shift+Enter for newline)"
+                  : "Message (Enter to send, Shift+Enter for newline)"
             }
             aria-label="Message"
             value={prompt}
             onChange={(e) => {
               setPrompt(e.target.value);
-              const el = e.target;
-              el.style.height = "auto";
-              el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
+              resizeComposerTextarea(e.target);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -14033,8 +15650,8 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
           paper: {
             sx: {
               borderRadius: "8px",
-              border: "1px solid rgba(255,255,255,0.08)",
-              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
+              border: "1px solid var(--surface-border)",
+              background: "var(--surface-bg-elevated)",
               boxShadow: "0 28px 96px rgba(0,0,0,0.5)"
             }
           }
@@ -14059,9 +15676,8 @@ function TasksManager({ autoRefresh }: { autoRefresh: boolean }) {
             <Box
               sx={{
                 borderRadius: "8px",
-                border: "1px solid rgba(96, 165, 250, 0.18)",
-                background:
-                  "linear-gradient(135deg, rgba(14, 22, 34, 0.96), rgba(15, 17, 22, 0.96))",
+                border: "1px solid var(--surface-border)",
+                background: "var(--micro-surface-bg)",
                 p: 1.4,
                 boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)"
               }}
@@ -19208,7 +20824,7 @@ function AutonomyManager({ autoRefresh }: { autoRefresh: boolean }) {
                       }}>
                         <Chip size="small" color={selfEvolveEnabled ? "success" : "default"} label={`Self-evolve ${selfEvolveEnabled ? "On" : "Off"}`} />
                         <Chip size="small" color={learningEnabled ? "success" : "default"} label={`Learning ${learningEnabled ? "On" : "Off"}`} />
-                        <Chip size="small" color={toBool(evolution.learning_local_only) ? "info" : "default"} label={toBool(evolution.learning_local_only) ? "Local-only" : "Remote allowed"} />
+                        <Chip size="small" color={toBool(evolution.learning_local_only) ? "info" : "default"} label={toBool(evolution.learning_local_only) ? "Local-only" : "Remote models allowed"} />
                         <Chip size="small" color={selfEvolveCanaryEnabled ? "warning" : "default"} label={`Canary ${selfEvolveCanaryEnabled ? "On" : "Off"}`} />
                       </Stack>
                       <Typography variant="body2">Baseline policy: {str(evolutionCanary.baseline_version, "routing-policy-default-v1")}</Typography>
@@ -19935,7 +21551,6 @@ function MemoryManager({
       {/* -- Compact stat row -- */}
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, 1fr)", sm: "repeat(3, 1fr)", md: "repeat(5, 1fr)" }, gap: 1.5 }}>
         {[
-          { label: "Episodes", value: num(stats.episodes), color: "#2fd4ff" },
           { label: "Facts", value: num(stats.facts), color: "#14f195" },
           { label: "Preferences", value: num(stats.preferences), color: "#a78bfa" },
           { label: "User Data", value: num(stats.user_data), color: "#f59e0b" },
@@ -20820,7 +22435,7 @@ function ProjectsManager({
         <DialogContent>
           <Stack spacing={1}>
             <Alert severity="warning">
-              This permanently deletes the project and ALL associated data: conversations, messages, documents, document chunks, episodic memories, and learned facts.
+              This permanently deletes the project and ALL associated data: conversations, messages, documents, document chunks, and durable memory items.
             </Alert>
             <Typography variant="body2">
               Type the project name to confirm deletion: <b>{str(deleteProject?.name, "")}</b>
@@ -20924,6 +22539,80 @@ type TraceStepConsoleView = {
   dataText: string;
 };
 
+function pickTraceStepArtifacts(step: JsonRecord): JsonRecord[] {
+  return pickRecords(step, "artifacts");
+}
+
+function traceArtifactLabel(artifact: JsonRecord): string {
+  const explicit = str(artifact.label, "").trim();
+  if (explicit) return explicit;
+  const kind = str(artifact.kind, "").trim();
+  return kind ? titleCaseLabel(kind) : "Artifact";
+}
+
+function traceArtifactKindLabel(artifact: JsonRecord): string {
+  const kind = str(artifact.kind, "").trim();
+  return kind ? titleCaseLabel(kind) : "Artifact";
+}
+
+function traceArtifactFormat(artifact: JsonRecord): string {
+  return str(artifact.format, "").trim().toUpperCase();
+}
+
+function traceArtifactBody(artifact: JsonRecord): string {
+  const raw = artifact.data;
+  if (typeof raw === "string") return formatTraceData(raw);
+  if (raw == null) return "";
+  try {
+    return JSON.stringify(raw, null, 2);
+  } catch {
+    return str(raw, "");
+  }
+}
+
+function traceArtifactSummary(artifact: JsonRecord): string {
+  const explicit = str(artifact.summary, "").trim();
+  if (explicit) return explicit;
+  const body = collapseInlineWhitespace(traceArtifactBody(artifact));
+  return body ? truncateTraceEvidence(body, 180) : "";
+}
+
+function traceArtifactChipLabel(artifact: JsonRecord): string {
+  const label = traceArtifactLabel(artifact);
+  const summary = traceArtifactSummary(artifact);
+  if (summary && summary.length <= 56) {
+    return `${label}: ${summary}`;
+  }
+  return label;
+}
+
+function summarizeTraceArtifactsInline(artifacts: JsonRecord[]): string {
+  return uniqueNonEmptyStrings(
+    artifacts.map((artifact) => traceArtifactSummary(artifact) || traceArtifactLabel(artifact))
+  )
+    .slice(0, 2)
+    .map((value) => truncateTraceEvidence(value, 120))
+    .join(" | ");
+}
+
+function buildTraceArtifactBlocks(artifacts: JsonRecord[]): string {
+  return artifacts
+    .map((artifact) => {
+      const label = traceArtifactLabel(artifact);
+      const format = traceArtifactFormat(artifact);
+      const summary = traceArtifactSummary(artifact);
+      const body = traceArtifactBody(artifact);
+      const lines = [
+        format ? `${label} (${format})` : label,
+        summary ? `Summary: ${summary}` : "",
+        body
+      ].filter(Boolean);
+      return lines.join("\n");
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 function truncateTraceEvidence(value: string, max = 240): string {
   const trimmed = value.trim();
   if (trimmed.length <= max) return trimmed;
@@ -20974,6 +22663,12 @@ function buildTraceEvidenceItems(steps: JsonRecord[]): TraceEvidenceItem[] {
 }
 
 function extractTraceArtifacts(trace: JsonRecord, steps: JsonRecord[]): string[] {
+  const artifactLabels = uniqueNonEmptyStrings(
+    steps.flatMap((step) => pickTraceStepArtifacts(step).map((artifact) => traceArtifactChipLabel(artifact)))
+  );
+  if (artifactLabels.length > 0) {
+    return artifactLabels.slice(0, 6);
+  }
   const sources = [
     str(trace.response, ""),
     ...steps.flatMap((step) => [str(step.detail, ""), formatTraceData(step.data)])
@@ -21016,7 +22711,12 @@ function buildExecutionProofConsoleEvidence(trace: JsonRecord, steps: JsonRecord
 
 function buildTraceStepConsoleView(trace: JsonRecord, steps: JsonRecord[], step: JsonRecord): TraceStepConsoleView {
   const detail = str(step.detail, "").trim();
-  const dataText = formatTraceData(step.data);
+  const rawDataText = formatTraceData(step.data);
+  const artifactText = buildTraceArtifactBlocks(pickTraceStepArtifacts(step));
+  const dataText =
+    artifactText && rawDataText.trim() === artifactText.trim()
+      ? artifactText
+      : [rawDataText, artifactText].filter(Boolean).join("\n\n");
 
   if (!isExecutionProofStep(step)) {
     return { detail, dataText };
@@ -22017,7 +23717,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                     sx={{
                       color: "text.secondary",
                       mx: -0.25
-                    }}>·</Typography>
+                    }}>|</Typography>
                   <Typography variant="body2" sx={{
                     color: "text.secondary"
                   }}>
@@ -22029,7 +23729,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                       sx={{
                         color: "text.secondary",
                         mx: -0.25
-                      }}>·</Typography>
+                      }}>|</Typography>
                     <Typography variant="body2" sx={{
                       color: "text.secondary"
                     }}>
@@ -22042,7 +23742,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                       sx={{
                         color: "text.secondary",
                         mx: -0.25
-                      }}>·</Typography>
+                      }}>|</Typography>
                     <Typography variant="body2" className="diagnostics-keyline">
                       {str(selectedTrace.model)}
                     </Typography>
@@ -22167,14 +23867,20 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                       <Stack spacing={0}>
                         {steps.map((step, idx) => {
                           const consoleView = buildTraceStepConsoleView(selectedTrace, steps, step);
+                          const stepArtifacts = pickTraceStepArtifacts(step);
                           const stepTime = formatTraceStepTime(str(step.time));
                           const isExpanded = expandedSteps.has(idx);
-                          const hasContent = !!(consoleView.detail || consoleView.dataText);
-                          const stepColor = str(step.type).includes("error") || str(step.type).includes("fail")
+                          const collapsedPreview = consoleView.detail || summarizeTraceArtifactsInline(stepArtifacts);
+                          const hasContent = !!(consoleView.detail || consoleView.dataText || stepArtifacts.length > 0);
+                          const showConsoleData = !!consoleView.dataText && (stepArtifacts.length === 0 || isExecutionProofStep(step));
+                          const stepSignal = `${str(step.status, "")} ${str(step.type, str(step.step_type, ""))}`.toLowerCase();
+                          const stepColor = stepSignal.includes("error") || stepSignal.includes("fail")
                             ? "rgba(255,100,100,0.85)"
-                            : str(step.type).includes("success") || str(step.type).includes("complete")
+                            : stepSignal.includes("success") || stepSignal.includes("complete")
                               ? "rgba(74,210,157,0.85)"
-                              : str(step.type).includes("think") || str(step.type).includes("reason")
+                              : stepSignal.includes("warning") || stepSignal.includes("blocked")
+                                ? "rgba(255,211,106,0.85)"
+                                : stepSignal.includes("think") || stepSignal.includes("reason")
                                 ? "rgba(255,211,106,0.85)"
                                 : "rgba(120,160,210,0.5)";
                           return (
@@ -22221,17 +23927,64 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                                       {consoleView.detail}
                                     </Typography>
                                   ) : null}
-                                  {consoleView.dataText ? (
+                                  {stepArtifacts.length > 0 ? (
+                                    <Stack spacing={0.75} className="trace-step-artifacts">
+                                      {stepArtifacts.map((artifact, artifactIdx) => {
+                                        const artifactLabel = traceArtifactLabel(artifact);
+                                        const artifactKind = traceArtifactKindLabel(artifact);
+                                        const artifactFormat = traceArtifactFormat(artifact);
+                                        const artifactSummaryText = traceArtifactSummary(artifact);
+                                        const artifactBody = traceArtifactBody(artifact);
+                                        return (
+                                          <Box
+                                            key={`${artifactLabel}-${artifactIdx}`}
+                                            className="trace-artifact-card"
+                                          >
+                                            <Stack
+                                              direction="row"
+                                              spacing={0.75}
+                                              useFlexGap
+                                              className="trace-artifact-head"
+                                              sx={{ alignItems: "flex-start", justifyContent: "space-between" }}
+                                            >
+                                              <Box sx={{ minWidth: 0, flex: 1 }}>
+                                                <Typography variant="caption" className="trace-artifact-kind">
+                                                  {artifactKind}
+                                                </Typography>
+                                                <Typography variant="body2" className="trace-artifact-label">
+                                                  {artifactLabel}
+                                                </Typography>
+                                              </Box>
+                                              {artifactFormat ? (
+                                                <Chip size="small" variant="outlined" label={artifactFormat} />
+                                              ) : null}
+                                            </Stack>
+                                            {artifactSummaryText ? (
+                                              <Typography variant="caption" className="trace-artifact-summary">
+                                                {artifactSummaryText}
+                                              </Typography>
+                                            ) : null}
+                                            {artifactBody ? (
+                                              <Box component="pre" className="diagnostics-code-block trace-artifact-pre">
+                                                {artifactBody}
+                                              </Box>
+                                            ) : null}
+                                          </Box>
+                                        );
+                                      })}
+                                    </Stack>
+                                  ) : null}
+                                  {showConsoleData ? (
                                     <Box component="pre" className="diagnostics-code-block diagnostics-step-code">
                                       {consoleView.dataText}
                                     </Box>
                                   ) : null}
                                 </Box>
-                              ) : consoleView.detail ? (
+                              ) : collapsedPreview ? (
                                 <Typography variant="caption" className="diagnostics-step-preview" noWrap sx={{
                                   color: "text.secondary"
                                 }}>
-                                  {consoleView.detail}
+                                  {collapsedPreview}
                                 </Typography>
                               ) : null}
                             </Box>
@@ -22247,7 +24000,7 @@ function TraceManager({ autoRefresh }: { autoRefresh: boolean }) {
                   color: "text.secondary"
                 }}>
                   Started: <span title={selectedTraceStarted.tip}>{selectedTraceStarted.label}</span>
-                  {selectedTrace.completed_at ? <>{" · Completed: "}<span title={selectedTraceCompleted.tip}>{selectedTraceCompleted.label}</span></> : ""}
+                  {selectedTrace.completed_at ? <>{" | Completed: "}<span title={selectedTraceCompleted.tip}>{selectedTraceCompleted.label}</span></> : ""}
                 </Typography>
               </Stack>
             )}
@@ -23768,8 +25521,8 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
   });
   const evolutionDevQ = useQuery({
     queryKey: ["settings-evolution-dev", showSuperseded],
-    queryFn: () => api.rawGet(`/settings/evolution/dev?limit=5000${showSuperseded ? "&include_superseded=true" : ""}`),
-    refetchInterval: autoRefresh ? REFRESH_MS : false
+    queryFn: () => api.rawGet(`/settings/evolution/dev?limit=${EVOLUTION_DEV_QUERY_LIMIT}${showSuperseded ? "&include_superseded=true" : ""}`),
+    refetchInterval: autoRefresh ? EVOLUTION_DEV_REFRESH_MS : false
   });
   const updateEvolutionMutation = useMutation({
     mutationFn: (payload: JsonRecord) => api.rawPost("/settings/evolution", payload),
@@ -23965,7 +25718,7 @@ function EvolutionManager({ autoRefresh }: { autoRefresh: boolean }) {
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
       <EvolutionStatStrip items={[
-      { label: "Learning", value: toBool(evolution.learning_enabled) ? "On" : "Off", helper: toBool(evolution.learning_local_only) ? "Local-only mode" : "Remote help allowed", tone: toBool(evolution.learning_enabled) ? "good" : "default" },
+      { label: "Learning", value: toBool(evolution.learning_enabled) ? "On" : "Off", helper: toBool(evolution.learning_local_only) ? "Local-only mode" : "Configured remote models allowed", tone: toBool(evolution.learning_enabled) ? "good" : "default" },
       { label: "Tests", value: activeTests, helper: `${maxRollout.toFixed(0)}% max rollout`, tone: activeTests > 0 ? "warn" : "info" },
       { label: "Review queue", value: num(learningQueue.draft_candidates, 0), helper: `${num(learningQueue.pending_consolidation, 0)} waiting consolidation`, tone: num(learningQueue.draft_candidates, 0) > 0 ? "warn" : "default" },
       { label: "Patterns learned", value: num(learningQueue.active_patterns, 0), helper: `Queue cap ${num(evolution.learning_queue_cap, 64)}`, tone: "info" },
@@ -24894,6 +26647,9 @@ function SettingsManager({
       lifecycle: 14,
       "data-lifecycle": 14,
       retention: 14,
+      update: 25,
+      updates: 25,
+      upgrade: 25,
       mcp: 8,
       routing: 20,
       browser: 20,
@@ -24917,7 +26673,7 @@ function SettingsManager({
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [restartNotice, setRestartNotice] = useState<string | null>(null);
+  const [restartNotice, setRestartNotice] = useState<RestartNoticeState | null>(null);
   const [rotateInternalCredentialsDialogOpen, setRotateInternalCredentialsDialogOpen] = useState(false);
   const [rotateInternalCredentialsAccepted, setRotateInternalCredentialsAccepted] = useState(false);
   const [modelConnectivityWarning, setModelConnectivityWarning] = useState<string | null>(null);
@@ -24935,10 +26691,7 @@ function SettingsManager({
   const [vaultEditorValue, setVaultEditorValue] = useState("");
   const [showVaultSecretValue, setShowVaultSecretValue] = useState(false);
   const [securityLogsDialogOpen, setSecurityLogsDialogOpen] = useState(false);
-  const [selectedSecurityLog, setSelectedSecurityLog] = useState<JsonRecord | null>(null);
   const [selectedPulseEvent, setSelectedPulseEvent] = useState<JsonRecord | null>(null);
-  const [storageMaintenanceOpen, setStorageMaintenanceOpen] = useState(false);
-  const [storageMaintenanceConfirm, setStorageMaintenanceConfirm] = useState("");
   const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
   const [selectedMoltbookEvent, setSelectedMoltbookEvent] = useState<JsonRecord | null>(null);
   const [pulsePollState, setPulsePollState] = useState<{ baselineEventId: string; deadlineAt: number } | null>(null);
@@ -24964,6 +26717,7 @@ function SettingsManager({
   const observabilityTabActive = tab === 6;
   const moltbookTabActive = tab === 7;
   const pulseTabActive = tab === 9;
+  const updatesTabActive = tab === 25;
 
   useEffect(() => {
     if (typeof initialTab === "number" && tab !== initialTab) {
@@ -24989,12 +26743,12 @@ function SettingsManager({
 
   useEffect(() => {
     if (!restartNotice) return;
-    const timer = window.setTimeout(() => setRestartNotice(null), RESTART_NOTICE_DURATION_MS);
+    const timer = window.setTimeout(() => setRestartNotice(null), restartNotice.durationMs);
     return () => window.clearTimeout(timer);
   }, [restartNotice]);
 
-  async function monitorRestartRecovery() {
-    const deadlineAt = Date.now() + RESTART_NOTICE_DURATION_MS;
+  async function monitorRestartRecovery(timeoutMs = RESTART_NOTICE_DURATION_MS) {
+    const deadlineAt = Date.now() + timeoutMs;
     const minimumVisibleUntil = Date.now() + 2000;
     let sawUnavailable = false;
     while (Date.now() < deadlineAt) {
@@ -25036,6 +26790,14 @@ function SettingsManager({
     queryKey: ["models"],
     queryFn: () => api.rawGet("/models"),
     refetchInterval: autoRefresh ? REFRESH_MS : false
+  });
+  const updateStatusQ = useQuery({
+    queryKey: ["settings-update-status"],
+    queryFn: api.getStatus,
+    enabled: updatesTabActive,
+    staleTime: 60_000,
+    refetchInterval: false,
+    refetchOnWindowFocus: false
   });
   const apiKeyQ = useQuery({
     queryKey: ["settings-api-key"],
@@ -25085,12 +26847,6 @@ function SettingsManager({
     queryFn: () => api.rawGet("/arkpulse?limit=40"),
     enabled: pulseTabActive,
     refetchInterval: pulseTabActive ? (pulsePollState ? 2000 : autoRefresh ? REFRESH_MS : false) : false
-  });
-  const storageMaintenanceReviewQ = useQuery({
-    queryKey: ["memory-maintenance-review"],
-    queryFn: () => api.rawGet("/memory/maintenance/review") as Promise<MemoryMaintenanceReviewResponse>,
-    enabled: storageMaintenanceOpen,
-    refetchOnWindowFocus: false
   });
   const moltbookStatusQ = useQuery({
     queryKey: ["moltbook-status"],
@@ -25252,16 +27008,6 @@ function SettingsManager({
     moltbook_write_enabled: true,
     moltbook_defer_when_busy: true,
 
-    memory_retention_enabled: true,
-    memory_retention_min_age_days: "180",
-    memory_retention_keep_last: "2500",
-    memory_retention_max_importance: "0.6",
-    memory_retention_max_access_count: "1",
-    memory_retention_require_consolidated: true,
-    memory_retention_run_interval_days: "7",
-    memory_retention_idle_threshold_secs: "600",
-    memory_retention_max_delete_per_run: "500",
-
     data_lifecycle_cleanup_enabled: true,
     data_lifecycle_notifications_cleanup_enabled: true,
     data_lifecycle_logs_cleanup_enabled: true,
@@ -25275,6 +27021,10 @@ function SettingsManager({
     data_lifecycle_swarm_delegation_retention_days: "30",
     data_lifecycle_llm_usage_retention_days: "30",
     data_lifecycle_terminal_task_retention_days: "90",
+    data_lifecycle_execution_run_retention_days: "90",
+    data_lifecycle_background_session_retention_days: "90",
+    data_lifecycle_browser_session_retention_days: "30",
+    data_lifecycle_automation_run_retention_days: "90",
     data_lifecycle_message_retention_days: "365",
     data_lifecycle_housekeeping_interval_secs: "3600",
     data_lifecycle_security_cleanup_interval_days: "15",
@@ -25642,22 +27392,6 @@ function SettingsManager({
       moltbook_write_enabled:
         settings.moltbook_write_enabled == null ? true : toBool(settings.moltbook_write_enabled),
       moltbook_defer_when_busy: toBool(settings.moltbook_defer_when_busy),
-
-      memory_retention_enabled:
-        settings.memory_retention_enabled == null
-          ? true
-          : toBool(settings.memory_retention_enabled),
-      memory_retention_min_age_days: str(settings.memory_retention_min_age_days, "180"),
-      memory_retention_keep_last: str(settings.memory_retention_keep_last, "2500"),
-      memory_retention_max_importance: str(settings.memory_retention_max_importance, "0.6"),
-      memory_retention_max_access_count: str(settings.memory_retention_max_access_count, "1"),
-      memory_retention_require_consolidated:
-        settings.memory_retention_require_consolidated == null
-          ? true
-          : toBool(settings.memory_retention_require_consolidated),
-      memory_retention_run_interval_days: str(settings.memory_retention_run_interval_days, "7"),
-      memory_retention_idle_threshold_secs: str(settings.memory_retention_idle_threshold_secs, "600"),
-      memory_retention_max_delete_per_run: str(settings.memory_retention_max_delete_per_run, "500"),
       data_lifecycle_cleanup_enabled:
         dataLifecycleSettings.cleanup_enabled == null
           ? true
@@ -25708,6 +27442,22 @@ function SettingsManager({
       ),
       data_lifecycle_terminal_task_retention_days: str(
         dataLifecycleSettings.terminal_task_retention_days,
+        "90"
+      ),
+      data_lifecycle_execution_run_retention_days: str(
+        dataLifecycleSettings.execution_run_retention_days,
+        "90"
+      ),
+      data_lifecycle_background_session_retention_days: str(
+        dataLifecycleSettings.background_session_retention_days,
+        "90"
+      ),
+      data_lifecycle_browser_session_retention_days: str(
+        dataLifecycleSettings.browser_session_retention_days,
+        "30"
+      ),
+      data_lifecycle_automation_run_retention_days: str(
+        dataLifecycleSettings.automation_run_retention_days,
         "90"
       ),
       data_lifecycle_message_retention_days: str(
@@ -25852,41 +27602,6 @@ function SettingsManager({
           if (k === "google_gemini") mediaProviders["google_veo"] = trimmed;
         }
       }
-      const memoryRetentionMinAgeDays = parsePositiveInt(
-        form.memory_retention_min_age_days,
-        "Episode retention minimum age (days)",
-        30
-      );
-      const memoryRetentionKeepLast = parsePositiveInt(
-        form.memory_retention_keep_last,
-        "Episodes to always keep",
-        500
-      );
-      const memoryRetentionMaxImportance = parseBoundedFloat(
-        form.memory_retention_max_importance,
-        "Episode retention max importance",
-        0,
-        1
-      );
-      const memoryRetentionMaxAccessCount = parseNonNegativeInt(
-        form.memory_retention_max_access_count,
-        "Episode retention max access count"
-      );
-      const memoryRetentionRunIntervalDays = parsePositiveInt(
-        form.memory_retention_run_interval_days,
-        "Episode retention run interval (days)",
-        1
-      );
-      const memoryRetentionIdleThresholdSecs = parsePositiveInt(
-        form.memory_retention_idle_threshold_secs,
-        "Episode retention idle threshold (seconds)",
-        60
-      );
-      const memoryRetentionMaxDeletePerRun = parsePositiveInt(
-        form.memory_retention_max_delete_per_run,
-        "Episode retention max delete per run",
-        10
-      );
       const dataLifecycle = {
         cleanup_enabled: form.data_lifecycle_cleanup_enabled,
         notifications_cleanup_enabled: form.data_lifecycle_notifications_cleanup_enabled,
@@ -25931,6 +27646,22 @@ function SettingsManager({
         terminal_task_retention_days: parseNonNegativeInt(
           form.data_lifecycle_terminal_task_retention_days,
           "Completed task retention (days)"
+        ),
+        execution_run_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_execution_run_retention_days,
+          "Execution run retention (days)"
+        ),
+        background_session_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_background_session_retention_days,
+          "Background session retention (days)"
+        ),
+        browser_session_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_browser_session_retention_days,
+          "Browser session retention (days)"
+        ),
+        automation_run_retention_days: parseNonNegativeInt(
+          form.data_lifecycle_automation_run_retention_days,
+          "Automation run retention (days)"
         ),
         message_retention_days: parseNonNegativeInt(
           form.data_lifecycle_message_retention_days,
@@ -26016,15 +27747,6 @@ function SettingsManager({
         moltbook_sync_frequency: form.moltbook_sync_frequency || null,
         moltbook_write_enabled: form.moltbook_write_enabled,
         moltbook_defer_when_busy: form.moltbook_defer_when_busy,
-        memory_retention_enabled: form.memory_retention_enabled,
-        memory_retention_min_age_days: memoryRetentionMinAgeDays,
-        memory_retention_keep_last: memoryRetentionKeepLast,
-        memory_retention_max_importance: memoryRetentionMaxImportance,
-        memory_retention_max_access_count: memoryRetentionMaxAccessCount,
-        memory_retention_require_consolidated: form.memory_retention_require_consolidated,
-        memory_retention_run_interval_days: memoryRetentionRunIntervalDays,
-        memory_retention_idle_threshold_secs: memoryRetentionIdleThresholdSecs,
-        memory_retention_max_delete_per_run: memoryRetentionMaxDeletePerRun,
         data_lifecycle: dataLifecycle,
 
         observability: {
@@ -26900,6 +28622,11 @@ function SettingsManager({
   const internalServiceRotationSupported =
     toBool(sec.internal_service_rotation_supported) && internalServiceTokens.length > 0;
   const internalServiceEnvManaged = internalServiceTokens.some((row) => toBool(row.managed_by_env));
+  const internalServiceDescription = internalServiceRotationSupported
+    ? "Executor and workspace trust the control plane with shared bearer credentials. Rotation rewrites those credentials and restarts AgentArk."
+    : internalServiceEnvManaged
+      ? "Executor and workspace trust the control plane with shared bearer credentials. This deployment provides them through environment variables."
+      : "Executor and workspace trust the control plane with shared bearer credentials.";
   const vaultSecrets = pickRecords(vaultSecretsQ.data, "entries");
   const securityStatusTone: "success" | "warning" | "info" = hasCustomMasterPassword
     ? "success"
@@ -27107,27 +28834,6 @@ function SettingsManager({
   const selectedPulseScanFinished = str(selectedPulseDetails.scan_finished_at, "").trim();
   const selectedPulseScanDurationMs = num(selectedPulseDetails.scan_duration_ms, 0);
   const selectedPulseNotificationOutcome = str(selectedPulseDetails.notification_outcome, "").trim();
-  const selectedPulsePalette =
-    selectedPulseGuidance.severity === "success"
-      ? {
-          accent: "#34d399",
-          accentSoft: "rgba(52, 211, 153, 0.16)",
-          border: "rgba(52, 211, 153, 0.22)",
-          background: "linear-gradient(135deg, rgba(14, 28, 24, 0.96), rgba(15, 18, 21, 0.96))"
-        }
-      : selectedPulseGuidance.severity === "warning"
-        ? {
-            accent: "#fbbf24",
-            accentSoft: "rgba(251, 191, 36, 0.16)",
-            border: "rgba(251, 191, 36, 0.24)",
-            background: "linear-gradient(135deg, rgba(31, 24, 14, 0.96), rgba(17, 18, 21, 0.96))"
-          }
-        : {
-            accent: "#60a5fa",
-            accentSoft: "rgba(96, 165, 250, 0.16)",
-            border: "rgba(96, 165, 250, 0.22)",
-            background: "linear-gradient(135deg, rgba(14, 24, 32, 0.96), rgba(16, 18, 22, 0.96))"
-          };
   const selectedPulseHeroIcon =
     selectedPulseGuidance.severity === "success" ? (
       <CheckCircleRoundedIcon sx={{ fontSize: 22 }} />
@@ -27145,13 +28851,7 @@ function SettingsManager({
           ? "Healthy run"
           : selectedPulseFindings.length > 0
             ? "Needs follow-up"
-            : "Score unavailable",
-      accent:
-        selectedPulseScore >= 90
-          ? "#34d399"
-          : selectedPulseFindings.length > 0
-            ? "#fbbf24"
-            : "#60a5fa"
+            : "Score unavailable"
     },
     {
       label: "Findings",
@@ -27159,26 +28859,14 @@ function SettingsManager({
       helper:
         selectedPulseFindings.length === 0
           ? "Nothing urgent"
-          : `${selectedPulseFindings.length} item${selectedPulseFindings.length === 1 ? "" : "s"} to review`,
-      accent: selectedPulseFindings.length === 0 ? "#34d399" : "#fbbf24"
+          : `${selectedPulseFindings.length} item${selectedPulseFindings.length === 1 ? "" : "s"} to review`
     },
     {
       label: "Watchers",
       value: String(num(selectedPulseDetails.active_watchers, 0)),
-      helper: "Active background monitors",
-      accent: "#60a5fa"
+      helper: "Active background monitors"
     }
   ];
-  const storageMaintenanceReview = storageMaintenanceReviewQ.data as MemoryMaintenanceReviewResponse | undefined;
-  const storageMaintenanceCounts = asRecord(storageMaintenanceReview?.knowledge_counts);
-  const storageMaintenancePolicy = asRecord(storageMaintenanceReview?.policy);
-  const storageMaintenanceDurablePolicy = asRecord(storageMaintenanceReview?.durable_policy);
-  const storageMaintenanceEpisode = asRecord(storageMaintenanceReview?.episode_cleanup);
-  const storageMaintenanceAvailable = toBool(storageMaintenanceEpisode.available);
-  const storageMaintenanceConfirmationPhrase = str(storageMaintenanceEpisode.confirmation_phrase, "");
-  const storageMaintenanceConfirmMatches =
-    storageMaintenanceConfirmationPhrase.trim().length > 0 &&
-    storageMaintenanceConfirm.trim() === storageMaintenanceConfirmationPhrase;
   const latestPulseEvent = asRecord(pulseEvents[0]);
   const latestPulseDetails = asRecord(latestPulseEvent.details);
   const latestPulseFindingsCount = pickRecords(latestPulseDetails, "doctor_findings").filter((f) =>
@@ -27242,6 +28930,21 @@ function SettingsManager({
     return "default";
   }
 
+  function securityEventTypeLabel(eventType: string): string {
+    const normalized = (eventType || "").trim().toLowerCase();
+    if (!normalized) return "Unknown";
+    return normalized.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+  }
+
+  function securitySeverityAccent(sev: string): string {
+    const s = (sev || "").trim().toLowerCase();
+    if (s === "critical" || s === "high" || s === "error") return "rgba(248, 113, 113, 0.9)";
+    if (s === "medium" || s === "warn" || s === "warning") return "rgba(251, 191, 36, 0.88)";
+    if (s === "low") return "rgba(56, 189, 248, 0.88)";
+    if (s === "ok" || s === "info") return "rgba(52, 211, 153, 0.88)";
+    return "rgba(255, 255, 255, 0.2)";
+  }
+
   function pulseScanStatusColor(status: string): "error" | "warning" | "info" | "success" | "default" {
     const normalized = (status || "").trim().toLowerCase();
     if (normalized === "error" || normalized === "critical" || normalized === "high") return "error";
@@ -27256,6 +28959,47 @@ function SettingsManager({
     if (!normalized) return "Unknown";
     if (normalized === "ok") return "OK";
     return normalized.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+  }
+
+  function pulseScanAlertReason(row: JsonRecord): string {
+    const normalizedStatus = str(row.status, "").trim().toLowerCase();
+    if (
+      !["warning", "warn", "error", "critical", "high", "medium"].includes(normalizedStatus)
+    ) {
+      return "";
+    }
+    const metricReasons = pickRecords(row, "metrics")
+      .map((metric) => {
+        const metricRow = asRecord(metric);
+        const label = collapseInlineWhitespace(str(metricRow.label, "").replace(/:$/, ""));
+        const value = collapseInlineWhitespace(str(metricRow.value, ""));
+        if (!label || !value) return "";
+        const normalizedLabel = label.toLowerCase();
+        const numericMatch = value.match(/-?\d+(?:\.\d+)?/);
+        const numericValue = numericMatch ? Number(numericMatch[0]) : Number.NaN;
+        const isPositiveCount = Number.isFinite(numericValue) && numericValue > 0;
+        if (
+          ["injections", "auth failures", "rate limits", "unauthorized channels", "overdue", "failed"].includes(normalizedLabel) &&
+          isPositiveCount
+        ) {
+          return `${titleCaseLabel(label)}: ${value}`;
+        }
+        if (normalizedLabel === "highest severity" && !["none", "info", "ok", "success"].includes(value.toLowerCase())) {
+          return `${titleCaseLabel(label)}: ${value}`;
+        }
+        if (["findings", "actionable"].includes(normalizedLabel) && isPositiveCount) {
+          return `${titleCaseLabel(label)}: ${value}`;
+        }
+        return "";
+      })
+      .filter(Boolean);
+    if (metricReasons.length > 0) {
+      return metricReasons.slice(0, 2).join(" | ");
+    }
+    const detail = collapseInlineWhitespace(str(row.detail, ""));
+    if (detail) return truncateUiText(detail, 150);
+    const summary = collapseInlineWhitespace(str(row.summary, ""));
+    return summary ? truncateUiText(summary, 150) : "";
   }
 
   function moltbookTriggerLabel(raw: string): string {
@@ -28077,11 +29821,42 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     }
   }
 
+  const updateStatus = updateStatusQ.data?.update ?? null;
+  const updateCheckedAtLabel = updateStatus?.checked_at
+    ? formatUiDateTime(updateStatus.checked_at)
+    : null;
+
   const restartMutation = useMutation({
     mutationFn: () => api.rawPost("/restart", {}),
     onSuccess: () => {
       setSuccess(null);
-      setRestartNotice("AgentArk is restarting. Give it up to 10 seconds. The page will refresh automatically when it is ready.");
+      setRestartNotice({
+        text: "AgentArk is restarting. Give it up to 10 seconds. The page will refresh automatically when it is ready.",
+        durationMs: RESTART_NOTICE_DURATION_MS,
+        etaLabel: "Up to 10 seconds"
+      });
+    },
+    onError: (e) => {
+      setRestartNotice(null);
+      setError(errMessage(e));
+    }
+  });
+
+  const updateAgentArkMutation = useMutation({
+    mutationFn: () => api.rawPost("/update", {}),
+    onSuccess: async (raw) => {
+      const response = asRecord(raw);
+      setError(null);
+      setSuccess(null);
+      setRestartNotice({
+        text: str(
+          response.message,
+          "AgentArk is updating and restarting. Pending work can be interrupted during the restart."
+        ),
+        durationMs: UPDATE_NOTICE_DURATION_MS,
+        etaLabel: "Up to 2 minutes"
+      });
+      await queryClient.invalidateQueries({ queryKey: ["server-ping"] });
     },
     onError: (e) => {
       setRestartNotice(null);
@@ -28163,31 +29938,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     },
     onError: (e) => setError(errMessage(e))
   });
-  const runStorageMaintenanceMutation = useMutation({
-    mutationFn: (payload: RunMemoryMaintenanceRequest) => api.rawPost("/memory/maintenance/run", payload),
-    onSuccess: async (raw) => {
-      const response = asRecord(raw);
-      setSuccess(str(response.summary, "Storage maintenance completed."));
-      setStorageMaintenanceOpen(false);
-      setStorageMaintenanceConfirm("");
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["memory-maintenance-review"] }),
-        queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] }),
-        queryClient.invalidateQueries({ queryKey: ["notifications"] }),
-        queryClient.invalidateQueries({ queryKey: ["notifications-count"] }),
-        queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
-        queryClient.invalidateQueries({ queryKey: ["memory-facts"] }),
-        queryClient.invalidateQueries({ queryKey: ["documents-manager"] })
-      ]);
-      try {
-        await api.rawPost("/arkpulse/trigger", {});
-      } catch (e) {
-        setError(`Storage maintenance ran, but ArkPulse refresh failed: ${errMessage(e)}`);
-      }
-    },
-    onError: (e) => setError(errMessage(e))
-  });
-
   const trustEvaluateMutation = useMutation({
     mutationFn: (payload: { action_kind: string; payload: unknown }) =>
       api.rawPost("/autonomy/trust/evaluate", payload)
@@ -28250,12 +30000,14 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       const response = asRecord(raw);
       await queryClient.invalidateQueries({ queryKey: ["security-status"] });
       setSuccess(null);
-      setRestartNotice(
-        str(
+      setRestartNotice({
+        text: str(
           response.message,
           "Internal service credentials rotated. AgentArk is restarting. The page will refresh automatically when it is ready."
-        )
-      );
+        ),
+        durationMs: RESTART_NOTICE_DURATION_MS,
+        etaLabel: "Up to 10 seconds"
+      });
     },
     onError: (e) => setError(errMessage(e))
   });
@@ -28456,7 +30208,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
       label: "Admin",
       items: [
         { value: 14, label: "Data Lifecycle" },
-        { value: 6, label: "Observability" }
+        { value: 6, label: "Observability" },
+        { value: 25, label: "Updates" }
       ]
     },
     {
@@ -28488,7 +30241,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     }
   }, [tab]);
 
-  const tabSupportsSave = ![9, 11, 13, 16, 17, 20, 21, 22, 23].includes(tab);
+  const tabSupportsSave = ![9, 11, 13, 16, 17, 20, 21, 22, 23, 25].includes(tab);
   const selectedSettingsMeta = (() => {
     switch (tab) {
       case 0:
@@ -28522,6 +30275,12 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           kicker: "Admin",
           title: "Data Cleanup",
           description: "Retention windows, cleanup cadence, and long-run storage posture."
+        };
+      case 25:
+        return {
+          kicker: "Admin",
+          title: "Updates",
+          description: "Release status, restart-aware update flow, and version pinning for this installation."
         };
       case 20:
         return { kicker: "Integrations", description: "Delivery channels, target routing, and messaging readiness." };
@@ -28677,6 +30436,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
     { label: "Delegations", value: form.data_lifecycle_swarm_delegation_retention_days },
     { label: "LLM usage", value: form.data_lifecycle_llm_usage_retention_days },
     { label: "Completed tasks", value: form.data_lifecycle_terminal_task_retention_days },
+    { label: "Execution runs", value: form.data_lifecycle_execution_run_retention_days },
+    {
+      label: "Background sessions",
+      value: form.data_lifecycle_background_session_retention_days
+    },
+    { label: "Browser sessions", value: form.data_lifecycle_browser_session_retention_days },
+    { label: "Automation runs", value: form.data_lifecycle_automation_run_retention_days },
     { label: "Conversations", value: form.data_lifecycle_message_retention_days }
   ].filter((rule) => {
     const parsed = Number(rule.value.trim());
@@ -28684,7 +30450,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
   });
   const foreverLifecycleSummary = foreverLifecycleRules.map((rule) => rule.label).join(", ");
   const dataCleanupEnabled = form.data_lifecycle_cleanup_enabled;
-  const episodeCleanupInputsEnabled = dataCleanupEnabled && form.memory_retention_enabled;
   const notificationsCleanupInputsEnabled =
     dataCleanupEnabled && form.data_lifecycle_notifications_cleanup_enabled;
   const logsCleanupInputsEnabled =
@@ -29954,12 +31719,17 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               {renderSettingsSectionIntro({
                 eyebrow: "Search",
                 title: "Provider Credentials",
-                description: "Configured providers are used automatically in a fixed order. Leave API key fields blank to keep any existing saved key.",
+                description: "Paid and self-hosted providers are ignored until configured. Configured providers are then used automatically in a fixed order.",
               })}
               <Stack spacing={1.2} sx={{ mt: 1 }}>
                 <Alert severity="info">
-                  Provider order: {SEARCH_PROVIDER_OPTIONS.map((provider) => provider.label).join(" → ")} — free fallback: Bing RSS → Lightpanda → DuckDuckGo.
+                  Configured provider order: {SEARCH_PROVIDER_OPTIONS.map((provider) => provider.label).join(" → ")} — free fallback: DuckDuckGo → Lightpanda → Bing RSS.
                 </Alert>
+                {!toBool(settings.search_lightpanda_available) ? (
+                  <Alert severity="warning">
+                    Lightpanda is missing from this runtime, so the bundled free search fallback skips it until the AgentArk runtime is updated or rebuilt.
+                  </Alert>
+                ) : null}
                 <Typography variant="caption" sx={{
                   color: "text.secondary"
                 }}>
@@ -30059,14 +31829,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   {renderSettingsSectionIntro({
                     eyebrow: "Security",
                     title: "Internal Service Credentials",
-                    description:
-                      "Executor and workspace trust the control plane with shared bearer credentials. Rotation rewrites those credentials and restarts AgentArk.",
-                    action: (
+                    description: internalServiceDescription,
+                    action: internalServiceRotationSupported ? (
                       <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap" }}>
                         <Chip size="small" label="Manual rotation" />
                         <Chip size="small" variant="outlined" label="Restart required" />
                       </Stack>
-                    ),
+                    ) : undefined,
                   })}
                   {securityStatusQ.isLoading ? (
                     <Typography variant="body2" sx={{ color: "text.secondary" }}>
@@ -30125,30 +31894,24 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           );
                         })}
                       </Stack>
-                      {internalServiceEnvManaged ? (
-                        <Alert severity="info">
-                          Rotation is disabled here because this deployment provides internal credentials through environment variables.
-                        </Alert>
-                      ) : (
+                      {internalServiceRotationSupported ? (
                         <Alert severity="info">
                           Rotation rewrites both credentials together, then restarts control, executor, and workspace immediately. Active work can be interrupted while the stack comes back.
                         </Alert>
-                      )}
-                      <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
-                        <Button
-                          variant="outlined"
-                          color="warning"
-                          size="large"
-                          disabled={
-                            !internalServiceRotationSupported ||
-                            rotateInternalServiceTokensMutation.isPending ||
-                            !!restartNotice
-                          }
-                          onClick={openRotateInternalCredentialsDialog}
-                        >
-                          {rotateInternalServiceTokensMutation.isPending ? "Rotating..." : "Rotate Internal Credentials"}
-                        </Button>
-                      </Stack>
+                      ) : null}
+                      {internalServiceRotationSupported ? (
+                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1} useFlexGap sx={{ flexWrap: "wrap" }}>
+                          <Button
+                            variant="outlined"
+                            color="warning"
+                            size="large"
+                            disabled={rotateInternalServiceTokensMutation.isPending || !!restartNotice}
+                            onClick={openRotateInternalCredentialsDialog}
+                          >
+                            {rotateInternalServiceTokensMutation.isPending ? "Rotating..." : "Rotate Internal Credentials"}
+                          </Button>
+                        </Stack>
+                      ) : null}
                     </Stack>
                   )}
                 </Stack>
@@ -30726,19 +32489,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               {renderSettingsSectionIntro({
                 eyebrow: "Security",
                 title: "Security logs",
-                description: "Hidden by default. Open the viewer to inspect individual events.",
+                description: "Review recent sign-in, policy, and protection events only when you need them.",
                 info:
                   "This log records security-related events such as sign-in failures, policy checks, and protection warnings.",
                 action: (
                   <Button
                     size="small"
                     variant="outlined"
-                    onClick={() => {
-                      setSelectedSecurityLog(null);
-                      setSecurityLogsDialogOpen(true);
-                    }}
+                    onClick={() => setSecurityLogsDialogOpen(true)}
                   >
-                    Open Logs
+                    Show Logs
                   </Button>
                 )
               })}
@@ -30753,13 +32513,13 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             ? renderSettingsInlineCard({
                 eyebrow: "Restarting",
                 title: "AgentArk is coming back online",
-                description: restartNotice,
+                description: restartNotice.text,
                 tone: "info",
                 action: (
                   <Chip
                     size="small"
                     icon={<AutorenewRoundedIcon />}
-                    label="Up to 10 seconds"
+                    label={restartNotice.etaLabel}
                     color="info"
                     variant="outlined"
                   />
@@ -30779,7 +32539,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           {/* -- System Controls group -- */}
           <Box className="adv-group">
             <div className="adv-group-header">
-              <div className="adv-group-header-icon" style={{ background: "rgba(255, 255, 255, 0.05)", border: "1px solid rgba(255, 255, 255, 0.1)" }}>
+              <div className="adv-group-header-icon">
                 <SettingsRoundedIcon sx={{ fontSize: 16, color: "rgba(244,245,247,0.82)" }} />
               </div>
               <div>
@@ -30875,7 +32635,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           {/* -- Permissions group -- */}
           <Box className="adv-group">
             <div className="adv-group-header">
-              <div className="adv-group-header-icon" style={{ background: "rgba(20, 241, 149, 0.10)", border: "1px solid rgba(20, 241, 149, 0.22)" }}>
+              <div className="adv-group-header-icon">
                 <span style={{ fontSize: 15 }}>&#128274;</span>
               </div>
               <div>
@@ -30950,7 +32710,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           {/* -- API Access group -- */}
           <Box className="adv-group">
             <div className="adv-group-header">
-              <div className="adv-group-header-icon" style={{ background: "rgba(255, 180, 50, 0.10)", border: "1px solid rgba(255, 180, 50, 0.22)" }}>
+              <div className="adv-group-header-icon">
                 <span style={{ fontSize: 15 }}>&#128273;</span>
               </div>
               <div>
@@ -31091,7 +32851,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               }}>
                 {foreverLifecycleRules.length > 0
                   ? `Forever is enabled for ${foreverLifecycleSummary}.`
-                  : "Set any retention field below to 0 if you intentionally want to keep that data forever."} Keeping rows forever or far beyond the defaults can increase DB size, slow queries, and make the server feel heavier over time. Emergency low-disk protection may still prune episodes even if normal cleanup is off.
+                  : "Set any retention field below to 0 if you intentionally want to keep that data forever."} Keeping rows forever or far beyond the defaults can increase DB size, slow queries, and make the server feel heavier over time.
               </Typography>
             </Stack>
           </Alert>
@@ -31116,11 +32876,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   variant="outlined"
                   label={form.data_lifecycle_logs_cleanup_enabled ? "Logs & traces on" : "Logs & traces off"}
                 />
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={form.memory_retention_enabled ? "Episodes on" : "Episodes off"}
-                />
               </Stack>
               <FormControlLabel
                 control={
@@ -31131,160 +32886,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                 }
                 label="Enable data cleanup"
               />
-            </Stack>
-          </Box>
-
-          <Box className="list-shell">
-            <Stack spacing={2}>
-              {renderSettingsSectionIntro({
-                eyebrow: "Lifecycle",
-                title: "Episode Retention",
-                description: "Controls pruning for episodic memory. Turning this off disables normal cleanup for this category.",
-              })}
-              <Stack direction="row" spacing={1} useFlexGap sx={{
-                flexWrap: "wrap"
-              }}>
-                <Chip
-                  size="small"
-                  color={episodeCleanupInputsEnabled ? "warning" : "default"}
-                  label={episodeCleanupInputsEnabled ? "Pruning enabled" : "Pruning paused"}
-                />
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={form.memory_retention_require_consolidated ? "Only finalized episodes" : "Finalized-only guard off"}
-                />
-              </Stack>
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={form.memory_retention_enabled}
-                    onChange={(e) => setField("memory_retention_enabled", e.target.checked)}
-                  />
-                }
-                label="Enable episode pruning"
-              />
-              <Grid2
-                container
-                spacing={1.5}
-                sx={{
-                  opacity: episodeCleanupInputsEnabled ? 1 : 0.55,
-                  pointerEvents: episodeCleanupInputsEnabled ? "auto" : "none",
-                  transition: "opacity 0.2s"
-                }}
-              >
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Minimum age (days)"
-                    value={form.memory_retention_min_age_days}
-                    onChange={(e) => setField("memory_retention_min_age_days", e.target.value)}
-                    helperText="Older than this before pruning is allowed."
-                    slotProps={{
-                      htmlInput: { min: 30, step: 1 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Always keep newest episodes"
-                    value={form.memory_retention_keep_last}
-                    onChange={(e) => setField("memory_retention_keep_last", e.target.value)}
-                    helperText="Safety floor for recent history."
-                    slotProps={{
-                      htmlInput: { min: 500, step: 1 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Max importance"
-                    value={form.memory_retention_max_importance}
-                    onChange={(e) => setField("memory_retention_max_importance", e.target.value)}
-                    helperText="Only prune episodes at or below this score."
-                    slotProps={{
-                      htmlInput: { min: 0, max: 1, step: 0.05 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Max access count"
-                    value={form.memory_retention_max_access_count}
-                    onChange={(e) => setField("memory_retention_max_access_count", e.target.value)}
-                    helperText="Protects frequently revisited episodes."
-                    slotProps={{
-                      htmlInput: { min: 0, step: 1 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Run interval (days)"
-                    value={form.memory_retention_run_interval_days}
-                    onChange={(e) => setField("memory_retention_run_interval_days", e.target.value)}
-                    helperText="Minimum days between prune runs."
-                    slotProps={{
-                      htmlInput: { min: 1, step: 1 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Idle threshold (seconds)"
-                    value={form.memory_retention_idle_threshold_secs}
-                    onChange={(e) => setField("memory_retention_idle_threshold_secs", e.target.value)}
-                    helperText="Only prune when the server has been idle this long."
-                    slotProps={{
-                      htmlInput: { min: 60, step: 60 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    type="number"
-                    label="Max delete per run"
-                    value={form.memory_retention_max_delete_per_run}
-                    onChange={(e) => setField("memory_retention_max_delete_per_run", e.target.value)}
-                    helperText="Caps each cleanup pass."
-                    slotProps={{
-                      htmlInput: { min: 10, step: 10 }
-                    }}
-                  />
-                </Grid2>
-                <Grid2 size={{ xs: 12, md: 4 }}>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={form.memory_retention_require_consolidated}
-                        onChange={(e) =>
-                          setField("memory_retention_require_consolidated", e.target.checked)
-                        }
-                      />
-                    }
-                    label="Only prune finalized episodes"
-                  />
-                </Grid2>
-              </Grid2>
             </Stack>
           </Box>
 
@@ -31389,6 +32990,70 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       setField("data_lifecycle_execution_trace_retention_days", e.target.value)
                     }
                     helperText="0 keeps all traces."
+                    slotProps={{
+                      htmlInput: { min: 0, step: 1 }
+                    }}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Execution runs (days)"
+                    value={form.data_lifecycle_execution_run_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_execution_run_retention_days", e.target.value)
+                    }
+                    helperText="0 keeps all execution runs, checkpoints, and tool attempts."
+                    slotProps={{
+                      htmlInput: { min: 0, step: 1 }
+                    }}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Background sessions (days)"
+                    value={form.data_lifecycle_background_session_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_background_session_retention_days", e.target.value)
+                    }
+                    helperText="0 keeps closed background sessions forever."
+                    slotProps={{
+                      htmlInput: { min: 0, step: 1 }
+                    }}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Browser sessions (days)"
+                    value={form.data_lifecycle_browser_session_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_browser_session_retention_days", e.target.value)
+                    }
+                    helperText="0 keeps completed and failed browser sessions forever."
+                    slotProps={{
+                      htmlInput: { min: 0, step: 1 }
+                    }}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 4 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    type="number"
+                    label="Automation runs (days)"
+                    value={form.data_lifecycle_automation_run_retention_days}
+                    onChange={(e) =>
+                      setField("data_lifecycle_automation_run_retention_days", e.target.value)
+                    }
+                    helperText="0 keeps automation history forever."
                     slotProps={{
                       htmlInput: { min: 0, step: 1 }
                     }}
@@ -31594,6 +33259,144 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   />
                 </Grid2>
               </Grid2>
+            </Stack>
+        </Box>
+      </Stack>
+    ) : null}
+
+      {tab === 25 ? (
+        <Stack spacing={2.5}>
+          {restartNotice
+            ? renderSettingsInlineCard({
+                eyebrow: "Restarting",
+                title: "AgentArk is coming back online",
+                description: restartNotice.text,
+                tone: "info",
+                action: (
+                  <Chip
+                    size="small"
+                    icon={<AutorenewRoundedIcon />}
+                    label={restartNotice.etaLabel}
+                    color="info"
+                    variant="outlined"
+                  />
+                )
+              })
+            : null}
+
+          {renderSettingsInlineCard({
+            eyebrow: "Updates",
+            title: "Managed release updates",
+            description:
+              "Updating restarts AgentArk. Pending chats, running jobs, and in-flight approvals can be interrupted. Stored data and conversation history remain on this machine.",
+            tone: "warning",
+            fullWidthCopy: true
+          })}
+
+          <Box className="list-shell">
+            <Stack spacing={2}>
+              {renderSettingsSectionIntro({
+                eyebrow: "Updates",
+                title: "Release status",
+                description: "Track the installed version and the latest tagged release without polling GitHub on every page refresh.",
+                action:
+                  updateStatus?.state === "available" && updateStatus.apply_supported ? (
+                    <Button
+                      size="small"
+                      variant="contained"
+                      color="warning"
+                      disabled={updateAgentArkMutation.isPending || !!restartNotice}
+                      onClick={async () => {
+                        const ok = window.confirm(
+                          "Update AgentArk and restart now? Pending chats, running jobs, and in-flight approvals can be interrupted."
+                        );
+                        if (!ok) return;
+                        setError(null);
+                        setSuccess(null);
+                        setRestartNotice(null);
+                        try {
+                          await updateAgentArkMutation.mutateAsync();
+                          void monitorRestartRecovery(UPDATE_NOTICE_DURATION_MS);
+                        } catch (e) {
+                          setError(errMessage(e));
+                        }
+                      }}
+                    >
+                      {updateAgentArkMutation.isPending ? "Starting..." : "Update and Restart"}
+                    </Button>
+                  ) : null
+              })}
+
+              {updateStatusQ.isLoading && !updateStatus ? (
+                <Alert severity="info">Checking the latest release.</Alert>
+              ) : updateStatusQ.error ? (
+                <Alert severity="error">{errMessage(updateStatusQ.error)}</Alert>
+              ) : null}
+
+              <Grid2 container spacing={1.5}>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Installed version"
+                    value={str(updateStatusQ.data?.version, "Unknown")}
+                    slotProps={{ input: { readOnly: true } }}
+                  />
+                </Grid2>
+                <Grid2 size={{ xs: 12, md: 6 }}>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Latest release"
+                    value={str(updateStatus?.latest_version, "Unavailable")}
+                    slotProps={{ input: { readOnly: true } }}
+                  />
+                </Grid2>
+              </Grid2>
+
+              {updateStatus?.checked_at ? (
+                <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                  Last checked {updateCheckedAtLabel}
+                </Typography>
+              ) : null}
+
+              {updateStatus?.release_url ? (
+                <Link
+                  href={updateStatus.release_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  underline="hover"
+                >
+                  Open release notes
+                </Link>
+              ) : null}
+
+              {(() => {
+                if (!updateStatus) {
+                  return null;
+                }
+                if (updateStatus.state === "available") {
+                  return (
+                    <Alert severity="warning">
+                      A newer tagged release is available.
+                      {updateStatus.apply_supported
+                        ? " Start the update here when you are ready for a restart."
+                        : ` ${updateStatus.apply_message || "Update this deployment from the CLI instead."}`}
+                    </Alert>
+                  );
+                }
+                if (updateStatus.state === "current") {
+                  return <Alert severity="success">This installation is already on the latest tagged release.</Alert>;
+                }
+                if (updateStatus.state === "unavailable") {
+                  return (
+                    <Alert severity="info">
+                      Update status is unavailable for this deployment. This is expected while release metadata is private or temporarily unreachable.
+                    </Alert>
+                  );
+                }
+                return <Alert severity="info">Checking release metadata.</Alert>;
+              })()}
             </Stack>
           </Box>
         </Stack>
@@ -32271,125 +34074,151 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
         open={securityLogsDialogOpen}
         onClose={() => {
           setSecurityLogsDialogOpen(false);
-          setSelectedSecurityLog(null);
         }}
-        maxWidth="lg"
+        maxWidth="md"
         fullWidth
+        slotProps={{
+          paper: {
+            sx: {
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.08)",
+              background: "linear-gradient(180deg, rgba(24, 25, 28, 0.98), rgba(16, 17, 19, 0.98))",
+              boxShadow: "0 30px 96px rgba(0,0,0,0.5)"
+            }
+          }
+        }}
       >
-        <DialogTitle>Security Logs</DialogTitle>
-        <DialogContent dividers>
-          <Stack spacing={1}>
-            <Stack
-              direction="row"
-              sx={{
-                justifyContent: "space-between",
-                alignItems: "center"
-              }}>
-              <Typography variant="caption" sx={{
-                color: "text.secondary"
-              }}>
-                event_type | severity | message
+        <DialogTitle sx={{ pb: 1.25 }}>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1.25}
+            sx={{
+              justifyContent: "space-between",
+              alignItems: { xs: "flex-start", sm: "center" }
+            }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ fontWeight: 650 }}>
+                Security Logs
               </Typography>
-              <Button size="small" onClick={() => void securityLogsQ.refetch()} disabled={securityLogsQ.isFetching}>
+              <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.35, maxWidth: 640 }}>
+                Recent authentication, policy, and protection events recorded by AgentArk.
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+              {!securityLogsQ.isLoading && !securityLogsQ.error ? (
+                <Chip size="small" variant="outlined" label={`${securityLogs.length} recent`} />
+              ) : null}
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() => void securityLogsQ.refetch()}
+                disabled={securityLogsQ.isFetching}
+              >
                 {securityLogsQ.isFetching ? "Refreshing..." : "Refresh"}
               </Button>
             </Stack>
+          </Stack>
+        </DialogTitle>
+        <DialogContent sx={{ pt: 0.5 }}>
+          <Stack spacing={1.25}>
             {securityLogsQ.isLoading ? (
-              <Typography variant="body2" sx={{
-                color: "text.secondary"
-              }}>
-                Loading security logs...
-              </Typography>
+              <Box className="list-shell" sx={{ py: 5, textAlign: "center" }}>
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  Loading security logs...
+                </Typography>
+              </Box>
             ) : securityLogsQ.error ? (
               <Alert severity="error">{errMessage(securityLogsQ.error)}</Alert>
             ) : securityLogs.length === 0 ? (
-              <Typography variant="body2" sx={{
-                color: "text.secondary"
-              }}>
-                No security logs yet.
-              </Typography>
+              <Box className="list-shell" sx={{ py: 5, textAlign: "center" }}>
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  No security logs yet.
+                </Typography>
+              </Box>
             ) : (
-              <TableContainer className="table-shell">
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>event_type</TableCell>
-                      <TableCell>severity</TableCell>
-                      <TableCell>message</TableCell>
-                      <TableCell align="right">Ops</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {securityLogs.map((row, idx) => {
-                      const eventType = str(row.event_type, "-");
-                      const severity = str(row.severity, "-");
-                      const message = str(row.message, "-");
-                      const rowKey = `${str(row.created_at, "")}:${eventType}:${idx}`;
-                      const selected = selectedSecurityLog === row;
-                      return (
-                        <TableRow
-                          key={rowKey}
-                          hover
-                          selected={selected}
-                          sx={{ cursor: "pointer" }}
-                          onClick={() => setSelectedSecurityLog(row)}
-                        >
-                          <TableCell sx={{ whiteSpace: "nowrap" }}>{eventType}</TableCell>
-                          <TableCell sx={{ whiteSpace: "nowrap" }}>
-                            <Chip size="small" label={severity} color={severityChipColor(severity)} />
-                          </TableCell>
-                          <TableCell sx={{ maxWidth: 560 }}>
-                            <Typography variant="body2" noWrap title={message}>
-                              {message}
+              <Box
+                sx={{
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  borderRadius: "8px",
+                  background: "rgba(255,255,255,0.025)",
+                  overflow: "hidden"
+                }}
+              >
+                <Box
+                  sx={{
+                    px: { xs: 1.5, sm: 2 },
+                    py: 1.1,
+                    borderBottom: "1px solid rgba(255,255,255,0.08)",
+                    background: "rgba(255,255,255,0.03)"
+                  }}
+                >
+                  <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                    Newest first. Each row includes the event type, severity, source, time, and grouped count when available.
+                  </Typography>
+                </Box>
+                <Stack
+                  divider={<Divider flexItem sx={{ borderColor: "rgba(255,255,255,0.08)" }} />}
+                  sx={{ maxHeight: "min(560px, 62vh)", overflowY: "auto" }}
+                >
+                  {securityLogs.map((row, idx) => {
+                    const eventType = str(row.event_type, "");
+                    const severity = str(row.severity, "-");
+                    const message = str(row.message, "-");
+                    const source = str(row.source, "").trim() || "Unknown source";
+                    const count = Math.max(1, num(row.count, 1));
+                    const createdAt = humanTs(str(row.created_at, "-"));
+                    const rowKey = `${str(row.created_at, "")}:${eventType}:${idx}`;
+                    return (
+                      <Box
+                        key={rowKey}
+                        sx={{
+                          px: { xs: 1.5, sm: 2 },
+                          py: 1.5,
+                          borderLeft: `3px solid ${securitySeverityAccent(severity)}`,
+                          background: "linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0))"
+                        }}
+                      >
+                        <Stack spacing={0.9}>
+                          <Stack
+                            direction={{ xs: "column", sm: "row" }}
+                            spacing={1}
+                            sx={{ justifyContent: "space-between", alignItems: { xs: "flex-start", sm: "center" } }}
+                          >
+                            <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+                              <Chip size="small" variant="outlined" label={securityEventTypeLabel(eventType)} />
+                              <Chip size="small" label={severity} color={severityChipColor(severity)} />
+                              {count > 1 ? <Chip size="small" variant="outlined" label={`${count} grouped`} /> : null}
+                            </Stack>
+                            <Typography variant="caption" sx={{ color: "text.secondary" }} title={createdAt.tip}>
+                              {createdAt.label}
                             </Typography>
-                          </TableCell>
-                          <TableCell align="right">
-                            <Button
-                              size="small"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedSecurityLog(row);
-                              }}
-                            >
-                              View
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            )}
-
-            {selectedSecurityLog ? (
-              <Box className="metadata-box">
-                <Stack spacing={0.5}>
-                  <Typography variant="subtitle2">Selected Log</Typography>
-                  <Typography variant="body2">
-                    <strong>event_type:</strong> {str(selectedSecurityLog.event_type, "-")}
-                  </Typography>
-                  <Typography variant="body2">
-                    <strong>severity:</strong> {str(selectedSecurityLog.severity, "-")}
-                  </Typography>
-                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                    <strong>message:</strong> {str(selectedSecurityLog.message, "-")}
-                  </Typography>
-                  <Typography variant="caption" sx={{
-                    color: "text.secondary"
-                  }}>
-                    source: {str(selectedSecurityLog.source, "-")} | created_at: <span title={humanTs(str(selectedSecurityLog.created_at, "-")).tip}>{humanTs(str(selectedSecurityLog.created_at, "-")).label}</span> | count: {str(selectedSecurityLog.count, "-")}
-                  </Typography>
+                          </Stack>
+                          <Typography
+                            variant="body2"
+                            sx={{ color: "text.primary", lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+                          >
+                            {message}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary", display: "block", whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+                          >
+                            Source {source} | Count {count}
+                          </Typography>
+                        </Stack>
+                      </Box>
+                    );
+                  })}
                 </Stack>
               </Box>
-            ) : null}
+            )}
           </Stack>
         </DialogContent>
         <DialogActions>
           <Button
             onClick={() => {
               setSecurityLogsDialogOpen(false);
-              setSelectedSecurityLog(null);
             }}
           >
             Close
@@ -32405,36 +34234,47 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
           paper: {
             sx: {
               borderRadius: "8px",
-              border: "1px solid rgba(255,255,255,0.08)",
-              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
-              backgroundImage:
-                "radial-gradient(circle at top right, rgba(52, 211, 153, 0.08), transparent 28%), radial-gradient(circle at top left, rgba(96, 165, 250, 0.06), transparent 24%)",
+              border: "1px solid var(--surface-border)",
+              background: "var(--surface-bg-elevated)",
               boxShadow: "0 30px 96px rgba(0,0,0,0.5)"
             }
           }
         }}
       >
-        <DialogTitle
-          sx={{
-            pb: 1.2,
-            borderBottom: "1px solid rgba(255,255,255,0.06)",
-            fontSize: "1rem",
-            fontWeight: 700
-          }}
-        >
-          {str(selectedPulseEvent?.summary, "ArkPulse Details")}
+        <DialogTitle sx={{ pb: 1.2, borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1.25}
+            sx={{
+              justifyContent: "space-between",
+              alignItems: { xs: "flex-start", sm: "center" }
+            }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ fontWeight: 650 }}>
+                ArkPulse Run
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.35, maxWidth: 720 }}>
+                {str(selectedPulseEvent?.summary, "Health check details, findings, and scan ledger.")}
+              </Typography>
+            </Box>
+            <Chip
+              size="small"
+              label={selectedPulseStatus}
+              color={selectedPulseStatusOk ? "success" : "warning"}
+              variant="outlined"
+            />
+          </Stack>
         </DialogTitle>
         <DialogContent sx={{ pt: 2 }}>
           <Stack spacing={1.25}>
             <Box
               sx={{
-                position: "relative",
-                overflow: "hidden",
                 borderRadius: "8px",
-                border: `1px solid ${selectedPulsePalette.border}`,
-                background: selectedPulsePalette.background,
+                border: "1px solid rgba(255,255,255,0.08)",
+                background: "rgba(255,255,255,0.02)",
                 p: { xs: 1.5, sm: 1.75 },
-                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)"
+                boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)"
               }}
             >
               <Stack spacing={1.5}>
@@ -32461,7 +34301,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     size="small"
                     label={`Status: ${selectedPulseStatus}`}
                     color={selectedPulseStatusOk ? "success" : "warning"}
-                    variant={selectedPulseStatusOk ? "filled" : "outlined"}
+                    variant="outlined"
                   />
                   <Chip
                     size="small"
@@ -32485,21 +34325,22 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          color: selectedPulsePalette.accent,
-                          background: selectedPulsePalette.accentSoft,
+                          color: "rgba(243, 246, 250, 0.92)",
+                          background: "rgba(255,255,255,0.05)",
+                          border: "1px solid rgba(255,255,255,0.08)",
                           flex: "0 0 auto"
                         }}
                       >
                         {selectedPulseHeroIcon}
                       </Box>
                       <Stack spacing={0.65} sx={{ minWidth: 0 }}>
-                        <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.1 }}>
+                        <Typography variant="h6" sx={{ fontWeight: 700, lineHeight: 1.15 }}>
                           {selectedPulseGuidance.title}
                         </Typography>
                         <Typography
                           variant="body2"
                           sx={{
-                            color: "rgba(231, 236, 243, 0.76)",
+                            color: "text.secondary",
                             maxWidth: 560,
                             lineHeight: 1.55
                           }}
@@ -32526,7 +34367,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                             p: 1.2,
                             borderRadius: "8px",
                             border: "1px solid rgba(255,255,255,0.08)",
-                            background: "rgba(255,255,255,0.04)"
+                            background: "rgba(255,255,255,0.03)"
                           }}
                         >
                           <Typography
@@ -32553,19 +34394,11 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                             sx={{
                               display: "block",
                               mt: 0.4,
-                              color: "rgba(231, 236, 243, 0.62)"
+                              color: "text.secondary"
                             }}
                           >
                             {item.helper}
                           </Typography>
-                          <Box
-                            sx={{
-                              mt: 0.9,
-                              height: 3,
-                              borderRadius: 999,
-                              background: item.accent
-                            }}
-                          />
                         </Box>
                       ))}
                     </Box>
@@ -32588,8 +34421,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
               <Box
                 sx={{
                   borderRadius: "8px",
-                  border: "1px solid rgba(52, 211, 153, 0.18)",
-                  background: "rgba(14, 32, 24, 0.56)",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "rgba(255,255,255,0.02)",
                   px: 1.4,
                   py: 1.25
                 }}
@@ -32603,8 +34436,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
-                      color: "#34d399",
-                      background: "rgba(52, 211, 153, 0.12)",
+                      color: "rgba(243, 246, 250, 0.92)",
+                      background: "rgba(255,255,255,0.05)",
+                      border: "1px solid rgba(255,255,255,0.08)",
                       flex: "0 0 auto"
                     }}
                   >
@@ -32614,7 +34448,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                     <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                       Nothing urgent in this run
                     </Typography>
-                    <Typography variant="body2" sx={{ color: "rgba(231, 236, 243, 0.72)" }}>
+                    <Typography variant="body2" sx={{ color: "text.secondary" }}>
                       The system snapshot below is still useful for context, but there is no direct remediation queued from this report.
                     </Typography>
                   </Stack>
@@ -32635,17 +34469,8 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   const fix = displayRemediation ? describeArkPulseRemediation(displayRemediation) : getArkPulseFixText(fr);
                   const canCopyFix = fix.trim().length > 0 && fix.trim() !== "-";
                   const canRunFix = runnableRemediation != null;
-                  const canReviewStorageMaintenance = target === "knowledge_store";
                   const fixActionId = `${title}:${target}:${idx}`;
                   const fixBusy = runPulseFixMutation.isPending && activePulseFixId === fixActionId;
-                  const severityAccent =
-                    sev.toLowerCase() === "critical" || sev.toLowerCase() === "high" || sev.toLowerCase() === "error"
-                      ? "#fb7185"
-                      : sev.toLowerCase() === "medium" || sev.toLowerCase() === "warning" || sev.toLowerCase() === "warn"
-                        ? "#fbbf24"
-                        : sev.toLowerCase() === "low"
-                          ? "#60a5fa"
-                          : "#94a3b8";
                   return (
                     <Grid2 key={`${title}-${idx}`} size={{ xs: 12, xl: 6 }}>
                     <Box
@@ -32653,8 +34478,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         height: "100%",
                         borderRadius: "8px",
                         border: "1px solid rgba(255,255,255,0.08)",
-                        borderLeft: `3px solid ${severityAccent}`,
-                        background: "rgba(20, 21, 24, 0.74)",
+                        background: "rgba(255,255,255,0.02)",
                         p: 1.35
                       }}
                     >
@@ -32728,22 +34552,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                         <Stack direction="row" spacing={1} useFlexGap sx={{
                           flexWrap: "wrap"
                         }}>
-                          {canReviewStorageMaintenance ? (
-                            <Button
-                              size="small"
-                              variant="contained"
-                              color="warning"
-                              sx={{ borderRadius: "8px", textTransform: "none" }}
-                              onClick={() => {
-                                setError(null);
-                                setSuccess(null);
-                                setStorageMaintenanceConfirm("");
-                                setStorageMaintenanceOpen(true);
-                              }}
-                            >
-                              Review storage maintenance
-                            </Button>
-                          ) : null}
                           <Button
                             size="small"
                             variant="outlined"
@@ -32794,9 +34602,7 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           color: "rgba(188, 198, 212, 0.66)",
                           lineHeight: 1.45
                         }}>
-                          {canReviewStorageMaintenance
-                            ? "Opens a review screen first, then requires explicit confirmation before any episodic cleanup can run."
-                            : typedRemediation
+                          {typedRemediation
                             ? "Runs directly from ArkPulse using the finding's typed remediation."
                             : canRunFix
                               ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
@@ -32892,6 +34698,9 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                   const durationMs = num(row.duration_ms, 0);
                   const summary = str(row.summary, "").trim();
                   const detail = str(row.detail, "").trim();
+                  const alertReason = pulseScanAlertReason(row);
+                  const alertReasonColor =
+                    pulseScanStatusColor(status) === "error" ? "error.main" : "warning.main";
                   return (
                     <Accordion
                       key={`${str(row.id, `scan-${idx}`)}-${idx}`}
@@ -32940,6 +34749,16 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
                           <Typography variant="body2" sx={{ color: "rgba(188, 198, 212, 0.72)" }} noWrap>
                             {summary || "No summary recorded."}
                           </Typography>
+                          {alertReason ? (
+                            <Typography
+                              variant="caption"
+                              sx={{ color: alertReasonColor }}
+                              noWrap
+                              title={alertReason}
+                            >
+                              Why: {alertReason}
+                            </Typography>
+                          ) : null}
                         </Stack>
                         {durationMs > 0 ? (
                           <Chip size="small" variant="outlined" label={formatTraceDuration(durationMs)} />
@@ -33049,171 +34868,6 @@ function buildMoltbookRunRows(events: JsonRecord[]): JsonRecord[] {
             ) : null}
           </Stack>
         </DialogContent>
-      </Dialog>
-      <Dialog
-        open={storageMaintenanceOpen}
-        onClose={() => {
-          if (runStorageMaintenanceMutation.isPending) return;
-          setStorageMaintenanceOpen(false);
-          setStorageMaintenanceConfirm("");
-        }}
-        maxWidth="md"
-        fullWidth
-      >
-        <DialogTitle>Storage Maintenance Review</DialogTitle>
-        <DialogContent dividers>
-          {storageMaintenanceReviewQ.isLoading ? (
-            <Typography variant="body2" sx={{
-              color: "text.secondary"
-            }}>
-              Building storage review...
-            </Typography>
-          ) : storageMaintenanceReviewQ.error ? (
-            <Alert severity="error">{errMessage(storageMaintenanceReviewQ.error)}</Alert>
-          ) : (
-            <Stack spacing={1.5}>
-              <Alert severity={storageMaintenanceAvailable ? "warning" : "info"} variant="outlined">
-                {str(storageMaintenanceEpisode.reason, "No storage maintenance action is available right now.")}
-              </Alert>
-
-              <Grid2 container spacing={1}>
-                {[
-                  { label: "Episodes", value: String(num(storageMaintenanceCounts.episodes, 0)) },
-                  { label: "Facts", value: String(num(storageMaintenanceCounts.facts, 0)) },
-                  { label: "Documents", value: String(num(storageMaintenanceCounts.documents, 0)) },
-                  { label: "Chunks", value: String(num(storageMaintenanceCounts.document_chunks, 0)) }
-                ].map((item) => (
-                  <Grid2 key={item.label} size={{ xs: 6, md: 3 }}>
-                    <Box className="metadata-box" sx={{ minHeight: 86 }}>
-                      <Typography variant="caption" sx={{
-                        color: "text.secondary"
-                      }}>
-                        {item.label}
-                      </Typography>
-                      <Typography variant="h6">{item.value}</Typography>
-                    </Box>
-                  </Grid2>
-                ))}
-              </Grid2>
-
-              <Stack direction="row" spacing={1} useFlexGap sx={{
-                flexWrap: "wrap"
-              }}>
-                <Chip
-                  size="small"
-                  label={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "Data cleanup on" : "Data cleanup off"}
-                  color={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "success" : "default"}
-                  variant={toBool(storageMaintenancePolicy.data_cleanup_enabled) ? "filled" : "outlined"}
-                />
-                <Chip
-                  size="small"
-                  label={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "Episode retention on" : "Episode retention off"}
-                  color={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "success" : "default"}
-                  variant={toBool(storageMaintenancePolicy.episode_retention_enabled) ? "filled" : "outlined"}
-                />
-              </Stack>
-
-              <Alert severity="info" variant="outlined">
-                {str(storageMaintenanceDurablePolicy.documents, "Documents stay durable.")}
-              </Alert>
-              <Alert severity="info" variant="outlined">
-                {str(storageMaintenanceDurablePolicy.learned_facts, "Learned facts stay durable.")}
-              </Alert>
-
-              <Box className="metadata-box">
-                <Stack spacing={0.7}>
-                  <Typography variant="subtitle2">Episode cleanup preview</Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Current episodes: {num(storageMaintenanceEpisode.current_episode_count, 0)} | Configured cap: {num(storageMaintenanceEpisode.max_episodes, 0)} | Estimated remaining after cleanup: {num(storageMaintenanceEpisode.estimated_remaining_episodes, 0)}
-                  </Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Eligible after protections: {num(storageMaintenanceEpisode.candidate_count, 0)} of {num(storageMaintenanceEpisode.raw_candidate_count, 0)} raw candidates
-                  </Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Safeguards: keep last {num(storageMaintenanceEpisode.keep_last, 0)} | min age {num(storageMaintenanceEpisode.cutoff_days, 0)} days | max importance {num(storageMaintenanceEpisode.max_importance, 0).toFixed(2)} | max access count {num(storageMaintenanceEpisode.max_access_count, 0)}
-                  </Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Protected rows: {num(storageMaintenanceEpisode.protected_recent_count, 0)} recent episodes
-                  </Typography>
-                  <Typography variant="body2" sx={{
-                    color: "text.secondary"
-                  }}>
-                    Finalized-only requirement: {toBool(storageMaintenanceEpisode.require_consolidated) ? "on" : "off"}
-                  </Typography>
-                </Stack>
-              </Box>
-
-              {storageMaintenanceAvailable ? (
-                <Box className="metadata-box">
-                  <Stack spacing={1}>
-                    <Typography variant="subtitle2">Confirmation required</Typography>
-                    <Typography variant="body2" sx={{
-                      color: "text.secondary"
-                    }}>
-                      Type <b>{storageMaintenanceConfirmationPhrase}</b> to run this reviewed cleanup.
-                    </Typography>
-                    <TextField
-                      fullWidth
-                      size="small"
-                      label="Confirmation text"
-                      value={storageMaintenanceConfirm}
-                      onChange={(e) => setStorageMaintenanceConfirm(e.target.value)}
-                    />
-                  </Stack>
-                </Box>
-              ) : null}
-            </Stack>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button
-            onClick={() => {
-              if (runStorageMaintenanceMutation.isPending) return;
-              setStorageMaintenanceOpen(false);
-              setStorageMaintenanceConfirm("");
-            }}
-          >
-            Close
-          </Button>
-          <Button
-            onClick={() => void storageMaintenanceReviewQ.refetch()}
-            disabled={storageMaintenanceReviewQ.isFetching || runStorageMaintenanceMutation.isPending}
-          >
-            {storageMaintenanceReviewQ.isFetching ? "Refreshing..." : "Refresh review"}
-          </Button>
-          <Button
-            color="warning"
-            variant="contained"
-            disabled={
-              !storageMaintenanceAvailable ||
-              !storageMaintenanceConfirmMatches ||
-              runStorageMaintenanceMutation.isPending
-            }
-            onClick={async () => {
-              setError(null);
-              setSuccess(null);
-              try {
-                await runStorageMaintenanceMutation.mutateAsync({
-                  action: "episode_retention_cleanup",
-                  preview_signature: str(storageMaintenanceEpisode.preview_signature, ""),
-                  confirmation_text: storageMaintenanceConfirm.trim()
-                });
-              } catch {
-                // handled by mutation onError
-              }
-            }}
-          >
-            {runStorageMaintenanceMutation.isPending ? "Running..." : "Run reviewed cleanup"}
-          </Button>
-        </DialogActions>
       </Dialog>
       {settingsQ.isLoading || mediaQ.isLoading ? (
         <Typography variant="body2" sx={{
@@ -33998,7 +35652,7 @@ function AnalyticsManager({ autoRefresh }: { autoRefresh: boolean }) {
   };
   const policyMetricsQ = useQuery({
     queryKey: ["analytics-policy-metrics"],
-    queryFn: () => api.rawGet("/settings/evolution/dev?limit=5000"),
+    queryFn: () => api.rawGet(`/settings/evolution/dev?limit=${EVOLUTION_DEV_QUERY_LIMIT}`),
     refetchInterval: autoRefresh ? 120000 : false
   });
 

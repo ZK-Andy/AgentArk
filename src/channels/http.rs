@@ -4,8 +4,8 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Extension, FromRequestParts, MatchedPath, Multipart, Path, Query, Request,
-        State,
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, MatchedPath, Multipart, Path,
+        Query, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
@@ -20,8 +20,7 @@ use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
@@ -81,7 +80,7 @@ use crate::clients::{
     ExecutorClient, ExecutorClientConfig, WorkspaceClient, WorkspaceClientConfig,
 };
 use crate::core::config::{
-    DeploymentMode, EmbeddingsConfig, EmbeddingsProviderKind, MemoryConfig, TelegramConfig,
+    DeploymentMode, EmbeddingsConfig, EmbeddingsProviderKind, TelegramConfig,
     TunnelCloudflareConfig, TunnelConfig, TunnelNgrokConfig, TunnelProviderKind,
     TunnelTailscaleConfig,
 };
@@ -112,9 +111,13 @@ const DEFAULT_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
 const SERVER_BUSY_TRACE_WINDOW_SECS: i64 = 20 * 60;
 const SERVER_BUSY_TASK_WINDOW_SECS: i64 = 20 * 60;
 const MAX_CHAT_MESSAGE_BYTES: usize = 100_000;
+const MAX_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const UI_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 const UI_SESSION_MAX_TRACKED: usize = 4096;
+const RELEASE_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const RELEASE_UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const SSE_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const HEADER_X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const HEADER_X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const HEADER_CONTENT_SECURITY_POLICY: HeaderName =
@@ -510,6 +513,8 @@ pub struct AppState {
     pub public_app_bind_addr: Option<String>,
     /// Optional externally visible base URL for public apps.
     pub public_app_base_url: Option<String>,
+    /// Cached release update metadata for lightweight UI polling.
+    release_update_cache: Arc<RwLock<ReleaseUpdateCache>>,
 }
 
 #[derive(Clone)]
@@ -554,6 +559,22 @@ fn build_workspace_client() -> Result<Option<Arc<WorkspaceClient>>> {
         return Ok(None);
     }
     Ok(Some(Arc::new(client)))
+}
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn cap_sse_lifetime<S>(
+    stream: S,
+) -> impl futures::Stream<Item = std::result::Result<Event, std::convert::Infallible>> + Send + 'static
+where
+    S: futures::Stream<Item = std::result::Result<Event, std::convert::Infallible>>
+        + Send
+        + 'static,
+{
+    stream.take_until(tokio::time::sleep(SSE_MAX_CONNECTION_LIFETIME))
 }
 
 #[derive(Clone, Debug)]
@@ -674,7 +695,7 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
     }
 
     // Step 1: Request user code from OpenAI
-    let client = reqwest::Client::new();
+    let client = shared_http_client().clone();
     let resp = client
         .post(OPENAI_DEVICE_USERCODE_URL)
         .json(&serde_json::json!({ "client_id": OPENAI_DEVICE_AUTH_CLIENT_ID }))
@@ -740,8 +761,8 @@ async fn spawn_codex_oauth_probe() -> std::result::Result<(), String> {
 
     // Step 2: Background task polls for authorization completion
     let runtime_bg = runtime.clone();
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
+    crate::spawn_logged!("src/channels/http.rs:764", async move {
+        let client = shared_http_client().clone();
         let max_attempts = (15 * 60) / interval.max(1); // 15 min timeout
 
         for _ in 0..max_attempts {
@@ -1112,9 +1133,9 @@ fn normalize_origin(value: &str) -> Option<String> {
 }
 
 fn generate_ephemeral_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
@@ -1629,7 +1650,11 @@ async fn handle_autonomy_quick_command(
                 ));
             }
 
-            let actions = agent.runtime.list_actions().await.unwrap_or_default();
+            let actions = agent
+                .runtime
+                .list_enabled_actions()
+                .await
+                .unwrap_or_default();
             let active_prompt_bundle = agent.active_prompt_bundle_for_message(&task).await;
             let active_specialist_prompt_bundle = agent
                 .active_specialist_prompt_bundle_for_message(&task)
@@ -1656,7 +1681,7 @@ async fn handle_autonomy_quick_command(
                 }
             };
             let delegation_id = uuid::Uuid::new_v4().to_string();
-            let empty_memories: Vec<crate::memory::MemoryEntry> = Vec::new();
+            let empty_memories: Vec<crate::core::PromptMemory> = Vec::new();
             let specialists = agent
                 .swarm
                 .as_ref()
@@ -1806,6 +1831,7 @@ pub struct ChatResponse {
     pub run_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    pub total_tokens: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradation: Vec<crate::core::DegradationNote>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1824,6 +1850,201 @@ pub struct StatusResponse {
     pub actions_loaded: Option<usize>,
     pub tasks_pending: usize,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateStatusResponse>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct UpdateStatusResponse {
+    pub state: String,
+    pub apply_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseUpdateCache {
+    last_checked_at: Option<Instant>,
+    summary: UpdateStatusResponse,
+    refreshing: bool,
+}
+
+impl Default for ReleaseUpdateCache {
+    fn default() -> Self {
+        Self {
+            last_checked_at: None,
+            summary: UpdateStatusResponse::checking(),
+            refreshing: false,
+        }
+    }
+}
+
+impl UpdateStatusResponse {
+    fn checking() -> Self {
+        Self {
+            state: "checking".to_string(),
+            apply_supported: false,
+            apply_message: None,
+            latest_version: None,
+            latest_tag: None,
+            release_url: None,
+            checked_at: None,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            state: "unavailable".to_string(),
+            apply_supported: false,
+            apply_message: None,
+            latest_version: None,
+            latest_tag: None,
+            release_url: None,
+            checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        }
+    }
+
+    fn with_apply_support(
+        mut self,
+        apply_supported: bool,
+        apply_message: Option<String>,
+    ) -> Self {
+        self.apply_supported = apply_supported;
+        self.apply_message = apply_message;
+        self
+    }
+}
+
+fn release_update_apply_support(state: &AppState) -> (bool, Option<String>) {
+    if !matches!(stack_role().as_deref(), Some("control-plane" | "control")) {
+        return (
+            false,
+            Some("Web UI updates are available only for managed Docker installs.".to_string()),
+        );
+    }
+
+    if !crate::core::release_updates::ui_update_supported_image(
+        &crate::core::runtime_image::default_runtime_image(),
+    ) {
+        return (
+            false,
+            Some(
+                "This deployment is using a local or custom image. Update it from the CLI instead."
+                    .to_string(),
+            ),
+        );
+    }
+
+    if state.executor_client.is_none() && build_executor_client().ok().flatten().is_none() {
+        return (
+            false,
+            Some("Internal executor service is unavailable for web-based updates.".to_string()),
+        );
+    }
+
+    (true, None)
+}
+
+async fn fetch_release_update_summary_uncached() -> UpdateStatusResponse {
+    let client = match reqwest::Client::builder()
+        .timeout(RELEASE_UPDATE_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!("Release update client creation failed: {}", error);
+            return UpdateStatusResponse::unavailable();
+        }
+    };
+
+    let latest = match crate::core::release_updates::fetch_latest_release_info(
+        &client,
+        &crate::core::release_updates::release_repo_slug(),
+    )
+    .await
+    {
+        Ok(latest) => latest,
+        Err(error) => {
+            tracing::debug!("Release update check unavailable: {}", error);
+            return UpdateStatusResponse::unavailable();
+        }
+    };
+
+    let state = match crate::core::release_updates::is_release_version_newer(
+        env!("CARGO_PKG_VERSION"),
+        &latest.version,
+    ) {
+        Some(true) => "available",
+        Some(false) => "current",
+        None => {
+            tracing::debug!(
+                "Release update version comparison failed for current={} latest={}",
+                env!("CARGO_PKG_VERSION"),
+                latest.version
+            );
+            return UpdateStatusResponse::unavailable();
+        }
+    };
+
+    UpdateStatusResponse {
+        state: state.to_string(),
+        apply_supported: false,
+        apply_message: None,
+        latest_version: Some(latest.version),
+        latest_tag: Some(latest.tag_name),
+        release_url: Some(latest.html_url),
+        checked_at: Some(chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+async fn current_release_update_summary(state: &AppState) -> UpdateStatusResponse {
+    let (apply_supported, apply_message) = release_update_apply_support(state);
+
+    {
+        let cache = state.release_update_cache.read().await;
+        let fresh = cache
+            .last_checked_at
+            .is_some_and(|checked| checked.elapsed() < RELEASE_UPDATE_CHECK_INTERVAL);
+        if fresh || cache.refreshing {
+            return cache
+                .summary
+                .clone()
+                .with_apply_support(apply_supported, apply_message);
+        }
+    }
+
+    {
+        let mut cache = state.release_update_cache.write().await;
+        let fresh = cache
+            .last_checked_at
+            .is_some_and(|checked| checked.elapsed() < RELEASE_UPDATE_CHECK_INTERVAL);
+        if fresh || cache.refreshing {
+            return cache
+                .summary
+                .clone()
+                .with_apply_support(apply_supported, apply_message);
+        }
+        cache.refreshing = true;
+    }
+
+    let fresh = fetch_release_update_summary_uncached().await;
+    let response = fresh
+        .clone()
+        .with_apply_support(apply_supported, apply_message.clone());
+
+    let mut cache = state.release_update_cache.write().await;
+    cache.last_checked_at = Some(Instant::now());
+    cache.summary = fresh;
+    cache.refreshing = false;
+    response
 }
 
 /// User profile response
@@ -2178,6 +2399,7 @@ pub struct SettingsResponse {
     pub search_tavily_configured: bool,
     pub search_perplexity_configured: bool,
     pub search_firecrawl_configured: bool,
+    pub search_lightpanda_available: bool,
     pub search_searxng_base_url: String,
     pub search_builtin_cooldown_hours: u64,
     pub settings_complete: bool,
@@ -2195,16 +2417,6 @@ pub struct SettingsResponse {
     pub deployment_mode: String,
     pub public_app_bind_addr: Option<String>,
     pub public_app_base_url: Option<String>,
-    // Memory retention (episodic pruning; disabled by default)
-    pub memory_retention_enabled: bool,
-    pub memory_retention_min_age_days: u64,
-    pub memory_retention_keep_last: usize,
-    pub memory_retention_max_importance: f32,
-    pub memory_retention_max_access_count: i32,
-    pub memory_retention_require_consolidated: bool,
-    pub memory_retention_run_interval_days: u64,
-    pub memory_retention_idle_threshold_secs: u64,
-    pub memory_retention_max_delete_per_run: u64,
     pub data_lifecycle: DataLifecycleSettings,
     pub observability: observability::ObservabilitySettingsResponse,
 }
@@ -2461,25 +2673,6 @@ pub struct SettingsUpdate {
     pub moltbook_defer_when_busy: Option<bool>,
     #[serde(default)]
     pub moltbook_model_slot_id: Option<String>,
-    // Memory retention (episodic pruning; optional)
-    #[serde(default)]
-    pub memory_retention_enabled: Option<bool>,
-    #[serde(default)]
-    pub memory_retention_min_age_days: Option<u64>,
-    #[serde(default)]
-    pub memory_retention_keep_last: Option<usize>,
-    #[serde(default)]
-    pub memory_retention_max_importance: Option<f32>,
-    #[serde(default)]
-    pub memory_retention_max_access_count: Option<i32>,
-    #[serde(default)]
-    pub memory_retention_require_consolidated: Option<bool>,
-    #[serde(default)]
-    pub memory_retention_run_interval_days: Option<u64>,
-    #[serde(default)]
-    pub memory_retention_idle_threshold_secs: Option<u64>,
-    #[serde(default)]
-    pub memory_retention_max_delete_per_run: Option<u64>,
     #[serde(default)]
     pub data_lifecycle: Option<DataLifecycleSettingsUpdate>,
     #[serde(default)]
@@ -2514,6 +2707,14 @@ pub struct DataLifecycleSettingsUpdate {
     pub llm_usage_retention_days: Option<u64>,
     #[serde(default)]
     pub terminal_task_retention_days: Option<u64>,
+    #[serde(default)]
+    pub execution_run_retention_days: Option<u64>,
+    #[serde(default)]
+    pub background_session_retention_days: Option<u64>,
+    #[serde(default)]
+    pub browser_session_retention_days: Option<u64>,
+    #[serde(default)]
+    pub automation_run_retention_days: Option<u64>,
     #[serde(default)]
     pub message_retention_days: Option<u64>,
     #[serde(default)]
@@ -2851,6 +3052,9 @@ const CLASSIFIER_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
 const SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl";
 const PROMPT_REPLAY_EVAL_SAMPLE_LIMIT: u64 = 5000;
+const EVOLUTION_DEV_DEFAULT_LIMIT: u64 = 250;
+const EVOLUTION_DEV_MAX_LIMIT: u64 = 500;
+const EVOLUTION_DEV_RECENT_RUN_RESPONSE_LIMIT: usize = 250;
 const CHAT_SUGGESTION_SCAN_INTERVAL_HOURS: i64 = 12;
 const CHAT_SUGGESTION_SCAN_DEFER_MINUTES: i64 = 30;
 const CHAT_SUGGESTION_SCAN_FETCH_LIMIT: u64 = 48;
@@ -3425,7 +3629,7 @@ fn spawn_security_log(
 ) {
     let event_type = event_type.to_string();
     let severity = severity.to_string();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:3632", async move {
         let log = crate::storage::security_log::Model {
             id: uuid::Uuid::new_v4().to_string(),
             event_type,
@@ -3452,6 +3656,13 @@ async fn rate_limit_middleware(
     let ip = addr.ip().to_string();
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
+
+    if auth::is_verified_ui_session_request(&state, request.headers(), addr, state.deployment_mode)
+        .await
+    {
+        return next.run(request).await;
+    }
+
     let limiter = state.tiered_rate_limiter.select_for_path(&path);
 
     if !limiter.check_rate_limit(&ip).await {
@@ -3553,7 +3764,7 @@ pub async fn serve(
 ) -> Result<()> {
     {
         let agent_for_reconcile = agent.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:3767", async move {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(OPTIONAL_BACKGROUND_JOB_TIMEOUT_SECS),
                 async {
@@ -3582,7 +3793,7 @@ pub async fn serve(
     {
         let trl = tiered_rate_limiter.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:3796", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tokio::select! {
@@ -3684,6 +3895,7 @@ pub async fn serve(
             server_role: HttpServerRole::ControlPlane,
             public_app_bind_addr,
             public_app_base_url,
+            release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
         }
     };
 
@@ -4075,7 +4287,7 @@ pub async fn serve(
         .route("/models/discover/{provider}", get(discover_provider_models))
         .route("/profile", get(get_profile))
         .route("/restart", post(restart_server))
-        // Self-update endpoints are intentionally left unmounted for now.
+        .route("/update", post(update_server))
         .route("/trace", get(trace::get_trace))
         .route("/trace/{id}", get(trace::get_trace_detail))
         // Integrations routes
@@ -4304,9 +4516,6 @@ pub async fn serve(
         .route("/documents/{id}/search", get(search_document_endpoint))
         // Memory
         .route("/memory/stats", get(memory_stats))
-        .route("/memory/maintenance/review", get(memory_maintenance_review))
-        .route("/memory/maintenance/run", post(run_memory_maintenance))
-        .route("/memory/episodes", get(list_episodes))
         .route("/memory/facts", get(list_facts))
         .route("/memory/preferences", get(list_user_preferences))
         .route("/memory/preferences", post(upsert_user_preference))
@@ -4454,6 +4663,7 @@ pub async fn serve(
             auth::auth_middleware,
         ))
         // Apply rate limiting first so invalid credentials still count.
+        // Verified same-origin UI sessions bypass inside the middleware.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
@@ -4519,6 +4729,7 @@ pub async fn serve(
     let app = public_routes
         .merge(protected_routes)
         .with_state(state.clone())
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn(metrics_middleware))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -4556,6 +4767,7 @@ pub async fn serve(
             .route("/apps/{app_id}/", any(serve_app_root))
             .route("/apps/{app_id}/{*path}", any(serve_app_path))
             .with_state(public_app_state.clone())
+            .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .layer(middleware::from_fn(metrics_middleware))
             .layer(middleware::from_fn_with_state(
                 public_app_state.clone(),
@@ -4659,7 +4871,7 @@ pub async fn serve(
 
     if auto_tunnel {
         let state_for_tunnel = state.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:4874", async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             tracing::info!("AGENTARK_TUNNEL=true - auto-starting remote access tunnel...");
             let provider = tunnel::load_tunnel_config(&state_for_tunnel).await.provider;
@@ -4682,7 +4894,7 @@ pub async fn serve(
     // Auto-start the bundled WhatsApp bridge only when Baileys + embedded mode is enabled.
     if should_manage_embedded_whatsapp_bridge(&state).await {
         let state_for_bridge = state.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:4897", async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             tracing::info!("Auto-starting bundled WhatsApp bridge...");
             match spawn_whatsapp_bridge(state_for_bridge).await {
@@ -4700,7 +4912,7 @@ pub async fn serve(
         let state_for_tunnel = state.clone();
         let wb = wa_bridge_handle.clone();
         let state_for_bridge = state.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:4915", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -4779,6 +4991,8 @@ pub async fn serve(
                     }
                 }
             }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
         });
     }
 
@@ -4786,7 +5000,7 @@ pub async fn serve(
     {
         let state_for_moltbook = state.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:5001", async move {
             let mut timeout_streak = 0u32;
             loop {
                 let storage = { state_for_moltbook.agent.read().await.storage.clone() };
@@ -4870,7 +5084,7 @@ pub async fn serve(
     {
         let state_for_suggestions = state.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:5085", async move {
             let mut timeout_streak = 0u32;
             loop {
                 let storage = { state_for_suggestions.agent.read().await.storage.clone() };
@@ -4993,7 +5207,7 @@ pub async fn serve(
         let mut tls_shutdown = shutdown_rx.clone();
         let shutdown_task = {
             let handle = handle.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http.rs:5208", async move {
                 let _ = tls_shutdown.changed().await;
                 handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
             })
@@ -5847,7 +6061,6 @@ fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value> {
         "Memory statistics by domain",
         "Memory",
     );
-    add("/memory/episodes", "GET", "List episodic memory", "Memory");
     add("/memory/facts", "GET", "List learned facts", "Memory");
     add(
         "/memory/preferences",
@@ -6155,7 +6368,7 @@ async fn openapi_spec(State(state): State<AppState>, headers: HeaderMap) -> Resp
             { "name": "Models", "description": "LLM model configuration" },
             { "name": "Integrations", "description": "Third-party service connections" },
             { "name": "Documents", "description": "Document storage and semantic search" },
-            { "name": "Memory", "description": "Episodic memory, user preferences, user data, and knowledge base" },
+            { "name": "Memory", "description": "Learned facts, user preferences, user data, and knowledge base" },
             { "name": "Notifications", "description": "Notification inbox and read status" },
             { "name": "Projects", "description": "Project workspace management" },
             { "name": "Conversations", "description": "Conversation history and messages" },
@@ -6829,46 +7042,28 @@ fn should_upgrade_insecure_links(content_type: &str) -> bool {
         || ct.starts_with("text/css")
 }
 
-fn rewrite_external_proxy_urls_for_public_apps(content: &str) -> String {
-    const ARXIV_EXPORT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_EXPORT_API__";
-    const ARXIV_ROOT_PLACEHOLDER: &str = "__AGENTARK_ARXIV_ROOT_API__";
+fn app_scoped_public_fetch_prefix(app_id: &str) -> String {
+    format!(
+        "/apps/{}/__agentark/http/fetch?url=",
+        urlencoding::encode(app_id)
+    )
+}
+
+fn rewrite_external_proxy_urls_for_public_apps(content: &str, app_id: &str) -> String {
+    let proxy_prefix = app_scoped_public_fetch_prefix(app_id);
+    let nested_prefix = format!("{}{}", proxy_prefix, proxy_prefix);
 
     let mut rewritten = content
-        // Redirect direct ArXiv API calls through our same-origin public proxy
-        // to avoid browser CORS failures on tunneled/public app URLs.
-        .replace(
-            "http://export.arxiv.org/api/query",
-            ARXIV_EXPORT_PLACEHOLDER,
-        )
-        .replace(
-            "https://export.arxiv.org/api/query",
-            ARXIV_EXPORT_PLACEHOLDER,
-        )
-        .replace("http://arxiv.org/api/query", ARXIV_ROOT_PLACEHOLDER)
-        .replace("https://arxiv.org/api/query", ARXIV_ROOT_PLACEHOLDER)
-        .replace(
-            "https://api.allorigins.win/raw?url=",
-            "/public/proxy/raw?url=",
-        )
-        .replace("https://corsproxy.io/?", "/public/proxy/raw?url=")
-        .replace(
-            "https://api.codetabs.com/v1/proxy/?quest=",
-            "/public/proxy/raw?url=",
-        )
-        .replace(
-            ARXIV_EXPORT_PLACEHOLDER,
-            "/public/proxy/raw?url=https://export.arxiv.org/api/query",
-        )
-        .replace(
-            ARXIV_ROOT_PLACEHOLDER,
-            "/public/proxy/raw?url=https://arxiv.org/api/query",
-        );
+        .replace("/public/proxy/raw?url=", &proxy_prefix)
+        .replace("https://api.allorigins.win/raw?url=", &proxy_prefix)
+        .replace("http://api.allorigins.win/raw?url=", &proxy_prefix)
+        .replace("https://corsproxy.io/?", &proxy_prefix)
+        .replace("http://corsproxy.io/?", &proxy_prefix)
+        .replace("https://api.codetabs.com/v1/proxy/?quest=", &proxy_prefix)
+        .replace("http://api.codetabs.com/v1/proxy/?quest=", &proxy_prefix);
 
-    while rewritten.contains("/public/proxy/raw?url=/public/proxy/raw?url=") {
-        rewritten = rewritten.replace(
-            "/public/proxy/raw?url=/public/proxy/raw?url=",
-            "/public/proxy/raw?url=",
-        );
+    while rewritten.contains(&nested_prefix) {
+        rewritten = rewritten.replace(&nested_prefix, &proxy_prefix);
     }
 
     rewritten
@@ -6885,7 +7080,7 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
   window.__agentarkLlmProxyShimApplied = true;
   const APP_ID = "{app_id}";
   const PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/llm/chat";
-  const ARXIV_PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/arxiv/search";
+  const PUBLIC_FETCH_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/http/fetch";
 
   const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
   if (nativeFetch) {{
@@ -6897,7 +7092,15 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
       }} catch (_) {{}}
       return "";
     }};
-    const shouldProxy = (url) => {{
+    const toAbsoluteUrl = (input) => {{
+      try {{
+        const candidate = extractUrl(input);
+        return candidate ? new URL(candidate, window.location.href).toString() : "";
+      }} catch (_) {{
+        return extractUrl(input);
+      }}
+    }};
+    const shouldProxyLlm = (url) => {{
       const lower = String(url || "").toLowerCase();
       return (
         lower.includes("openrouter.ai/api/v1/chat/completions") ||
@@ -6911,24 +7114,41 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
         lower.endsWith("/v1/completions")
       );
     }};
-    const shouldProxyArxiv = (url) => {{
-      const lower = String(url || "").toLowerCase();
-      return (
-        !lower.includes("/__agentark/arxiv/search") &&
-        (
-          lower.includes("export.arxiv.org/api/query") ||
-          lower.includes("arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=https://export.arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=http://export.arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=https://arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=http://arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=/public/proxy/raw?url=https://export.arxiv.org/api/query") ||
-          lower.includes("/public/proxy/raw?url=/public/proxy/raw?url=https://arxiv.org/api/query")
-        )
-      );
+    const shouldProxyPublicRead = (url, method) => {{
+      const inferredMethod = String(method || "GET").toUpperCase();
+      if (inferredMethod !== "GET" && inferredMethod !== "HEAD") {{
+        return false;
+      }}
+      try {{
+        const absolute = new URL(String(url || ""), window.location.href);
+        if ((absolute.protocol !== "http:" && absolute.protocol !== "https:") || absolute.origin === window.location.origin) {{
+          return false;
+        }}
+        const lowerPath = absolute.pathname.toLowerCase();
+        return (
+          !lowerPath.includes("/__agentark/http/fetch") &&
+          !lowerPath.includes("/__agentark/llm/chat") &&
+          !lowerPath.includes("/__agentark/arxiv/search")
+        );
+      }} catch (_) {{
+        return false;
+      }}
+    }};
+    const buildPublicFetchHeaders = (source) => {{
+      const headers = new Headers();
+      const sourceHeaders = new Headers(source || {{}});
+      ["accept", "accept-language", "if-none-match", "if-modified-since", "range"].forEach((name) => {{
+        const value = sourceHeaders.get(name);
+        if (value) {{
+          headers.set(name, value);
+        }}
+      }});
+      headers.set("x-agentark-app-proxy", "raw");
+      return headers;
     }};
     window.fetch = function(input, init) {{
       const targetUrl = extractUrl(input);
+      const absoluteTargetUrl = toAbsoluteUrl(input);
       const baseInit = Object.assign({{}}, init || {{}});
       const inferredMethod = (
         baseInit.method ||
@@ -6937,19 +7157,21 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
       )
         .toString()
         .toUpperCase();
-      if (shouldProxyArxiv(targetUrl) && inferredMethod === "GET") {{
-        const arxivHeaders = new Headers();
-        arxivHeaders.set("x-agentark-app-proxy", "arxiv");
+      if (shouldProxyPublicRead(absoluteTargetUrl || targetUrl, inferredMethod)) {{
+        const proxyReadInit = {{
+          method: inferredMethod,
+          headers: buildPublicFetchHeaders(baseInit.headers || (input && input.headers)),
+          credentials: "same-origin"
+        }};
+        if (baseInit.signal) {{
+          proxyReadInit.signal = baseInit.signal;
+        }}
         return nativeFetch(
-          ARXIV_PROXY_PATH + "?source_url=" + encodeURIComponent(targetUrl),
-          {{
-            method: "GET",
-            headers: arxivHeaders,
-            credentials: "same-origin"
-          }}
+          PUBLIC_FETCH_PATH + "?url=" + encodeURIComponent(absoluteTargetUrl || targetUrl),
+          proxyReadInit
         );
       }}
-      if (!shouldProxy(targetUrl)) {{
+      if (!shouldProxyLlm(targetUrl)) {{
         return nativeFetch(input, init);
       }}
       const proxyInit = baseInit;
@@ -6964,6 +7186,31 @@ fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> String {
       headers.set("x-agentark-app-proxy", "llm");
       proxyInit.headers = headers;
       return nativeFetch(PROXY_PATH, proxyInit);
+    }};
+  }}
+
+  if (window.XMLHttpRequest && window.XMLHttpRequest.prototype) {{
+    const xhrProto = window.XMLHttpRequest.prototype;
+    const nativeXhrOpen = xhrProto.open;
+    const nativeXhrSend = xhrProto.send;
+    xhrProto.open = function(method, url) {{
+      const args = Array.prototype.slice.call(arguments);
+      const targetUrl = toAbsoluteUrl(url);
+      if (shouldProxyPublicRead(targetUrl, method)) {{
+        args[1] = PUBLIC_FETCH_PATH + "?url=" + encodeURIComponent(targetUrl);
+        this.__agentarkPublicFetchProxy = true;
+      }} else {{
+        this.__agentarkPublicFetchProxy = false;
+      }}
+      return nativeXhrOpen.apply(this, args);
+    }};
+    xhrProto.send = function(body) {{
+      if (this.__agentarkPublicFetchProxy) {{
+        try {{
+          this.setRequestHeader("x-agentark-app-proxy", "raw");
+        }} catch (_) {{}}
+      }}
+      return nativeXhrSend.call(this, body);
     }};
   }}
 
@@ -7259,6 +7506,63 @@ fn arxiv_sort_order_param(raw: Option<&str>) -> String {
     }
 }
 
+fn extract_query_value_from_url(parsed: &reqwest::Url, key: &str) -> Option<String> {
+    parsed
+        .query()
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find_map(|(query_key, value)| (query_key == key).then(|| value.into_owned()))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn extract_wrapped_public_proxy_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("/public/proxy/raw?url=") {
+        return Some(
+            trimmed
+                .trim_start_matches("/public/proxy/raw?url=")
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    if parsed.path() == "/public/proxy/raw" {
+        return extract_query_value_from_url(&parsed, "url");
+    }
+
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if host == "api.allorigins.win" && parsed.path() == "/raw" {
+        return extract_query_value_from_url(&parsed, "url");
+    }
+    if host == "api.codetabs.com" && parsed.path().starts_with("/v1/proxy") {
+        return extract_query_value_from_url(&parsed, "quest");
+    }
+    if host == "corsproxy.io" {
+        if let Some(query) = parsed.query() {
+            let trimmed_query = query.trim();
+            if trimmed_query.starts_with("http://") || trimmed_query.starts_with("https://") {
+                return Some(trimmed_query.to_string());
+            }
+            if let Some(url_value) = extract_query_value_from_url(&parsed, "url") {
+                return Some(url_value);
+            }
+        }
+    }
+    if parsed.path().starts_with("/apps/") && parsed.path().contains("/__agentark/http/fetch") {
+        return extract_query_value_from_url(&parsed, "url");
+    }
+    if parsed.path().starts_with("/apps/") && parsed.path().contains("/__agentark/arxiv/search") {
+        return extract_query_value_from_url(&parsed, "source_url");
+    }
+    None
+}
+
 fn unwrap_nested_public_proxy_url(raw: &str) -> String {
     let mut current = raw.trim().to_string();
     for _ in 0..5 {
@@ -7266,33 +7570,139 @@ fn unwrap_nested_public_proxy_url(raw: &str) -> String {
             .map(|value| value.into_owned())
             .unwrap_or_else(|_| current.clone());
         let trimmed = decoded.trim().to_string();
-        if trimmed.starts_with("/public/proxy/raw?url=") {
-            current = trimmed
-                .trim_start_matches("/public/proxy/raw?url=")
-                .trim()
-                .to_string();
+        if let Some(unwrapped) = extract_wrapped_public_proxy_url(&trimmed) {
+            current = unwrapped;
             continue;
-        }
-        if let Ok(parsed) = reqwest::Url::parse(&trimmed) {
-            if parsed.path() == "/public/proxy/raw" {
-                if let Some(raw_query) = parsed.query() {
-                    if raw_query.starts_with("url=http://") || raw_query.starts_with("url=https://")
-                    {
-                        current = raw_query.trim_start_matches("url=").trim().to_string();
-                        continue;
-                    }
-                    if let Some(url_value) = url::form_urlencoded::parse(raw_query.as_bytes())
-                        .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))
-                    {
-                        current = url_value;
-                        continue;
-                    }
-                }
-            }
         }
         return trimmed;
     }
     current
+}
+
+fn trim_public_proxy_url_candidate(raw: &str) -> &str {
+    raw.trim_end_matches(|ch: char| matches!(ch, ',' | ';' | '.'))
+}
+
+fn is_public_proxy_target_url_candidate(url: &reqwest::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().trim();
+    !host.is_empty() && !is_local_or_private_host_for_upgrade(host)
+}
+
+fn extract_public_proxy_target_hosts_from_text(content: &str) -> HashSet<String> {
+    static ABSOLUTE_URL_RE: OnceLock<Regex> = OnceLock::new();
+    static WRAPPED_PROXY_URL_RE: OnceLock<Regex> = OnceLock::new();
+    let absolute_url_re = ABSOLUTE_URL_RE.get_or_init(|| {
+        Regex::new(r#"https?://[^\s"'<>`)]+"#).expect("valid absolute public URL regex")
+    });
+    let wrapped_proxy_url_re = WRAPPED_PROXY_URL_RE.get_or_init(|| {
+        Regex::new(
+            r#"/(?:public/proxy/raw\?url=|apps/[A-Za-z0-9_-]+/__agentark/(?:http/fetch\?url=|arxiv/search\?source_url=))[^\s"'<>`)]+"#,
+        )
+        .expect("valid wrapped public URL regex")
+    });
+
+    let mut hosts = HashSet::new();
+    for raw_match in absolute_url_re
+        .find_iter(content)
+        .chain(wrapped_proxy_url_re.find_iter(content))
+    {
+        let raw_candidate = trim_public_proxy_url_candidate(raw_match.as_str());
+        let unwrapped = unwrap_nested_public_proxy_url(raw_candidate);
+        let Ok(parsed) = reqwest::Url::parse(&unwrapped) else {
+            continue;
+        };
+        if !is_public_proxy_target_url_candidate(&parsed) {
+            continue;
+        }
+        let host = parsed
+            .host_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !host.is_empty() {
+            hosts.insert(host);
+        }
+    }
+
+    hosts
+}
+
+fn should_scan_app_public_proxy_file(path: &FsPath) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()),
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "html"
+                    | "htm"
+                    | "js"
+                    | "mjs"
+                    | "cjs"
+                    | "jsx"
+                    | "ts"
+                    | "tsx"
+                    | "json"
+                    | "css"
+                    | "txt"
+                    | "md"
+            )
+    )
+}
+
+fn should_descend_public_proxy_scan_entry(entry: &walkdir::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        ".git" | "node_modules" | "target" | ".next" | ".venv" | "venv"
+    )
+}
+
+fn scan_public_proxy_hosts_from_app_dir_sync(app_dir: &FsPath) -> HashSet<String> {
+    const MAX_FILES: usize = 256;
+    const MAX_FILE_BYTES: u64 = 512 * 1024;
+
+    let mut hosts = HashSet::new();
+    let mut scanned_files = 0usize;
+
+    for entry in walkdir::WalkDir::new(app_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_descend_public_proxy_scan_entry)
+        .filter_map(Result::ok)
+    {
+        if scanned_files >= MAX_FILES {
+            break;
+        }
+        if !entry.file_type().is_file() || !should_scan_app_public_proxy_file(entry.path()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        hosts.extend(extract_public_proxy_target_hosts_from_text(&content));
+        scanned_files += 1;
+    }
+
+    hosts
+}
+
+async fn load_allowed_public_proxy_hosts_for_app(app_dir: PathBuf) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || scan_public_proxy_hosts_from_app_dir_sync(&app_dir))
+        .await
+        .unwrap_or_default()
 }
 
 fn build_arxiv_search_request_from_source_url(
@@ -7703,6 +8113,215 @@ async fn app_scoped_arxiv_search_proxy(
         .into_response()
 }
 
+fn extract_public_proxy_target_from_query(raw_query: Option<&str>, key: &str) -> Option<String> {
+    let mut raw_url = raw_query
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find_map(|(query_key, value)| (query_key == key).then(|| value.into_owned()))
+        })
+        .unwrap_or_default();
+    if let Some(query) = raw_query.map(str::trim) {
+        let http_prefix = format!("{}=http://", key);
+        let https_prefix = format!("{}=https://", key);
+        if query.starts_with(&http_prefix) || query.starts_with(&https_prefix) {
+            raw_url = query
+                .split_once('=')
+                .map(|(_, value)| value.trim().to_string())
+                .unwrap_or_default();
+        }
+    }
+    let trimmed = raw_url.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn parse_public_proxy_target_url(
+    raw_url: &str,
+) -> Result<reqwest::Url, (&'static str, &'static str)> {
+    let unwrapped = unwrap_nested_public_proxy_url(raw_url);
+    let mut parsed = reqwest::Url::parse(&unwrapped).map_err(|_| ("invalid_url", "invalid url"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(("invalid_scheme", "only http and https urls are allowed"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err((
+            "embedded_credentials",
+            "embedded credentials are not allowed in proxied urls",
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default().trim();
+    if host.is_empty() {
+        return Err(("missing_host", "url must include a host"));
+    }
+    if is_local_or_private_host_for_upgrade(host) {
+        return Err(("host_not_allowed", "host not allowed"));
+    }
+    if parsed.scheme() == "http" {
+        let _ = parsed.set_scheme("https");
+    }
+    if parsed.scheme() != "https" {
+        return Err(("invalid_scheme", "only https urls are allowed"));
+    }
+    Ok(parsed)
+}
+
+async fn app_scoped_public_fetch_proxy(
+    state: &AppState,
+    app_id: &str,
+    headers: &axum::http::HeaderMap,
+    method: &Method,
+    raw_query: Option<&str>,
+) -> Response {
+    if !app_origin_request_allowed(headers, app_id, "raw") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "forbidden",
+                "message": "app-scoped fetch proxy requires app-origin request context"
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(raw_url) = extract_public_proxy_target_from_query(raw_query, "url") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_url",
+                "message": "Provide a url query parameter."
+            })),
+        )
+            .into_response();
+    };
+
+    let parsed = match parse_public_proxy_target_url(&raw_url) {
+        Ok(url) => url,
+        Err((error, message)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "message": message
+                })),
+            )
+                .into_response();
+        }
+    };
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let allowed_hosts = load_allowed_public_proxy_hosts_for_app(app_dir).await;
+    if !allowed_hosts.contains(&host) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "host_not_allowed_for_app",
+                "host": host,
+                "message": "Public app fetch proxy only allows public hosts referenced by the deployed app source."
+            })),
+        )
+            .into_response();
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .user_agent(crate::branding::user_agent_with_suffix(
+            "public app fetch proxy",
+        ))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let mut request_builder = if *method == Method::HEAD {
+        client.head(parsed.clone())
+    } else {
+        client.get(parsed.clone())
+    };
+    for header_name in [
+        "accept",
+        "accept-language",
+        "if-none-match",
+        "if-modified-since",
+        "range",
+    ] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            request_builder = request_builder.header(header_name, value);
+        }
+    }
+
+    let response = match request_builder.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "fetch_failed",
+                    "message": error.to_string(),
+                    "url": parsed.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !response.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "upstream_error",
+                "status": response.status().as_u16(),
+                "url": parsed.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    if *method == Method::HEAD {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+            ],
+            Vec::<u8>::new(),
+        )
+            .into_response();
+    }
+
+    match response.bytes().await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
 async fn app_scoped_llm_chat_proxy(
     state: &AppState,
     app_id: &str,
@@ -8013,33 +8632,24 @@ fn is_allowed_public_proxy_host(host: &str) -> bool {
 /// Public proxy for static tunneled apps.
 /// Strict allowlist prevents open-proxy abuse.
 async fn public_proxy_raw(uri: Uri, Query(params): Query<HashMap<String, String>>) -> Response {
-    // Accept both properly encoded URLs and pragmatic unencoded forms such as:
-    // /public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=...&start=0
-    // The latter appears in generated JS that appends query params dynamically.
-    let mut raw_url = params
-        .get("url")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if let Some(raw_query) = uri.query().map(str::trim) {
-        if raw_query.starts_with("url=http://") || raw_query.starts_with("url=https://") {
-            raw_url = raw_query.trim_start_matches("url=").trim().to_string();
-        }
-    }
-    let raw_url = raw_url.trim();
-    if raw_url.is_empty() {
+    let raw_url = extract_public_proxy_target_from_query(uri.query(), "url")
+        .or_else(|| params.get("url").map(|value| value.trim().to_string()));
+    let Some(raw_url) = raw_url.filter(|value| !value.trim().is_empty()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "missing query param: url" })),
         )
             .into_response();
-    }
-
-    let mut parsed = match reqwest::Url::parse(raw_url) {
+    };
+    let parsed = match parse_public_proxy_target_url(&raw_url) {
         Ok(url) => url,
-        Err(_) => {
+        Err((error, message)) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid url" })),
+                Json(serde_json::json!({
+                    "error": error,
+                    "message": message,
+                })),
             )
                 .into_response();
         }
@@ -8050,17 +8660,6 @@ async fn public_proxy_raw(uri: Uri, Query(params): Query<HashMap<String, String>
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "host not allowed" })),
-        )
-            .into_response();
-    }
-
-    if parsed.scheme() == "http" {
-        let _ = parsed.set_scheme("https");
-    }
-    if parsed.scheme() != "https" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "only https urls are allowed" })),
         )
             .into_response();
     }
@@ -8254,10 +8853,10 @@ fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
 
 fn axum_to_tungstenite_message(msg: AxumWsMessage) -> Option<TungsteniteMessage> {
     match msg {
-        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string())),
-        AxumWsMessage::Binary(data) => Some(TungsteniteMessage::Binary(data.to_vec())),
-        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data.to_vec())),
-        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data.to_vec())),
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumWsMessage::Binary(data) => Some(TungsteniteMessage::Binary(data)),
+        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data)),
+        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data)),
         AxumWsMessage::Close(_) => Some(TungsteniteMessage::Close(None)),
     }
 }
@@ -8593,6 +9192,19 @@ async fn serve_app_file_inner(
         }
         return app_scoped_llm_chat_proxy(state, app_id, &headers, body).await;
     }
+    if normalized_path.eq_ignore_ascii_case("__agentark/http/fetch") {
+        if method != Method::GET && method != Method::HEAD {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return app_scoped_public_fetch_proxy(
+            state,
+            app_id,
+            &headers,
+            &method,
+            clean_query.as_deref(),
+        )
+        .await;
+    }
     if normalized_path.eq_ignore_ascii_case("__agentark/arxiv/search") {
         if method != Method::GET {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -8864,7 +9476,7 @@ async fn serve_app_file_inner(
             target_url.push_str(q);
         }
 
-        let client = reqwest::Client::new();
+        let client = shared_http_client().clone();
         let mut upstream = client.request(method.clone(), &target_url);
         for (name, value) in &headers {
             let lower = name.as_str().to_ascii_lowercase();
@@ -8980,7 +9592,7 @@ async fn serve_app_file_inner(
                 let mut response_bytes = bytes;
                 if should_upgrade_insecure_links(&content_type) {
                     let mut rewritten = String::from_utf8_lossy(&response_bytes).into_owned();
-                    rewritten = rewrite_external_proxy_urls_for_public_apps(&rewritten);
+                    rewritten = rewrite_external_proxy_urls_for_public_apps(&rewritten, app_id);
                     if content_type.to_ascii_lowercase().starts_with("text/html") {
                         rewritten = inject_app_runtime_fetch_shims(&rewritten, app_id);
                     }
@@ -9872,6 +10484,7 @@ async fn build_runtime_health_payload(
         "approval_log",
         "automation_runs",
         "automation_supervisor_states",
+        "background_sessions",
         "conversations",
         "execution_runs",
         "kv_store",
@@ -10371,7 +10984,7 @@ async fn stream_run_events(
     });
     let stream = replay_stream.chain(live_stream);
 
-    Sse::new(stream)
+    Sse::new(cap_sse_lifetime(stream))
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10)))
         .into_response()
 }
@@ -10459,6 +11072,7 @@ async fn resume_run(
                 run_id: processed.run_id,
                 run_status: processed.run_status,
                 trace_id: processed.trace_id,
+                total_tokens: processed.total_tokens,
                 degradation: processed.degradation,
                 attempted_models: processed.attempted_models,
                 user_outcome: processed.user_outcome,
@@ -10602,7 +11216,7 @@ async fn whatsapp_webhook_handler(
     }
 
     let agent = state.agent.clone();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:11217", async move {
         if let Err(e) = crate::channels::whatsapp::handle_webhook(agent, &body).await {
             tracing::error!("WhatsApp webhook processing error: {}", e);
         }
@@ -10680,7 +11294,7 @@ async fn slack_webhook_handler(
     let timestamp_owned = timestamp.clone();
     let signature_owned = signature.clone();
     let body_owned = body_bytes.to_vec();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:11295", async move {
         if let Err(error) = crate::channels::slack::handle_webhook(
             agent,
             &body_owned,
@@ -10739,7 +11353,7 @@ async fn teams_webhook_handler(
         }
     };
 
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:11354", async move {
         if let Err(error) =
             crate::channels::teams::handle_activity(&agent, &config, activity, verified).await
         {
@@ -11950,8 +12564,11 @@ async fn browser_complete(
 
 /// Get agent status
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
-    let agent = state.agent.read().await;
-    let status = agent.status().await;
+    let status = {
+        let agent = state.agent.read().await;
+        agent.status().await
+    };
+    let update = current_release_update_summary(&state).await;
 
     Json(StatusResponse {
         did: status.did,
@@ -11960,6 +12577,7 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         actions_loaded: Some(status.actions_loaded),
         tasks_pending: status.tasks_pending,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        update: Some(update),
     })
 }
 
@@ -12894,7 +13512,7 @@ async fn trigger_arkpulse_after_app_change(state: &AppState, reason: &'static st
         }
     }
     let agent = state.agent.clone();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:13513", async move {
         tracing::info!("ArkPulse auto-triggered after {}", reason);
         crate::sentinel::run_pulse(&agent).await;
     });
@@ -12919,7 +13537,7 @@ async fn trigger_pulse(State(state): State<AppState>) -> Json<serde_json::Value>
         }
     }
     let agent = state.agent.clone();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:13538", async move {
         crate::sentinel::run_pulse(&agent).await;
     });
     Json(serde_json::json!({ "status": "triggered", "message": "ArkPulse check started" }))
@@ -13086,6 +13704,7 @@ async fn chat(
                 run_id: None,
                 run_status: None,
                 trace_id: None,
+                total_tokens: 0,
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: None,
@@ -13178,6 +13797,7 @@ async fn chat(
                 run_id: None,
                 run_status: None,
                 trace_id: None,
+                total_tokens: 0,
                 degradation: Vec::new(),
                 attempted_models: Vec::new(),
                 user_outcome: None,
@@ -13200,6 +13820,7 @@ async fn chat(
                         run_id: None,
                         run_status: None,
                         trace_id: None,
+                        total_tokens: 0,
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -13227,6 +13848,7 @@ async fn chat(
                         run_id: None,
                         run_status: None,
                         trace_id: None,
+                        total_tokens: 0,
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -13258,6 +13880,7 @@ async fn chat(
                         run_id: None,
                         run_status: None,
                         trace_id: None,
+                        total_tokens: 0,
                         degradation: Vec::new(),
                         attempted_models: Vec::new(),
                         user_outcome: None,
@@ -13324,6 +13947,7 @@ async fn chat(
                     run_id: processed.run_id,
                     run_status: processed.run_status,
                     trace_id: processed.trace_id,
+                    total_tokens: processed.total_tokens,
                     degradation: processed.degradation,
                     attempted_models: processed.attempted_models,
                     user_outcome: processed.user_outcome,
@@ -13356,6 +13980,7 @@ async fn chat(
                     run_id: None,
                     run_status: Some("platform_failed".to_string()),
                     trace_id: None,
+                    total_tokens: 0,
                     degradation,
                     attempted_models: Vec::new(),
                     user_outcome: Some(user_outcome),
@@ -14008,6 +14633,110 @@ fn chat_task_terminal_status(response: &str) -> crate::core::TaskStatus {
     }
 }
 
+fn deep_research_failure_reason(
+    response: &str,
+    run_status: Option<&str>,
+    user_outcome: Option<&crate::core::UserFacingOutcome>,
+) -> String {
+    let outcome_message = user_outcome
+        .map(|outcome| truncate_stream_task_text(&outcome.message, 240))
+        .filter(|value| !value.is_empty());
+    if let Some(message) = outcome_message {
+        return message;
+    }
+
+    let response_preview = truncate_stream_task_text(response, 240);
+    if !response_preview.is_empty() {
+        return response_preview;
+    }
+
+    let normalized = run_status
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "failed".to_string())
+        .replace('_', " ");
+    format!("Deep research {}.", normalized)
+}
+
+fn deep_research_terminal_status(
+    response: &str,
+    run_status: Option<&str>,
+    user_outcome: Option<&crate::core::UserFacingOutcome>,
+) -> crate::core::TaskStatus {
+    let normalized_run_status = run_status
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    match normalized_run_status.as_deref() {
+        Some("degraded") | Some("platform_failed") => crate::core::TaskStatus::Failed {
+            error: deep_research_failure_reason(response, run_status, user_outcome),
+        },
+        Some("needs_input") | Some("blocked") | Some("needs_stronger_model") => {
+            crate::core::TaskStatus::Paused
+        }
+        Some("cancelled") => crate::core::TaskStatus::Cancelled,
+        Some("completed") => chat_task_terminal_status(response),
+        _ => match user_outcome.map(|outcome| &outcome.status) {
+            Some(crate::core::UserFacingOutcomeStatus::Degraded)
+            | Some(crate::core::UserFacingOutcomeStatus::ServiceUnavailable) => {
+                crate::core::TaskStatus::Failed {
+                    error: deep_research_failure_reason(response, run_status, user_outcome),
+                }
+            }
+            Some(crate::core::UserFacingOutcomeStatus::NeedsClarification)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsPermission)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsIntegration)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsCredentials)
+            | Some(crate::core::UserFacingOutcomeStatus::NeedsStrongerModel) => {
+                crate::core::TaskStatus::Paused
+            }
+            _ => chat_task_terminal_status(response),
+        },
+    }
+}
+
+fn deep_research_notification_details(
+    topic: &str,
+    terminal_status: &crate::core::TaskStatus,
+    run_status: Option<&str>,
+) -> Option<(&'static str, String, &'static str)> {
+    match terminal_status {
+        crate::core::TaskStatus::Completed => Some((
+            "Deep research completed",
+            format!(
+                "{} is ready. Open Chat to review the completed report.",
+                topic
+            ),
+            "info",
+        )),
+        crate::core::TaskStatus::Failed { .. } => {
+            let normalized_run_status = run_status
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if normalized_run_status == "platform_failed" {
+                Some((
+                    "Deep research failed",
+                    format!(
+                        "{} could not finish because AgentArk hit an execution problem. Open Chat to review the error.",
+                        topic
+                    ),
+                    "error",
+                ))
+            } else {
+                Some((
+                    "Deep research failed",
+                    format!(
+                        "{} could not finish cleanly. Open Chat to review the issue.",
+                        topic
+                    ),
+                    "warning",
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 struct StreamedChatTask {
     task_id: String,
@@ -14038,7 +14767,9 @@ struct ChatStreamRunRequest {
 }
 
 fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        std::result::Result<Event, std::convert::Infallible>,
+    >(64);
     // Per-request trace so concurrent requests cannot clobber each other.
     let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
     let agent_ref = state.agent.clone();
@@ -14055,7 +14786,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
     let app_state = state.clone();
     let stream_request_id = uuid::Uuid::new_v4().to_string();
 
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:14787", async move {
         let tracked_task = match task_mode {
             ChatStreamTaskMode::CreateIfNeeded => None,
             ChatStreamTaskMode::Existing(task) => {
@@ -14108,7 +14839,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let tracked_task_ref = tracked_task_ref.clone();
             let app_state = app_state.clone();
             let cancel_tx = cancel_tx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http.rs:14840", async move {
                 let mut last_thinking_detail = String::new();
                 while let Some(ev) = stream_rx.recv().await {
                     if let crate::core::StreamEvent::ChatTaskStarted {
@@ -14152,7 +14883,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
             let tx = tx.clone();
             let trace_ref = trace_ref.clone();
             let cancel_tx = cancel_tx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http.rs:14884", async move {
                 let mut last_step_count = 0;
                 let start = std::time::Instant::now();
                 let mut last_progress_at = std::time::Instant::now();
@@ -14428,7 +15159,15 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     }
                 }
                 if let Some(task) = tracked_task.as_ref() {
-                    let terminal_status = chat_task_terminal_status(&processed.response);
+                    let terminal_status = if deep_research {
+                        deep_research_terminal_status(
+                            &processed.response,
+                            processed.run_status.as_deref(),
+                            processed.user_outcome.as_ref(),
+                        )
+                    } else {
+                        chat_task_terminal_status(&processed.response)
+                    };
                     let result_preview = truncate_stream_task_text(
                         if processed.response.trim().is_empty() {
                             "Task completed."
@@ -14477,22 +15216,23 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         .to_string(),
                     );
                     let _ = tx.send(Ok(status_event)).await;
-                    if deep_research
-                        && matches!(terminal_status, crate::core::TaskStatus::Completed)
-                    {
-                        let title = "Deep research completed";
-                        let body = format!(
-                            "{} is ready. Open Chat to review the completed report.",
-                            processed
-                                .conversation_title
-                                .as_deref()
-                                .filter(|value| !value.trim().is_empty())
-                                .unwrap_or(task.description.as_str())
+                    if deep_research {
+                        let topic = processed
+                            .conversation_title
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or(task.description.as_str());
+                        let notification = deep_research_notification_details(
+                            topic,
+                            &terminal_status,
+                            processed.run_status.as_deref(),
                         );
-                        let agent_guard = agent_ref.read().await;
-                        agent_guard
-                            .emit_notification(title, &body, "info", "deep_research")
-                            .await;
+                        if let Some((title, body, level)) = notification {
+                            let agent_guard = agent_ref.read().await;
+                            agent_guard
+                                .emit_notification(title, &body, level, "deep_research")
+                                .await;
+                        }
                     }
                 }
 
@@ -14502,6 +15242,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                     "run_id": processed.run_id,
                     "run_status": processed.run_status,
                     "trace_id": processed.trace_id,
+                    "total_tokens": processed.total_tokens,
                     "degradation": processed.degradation,
                     "attempted_models": processed.attempted_models,
                     "user_outcome": processed.user_outcome,
@@ -14518,6 +15259,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
                         "run_id": content["run_id"],
                         "run_status": content["run_status"],
                         "trace_id": content["trace_id"],
+                        "total_tokens": content["total_tokens"],
                         "degradation": content["degradation"],
                         "attempted_models": content["attempted_models"],
                         "user_outcome": content["user_outcome"],
@@ -14690,7 +15432,7 @@ fn spawn_chat_stream_response(state: AppState, request: ChatStreamRunRequest) ->
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Sse::new(stream)
+    Sse::new(cap_sse_lifetime(stream))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -14897,7 +15639,7 @@ async fn parse_execution_plan_override(
     let agent = state.agent.read().await;
     let actions = agent
         .runtime
-        .list_actions()
+        .list_enabled_actions()
         .await
         .map_err(|error| format!("Failed to load actions for plan validation: {}", error))?;
     let parsed = crate::core::planner::parse_plan_from_value(raw_plan, &actions, None, 1, false)
@@ -14980,8 +15722,10 @@ async fn chat_stream(
             Err(e) => serde_json::json!({ "error": format!("Failed to store secret: {}", e) }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<Event, std::convert::Infallible>,
+        >(4);
+        crate::spawn_logged!("src/channels/http.rs:15726", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
             } else {
@@ -14995,7 +15739,7 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
@@ -15073,8 +15817,10 @@ async fn chat_stream(
             })
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<Event, std::convert::Infallible>,
+        >(4);
+        crate::spawn_logged!("src/channels/http.rs:15821", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
             } else {
@@ -15088,7 +15834,7 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
@@ -15104,8 +15850,10 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<Event, std::convert::Infallible>,
+        >(4);
+        crate::spawn_logged!("src/channels/http.rs:15854", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
             } else {
@@ -15119,7 +15867,7 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
@@ -15135,8 +15883,10 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<Event, std::convert::Infallible>,
+        >(4);
+        crate::spawn_logged!("src/channels/http.rs:15887", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
             } else {
@@ -15150,7 +15900,7 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
@@ -15166,8 +15916,10 @@ async fn chat_stream(
             Err(error) => serde_json::json!({ "error": error }),
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            std::result::Result<Event, std::convert::Infallible>,
+        >(4);
+        crate::spawn_logged!("src/channels/http.rs:15920", async move {
             let event_name = if payload.get("error").is_some() {
                 "error"
             } else {
@@ -15181,7 +15933,7 @@ async fn chat_stream(
             let _ = tx.send(Ok(Event::default().event("done").data("{}"))).await;
         });
 
-        return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        return Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
@@ -18033,7 +18785,7 @@ async fn plan_task(
 ) -> Response {
     let (llm, actions) = {
         let agent = state.agent.read().await;
-        let actions = match agent.runtime.list_actions().await {
+        let actions = match agent.runtime.list_enabled_actions().await {
             Ok(s) => s,
             Err(e) => {
                 return (
@@ -18675,7 +19427,7 @@ async fn accept_chat_suggestion(
         let trace_id_for_run = trace_id.clone();
         let suggestion_kind_for_run = suggestion.kind.clone();
         let run_snapshot_for_run = run_snapshot;
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/http.rs:19428", async move {
             let (token_tx, mut token_rx) =
                 tokio::sync::mpsc::channel::<crate::core::StreamEvent>(256);
             let drain = tokio::spawn(async move { while token_rx.recv().await.is_some() {} });
@@ -20630,6 +21382,12 @@ fn build_experience_run_summary(run: &crate::storage::experience_run::Model) -> 
     })
 }
 
+fn normalize_evolution_dev_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(EVOLUTION_DEV_DEFAULT_LIMIT)
+        .clamp(24, EVOLUTION_DEV_MAX_LIMIT)
+}
+
 async fn build_evolution_settings_response(
     storage: &crate::storage::Storage,
 ) -> EvolutionSettingsResponse {
@@ -21526,6 +22284,7 @@ async fn build_evolution_dev_response(
     limit: u64,
     include_superseded: bool,
 ) -> EvolutionDevResponse {
+    let limit = limit.clamp(24, EVOLUTION_DEV_MAX_LIMIT);
     let logs = storage
         .list_operational_log_version_metrics_by_event("tool_call", limit)
         .await
@@ -21677,6 +22436,7 @@ async fn build_evolution_dev_response(
         .collect::<Vec<_>>();
     let recent_experience_runs = recent_experience_run_rows
         .into_iter()
+        .take(EVOLUTION_DEV_RECENT_RUN_RESPONSE_LIMIT)
         .map(|run| build_experience_run_summary(&run))
         .collect::<Vec<_>>();
     EvolutionDevResponse {
@@ -21869,7 +22629,7 @@ async fn get_evolution_dev(
         let agent = state.agent.read().await;
         agent.storage.clone()
     };
-    let limit = query.limit.unwrap_or(5000).clamp(100, 100_000);
+    let limit = normalize_evolution_dev_limit(query.limit);
     Json(
         build_evolution_dev_response(&storage, limit, query.include_superseded.unwrap_or(false))
             .await,
@@ -22943,7 +23703,7 @@ async fn run_evolution_dev_action(
     };
 
     let evolution = build_evolution_settings_response(&storage).await;
-    let dev = build_evolution_dev_response(&storage, 5000, false).await;
+    let dev = build_evolution_dev_response(&storage, EVOLUTION_DEV_DEFAULT_LIMIT, false).await;
     let trace_id = persist_evolution_action_trace(
         &state,
         &action,
@@ -23801,6 +24561,10 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
             .as_ref()
             .map(|cfg| cfg.firecrawl.is_some())
             .unwrap_or(false),
+        search_lightpanda_available: search_cfg
+            .as_ref()
+            .map(|cfg| cfg.lightpanda_available)
+            .unwrap_or(false),
         search_searxng_base_url: search_cfg
             .as_ref()
             .and_then(|cfg| match cfg.searxng.as_ref() {
@@ -23823,15 +24587,6 @@ async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
         deployment_mode: config.deployment_mode.as_str().to_string(),
         public_app_bind_addr: config.public_apps.bind_addr.clone(),
         public_app_base_url: config.public_apps.base_url.clone(),
-        memory_retention_enabled: config.memory.retention_enabled,
-        memory_retention_min_age_days: config.memory.retention_min_age_days,
-        memory_retention_keep_last: config.memory.retention_keep_last,
-        memory_retention_max_importance: config.memory.retention_max_importance,
-        memory_retention_max_access_count: config.memory.retention_max_access_count,
-        memory_retention_require_consolidated: config.memory.retention_require_consolidated,
-        memory_retention_run_interval_days: config.memory.retention_run_interval_days,
-        memory_retention_idle_threshold_secs: config.memory.retention_idle_threshold_secs,
-        memory_retention_max_delete_per_run: config.memory.retention_max_delete_per_run,
         data_lifecycle,
         observability: observability::build_observability_settings_response(
             &config.observability,
@@ -24373,6 +25128,18 @@ async fn update_settings(
         if let Some(v) = update.terminal_task_retention_days {
             current.terminal_task_retention_days = v;
         }
+        if let Some(v) = update.execution_run_retention_days {
+            current.execution_run_retention_days = v;
+        }
+        if let Some(v) = update.background_session_retention_days {
+            current.background_session_retention_days = v;
+        }
+        if let Some(v) = update.browser_session_retention_days {
+            current.browser_session_retention_days = v;
+        }
+        if let Some(v) = update.automation_run_retention_days {
+            current.automation_run_retention_days = v;
+        }
         if let Some(v) = update.message_retention_days {
             current.message_retention_days = v;
         }
@@ -24425,50 +25192,6 @@ async fn update_settings(
         if let Some(personality) = &settings.personality {
             if !personality.is_empty() {
                 agent_guard.config.personality = personality.clone();
-            }
-        }
-
-        // Episodic memory retention settings (safe-by-default).
-        if settings.memory_retention_enabled.is_some()
-            || settings.memory_retention_min_age_days.is_some()
-            || settings.memory_retention_keep_last.is_some()
-            || settings.memory_retention_max_importance.is_some()
-            || settings.memory_retention_max_access_count.is_some()
-            || settings.memory_retention_require_consolidated.is_some()
-            || settings.memory_retention_run_interval_days.is_some()
-            || settings.memory_retention_idle_threshold_secs.is_some()
-            || settings.memory_retention_max_delete_per_run.is_some()
-        {
-            if let Some(v) = settings.memory_retention_enabled {
-                agent_guard.config.memory.retention_enabled = v;
-            }
-            if let Some(v) = settings.memory_retention_min_age_days {
-                // Keep a conservative floor.
-                agent_guard.config.memory.retention_min_age_days = v.max(30);
-            }
-            if let Some(v) = settings.memory_retention_keep_last {
-                // Always keep at least some recent episodes; never exceed max_episodes.
-                let keep = v.max(500);
-                agent_guard.config.memory.retention_keep_last =
-                    keep.min(agent_guard.config.memory.max_episodes.max(1));
-            }
-            if let Some(v) = settings.memory_retention_max_importance {
-                agent_guard.config.memory.retention_max_importance = v.clamp(0.0, 1.0);
-            }
-            if let Some(v) = settings.memory_retention_max_access_count {
-                agent_guard.config.memory.retention_max_access_count = v.max(0);
-            }
-            if let Some(v) = settings.memory_retention_require_consolidated {
-                agent_guard.config.memory.retention_require_consolidated = v;
-            }
-            if let Some(v) = settings.memory_retention_run_interval_days {
-                agent_guard.config.memory.retention_run_interval_days = v.max(1);
-            }
-            if let Some(v) = settings.memory_retention_idle_threshold_secs {
-                agent_guard.config.memory.retention_idle_threshold_secs = v.max(60);
-            }
-            if let Some(v) = settings.memory_retention_max_delete_per_run {
-                agent_guard.config.memory.retention_max_delete_per_run = v.clamp(10, 20_000);
             }
         }
 
@@ -26635,11 +27358,8 @@ async fn update_settings(
         }
 
         agent_guard.embedding_client = next_embedding_client.clone();
-        agent_guard
-            .memory
-            .set_embedding_client(next_embedding_client.clone());
         if let Some(client) = next_embedding_client {
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http.rs:27360", async move {
                 if let Err(error) = client.prepare().await {
                     tracing::warn!(
                         "Embedding warmup unavailable after settings save: {}",
@@ -26843,7 +27563,7 @@ async fn update_settings(
             if !media_provider_updates.is_empty() {
                 let agent_ref = state.agent.clone();
                 let updates = media_provider_updates.clone();
-                tokio::spawn(async move {
+                crate::spawn_logged!("src/channels/http.rs:27564", async move {
                     let agent = agent_ref.read().await;
                     if let Some(media_gen) = agent.integrations.get("media_gen") {
                         for (provider, api_key) in updates {
@@ -26872,7 +27592,7 @@ async fn update_settings(
             }
 
             if let Some(provider) = llm_connectivity_probe {
-                tokio::spawn(async move {
+                crate::spawn_logged!("src/channels/http.rs:27593", async move {
                     if let Err(e) = test_llm_connection(&provider).await {
                         tracing::warn!("LLM provider connectivity probe failed after save: {}", e);
                     }
@@ -26930,7 +27650,7 @@ async fn update_settings(
             if wa_start_bridge || wa_restart_bridge {
                 let state_for_bridge = state.clone();
                 let wb = state.whatsapp_bridge.clone();
-                tokio::spawn(async move {
+                crate::spawn_logged!("src/channels/http.rs:27651", async move {
                     if wa_restart_bridge {
                         stop_whatsapp_bridge(wb.clone()).await;
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -26943,7 +27663,7 @@ async fn update_settings(
                 });
             } else if wa_stop_bridge {
                 let wb = state.whatsapp_bridge.clone();
-                tokio::spawn(async move {
+                crate::spawn_logged!("src/channels/http.rs:27664", async move {
                     tracing::info!("Stopping WhatsApp bridge (user disabled in settings)...");
                     stop_whatsapp_bridge(wb).await;
                 });
@@ -26951,10 +27671,12 @@ async fn update_settings(
 
             if needs_restart {
                 tracing::info!("Telegram config changed - scheduling automatic restart in 2s");
-                tokio::spawn(async {
+                crate::spawn_logged!("src/channels/http.rs:27672", async {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     tracing::info!("Restarting process to apply Telegram config changes...");
                     std::process::exit(0); // Docker restart: unless-stopped will bring us back
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
                 });
                 (
                     StatusCode::OK,
@@ -27189,9 +27911,11 @@ async fn trigger_runtime_restart(
     }
 
     tracing::info!("Restart requested via API - shutting down local server process");
-    tokio::spawn(async {
+    crate::spawn_logged!("src/channels/http.rs:27910", async {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         std::process::exit(0);
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
     });
 
     Ok(serde_json::json!({
@@ -27205,6 +27929,143 @@ async fn restart_server(State(state): State<AppState>) -> Response {
     match trigger_runtime_restart(&state).await {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err((status, payload)) => (status, Json(payload)).into_response(),
+    }
+}
+
+/// Update to the latest tagged release and restart the managed Docker stack.
+async fn update_server(State(state): State<AppState>) -> Response {
+    let summary = current_release_update_summary(&state).await;
+    if summary.state != "available" {
+        let message = match summary.state.as_str() {
+            "current" => "AgentArk is already on the latest release.",
+            "unavailable" => "Update status is unavailable for this deployment.",
+            _ => "AgentArk is still checking for updates.",
+        };
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": message
+            })),
+        )
+            .into_response();
+    }
+
+    if !summary.apply_supported {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": summary
+                    .apply_message
+                    .clone()
+                    .unwrap_or_else(|| "Web UI updates are unavailable for this deployment.".to_string())
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(release_tag) = summary.latest_tag.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Latest release metadata is incomplete."
+            })),
+        )
+            .into_response();
+    };
+    let Some(release_version) = summary.latest_version.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Latest release version metadata is incomplete."
+            })),
+        )
+            .into_response();
+    };
+
+    let executor_client = state
+        .executor_client
+        .clone()
+        .or_else(|| build_executor_client().ok().flatten());
+    let Some(executor_client) = executor_client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "Internal executor client is unavailable for updates."
+            })),
+        )
+            .into_response();
+    };
+
+    let request = crate::executor::protocol::StackUpdateRequest {
+        release_tag: release_tag.clone(),
+        release_version: release_version.clone(),
+        release_repo: crate::core::release_updates::release_repo_slug(),
+        image_repository: crate::core::release_updates::runtime_image_repository(),
+    };
+
+    match executor_client
+        .request(reqwest::Method::POST, "/internal/v1/system/update-stack")
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            let payload = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if !status.is_success() {
+                return (
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "message": payload
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("Failed to start the AgentArk update."),
+                        "details": payload
+                    })),
+                )
+                    .into_response();
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": payload
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("updating"),
+                    "message": payload
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("AgentArk is updating and restarting."),
+                    "release_tag": payload
+                        .get("release_tag")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(release_tag.as_str()),
+                    "release_version": payload
+                        .get("release_version")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(release_version.as_str())
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to reach executor for update: {}", error)
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -27554,6 +28415,16 @@ async fn ssh_upload_key(
                 .into_response();
         }
     };
+
+    if let Err(e) = crate::actions::ssh::validate_private_key_pem(&name, &pem_content) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     match crate::actions::ssh::store_key(&config_dir, &name, &pem_content) {
         Ok(_) => (
@@ -29637,7 +30508,7 @@ async fn swarm_agent_access_plan(
     .join("\n");
 
     let agent = state.agent.read().await;
-    let actions = match agent.runtime.list_actions().await {
+    let actions = match agent.runtime.list_enabled_actions().await {
         Ok(actions) => actions,
         Err(error) => {
             return (
@@ -30700,10 +31571,47 @@ async fn get_conversation_messages(
         Ok(msgs) => {
             let unavailable_message =
                 "Older message unavailable after a past password/key change.".to_string();
-            let list: Vec<serde_json::Value> = msgs.iter().map(|m| serde_json::json!({
-                "id": m.id, "role": m.role, "content": if m.content == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE { unavailable_message.clone() } else { m.content.clone() },
-                "timestamp": m.timestamp, "model_used": m.model_used, "trace_id": m.trace_id,
-            })).collect();
+            let trace_ids = msgs
+                .iter()
+                .filter_map(|m| m.trace_id.as_deref())
+                .map(str::trim)
+                .filter(|trace_id| !trace_id.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let trace_totals = match agent
+                .storage
+                .get_execution_trace_total_tokens_by_ids(&trace_ids)
+                .await
+            {
+                Ok(totals) => totals,
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to load execution trace token totals for conversation '{}': {}",
+                        id,
+                        error
+                    );
+                    std::collections::HashMap::new()
+                }
+            };
+            let list: Vec<serde_json::Value> = msgs
+                .iter()
+                .map(|m| {
+                    let total_tokens = if m.role == "assistant" {
+                        m.trace_id
+                            .as_ref()
+                            .and_then(|trace_id| trace_totals.get(trace_id.trim()))
+                            .copied()
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    serde_json::json!({
+                        "id": m.id, "role": m.role, "content": if m.content == crate::storage::ENCRYPTED_STORAGE_UNAVAILABLE { unavailable_message.clone() } else { m.content.clone() },
+                        "timestamp": m.timestamp, "model_used": m.model_used, "trace_id": m.trace_id,
+                        "total_tokens": total_tokens,
+                    })
+                })
+                .collect();
             (StatusCode::OK, Json(serde_json::json!({"messages": list}))).into_response()
         }
         Err(e) => (
@@ -31335,7 +32243,11 @@ async fn start_goal_loop(
         .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
 
     let agent = state.agent.read().await;
-    let actions = agent.runtime.list_actions().await.unwrap_or_default();
+    let actions = agent
+        .runtime
+        .list_enabled_actions()
+        .await
+        .unwrap_or_default();
     let planner_request = format!(
         "Goal: {}\nConstraints: {}",
         goal,
@@ -32437,7 +33349,7 @@ pub async fn run_autonomy_analysis_tick(
 
 fn spawn_autonomy_analysis_tick(agent: SharedAgent, trigger: &str) {
     let trigger = trigger.to_string();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:33346", async move {
         let _ = run_autonomy_analysis_tick(agent, &trigger).await;
     });
 }
@@ -32687,8 +33599,10 @@ async fn notification_stream_endpoint(State(state): State<AppState>) -> Response
         agent.subscribe_notification_events()
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
-    tokio::spawn(async move {
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        std::result::Result<Event, std::convert::Infallible>,
+    >(32);
+    crate::spawn_logged!("src/channels/http.rs:33599", async move {
         let connected = serde_json::json!({
             "kind": "notifications.connected",
             "connected_at": chrono::Utc::now().to_rfc3339(),
@@ -32755,7 +33669,7 @@ async fn notification_stream_endpoint(State(state): State<AppState>) -> Response
         }
     });
 
-    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+    Sse::new(cap_sse_lifetime(tokio_stream::wrappers::ReceiverStream::new(rx)))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -34090,11 +35004,6 @@ async fn memory_stats(
 ) -> Response {
     let project_id = params.get("project_id").map(|s| s.as_str());
     let agent = state.agent.read().await;
-    let episode_count = agent
-        .storage
-        .count_episodes_by_project(project_id)
-        .await
-        .unwrap_or(0);
     let fact_count = agent.storage.count_facts(project_id).await.unwrap_or(0);
     let doc_count = agent.storage.count_documents(project_id).await.unwrap_or(0);
     let preference_count = agent
@@ -34115,7 +35024,6 @@ async fn memory_stats(
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "episodes": episode_count,
             "facts": fact_count,
             "documents": doc_count,
             "preferences": preference_count,
@@ -34124,67 +35032,6 @@ async fn memory_stats(
         })),
     )
         .into_response()
-}
-
-/// List memory episodes (paginated)
-async fn list_episodes(
-    State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(20);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let project_id = params.get("project_id").map(|s| s.as_str());
-    let agent = state.agent.read().await;
-    match agent
-        .encrypted_storage
-        .get_episodes_by_project_decrypted(limit, offset, project_id)
-        .await
-    {
-        Ok(episodes) => {
-            let total = agent
-                .storage
-                .count_episodes_by_project(project_id)
-                .await
-                .unwrap_or(0);
-            let items: Vec<serde_json::Value> = episodes
-                .iter()
-                .map(|ep| {
-                    serde_json::json!({
-                        "id": ep.id,
-                        "content": ep.content,
-                        "context": ep.context,
-                        "timestamp": ep.timestamp,
-                        "consolidated": ep.consolidated,
-                        "importance": ep.importance,
-                        "access_count": ep.access_count,
-                    })
-                })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "episodes": items,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
 }
 
 /// List learned facts from the current memory store.
@@ -34271,383 +35118,6 @@ struct CreateKnowledgeItemRequest {
     url: Option<String>,
     tags: Option<String>,
     project_id: Option<String>,
-}
-
-const MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION: &str = "episode_retention_cleanup";
-
-#[derive(Debug, Serialize)]
-struct MemoryMaintenanceKnowledgeCounts {
-    episodes: u64,
-    facts: u64,
-    documents: u64,
-    document_chunks: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct MemoryMaintenancePolicy {
-    data_cleanup_enabled: bool,
-    episode_retention_enabled: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct MemoryMaintenanceDurablePolicy {
-    documents: String,
-    learned_facts: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MemoryMaintenanceEpisodeCleanupReview {
-    available: bool,
-    reason: String,
-    current_episode_count: u64,
-    max_episodes: u64,
-    candidate_count: u64,
-    raw_candidate_count: u64,
-    estimated_remaining_episodes: u64,
-    protected_recent_count: u64,
-    cutoff_days: u64,
-    keep_last: u64,
-    require_consolidated: bool,
-    max_importance: f32,
-    max_access_count: i32,
-    preview_signature: String,
-    confirmation_phrase: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MemoryMaintenanceReviewResponse {
-    generated_at: String,
-    knowledge_counts: MemoryMaintenanceKnowledgeCounts,
-    policy: MemoryMaintenancePolicy,
-    durable_policy: MemoryMaintenanceDurablePolicy,
-    episode_cleanup: MemoryMaintenanceEpisodeCleanupReview,
-}
-
-#[derive(Debug, Deserialize)]
-struct RunMemoryMaintenanceRequest {
-    action: String,
-    preview_signature: String,
-    confirmation_text: String,
-}
-
-#[derive(Debug)]
-struct EpisodeCleanupPlan {
-    delete_ids: Vec<String>,
-    review: MemoryMaintenanceEpisodeCleanupReview,
-}
-
-fn build_episode_cleanup_preview_signature(
-    current_episode_count: u64,
-    delete_ids: &[String],
-    mem_cfg: &MemoryConfig,
-) -> String {
-    let mut hasher = DefaultHasher::new();
-    MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION.hash(&mut hasher);
-    current_episode_count.hash(&mut hasher);
-    mem_cfg.max_episodes.hash(&mut hasher);
-    mem_cfg.retention_min_age_days.hash(&mut hasher);
-    mem_cfg.retention_keep_last.hash(&mut hasher);
-    mem_cfg.retention_require_consolidated.hash(&mut hasher);
-    mem_cfg.retention_max_access_count.hash(&mut hasher);
-    mem_cfg.retention_max_importance.to_bits().hash(&mut hasher);
-    for id in delete_ids {
-        id.hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
-}
-
-async fn get_memory_maintenance_counts(
-    storage: &crate::storage::Storage,
-) -> Result<MemoryMaintenanceKnowledgeCounts, String> {
-    let episodes = storage
-        .count_episodes()
-        .await
-        .map_err(|e| format!("Failed to count episodes: {}", e))?;
-    let facts = storage
-        .count_facts(None)
-        .await
-        .map_err(|e| format!("Failed to count learned facts: {}", e))?;
-    let documents = storage
-        .count_documents(None)
-        .await
-        .map_err(|e| format!("Failed to count documents: {}", e))?;
-    let document_chunks = storage
-        .count_document_chunks()
-        .await
-        .map_err(|e| format!("Failed to count document chunks: {}", e))?;
-    Ok(MemoryMaintenanceKnowledgeCounts {
-        episodes,
-        facts,
-        documents,
-        document_chunks,
-    })
-}
-
-async fn build_episode_cleanup_plan(
-    storage: &crate::storage::Storage,
-    mem_cfg: &MemoryConfig,
-    lifecycle: &DataLifecycleSettings,
-) -> Result<EpisodeCleanupPlan, String> {
-    let current_episode_count = storage
-        .count_episodes()
-        .await
-        .map_err(|e| format!("Failed to count episodes: {}", e))?;
-    let cutoff_days = mem_cfg.retention_min_age_days.max(1);
-    let safe_cutoff_days = cutoff_days.min(36500);
-    let keep_last = mem_cfg.retention_keep_last.max(1) as u64;
-    let max_episodes = mem_cfg.max_episodes.max(1) as u64;
-    let cutoff = chrono::Utc::now()
-        - chrono::Duration::days(i64::try_from(safe_cutoff_days).unwrap_or(36500));
-    let cutoff_rfc3339 = cutoff.to_rfc3339();
-
-    let keep_newest_ids = storage
-        .list_newest_episode_ids(keep_last)
-        .await
-        .map_err(|e| format!("Failed to load protected recent episodes: {}", e))?;
-    let keep_newest_protected: HashSet<String> = keep_newest_ids.into_iter().collect();
-
-    let target = if current_episode_count > max_episodes {
-        ((current_episode_count - max_episodes) + 100)
-            .min(mem_cfg.retention_max_delete_per_run.max(1))
-    } else {
-        0
-    };
-
-    let raw_candidates = if target > 0 {
-        storage
-            .list_episode_prune_candidates(
-                &cutoff_rfc3339,
-                mem_cfg.retention_require_consolidated,
-                mem_cfg.retention_max_importance,
-                mem_cfg.retention_max_access_count,
-                target,
-            )
-            .await
-            .map_err(|e| format!("Failed to build cleanup preview: {}", e))?
-    } else {
-        Vec::new()
-    };
-
-    let delete_ids: Vec<String> = raw_candidates
-        .iter()
-        .filter(|id| !keep_newest_protected.contains(*id))
-        .cloned()
-        .collect();
-    let available = !delete_ids.is_empty();
-    let reason = if current_episode_count == 0 {
-        "No episodic memories are stored yet.".to_string()
-    } else if current_episode_count <= max_episodes {
-        format!(
-            "Episode count is within the configured cap ({} <= {}). No manual cleanup is needed right now.",
-            current_episode_count, max_episodes
-        )
-    } else if raw_candidates.is_empty() {
-        "No episodes met the current retention safety thresholds, so nothing is eligible for reviewed cleanup.".to_string()
-    } else if delete_ids.is_empty() {
-        "Episodes matched age/importance rules, but they are still protected by the keep-last window.".to_string()
-    } else if !lifecycle.cleanup_enabled || !mem_cfg.retention_enabled {
-        "Automatic cleanup is disabled, but this reviewed flow can still run a one-time cleanup with the same safety thresholds.".to_string()
-    } else {
-        format!(
-            "{} low-risk episodic memories can be removed while leaving documents and learned facts untouched.",
-            delete_ids.len()
-        )
-    };
-    let preview_signature = if available {
-        build_episode_cleanup_preview_signature(current_episode_count, &delete_ids, mem_cfg)
-    } else {
-        String::new()
-    };
-    let confirmation_phrase = if available {
-        format!("delete {} episodes", delete_ids.len())
-    } else {
-        String::new()
-    };
-    let review = MemoryMaintenanceEpisodeCleanupReview {
-        available,
-        reason,
-        current_episode_count,
-        max_episodes,
-        candidate_count: delete_ids.len() as u64,
-        raw_candidate_count: raw_candidates.len() as u64,
-        estimated_remaining_episodes: current_episode_count.saturating_sub(delete_ids.len() as u64),
-        protected_recent_count: keep_newest_protected.len() as u64,
-        cutoff_days: safe_cutoff_days,
-        keep_last,
-        require_consolidated: mem_cfg.retention_require_consolidated,
-        max_importance: mem_cfg.retention_max_importance,
-        max_access_count: mem_cfg.retention_max_access_count,
-        preview_signature,
-        confirmation_phrase,
-    };
-
-    Ok(EpisodeCleanupPlan { delete_ids, review })
-}
-
-async fn memory_maintenance_review(State(state): State<AppState>) -> Response {
-    let (storage, mem_cfg) = {
-        let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.config.memory.clone())
-    };
-    let lifecycle = load_data_lifecycle_settings(&storage).await;
-    let counts = match get_memory_maintenance_counts(&storage).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Memory maintenance review failed to load counts: {}", error);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error }),
-            )
-                .into_response();
-        }
-    };
-    let plan = match build_episode_cleanup_plan(&storage, &mem_cfg, &lifecycle).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Memory maintenance review failed to build plan: {}", error);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error }),
-            )
-                .into_response();
-        }
-    };
-
-    if plan.review.available {
-        tracing::info!(
-            "Memory maintenance review ready: delete_candidates={} current_episodes={} documents={} chunks={}",
-            plan.review.candidate_count,
-            counts.episodes,
-            counts.documents,
-            counts.document_chunks
-        );
-    } else {
-        tracing::info!(
-            "Memory maintenance review generated with no actionable cleanup: current_episodes={} max_episodes={}",
-            counts.episodes,
-            plan.review.max_episodes
-        );
-    }
-
-    let response = MemoryMaintenanceReviewResponse {
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        knowledge_counts: counts,
-        policy: MemoryMaintenancePolicy {
-            data_cleanup_enabled: lifecycle.cleanup_enabled,
-            episode_retention_enabled: mem_cfg.retention_enabled,
-        },
-        durable_policy: MemoryMaintenanceDurablePolicy {
-            documents: "Documents and document chunks are durable. This review screen reports their size but never deletes them.".to_string(),
-            learned_facts: "Learned facts and operating constraints live in the experience-item memory store. Episode cleanup leaves them intact.".to_string(),
-        },
-        episode_cleanup: plan.review,
-    };
-    (StatusCode::OK, Json(response)).into_response()
-}
-
-async fn run_memory_maintenance(
-    State(state): State<AppState>,
-    Json(request): Json<RunMemoryMaintenanceRequest>,
-) -> Response {
-    if request.action.trim() != MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Unsupported maintenance action".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let (storage, mem_cfg) = {
-        let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.config.memory.clone())
-    };
-    let lifecycle = load_data_lifecycle_settings(&storage).await;
-    let plan = match build_episode_cleanup_plan(&storage, &mem_cfg, &lifecycle).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Memory maintenance run failed to rebuild plan: {}", error);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error }),
-            )
-                .into_response();
-        }
-    };
-
-    if !plan.review.available || plan.delete_ids.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: plan.review.reason,
-            }),
-        )
-            .into_response();
-    }
-    if request.preview_signature.trim() != plan.review.preview_signature {
-        tracing::warn!(
-            "Memory maintenance rejected stale preview: provided={} expected={}",
-            request.preview_signature.trim(),
-            plan.review.preview_signature
-        );
-        return (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "The cleanup preview is stale. Refresh the review screen and confirm again."
-                    .to_string(),
-            }),
-        )
-            .into_response();
-    }
-    if request.confirmation_text.trim() != plan.review.confirmation_phrase {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!(
-                    "Confirmation text must exactly match '{}'.",
-                    plan.review.confirmation_phrase
-                ),
-            }),
-        )
-            .into_response();
-    }
-
-    let deleted = match storage.delete_episodes_by_ids(&plan.delete_ids).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!("Memory maintenance cleanup failed: {}", error);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to delete episodic memories: {}", error),
-                }),
-            )
-                .into_response();
-        }
-    };
-    tracing::warn!(
-        "Memory maintenance cleanup executed: deleted={} expected={} current_before={} remaining_estimate={} signature={}",
-        deleted,
-        plan.delete_ids.len(),
-        plan.review.current_episode_count,
-        plan.review.estimated_remaining_episodes,
-        plan.review.preview_signature
-    );
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "action": MEMORY_MAINTENANCE_EPISODE_RETENTION_ACTION,
-            "deleted": deleted,
-            "summary": format!(
-                "Deleted {} episodic memories using the reviewed retention policy. Documents and learned facts were left intact.",
-                deleted
-            ),
-        })),
-    )
-        .into_response()
 }
 
 async fn list_user_preferences(
@@ -35198,11 +35668,29 @@ async fn mcp_handler(
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
                 let agent = state.agent.read().await;
-                match agent.memory.retrieve_relevant(query, limit, None).await {
-                    Ok(memories) => {
-                        let results: Vec<serde_json::Value> = memories.iter().map(|m| {
-                            serde_json::json!({ "content": m.content, "score": m.final_score, "timestamp": m.timestamp.to_rfc3339() })
-                        }).collect();
+                match agent
+                    .storage
+                    .search_experience_items(
+                        query,
+                        &["constraint", "personal_fact", "lesson", "procedure"],
+                        None,
+                        None,
+                        limit as u64,
+                    )
+                    .await
+                {
+                    Ok(hits) => {
+                        let results: Vec<serde_json::Value> = hits
+                            .iter()
+                            .map(|hit| {
+                                serde_json::json!({
+                                    "kind": hit.item.kind,
+                                    "content": hit.item.content,
+                                    "score": hit.score,
+                                    "updated_at": hit.item.updated_at,
+                                })
+                            })
+                            .collect();
                         serde_json::json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&results).unwrap_or_default() }] })
                     }
                     Err(e) => {
@@ -35243,7 +35731,7 @@ async fn mcp_handler(
             }
             "list_actions" => {
                 let agent = state.agent.read().await;
-                match agent.runtime.list_actions().await {
+                match agent.runtime.list_enabled_actions().await {
                     Ok(actions) => {
                         let items: Vec<serde_json::Value> = actions.iter().map(|a| {
                             serde_json::json!({ "name": a.name, "description": a.description })
@@ -35935,7 +36423,7 @@ fn mcp_sync_timeout_for_config(config: &crate::core::config::AgentConfig) -> std
 }
 
 fn schedule_mcp_registry_sync(agent_ref: SharedAgent) {
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:36420", async move {
         let agent = agent_ref.read().await;
         let secrets = match load_mcp_secrets(&agent) {
             Ok(s) => s,
@@ -35953,7 +36441,7 @@ fn schedule_mcp_registry_sync(agent_ref: SharedAgent) {
 }
 
 fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:36438", async move {
         let agent = agent_ref.read().await;
         if agent.config.mcp.servers.iter().all(|s| s.id != id) {
             return;
@@ -35996,7 +36484,7 @@ fn schedule_mcp_server_refresh(agent_ref: SharedAgent, id: String) {
 }
 
 fn schedule_enabled_mcp_server_resumes(agent_ref: SharedAgent) {
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http.rs:36481", async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let enabled_ids = {
             let agent = agent_ref.read().await;
@@ -36183,7 +36671,8 @@ pub async fn serve_locked(
         .route("/readiness", get(locked_readiness))
         .route("/unlock", post(handle_unlock))
         .route("/logo.svg", get(serve_logo_svg_locked))
-        .with_state(locked_state);
+        .with_state(locked_state)
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES));
 
     let bind_addr = std::env::var("AGENTARK_BIND").unwrap_or("127.0.0.1:8990".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -36788,8 +37277,9 @@ mod tests {
     use super::*;
     use crate::core::autonomy::{RecommendedAction, RiskEnvelope};
     use axum::body::{to_bytes, Body};
-    use axum::http::{header, Request};
+    use axum::http::{header, HeaderValue, Request};
     use axum::routing::{get, post};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -36847,8 +37337,13 @@ mod tests {
             server_role: HttpServerRole::ControlPlane,
             public_app_bind_addr: None,
             public_app_base_url: None,
+            release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
         };
         (state, config_dir, data_dir)
+    }
+
+    fn loopback_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45678)
     }
 
     async fn response_json(response: Response) -> serde_json::Value {
@@ -37487,30 +37982,35 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_external_proxy_urls_for_public_apps_rewrites_direct_arxiv_api_calls() {
-        let input = r#"fetch("https://export.arxiv.org/api/query?search_query=all:transformer");"#;
+    fn rewrite_external_proxy_urls_for_public_apps_rewrites_known_public_proxy_wrappers() {
+        let input = r#"fetch("https://api.allorigins.win/raw?url=https://export.arxiv.org/api/query?search_query=all:transformer");"#;
 
-        let rewritten = rewrite_external_proxy_urls_for_public_apps(input);
+        let rewritten = rewrite_external_proxy_urls_for_public_apps(input, "demo-app");
 
         assert!(rewritten.contains(
-            "/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=all:transformer"
+            "/apps/demo-app/__agentark/http/fetch?url=https://export.arxiv.org/api/query?search_query=all:transformer"
         ));
-        assert!(!rewritten.contains("fetch(\"https://export.arxiv.org/api/query"));
+        assert!(!rewritten.contains("https://api.allorigins.win/raw?url="));
     }
 
     #[test]
-    fn rewrite_external_proxy_urls_for_public_apps_does_not_double_proxy_arxiv_urls() {
-        let input = r#"fetch("/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=all:transformer");"#;
+    fn rewrite_external_proxy_urls_for_public_apps_does_not_double_proxy_urls() {
+        let input = r#"fetch("/apps/demo-app/__agentark/http/fetch?url=/apps/demo-app/__agentark/http/fetch?url=https://export.arxiv.org/api/query?search_query=all:transformer");"#;
 
-        let rewritten = rewrite_external_proxy_urls_for_public_apps(input);
+        let rewritten = rewrite_external_proxy_urls_for_public_apps(input, "demo-app");
 
-        assert_eq!(rewritten, input);
-        assert!(!rewritten.contains("/public/proxy/raw?url=/public/proxy/raw?url="));
+        assert_eq!(
+            rewritten,
+            r#"fetch("/apps/demo-app/__agentark/http/fetch?url=https://export.arxiv.org/api/query?search_query=all:transformer");"#
+        );
+        assert!(!rewritten.contains(
+            "/apps/demo-app/__agentark/http/fetch?url=/apps/demo-app/__agentark/http/fetch?url="
+        ));
     }
 
     #[test]
     fn build_arxiv_search_request_from_source_url_repairs_nested_proxy_and_field_aliases() {
-        let source = "/public/proxy/raw?url=/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=(cat:cs.LG OR cat:cs.RO OR (cat:stat.ML AND (title:time series OR abs:time series OR forecasting OR abs:forecasting)))&start=0&max_results=50&sortBy=submittedDate&sortOrder=descending";
+        let source = "/apps/demo-app/__agentark/http/fetch?url=/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=(cat:cs.LG OR cat:cs.RO OR (cat:stat.ML AND (title:time series OR abs:time series OR forecasting OR abs:forecasting)))&start=0&max_results=50&sortBy=submittedDate&sortOrder=descending";
 
         let request = build_arxiv_search_request_from_source_url(source)
             .expect("nested arxiv proxy url should normalize");
@@ -37529,15 +38029,32 @@ mod tests {
     }
 
     #[test]
-    fn inject_app_runtime_fetch_shims_adds_arxiv_helper_proxy() {
+    fn inject_app_runtime_fetch_shims_adds_generic_public_fetch_proxy() {
         let html = "<!DOCTYPE html><html><head></head><body></body></html>";
 
         let rewritten = inject_app_runtime_fetch_shims(html, "demo-app");
 
-        assert!(rewritten
-            .contains("/apps/\" + encodeURIComponent(APP_ID) + \"/__agentark/arxiv/search"));
-        assert!(rewritten.contains("source_url="));
-        assert!(rewritten.contains("x-agentark-app-proxy\", \"arxiv"));
+        assert!(
+            rewritten.contains("/apps/\" + encodeURIComponent(APP_ID) + \"/__agentark/http/fetch")
+        );
+        assert!(rewritten.contains("shouldProxyPublicRead"));
+        assert!(rewritten.contains("x-agentark-app-proxy\", \"raw"));
+        assert!(rewritten.contains("XMLHttpRequest"));
+    }
+
+    #[test]
+    fn extract_public_proxy_target_hosts_from_text_finds_direct_and_wrapped_hosts() {
+        let source = r#"
+const direct = "https://news.ycombinator.com/rss";
+const wrapped = "/public/proxy/raw?url=https://export.arxiv.org/api/query?search_query=all:rl";
+const appWrapped = "/apps/demo-app/__agentark/http/fetch?url=https://api.github.com/repos/openai/openai-python";
+"#;
+
+        let hosts = extract_public_proxy_target_hosts_from_text(source);
+
+        assert!(hosts.contains("news.ycombinator.com"));
+        assert!(hosts.contains("export.arxiv.org"));
+        assert!(hosts.contains("api.github.com"));
     }
 
     #[test]
@@ -39081,6 +39598,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_evolution_dev_limit_uses_bounded_sample_sizes() {
+        assert_eq!(
+            normalize_evolution_dev_limit(None),
+            EVOLUTION_DEV_DEFAULT_LIMIT
+        );
+        assert_eq!(normalize_evolution_dev_limit(Some(1)), 24);
+        assert_eq!(
+            normalize_evolution_dev_limit(Some(999_999)),
+            EVOLUTION_DEV_MAX_LIMIT
+        );
+    }
+
+    #[test]
     fn aggregate_prompt_metrics_excludes_provisional_runs_from_resolved_samples() {
         let version = "system_prompt_v2+prompt-candidate-b";
         let experience_runs = vec![
@@ -39279,6 +39809,92 @@ mod tests {
             .await
             .expect_err("openai-compatible slots should require an explicit base URL");
         assert!(error.contains("Base URL is required"));
+    }
+
+    #[tokio::test]
+    async fn verified_ui_session_request_accepts_same_origin_cookie() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let now = auth::unix_now_ts();
+        let token = "session-token";
+        state.ui_sessions.write().await.insert(
+            token.to_string(),
+            UiSessionRecord {
+                issued_at: now,
+                expires_at: now + UI_SESSION_TTL_SECS,
+                last_seen_at: now,
+                source: "test".to_string(),
+                client_hint: None,
+            },
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8990"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://localhost:8990/ui/chat"),
+        );
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                crate::branding::SESSION_COOKIE_NAME,
+                token
+            ))
+            .unwrap(),
+        );
+
+        assert!(
+            auth::is_verified_ui_session_request(
+                &state,
+                &headers,
+                loopback_addr(),
+                state.deployment_mode,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_ui_session_request_rejects_app_referer() {
+        let (state, _config_dir, _data_dir) = build_test_state().await;
+        let now = auth::unix_now_ts();
+        let token = "session-token";
+        state.ui_sessions.write().await.insert(
+            token.to_string(),
+            UiSessionRecord {
+                issued_at: now,
+                expires_at: now + UI_SESSION_TTL_SECS,
+                last_seen_at: now,
+                source: "test".to_string(),
+                client_hint: None,
+            },
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8990"));
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://localhost:8990/apps/demo"),
+        );
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                crate::branding::SESSION_COOKIE_NAME,
+                token
+            ))
+            .unwrap(),
+        );
+
+        assert!(
+            !auth::is_verified_ui_session_request(
+                &state,
+                &headers,
+                loopback_addr(),
+                state.deployment_mode,
+            )
+            .await
+        );
     }
 
     #[test]

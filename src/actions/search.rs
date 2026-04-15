@@ -58,7 +58,7 @@ const SEARCH_BACKEND_HEALTH_KEY: &str = "search_backend_health:v1";
 const BUILTIN_BACKEND_COOLDOWN_HOURS: i64 = 24;
 
 pub const SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE: &str =
-    "Search providers are blocking anonymous HTML/browser search from this environment. Configure Serper or Brave Search API for reliable research.";
+    "No search backend is currently available from this environment. Anonymous HTML/browser search may be blocked; configure a reachable SearXNG instance or an API-backed search provider for reliable research.";
 
 fn char_prefix(value: &str, max_chars: usize) -> &str {
     if value.chars().count() <= max_chars {
@@ -1645,7 +1645,7 @@ const DEFAULT_CONFIGURED_PROVIDER_ORDER: &[&str] = &[
     "firecrawl",
     "searxng",
 ];
-const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["bing_rss", "lightpanda", "duckduckgo"];
+const DEFAULT_FREE_BACKEND_ORDER: &[&str] = &["duckduckgo", "lightpanda", "bing_rss"];
 
 /// Execute a web search
 pub async fn execute_search(args: &SearchArgs, config: &SearchConfig) -> Result<String> {
@@ -1671,6 +1671,10 @@ fn format_search_results(response: &SearchResponse) -> String {
     output
 }
 
+fn default_lightpanda_available() -> bool {
+    true
+}
+
 /// Search configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
@@ -1682,6 +1686,8 @@ pub struct SearchConfig {
     pub firecrawl: Option<SearchBackend>,
     pub searxng: Option<SearchBackend>,
     pub playwright: Option<SearchBackend>,
+    #[serde(skip, default = "default_lightpanda_available")]
+    pub lightpanda_available: bool,
     /// Preferred primary backend name (e.g. "lightpanda", "serper", "duckduckgo")
     #[serde(default)]
     pub primary: Option<String>,
@@ -1708,6 +1714,7 @@ impl Default for SearchConfig {
             firecrawl: None,
             searxng: None,
             playwright: None,
+            lightpanda_available: default_lightpanda_available(),
             primary: None,
             fallback1: None,
             fallback2: None,
@@ -1736,32 +1743,117 @@ impl SearchConfig {
             "searxng" => self.searxng.clone(),
             "bing_rss" => Some(SearchBackend::BingRss),
             "duckduckgo" => Some(SearchBackend::DuckDuckGo),
-            "lightpanda" => Some(SearchBackend::Lightpanda),
+            "lightpanda" if self.lightpanda_available => Some(SearchBackend::Lightpanda),
             _ => None,
         }
     }
 
-    pub fn ordered_backend_names(&self) -> Vec<String> {
+    fn push_unique_backend_name(ordered: &mut Vec<String>, name: &str) {
+        let normalized = normalize_backend_name(name);
+        if normalized.is_empty() || ordered.contains(&normalized) {
+            return;
+        }
+        ordered.push(normalized);
+    }
+
+    fn preferred_configured_provider_names(&self) -> Vec<String> {
         let mut ordered = Vec::new();
 
-        for name in DEFAULT_CONFIGURED_PROVIDER_ORDER {
-            let normalized = (*name).to_string();
-            if self.resolve_backend(&normalized).is_some() && !ordered.contains(&normalized) {
-                ordered.push(normalized);
+        for name in &self.provider_order {
+            let normalized = normalize_backend_name(name);
+            if is_configurable_provider_backend(&normalized)
+                && self.resolve_backend(&normalized).is_some()
+            {
+                Self::push_unique_backend_name(&mut ordered, &normalized);
             }
         }
 
-        for name in DEFAULT_FREE_BACKEND_ORDER {
-            let normalized = (*name).to_string();
-            if self.resolve_backend(&normalized).is_some() && !ordered.contains(&normalized) {
-                ordered.push(normalized);
+        if ordered.is_empty() {
+            for legacy_name in [
+                self.primary.as_deref(),
+                self.fallback1.as_deref(),
+                self.fallback2.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let normalized = normalize_backend_name(legacy_name);
+                if is_configurable_provider_backend(&normalized)
+                    && self.resolve_backend(&normalized).is_some()
+                {
+                    Self::push_unique_backend_name(&mut ordered, &normalized);
+                }
             }
         }
 
         ordered
     }
 
-    pub fn ensure_default_chain(&mut self) {}
+    pub fn ordered_backend_names(&self) -> Vec<String> {
+        let mut ordered = Vec::new();
+
+        for name in self.preferred_configured_provider_names() {
+            Self::push_unique_backend_name(&mut ordered, &name);
+        }
+
+        for name in DEFAULT_CONFIGURED_PROVIDER_ORDER {
+            let normalized = normalize_backend_name(name);
+            if self.resolve_backend(&normalized).is_some() {
+                Self::push_unique_backend_name(&mut ordered, &normalized);
+            }
+        }
+
+        for name in DEFAULT_FREE_BACKEND_ORDER {
+            let normalized = normalize_backend_name(name);
+            if self.resolve_backend(&normalized).is_some() {
+                Self::push_unique_backend_name(&mut ordered, &normalized);
+            }
+        }
+
+        ordered
+    }
+
+    pub fn ensure_default_chain(&mut self) {
+        let mut normalized_order = Vec::new();
+        for name in &self.provider_order {
+            let normalized = normalize_backend_name(name);
+            if is_configurable_provider_backend(&normalized) {
+                Self::push_unique_backend_name(&mut normalized_order, &normalized);
+            }
+        }
+
+        if normalized_order.is_empty() {
+            for legacy_name in [
+                self.primary.as_deref(),
+                self.fallback1.as_deref(),
+                self.fallback2.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let normalized = normalize_backend_name(legacy_name);
+                if is_configurable_provider_backend(&normalized) {
+                    Self::push_unique_backend_name(&mut normalized_order, &normalized);
+                }
+            }
+        }
+
+        self.provider_order = normalized_order;
+    }
+
+    fn backend_attempt_chain(
+        &self,
+        explicit_backend: Option<&str>,
+    ) -> (Vec<String>, Option<String>) {
+        let explicit_backend_name = explicit_backend.map(normalize_backend_name);
+        if let Some(backend_name) = explicit_backend_name.as_deref() {
+            if self.resolve_backend(backend_name).is_some() {
+                return (vec![backend_name.to_string()], None);
+            }
+            return (self.ordered_backend_names(), Some(backend_name.to_string()));
+        }
+        (self.ordered_backend_names(), None)
+    }
 
     pub fn is_builtin_cooldown_backend(&self, name: &str) -> bool {
         matches!(
@@ -1786,26 +1878,27 @@ pub async fn search_with_config(
         );
     }
 
-    if let Some(explicit) = explicit_backend {
-        let backend_name = normalize_backend_name(explicit);
-        let backend = config
-            .resolve_backend(&backend_name)
-            .ok_or_else(|| anyhow!("Search backend '{}' is not configured", backend_name))?;
-        let client = SearchClient::new(backend);
-        return client.search(&normalized_query, num_results).await;
-    }
-
-    let chain = config.ordered_backend_names();
+    let (chain, fallback_backend_name) = config.backend_attempt_chain(explicit_backend);
     let mut last_err = None;
     let mut attempts = Vec::new();
     let mut cooldowns = Vec::new();
-    let mut configured_provider_available = false;
+    let mut search_available = false;
+
+    if let Some(backend_name) = fallback_backend_name.as_deref() {
+        if chain.is_empty() {
+            return Err(anyhow!(
+                "Search backend '{}' is not configured",
+                backend_name
+            ));
+        }
+        attempts.push(format!(
+            "{}: not configured, falling back to automatic chain",
+            backend_name
+        ));
+    }
 
     for name in &chain {
-        if is_configurable_provider_backend(name) {
-            configured_provider_available = true;
-        }
-
+        let backend = config.resolve_backend(name);
         if config.is_builtin_cooldown_backend(name) && config.health.is_in_cooldown(name) {
             let cooldown_until = config
                 .health
@@ -1821,7 +1914,7 @@ pub async fn search_with_config(
             continue;
         }
 
-        let Some(backend) = config.resolve_backend(name) else {
+        let Some(backend) = backend else {
             attempts.push(format!("{}: not configured", name));
             continue;
         };
@@ -1835,6 +1928,7 @@ pub async fn search_with_config(
                 return Ok(response);
             }
             Ok(_) => {
+                search_available = true;
                 last_err = Some(anyhow!("Backend '{}' returned 0 results", name));
                 attempts.push(format!("{}: returned 0 results", name));
             }
@@ -1861,7 +1955,7 @@ pub async fn search_with_config(
         }
     }
 
-    if !configured_provider_available {
+    if !search_available {
         let mut detail = String::from(SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE);
         if !cooldowns.is_empty() {
             detail.push(' ');
@@ -2064,10 +2158,96 @@ mod tests {
             vec![
                 "tavily".to_string(),
                 "serper".to_string(),
-                "bing_rss".to_string(),
+                "duckduckgo".to_string(),
                 "lightpanda".to_string(),
-                "duckduckgo".to_string()
+                "bing_rss".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn ordered_backend_names_uses_legacy_primary_and_fallbacks_when_provider_order_absent() {
+        let mut config = SearchConfig::default();
+        config.primary = Some("brave".to_string());
+        config.fallback1 = Some("tavily".to_string());
+        config.brave = Some(SearchBackend::Brave {
+            api_key: "test".to_string(),
+        });
+        config.tavily = Some(SearchBackend::Tavily {
+            api_key: "test".to_string(),
+        });
+
+        let chain = config.ordered_backend_names();
+
+        assert_eq!(chain[0], "brave_api");
+        assert_eq!(chain[1], "tavily");
+        assert!(chain.ends_with(&[
+            "duckduckgo".to_string(),
+            "lightpanda".to_string(),
+            "bing_rss".to_string()
+        ]));
+    }
+
+    #[test]
+    fn ensure_default_chain_normalizes_provider_order_and_legacy_aliases() {
+        let mut config = SearchConfig::default();
+        config.primary = Some("brave".to_string());
+        config.fallback1 = Some("serper".to_string());
+        config.provider_order = vec![
+            " Brave ".to_string(),
+            "serper".to_string(),
+            "brave_api".to_string(),
+            String::new(),
+        ];
+
+        config.ensure_default_chain();
+
+        assert_eq!(
+            config.provider_order,
+            vec!["brave_api".to_string(), "serper".to_string()]
+        );
+    }
+
+    #[test]
+    fn backend_attempt_chain_falls_back_from_unconfigured_explicit_provider() {
+        let config = SearchConfig::default();
+
+        let (chain, fallback_backend_name) = config.backend_attempt_chain(Some("brave"));
+
+        assert_eq!(fallback_backend_name.as_deref(), Some("brave_api"));
+        assert_eq!(
+            chain,
+            vec![
+                "duckduckgo".to_string(),
+                "lightpanda".to_string(),
+                "bing_rss".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_attempt_chain_keeps_configured_explicit_provider() {
+        let mut config = SearchConfig::default();
+        config.serper = Some(SearchBackend::Serper {
+            api_key: "test".to_string(),
+        });
+
+        let (chain, fallback_backend_name) = config.backend_attempt_chain(Some("serper"));
+
+        assert_eq!(chain, vec!["serper".to_string()]);
+        assert!(fallback_backend_name.is_none());
+    }
+
+    #[test]
+    fn ordered_backend_names_skips_lightpanda_when_runtime_marks_it_unavailable() {
+        let mut config = SearchConfig::default();
+        config.lightpanda_available = false;
+
+        let chain = config.ordered_backend_names();
+
+        assert_eq!(
+            chain,
+            vec!["duckduckgo".to_string(), "bing_rss".to_string()]
         );
     }
 

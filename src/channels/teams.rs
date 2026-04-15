@@ -7,14 +7,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use once_cell::sync::Lazy;
-use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey};
-use rsa::signature::Verifier;
-use rsa::{BigUint, RsaPublicKey};
+use ring::signature::{self, RsaPublicKeyComponents};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
@@ -31,9 +29,25 @@ const TEAMS_BOT_FRAMEWORK_OPENID_CONFIGURATION_URL: &str =
     "https://login.botframework.com/v1/.well-known/openidconfiguration";
 const TEAMS_BOT_FRAMEWORK_AUTH_CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 const TEAMS_BOT_FRAMEWORK_CLOCK_SKEW_SECS: i64 = 300;
+const TEAMS_RECENT_ACTIVITY_IDS_STORAGE_KEY: &str = "channels:teams:recent_activity_ids";
+const MAX_RECENT_ACTIVITY_IDS: usize = 64;
+const RECENT_ACTIVITY_ID_WINDOW_SECS: u64 = 60 * 60 * 24;
 
 static TEAMS_BOT_FRAMEWORK_AUTH_CACHE: Lazy<RwLock<Option<BotFrameworkAuthCache>>> =
     Lazy::new(|| RwLock::new(None));
+static TEAMS_ACTIVITY_DEDUP_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TeamsRecentActivityState {
+    #[serde(default)]
+    recent: Vec<TeamsRecentActivityEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamsRecentActivityEntry {
+    activity_id: String,
+    seen_at: u64,
+}
 
 fn teams_sender_verification_notice(sender_label: &str) -> String {
     format!(
@@ -297,7 +311,8 @@ struct BotFrameworkSigningKey {
     kid: Option<String>,
     x5t: Option<String>,
     endorsements: Vec<String>,
-    public_key: RsaPublicKey,
+    modulus: Vec<u8>,
+    exponent: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,6 +404,61 @@ fn now_unix_seconds() -> Result<i64> {
         .as_secs() as i64)
 }
 
+fn prune_recent_activity_state(state: &mut TeamsRecentActivityState, now: u64) {
+    let min_seen_at = now.saturating_sub(RECENT_ACTIVITY_ID_WINDOW_SECS);
+    state.recent.retain(|entry| entry.seen_at >= min_seen_at);
+    if state.recent.len() > MAX_RECENT_ACTIVITY_IDS {
+        let excess = state.recent.len() - MAX_RECENT_ACTIVITY_IDS;
+        state.recent.drain(0..excess);
+    }
+}
+
+async fn load_recent_activity_state(storage: &Storage) -> Result<TeamsRecentActivityState> {
+    if let Ok(Some(raw)) = storage.get(TEAMS_RECENT_ACTIVITY_IDS_STORAGE_KEY).await {
+        if let Ok(state) = serde_json::from_slice::<TeamsRecentActivityState>(&raw) {
+            return Ok(state);
+        }
+    }
+    Ok(TeamsRecentActivityState::default())
+}
+
+async fn persist_recent_activity_state(
+    storage: &Storage,
+    state: &TeamsRecentActivityState,
+) -> Result<()> {
+    let raw = serde_json::to_vec(state)?;
+    storage
+        .set(TEAMS_RECENT_ACTIVITY_IDS_STORAGE_KEY, &raw)
+        .await?;
+    Ok(())
+}
+
+async fn record_teams_activity_id(storage: &Storage, activity_id: &str) -> Result<bool> {
+    let activity_id = activity_id.trim();
+    if activity_id.is_empty() {
+        return Ok(false);
+    }
+    let _guard = TEAMS_ACTIVITY_DEDUP_LOCK.lock().await;
+    let now = u64::try_from(now_unix_seconds()?)
+        .map_err(|_| anyhow!("system clock returned a negative timestamp"))?;
+    let mut state = load_recent_activity_state(storage).await?;
+    prune_recent_activity_state(&mut state, now);
+    if state
+        .recent
+        .iter()
+        .any(|entry| entry.activity_id == activity_id)
+    {
+        return Ok(true);
+    }
+    state.recent.push(TeamsRecentActivityEntry {
+        activity_id: activity_id.to_string(),
+        seen_at: now,
+    });
+    prune_recent_activity_state(&mut state, now);
+    persist_recent_activity_state(storage, &state).await?;
+    Ok(false)
+}
+
 fn sanitize_text(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -467,13 +537,12 @@ fn jwk_to_signing_key(jwk: &BotFrameworkJwk) -> Result<BotFrameworkSigningKey> {
     let e = URL_SAFE_NO_PAD
         .decode(e)
         .context("failed to decode Bot Framework JWK exponent")?;
-    let public_key = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
-        .context("invalid Bot Framework JWK RSA key")?;
     Ok(BotFrameworkSigningKey {
         kid: jwk.kid.clone(),
         x5t: jwk.x5t.clone(),
         endorsements: jwk.endorsements.clone(),
-        public_key,
+        modulus: n,
+        exponent: e,
     })
 }
 
@@ -514,14 +583,19 @@ fn verify_signature(
     signed_input: &str,
     signature_segment: &str,
 ) -> Result<()> {
-    let signature = URL_SAFE_NO_PAD
+    let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_segment)
         .context("failed to decode Teams authorization signature")?;
-    let signature = RsaPkcs1v15Signature::try_from(signature.as_slice())
-        .context("invalid Teams authorization signature format")?;
-    let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(key.public_key.clone());
-    verifying_key
-        .verify(signed_input.as_bytes(), &signature)
+    let public_key = RsaPublicKeyComponents {
+        n: key.modulus.as_slice(),
+        e: key.exponent.as_slice(),
+    };
+    public_key
+        .verify(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            signed_input.as_bytes(),
+            signature_bytes.as_slice(),
+        )
         .map_err(|_| anyhow!("Teams authorization signature verification failed"))
 }
 
@@ -1043,13 +1117,16 @@ pub async fn send_message_to_destination(
         TeamsDeliveryMode::Graph => {
             let endpoint = graph_endpoint_for_destination(config, destination)
                 .ok_or_else(|| anyhow!("Graph endpoint could not be derived from destination"))?;
-            let response = client
-                .post(endpoint.clone())
-                .bearer_auth(config.access_token.trim())
-                .json(&build_graph_payload(message))
-                .send()
-                .await
-                .context("failed to send Teams Graph message")?;
+            let response = super::outbound_rate_limit::send_with_bounded_retries(
+                "teams",
+                "graph_message",
+                client
+                    .post(endpoint.clone())
+                    .bearer_auth(config.access_token.trim())
+                    .json(&build_graph_payload(message)),
+            )
+            .await
+            .context("failed to send Teams Graph message")?;
             let status = response.status();
             let payload: serde_json::Value =
                 response.json().await.unwrap_or(serde_json::Value::Null);
@@ -1091,13 +1168,16 @@ pub async fn send_message_to_destination(
                 service_url,
                 urlencoding::encode(&destination.conversation_id)
             );
-            let response = client
-                .post(endpoint.clone())
-                .bearer_auth(config.access_token.trim())
-                .json(&build_bot_framework_payload(config, destination, message))
-                .send()
-                .await
-                .context("failed to send Teams Bot Framework message")?;
+            let response = super::outbound_rate_limit::send_with_bounded_retries(
+                "teams",
+                "botframework_message",
+                client
+                    .post(endpoint.clone())
+                    .bearer_auth(config.access_token.trim())
+                    .json(&build_bot_framework_payload(config, destination, message)),
+            )
+            .await
+            .context("failed to send Teams Bot Framework message")?;
             let status = response.status();
             let payload: serde_json::Value =
                 response.json().await.unwrap_or(serde_json::Value::Null);
@@ -1235,6 +1315,19 @@ pub async fn handle_activity(
             processed: false,
             response_preview: None,
         });
+    }
+
+    if let Some(activity_id) = activity.id.as_deref() {
+        if record_teams_activity_id(&storage, activity_id).await? {
+            tracing::debug!("Ignoring duplicate Teams activity {}", activity_id);
+            return Ok(TeamsInboundSummary {
+                activity_id: activity.id,
+                conversation_id,
+                reply_destination_key,
+                processed: false,
+                response_preview: None,
+            });
+        }
     }
 
     let trust_decision = {
@@ -1448,5 +1541,35 @@ mod tests {
         assert_eq!(destination.conversation_id, "team-1:channel-1");
         assert_eq!(destination.last_reply_to_id, None);
         assert_eq!(destination.chat_id, None);
+    }
+
+    #[test]
+    fn recent_activity_state_is_pruned_to_a_bounded_window() {
+        let mut state = TeamsRecentActivityState {
+            recent: (0..(MAX_RECENT_ACTIVITY_IDS + 10))
+                .map(|idx| TeamsRecentActivityEntry {
+                    activity_id: format!("activity-{}", idx),
+                    seen_at: 1,
+                })
+                .collect(),
+        };
+        prune_recent_activity_state(&mut state, RECENT_ACTIVITY_ID_WINDOW_SECS + 2);
+        assert!(state.recent.len() <= MAX_RECENT_ACTIVITY_IDS);
+    }
+
+    #[tokio::test]
+    async fn record_activity_id_is_idempotent_for_retries() {
+        let _dir = tempfile::tempdir().unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
+        assert!(!record_teams_activity_id(&storage, "activity-1")
+            .await
+            .unwrap());
+        assert!(record_teams_activity_id(&storage, "activity-1")
+            .await
+            .unwrap());
     }
 }

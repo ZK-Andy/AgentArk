@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-const STORAGE_KEY: &str = "background_sessions:v1";
+const LEGACY_STORAGE_KEY: &str = "background_sessions:v1";
 const MAX_EVENTS: usize = 80;
 const MAX_TEXT_CHARS: usize = 8_000;
 const MAX_WORKING_MEMORY_CHARS: usize = 24_000;
@@ -188,6 +188,41 @@ pub struct BackgroundSessionManager {
     storage: Option<crate::storage::Storage>,
 }
 
+fn normalize_session_map(items: Vec<BackgroundSession>) -> HashMap<String, BackgroundSession> {
+    items
+        .into_iter()
+        .map(|mut session| {
+            session.policy = session.policy.normalized();
+            (session.id.clone(), session)
+        })
+        .collect()
+}
+
+async fn load_legacy_background_sessions(
+    storage_ref: &crate::storage::Storage,
+) -> HashMap<String, BackgroundSession> {
+    match storage_ref.get(LEGACY_STORAGE_KEY).await {
+        Ok(Some(raw)) => match serde_json::from_slice::<Vec<BackgroundSession>>(&raw) {
+            Ok(items) => normalize_session_map(items),
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to parse legacy background sessions; starting empty: {}",
+                    error
+                );
+                HashMap::new()
+            }
+        },
+        Ok(None) => HashMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to load legacy background sessions; starting empty: {}",
+                error
+            );
+            HashMap::new()
+        }
+    }
+}
+
 fn trim_to_option(value: Option<String>) -> Option<String> {
     value.and_then(|inner| {
         let trimmed = inner.trim();
@@ -360,30 +395,36 @@ pub fn set_background_session_id_in_automation(
 impl BackgroundSessionManager {
     pub async fn new(storage: Option<crate::storage::Storage>) -> Self {
         let sessions = if let Some(storage_ref) = storage.as_ref() {
-            match storage_ref.get(STORAGE_KEY).await {
-                Ok(Some(raw)) => match serde_json::from_slice::<Vec<BackgroundSession>>(&raw) {
-                    Ok(items) => items
-                        .into_iter()
-                        .map(|mut session| {
-                            session.policy = session.policy.normalized();
-                            (session.id.clone(), session)
-                        })
-                        .collect(),
-                    Err(error) => {
-                        tracing::warn!(
-                            "Failed to parse persisted background sessions; starting empty: {}",
-                            error
-                        );
-                        HashMap::new()
+            match storage_ref.list_background_sessions().await {
+                Ok(items) if !items.is_empty() => normalize_session_map(items),
+                Ok(_) => {
+                    let legacy = load_legacy_background_sessions(storage_ref).await;
+                    if !legacy.is_empty() {
+                        for session in legacy.values() {
+                            if let Err(error) = storage_ref.upsert_background_session(session).await
+                            {
+                                tracing::warn!(
+                                    "Failed to import legacy background session {} into row storage: {}",
+                                    session.id,
+                                    error
+                                );
+                            }
+                        }
+                        if let Err(error) = storage_ref.delete(LEGACY_STORAGE_KEY).await {
+                            tracing::debug!(
+                                "Failed to clear legacy background-session blob after import: {}",
+                                error
+                            );
+                        }
                     }
-                },
-                Ok(None) => HashMap::new(),
+                    legacy
+                }
                 Err(error) => {
                     tracing::warn!(
-                        "Failed to load persisted background sessions; starting empty: {}",
+                        "Failed to load persisted background sessions from row storage; falling back to legacy blob: {}",
                         error
                     );
-                    HashMap::new()
+                    load_legacy_background_sessions(storage_ref).await
                 }
             }
         } else {
@@ -396,22 +437,62 @@ impl BackgroundSessionManager {
         }
     }
 
-    async fn persist(&self) {
+    async fn persist_session(&self, session: &BackgroundSession) {
         let Some(storage) = self.storage.as_ref() else {
             return;
         };
-        let mut sessions: Vec<_> = self.sessions.read().await.values().cloned().collect();
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        match serde_json::to_vec(&sessions) {
-            Ok(payload) => {
-                if let Err(error) = storage.set(STORAGE_KEY, &payload).await {
-                    tracing::warn!("Failed to persist background sessions: {}", error);
-                }
-            }
-            Err(error) => {
-                tracing::warn!("Failed to serialize background sessions: {}", error);
+        if let Err(error) = storage.upsert_background_session(session).await {
+            tracing::warn!(
+                "Failed to persist background session {} to row storage: {}",
+                session.id,
+                error
+            );
+        }
+    }
+
+    async fn persist_sessions(&self, sessions: &[BackgroundSession]) {
+        if sessions.is_empty() {
+            return;
+        }
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        for session in sessions {
+            if let Err(error) = storage.upsert_background_session(session).await {
+                tracing::warn!(
+                    "Failed to persist background session {} to row storage: {}",
+                    session.id,
+                    error
+                );
             }
         }
+    }
+
+    async fn delete_persisted_session(&self, id: &str) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        if let Err(error) = storage.delete_background_session(id).await {
+            tracing::warn!(
+                "Failed to delete persisted background session {} from row storage: {}",
+                id,
+                error
+            );
+        }
+    }
+
+    async fn persist_changed_ids(&self, changed_ids: &[String]) {
+        if changed_ids.is_empty() {
+            return;
+        }
+        let snapshots = {
+            let sessions = self.sessions.read().await;
+            changed_ids
+                .iter()
+                .filter_map(|id| sessions.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        self.persist_sessions(&snapshots).await;
     }
 
     pub async fn list(&self) -> Vec<BackgroundSession> {
@@ -498,7 +579,7 @@ impl BackgroundSessionManager {
             .write()
             .await
             .insert(session.id.clone(), session.clone());
-        self.persist().await;
+        self.persist_session(&session).await;
         session
     }
 
@@ -623,7 +704,7 @@ impl BackgroundSessionManager {
             Some(session.clone())
         }?;
 
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -650,7 +731,7 @@ impl BackgroundSessionManager {
             );
             Some(session.clone())
         }?;
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -709,7 +790,7 @@ impl BackgroundSessionManager {
             Some(session.clone())
         }?;
 
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -768,7 +849,7 @@ impl BackgroundSessionManager {
             Some(session.clone())
         }?;
 
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -805,7 +886,7 @@ impl BackgroundSessionManager {
             Some(session.clone())
         }?;
 
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -864,7 +945,7 @@ impl BackgroundSessionManager {
             Some(session.clone())
         }?;
 
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -914,7 +995,7 @@ impl BackgroundSessionManager {
             );
             Some(session.clone())
         }?;
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -958,7 +1039,7 @@ impl BackgroundSessionManager {
             );
             Some(session.clone())
         }?;
-        self.persist().await;
+        self.persist_session(&updated).await;
         Some(updated)
     }
 
@@ -974,7 +1055,7 @@ impl BackgroundSessionManager {
             return;
         }
 
-        let mut changed = false;
+        let mut changed_ids = Vec::new();
         {
             let mut sessions = self.sessions.write().await;
             for session in sessions.values_mut() {
@@ -1016,20 +1097,21 @@ impl BackgroundSessionManager {
                             ),
                         );
                     }
-                    changed = true;
+                    changed_ids.push(session.id.clone());
                 }
             }
         }
 
-        if changed {
-            self.persist().await;
+        if !changed_ids.is_empty() {
+            self.persist_changed_ids(&changed_ids).await;
         }
     }
 
     pub async fn delete(&self, id: &str) -> Option<BackgroundSession> {
-        let removed = self.sessions.write().await.remove(id.trim());
+        let normalized = id.trim();
+        let removed = self.sessions.write().await.remove(normalized);
         if removed.is_some() {
-            self.persist().await;
+            self.delete_persisted_session(normalized).await;
         }
         removed
     }

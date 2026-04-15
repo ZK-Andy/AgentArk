@@ -3,7 +3,7 @@
 //! Allows the agent to execute commands on configured remote servers.
 //! Private keys are stored encrypted via SecureConfigManager.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +12,9 @@ const SSH_KEYS_KEY: &str = "ssh_keys";
 const SSH_KNOWN_HOSTS_KEY: &str = "ssh_known_hosts";
 const SSH_EXEC_TIMEOUT_SECS: u64 = 60;
 const SSH_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SSH_AUDIT_COMMAND_CHARS: usize = 240;
+const SSH_SUPPORTED_PRIVATE_KEY_MESSAGE: &str =
+    "AgentArk accepts Ed25519 or ECDSA OpenSSH private keys only; RSA/id_rsa is not supported.";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SshConnection {
@@ -113,6 +116,33 @@ fn server_key_fingerprint(server_public_key: &russh::keys::ssh_key::PublicKey) -
     )
 }
 
+fn decode_supported_private_key(
+    name: &str,
+    pem_content: &str,
+) -> Result<russh::keys::ssh_key::PrivateKey> {
+    let key = russh::keys::decode_secret_key(pem_content, None).map_err(|_| {
+        anyhow!(
+            "SSH key '{}' is not a supported private key. {}",
+            name,
+            SSH_SUPPORTED_PRIVATE_KEY_MESSAGE
+        )
+    })?;
+
+    match key.algorithm() {
+        russh::keys::ssh_key::Algorithm::Ed25519
+        | russh::keys::ssh_key::Algorithm::Ecdsa { .. } => Ok(key),
+        _ => bail!(
+            "SSH key '{}' uses an unsupported algorithm. {}",
+            name,
+            SSH_SUPPORTED_PRIVATE_KEY_MESSAGE
+        ),
+    }
+}
+
+pub fn validate_private_key_pem(name: &str, pem_content: &str) -> Result<()> {
+    decode_supported_private_key(name, pem_content).map(|_| ())
+}
+
 fn verify_or_learn_server_key(
     config_dir: &Path,
     host: &str,
@@ -178,6 +208,24 @@ fn append_ssh_output(
         stdout.extend_from_slice(data);
     }
     Ok(())
+}
+
+fn truncate_ssh_audit_command(command: &str) -> String {
+    let normalized = command
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() <= MAX_SSH_AUDIT_COMMAND_CHARS {
+        normalized
+    } else {
+        let mut truncated = normalized
+            .chars()
+            .take(MAX_SSH_AUDIT_COMMAND_CHARS.saturating_sub(3))
+            .collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
 }
 
 /// List available SSH connections
@@ -260,9 +308,18 @@ pub async fn ssh_execute_scoped(
         .ok_or_else(|| anyhow!("SSH key '{}' not found", conn.key_name))?;
 
     // Parse the private key
-    let key_pair = russh::keys::decode_secret_key(key_pem, None)
-        .map_err(|e| anyhow!("Failed to parse SSH key '{}': {}", conn.key_name, e))?;
+    let key_pair = decode_supported_private_key(&conn.key_name, key_pem)?;
     let key_pair = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
+    let command_audit = truncate_ssh_audit_command(command);
+    let started_at = std::time::Instant::now();
+    tracing::info!(
+        ssh_connection = %conn.name,
+        ssh_host = %conn.host,
+        ssh_port = conn.port,
+        ssh_user = %conn.username,
+        ssh_command = %command_audit,
+        "SSH command execution started"
+    );
 
     // Connect and execute
     let config = russh::client::Config::default();
@@ -376,6 +433,17 @@ pub async fn ssh_execute_scoped(
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
     let code = exit_code.unwrap_or(0);
+    tracing::info!(
+        ssh_connection = %conn.name,
+        ssh_host = %conn.host,
+        ssh_port = conn.port,
+        ssh_user = %conn.username,
+        ssh_command = %command_audit,
+        ssh_exit_code = code,
+        ssh_duration_ms = started_at.elapsed().as_millis() as u64,
+        ssh_stderr_present = !stderr_str.trim().is_empty(),
+        "SSH command execution finished"
+    );
 
     let mut result = format!("[{}@{} exit:{}]\n", conn.username, conn.host, code);
     if !stdout_str.is_empty() {
@@ -415,6 +483,7 @@ pub fn remove_connection(config_dir: &Path, name: &str) -> Result<bool> {
 
 /// Store an SSH private key (encrypted)
 pub fn store_key(config_dir: &Path, name: &str, pem_content: &str) -> Result<()> {
+    validate_private_key_pem(name, pem_content)?;
     let mut store = load_keys(config_dir)?;
     store.keys.insert(name.to_string(), pem_content.to_string());
     save_keys(config_dir, &store)
@@ -456,6 +525,24 @@ impl russh::client::Handler for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_ED25519_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDB7PJzXd4V6Qtm7RBCrQfenP+UuUk92v3nWse3CI6ASAAAAKC2qFxRtqhc
+UQAAAAtzc2gtZWQyNTUxOQAAACDB7PJzXd4V6Qtm7RBCrQfenP+UuUk92v3nWse3CI6ASA
+AAAEC6dCeN3Rct1cIuWYZ5+vtGDXmBAM75U1UZlf76Qi5HEsHs8nNd3hXpC2btEEKtB96c
+/5S5ST3a/edax7cIjoBIAAAAG2NvZGV4c2FuZGJveG9mZmxpbmVAZGViYW5rYQEC
+-----END OPENSSH PRIVATE KEY-----"#;
+
+    const TEST_ECDSA_PRIVATE_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQT7P/zwzqFj+pLe3pK15tyvd4Nqa1Ga
+4pkKzHYnCkL+mjEv5fZe32/lFlWA8tCTvIkDhKTRzPRf+viXFfQu8bZHAAAAuIArCvuAKw
+r7AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPs//PDOoWP6kt7e
+krXm3K93g2prUZrimQrMdicKQv6aMS/l9l7fb+UWVYDy0JO8iQOEpNHM9F/6+JcV9C7xtk
+cAAAAgCRz4jFQ1vt+nLYhG9VajtcszkFC9/1asEeZ519bHgdsAAAAbY29kZXhzYW5kYm94
+b2ZmbGluZUBkZWJhbmthAQIDBAU=
+-----END OPENSSH PRIVATE KEY-----"#;
 
     #[test]
     fn filter_connections_by_allowlist_keeps_only_attached_names() {
@@ -523,5 +610,25 @@ mod tests {
 
         assert!(error.contains("mismatch"));
         assert!(error.contains("example.com:22"));
+    }
+
+    #[test]
+    fn validate_private_key_pem_accepts_ed25519_keys() {
+        validate_private_key_pem("ed25519-key", TEST_ED25519_PRIVATE_KEY).unwrap();
+    }
+
+    #[test]
+    fn validate_private_key_pem_accepts_ecdsa_keys() {
+        validate_private_key_pem("ecdsa-key", TEST_ECDSA_PRIVATE_KEY).unwrap();
+    }
+
+    #[test]
+    fn validate_private_key_pem_rejects_invalid_keys_with_guidance() {
+        let error = validate_private_key_pem("legacy-key", "not a private key")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Ed25519 or ECDSA"));
+        assert!(error.contains("RSA/id_rsa"));
     }
 }

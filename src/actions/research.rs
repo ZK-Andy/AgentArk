@@ -6,6 +6,7 @@
 //! 3. Synthesizing information into a coherent report
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -29,6 +30,15 @@ pub struct ResearchArgs {
     /// Depth of research (quick, standard, deep)
     #[serde(default)]
     pub depth: ResearchDepth,
+    /// Minimum number of primary-source-like results to include when available
+    #[serde(default = "default_min_primary_sources")]
+    pub min_primary_sources: usize,
+    /// Optional source freshness window in days for ranking and diversity
+    #[serde(default)]
+    pub freshness_window_days: Option<u32>,
+    /// Extra follow-up search rounds for unresolved gaps or contradictions
+    #[serde(default = "default_followup_rounds")]
+    pub followup_rounds: usize,
 }
 
 fn default_max_sources() -> usize {
@@ -42,6 +52,17 @@ fn default_deep_max_sources() -> usize {
 fn default_include_sources() -> bool {
     true
 }
+
+fn default_min_primary_sources() -> usize {
+    0
+}
+
+fn default_followup_rounds() -> usize {
+    0
+}
+
+const MAX_RESEARCH_FETCH_REDIRECTS: usize = 3;
+const MAX_RESEARCH_FETCH_BYTES: usize = 2 * 1024 * 1024;
 
 /// Research depth level
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -102,6 +123,9 @@ pub struct Source {
     pub description: String,
     /// Reliability score (0.0-1.0)
     pub reliability: f32,
+    /// Published date when the search backend could infer one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,6 +148,12 @@ struct RankedResearchResult {
     result: SearchResult,
     categories: HashSet<ResearchQueryCategory>,
     score: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResearchCoverage {
+    primary_sources: usize,
+    recent_sources: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -293,6 +323,7 @@ pub struct ResearchClient {
 impl ResearchClient {
     pub fn new(search_config: SearchConfig) -> Self {
         let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
@@ -322,6 +353,63 @@ impl ResearchClient {
                 default_deep_max_sources()
             }
             _ => args.max_sources.max(1),
+        }
+    }
+
+    fn effective_min_primary_sources(&self, args: &ResearchArgs) -> usize {
+        if args.min_primary_sources > 0 {
+            return args.min_primary_sources;
+        }
+        if matches!(args.depth, ResearchDepth::Deep) {
+            return self.effective_max_sources(args).min(2);
+        }
+        0
+    }
+
+    fn effective_followup_rounds(&self, args: &ResearchArgs) -> usize {
+        if args.followup_rounds > 0 {
+            return args.followup_rounds;
+        }
+        if matches!(args.depth, ResearchDepth::Deep) {
+            return 2;
+        }
+        0
+    }
+
+    fn effective_freshness_window_days(&self, args: &ResearchArgs, query: &str) -> Option<i64> {
+        if let Some(days) = args.freshness_window_days {
+            return Some(days.max(1) as i64);
+        }
+        if matches!(args.depth, ResearchDepth::Deep) && !self.query_targets_historical_period(query)
+        {
+            return Some(365);
+        }
+        None
+    }
+
+    fn query_targets_historical_period(&self, query: &str) -> bool {
+        let current_year = Utc::now().year();
+        let years = query
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter_map(|token| {
+                let token = token.trim();
+                if token.len() == 4 {
+                    token.parse::<i32>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        !years.is_empty() && years.iter().all(|year| *year <= current_year - 2)
+    }
+
+    fn build_source(&self, result: &SearchResult) -> Source {
+        Source {
+            title: result.title.clone(),
+            url: result.url.clone(),
+            description: result.snippet.clone(),
+            reliability: self.estimate_reliability(&result.url),
+            published_date: result.published_date.clone(),
         }
     }
 
@@ -399,12 +487,7 @@ impl ResearchClient {
 
         let sources: Vec<Source> = search_results
             .iter()
-            .map(|r| Source {
-                title: r.title.clone(),
-                url: r.url.clone(),
-                description: r.snippet.clone(),
-                reliability: self.estimate_reliability(&r.url),
-            })
+            .map(|r| self.build_source(r))
             .collect();
 
         let summary = self.generate_summary(&args.query, &findings);
@@ -508,57 +591,22 @@ impl ResearchClient {
 
         let mut sources: Vec<Source> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
+        let selected_results = search_results
+            .iter()
+            .take(max_sources)
+            .cloned()
+            .collect::<Vec<_>>();
 
-        for (i, result) in search_results.iter().enumerate().take(max_sources) {
-            // Add source
-            sources.push(Source {
-                title: result.title.clone(),
-                url: result.url.clone(),
-                description: result.snippet.clone(),
-                reliability: self.estimate_reliability(&result.url),
-            });
-
-            // Try to fetch and extract content
-            if let Some(progress) = progress {
-                progress.emit(
-                    "reading",
-                    "Reading sources",
-                    format!(
-                        "Source {}/{}: reading {}.",
-                        i + 1,
-                        max_sources.min(search_results.len()),
-                        source_label(result)
-                    ),
-                    "running",
-                    "phase-status:research:reading",
-                );
-            }
-            match self
-                .fetch_content(&result.url, progress, "phase-status:research:reading")
-                .await
-            {
-                Ok(content) => {
-                    // Extract key points from the content
-                    let key_points = self.extract_key_points(&content, &args.query);
-                    for point in key_points {
-                        findings.push(Finding {
-                            content: point,
-                            confidence: 0.8,
-                            source_index: i,
-                            supporting_source_indices: vec![i],
-                        });
-                    }
-                }
-                Err(_) => {
-                    // Fall back to snippet
-                    if let Some(finding) =
-                        self.build_snippet_finding(&result.snippet, &query_terms, i, 0.6)
-                    {
-                        findings.push(finding);
-                    }
-                }
-            }
-        }
+        self.read_search_results_into_evidence(
+            &selected_results,
+            &args.query,
+            &query_terms,
+            &mut sources,
+            &mut findings,
+            progress,
+            "phase-status:research:reading",
+        )
+        .await;
 
         let summary = self.generate_summary(&args.query, &findings);
         let result = ResearchResult {
@@ -621,6 +669,10 @@ impl ResearchClient {
     ) -> Result<ResearchResult> {
         let query_terms = self.normalized_query_terms(&args.query);
         let max_sources = self.effective_max_sources(args);
+        let min_primary_sources = self.effective_min_primary_sources(args);
+        let followup_rounds = self.effective_followup_rounds(args);
+        let freshness_window_days = self.effective_freshness_window_days(args, &args.query);
+        let prefer_primary_sources = min_primary_sources > 0;
         if let Some(progress) = progress {
             progress.emit(
                 "planning",
@@ -633,7 +685,7 @@ impl ResearchClient {
                 "phase-status:research:planning",
             );
         }
-        let queries = self.generate_research_queries(&args.query);
+        let queries = self.generate_research_queries(&args.query, prefer_primary_sources);
         if let Some(progress) = progress {
             progress.emit(
                 "planning",
@@ -654,81 +706,21 @@ impl ResearchClient {
                 "phase-status:research:searching",
             );
         }
-        let prefers_official_sources = self.prefers_official_sources(&args.query);
-        let mut results_by_url: HashMap<String, RankedResearchResult> = HashMap::new();
-        let mut search_errors = Vec::new();
-
-        for (query_index, query) in queries.iter().enumerate() {
-            if let Some(progress) = progress {
-                progress.emit(
-                    "searching",
-                    "Searching sources",
-                    format!(
-                        "Angle {}/{}: {}.",
-                        query_index + 1,
-                        queries.len(),
-                        summarize_progress_text(&query.text, 104)
-                    ),
-                    "running",
-                    "phase-status:research:searching",
-                );
-            }
-            match self
-                .search(
-                    &query.text,
-                    4,
-                    &args.backend,
-                    progress,
-                    "phase-status:research:searching",
-                )
-                .await
-            {
-                Ok(results) => {
-                    for result in results {
-                        let normalized_url = result.url.trim().to_lowercase();
-                        if normalized_url.is_empty() {
-                            continue;
-                        }
-                        let score = self.research_rank_score(
-                            &result,
-                            &args.query,
-                            prefers_official_sources,
-                            query.category,
-                        );
-                        if score <= 0.0 {
-                            continue;
-                        }
-                        results_by_url
-                            .entry(normalized_url)
-                            .and_modify(|existing| {
-                                existing.categories.insert(query.category);
-                                if score > existing.score {
-                                    existing.result = result.clone();
-                                    existing.score = score;
-                                }
-                            })
-                            .or_insert_with(|| RankedResearchResult {
-                                result,
-                                categories: HashSet::from([query.category]),
-                                score,
-                            });
-                    }
-                }
-                Err(error) => search_errors.push(error.to_string()),
-            }
-        }
-        if results_by_url.is_empty() && !search_errors.is_empty() {
-            if let Some(provider_setup_error) = search_errors
-                .iter()
-                .find(|error| error.contains(super::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE))
-            {
-                return Err(anyhow!(provider_setup_error.clone()));
-            }
-            return Err(anyhow!(
-                "Unable to complete research because all search angles failed: {}",
-                search_errors.join(" | ")
-            ));
-        }
+        let mut used_urls = HashSet::new();
+        let results_by_url = self
+            .collect_ranked_results(
+                &args.query,
+                &queries,
+                4,
+                &args.backend,
+                progress,
+                "phase-status:research:searching",
+                prefer_primary_sources,
+                freshness_window_days,
+                &used_urls,
+                true,
+            )
+            .await?;
         if let Some(progress) = progress {
             progress.emit(
                 "searching",
@@ -755,7 +747,9 @@ impl ResearchClient {
         let ranked_results = self.select_diverse_results(
             results_by_url.into_values().collect(),
             max_sources,
-            prefers_official_sources,
+            prefer_primary_sources,
+            min_primary_sources,
+            freshness_window_days,
         );
         if let Some(progress) = progress {
             progress.emit(
@@ -777,89 +771,130 @@ impl ResearchClient {
                 "phase-status:research:reading",
             );
         }
-        let all_results = ranked_results
+        let mut all_results = ranked_results
             .into_iter()
             .map(|entry| entry.result)
             .collect::<Vec<_>>();
+        for result in &all_results {
+            used_urls.insert(result.url.trim().to_lowercase());
+        }
 
         let mut sources: Vec<Source> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
 
-        for (i, result) in all_results.iter().enumerate() {
-            let reliability = self.estimate_reliability(&result.url);
-            sources.push(Source {
-                title: result.title.clone(),
-                url: result.url.clone(),
-                description: result.snippet.clone(),
-                reliability,
-            });
+        self.read_search_results_into_evidence(
+            &all_results,
+            &args.query,
+            &query_terms,
+            &mut sources,
+            &mut findings,
+            progress,
+            "phase-status:research:reading",
+        )
+        .await;
+
+        let mut findings = self.deduplicate_findings(findings);
+        let mut key_findings = self.cluster_findings(&findings);
+        let mut contradictions = self.detect_contradictions(&findings, &sources);
+        let mut open_questions =
+            self.derive_open_questions(&args.query, &sources, &findings, &contradictions);
+
+        for round in 0..followup_rounds {
+            let remaining_slots = max_sources.saturating_sub(sources.len());
+            let coverage = self.research_coverage(&sources, freshness_window_days);
+            let primary_gap = coverage.primary_sources < min_primary_sources;
+            let freshness_gap = freshness_window_days.is_some() && coverage.recent_sources == 0;
+            let unresolved = !open_questions.is_empty() || !contradictions.is_empty();
+            if remaining_slots == 0 || (!primary_gap && !freshness_gap && !unresolved) {
+                break;
+            }
+
+            let followup_queries = self.generate_followup_queries(
+                &args.query,
+                &open_questions,
+                &contradictions,
+                primary_gap,
+                freshness_gap,
+                round,
+            );
+            if followup_queries.is_empty() {
+                break;
+            }
 
             if let Some(progress) = progress {
                 progress.emit(
-                    "reading",
-                    "Reading sources",
+                    "searching",
+                    "Searching sources",
                     format!(
-                        "Source {}/{}: reading {}.",
-                        i + 1,
-                        all_results.len(),
-                        source_label(result)
+                        "Follow-up round {}/{}: resolving remaining evidence gaps.",
+                        round + 1,
+                        followup_rounds
                     ),
                     "running",
-                    "phase-status:research:reading",
+                    "phase-status:research:searching",
                 );
             }
-            match self
-                .fetch_content(&result.url, progress, "phase-status:research:reading")
-                .await
-            {
-                Ok(content) => {
-                    let key_points = self.extract_key_points(&content, &args.query);
-                    if key_points.is_empty() {
-                        if let Some(finding) = self.build_snippet_finding(
-                            &result.snippet,
-                            &query_terms,
-                            i,
-                            (0.58 + reliability * 0.25).min(0.92),
-                        ) {
-                            findings.push(finding);
-                        }
-                    } else {
-                        for point in key_points {
-                            findings.push(Finding {
-                                content: point,
-                                confidence: (0.62 + reliability * 0.28).min(0.96),
-                                source_index: i,
-                                supporting_source_indices: vec![i],
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    if let Some(progress) = progress {
-                        progress.emit(
-                            "reading",
-                            "Reading sources",
-                            format!(
-                                "Source {}/{}: using the search snippet after the page read failed ({}).",
-                                i + 1,
-                                all_results.len(),
-                                summarize_error(&err)
-                            ),
-                            "running",
-                            "phase-status:research:reading",
-                        );
-                    }
-                    if let Some(finding) = self.build_snippet_finding(
-                        &result.snippet,
-                        &query_terms,
-                        i,
-                        (0.44 + reliability * 0.2).min(0.8),
-                    ) {
-                        findings.push(finding);
-                    }
-                }
+
+            let followup_results_by_url = self
+                .collect_ranked_results(
+                    &args.query,
+                    &followup_queries,
+                    3,
+                    &args.backend,
+                    progress,
+                    "phase-status:research:searching",
+                    prefer_primary_sources,
+                    freshness_window_days,
+                    &used_urls,
+                    false,
+                )
+                .await?;
+            if followup_results_by_url.is_empty() {
+                break;
             }
+
+            let followup_results = self.select_diverse_results(
+                followup_results_by_url.into_values().collect(),
+                remaining_slots.min(4),
+                prefer_primary_sources,
+                min_primary_sources.saturating_sub(coverage.primary_sources),
+                if coverage.recent_sources > 0 {
+                    None
+                } else {
+                    freshness_window_days
+                },
+            );
+            if followup_results.is_empty() {
+                break;
+            }
+
+            let new_results = followup_results
+                .into_iter()
+                .map(|entry| entry.result)
+                .collect::<Vec<_>>();
+            for result in &new_results {
+                used_urls.insert(result.url.trim().to_lowercase());
+            }
+            all_results.extend(new_results.iter().cloned());
+
+            self.read_search_results_into_evidence(
+                &new_results,
+                &args.query,
+                &query_terms,
+                &mut sources,
+                &mut findings,
+                progress,
+                "phase-status:research:reading",
+            )
+            .await;
+
+            findings = self.deduplicate_findings(findings);
+            key_findings = self.cluster_findings(&findings);
+            contradictions = self.detect_contradictions(&findings, &sources);
+            open_questions =
+                self.derive_open_questions(&args.query, &sources, &findings, &contradictions);
         }
+
         if let Some(progress) = progress {
             progress.emit(
                 "reading",
@@ -889,11 +924,6 @@ impl ResearchClient {
             );
         }
 
-        findings = self.deduplicate_findings(findings);
-        let key_findings = self.cluster_findings(&findings);
-        let contradictions = self.detect_contradictions(&findings, &sources);
-        let open_questions =
-            self.derive_open_questions(&args.query, &sources, &findings, &contradictions);
         let summary = self.generate_comprehensive_summary(
             &args.query,
             &key_findings,
@@ -1008,6 +1038,187 @@ impl ResearchClient {
         }
     }
 
+    async fn collect_ranked_results(
+        &self,
+        query: &str,
+        queries: &[ResearchQuery],
+        results_per_query: usize,
+        backend_preference: &Option<String>,
+        progress: Option<&ResearchProgressReporter>,
+        stream_key: &str,
+        prefer_primary_sources: bool,
+        freshness_window_days: Option<i64>,
+        already_used_urls: &HashSet<String>,
+        fail_on_total_failure: bool,
+    ) -> Result<HashMap<String, RankedResearchResult>> {
+        let mut results_by_url: HashMap<String, RankedResearchResult> = HashMap::new();
+        let mut search_errors = Vec::new();
+
+        for (query_index, search_query) in queries.iter().enumerate() {
+            if let Some(progress) = progress {
+                progress.emit(
+                    "searching",
+                    "Searching sources",
+                    format!(
+                        "Angle {}/{}: {}.",
+                        query_index + 1,
+                        queries.len(),
+                        summarize_progress_text(&search_query.text, 104)
+                    ),
+                    "running",
+                    stream_key,
+                );
+            }
+            match self
+                .search(
+                    &search_query.text,
+                    results_per_query,
+                    backend_preference,
+                    progress,
+                    stream_key,
+                )
+                .await
+            {
+                Ok(results) => {
+                    for result in results {
+                        let normalized_url = result.url.trim().to_lowercase();
+                        if normalized_url.is_empty() || already_used_urls.contains(&normalized_url)
+                        {
+                            continue;
+                        }
+                        let score = self.research_rank_score(
+                            &result,
+                            query,
+                            prefer_primary_sources,
+                            search_query.category,
+                            freshness_window_days,
+                        );
+                        if score <= 0.0 {
+                            continue;
+                        }
+                        results_by_url
+                            .entry(normalized_url)
+                            .and_modify(|existing| {
+                                existing.categories.insert(search_query.category);
+                                if score > existing.score {
+                                    existing.result = result.clone();
+                                    existing.score = score;
+                                }
+                            })
+                            .or_insert_with(|| RankedResearchResult {
+                                result,
+                                categories: HashSet::from([search_query.category]),
+                                score,
+                            });
+                    }
+                }
+                Err(error) => search_errors.push(error.to_string()),
+            }
+        }
+
+        if results_by_url.is_empty() && fail_on_total_failure && !search_errors.is_empty() {
+            if let Some(provider_setup_error) = search_errors
+                .iter()
+                .find(|error| error.contains(super::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE))
+            {
+                return Err(anyhow!(provider_setup_error.clone()));
+            }
+            return Err(anyhow!(
+                "Unable to complete research because all search angles failed: {}",
+                search_errors.join(" | ")
+            ));
+        }
+
+        Ok(results_by_url)
+    }
+
+    async fn read_search_results_into_evidence(
+        &self,
+        results: &[SearchResult],
+        query: &str,
+        query_terms: &[String],
+        sources: &mut Vec<Source>,
+        findings: &mut Vec<Finding>,
+        progress: Option<&ResearchProgressReporter>,
+        stream_key: &str,
+    ) {
+        let total_after_batch = sources.len() + results.len();
+        for result in results {
+            let source_index = sources.len();
+            let source = self.build_source(result);
+            let reliability = source.reliability;
+            sources.push(source);
+
+            if let Some(progress) = progress {
+                progress.emit(
+                    "reading",
+                    "Reading sources",
+                    format!(
+                        "Source {}/{}: reading {}.",
+                        source_index + 1,
+                        total_after_batch,
+                        source_label(result)
+                    ),
+                    "running",
+                    stream_key,
+                );
+            }
+            match self.fetch_content(&result.url, progress, stream_key).await {
+                Ok(content) => {
+                    let key_points = self.extract_key_points(&content, query);
+                    if key_points.is_empty() {
+                        if let Some(finding) = self.build_snippet_finding(
+                            &result.snippet,
+                            query_terms,
+                            source_index,
+                            (0.58 + reliability * 0.25 + self.search_result_recency_bonus(result))
+                                .min(0.92),
+                        ) {
+                            findings.push(finding);
+                        }
+                    } else {
+                        for point in key_points {
+                            findings.push(Finding {
+                                content: point,
+                                confidence: (0.62
+                                    + reliability * 0.28
+                                    + self.search_result_recency_bonus(result))
+                                .min(0.96),
+                                source_index,
+                                supporting_source_indices: vec![source_index],
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(progress) = progress {
+                        progress.emit(
+                            "reading",
+                            "Reading sources",
+                            format!(
+                                "Source {}/{}: using the search snippet after the page read failed ({}).",
+                                source_index + 1,
+                                total_after_batch,
+                                summarize_error(&err)
+                            ),
+                            "running",
+                            stream_key,
+                        );
+                    }
+                    if let Some(finding) = self.build_snippet_finding(
+                        &result.snippet,
+                        query_terms,
+                        source_index,
+                        (0.44 + reliability * 0.2 + self.search_result_recency_bonus(result))
+                            .min(0.8),
+                    ) {
+                        findings.push(finding);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fetch content from a URL
     async fn fetch_content(
         &self,
@@ -1015,17 +1226,21 @@ impl ResearchClient {
         progress: Option<&ResearchProgressReporter>,
         stream_key: &str,
     ) -> Result<String> {
+        let validated_url = crate::core::net::validate_public_https_url(url).await?;
         if let Some(progress) = progress {
             progress.emit(
                 "reading",
                 "Reading sources",
-                format!("Opening {}.", source_host_label(url)),
+                format!("Opening {}.", source_host_label(validated_url.as_str())),
                 "running",
                 stream_key,
             );
         }
+        let (final_url, html) = self
+            .fetch_html_with_safe_redirects(validated_url.clone())
+            .await?;
         // Fast-path: Lightpanda returns clean markdown (no HTML stripping needed)
-        match crate::integrations::lightpanda::fetch_markdown(url).await {
+        match crate::integrations::lightpanda::fetch_markdown(final_url.as_str()).await {
             Ok(markdown) => return Ok(markdown),
             Err(e) => {
                 tracing::debug!(
@@ -1038,7 +1253,7 @@ impl ResearchClient {
                         "Reading sources",
                         format!(
                             "Using direct fetch for {} after Lightpanda fallback ({}).",
-                            source_host_label(url),
+                            source_host_label(final_url.as_str()),
                             summarize_error(&e)
                         ),
                         "running",
@@ -1048,17 +1263,44 @@ impl ResearchClient {
             }
         }
 
-        // Fallback: raw HTTP + HTML text extraction
-        let response = self.http_client.get(url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to fetch URL: {}", response.status()));
-        }
-
-        let html = response.text().await?;
-
         // Extract text content from HTML
         Ok(self.extract_text_from_html(&html))
+    }
+
+    async fn fetch_html_with_safe_redirects(
+        &self,
+        initial: reqwest::Url,
+    ) -> Result<(reqwest::Url, String)> {
+        let mut current = initial;
+        for _ in 0..=MAX_RESEARCH_FETCH_REDIRECTS {
+            let response = self.http_client.get(current.clone()).send().await?;
+            if response.status().is_success() {
+                if let Some(length) = response.content_length() {
+                    if length > MAX_RESEARCH_FETCH_BYTES as u64 {
+                        return Err(anyhow!("Fetched content is too large"));
+                    }
+                }
+                let bytes = response.bytes().await?;
+                if bytes.len() > MAX_RESEARCH_FETCH_BYTES {
+                    return Err(anyhow!("Fetched content is too large"));
+                }
+                return Ok((current, String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow!("Redirect missing Location header"))?;
+                let next = current
+                    .join(location)
+                    .map_err(|error| anyhow!("Invalid redirect URL: {}", error))?;
+                current = crate::core::net::validate_public_https_url(next.as_str()).await?;
+                continue;
+            }
+            return Err(anyhow!("Failed to fetch URL: {}", response.status()));
+        }
+        Err(anyhow!("Too many redirects while fetching research content"))
     }
 
     fn filter_search_results_for_query(
@@ -1110,6 +1352,111 @@ impl ResearchClient {
             Some(format!("https://{}", trimmed))
         } else {
             None
+        }
+    }
+
+    fn parse_published_date(&self, value: Option<&str>) -> Option<DateTime<Utc>> {
+        let value = value?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+            return Some(parsed.with_timezone(&Utc));
+        }
+        if let Ok(parsed) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+            return parsed
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| Utc.from_utc_datetime(&dt));
+        }
+        for fmt in [
+            "%B %d, %Y",
+            "%b %d, %Y",
+            "%m/%d/%Y",
+            "%m/%d/%y",
+            "%d/%m/%Y",
+            "%d/%m/%y",
+        ] {
+            if let Ok(parsed) = NaiveDate::parse_from_str(value, fmt) {
+                if let Some(dt) = parsed.and_hms_opt(0, 0, 0) {
+                    return Some(Utc.from_utc_datetime(&dt));
+                }
+            }
+        }
+
+        let lower = value.to_ascii_lowercase();
+        let mut parts = lower.split_whitespace();
+        let amount = parts.next().and_then(|token| token.parse::<i64>().ok());
+        let unit = parts.next();
+        let ago = parts.next();
+        if let (Some(amount), Some(unit), Some("ago")) = (amount, unit, ago) {
+            let duration = match unit {
+                "minute" | "minutes" => Some(ChronoDuration::minutes(amount)),
+                "hour" | "hours" => Some(ChronoDuration::hours(amount)),
+                "day" | "days" => Some(ChronoDuration::days(amount)),
+                "week" | "weeks" => Some(ChronoDuration::weeks(amount)),
+                "month" | "months" => Some(ChronoDuration::days(amount * 30)),
+                "year" | "years" => Some(ChronoDuration::days(amount * 365)),
+                _ => None,
+            };
+            if let Some(duration) = duration {
+                return Some(Utc::now() - duration);
+            }
+        }
+
+        None
+    }
+
+    fn search_result_is_recent(
+        &self,
+        result: &SearchResult,
+        freshness_window_days: Option<i64>,
+    ) -> bool {
+        let Some(window_days) = freshness_window_days else {
+            return false;
+        };
+        let Some(published_at) = self.parse_published_date(result.published_date.as_deref()) else {
+            return false;
+        };
+        published_at >= Utc::now() - ChronoDuration::days(window_days.max(1))
+    }
+
+    fn source_is_recent(&self, source: &Source, freshness_window_days: Option<i64>) -> bool {
+        let Some(window_days) = freshness_window_days else {
+            return false;
+        };
+        let Some(published_at) = self.parse_published_date(source.published_date.as_deref()) else {
+            return false;
+        };
+        published_at >= Utc::now() - ChronoDuration::days(window_days.max(1))
+    }
+
+    fn search_result_recency_bonus(&self, result: &SearchResult) -> f32 {
+        let Some(published_at) = self.parse_published_date(result.published_date.as_deref()) else {
+            return 0.0;
+        };
+        let age_days = (Utc::now() - published_at).num_days().max(0);
+        match age_days {
+            0..=30 => 0.06,
+            31..=90 => 0.04,
+            91..=365 => 0.02,
+            _ => 0.0,
+        }
+    }
+
+    fn research_coverage(
+        &self,
+        sources: &[Source],
+        freshness_window_days: Option<i64>,
+    ) -> ResearchCoverage {
+        ResearchCoverage {
+            primary_sources: sources
+                .iter()
+                .filter(|source| self.looks_like_primary_source(&source.url))
+                .count(),
+            recent_sources: sources
+                .iter()
+                .filter(|source| self.source_is_recent(source, freshness_window_days))
+                .count(),
         }
     }
 
@@ -1241,8 +1588,36 @@ impl ResearchClient {
 
     /// Extract text content from HTML
     fn extract_text_from_html(&self, html: &str) -> String {
-        // Remove script and style tags
-        let mut text = html.to_string();
+        // Insert block boundaries before stripping tags so paragraphs do not collapse.
+        let mut text = html
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n");
+        for block_tag in [
+            "</p>",
+            "</div>",
+            "</section>",
+            "</article>",
+            "</header>",
+            "</footer>",
+            "</main>",
+            "</aside>",
+            "</h1>",
+            "</h2>",
+            "</h3>",
+            "</h4>",
+            "</h5>",
+            "</h6>",
+            "</li>",
+            "</ul>",
+            "</ol>",
+            "</table>",
+            "</tr>",
+            "</td>",
+            "</th>",
+        ] {
+            text = text.replace(block_tag, &format!("{}\n", block_tag));
+        }
 
         // Simple regex-free HTML stripping
         // Remove script tags
@@ -1355,6 +1730,12 @@ impl ResearchClient {
             "reuters.com",
             "apnews.com",
             "nytimes.com",
+            "sec.gov",
+            "who.int",
+            "imf.org",
+            "worldbank.org",
+            "oecd.org",
+            "europa.eu",
             "github.com",
             "stackoverflow.com",
             "docs.rs",
@@ -1371,11 +1752,6 @@ impl ResearchClient {
         0.6
     }
 
-    fn prefers_official_sources(&self, query: &str) -> bool {
-        let _ = query;
-        false
-    }
-
     fn looks_like_primary_source(&self, url: &str) -> bool {
         let lower = url.to_lowercase();
         lower.contains(".gov")
@@ -1384,6 +1760,12 @@ impl ResearchClient {
             || lower.contains("/docs")
             || lower.contains("developer.")
             || lower.contains("github.com")
+            || lower.contains("arxiv.org")
+            || lower.contains("sec.gov")
+            || lower.contains("who.int")
+            || lower.contains("worldbank.org")
+            || lower.contains("oecd.org")
+            || lower.contains("europa.eu")
             || lower.contains("ietf.org")
             || lower.contains("w3.org")
     }
@@ -1392,8 +1774,9 @@ impl ResearchClient {
         &self,
         result: &SearchResult,
         query: &str,
-        prefers_official_sources: bool,
+        prefer_primary_sources: bool,
         category: ResearchQueryCategory,
+        freshness_window_days: Option<i64>,
     ) -> f32 {
         let query_terms = self.normalized_query_terms(query);
         let mut score = self.estimate_reliability(&result.url);
@@ -1406,8 +1789,14 @@ impl ResearchClient {
             return 0.0;
         };
         score += relevance_score.min(6.0) * 0.04;
-        if prefers_official_sources && self.looks_like_primary_source(&result.url) {
+        if prefer_primary_sources && self.looks_like_primary_source(&result.url) {
             score += 0.18;
+        }
+        score += self.search_result_recency_bonus(result);
+        if freshness_window_days.is_some()
+            && self.search_result_is_recent(result, freshness_window_days)
+        {
+            score += 0.08;
         }
         score += match category {
             ResearchQueryCategory::Primary => 0.16,
@@ -1423,7 +1812,9 @@ impl ResearchClient {
         &self,
         mut ranked: Vec<RankedResearchResult>,
         max_sources: usize,
-        prefers_official_sources: bool,
+        prefer_primary_sources: bool,
+        min_primary_sources: usize,
+        freshness_window_days: Option<i64>,
     ) -> Vec<RankedResearchResult> {
         ranked.sort_by(|a, b| {
             b.score
@@ -1433,14 +1824,36 @@ impl ResearchClient {
 
         let mut selected = Vec::new();
         let mut used_urls = HashSet::new();
+
+        if min_primary_sources > 0 {
+            self.push_matching_ranked_results(
+                &ranked,
+                max_sources,
+                &mut selected,
+                &mut used_urls,
+                min_primary_sources,
+                |candidate| self.looks_like_primary_source(&candidate.result.url),
+            );
+        }
+        if freshness_window_days.is_some() {
+            self.push_matching_ranked_results(
+                &ranked,
+                max_sources,
+                &mut selected,
+                &mut used_urls,
+                1,
+                |candidate| self.search_result_is_recent(&candidate.result, freshness_window_days),
+            );
+        }
+
         let mut quotas = vec![
             (ResearchQueryCategory::Recent, 1usize),
             (ResearchQueryCategory::Comparison, 1usize),
             (ResearchQueryCategory::Risks, 1usize),
         ];
 
-        if prefers_official_sources {
-            quotas.insert(0, (ResearchQueryCategory::Primary, 2usize));
+        if prefer_primary_sources {
+            quotas.insert(0, (ResearchQueryCategory::Primary, 1usize));
         } else {
             quotas.insert(0, (ResearchQueryCategory::General, 1usize));
         }
@@ -1477,6 +1890,32 @@ impl ResearchClient {
         }
 
         selected
+    }
+
+    fn push_matching_ranked_results<F>(
+        &self,
+        ranked: &[RankedResearchResult],
+        max_sources: usize,
+        selected: &mut Vec<RankedResearchResult>,
+        used_urls: &mut HashSet<String>,
+        target: usize,
+        predicate: F,
+    ) where
+        F: Fn(&RankedResearchResult) -> bool,
+    {
+        let mut added = 0usize;
+        for candidate in ranked {
+            let url_key = candidate.result.url.to_lowercase();
+            if used_urls.contains(&url_key) || !predicate(candidate) {
+                continue;
+            }
+            used_urls.insert(url_key);
+            selected.push(candidate.clone());
+            added += 1;
+            if selected.len() >= max_sources || added >= target {
+                break;
+            }
+        }
     }
 
     fn cluster_findings(&self, findings: &[Finding]) -> Vec<Finding> {
@@ -1698,6 +2137,19 @@ impl ResearchClient {
         }
     }
 
+    fn normalize_search_tail(&self, content: &str, max_len: usize) -> String {
+        self.compact_sentence(content, max_len)
+            .chars()
+            .map(|ch| match ch {
+                '[' | ']' | '(' | ')' | ':' | ';' | '.' | ',' | '"' | '\'' => ' ',
+                _ => ch,
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Generate summary from findings
     fn generate_summary(&self, query: &str, findings: &[Finding]) -> String {
         if findings.is_empty() {
@@ -1735,6 +2187,7 @@ impl ResearchClient {
 
         let avg_reliability: f32 =
             sources.iter().map(|s| s.reliability).sum::<f32>() / sources.len().max(1) as f32;
+        let coverage = self.research_coverage(sources, Some(365));
 
         let contradiction_line = if contradictions.is_empty() {
             "No major source contradictions surfaced in the top findings.".to_string()
@@ -1755,11 +2208,15 @@ impl ResearchClient {
 
         format!(
             "**Sources analyzed:** {}\n\
+            **Primary-like sources:** {}\n\
+            **Recent sources with dates:** {}\n\
             **Average confidence:** {:.0}%\n\
             **Average source reliability:** {:.0}%\n\
             **Contradictions:** {}\n\
             **Open questions:** {}",
             sources.len(),
+            coverage.primary_sources,
+            coverage.recent_sources,
             avg_confidence * 100.0,
             avg_reliability * 100.0,
             contradiction_line,
@@ -1768,8 +2225,11 @@ impl ResearchClient {
     }
 
     /// Generate sub-queries for deep research
-    fn generate_research_queries(&self, query: &str) -> Vec<ResearchQuery> {
-        let prefers_official = self.prefers_official_sources(query);
+    fn generate_research_queries(
+        &self,
+        query: &str,
+        prefer_primary_sources: bool,
+    ) -> Vec<ResearchQuery> {
         let mut queries = vec![
             ResearchQuery {
                 category: ResearchQueryCategory::General,
@@ -1793,18 +2253,18 @@ impl ResearchClient {
             },
         ];
 
-        if prefers_official {
+        if prefer_primary_sources {
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} official documentation", query),
+                text: format!("{} official source", query),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} implementation guide", query),
+                text: format!("{} original report data", query),
             });
             queries.push(ResearchQuery {
                 category: ResearchQueryCategory::Primary,
-                text: format!("{} specification standard", query),
+                text: format!("{} source material", query),
             });
         } else {
             queries.push(ResearchQuery {
@@ -1824,6 +2284,67 @@ impl ResearchClient {
         let mut seen = HashSet::new();
         queries
             .into_iter()
+            .filter(|candidate| seen.insert(candidate.text.to_lowercase()))
+            .collect()
+    }
+
+    fn generate_followup_queries(
+        &self,
+        query: &str,
+        open_questions: &[String],
+        contradictions: &[String],
+        primary_gap: bool,
+        freshness_gap: bool,
+        round: usize,
+    ) -> Vec<ResearchQuery> {
+        let mut queries = Vec::new();
+        if primary_gap {
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::Primary,
+                text: format!("{} official source", query),
+            });
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::Primary,
+                text: format!("{} original report data", query),
+            });
+        }
+        if freshness_gap {
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::Recent,
+                text: format!("{} {}", query, Utc::now().year()),
+            });
+        }
+        for question in open_questions.iter().take(2) {
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::General,
+                text: format!("{} {}", query, self.normalize_search_tail(question, 90)),
+            });
+        }
+        if let Some(contradiction) =
+            contradictions.get(round.min(contradictions.len().saturating_sub(1)))
+        {
+            queries.push(ResearchQuery {
+                category: ResearchQueryCategory::Risks,
+                text: format!(
+                    "{} {}",
+                    query,
+                    self.normalize_search_tail(contradiction, 90)
+                ),
+            });
+        }
+
+        let mut seen = HashSet::new();
+        queries
+            .into_iter()
+            .map(|mut candidate| {
+                candidate.text = candidate
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                candidate
+            })
+            .filter(|candidate| !candidate.text.trim().is_empty())
             .filter(|candidate| seen.insert(candidate.text.to_lowercase()))
             .collect()
     }
@@ -1951,20 +2472,27 @@ pub async fn execute_research_with_progress(
     if !result.sources.is_empty() {
         output.push_str("## Sources\n\n");
         for (i, source) in result.sources.iter().enumerate() {
+            let date_suffix = source
+                .published_date
+                .as_deref()
+                .map(|date| format!(" | date: {}", date))
+                .unwrap_or_default();
             if let Some(url) = client.normalize_source_url(&source.url) {
                 output.push_str(&format!(
-                    "{}. [{}]({}) - reliability: {:.0}%\n",
+                    "{}. [{}]({}) - reliability: {:.0}%{}\n",
                     i + 1,
                     source.title,
                     url,
-                    source.reliability * 100.0
+                    source.reliability * 100.0,
+                    date_suffix
                 ));
             } else {
                 output.push_str(&format!(
-                    "{}. {} - reliability: {:.0}%\n",
+                    "{}. {} - reliability: {:.0}%{}\n",
                     i + 1,
                     source.title,
-                    source.reliability * 100.0
+                    source.reliability * 100.0,
+                    date_suffix
                 ));
             }
         }
@@ -2013,6 +2541,9 @@ mod tests {
             _include_sources: true,
             backend: None,
             depth: ResearchDepth::Deep,
+            min_primary_sources: 0,
+            freshness_window_days: None,
+            followup_rounds: 0,
         };
 
         assert_eq!(client.effective_max_sources(&args), 12);
@@ -2021,7 +2552,7 @@ mod tests {
     #[test]
     fn deep_research_queries_cover_verification_phases() {
         let client = test_client();
-        let queries = client.generate_research_queries("rust agent framework");
+        let queries = client.generate_research_queries("rust agent framework", true);
 
         assert!(queries
             .iter()
@@ -2035,6 +2566,28 @@ mod tests {
         assert!(queries
             .iter()
             .any(|query| query.text.contains("risks limitations open questions")));
+    }
+
+    #[test]
+    fn deep_research_defaults_to_primary_coverage_followups_and_recent_bias() {
+        let client = test_client();
+        let args = ResearchArgs {
+            query: "distributed agent runtime".to_string(),
+            max_sources: default_max_sources(),
+            _include_sources: true,
+            backend: None,
+            depth: ResearchDepth::Deep,
+            min_primary_sources: 0,
+            freshness_window_days: None,
+            followup_rounds: 0,
+        };
+
+        assert_eq!(client.effective_min_primary_sources(&args), 2);
+        assert_eq!(client.effective_followup_rounds(&args), 2);
+        assert_eq!(
+            client.effective_freshness_window_days(&args, &args.query),
+            Some(365)
+        );
     }
 
     #[test]
@@ -2061,12 +2614,14 @@ mod tests {
                 url: "https://docs.example.com/offline".to_string(),
                 description: String::new(),
                 reliability: 0.92,
+                published_date: Some("2026-04-01".to_string()),
             },
             Source {
                 title: "Recent review".to_string(),
                 url: "https://example.com/review".to_string(),
                 description: String::new(),
                 reliability: 0.71,
+                published_date: Some("2026-04-02".to_string()),
             },
         ];
 
@@ -2115,12 +2670,14 @@ mod tests {
                 url: "https://example.com".to_string(),
                 description: String::new(),
                 reliability: 0.8,
+                published_date: Some("2026-04-01".to_string()),
             }],
             &[],
             &[],
         );
 
         assert!(summary.contains("**Sources analyzed:** 1"));
+        assert!(summary.contains("**Primary-like sources:**"));
         assert!(!summary.contains("# Research Summary:"));
         assert!(!summary.contains("## Key Findings"));
     }

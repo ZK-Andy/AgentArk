@@ -721,6 +721,7 @@ pub(crate) const BUNDLED_HELP_DOCS: &[BundledHelpDoc] = &[
                 label: "when to use each",
                 items: &[
                     "Use Library > Documents for file upload and search.",
+                    "Use `memory_lookup` when you need durable learned facts, operating constraints, lessons, or procedures during an active request.",
                     "Use Settings > Knowledge > Memory > Knowledge for reusable KB entries, notes, or curated instructions.",
                     "Use Facts, Preferences, and User Data when the question is about what __PRODUCT_NAME__ remembers.",
                     "Use Settings > Knowledge > MCP Servers when you want to add or manage external MCP-backed tools.",

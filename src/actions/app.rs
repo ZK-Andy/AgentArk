@@ -2213,8 +2213,8 @@ async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> 
 }
 
 /// Validate and normalise an app entry command.
-/// If the command contains shell operators (`&&`, `|`, `;`, etc.), wrap it in
-/// `sh -c "..."` so it runs through a shell interpreter inside the sandbox.
+/// Local runtime commands must stay as direct program+args invocations rather
+/// than shell snippets so shell metacharacters cannot change execution shape.
 fn validate_app_command(command: &str, label: &str) -> Result<String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -2228,34 +2228,44 @@ fn validate_app_command(command: &str, label: &str) -> Result<String> {
             MAX_APP_COMMAND_LEN
         );
     }
-    // Collapse multi-line commands into a single line joined with &&
-    let collapsed = if trimmed.contains('\n') || trimmed.contains('\r') {
-        trimmed
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" && ")
-    } else {
-        trimmed.to_string()
-    };
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        anyhow::bail!(
+            "{} must be a single direct command and cannot contain newlines",
+            label
+        );
+    }
+    let collapsed = trimmed.to_string();
     let lowered = collapsed.to_ascii_lowercase();
-    if lowered.starts_with("sh -c ") || lowered.starts_with("bash -c ") {
-        return Ok(collapsed);
+    let direct_shell_prefixes = [
+        "sh -c ",
+        "bash -c ",
+        "zsh -c ",
+        "cmd /c ",
+        "cmd.exe /c ",
+        "powershell -command ",
+        "powershell.exe -command ",
+        "pwsh -command ",
+        "pwsh.exe -command ",
+    ];
+    if direct_shell_prefixes
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        anyhow::bail!(
+            "{} must be a direct command and cannot invoke a shell interpreter",
+            label
+        );
     }
 
     let shell_tokens = ["&&", "||", ";", "|", "`", "$(", "<", ">"];
     if shell_tokens.iter().any(|tok| collapsed.contains(tok)) {
-        // Wrap in sh -c so shell operators work inside the sandbox
-        let escaped = collapsed
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "\\$")
-            .replace('`', "\\`");
-        Ok(format!("sh -c \"{}\"", escaped))
-    } else {
-        Ok(collapsed)
+        anyhow::bail!(
+            "{} contains shell operators and must be a direct command only",
+            label
+        );
     }
+    let _ = split_command_args(&collapsed, label)?;
+    Ok(collapsed)
 }
 
 fn is_valid_env_key(key: &str) -> bool {
@@ -3706,7 +3716,7 @@ impl AppRegistry {
         llm_env: HashMap<String, String>,
     ) {
         let registry = self.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/actions/app.rs:3719", async move {
             registry
                 .restore_from_disk(&config_dir, &data_dir, &llm_env)
                 .await;
@@ -4294,7 +4304,7 @@ impl AppRegistry {
                 ((now - previous).num_seconds() >= 30).then(|| (app.app_dir.clone(), now))
             };
             if let Some((app_dir, last_accessed)) = persist_target {
-                tokio::spawn(async move {
+                crate::spawn_logged!("src/actions/app.rs:4307", async move {
                     if let Err(error) =
                         persist_app_last_accessed_meta(&app_dir, last_accessed).await
                     {
@@ -5456,6 +5466,20 @@ mod tests {
                 args
             );
         }
+    }
+
+    #[test]
+    fn validate_app_command_rejects_shell_operators() {
+        let error = validate_app_command("npm run dev && echo hi", "entry_command")
+            .expect_err("shell operators should be rejected");
+        assert!(error.to_string().contains("shell operators"));
+    }
+
+    #[test]
+    fn validate_app_command_rejects_shell_interpreters() {
+        let error = validate_app_command("bash -c 'npm run dev'", "entry_command")
+            .expect_err("shell interpreters should be rejected");
+        assert!(error.to_string().contains("direct command"));
     }
 
     #[test]

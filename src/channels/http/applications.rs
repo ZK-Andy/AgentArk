@@ -789,7 +789,7 @@ fn spawn_application_log_reader<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http/applications.rs:792", async move {
         let mut lines = BufReader::new(reader).lines();
         loop {
             match lines.next_line().await {

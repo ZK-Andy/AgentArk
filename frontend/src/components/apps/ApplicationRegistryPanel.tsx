@@ -222,7 +222,7 @@ export function ApplicationRegistryPanel({ autoRefresh }: { autoRefresh: boolean
                 (stopMutation.isPending && stopMutation.variables?.id === id);
 
               return (
-                <Box key={id} className="action-row" sx={{ p: 1.25, borderRadius: 2, border: "1px solid rgba(108, 156, 212, 0.12)" }}>
+                <Box key={id} className="action-row" sx={{ p: 1.25, borderRadius: 2, border: "1px solid var(--surface-border)" }}>
                   <Stack spacing={1}>
                     <Stack direction={{ xs: "column", md: "row" }} spacing={1} sx={{
                       justifyContent: "space-between"

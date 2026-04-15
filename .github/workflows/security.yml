@@ -31,6 +31,7 @@ jobs:
         uses: actions/dependency-review-action@v4
 
   cargo-audit:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,26 +40,30 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo dependencies
+      - name: Cache cargo-audit toolchain
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-audit-tool-v1
           restore-keys: |
-            ${{ runner.os }}-cargo-audit-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-audit-tool-
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --force
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
 
       - name: Audit Rust dependencies
         run: cargo audit --deny warnings
 
   cargo-deny:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -67,21 +72,24 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo dependencies
+      - name: Cache cargo-deny toolchain
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-deny-${{ hashFiles('**/Cargo.lock', 'deny.toml') }}
+          key: ${{ runner.os }}-cargo-deny-tool-v1
           restore-keys: |
-            ${{ runner.os }}-cargo-deny-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-deny-tool-
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --force
+        run: |
+          if ! command -v cargo-deny >/dev/null 2>&1; then
+            cargo install cargo-deny --locked
+          fi
 
       - name: Run cargo-deny
         run: cargo deny --all-features check advisories bans licenses sources

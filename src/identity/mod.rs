@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -80,8 +80,15 @@ impl IdentityManager {
             SigningKey::from_bytes(&key_array)
         } else {
             // Generate new key
-            let signing_key = SigningKey::generate(&mut OsRng);
+            let mut secret = [0u8; 32];
+            rand::rng().fill(&mut secret);
+            let signing_key = SigningKey::from_bytes(&secret);
             std::fs::write(&key_path, signing_key.to_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             signing_key
         };
 

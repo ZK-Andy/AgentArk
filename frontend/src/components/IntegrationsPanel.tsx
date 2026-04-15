@@ -4579,7 +4579,7 @@ export function IntegrationsPanel({
           <Typography variant="caption" sx={{
             color: "text.secondary"
           }}>
-            Upload private keys, create named connection profiles, and run connectivity tests.
+            Upload Ed25519 or ECDSA private keys, create named connection profiles, and run connectivity tests.
           </Typography>
           {sshNotice ? <Alert sx={{ mt: 1 }} severity={sshNotice.kind}>{sshNotice.text}</Alert> : null}
           {sshKeysQ.error ? (
@@ -5569,7 +5569,7 @@ export function IntegrationsPanel({
                               width: 220,
                               height: 220,
                               borderRadius: 1,
-                              border: "1px solid rgba(108, 156, 212, 0.35)",
+                              border: "1px solid var(--surface-border)",
                               background: "#fff",
                               p: 0.75
                             }}
@@ -6177,6 +6177,9 @@ export function IntegrationsPanel({
               value={sshKeyPem}
               onChange={(e) => setSshKeyPem(e.target.value)}
             />
+            <Typography variant="caption" sx={{ color: "text.secondary" }}>
+              Use Ed25519 or ECDSA OpenSSH private keys. RSA and legacy `id_rsa` keys are not supported.
+            </Typography>
           </Stack>
         </DialogContent>
         <DialogActions>

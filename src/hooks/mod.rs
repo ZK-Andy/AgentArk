@@ -194,7 +194,7 @@ impl HookManager {
             let runs = self.runs.clone();
 
             // Contained execution: do not block request/action flow.
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/hooks/mod.rs:197", async move {
                 let hook_type = hook_copy.hook_type.trim().to_ascii_lowercase();
                 let (attempts, error) = if hook_type == "webhook" {
                     if let Some(url) = hook_copy.url.clone() {

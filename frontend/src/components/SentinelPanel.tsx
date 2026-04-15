@@ -462,8 +462,8 @@ export function SentinelPanel({
             background: "linear-gradient(135deg, rgba(33, 27, 15, 0.96), rgba(15, 17, 21, 0.96))"
           }
         : {
-            border: "rgba(59, 130, 246, 0.24)",
-            background: "linear-gradient(135deg, rgba(13, 24, 38, 0.96), rgba(15, 17, 21, 0.96))"
+            border: "rgba(255, 255, 255, 0.12)",
+            background: "linear-gradient(135deg, rgba(24, 24, 28, 0.96), rgba(15, 17, 21, 0.96))"
           };
   const heroStats = [
     {
@@ -949,11 +949,9 @@ export function SentinelPanel({
                         borderRadius: "8px",
                         minHeight: 152,
                         border: selected ? `1px solid ${accent}` : "1px solid rgba(255,255,255,0.08)",
-                        background: selected
-                          ? `linear-gradient(180deg, ${accent.replace(/0\.\d+\)$/, "0.16)")}, rgba(255,255,255,0.03))`
-                          : "rgba(255,255,255,0.02)",
+                        background: selected ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.02)",
                         boxShadow: selected
-                          ? `0 0 0 1px rgba(255,255,255,0.03) inset, 0 18px 40px ${accent.replace(/0\.\d+\)$/, "0.12)")}`
+                          ? "0 0 0 1px rgba(255,255,255,0.04) inset, 0 18px 40px rgba(0,0,0,0.22)"
                           : "0 0 0 1px rgba(255,255,255,0.02) inset",
                         px: 1.35,
                         py: 1.25,
@@ -962,11 +960,11 @@ export function SentinelPanel({
                         transition: "border-color 180ms ease, background 180ms ease, box-shadow 180ms ease, transform 180ms ease",
                         "&:hover": {
                           borderColor: accent,
-                          background: `linear-gradient(180deg, ${accent.replace(/0\.\d+\)$/, "0.10)")}, rgba(255,255,255,0.03))`,
+                          background: "rgba(255,255,255,0.04)",
                           transform: "translateY(-1px)"
                         },
                         "&:focus-visible": {
-                          outline: "2px solid rgba(196,223,255,0.85)",
+                          outline: "2px solid rgba(255,255,255,0.18)",
                           outlineOffset: 2
                         }
                       }}

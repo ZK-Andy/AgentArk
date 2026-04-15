@@ -167,15 +167,17 @@ async fn send_to_destination(
     if !config.bridge_token.trim().is_empty() {
         request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
     }
-    let response = request
-        .json(&serde_json::json!({
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "imessage",
+        "bridge_message",
+        request.json(&serde_json::json!({
             "channel": "imessage",
             "text": text,
             "chat_id": destination.chat_id,
             "handle": destination.handle
-        }))
-        .send()
-        .await?;
+        })),
+    )
+    .await?;
     if !response.status().is_success() {
         let payload = response.text().await.unwrap_or_default();
         return Err(anyhow!("iMessage bridge error: {}", payload));

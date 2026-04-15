@@ -206,7 +206,7 @@ impl BrowserSessionManager {
         let task_desc = task.to_string();
         let storage = self.storage.clone();
 
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/core/browser_session.rs:209", async move {
             let result = run_browser_loop(
                 &sid,
                 BrowserLoopContext {
@@ -243,6 +243,13 @@ impl BrowserSessionManager {
             if let Some(snapshot) = snapshot {
                 persist_browser_session(storage.as_ref(), &snapshot).await;
             }
+            let should_remove = sessions
+                .get(&sid)
+                .map(|entry| session_status_is_terminal(&entry.status))
+                .unwrap_or(false);
+            if should_remove {
+                sessions.remove(&sid);
+            }
         });
 
         Ok(session_id)
@@ -250,7 +257,7 @@ impl BrowserSessionManager {
 
     pub async fn describe_session(&self, session_id: &str) -> Option<BrowserSessionView> {
         let (id, sidecar_session_id, task_description, status, created_at, updated_at) =
-            self.sessions.get(session_id).map(|entry| {
+            if let Some(entry) = self.sessions.get(session_id) {
                 (
                     entry.id.clone(),
                     entry.sidecar_session_id.clone(),
@@ -259,7 +266,19 @@ impl BrowserSessionManager {
                     entry.created_at.clone(),
                     entry.updated_at.clone(),
                 )
-            })?;
+            } else {
+                let storage = self.storage.as_ref()?;
+                let persisted = storage.load_browser_session(session_id).await.ok()??;
+                let (session, _changed) = BrowserSession::restore_from_persisted(persisted);
+                (
+                    session.id,
+                    session.sidecar_session_id,
+                    session.task_description,
+                    session.status,
+                    session.created_at,
+                    session.updated_at,
+                )
+            };
 
         let sidecar_state =
             if session_status_has_live_session(&status) && !sidecar_session_id.trim().is_empty() {
@@ -540,7 +559,9 @@ impl BrowserSessionManager {
             let (session, changed) = BrowserSession::restore_from_persisted(persisted);
             let session_id = session.id.clone();
             let snapshot = changed.then(|| PersistedBrowserSession::from_session(&session));
-            self.sessions.insert(session_id, session);
+            if !session_status_is_terminal(&session.status) {
+                self.sessions.insert(session_id, session);
+            }
             if let Some(snapshot) = snapshot {
                 persist_browser_session(Some(storage), &snapshot).await;
             }
@@ -564,6 +585,10 @@ fn session_status_has_live_session(status: &SessionStatus) -> bool {
             | SessionStatus::WaitingForOperator { .. }
             | SessionStatus::OperatorClaimed { .. }
     )
+}
+
+fn session_status_is_terminal(status: &SessionStatus) -> bool {
+    matches!(status, SessionStatus::Completed { .. } | SessionStatus::Failed(_))
 }
 
 fn build_browser_session_view(

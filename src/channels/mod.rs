@@ -7,6 +7,7 @@ pub mod http;
 pub mod imessage;
 pub mod line;
 pub mod matrix;
+pub(crate) mod outbound_rate_limit;
 pub mod qq;
 pub mod signal;
 pub mod slack;

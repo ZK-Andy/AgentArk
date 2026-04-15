@@ -4,11 +4,12 @@
 //! helpers for later channel-tree wiring.
 use anyhow::{anyhow, Result};
 use futures::{Sink, SinkExt, StreamExt};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::core::Agent;
@@ -24,6 +25,23 @@ const LAST_THREAD_STORAGE_KEY: &str = "channels:discord:last_thread_id";
 const LAST_MESSAGE_STORAGE_KEY: &str = "channels:discord:last_message_id";
 const GATEWAY_STATE_STORAGE_KEY: &str = "channels:discord:gateway_state";
 const SELF_USER_STORAGE_KEY: &str = "channels:discord:self_user_id";
+const RECENT_EVENT_IDS_STORAGE_KEY: &str = "channels:discord:recent_event_ids";
+const MAX_RECENT_EVENT_IDS: usize = 64;
+const RECENT_EVENT_ID_WINDOW_SECS: u64 = 60 * 60 * 24;
+
+static DISCORD_EVENT_DEDUP_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DiscordRecentEventState {
+    #[serde(default)]
+    recent: Vec<DiscordRecentEventEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscordRecentEventEntry {
+    event_id: String,
+    seen_at: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordChannelConfig {
@@ -328,14 +346,15 @@ async fn send_via_webhook(
     };
 
     let client = http_client()?;
-    let response = client
-        .post(url)
-        .json(&serde_json::json!({
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "discord",
+        "webhook_message",
+        client.post(url).json(&serde_json::json!({
             "content": text,
             "allowed_mentions": { "parse": [] }
-        }))
-        .send()
-        .await?;
+        })),
+    )
+    .await?;
 
     if !(response.status().is_success() || response.status().as_u16() == 204) {
         let payload = response.text().await.unwrap_or_default();
@@ -366,15 +385,18 @@ async fn send_via_bot(
     );
 
     let client = http_client()?;
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bot {}", config.bot_token))
-        .json(&serde_json::json!({
-            "content": text,
-            "allowed_mentions": { "parse": [] }
-        }))
-        .send()
-        .await?;
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "discord",
+        "bot_message",
+        client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", config.bot_token))
+            .json(&serde_json::json!({
+                "content": text,
+                "allowed_mentions": { "parse": [] }
+            })),
+    )
+    .await?;
 
     if !response.status().is_success() {
         let payload = response.text().await.unwrap_or_default();
@@ -489,6 +511,58 @@ async fn save_runtime_state(agent: &Agent, state: &DiscordGatewayRuntimeState) -
     Ok(())
 }
 
+fn now_unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow!("system clock before unix epoch: {}", error))?
+        .as_secs())
+}
+
+fn prune_recent_event_state(state: &mut DiscordRecentEventState, now: u64) {
+    let min_seen_at = now.saturating_sub(RECENT_EVENT_ID_WINDOW_SECS);
+    state.recent.retain(|entry| entry.seen_at >= min_seen_at);
+    if state.recent.len() > MAX_RECENT_EVENT_IDS {
+        let excess = state.recent.len() - MAX_RECENT_EVENT_IDS;
+        state.recent.drain(0..excess);
+    }
+}
+
+async fn load_recent_event_state(storage: &Storage) -> Result<DiscordRecentEventState> {
+    if let Ok(Some(raw)) = storage.get(RECENT_EVENT_IDS_STORAGE_KEY).await {
+        if let Ok(state) = serde_json::from_slice::<DiscordRecentEventState>(&raw) {
+            return Ok(state);
+        }
+    }
+    Ok(DiscordRecentEventState::default())
+}
+
+async fn persist_recent_event_state(storage: &Storage, state: &DiscordRecentEventState) -> Result<()> {
+    let raw = serde_json::to_vec(state)?;
+    storage.set(RECENT_EVENT_IDS_STORAGE_KEY, &raw).await?;
+    Ok(())
+}
+
+async fn record_discord_event_id(storage: &Storage, event_id: &str) -> Result<bool> {
+    let event_id = event_id.trim();
+    if event_id.is_empty() {
+        return Ok(false);
+    }
+    let _guard = DISCORD_EVENT_DEDUP_LOCK.lock().await;
+    let now = now_unix_seconds()?;
+    let mut state = load_recent_event_state(storage).await?;
+    prune_recent_event_state(&mut state, now);
+    if state.recent.iter().any(|entry| entry.event_id == event_id) {
+        return Ok(true);
+    }
+    state.recent.push(DiscordRecentEventEntry {
+        event_id: event_id.to_string(),
+        seen_at: now,
+    });
+    prune_recent_event_state(&mut state, now);
+    persist_recent_event_state(storage, &state).await?;
+    Ok(false)
+}
+
 async fn load_self_user_id(agent: &Agent) -> Option<String> {
     if let Ok(Some(raw)) = agent.storage.get(SELF_USER_STORAGE_KEY).await {
         let value = String::from_utf8_lossy(&raw).trim().to_string();
@@ -529,7 +603,7 @@ async fn send_gateway_json(
     payload: &Value,
 ) -> Result<()> {
     let text = serde_json::to_string(payload)?;
-    sender.send(Message::Text(text)).await?;
+    sender.send(Message::Text(text.into())).await?;
     Ok(())
 }
 
@@ -633,6 +707,14 @@ async fn handle_message_create_event(
         tracing::debug!(
             "Discord message ignored because it is outside the configured guild/channel scope"
         );
+        return Ok(());
+    }
+    let is_duplicate = {
+        let agent = agent.read().await;
+        record_discord_event_id(&agent.storage, &message.id).await?
+    };
+    if is_duplicate {
+        tracing::debug!("Ignoring duplicate Discord message event {}", message.id);
         return Ok(());
     }
 
@@ -854,7 +936,7 @@ async fn run_gateway_once(
                                             let message = serde_json::from_value::<DiscordMessageCreate>(envelope.d.clone())?;
                                             let agent_clone = agent.clone();
                                             let state_clone = state.clone();
-                                            tokio::spawn(async move {
+                                            crate::spawn_logged!("src/channels/discord.rs:935", async move {
                                                 if let Err(error) = handle_message_create_event(agent_clone, state_clone, message).await {
                                                     tracing::warn!("Discord message handling failed: {}", error);
                                                 }
@@ -897,7 +979,7 @@ async fn run_gateway_once(
                                             let message = serde_json::from_value::<DiscordMessageCreate>(envelope.d.clone())?;
                                             let agent_clone = agent.clone();
                                             let state_clone = state.clone();
-                                            tokio::spawn(async move {
+                                            crate::spawn_logged!("src/channels/discord.rs:978", async move {
                                                 if let Err(error) = handle_message_create_event(agent_clone, state_clone, message).await {
                                                     tracing::warn!("Discord message handling failed: {}", error);
                                                 }

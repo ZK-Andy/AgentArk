@@ -1,16 +1,15 @@
 //! Encrypted storage wrapper
 //!
 //! Provides transparent encryption for sensitive data in the database.
-//! Content fields (episode content, fact text, message content, KV values)
+//! Content fields (fact text, message content, KV values)
 //! are encrypted with AES-256-GCM before storage and decrypted on retrieval.
 //! Non-content fields (timestamps, IDs, metadata) remain in plaintext for querying.
 
-use super::entities::{approval_log, episode, execution_trace, message};
+use super::entities::{approval_log, execution_trace, message};
 use super::Storage;
 use crate::crypto::KeyManager;
 use anyhow::Result;
 use parking_lot::RwLock;
-use sea_orm::entity::prelude::PgVector;
 use std::sync::Arc;
 
 /// Encrypted storage that wraps the base storage
@@ -81,95 +80,18 @@ impl EncryptedStorage {
 
     // ==================== Decrypt Helpers ====================
 
-    /// Decrypt the content field of episodes, falling back to plaintext for legacy data
-    fn decrypt_episode_content(&self, mut episodes: Vec<episode::Model>) -> Vec<episode::Model> {
-        let key_manager = self.current_key_manager();
-        for ep in &mut episodes {
-            if let Ok(decrypted) = key_manager.decrypt_string(&ep.content) {
-                ep.content = decrypted;
-            }
-            // If decrypt fails, content is already plaintext (legacy) — leave as-is
-        }
-        episodes
-    }
-
     /// Decrypt learned fact text when the caller hands us encrypted compatibility rows.
     fn decrypt_fact_content(
         &self,
         mut facts: Vec<super::LearnedFactRecord>,
     ) -> Vec<super::LearnedFactRecord> {
         let key_manager = self.current_key_manager();
-        for f in &mut facts {
-            if let Ok(decrypted) = key_manager.decrypt_string(&f.fact) {
-                f.fact = decrypted;
+        for fact in &mut facts {
+            if let Ok(decrypted) = key_manager.decrypt_string(&fact.fact) {
+                fact.fact = decrypted;
             }
         }
         facts
-    }
-
-    // ==================== Encrypted Episodes ====================
-
-    /// Insert an episode with encrypted content
-    pub async fn insert_episode_encrypted(
-        &self,
-        id: &str,
-        content: &str,
-        context: &str,
-        embedding: Option<PgVector>,
-        importance: f32,
-        project_id: Option<&str>,
-    ) -> Result<()> {
-        let encrypted_content = self.current_key_manager().encrypt_string(content)?;
-        self.storage
-            .insert_episode(
-                id,
-                &encrypted_content,
-                context,
-                embedding,
-                importance,
-                project_id,
-            )
-            .await
-    }
-
-    /// Get all episodes for scoring and decrypt content
-    pub async fn get_all_episodes_for_scoring_decrypted(&self) -> Result<Vec<episode::Model>> {
-        let episodes = self.storage.get_all_episodes_for_scoring().await?;
-        Ok(self.decrypt_episode_content(episodes))
-    }
-
-    /// Get all episodes for scoring by project and decrypt content
-    pub async fn get_all_episodes_for_scoring_by_project_decrypted(
-        &self,
-        project_id: Option<&str>,
-    ) -> Result<Vec<episode::Model>> {
-        let episodes = self
-            .storage
-            .get_all_episodes_for_scoring_by_project(project_id)
-            .await?;
-        Ok(self.decrypt_episode_content(episodes))
-    }
-
-    pub async fn get_episodes_by_ids_decrypted(
-        &self,
-        ids: &[String],
-    ) -> Result<Vec<episode::Model>> {
-        let episodes = self.storage.get_episodes_by_ids(ids).await?;
-        Ok(self.decrypt_episode_content(episodes))
-    }
-
-    /// Get episodes by project and decrypt content
-    pub async fn get_episodes_by_project_decrypted(
-        &self,
-        limit: u64,
-        offset: u64,
-        project_id: Option<&str>,
-    ) -> Result<Vec<episode::Model>> {
-        let episodes = self
-            .storage
-            .get_episodes_by_project(limit, offset, project_id)
-            .await?;
-        Ok(self.decrypt_episode_content(episodes))
     }
 
     // ==================== Learned Facts ====================
@@ -240,12 +162,10 @@ impl EncryptedStorage {
     pub async fn get_decrypted(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let key_manager = self.current_key_manager();
         match self.storage.get(key).await? {
-            Some(encrypted) => {
-                match key_manager.decrypt(&encrypted) {
-                    Ok(decrypted) => Ok(Some(decrypted)),
-                    Err(_) => Ok(Some(encrypted)), // Legacy unencrypted data
-                }
-            }
+            Some(encrypted) => match key_manager.decrypt(&encrypted) {
+                Ok(decrypted) => Ok(Some(decrypted)),
+                Err(_) => Ok(Some(encrypted)), // Legacy unencrypted data
+            },
             None => Ok(None),
         }
     }
@@ -346,10 +266,6 @@ mod tests {
         let clone = encrypted_storage.clone();
 
         encrypted_storage
-            .insert_episode_encrypted("ep-1", "episode secret", "ctx", None, 0.5, None)
-            .await
-            .unwrap();
-        encrypted_storage
             .insert_fact_encrypted("fact-1", "fact secret", 0.9, "[]", None, None)
             .await
             .unwrap();
@@ -372,34 +288,34 @@ mod tests {
             .await
             .unwrap();
 
-        let raw_episode_before = storage
-            .get_all_episodes_for_scoring()
+        let raw_fact_before = storage
+            .get_facts()
             .await
             .unwrap()
             .into_iter()
-            .find(|row| row.id == "ep-1")
+            .find(|row| row.id == "fact-1")
             .unwrap()
-            .content;
-        assert!(old_key.decrypt_string(&raw_episode_before).is_ok());
-        assert!(new_key.decrypt_string(&raw_episode_before).is_err());
+            .fact;
+        assert!(old_key.decrypt_string(&raw_fact_before).is_ok());
+        assert!(new_key.decrypt_string(&raw_fact_before).is_err());
 
         encrypted_storage
             .reencrypt_all_sensitive_data(old_key.clone(), new_key.clone())
             .await
             .unwrap();
 
-        let raw_episode_after = storage
-            .get_all_episodes_for_scoring()
+        let raw_fact_after = storage
+            .get_facts()
             .await
             .unwrap()
             .into_iter()
-            .find(|row| row.id == "ep-1")
+            .find(|row| row.id == "fact-1")
             .unwrap()
-            .content;
-        assert!(old_key.decrypt_string(&raw_episode_after).is_err());
+            .fact;
+        assert!(old_key.decrypt_string(&raw_fact_after).is_err());
         assert_eq!(
-            new_key.decrypt_string(&raw_episode_after).unwrap(),
-            "episode secret"
+            new_key.decrypt_string(&raw_fact_after).unwrap(),
+            "fact secret"
         );
 
         let raw_profile = storage.get("user_profile").await.unwrap().unwrap();
@@ -436,11 +352,6 @@ mod tests {
         assert!(old_key.decrypt(&raw_pulse).is_err());
         assert!(new_key.decrypt(&raw_pulse).is_ok());
 
-        let episodes = clone
-            .get_all_episodes_for_scoring_decrypted()
-            .await
-            .unwrap();
-        assert_eq!(episodes[0].content, "episode secret");
         let facts = clone.get_facts_decrypted().await.unwrap();
         assert_eq!(facts[0].fact, "fact secret");
         assert_eq!(

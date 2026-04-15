@@ -171,12 +171,12 @@ impl SwarmManager {
         task: &str,
         context: &str,
         coordinator_llm: &LlmClient,
-        _memories: &[crate::memory::MemoryEntry],
+        _memories: &[crate::core::PromptMemory],
         _actions: &[ActionDef],
         specialist_prompt_bundle: Option<&crate::core::self_evolve::SpecialistPromptBundleProfile>,
     ) -> Result<SwarmDelegationResult> {
         let start = std::time::Instant::now();
-        let specialists = self.specialists.read().await;
+        let specialists = self.specialists.read().await.clone();
 
         if specialists.is_empty() {
             return Err(anyhow!("No specialist agents available in swarm"));

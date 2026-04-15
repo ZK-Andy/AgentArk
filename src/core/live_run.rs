@@ -200,6 +200,10 @@ impl LiveRunRegistry {
         self.journals.read().await.get(run_id).cloned()
     }
 
+    pub async fn unregister_run(&self, run_id: &str) {
+        self.journals.write().await.remove(run_id);
+    }
+
     pub async fn load_persisted_events(&self, run_id: &str) -> anyhow::Result<Vec<RunEvent>> {
         let Some(storage) = self.storage.as_ref() else {
             return Ok(Vec::new());

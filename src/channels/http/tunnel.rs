@@ -737,7 +737,7 @@ fn spawn_tunnel_output_reader<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/http/tunnel.rs:740", async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -1968,7 +1968,7 @@ async fn spawn_ngrok_tunnel(
                     "stderr",
                 );
             }
-            tokio::spawn(spawn_ngrok_url_probe(tunnel_arc));
+            crate::spawn_logged!("src/channels/http/tunnel.rs:1971", spawn_ngrok_url_probe(tunnel_arc));
             Ok(())
         }
         Err(e) => Err(format!("Failed to start ngrok tunnel: {}", e)),
@@ -2032,7 +2032,7 @@ async fn spawn_tailscale_tunnel(
                     "stderr",
                 );
             }
-            tokio::spawn(spawn_tailscale_url_probe(
+            crate::spawn_logged!("src/channels/http/tunnel.rs:2035", spawn_tailscale_url_probe(
                 tunnel_arc,
                 TunnelProviderKind::TailscaleFunnel,
                 binary.to_string(),
@@ -2101,7 +2101,7 @@ async fn spawn_tailscale_private_access(
                     "stderr",
                 );
             }
-            tokio::spawn(spawn_tailscale_url_probe(
+            crate::spawn_logged!("src/channels/http/tunnel.rs:2104", spawn_tailscale_url_probe(
                 tunnel_arc,
                 TunnelProviderKind::TailscalePrivate,
                 binary.to_string(),

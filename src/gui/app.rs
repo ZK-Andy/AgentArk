@@ -310,17 +310,17 @@ impl AgentArkApp {
 
         let count = self.runtime.block_on(async {
             let agent = self.agent.read().await;
-            agent.memory.entry_count()
+            agent.storage.count_facts(None).await.unwrap_or(0) as usize
         });
 
-        ui.label(format!("Total memory entries: {}", count));
+        ui.label(format!("Total learned facts: {}", count));
 
         ui.separator();
-        ui.label("Memory types:");
+        ui.label("Durable memory surfaces:");
         ui.horizontal(|ui| {
-            ui.label("Episodic");
-            ui.label("Semantic");
-            ui.label("Procedural");
+            ui.label("Facts");
+            ui.label("Preferences");
+            ui.label("Knowledge");
         });
     }
 

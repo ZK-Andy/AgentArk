@@ -284,14 +284,11 @@ pub struct HealthCheck {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct KnowledgeStoreCounts {
-    episodes: u64,
     facts: u64,
     documents: u64,
     document_chunks: u64,
 }
 
-const KNOWLEDGE_EPISODE_WARN_THRESHOLD: u64 = 20_000;
-const KNOWLEDGE_EPISODE_HIGH_THRESHOLD: u64 = 100_000;
 const KNOWLEDGE_FACT_WARN_THRESHOLD: u64 = 10_000;
 const KNOWLEDGE_FACT_HIGH_THRESHOLD: u64 = 50_000;
 const KNOWLEDGE_DOCUMENT_WARN_THRESHOLD: u64 = 500;
@@ -461,31 +458,26 @@ async fn should_emit_arkpulse_growth_notification(
 
 fn knowledge_store_counts_summary(counts: &KnowledgeStoreCounts) -> String {
     format!(
-        "{} episodes, {} facts, {} documents, {} chunks",
-        counts.episodes, counts.facts, counts.documents, counts.document_chunks
+        "{} facts, {} documents, {} chunks",
+        counts.facts, counts.documents, counts.document_chunks
     )
 }
 
 fn knowledge_store_growth_reasons(counts: &KnowledgeStoreCounts, high: bool) -> Vec<String> {
     let mut reasons = Vec::new();
-    let (episode_threshold, fact_threshold, document_threshold, chunk_threshold) = if high {
+    let (fact_threshold, document_threshold, chunk_threshold) = if high {
         (
-            KNOWLEDGE_EPISODE_HIGH_THRESHOLD,
             KNOWLEDGE_FACT_HIGH_THRESHOLD,
             KNOWLEDGE_DOCUMENT_HIGH_THRESHOLD,
             KNOWLEDGE_DOCUMENT_CHUNK_HIGH_THRESHOLD,
         )
     } else {
         (
-            KNOWLEDGE_EPISODE_WARN_THRESHOLD,
             KNOWLEDGE_FACT_WARN_THRESHOLD,
             KNOWLEDGE_DOCUMENT_WARN_THRESHOLD,
             KNOWLEDGE_DOCUMENT_CHUNK_WARN_THRESHOLD,
         )
     };
-    if counts.episodes >= episode_threshold {
-        reasons.push(format!("episodes={}", counts.episodes));
-    }
     if counts.facts >= fact_threshold {
         reasons.push(format!("facts={}", counts.facts));
     }
@@ -1987,24 +1979,17 @@ async fn run_resource_checks(
     }
 
     let knowledge_counts = match (
-        ctx.storage.count_episodes().await,
         ctx.storage.count_facts(None).await,
         ctx.storage.count_documents(None).await,
         ctx.storage.count_document_chunks().await,
     ) {
-        (Ok(episodes), Ok(facts), Ok(documents), Ok(document_chunks)) => {
-            Some(KnowledgeStoreCounts {
-                episodes,
-                facts,
-                documents,
-                document_chunks,
-            })
-        }
-        (episode_res, fact_res, document_res, chunk_res) => {
+        (Ok(facts), Ok(documents), Ok(document_chunks)) => Some(KnowledgeStoreCounts {
+            facts,
+            documents,
+            document_chunks,
+        }),
+        (fact_res, document_res, chunk_res) => {
             let mut errors = Vec::new();
-            if let Err(error) = episode_res {
-                errors.push(format!("episodes: {}", error));
-            }
             if let Err(error) = fact_res {
                 errors.push(format!("facts: {}", error));
             }
@@ -2940,7 +2925,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:2928", async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(config.scheduler_interval));
             loop {
@@ -2960,7 +2945,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:2948", async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(config.watcher_interval));
             loop {
@@ -2980,7 +2965,7 @@ pub fn start(
         handles.push({
             let agent = agent.clone();
             let mut shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/sentinel.rs:2968", async move {
                 if !sleep_or_shutdown(std::time::Duration::from_secs(35), &mut shutdown).await {
                     return;
                 }
@@ -3016,7 +3001,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3004", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.experience_consolidation_interval,
             ));
@@ -3046,7 +3031,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3034", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.pattern_induction_interval,
             ));
@@ -3076,7 +3061,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3064", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.candidate_generation_interval,
             ));
@@ -3107,7 +3092,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3095", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 config.approval_expiry_interval,
             ));
@@ -3139,7 +3124,7 @@ pub fn start(
         handles.push({
             let agent = agent.clone();
             let mut shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/sentinel.rs:3127", async move {
                 // Wait for initial startup to settle
                 if !sleep_or_shutdown(std::time::Duration::from_secs(60), &mut shutdown).await {
                     return;
@@ -3176,7 +3161,7 @@ pub fn start(
         handles.push({
             let agent = agent.clone();
             let mut shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/sentinel.rs:3164", async move {
                 if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
                     return;
                 }
@@ -3216,41 +3201,10 @@ pub fn start(
 
     // ── Vector memory cleanup (monthly, idle-only) ──────────────────────
     // ── Unused App Notifications ────────────────────────────────────────
-    // Episodic memory retention cleanup (safe-by-default, idle-only, bounded).
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            // Wait for startup to settle.
-            if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
-                return;
-            }
-            // Check a few times a day; function is internally rate-limited (days).
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
-            interval.tick().await;
-            loop {
-                if !tick_or_shutdown(&mut interval, &mut shutdown).await {
-                    break;
-                }
-                run_with_busy_deferral(
-                    &agent,
-                    "episode_retention_cleanup",
-                    MAINTENANCE_DEFER_MINUTES,
-                    MAINTENANCE_MAX_DEFERS,
-                    || {
-                        let agent = agent.clone();
-                        async move { run_episode_retention_cleanup(&agent).await }
-                    },
-                )
-                .await;
-            }
-        })
-    });
-
-    handles.push({
-        let agent = agent.clone();
-        let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3207", async move {
             // Wait for startup to settle
             if !sleep_or_shutdown(std::time::Duration::from_secs(120), &mut shutdown).await {
                 return;
@@ -3285,7 +3239,7 @@ pub fn start(
         handles.push({
             let agent = agent.clone();
             let mut shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/sentinel.rs:3242", async move {
                 if !sleep_or_shutdown(std::time::Duration::from_secs(45), &mut shutdown).await {
                     return;
                 }
@@ -3329,7 +3283,7 @@ pub fn start(
     handles.push({
         let agent = agent.clone();
         let mut shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3286", async move {
             // Check every 6 hours, but only actually cleanup every 15 days when idle
             if !sleep_or_shutdown(std::time::Duration::from_secs(600), &mut shutdown).await {
                 return;
@@ -3414,7 +3368,7 @@ async fn run_scheduler(agent: &SharedAgent) {
         );
         let agent = Arc::clone(agent);
         let permits = Arc::clone(&SCHEDULED_TASK_PERMITS);
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/sentinel.rs:3371", async move {
             let Ok(_permit) = permits.acquire_owned().await else {
                 return;
             };
@@ -3688,7 +3642,7 @@ async fn run_watchers(agent: &SharedAgent) {
                     };
                     let agent = Arc::clone(agent);
                     let permits = Arc::clone(&WATCHER_TRIGGER_PERMITS);
-                    tokio::spawn(async move {
+                    crate::spawn_logged!("src/sentinel.rs:3645", async move {
                         let Ok(_permit) = permits.acquire_owned().await else {
                             return;
                         };
@@ -4498,13 +4452,6 @@ pub async fn run_pulse(agent: &SharedAgent) {
         let health_snapshot_started = Instant::now();
 
         // Postgres-backed pgvector retrieval
-        let episode_count = match pulse_ctx.storage.count_episodes().await {
-            Ok(count) => count as usize,
-            Err(error) => {
-                tracing::warn!("ArkPulse failed to count episodes: {}", error);
-                0
-            }
-        };
         let fact_count = match pulse_ctx.storage.count_facts(None).await {
             Ok(count) => count as usize,
             Err(error) => {
@@ -4526,9 +4473,8 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 0
             }
         };
-        let total_memories = episode_count.saturating_add(fact_count);
+        let total_memories = fact_count;
         let knowledge_counts = KnowledgeStoreCounts {
-            episodes: episode_count as u64,
             facts: fact_count as u64,
             documents: document_count,
             document_chunks: document_chunk_count,
@@ -4542,16 +4488,16 @@ pub async fn run_pulse(agent: &SharedAgent) {
                             service: "Postgres pgvector retrieval".to_string(),
                             status: "ok".to_string(),
                             message: format!(
-                                "pgvector ready, embeddings healthy ({}) | {} episodes, {} learned facts",
-                                message, episode_count, fact_count
+                                "pgvector ready, embeddings healthy ({}) | {} learned facts",
+                                message, fact_count
                             ),
                         },
                         Err(error) => HealthCheck {
                             service: "Postgres pgvector retrieval".to_string(),
                             status: "warn".to_string(),
                             message: format!(
-                                "pgvector ready, embeddings unavailable: {} | {} episodes, {} learned facts",
-                                error, episode_count, fact_count
+                                "pgvector ready, embeddings unavailable: {} | {} learned facts",
+                                error, fact_count
                             ),
                         },
                     }
@@ -4560,8 +4506,8 @@ pub async fn run_pulse(agent: &SharedAgent) {
                         service: "Postgres pgvector retrieval".to_string(),
                         status: "warn".to_string(),
                         message: format!(
-                            "pgvector ready, but retrieval is lexical-only until embeddings are configured | {} episodes, {} learned facts",
-                            episode_count, fact_count
+                            "pgvector ready, but retrieval is lexical-only until embeddings are configured | {} learned facts",
+                            fact_count
                         ),
                     }
                 }
@@ -4570,8 +4516,8 @@ pub async fn run_pulse(agent: &SharedAgent) {
                 service: "Postgres pgvector retrieval".to_string(),
                 status: "warn".to_string(),
                 message: format!(
-                    "pgvector unavailable: {} | {} episodes, {} learned facts",
-                    error, episode_count, fact_count
+                    "pgvector unavailable: {} | {} learned facts",
+                    error, fact_count
                 ),
             },
         };
@@ -5396,244 +5342,5 @@ async fn run_unused_app_check(agent: &SharedAgent) {
             title,
             idle_display
         );
-    }
-}
-
-// =====================================================================
-// Episodic Memory Retention Cleanup
-// - Fresh installs enable normal retention by default; users can disable it.
-// - Only runs when episode count exceeds memory.max_episodes
-// - Only deletes low-importance, low-access episodes
-// - Strongly prefers deleting only finalized episodes
-// - Protects newest N episodes
-// =====================================================================
-
-const EPISODE_RETENTION_CLEANUP_KEY: &str = "episode_retention_last_cleanup";
-const EPISODE_RETENTION_EMERGENCY_CLEANUP_KEY: &str = "episode_retention_emergency_last_cleanup";
-/// Trigger emergency prune when free disk drops below this threshold.
-const EPISODE_RETENTION_EMERGENCY_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-/// Emergency runs use a short cooldown instead of the normal day-level interval.
-const EPISODE_RETENTION_EMERGENCY_COOLDOWN_SECS: i64 = 30 * 60; // 30 minutes
-/// In emergency mode, allow pruning episodes as recent as this age.
-const EPISODE_RETENTION_EMERGENCY_MIN_AGE_DAYS: u64 = 2;
-/// Hard ceiling so emergency mode cannot delete unbounded rows in one pass.
-const EPISODE_RETENTION_EMERGENCY_MAX_DELETE_PER_RUN: u64 = 20_000;
-
-fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .ok()
-}
-
-fn available_disk_bytes(path: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let path_str = path.to_str()?;
-        let output = std::process::Command::new("df")
-            .args(["-Pk", path_str])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // POSIX df -Pk columns: Filesystem 1024-blocks Used Available Capacity Mounted on
-        let line = stdout.lines().nth(1)?;
-        let available_kb = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
-        return Some(available_kb.saturating_mul(1024));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let path_lit = path.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "$d=(Get-Item -LiteralPath '{}').PSDrive; if ($d) {{ [string]$d.Free }}",
-            path_lit
-        );
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return stdout.trim().parse::<u64>().ok();
-    }
-
-    #[allow(unreachable_code)]
-    None
-}
-
-async fn run_episode_retention_cleanup(agent: &SharedAgent) {
-    let (storage, mem_cfg, last_activity, data_dir) = {
-        let agent_guard = agent.read().await;
-        let storage = agent_guard.storage.clone();
-        (
-            storage.clone(),
-            agent_guard.config.memory.clone(),
-            agent_guard.last_activity_at(),
-            agent_guard.data_dir().to_path_buf(),
-        )
-    };
-    let lifecycle = load_data_lifecycle_settings(&storage).await;
-    let now = chrono::Utc::now();
-    let free_bytes = available_disk_bytes(&data_dir);
-    let emergency_mode = free_bytes
-        .map(|b| b <= EPISODE_RETENTION_EMERGENCY_MIN_FREE_BYTES)
-        .unwrap_or(false);
-
-    // Global cleanup controls disable normal retention, but emergency mode still activates
-    // under real disk pressure to avoid hard outages.
-    if (!lifecycle.cleanup_enabled || !mem_cfg.retention_enabled) && !emergency_mode {
-        return;
-    }
-
-    if !emergency_mode {
-        // Only run normal retention when server is idle.
-        if let Some(last) = last_activity {
-            if (now - last).num_seconds() < mem_cfg.retention_idle_threshold_secs as i64 {
-                return;
-            }
-        }
-        // Rate-limit normal runs.
-        if let Ok(Some(bytes)) = storage.get(EPISODE_RETENTION_CLEANUP_KEY).await {
-            if let Ok(ts) = String::from_utf8(bytes) {
-                if let Some(last_ts) = parse_rfc3339(&ts) {
-                    let min_secs = (mem_cfg.retention_run_interval_days as i64) * 24 * 3600;
-                    if (now - last_ts).num_seconds() < min_secs {
-                        return;
-                    }
-                }
-            }
-        }
-    } else if let Ok(Some(bytes)) = storage.get(EPISODE_RETENTION_EMERGENCY_CLEANUP_KEY).await {
-        // Separate cooldown for emergency mode (much shorter than normal cadence).
-        if let Ok(ts) = String::from_utf8(bytes) {
-            if let Some(last_ts) = parse_rfc3339(&ts) {
-                if (now - last_ts).num_seconds() < EPISODE_RETENTION_EMERGENCY_COOLDOWN_SECS {
-                    return;
-                }
-            }
-        }
-    }
-
-    // Normal retention only prunes above max_episodes.
-    // Emergency mode prunes regardless of max_episodes to recover free disk.
-    let count = storage.count_episodes().await.unwrap_or(0) as i64;
-    if !emergency_mode && count <= mem_cfg.max_episodes as i64 {
-        return;
-    }
-    if emergency_mode && count <= mem_cfg.retention_keep_last as i64 {
-        return;
-    }
-
-    let effective_cutoff_days = if emergency_mode {
-        EPISODE_RETENTION_EMERGENCY_MIN_AGE_DAYS
-    } else {
-        mem_cfg.retention_min_age_days
-    };
-    let cutoff = now - chrono::Duration::days(effective_cutoff_days as i64);
-    let cutoff_rfc3339 = cutoff.to_rfc3339();
-
-    // Protect newest N episodes (always keep).
-    let keep_newest = storage
-        .list_newest_episode_ids(mem_cfg.retention_keep_last as u64)
-        .await
-        .unwrap_or_default();
-    let keep_newest_protected: std::collections::HashSet<String> =
-        keep_newest.into_iter().collect();
-    let protected = keep_newest_protected.clone();
-
-    // Delete in bounded batches.
-    let target = if emergency_mode {
-        let emergency_cap = mem_cfg
-            .retention_max_delete_per_run
-            .saturating_mul(4)
-            .clamp(200, EPISODE_RETENTION_EMERGENCY_MAX_DELETE_PER_RUN);
-        let max_deletable = (count - mem_cfg.retention_keep_last as i64).max(0) as u64;
-        max_deletable.min(emergency_cap)
-    } else {
-        let needed = (count - mem_cfg.max_episodes as i64).max(0) as u64;
-        (needed + 100).min(mem_cfg.retention_max_delete_per_run.max(1))
-    };
-    if target == 0 {
-        return;
-    }
-
-    let candidates = storage
-        .list_episode_prune_candidates(
-            &cutoff_rfc3339,
-            if emergency_mode {
-                false
-            } else {
-                mem_cfg.retention_require_consolidated
-            },
-            if emergency_mode {
-                1.0
-            } else {
-                mem_cfg.retention_max_importance
-            },
-            if emergency_mode {
-                i32::MAX
-            } else {
-                mem_cfg.retention_max_access_count
-            },
-            target,
-        )
-        .await
-        .unwrap_or_default();
-
-    let delete_ids: Vec<String> = candidates
-        .into_iter()
-        .filter(|id| !protected.contains(id))
-        .collect();
-
-    if delete_ids.is_empty() {
-        // Record attempts so we don't spin aggressively.
-        let key = if emergency_mode {
-            EPISODE_RETENTION_EMERGENCY_CLEANUP_KEY
-        } else {
-            EPISODE_RETENTION_CLEANUP_KEY
-        };
-        let _ = storage.set(key, now.to_rfc3339().as_bytes()).await;
-        return;
-    }
-
-    match storage.delete_episodes_by_ids(&delete_ids).await {
-        Ok(deleted) => {
-            if emergency_mode {
-                tracing::warn!(
-                    "Episode emergency prune: deleted={} (count={}, keep_last={}, cutoff_days={}, free_bytes={:?})",
-                    deleted,
-                    count,
-                    mem_cfg.retention_keep_last,
-                    effective_cutoff_days,
-                    free_bytes
-                );
-            } else {
-                tracing::info!(
-                    "Episode retention cleanup: deleted={} (count={}, max_episodes={}, cutoff_days={}, finalized_required={})",
-                    deleted,
-                    count,
-                    mem_cfg.max_episodes,
-                    mem_cfg.retention_min_age_days,
-                    mem_cfg.retention_require_consolidated
-                );
-            }
-            let key = if emergency_mode {
-                EPISODE_RETENTION_EMERGENCY_CLEANUP_KEY
-            } else {
-                EPISODE_RETENTION_CLEANUP_KEY
-            };
-            let _ = storage.set(key, now.to_rfc3339().as_bytes()).await;
-        }
-        Err(e) => {
-            if emergency_mode {
-                tracing::warn!("Episode emergency prune failed: {}", e);
-            } else {
-                tracing::debug!("Episode retention cleanup failed: {}", e);
-            }
-        }
     }
 }

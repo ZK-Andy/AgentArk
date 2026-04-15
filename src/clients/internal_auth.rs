@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
@@ -300,7 +300,7 @@ fn describe_internal_service_token(
 
 fn generate_internal_service_token(service: InternalServiceKind) -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill(&mut bytes);
     format!(
         "{}{}",
         service.token_prefix(),

@@ -6,13 +6,12 @@
 pub mod master;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
 use argon2::{Argon2, Params};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -317,6 +316,11 @@ pub fn generate_self_signed_cert(data_dir: &Path) -> Result<(String, String)> {
     // Save for reuse
     std::fs::write(&cert_path, &cert_pem)?;
     std::fs::write(&key_path, &key_pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     tracing::info!("Generated self-signed TLS certificate at {:?}", cert_path);
 

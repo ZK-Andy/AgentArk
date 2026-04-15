@@ -507,6 +507,7 @@ mod tests {
                 server_role: HttpServerRole::ControlPlane,
                 public_app_bind_addr: None,
                 public_app_base_url: None,
+                release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
             },
             config_dir,
             data_dir,

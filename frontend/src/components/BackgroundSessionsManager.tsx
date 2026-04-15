@@ -380,13 +380,6 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     ["completed", "failed", "cancelled"].includes(session.status),
   ).length;
 
-  const openCreateDialog = () => {
-    setEditingSessionId(null);
-    setForm(emptySessionForm());
-    setFormError(null);
-    setDialogOpen(true);
-  };
-
   const openEditDialog = (session: BackgroundSessionSummary) => {
     if (!detailQ.data || detailQ.data.session.id !== session.id) return;
     setEditingSessionId(detailQ.data.session.id);
@@ -405,12 +398,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
       <WorkspacePageHeader
         eyebrow="Operations"
         title="Sessions"
-        description="Durable containers for ongoing work across tasks, watchers, and recent runtime history."
-        actions={
-          <Button variant="contained" onClick={openCreateDialog}>
-            New Session
-          </Button>
-        }
+        description="Durable work created through chat and kept here for inspection, pause/resume control, and linked task or watcher management."
       />
       {/* Compact stat strip */}
       <Box className="list-shell stat-strip">
@@ -443,13 +431,11 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
               variant="body2"
               sx={{
                 color: "text.secondary",
-                mb: 2
+                maxWidth: 520,
+                mx: "auto"
               }}>
-              No background sessions yet. Create a session when work should persist beyond one chat turn.
+              No background sessions yet. Start one from chat when work should stay alive across follow-ups, linked tasks, or watchers. This page is for reviewing and managing those sessions after they exist.
             </Typography>
-            <Button variant="outlined" onClick={openCreateDialog}>
-              Create your first session
-            </Button>
           </Box>
         ) : (
           <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
@@ -556,8 +542,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
           paper: {
             sx: {
               borderRadius: "8px",
-              border: "1px solid rgba(255,255,255,0.08)",
-              background: "linear-gradient(180deg, rgba(18, 19, 22, 0.98), rgba(11, 12, 15, 0.98))",
+              border: "1px solid var(--surface-border)",
+              background: "var(--surface-bg-elevated)",
               boxShadow: "0 28px 96px rgba(0,0,0,0.5)",
             },
           },
@@ -589,9 +575,8 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
               <Box
                 sx={{
                   borderRadius: "8px",
-                  border: "1px solid rgba(96, 165, 250, 0.18)",
-                  background:
-                    "linear-gradient(135deg, rgba(14, 22, 34, 0.96), rgba(15, 17, 22, 0.96))",
+                  border: "1px solid var(--surface-border)",
+                  background: "var(--micro-surface-bg)",
                   p: 1.45,
                   boxShadow: "inset 0 1px 0 rgba(255,255,255,0.04)",
                 }}
@@ -798,7 +783,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                                 borderRadius: "8px",
                                 border: "1px solid rgba(255,255,255,0.07)",
                                 background: "rgba(255,255,255,0.02)",
-                                borderLeft: "3px solid rgba(96, 165, 250, 0.7)",
+                                borderLeft: "3px solid rgba(255,255,255,0.12)",
                               }}
                             >
                               <Stack

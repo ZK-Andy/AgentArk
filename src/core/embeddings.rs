@@ -18,6 +18,7 @@ use super::config::{AgentConfig, EmbeddingsProviderKind};
 use super::llm_provider::effective_openai_base_url;
 
 const MAX_EMBED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROVIDER_EMBED_BATCH_TEXTS: usize = 64;
 const DEFAULT_LOCAL_EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_OPENAI_EMBEDDINGS_BASE_URL: &str = "https://api.openai.com/v1";
 const LOCAL_EMBEDDING_RETRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -549,15 +550,20 @@ impl EmbeddingClient {
 
         self.prepare().await?;
 
-        match &self.provider {
-            EmbeddingProvider::LocalHf { runtime, .. } => {
-                self.embed_local_hf(Arc::clone(runtime), texts).await
-            }
-            EmbeddingProvider::OpenAICompatible { api_key, base_url } => {
-                self.embed_openai(api_key, base_url.as_deref(), texts).await
-            }
-            EmbeddingProvider::Ollama { base_url } => self.embed_ollama(base_url, texts).await,
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(MAX_PROVIDER_EMBED_BATCH_TEXTS) {
+            let chunk_embeddings = match &self.provider {
+                EmbeddingProvider::LocalHf { runtime, .. } => {
+                    self.embed_local_hf(Arc::clone(runtime), chunk).await
+                }
+                EmbeddingProvider::OpenAICompatible { api_key, base_url } => {
+                    self.embed_openai(api_key, base_url.as_deref(), chunk).await
+                }
+                EmbeddingProvider::Ollama { base_url } => self.embed_ollama(base_url, chunk).await,
+            }?;
+            embeddings.extend(chunk_embeddings);
         }
+        Ok(embeddings)
     }
 
     async fn fetch_ollama_tags(&self, base_url: &str) -> Result<Vec<String>> {

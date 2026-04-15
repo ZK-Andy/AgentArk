@@ -1703,9 +1703,9 @@ export function SwarmManager({ autoRefresh }: Props) {
               alignItems: "center",
               p: 0.45,
               borderRadius: "8px",
-              border: "1px solid rgba(108, 156, 212, 0.12)",
-              background: "linear-gradient(180deg, rgba(9, 19, 35, 0.72), rgba(7, 15, 28, 0.62))",
-              boxShadow: "inset 0 1px 0 rgba(148, 199, 245, 0.04)"
+              border: "1px solid var(--surface-border)",
+              background: "rgba(255,255,255,0.02)",
+              boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)"
             }}>
             <Button
               size="small"

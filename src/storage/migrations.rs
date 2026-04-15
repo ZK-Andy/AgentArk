@@ -6,7 +6,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Schem
 
 use super::entities::*;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 pub fn latest_version() -> i64 {
     CURRENT_SCHEMA_VERSION
@@ -52,6 +52,10 @@ async fn ensure_optional_sql(
 
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn vector_type_has_dimensions(formatted_type: &str) -> bool {
@@ -107,6 +111,37 @@ async fn ensure_pgvector_hnsw_index(
     ensure_optional_sql(db, backend, sql, description).await
 }
 
+async fn ensure_foreign_key(
+    db: &DatabaseConnection,
+    backend: DbBackend,
+    constraint_name: &str,
+    table: &str,
+    column: &str,
+    referenced_table: &str,
+    referenced_column: &str,
+    on_delete: &str,
+) -> Result<()> {
+    let sql = format!(
+        "DO $$ BEGIN \
+         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = {constraint_name}) THEN \
+             ALTER TABLE {table} \
+             ADD CONSTRAINT {constraint} \
+             FOREIGN KEY ({column}) REFERENCES {referenced_table} ({referenced_column}) \
+             ON DELETE {on_delete}; \
+         END IF; \
+         END $$;",
+        constraint_name = sql_string_literal(constraint_name),
+        table = sql_identifier(table),
+        constraint = sql_identifier(constraint_name),
+        column = sql_identifier(column),
+        referenced_table = sql_identifier(referenced_table),
+        referenced_column = sql_identifier(referenced_column),
+        on_delete = on_delete,
+    );
+    db.execute(Statement::from_string(backend, sql)).await?;
+    Ok(())
+}
+
 macro_rules! ensure_table_list {
     ($db:expr, $backend:expr, $schema:expr, [$($entity:path),+ $(,)?]) => {
         $(
@@ -140,8 +175,8 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         [
             kv_store::Entity,
             arkpulse_event::Entity,
+            background_session::Entity,
             browser_session::Entity,
-            episode::Entity,
             action::Entity,
             execution_proof::Entity,
             execution_trace::Entity,
@@ -184,6 +219,309 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
     )
     .await?;
 
+    for (constraint_name, table, column, referenced_table, referenced_column, on_delete) in [
+        (
+            "fk_conversations_project_id",
+            "conversations",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_messages_conversation_id",
+            "messages",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_messages_trace_id",
+            "messages",
+            "trace_id",
+            "execution_traces",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_documents_project_id",
+            "documents",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_document_chunks_document_id",
+            "document_chunks",
+            "document_id",
+            "documents",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_background_sessions_conversation_id",
+            "background_sessions",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_background_sessions_project_id",
+            "background_sessions",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_execution_traces_proof_id",
+            "execution_traces",
+            "proof_id",
+            "execution_proofs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_execution_runs_trace_id",
+            "execution_runs",
+            "trace_id",
+            "execution_traces",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_execution_runs_conversation_id",
+            "execution_runs",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_run_checkpoints_run_id",
+            "run_checkpoints",
+            "run_id",
+            "execution_runs",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_tool_attempts_run_id",
+            "tool_attempts",
+            "run_id",
+            "execution_runs",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_operational_logs_trace_id",
+            "operational_logs",
+            "trace_id",
+            "execution_traces",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_operational_logs_conversation_id",
+            "operational_logs",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_swarm_delegations_parent_task_id",
+            "swarm_delegations",
+            "parent_task_id",
+            "tasks",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_swarm_delegations_agent_id",
+            "swarm_delegations",
+            "agent_id",
+            "swarm_agents",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_tasks_proof_id",
+            "tasks",
+            "proof_id",
+            "execution_proofs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_tasks_last_run_id",
+            "tasks",
+            "last_run_id",
+            "automation_runs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_watchers_last_run_id",
+            "watchers",
+            "last_run_id",
+            "automation_runs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_automation_supervisor_states_last_run_id",
+            "automation_supervisor_states",
+            "last_run_id",
+            "automation_runs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_experience_runs_execution_run_id",
+            "experience_runs",
+            "execution_run_id",
+            "execution_runs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_experience_runs_trace_id",
+            "experience_runs",
+            "trace_id",
+            "execution_traces",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_experience_runs_conversation_id",
+            "experience_runs",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_experience_runs_project_id",
+            "experience_runs",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_experience_items_conversation_id",
+            "experience_items",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_experience_items_project_id",
+            "experience_items",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_experience_edges_source_run_id",
+            "experience_edges",
+            "source_run_id",
+            "experience_runs",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_procedural_patterns_conversation_id",
+            "procedural_patterns",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_procedural_patterns_project_id",
+            "procedural_patterns",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_learning_candidates_conversation_id",
+            "learning_candidates",
+            "conversation_id",
+            "conversations",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_learning_candidates_project_id",
+            "learning_candidates",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_learning_candidates_pattern_id",
+            "learning_candidates",
+            "pattern_id",
+            "procedural_patterns",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_user_data_items_conversation_id",
+            "user_data_items",
+            "conversation_id",
+            "conversations",
+            "id",
+            "SET NULL",
+        ),
+        (
+            "fk_user_data_items_project_id",
+            "user_data_items",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_knowledge_items_project_id",
+            "knowledge_items",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+        (
+            "fk_user_preferences_project_id",
+            "user_preferences",
+            "project_id",
+            "projects",
+            "id",
+            "CASCADE",
+        ),
+    ] {
+        ensure_foreign_key(
+            db,
+            backend,
+            constraint_name,
+            table,
+            column,
+            referenced_table,
+            referenced_column,
+            on_delete,
+        )
+        .await?;
+    }
+
     ensure_index(
         db,
         backend,
@@ -191,6 +529,41 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .name("idx_arkpulse_events_timestamp")
             .table(arkpulse_event::Entity)
             .col(arkpulse_event::Column::Timestamp)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_background_sessions_updated")
+            .table(background_session::Entity)
+            .col(background_session::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_background_sessions_status_updated")
+            .table(background_session::Entity)
+            .col(background_session::Column::Status)
+            .col(background_session::Column::UpdatedAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_background_sessions_conversation_updated")
+            .table(background_session::Entity)
+            .col(background_session::Column::ConversationId)
+            .col(background_session::Column::UpdatedAt)
             .if_not_exists()
             .to_owned(),
     )
@@ -216,39 +589,6 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .col(browser_session::Column::UpdatedAt)
             .if_not_exists()
             .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_episodes_timestamp")
-            .table(episode::Entity)
-            .col(episode::Column::Timestamp)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_index(
-        db,
-        backend,
-        Index::create()
-            .name("idx_episodes_project_id")
-            .table(episode::Entity)
-            .col(episode::Column::ProjectId)
-            .if_not_exists()
-            .to_owned(),
-    )
-    .await?;
-    ensure_pgvector_hnsw_index(
-        db,
-        backend,
-        "episodes",
-        "embedding",
-        "CREATE INDEX IF NOT EXISTS idx_episodes_embedding_hnsw \
-         ON episodes USING hnsw (embedding vector_cosine_ops) \
-         WHERE embedding IS NOT NULL",
-        "episodes pgvector HNSW index",
     )
     .await?;
     ensure_index(
@@ -391,6 +731,18 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .name("idx_messages_role_timestamp")
             .table(message::Entity)
             .col(message::Column::Role)
+            .col(message::Column::Timestamp)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_messages_conversation_timestamp")
+            .table(message::Entity)
+            .col(message::Column::ConversationId)
             .col(message::Column::Timestamp)
             .if_not_exists()
             .to_owned(),
@@ -679,6 +1031,28 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
         db,
         backend,
         Index::create()
+            .name("idx_operational_logs_conversation_id")
+            .table(operational_log::Entity)
+            .col(operational_log::Column::ConversationId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_operational_logs_trace_id")
+            .table(operational_log::Entity)
+            .col(operational_log::Column::TraceId)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
             .name("idx_llm_usage_created")
             .table(llm_usage::Entity)
             .col(llm_usage::Column::CreatedAt)
@@ -859,6 +1233,17 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             .table(execution_run::Entity)
             .col(execution_run::Column::RequestId)
             .unique()
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_execution_runs_conversation_id")
+            .table(execution_run::Entity)
+            .col(execution_run::Column::ConversationId)
             .if_not_exists()
             .to_owned(),
     )

@@ -237,7 +237,7 @@ export function NeedsAttentionInbox({
                     sx={{
                       p: "10px 12px",
                       borderLeft: `3px solid ${meta.accent}`,
-                      background: "linear-gradient(180deg, rgba(8, 18, 34, 0.76), rgba(6, 14, 28, 0.72))",
+                      background: "rgba(255,255,255,0.02)",
                     }}
                   >
                     <Stack

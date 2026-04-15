@@ -452,14 +452,7 @@ fn sanitize_excerpt(value: &str, max_chars: usize) -> String {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    crate::security::constant_time_eq(left, right)
 }
 
 fn hmac_sha256_hex(secret: &str, data: &[u8]) -> String {
@@ -2024,6 +2017,7 @@ mod tests {
                 server_role: HttpServerRole::ControlPlane,
                 public_app_bind_addr: None,
                 public_app_base_url: None,
+                release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
             },
             config_dir,
             data_dir,

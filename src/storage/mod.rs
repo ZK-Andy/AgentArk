@@ -8,7 +8,9 @@ use crate::crypto::KeyManager;
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sea_orm::entity::prelude::PgVector;
-use sea_orm::sea_query::{Alias, Expr, Func, OnConflict, Order, Query, SimpleExpr};
+use sea_orm::sea_query::{
+    Alias, Expr, Func, OnConflict, Order, PostgresQueryBuilder, Query, SimpleExpr,
+};
 #[allow(unused_imports)]
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, Database,
@@ -685,7 +687,6 @@ impl Storage {
     const DATABASE_MAX_INTEGER: u64 = i64::MAX as u64;
     const HOUSEKEEPING_PURGE_LAST_RUN_KEY: &'static str = "storage_housekeeping_last_purge_v1";
     const UPLOAD_MANIFEST_KEY_PREFIX: &'static str = "upload_manifest:";
-    const MAX_EPISODES_FOR_SCORING: u64 = 10_000;
     const MAX_DOCUMENTS_FOR_SEARCH: u64 = 5_000;
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
     const MAX_LLM_USAGE_ROWS_PER_QUERY: u64 = 5_000;
@@ -1180,21 +1181,6 @@ impl Storage {
     ) -> Result<()> {
         let txn = self.db.begin().await?;
 
-        let episodes = episode::Entity::find().all(&txn).await?;
-        for row in episodes {
-            let plaintext = old_key
-                .decrypt_string(&row.content)
-                .unwrap_or_else(|_| row.content.clone());
-            let encrypted = new_key.encrypt_string(&plaintext)?;
-            episode::ActiveModel {
-                id: Unchanged(row.id),
-                content: Set(encrypted),
-                ..Default::default()
-            }
-            .update(&txn)
-            .await?;
-        }
-
         let messages = message::Entity::find().all(&txn).await?;
         for row in messages {
             let plaintext = old_key
@@ -1625,215 +1611,6 @@ impl Storage {
         Ok(rows)
     }
 
-    // ==================== Episodes ====================
-
-    /// Insert an episodic memory entry.
-    pub async fn insert_episode(
-        &self,
-        id: &str,
-        content: &str,
-        context: &str,
-        embedding: Option<PgVector>,
-        importance: f32,
-        project_id: Option<&str>,
-    ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let bounded_importance = importance.clamp(0.0, 1.0);
-
-        episode::ActiveModel {
-            id: Set(id.to_string()),
-            content: Set(content.to_string()),
-            context: Set(context.to_string()),
-            embedding: Set(embedding),
-            timestamp: Set(now),
-            consolidated: Set(true),
-            importance: Set(bounded_importance),
-            last_accessed: Set(None),
-            access_count: Set(0),
-            project_id: Set(project_id.map(|s| s.to_string())),
-        }
-        .insert(&self.db)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Update episode access time (called when memory is retrieved)
-    pub async fn touch_episode(&self, id: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-
-        episode::Entity::update_many()
-            .col_expr(episode::Column::LastAccessed, Expr::value(now))
-            .col_expr(
-                episode::Column::AccessCount,
-                Expr::col(episode::Column::AccessCount).add(1),
-            )
-            .filter(episode::Column::Id.eq(id))
-            .exec(&self.db)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Get all episodes with their metadata for scoring
-    pub async fn get_all_episodes_for_scoring(&self) -> Result<Vec<episode::Model>> {
-        let episodes = episode::Entity::find()
-            .order_by_desc(episode::Column::Timestamp)
-            .limit(Self::MAX_EPISODES_FOR_SCORING)
-            .all(&self.db)
-            .await?;
-
-        Ok(episodes)
-    }
-
-    pub async fn get_episodes_by_ids(&self, ids: &[String]) -> Result<Vec<episode::Model>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let models = episode::Entity::find()
-            .filter(episode::Column::Id.is_in(ids.iter().cloned()))
-            .all(&self.db)
-            .await?;
-        let mut by_id = models
-            .into_iter()
-            .map(|model| (model.id.clone(), model))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        Ok(ids
-            .iter()
-            .filter_map(|id| by_id.remove(id))
-            .collect::<Vec<_>>())
-    }
-
-    pub async fn list_recent_episode_ids_for_scoring(
-        &self,
-        project_id: Option<&str>,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut query = episode::Entity::find()
-            .select_only()
-            .column(episode::Column::Id)
-            .order_by_desc(episode::Column::Timestamp);
-        if let Some(pid) = project_id {
-            query = query.filter(
-                Condition::any()
-                    .add(episode::Column::ProjectId.eq(pid))
-                    .add(episode::Column::ProjectId.is_null()),
-            );
-        }
-
-        query
-            .limit(Self::db_limit(limit))
-            .into_tuple::<String>()
-            .all(&self.db)
-            .await
-            .map_err(Into::into)
-    }
-
-    pub async fn nearest_episode_ids(
-        &self,
-        query_embedding: &PgVector,
-        project_id: Option<&str>,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let embedding_sql = pgvector_sql_literal(query_embedding);
-        let scope_filter = if let Some(pid) = project_id {
-            format!(
-                " AND (project_id = '{}' OR project_id IS NULL)",
-                pid.replace('\'', "''")
-            )
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "SELECT id \
-             FROM episodes \
-             WHERE embedding IS NOT NULL{scope_filter} \
-             ORDER BY embedding <=> {embedding_sql} ASC, timestamp DESC \
-             LIMIT {}",
-            Self::db_limit(limit)
-        );
-
-        let rows = self
-            .db
-            .query_all(Statement::from_string(DbBackend::Postgres, sql))
-            .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| row.try_get::<String>("", "id").ok())
-            .collect())
-    }
-
-    /// Count episodes
-    pub async fn count_episodes(&self) -> Result<u64> {
-        let count = episode::Entity::find().count(&self.db).await?;
-        Ok(count)
-    }
-
-    /// List newest episode ids (by timestamp desc).
-    pub async fn list_newest_episode_ids(&self, limit: u64) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(vec![]);
-        }
-        let models = episode::Entity::find()
-            .select_only()
-            .column(episode::Column::Id)
-            .order_by_desc(episode::Column::Timestamp)
-            .limit(Self::db_limit(limit))
-            .into_tuple::<String>()
-            .all(&self.db)
-            .await?;
-        Ok(models)
-    }
-
-    /// List candidate episode ids for pruning based on metadata only (no decryption).
-    pub async fn list_episode_prune_candidates(
-        &self,
-        cutoff_rfc3339: &str,
-        require_consolidated: bool,
-        max_importance: f32,
-        max_access_count: i32,
-        limit: u64,
-    ) -> Result<Vec<String>> {
-        if limit == 0 {
-            return Ok(vec![]);
-        }
-        let mut query = episode::Entity::find()
-            .select_only()
-            .column(episode::Column::Id)
-            .filter(episode::Column::Timestamp.lte(cutoff_rfc3339.to_string()))
-            .filter(episode::Column::Importance.lte(max_importance))
-            .filter(episode::Column::AccessCount.lte(max_access_count))
-            .order_by_asc(episode::Column::Timestamp)
-            .limit(Self::db_limit(limit));
-        if require_consolidated {
-            query = query.filter(episode::Column::Consolidated.eq(true));
-        }
-        let ids = query.into_tuple::<String>().all(&self.db).await?;
-        Ok(ids)
-    }
-
-    /// Delete episodes by id. Returns rows affected.
-    pub async fn delete_episodes_by_ids(&self, ids: &[String]) -> Result<u64> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let res = episode::Entity::delete_many()
-            .filter(episode::Column::Id.is_in(ids.to_vec()))
-            .exec(&self.db)
-            .await?;
-        Ok(res.rows_affected)
-    }
-
     // ==================== Learned Facts ====================
 
     /// Insert a learned fact into the current experience-item memory store.
@@ -1894,35 +1671,6 @@ impl Storage {
             .collect())
     }
 
-    /// Get episodes filtered by project
-    pub async fn get_episodes_by_project(
-        &self,
-        limit: u64,
-        offset: u64,
-        project_id: Option<&str>,
-    ) -> Result<Vec<episode::Model>> {
-        let mut query = episode::Entity::find().order_by_desc(episode::Column::Timestamp);
-        if let Some(pid) = project_id {
-            query = query.filter(episode::Column::ProjectId.eq(pid));
-        }
-        let episodes = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        Ok(episodes)
-    }
-
-    /// Count episodes filtered by project
-    pub async fn count_episodes_by_project(&self, project_id: Option<&str>) -> Result<u64> {
-        let mut query = episode::Entity::find();
-        if let Some(pid) = project_id {
-            query = query.filter(episode::Column::ProjectId.eq(pid));
-        }
-        let count = query.count(&self.db).await?;
-        Ok(count)
-    }
-
     /// Get learned facts filtered by project (paginated).
     pub async fn get_facts_by_project(
         &self,
@@ -1979,26 +1727,6 @@ impl Storage {
             query = query.filter(experience_item::Column::ProjectId.eq(pid));
         }
         Ok(query.count(&self.db).await?)
-    }
-
-    /// Get episodes for scoring, scoped to project (includes global episodes too)
-    pub async fn get_all_episodes_for_scoring_by_project(
-        &self,
-        project_id: Option<&str>,
-    ) -> Result<Vec<episode::Model>> {
-        let mut query = episode::Entity::find().order_by_desc(episode::Column::Timestamp);
-        if let Some(pid) = project_id {
-            query = query.filter(
-                Condition::any()
-                    .add(episode::Column::ProjectId.eq(pid))
-                    .add(episode::Column::ProjectId.is_null()),
-            );
-        }
-        let episodes = query
-            .limit(Self::MAX_EPISODES_FOR_SCORING)
-            .all(&self.db)
-            .await?;
-        Ok(episodes)
     }
 
     // ==================== Tasks ====================
@@ -2539,6 +2267,70 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn list_background_sessions(&self) -> Result<Vec<crate::core::BackgroundSession>> {
+        let rows = background_session::Entity::find()
+            .order_by_desc(background_session::Column::UpdatedAt)
+            .all(&self.db)
+            .await?;
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload = decrypt_storage_string(&row.payload);
+            match serde_json::from_str::<crate::core::BackgroundSession>(&payload) {
+                Ok(mut session) => {
+                    session.policy = session.policy.normalized();
+                    sessions.push(session);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Failed to parse persisted background session {}; skipping row: {}",
+                        row.id,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    pub async fn upsert_background_session(
+        &self,
+        session: &crate::core::BackgroundSession,
+    ) -> Result<()> {
+        let payload = encrypt_storage_string(&serde_json::to_string(session)?)?;
+        background_session::Entity::insert(background_session::ActiveModel {
+            id: Set(session.id.clone()),
+            status: Set(session.status.label().to_string()),
+            conversation_id: Set(session.conversation_id.clone()),
+            project_id: Set(session.project_id.clone()),
+            created_at: Set(session.created_at.to_rfc3339()),
+            updated_at: Set(session.updated_at.to_rfc3339()),
+            last_activity_at: Set(session.last_activity_at.to_rfc3339()),
+            payload: Set(payload),
+        })
+        .on_conflict(
+            OnConflict::column(background_session::Column::Id)
+                .update_columns([
+                    background_session::Column::Status,
+                    background_session::Column::ConversationId,
+                    background_session::Column::ProjectId,
+                    background_session::Column::UpdatedAt,
+                    background_session::Column::LastActivityAt,
+                    background_session::Column::Payload,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_background_session(&self, id: &str) -> Result<()> {
+        background_session::Entity::delete_by_id(id.to_string())
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
     pub async fn try_claim_task(
         &self,
         id: &str,
@@ -2600,9 +2392,26 @@ impl Storage {
 
     /// Delete a task
     pub async fn delete_task(&self, id: &str) -> Result<()> {
-        task::Entity::delete_by_id(id.to_string())
-            .exec(&self.db)
+        let txn = self.db.begin().await?;
+        self.cleanup_automation_records_for_ids(&txn, &[id.to_string()])
             .await?;
+
+        let delegations = swarm_delegation::Entity::find()
+            .filter(swarm_delegation::Column::ParentTaskId.eq(id.to_string()))
+            .all(&txn)
+            .await?;
+        for row in delegations {
+            swarm_delegation::ActiveModel {
+                id: Unchanged(row.id),
+                parent_task_id: Set(None),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
+        }
+
+        task::Entity::delete_by_id(id.to_string()).exec(&txn).await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -2760,6 +2569,84 @@ impl Storage {
         Ok(result.rows_affected > 0)
     }
 
+    async fn cleanup_automation_records_for_ids<C>(
+        &self,
+        db: &C,
+        automation_ids: &[String],
+    ) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        if automation_ids.is_empty() {
+            return Ok(());
+        }
+
+        let automation_id_filter = automation_ids.to_vec();
+        let run_ids = automation_run::Entity::find()
+            .select_only()
+            .column(automation_run::Column::Id)
+            .filter(automation_run::Column::AutomationId.is_in(automation_id_filter.clone()))
+            .into_tuple::<String>()
+            .all(db)
+            .await?;
+
+        if !run_ids.is_empty() {
+            let task_rows = task::Entity::find()
+                .filter(task::Column::LastRunId.is_in(run_ids.clone()))
+                .all(db)
+                .await?;
+            for row in task_rows {
+                task::ActiveModel {
+                    id: Unchanged(row.id),
+                    last_run_id: Set(None),
+                    ..Default::default()
+                }
+                .update(db)
+                .await?;
+            }
+
+            let watcher_rows = watcher::Entity::find()
+                .filter(watcher::Column::LastRunId.is_in(run_ids.clone()))
+                .all(db)
+                .await?;
+            for row in watcher_rows {
+                watcher::ActiveModel {
+                    id: Unchanged(row.id),
+                    last_run_id: Set(None),
+                    ..Default::default()
+                }
+                .update(db)
+                .await?;
+            }
+
+            let supervisor_rows = automation_supervisor_state::Entity::find()
+                .filter(automation_supervisor_state::Column::LastRunId.is_in(run_ids.clone()))
+                .all(db)
+                .await?;
+            for row in supervisor_rows {
+                automation_supervisor_state::ActiveModel {
+                    automation_id: Unchanged(row.automation_id),
+                    last_run_id: Set(None),
+                    ..Default::default()
+                }
+                .update(db)
+                .await?;
+            }
+        }
+
+        automation_supervisor_state::Entity::delete_many()
+            .filter(
+                automation_supervisor_state::Column::AutomationId.is_in(automation_id_filter.clone()),
+            )
+            .exec(db)
+            .await?;
+        automation_run::Entity::delete_many()
+            .filter(automation_run::Column::AutomationId.is_in(automation_id_filter))
+            .exec(db)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_watchers(&self) -> Result<Vec<crate::core::watcher::Watcher>> {
         let mut watchers = Vec::new();
         let rows = watcher::Entity::find()
@@ -2780,13 +2667,31 @@ impl Storage {
         watchers: &[crate::core::watcher::Watcher],
     ) -> Result<()> {
         let txn = self.db.begin().await?;
+        let existing_ids = watcher::Entity::find()
+            .select_only()
+            .column(watcher::Column::Id)
+            .into_tuple::<String>()
+            .all(&txn)
+            .await?;
         if watchers.is_empty() {
+            self.cleanup_automation_records_for_ids(&txn, &existing_ids)
+                .await?;
             watcher::Entity::delete_many().exec(&txn).await?;
         } else {
             let active_ids = watchers
                 .iter()
                 .map(|watcher| watcher.id.to_string())
                 .collect::<Vec<_>>();
+            let active_ids_set = active_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let removed_ids = existing_ids
+                .into_iter()
+                .filter(|id| !active_ids_set.contains(id))
+                .collect::<Vec<_>>();
+            self.cleanup_automation_records_for_ids(&txn, &removed_ids)
+                .await?;
             watcher::Entity::delete_many()
                 .filter(watcher::Column::Id.is_not_in(active_ids))
                 .exec(&txn)
@@ -2861,6 +2766,35 @@ impl Storage {
                 })
             })
             .collect()
+    }
+
+    pub async fn load_browser_session(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::core::browser_session::PersistedBrowserSession>> {
+        let Some(row) = browser_session::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let task_description = decrypt_storage_string(&row.task_description);
+        let chat_id = row.chat_id.map(|value| decrypt_storage_string(&value));
+        let status_detail = row
+            .status_detail
+            .map(|value| decrypt_storage_string(&value));
+        let action_history_json = decrypt_storage_string(&row.action_history_json);
+        Ok(Some(crate::core::browser_session::PersistedBrowserSession {
+            id: row.id,
+            status: row.status,
+            task_description,
+            channel: row.channel,
+            chat_id,
+            status_detail,
+            action_history: serde_json::from_str(&action_history_json).unwrap_or_default(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }))
     }
 
     pub async fn upsert_browser_session(
@@ -2961,6 +2895,18 @@ impl Storage {
 
     pub async fn load_execution_run(&self, id: &str) -> Result<Option<crate::core::ExecutionRun>> {
         Ok(execution_run::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+            .map(model_to_execution_run))
+    }
+
+    pub async fn load_execution_run_by_trace_id(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<crate::core::ExecutionRun>> {
+        Ok(execution_run::Entity::find()
+            .filter(execution_run::Column::TraceId.eq(trace_id.to_string()))
+            .order_by_desc(execution_run::Column::UpdatedAt)
             .one(&self.db)
             .await?
             .map(model_to_execution_run))
@@ -4885,8 +4831,75 @@ impl Storage {
     /// Delete a conversation and its messages
     pub async fn delete_conversation(&self, id: &str) -> Result<()> {
         let txn = self.db.begin().await?;
+        let message_rows = message::Entity::find()
+            .filter(message::Column::ConversationId.eq(id))
+            .all(&txn)
+            .await?;
+        let execution_runs = execution_run::Entity::find()
+            .filter(execution_run::Column::ConversationId.eq(id.to_string()))
+            .all(&txn)
+            .await?;
+        let mut trace_ids = std::collections::BTreeSet::new();
+        for row in &message_rows {
+            if let Some(trace_id) = row
+                .trace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                trace_ids.insert(trace_id.to_string());
+            }
+        }
+        for run in &execution_runs {
+            if let Some(trace_id) = run
+                .trace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                trace_ids.insert(trace_id.to_string());
+            }
+        }
+        let trace_ids_vec = trace_ids.iter().cloned().collect::<Vec<_>>();
+        let proof_ids = if trace_ids_vec.is_empty() {
+            Vec::new()
+        } else {
+            execution_trace::Entity::find()
+                .filter(execution_trace::Column::Id.is_in(trace_ids_vec.clone()))
+                .all(&txn)
+                .await?
+                .into_iter()
+                .filter_map(|row| row.proof_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
         message::Entity::delete_many()
             .filter(message::Column::ConversationId.eq(id))
+            .exec(&txn)
+            .await?;
+        operational_log::Entity::delete_many()
+            .filter(operational_log::Column::ConversationId.eq(id.to_string()))
+            .exec(&txn)
+            .await?;
+        if !trace_ids_vec.is_empty() {
+            operational_log::Entity::delete_many()
+                .filter(operational_log::Column::TraceId.is_in(trace_ids_vec.clone()))
+                .exec(&txn)
+                .await?;
+            execution_trace::Entity::delete_many()
+                .filter(execution_trace::Column::Id.is_in(trace_ids_vec))
+                .exec(&txn)
+                .await?;
+        }
+        if !proof_ids.is_empty() {
+            execution_proof::Entity::delete_many()
+                .filter(execution_proof::Column::Id.is_in(proof_ids))
+                .exec(&txn)
+                .await?;
+        }
+        execution_run::Entity::delete_many()
+            .filter(execution_run::Column::ConversationId.eq(id.to_string()))
             .exec(&txn)
             .await?;
         conversation::Entity::delete_by_id(id.to_string())
@@ -5135,11 +5148,6 @@ impl Storage {
             .exec(&txn)
             .await?;
 
-        // Memory scoped to project
-        episode::Entity::delete_many()
-            .filter(episode::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
         user_preference::Entity::delete_many()
             .filter(user_preference::Column::ProjectId.eq(id))
             .exec(&txn)
@@ -6083,6 +6091,29 @@ impl Storage {
         Ok(query.count(&self.db).await?)
     }
 
+    pub async fn get_execution_trace_total_tokens_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = crate::storage::entities::execution_trace::Entity::find()
+            .select_only()
+            .columns([
+                crate::storage::entities::execution_trace::Column::Id,
+                crate::storage::entities::execution_trace::Column::TotalTokens,
+            ])
+            .filter(crate::storage::entities::execution_trace::Column::Id.is_in(ids.to_vec()))
+            .into_tuple::<(String, i32)>()
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, total_tokens)| (id, total_tokens as i64))
+            .collect())
+    }
+
     /// Get a single persisted execution trace by id.
     pub async fn get_execution_trace(
         &self,
@@ -6656,7 +6687,9 @@ impl Storage {
         let applied_limit = request.limit.unwrap_or(50).clamp(1, 200);
         query.limit(applied_limit);
 
-        let rows = self.db.query_all(DbBackend::Postgres.build(&query)).await?;
+        let rendered_sql = query.to_string(PostgresQueryBuilder);
+        let statement = DbBackend::Postgres.build(&query);
+        let rows = self.db.query_all(statement).await?;
         let mut json_rows = Vec::with_capacity(rows.len());
         for row in rows {
             if let Ok(value) = row.try_get::<serde_json::Value>("", "row_json") {
@@ -6679,6 +6712,7 @@ impl Storage {
             "filters": request.filters,
             "order_by": request.order_by,
             "applied_limit": applied_limit,
+            "sql": rendered_sql,
             "row_count": json_rows.len(),
             "rows": json_rows,
         }))
@@ -6724,6 +6758,219 @@ impl Storage {
         Ok(result.rows_affected)
     }
 
+    const HOUSEKEEPING_PURGE_BATCH_SIZE: i64 = 1_000;
+
+    async fn delete_by_cutoff_in_batches(
+        &self,
+        table_name: &str,
+        id_column: &str,
+        cutoff_column: &str,
+        cutoff: &str,
+        extra_predicate_sql: &str,
+    ) -> Result<u64> {
+        let sql = format!(
+            "DELETE FROM {table_name} \
+             WHERE {id_column} IN ( \
+                SELECT {id_column} \
+                FROM {table_name} \
+                WHERE {cutoff_column} < $1 {extra_predicate_sql} \
+                ORDER BY {cutoff_column} ASC \
+                LIMIT $2 \
+             )"
+        );
+        let mut total_deleted = 0u64;
+        loop {
+            let result = self
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql.clone(),
+                    vec![
+                        cutoff.to_string().into(),
+                        Self::HOUSEKEEPING_PURGE_BATCH_SIZE.into(),
+                    ],
+                ))
+                .await?;
+            let deleted = result.rows_affected();
+            total_deleted = total_deleted.saturating_add(deleted);
+            if deleted == 0 {
+                break;
+            }
+        }
+        Ok(total_deleted)
+    }
+
+    async fn delete_rows_by_ids<C>(
+        conn: &C,
+        table_name: &str,
+        id_column: &str,
+        ids: &[String],
+    ) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| format!("${}", idx + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM {table_name} WHERE {id_column} IN ({placeholders})");
+        let values = ids
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<sea_orm::Value>>();
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn recount_conversations_after_message_batch<C>(
+        conn: &C,
+        conversation_ids: &[String],
+        message_cutoff: &str,
+    ) -> Result<()>
+    where
+        C: ConnectionTrait,
+    {
+        if conversation_ids.is_empty() {
+            return Ok(());
+        }
+
+        let value_rows = conversation_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| format!("(${})", idx + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = conversation_ids
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<sea_orm::Value>>();
+        let update_sql = format!(
+            "UPDATE conversations AS c \
+             SET message_count = counts.message_count \
+             FROM ( \
+                SELECT ids.conversation_id, COUNT(m.id)::integer AS message_count \
+                FROM (VALUES {value_rows}) AS ids(conversation_id) \
+                LEFT JOIN messages AS m ON m.conversation_id = ids.conversation_id \
+                GROUP BY ids.conversation_id \
+             ) AS counts \
+             WHERE c.id = counts.conversation_id"
+        );
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            update_sql,
+            values.clone(),
+        ))
+        .await?;
+
+        let placeholders = conversation_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| format!("${}", idx + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut delete_values = values;
+        delete_values.push(message_cutoff.to_string().into());
+        let delete_sql = format!(
+            "DELETE FROM conversations \
+             WHERE id IN ({placeholders}) \
+               AND updated_at < ${} \
+               AND message_count = 0",
+            conversation_ids.len() + 1
+        );
+        conn.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            delete_sql,
+            delete_values,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn purge_message_batches(&self, message_cutoff: &str) -> Result<()> {
+        loop {
+            let txn = self.db.begin().await?;
+            let deleted_rows = txn
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "DELETE FROM messages \
+                     WHERE id IN ( \
+                        SELECT id \
+                        FROM messages \
+                        WHERE timestamp < $1 \
+                        ORDER BY timestamp ASC \
+                        LIMIT $2 \
+                     ) \
+                     RETURNING conversation_id",
+                    vec![
+                        message_cutoff.to_string().into(),
+                        Self::HOUSEKEEPING_PURGE_BATCH_SIZE.into(),
+                    ],
+                ))
+                .await?;
+            if deleted_rows.is_empty() {
+                txn.commit().await?;
+                break;
+            }
+            let conversation_ids = deleted_rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String>("", "conversation_id").ok())
+                .filter(|value| !value.trim().is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            Self::recount_conversations_after_message_batch(&txn, &conversation_ids, message_cutoff)
+                .await?;
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
+    async fn purge_execution_run_batches(&self, execution_run_cutoff: &str) -> Result<()> {
+        loop {
+            let txn = self.db.begin().await?;
+            let rows = txn
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT id \
+                     FROM execution_runs \
+                     WHERE created_at < $1 \
+                     ORDER BY created_at ASC \
+                     LIMIT $2",
+                    vec![
+                        execution_run_cutoff.to_string().into(),
+                        Self::HOUSEKEEPING_PURGE_BATCH_SIZE.into(),
+                    ],
+                ))
+                .await?;
+            let run_ids = rows
+                .into_iter()
+                .filter_map(|row| row.try_get::<String>("", "id").ok())
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>();
+            if run_ids.is_empty() {
+                txn.commit().await?;
+                break;
+            }
+            Self::delete_rows_by_ids(&txn, "run_checkpoints", "run_id", &run_ids).await?;
+            Self::delete_rows_by_ids(&txn, "tool_attempts", "run_id", &run_ids).await?;
+            Self::delete_rows_by_ids(&txn, "execution_runs", "id", &run_ids).await?;
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
     async fn maybe_purge_housekeeping_tables(&self) -> Result<()> {
         let now = chrono::Utc::now();
         let lifecycle = crate::core::data_lifecycle::load_data_lifecycle_settings(self).await;
@@ -6750,6 +6997,10 @@ impl Storage {
             && lifecycle.swarm_delegation_retention_days == 0
             && lifecycle.llm_usage_retention_days == 0
             && lifecycle.terminal_task_retention_days == 0
+            && lifecycle.execution_run_retention_days == 0
+            && lifecycle.background_session_retention_days == 0
+            && lifecycle.browser_session_retention_days == 0
+            && lifecycle.automation_run_retention_days == 0
             && lifecycle.message_retention_days == 0
             && lifecycle.experience_run_retention_days == 0
             && lifecycle.experience_edge_retention_days == 0
@@ -6766,157 +7017,214 @@ impl Storage {
             return Ok(());
         }
 
-        let txn = self.db.begin().await?;
         if lifecycle.message_retention_days > 0 {
             let message_cutoff = (now
                 - chrono::Duration::days(lifecycle.message_retention_days as i64))
             .to_rfc3339();
-            let message_delete = message::Entity::delete_many()
-                .filter(message::Column::Timestamp.lt(message_cutoff.clone()))
-                .exec(&txn)
-                .await?;
-            if message_delete.rows_affected > 0 {
-                let conversations = conversation::Entity::find().all(&txn).await?;
-                for row in conversations {
-                    let message_count = message::Entity::find()
-                        .filter(message::Column::ConversationId.eq(row.id.clone()))
-                        .count(&txn)
-                        .await? as i32;
-                    conversation::ActiveModel {
-                        id: Unchanged(row.id),
-                        message_count: Set(message_count.max(0)),
-                        ..Default::default()
-                    }
-                    .update(&txn)
-                    .await?;
-                }
-                conversation::Entity::delete_many()
-                    .filter(conversation::Column::MessageCount.eq(0))
-                    .filter(conversation::Column::UpdatedAt.lt(message_cutoff))
-                    .exec(&txn)
-                    .await?;
-            }
+            self.purge_message_batches(&message_cutoff).await?;
         }
 
         if lifecycle.execution_trace_retention_days > 0 {
             let trace_cutoff = (now
                 - chrono::Duration::days(lifecycle.execution_trace_retention_days as i64))
             .to_rfc3339();
-            crate::storage::entities::execution_trace::Entity::delete_many()
-                .filter(
-                    crate::storage::entities::execution_trace::Column::CreatedAt.lt(trace_cutoff),
-                )
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "execution_traces",
+                "id",
+                "created_at",
+                &trace_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.execution_proof_retention_days > 0 {
             let proof_cutoff = (now
                 - chrono::Duration::days(lifecycle.execution_proof_retention_days as i64))
             .to_rfc3339();
-            crate::storage::entities::execution_proof::Entity::delete_many()
-                .filter(
-                    crate::storage::entities::execution_proof::Column::Timestamp.lt(proof_cutoff),
-                )
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "execution_proofs",
+                "id",
+                "timestamp",
+                &proof_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.operational_log_retention_days > 0 {
             let operational_cutoff = (now
                 - chrono::Duration::days(lifecycle.operational_log_retention_days as i64))
             .to_rfc3339();
-            operational_log::Entity::delete_many()
-                .filter(operational_log::Column::CreatedAt.lt(operational_cutoff))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "operational_logs",
+                "id",
+                "created_at",
+                &operational_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.security_log_retention_days > 0 {
             let security_cutoff = (now
                 - chrono::Duration::days(lifecycle.security_log_retention_days as i64))
             .to_rfc3339();
-            security_log::Entity::delete_many()
-                .filter(security_log::Column::CreatedAt.lt(security_cutoff))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "security_logs",
+                "id",
+                "created_at",
+                &security_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.approval_log_retention_days > 0 {
             let approval_cutoff = (now
                 - chrono::Duration::days(lifecycle.approval_log_retention_days as i64))
             .to_rfc3339();
-            approval_log::Entity::delete_many()
-                .filter(approval_log::Column::RequestedAt.lt(approval_cutoff))
-                .filter(approval_log::Column::Status.ne("pending"))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "approval_log",
+                "id",
+                "requested_at",
+                &approval_cutoff,
+                "AND status <> 'pending'",
+            )
+            .await?;
         }
         if lifecycle.swarm_delegation_retention_days > 0 {
             let delegation_cutoff = (now
                 - chrono::Duration::days(lifecycle.swarm_delegation_retention_days as i64))
             .to_rfc3339();
-            swarm_delegation::Entity::delete_many()
-                .filter(swarm_delegation::Column::CreatedAt.lt(delegation_cutoff))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "swarm_delegations",
+                "id",
+                "created_at",
+                &delegation_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.llm_usage_retention_days > 0 {
             let llm_usage_cutoff = (now
                 - chrono::Duration::days(lifecycle.llm_usage_retention_days as i64))
             .to_rfc3339();
-            llm_usage::Entity::delete_many()
-                .filter(llm_usage::Column::CreatedAt.lt(llm_usage_cutoff))
-                .exec(&txn)
+            self.delete_by_cutoff_in_batches(
+                "llm_usage",
+                "id",
+                "created_at",
+                &llm_usage_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.execution_run_retention_days > 0 {
+            let execution_run_cutoff = (now
+                - chrono::Duration::days(lifecycle.execution_run_retention_days as i64))
+            .to_rfc3339();
+            self.purge_execution_run_batches(&execution_run_cutoff)
                 .await?;
         }
         if lifecycle.experience_run_retention_days > 0 {
             let experience_run_cutoff = (now
                 - chrono::Duration::days(lifecycle.experience_run_retention_days as i64))
             .to_rfc3339();
-            experience_run::Entity::delete_many()
-                .filter(experience_run::Column::CreatedAt.lt(experience_run_cutoff))
-                .filter(experience_run::Column::Consolidated.eq(true))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "experience_runs",
+                "id",
+                "created_at",
+                &experience_run_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.experience_edge_retention_days > 0 {
             let experience_edge_cutoff = (now
                 - chrono::Duration::days(lifecycle.experience_edge_retention_days as i64))
             .to_rfc3339();
-            experience_edge::Entity::delete_many()
-                .filter(experience_edge::Column::CreatedAt.lt(experience_edge_cutoff))
-                .filter(experience_edge::Column::SourceRunId.is_not_null())
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "experience_edges",
+                "id",
+                "created_at",
+                &experience_edge_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.learning_candidate_retention_days > 0 {
             let learning_candidate_cutoff = (now
                 - chrono::Duration::days(lifecycle.learning_candidate_retention_days as i64))
             .to_rfc3339();
-            learning_candidate::Entity::delete_many()
-                .filter(learning_candidate::Column::CreatedAt.lt(learning_candidate_cutoff))
-                .filter(learning_candidate::Column::ApprovalStatus.ne("pending"))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "learning_candidates",
+                "id",
+                "created_at",
+                &learning_candidate_cutoff,
+                "",
+            )
+            .await?;
         }
         if lifecycle.experience_item_retention_days > 0 {
             let experience_item_cutoff = (now
                 - chrono::Duration::days(lifecycle.experience_item_retention_days as i64))
             .to_rfc3339();
-            let active_user_memory_protection = Condition::any()
-                .add(experience_item::Column::Status.ne("active"))
-                .add(experience_item::Column::Kind.is_not_in(["personal_fact", "constraint"]));
-            experience_item::Entity::delete_many()
-                .filter(experience_item::Column::UpdatedAt.lt(experience_item_cutoff))
-                .filter(active_user_memory_protection)
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "experience_items",
+                "id",
+                "updated_at",
+                &experience_item_cutoff,
+                "AND (status <> 'active' OR kind NOT IN ('personal_fact', 'constraint'))",
+            )
+            .await?;
         }
         if lifecycle.procedural_pattern_retention_days > 0 {
             let procedural_pattern_cutoff = (now
                 - chrono::Duration::days(lifecycle.procedural_pattern_retention_days as i64))
             .to_rfc3339();
-            procedural_pattern::Entity::delete_many()
-                .filter(procedural_pattern::Column::UpdatedAt.lt(procedural_pattern_cutoff))
-                .exec(&txn)
-                .await?;
+            self.delete_by_cutoff_in_batches(
+                "procedural_patterns",
+                "id",
+                "updated_at",
+                &procedural_pattern_cutoff,
+                "",
+            )
+            .await?;
+        }
+        if lifecycle.background_session_retention_days > 0 {
+            let background_session_cutoff = (now
+                - chrono::Duration::days(lifecycle.background_session_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "background_sessions",
+                "id",
+                "last_activity_at",
+                &background_session_cutoff,
+                "AND status IN ('completed', 'failed', 'cancelled')",
+            )
+            .await?;
+        }
+        if lifecycle.browser_session_retention_days > 0 {
+            let browser_session_cutoff = (now
+                - chrono::Duration::days(lifecycle.browser_session_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "browser_sessions",
+                "id",
+                "updated_at",
+                &browser_session_cutoff,
+                "AND status IN ('completed', 'failed', 'interrupted')",
+            )
+            .await?;
+        }
+        if lifecycle.automation_run_retention_days > 0 {
+            let automation_run_cutoff = (now
+                - chrono::Duration::days(lifecycle.automation_run_retention_days as i64))
+            .to_rfc3339();
+            self.delete_by_cutoff_in_batches(
+                "automation_runs",
+                "id",
+                "started_at",
+                &automation_run_cutoff,
+                "",
+            )
+            .await?;
         }
 
         if lifecycle.terminal_task_retention_days > 0 {
@@ -6925,7 +7233,7 @@ impl Storage {
             .to_rfc3339();
             let stale_tasks = task::Entity::find()
                 .filter(task::Column::CreatedAt.lt(terminal_task_cutoff))
-                .all(&txn)
+                .all(&self.db)
                 .await?;
             for stale_task in stale_tasks {
                 if stale_task.cron.is_some() {
@@ -6942,10 +7250,11 @@ impl Storage {
                 if !terminal {
                     continue;
                 }
-                task::Entity::delete_by_id(stale_task.id).exec(&txn).await?;
+                task::Entity::delete_by_id(stale_task.id)
+                    .exec(&self.db)
+                    .await?;
             }
         }
-        txn.commit().await?;
 
         self.set(
             Self::HOUSEKEEPING_PURGE_LAST_RUN_KEY,

@@ -19,6 +19,7 @@ if "%CMD%"=="setup" (
 )
 if "%CMD%"=="start" (
     docker compose up -d --build
+    call :verify_lightpanda || exit /b 1
     echo.
     echo AgentArk is running!
     echo   Web UI: http://localhost:8990
@@ -31,6 +32,7 @@ if "%CMD%"=="stop" (
 if "%CMD%"=="restart" (
     docker compose down
     docker compose up -d
+    call :verify_lightpanda || exit /b 1
     goto :eof
 )
 if "%CMD%"=="logs" (
@@ -42,11 +44,28 @@ if "%CMD%"=="status" (
     goto :eof
 )
 if "%CMD%"=="update" (
-    docker compose build agentark
-    docker compose up -d agentark
+    docker compose up -d --build
+    call :verify_lightpanda || exit /b 1
     echo Update complete!
     goto :eof
 )
+
+:verify_lightpanda
+echo Verifying bundled Lightpanda runtime...
+set "LIGHTPANDA_RETRIES=20"
+:verify_lightpanda_loop
+docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Lightpanda is available inside the AgentArk runtime.
+    exit /b 0
+)
+set /a LIGHTPANDA_RETRIES-=1
+if %LIGHTPANDA_RETRIES% LEQ 0 (
+    echo Lightpanda is missing from the bundled AgentArk runtime. Update or rebuild before relying on the free search fallback.
+    exit /b 1
+)
+timeout /t 2 >nul
+goto verify_lightpanda_loop
 
 echo AgentArk CLI
 echo.

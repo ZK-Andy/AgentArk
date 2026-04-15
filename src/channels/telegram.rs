@@ -702,7 +702,7 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     let typing_chat_id = chat_id;
                     let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let typing_flag = typing_done.clone();
-                    tokio::spawn(async move {
+                    crate::spawn_logged!("src/channels/telegram.rs:705", async move {
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                             if typing_flag.load(std::sync::atomic::Ordering::Relaxed) {

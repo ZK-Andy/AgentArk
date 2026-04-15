@@ -563,7 +563,7 @@ pub(super) async fn handle_extension_pack_webhook(
             let registry_clone = registry.clone();
             let agent = state.agent.clone();
             let event_id = event.id.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http/extension_packs.rs:566", async move {
                 let outcome = crate::channels::slack::handle_webhook_with_config(
                     agent,
                     Some(&config),
@@ -660,7 +660,7 @@ pub(super) async fn handle_extension_pack_webhook(
             let registry_clone = registry.clone();
             let agent = state.agent.clone();
             let event_id = event.id.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http/extension_packs.rs:663", async move {
                 let outcome =
                     crate::channels::teams::handle_activity(&agent, &config, activity, verified)
                         .await;
@@ -809,7 +809,7 @@ pub(super) async fn handle_extension_pack_webhook(
             let registry_clone = registry.clone();
             let agent = state.agent.clone();
             let event_id = event.id.clone();
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/channels/http/extension_packs.rs:812", async move {
                 let outcome =
                     crate::channels::whatsapp::handle_webhook_with_config(agent, &config, &payload)
                         .await;

@@ -844,6 +844,11 @@ export default function App() {
   const serverDotColor =
     serverQ.isError ? "#f44336" : serverQ.data && !pingStale ? "#4caf50" : "#ff9800";
   const serverPulse = !serverQ.isError && serverQ.data && !pingStale;
+  const updateStatus = serverQ.data?.status.update;
+  const updateAvailable = updateStatus?.state === "available";
+  const updateChipLabel = updateStatus?.latest_version
+    ? `Update ${updateStatus.latest_version}`
+    : "Update available";
 
   const markReadMutation = useMutation({
     mutationFn: (id: string) => api.rawPost(`/notifications/${encodeURIComponent(id)}/read`, {}),
@@ -1113,6 +1118,16 @@ export default function App() {
             <Stack direction="row" spacing={0.5} className="shell-actions" sx={{
               alignItems: "center"
             }}>
+              {updateAvailable ? (
+                <Chip
+                  size="small"
+                  color="warning"
+                  variant="outlined"
+                  label={updateChipLabel}
+                  onClick={() => openSettingsView("settings", 25)}
+                  clickable
+                />
+              ) : null}
               <Tooltip title="Notifications">
                 <IconButton
                   color="primary"

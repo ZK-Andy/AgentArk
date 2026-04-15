@@ -1262,87 +1262,10 @@ fn inject_model_into_frontmatter(content: &str, model: &str) -> String {
     format!("---\n{}\n---\n\n{}", model_line, content)
 }
 
-fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 0
-                || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unicast_link_local()
-                || v6.is_unique_local()
-        }
-    }
-}
-
-fn is_disallowed_import_hostname(host: &str) -> bool {
-    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    h.is_empty()
-        || h == "localhost"
-        || h.ends_with(".localhost")
-        || h.ends_with(".local")
-        || h == "0.0.0.0"
-        || h == "[::]"
-}
-
 async fn validate_import_fetch_url(raw: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(raw).map_err(|e| format!("Invalid URL: {}", e))?;
-    if url.scheme() != "https" {
-        return Err("Only HTTPS URLs are supported".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("Userinfo is not allowed in import URLs".to_string());
-    }
-    if let Some(port) = url.port() {
-        if port != 443 {
-            return Err("Only port 443 is allowed in import URLs".to_string());
-        }
-    }
-
-    let host = url
-        .host()
-        .ok_or_else(|| "Import URL must include a host".to_string())?;
-    match host {
-        url::Host::Domain(domain) => {
-            if is_disallowed_import_hostname(domain) {
-                return Err("Disallowed import host".to_string());
-            }
-            // Best-effort DNS check to reduce obvious SSRF.
-            let mut resolved_any = false;
-            if let Ok(addrs) = tokio::net::lookup_host((domain, 443)).await {
-                for addr in addrs {
-                    resolved_any = true;
-                    if is_private_or_local_ip(addr.ip()) {
-                        return Err("Import URL resolves to a private/local IP".to_string());
-                    }
-                }
-            }
-            if !resolved_any {
-                return Err("Failed to resolve import host".to_string());
-            }
-        }
-        url::Host::Ipv4(ip) => {
-            if is_private_or_local_ip(std::net::IpAddr::V4(ip)) {
-                return Err("Import URL IP is private/local".to_string());
-            }
-        }
-        url::Host::Ipv6(ip) => {
-            if is_private_or_local_ip(std::net::IpAddr::V6(ip)) {
-                return Err("Import URL IP is private/local".to_string());
-            }
-        }
-    }
-
-    Ok(url)
+    crate::core::net::validate_public_https_url(raw)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn fetch_text_with_redirects(

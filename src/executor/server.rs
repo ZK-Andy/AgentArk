@@ -7,6 +7,7 @@ use crate::actions::app::{
 use crate::executor::protocol::{
     AppActionResponse, AppDeployRequest, AppDeployResponse, AppLifecycleRequest,
     CodeExecuteRequest, CodeExecuteResponse, ExecutorStatusResponse, InternalServiceHealth,
+    StackUpdateRequest, StackUpdateResponse,
 };
 use crate::runtime::ActionRuntime;
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ use axum::{
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -35,6 +37,54 @@ use tokio_tungstenite::{
 const CONTROL_CONTAINER_NAME: &str = "agentark-control";
 const EXECUTOR_CONTAINER_NAME: &str = "agentark-executor";
 const WORKSPACE_CONTAINER_NAME: &str = "agentark-workspace";
+const DEFAULT_STACK_UPDATER_IMAGE: &str = "docker:28-cli";
+const STACK_UPDATE_SCRIPT: &str = r#"set -eu
+if ! command -v git >/dev/null 2>&1; then
+    apk add --no-cache git >/dev/null
+fi
+if [ ! -d .git ]; then
+    echo "AgentArk source checkout is missing at /workspace." >&2
+    exit 2
+fi
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "AgentArk source checkout has tracked local changes. Resolve them before updating." >&2
+    exit 2
+fi
+git fetch --tags --force origin
+git checkout --force "$AGENTARK_RELEASE_TAG"
+if [ ! -f .env ] && [ -f .env.example ]; then
+    cp .env.example .env
+fi
+touch .env
+upsert_env() {
+    key="$1"
+    value="$2"
+    if grep -q "^${key}=" .env 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" .env
+    else
+        printf "%s=%s\n" "$key" "$value" >> .env
+    fi
+}
+upsert_env AGENTARK_IMAGE "${AGENTARK_IMAGE_REPOSITORY}:${AGENTARK_RELEASE_VERSION}"
+upsert_env AGENTARK_RELEASE_REPO "$AGENTARK_RELEASE_REPO"
+upsert_env AGENTARK_RELEASE_TAG "$AGENTARK_RELEASE_TAG"
+docker compose pull
+docker compose up -d
+"#;
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectContainer {
+    #[serde(default, rename = "Mounts")]
+    mounts: Vec<DockerInspectMount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerInspectMount {
+    #[serde(default, rename = "Source")]
+    source: String,
+    #[serde(default, rename = "Destination")]
+    destination: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutorServiceConfig {
@@ -175,6 +225,7 @@ pub async fn run_service(config: ExecutorServiceConfig) -> Result<()> {
         .route("/health", get(health))
         .route("/internal/v1/status", get(status))
         .route("/internal/v1/system/restart-stack", post(restart_stack))
+        .route("/internal/v1/system/update-stack", post(update_stack))
         .route("/internal/v1/code/execute", post(code_execute))
         .route("/internal/v1/apps/deploy", post(app_deploy))
         .route("/internal/v1/apps/{app_id}/restart", post(app_restart))
@@ -221,7 +272,7 @@ async fn health(State(state): State<ExecutorState>) -> impl IntoResponse {
 
 fn authorize_internal(headers: &HeaderMap, token: Option<&str>) -> Result<(), StatusCode> {
     let Some(expected) = token.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let provided = headers
         .get(header::AUTHORIZATION)
@@ -260,7 +311,7 @@ async fn restart_stack(State(state): State<ExecutorState>, headers: HeaderMap) -
             .into_response();
     }
 
-    tokio::spawn(async {
+    crate::spawn_logged!("src/executor/server.rs:314", async {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Err(error) = restart_agentark_stack_services().await {
             tracing::error!("Failed to restart AgentArk split-stack services: {}", error);
@@ -278,6 +329,78 @@ async fn restart_stack(State(state): State<ExecutorState>, headers: HeaderMap) -
                 EXECUTOR_CONTAINER_NAME
             ]
         })),
+    )
+        .into_response()
+}
+
+async fn update_stack(
+    State(state): State<ExecutorState>,
+    headers: HeaderMap,
+    Json(request): Json<StackUpdateRequest>,
+) -> Response {
+    if let Err(status) = authorize_internal(&headers, state.config.token.as_deref()) {
+        return (
+            status,
+            Json(StackUpdateResponse {
+                status: "error".to_string(),
+                message: "Unauthorized".to_string(),
+                release_tag: None,
+                release_version: None,
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = validate_stack_update_request(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(StackUpdateResponse {
+                status: "error".to_string(),
+                message: error.to_string(),
+                release_tag: None,
+                release_version: None,
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = validate_stack_restart_prerequisites().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(StackUpdateResponse {
+                status: "error".to_string(),
+                message: error.to_string(),
+                release_tag: None,
+                release_version: None,
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(error) = spawn_stack_update_job(&request).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(StackUpdateResponse {
+                status: "error".to_string(),
+                message: error.to_string(),
+                release_tag: None,
+                release_version: None,
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(StackUpdateResponse {
+            status: "updating".to_string(),
+            message: format!(
+                "Updating AgentArk to {} and restarting the stack.",
+                request.release_tag
+            ),
+            release_tag: Some(request.release_tag),
+            release_version: Some(request.release_version),
+        }),
     )
         .into_response()
 }
@@ -301,6 +424,120 @@ async fn validate_stack_restart_prerequisites() -> Result<()> {
         "AgentArk split-stack restart is unavailable: {}",
         if stderr.is_empty() {
             "docker could not inspect the control, workspace, and executor containers".to_string()
+        } else {
+            stderr
+        }
+    );
+}
+
+fn stack_updater_image() -> String {
+    std::env::var("AGENTARK_STACK_UPDATER_IMAGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_STACK_UPDATER_IMAGE.to_string())
+}
+
+fn stack_workspace_root() -> String {
+    std::env::var("AGENTARK_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/workspace/agentark".to_string())
+}
+
+fn validate_stack_update_request(request: &StackUpdateRequest) -> Result<()> {
+    let release_tag = request.release_tag.trim();
+    if release_tag.is_empty() {
+        anyhow::bail!("Release tag is required.");
+    }
+    if request.release_version.trim().is_empty() {
+        anyhow::bail!("Release version is required.");
+    }
+    if request.release_repo.trim().is_empty() || !request.release_repo.contains('/') {
+        anyhow::bail!("Release repository must use owner/repo format.");
+    }
+    if request.image_repository.trim().is_empty() || !request.image_repository.contains('/') {
+        anyhow::bail!("Image repository must be a fully qualified registry path.");
+    }
+    Ok(())
+}
+
+async fn resolve_stack_workspace_host_dir() -> Result<String> {
+    let output = tokio::process::Command::new("docker")
+        .args(["inspect", EXECUTOR_CONTAINER_NAME])
+        .output()
+        .await
+        .context("Failed to inspect executor container mounts")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "AgentArk update is unavailable: {}",
+            if stderr.is_empty() {
+                "docker inspect could not read executor container metadata".to_string()
+            } else {
+                stderr
+            }
+        );
+    }
+
+    let containers: Vec<DockerInspectContainer> = serde_json::from_slice(&output.stdout)
+        .context("Failed to decode executor container mount metadata")?;
+    let workspace_root = stack_workspace_root();
+    let mount = containers
+        .into_iter()
+        .flat_map(|container| container.mounts.into_iter())
+        .find(|mount| mount.destination == workspace_root)
+        .map(|mount| mount.source)
+        .filter(|value| !value.trim().is_empty());
+    match mount {
+        Some(source) => Ok(source),
+        None => anyhow::bail!(
+            "AgentArk update is unavailable: executor does not expose a host workspace mount for {}",
+            workspace_root
+        ),
+    }
+}
+
+async fn spawn_stack_update_job(request: &StackUpdateRequest) -> Result<()> {
+    let host_workspace_dir = resolve_stack_workspace_host_dir().await?;
+    let updater_name = format!(
+        "agentark-stack-updater-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let output = tokio::process::Command::new("docker")
+        .args(["run", "-d", "--rm", "--name", updater_name.as_str()])
+        .args(["-e", &format!("AGENTARK_RELEASE_TAG={}", request.release_tag)])
+        .args([
+            "-e",
+            &format!("AGENTARK_RELEASE_VERSION={}", request.release_version),
+        ])
+        .args(["-e", &format!("AGENTARK_RELEASE_REPO={}", request.release_repo)])
+        .args([
+            "-e",
+            &format!("AGENTARK_IMAGE_REPOSITORY={}", request.image_repository),
+        ])
+        .args(["-v", "/var/run/docker.sock:/var/run/docker.sock"])
+        .args(["-v", &format!("{}:/workspace", host_workspace_dir)])
+        .args(["-w", "/workspace"])
+        .arg(stack_updater_image())
+        .args(["sh", "-lc", STACK_UPDATE_SCRIPT])
+        .output()
+        .await
+        .context("Failed to start the AgentArk update job")?;
+    if output.status.success() {
+        tracing::info!(
+            "Spawned AgentArk stack updater job {} for release {}",
+            updater_name,
+            request.release_tag
+        );
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "Failed to start the AgentArk update job: {}",
+        if stderr.is_empty() {
+            "docker run returned an unknown error".to_string()
         } else {
             stderr
         }
@@ -1289,10 +1526,10 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 
 fn axum_to_tungstenite_message(msg: AxumWsMessage) -> Option<TungsteniteMessage> {
     match msg {
-        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string())),
-        AxumWsMessage::Binary(data) => Some(TungsteniteMessage::Binary(data.to_vec())),
-        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data.to_vec())),
-        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data.to_vec())),
+        AxumWsMessage::Text(text) => Some(TungsteniteMessage::Text(text.to_string().into())),
+        AxumWsMessage::Binary(data) => Some(TungsteniteMessage::Binary(data)),
+        AxumWsMessage::Ping(data) => Some(TungsteniteMessage::Ping(data)),
+        AxumWsMessage::Pong(data) => Some(TungsteniteMessage::Pong(data)),
         AxumWsMessage::Close(_) => Some(TungsteniteMessage::Close(None)),
     }
 }

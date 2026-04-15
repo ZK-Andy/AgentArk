@@ -1,7 +1,7 @@
 use super::config::{ModelCapabilityTier, ModelCostTier};
 use super::llm::{LlmClient, LlmResponse};
 use crate::actions::ActionDef;
-use crate::memory::MemoryEntry;
+use crate::core::PromptMemory;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -736,7 +736,7 @@ pub async fn execute_supervised_transport_chat(
     request: &ExecutionRequest,
     system_prompt: &str,
     user_message: &str,
-    memories: &[MemoryEntry],
+    memories: &[PromptMemory],
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
 ) -> Result<LlmResponse> {

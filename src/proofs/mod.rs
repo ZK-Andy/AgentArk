@@ -217,14 +217,23 @@ impl ProofEngine {
 
     /// Save trace to disk
     fn save_trace(&self) -> Result<()> {
-        let trace = self
-            .trace
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
-        let content = serde_json::to_string_pretty(&*trace)?;
+        let content = {
+            let trace = self
+                .trace
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Trace lock poisoned: {}", e))?;
+            serde_json::to_string_pretty(&*trace)?
+        };
         let encrypted = self.trace_encryption_key.encrypt(content.as_bytes())?;
         let encrypted_path = self.data_dir.join("execution_trace.enc");
-        std::fs::write(encrypted_path, encrypted)?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| -> Result<()> {
+                std::fs::write(&encrypted_path, &encrypted)?;
+                Ok(())
+            })?;
+        } else {
+            std::fs::write(&encrypted_path, &encrypted)?;
+        }
         Ok(())
     }
 

@@ -7,10 +7,12 @@
 //! API reference: https://developers.facebook.com/docs/whatsapp/cloud-api
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::core::sender_verification::{self, SenderChannel, SenderIdentity, SenderTrustDecision};
@@ -18,6 +20,24 @@ use crate::core::{Agent, TaskStatus};
 use crate::storage::Storage;
 
 type SharedAgent = Arc<RwLock<Agent>>;
+
+const RECENT_MESSAGE_IDS_STORAGE_KEY: &str = "channels:whatsapp:recent_message_ids";
+const MAX_RECENT_MESSAGE_IDS: usize = 64;
+const RECENT_MESSAGE_ID_WINDOW_SECS: u64 = 60 * 60 * 24;
+
+static WHATSAPP_MESSAGE_DEDUP_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct WhatsAppRecentMessageState {
+    #[serde(default)]
+    recent: Vec<WhatsAppRecentMessageEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct WhatsAppRecentMessageEntry {
+    message_id: String,
+    seen_at: u64,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum TunnelControlCommand {
@@ -39,6 +59,65 @@ fn parse_tunnel_command(text: &str) -> Option<TunnelControlCommand> {
 
 fn internal_api_base_url() -> String {
     crate::core::net::internal_api_base_url()
+}
+
+fn now_unix_seconds() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| anyhow!("system clock before unix epoch: {}", error))?
+        .as_secs())
+}
+
+fn prune_recent_message_state(state: &mut WhatsAppRecentMessageState, now: u64) {
+    let min_seen_at = now.saturating_sub(RECENT_MESSAGE_ID_WINDOW_SECS);
+    state.recent.retain(|entry| entry.seen_at >= min_seen_at);
+    if state.recent.len() > MAX_RECENT_MESSAGE_IDS {
+        let excess = state.recent.len() - MAX_RECENT_MESSAGE_IDS;
+        state.recent.drain(0..excess);
+    }
+}
+
+async fn load_recent_message_state(storage: &Storage) -> Result<WhatsAppRecentMessageState> {
+    if let Ok(Some(raw)) = storage.get(RECENT_MESSAGE_IDS_STORAGE_KEY).await {
+        if let Ok(state) = serde_json::from_slice::<WhatsAppRecentMessageState>(&raw) {
+            return Ok(state);
+        }
+    }
+    Ok(WhatsAppRecentMessageState::default())
+}
+
+async fn persist_recent_message_state(
+    storage: &Storage,
+    state: &WhatsAppRecentMessageState,
+) -> Result<()> {
+    let raw = serde_json::to_vec(state)?;
+    storage.set(RECENT_MESSAGE_IDS_STORAGE_KEY, &raw).await?;
+    Ok(())
+}
+
+async fn record_whatsapp_message_id(storage: &Storage, message_id: &str) -> Result<bool> {
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        return Ok(false);
+    }
+    let _guard = WHATSAPP_MESSAGE_DEDUP_LOCK.lock().await;
+    let now = now_unix_seconds()?;
+    let mut state = load_recent_message_state(storage).await?;
+    prune_recent_message_state(&mut state, now);
+    if state
+        .recent
+        .iter()
+        .any(|entry| entry.message_id == message_id)
+    {
+        return Ok(true);
+    }
+    state.recent.push(WhatsAppRecentMessageEntry {
+        message_id: message_id.to_string(),
+        seen_at: now,
+    });
+    prune_recent_message_state(&mut state, now);
+    persist_recent_message_state(storage, &state).await?;
+    Ok(false)
 }
 
 async fn execute_tunnel_command(agent: &SharedAgent, cmd: TunnelControlCommand) -> String {
@@ -289,14 +368,7 @@ impl WhatsAppChannelConfig {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    crate::security::constant_time_eq(left, right)
 }
 
 fn hmac_sha256_hex(secret: &str, body: &[u8]) -> String {
@@ -690,13 +762,16 @@ async fn send_whatsapp_text(config: &WhatsAppChannelConfig, to: &str, text: &str
             }
         });
 
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", config.access_token))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let resp = super::outbound_rate_limit::send_with_bounded_retries(
+            "whatsapp",
+            "cloud_message",
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", config.access_token))
+                .header("Content-Type", "application/json")
+                .json(&body),
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -731,13 +806,16 @@ async fn mark_as_read(config: &WhatsAppChannelConfig, message_id: &str) -> Resul
         "message_id": message_id
     });
 
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.access_token))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let resp = super::outbound_rate_limit::send_with_bounded_retries(
+        "whatsapp",
+        "mark_read",
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.access_token))
+            .header("Content-Type", "application/json")
+            .json(&body),
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -815,7 +893,12 @@ async fn send_via_bridge(config: &WhatsAppChannelConfig, to: &str, text: &str) -
     if !config.bridge_token.trim().is_empty() {
         request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
     }
-    let resp = request.json(&body).send().await?;
+    let resp = super::outbound_rate_limit::send_with_bounded_retries(
+        "whatsapp",
+        "bridge_message",
+        request.json(&body),
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -849,7 +932,12 @@ async fn send_presence(
     if !config.bridge_token.trim().is_empty() {
         request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
     }
-    let resp = request.json(&body).send().await?;
+    let resp = super::outbound_rate_limit::send_with_bounded_retries(
+        "whatsapp",
+        "bridge_presence",
+        request.json(&body),
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1002,6 +1090,17 @@ pub async fn handle_webhook_with_config(
         return Ok("ok".to_string());
     }
 
+    if !message_id.is_empty() {
+        let storage = {
+            let agent_read = agent.read().await;
+            agent_read.storage.clone()
+        };
+        if record_whatsapp_message_id(&storage, message_id).await? {
+            tracing::debug!("WhatsApp: ignoring duplicate message {}", message_id);
+            return Ok("ok".to_string());
+        }
+    }
+
     if !config.allowed_numbers.is_empty() && !config.allowed_numbers.iter().any(|n| n == from) {
         tracing::warn!(
             "WhatsApp: rejected message from unauthorized number {}",
@@ -1030,7 +1129,7 @@ pub async fn handle_webhook_with_config(
     if !message_id.is_empty() && config.mode == WhatsAppMode::CloudApi {
         let config_clone = config.clone();
         let mid = message_id.to_string();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/channels/whatsapp.rs:1116", async move {
             if let Err(e) = mark_as_read(&config_clone, &mid).await {
                 tracing::warn!("Failed to mark WhatsApp message as read: {}", e);
             }
@@ -1270,7 +1369,7 @@ pub async fn handle_webhook_with_config(
     let typing_from = from.to_string();
     let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let typing_flag = typing_done.clone();
-    tokio::spawn(async move {
+    crate::spawn_logged!("src/channels/whatsapp.rs:1356", async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             if typing_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1339,7 +1438,12 @@ pub async fn send_video(
             if !config.bridge_token.trim().is_empty() {
                 request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
             }
-            let resp = request.send().await?;
+            let resp = super::outbound_rate_limit::send_with_bounded_retries(
+                "whatsapp",
+                "bridge_video",
+                request,
+            )
+            .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let error_body = resp.text().await.unwrap_or_default();
@@ -1401,7 +1505,12 @@ pub async fn send_image(
             if !config.bridge_token.trim().is_empty() {
                 request = request.header("x-agentark-bridge-token", config.bridge_token.trim());
             }
-            let resp = request.send().await?;
+            let resp = super::outbound_rate_limit::send_with_bounded_retries(
+                "whatsapp",
+                "bridge_image",
+                request,
+            )
+            .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let error_body = resp.text().await.unwrap_or_default();
@@ -1943,5 +2052,35 @@ mod tests {
         assert!(
             verify_cloud_api_request_signature(&config, tampered_body, Some(&signature)).is_err()
         );
+    }
+
+    #[test]
+    fn recent_message_state_is_pruned_to_a_bounded_window() {
+        let mut state = WhatsAppRecentMessageState {
+            recent: (0..(MAX_RECENT_MESSAGE_IDS + 10))
+                .map(|idx| WhatsAppRecentMessageEntry {
+                    message_id: format!("wamid.{}", idx),
+                    seen_at: 1,
+                })
+                .collect(),
+        };
+        prune_recent_message_state(&mut state, RECENT_MESSAGE_ID_WINDOW_SECS + 2);
+        assert!(state.recent.len() <= MAX_RECENT_MESSAGE_IDS);
+    }
+
+    #[tokio::test]
+    async fn record_message_id_is_idempotent_for_retries() {
+        let _dir = tempfile::tempdir().unwrap();
+        let storage = Storage::connect(
+            crate::storage::DatabaseConfig::for_tests().expect("test database config"),
+        )
+        .await
+        .unwrap();
+        assert!(!record_whatsapp_message_id(&storage, "wamid.1")
+            .await
+            .unwrap());
+        assert!(record_whatsapp_message_id(&storage, "wamid.1")
+            .await
+            .unwrap());
     }
 }

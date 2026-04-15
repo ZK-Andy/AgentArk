@@ -127,6 +127,34 @@ docker compose up -d
 
 Open **http://localhost:8990**, pick your LLM provider in Settings, start chatting.
 
+The bundled Docker runtime includes Lightpanda for fast free-content fetching, and the install/update scripts verify that it is present after startup.
+
+### Optional: run your own SearXNG backend
+
+AgentArk can use a self-hosted SearXNG instance for web search and deep research. AgentArk calls `/search?format=json`, so the SearXNG instance must allow JSON output.
+
+Start one locally in a single command:
+
+```bash
+mkdir -p .agentark-searxng && printf 'use_default_settings: true\nserver:\n  secret_key: "agentark-local-searxng"\n  limiter: false\nsearch:\n  formats:\n    - html\n    - json\n' > .agentark-searxng/settings.yml && docker run -d --name agentark-searxng --restart unless-stopped -p 8080:8080 -v "$PWD/.agentark-searxng/settings.yml:/etc/searxng/settings.yml:ro" searxng/searxng:latest
+```
+
+Then open AgentArk Settings -> Search and set **SearXNG Base URL (self-hosted)** to:
+
+- `http://host.docker.internal:8080` if AgentArk is running in Docker Desktop
+- `http://localhost:8080` if AgentArk is running directly on the host
+- `http://<your-host-ip>:8080` or the SearXNG container hostname if AgentArk is running in Docker on Linux
+
+Paste only the base URL and save; AgentArk appends `/search?format=json` itself. No API key is required.
+
+Provider selection logic:
+
+1. If your instance already has an explicit provider order saved in config, AgentArk uses that order for configured providers.
+2. Otherwise, AgentArk only considers providers that are actually configured and tries them in this fixed order: Serper -> Brave Search API -> Exa -> Tavily -> Perplexity -> Firecrawl -> SearXNG.
+3. If no configured provider is available or they fail, AgentArk falls back to the free chain: DuckDuckGo -> Lightpanda -> Bing RSS.
+
+Paid/API providers are ignored until you save their credentials. Setting a SearXNG base URL is enough to add it to the configured-provider chain. There is currently no up/down control for search provider order in the Settings UI.
+
 ### Convenience installer
 
 ```bash
@@ -191,6 +219,8 @@ export AGENTARK_DATABASE_URL=postgres://agentark:agentark@localhost:5432/agentar
 cargo build --release
 ./target/release/agentark --headless
 ```
+
+Native source builds do not include the bundled Docker runtime, so AgentArk disables Lightpanda there instead of expecting users to install it separately. Use Docker Compose for the default fully bundled search stack.
 
 ### Verify before install
 

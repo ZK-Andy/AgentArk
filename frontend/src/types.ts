@@ -1,3 +1,13 @@
+export type UpdateStatus = {
+  state: string;
+  apply_supported: boolean;
+  apply_message?: string | null;
+  latest_version?: string | null;
+  latest_tag?: string | null;
+  release_url?: string | null;
+  checked_at?: string | null;
+};
+
 export type StatusResponse = {
   did: string;
   memory_entries: number;
@@ -5,6 +15,7 @@ export type StatusResponse = {
   actions_loaded?: number;
   tasks_pending: number;
   version: string;
+  update?: UpdateStatus | null;
 };
 
 export type Task = {
@@ -189,47 +200,6 @@ export type ArkPulseRunFixRequest = {
   target?: string;
   event_timestamp?: string;
   finding_index?: number;
-};
-
-export type MemoryMaintenanceReviewResponse = {
-  generated_at: string;
-  knowledge_counts: {
-    episodes: number;
-    facts: number;
-    documents: number;
-    document_chunks: number;
-  };
-  policy: {
-    data_cleanup_enabled: boolean;
-    episode_retention_enabled: boolean;
-  };
-  durable_policy: {
-    documents: string;
-    learned_facts: string;
-  };
-  episode_cleanup: {
-    available: boolean;
-    reason: string;
-    current_episode_count: number;
-    max_episodes: number;
-    candidate_count: number;
-    raw_candidate_count: number;
-    estimated_remaining_episodes: number;
-    protected_recent_count: number;
-    cutoff_days: number;
-    keep_last: number;
-    require_consolidated: boolean;
-    max_importance: number;
-    max_access_count: number;
-    preview_signature: string;
-    confirmation_phrase: string;
-  };
-};
-
-export type RunMemoryMaintenanceRequest = {
-  action: string;
-  preview_signature: string;
-  confirmation_text: string;
 };
 
 export type TraceSummary = {

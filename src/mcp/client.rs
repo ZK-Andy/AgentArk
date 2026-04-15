@@ -469,7 +469,7 @@ impl StdioTransport {
 
         // Drain stderr in background to prevent blocking and capture diagnostics
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
+            crate::spawn_logged!("src/mcp/client.rs:472", async move {
                 use tokio::io::AsyncBufReadExt;
                 let reader = tokio::io::BufReader::new(stderr);
                 let mut lines = reader.lines();

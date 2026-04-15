@@ -439,13 +439,16 @@ pub async fn send_message_to_room(
         });
     }
 
-    let response = client
-        .put(url)
-        .bearer_auth(config.access_token.trim())
-        .json(&content)
-        .send()
-        .await
-        .context("failed to send Matrix message")?;
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "matrix",
+        "send_message",
+        client
+            .put(url)
+            .bearer_auth(config.access_token.trim())
+            .json(&content),
+    )
+    .await
+    .context("failed to send Matrix message")?;
 
     let status = response.status();
     let payload: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);

@@ -299,6 +299,165 @@ test.describe("Chat Activity UI @smoke", () => {
     await expect(page.locator("body")).not.toContainText("matched_app");
   });
 
+  test("collapses raw activity payloads until the user expands them", async ({ page }) => {
+    let createdConversationId = "";
+    let userMessage = "";
+    const assistantMessage = "I checked the file and kept the raw payload in the side panel.";
+    const payloadJson = JSON.stringify({
+      kind: "tool_dispatch",
+      tool_name: "file_read",
+      status: "running",
+      path: "src/main.rs",
+      run_id: "run-live-1",
+      ts: "2026-03-09T11:30:00.000Z"
+    });
+
+    await page.setViewportSize({ width: 2100, height: 1200 });
+
+    await page.route("**/projects", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ projects: [] })
+      });
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      const conversations = createdConversationId
+        ? [
+            {
+              id: createdConversationId,
+              title: "Payload disclosure chat",
+              channel: "web",
+              project_id: null,
+              created_at: "2026-03-09T11:30:00.000Z",
+              updated_at: "2026-03-09T11:30:08.000Z",
+              message_count: 2,
+              archived: false
+            }
+          ]
+        : [];
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations,
+          total: conversations.length,
+          limit: 30,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route("**/conversations/*/messages?**", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages:
+            conversationId && conversationId === createdConversationId
+              ? [
+                  {
+                    id: "msg-user-payload",
+                    role: "user",
+                    content: userMessage,
+                    timestamp: "2026-03-09T11:30:01.000Z",
+                    model_used: null,
+                    trace_id: null
+                  },
+                  {
+                    id: "msg-assistant-payload",
+                    role: "assistant",
+                    content: assistantMessage,
+                    timestamp: "2026-03-09T11:30:08.000Z",
+                    model_used: "test-model",
+                    trace_id: null
+                  }
+                ]
+              : []
+        })
+      });
+    });
+
+    await page.route("**/conversations/*", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      if (!conversationId || conversationId !== createdConversationId) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "not found" })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: createdConversationId,
+          title: "Payload disclosure chat",
+          channel: "web",
+          project_id: null,
+          created_at: "2026-03-09T11:30:00.000Z",
+          updated_at: "2026-03-09T11:30:08.000Z",
+          message_count: 2
+        })
+      });
+    });
+
+    await page.route("**/chat/stream", async (route) => {
+      const payload = route.request().postDataJSON() as {
+        conversation_id?: string;
+        message?: string;
+      };
+      createdConversationId = payload.conversation_id || "conv-payload-ui";
+      userMessage = payload.message || "read src/main.rs and keep the raw payload collapsed";
+      await route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: [
+          'event: thinking\ndata: {"title":"Message Received","detail":"Channel: web | Length: 48 chars","step_type":"info"}\n\n',
+          `event: tool_progress\ndata: ${JSON.stringify({
+            name: "file_read",
+            content: payloadJson,
+            kind: "tool_dispatch",
+            tool_name: "file_read",
+            status: "running",
+            path: "src/main.rs",
+            run_id: "run-live-1",
+            ts: "2026-03-09T11:30:00.000Z"
+          })}\n\n`,
+          `event: content\ndata: {"conversation_id":"${createdConversationId}","content":"${assistantMessage}"}\n\n`,
+          "event: done\ndata: {}\n\n"
+        ].join("")
+      });
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    const input = page.locator("textarea[aria-label='Message']").first();
+    await expect(input).toBeVisible({ timeout: 10_000 });
+    await input.fill("read src/main.rs and keep the raw payload collapsed");
+    await input.press("Enter");
+
+    await expect(page.locator(".activity-row-summary").filter({ hasText: "File Read dispatch ready." }).first()).toBeVisible({
+      timeout: 10_000
+    });
+    await expect(page.locator(".activity-payload-pre")).toHaveCount(0);
+    await expect(page.locator("body")).not.toContainText('"run_id": "run-live-1"');
+
+    await page.getByRole("button", { name: "Show data" }).first().click();
+
+    const payloadPre = page.locator(".activity-payload-pre").first();
+    await expect(payloadPre).toBeVisible({ timeout: 10_000 });
+    await expect(payloadPre).toContainText('"run_id": "run-live-1"');
+    await expect(payloadPre).toContainText('"path": "src/main.rs"');
+  });
+
   test("shows a stopped run card and resumes in-thread without a duplicate pending user bubble", async ({ page }) => {
     const conversationId = "conv-resume-inline";
     const taskId = "task-resume-inline";
@@ -804,5 +963,165 @@ test.describe("Chat Activity UI @smoke", () => {
     expect(
       (resumePayload?.plan_override as { summary?: string } | undefined)?.summary
     ).toBe("Edited summary for a source-backed open source release strategy review.");
+  });
+
+  test("deleting the active chat loads the next available conversation", async ({ page }) => {
+    const currentConversationId = "conv-delete-current";
+    const nextConversationId = "conv-delete-next";
+    const createdAt = "2026-03-12T10:00:00.000Z";
+    const updatedAt = "2026-03-12T10:05:00.000Z";
+    let conversations = [
+      {
+        id: currentConversationId,
+        title: "Current chat slated for delete",
+        channel: "web",
+        project_id: null,
+        created_at: createdAt,
+        updated_at: updatedAt,
+        message_count: 2,
+        archived: false
+      },
+      {
+        id: nextConversationId,
+        title: "Fallback chat after delete",
+        channel: "web",
+        project_id: null,
+        created_at: createdAt,
+        updated_at: "2026-03-12T10:04:00.000Z",
+        message_count: 2,
+        archived: false
+      }
+    ];
+    const messagesByConversation: Record<string, Array<Record<string, unknown>>> = {
+      [currentConversationId]: [
+        {
+          id: "msg-delete-user",
+          role: "user",
+          content: "delete the current chat when done",
+          timestamp: createdAt,
+          model_used: null,
+          trace_id: null
+        },
+        {
+          id: "msg-delete-assistant",
+          role: "assistant",
+          content: "Current conversation reply.",
+          timestamp: updatedAt,
+          model_used: "test-model",
+          trace_id: null
+        }
+      ],
+      [nextConversationId]: [
+        {
+          id: "msg-fallback-user",
+          role: "user",
+          content: "show the fallback chat after delete",
+          timestamp: createdAt,
+          model_used: null,
+          trace_id: null
+        },
+        {
+          id: "msg-fallback-assistant",
+          role: "assistant",
+          content: "Next conversation reply.",
+          timestamp: updatedAt,
+          model_used: "test-model",
+          trace_id: null
+        }
+      ]
+    };
+
+    await page.setViewportSize({ width: 1700, height: 1100 });
+    await page.addInitScript((conversationId: string) => {
+      window.sessionStorage.setItem("agentark.chat.lastConversationId", conversationId);
+    }, currentConversationId);
+
+    await page.route("**/projects", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ projects: [] })
+      });
+    });
+
+    await page.route("**/conversations?**", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          conversations,
+          total: conversations.length,
+          limit: 30,
+          offset: 0
+        })
+      });
+    });
+
+    await page.route(`**/conversations/${currentConversationId}`, async (route) => {
+      if (route.request().method().toUpperCase() === "DELETE") {
+        conversations = conversations.filter((conversation) => conversation.id !== currentConversationId);
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({ ok: true })
+        });
+        return;
+      }
+      const conversation = conversations.find((item) => item.id === currentConversationId);
+      if (!conversation) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "not found" })
+        });
+        return;
+      }
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(conversation)
+      });
+    });
+
+    await page.route(`**/conversations/${nextConversationId}`, async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(conversations.find((item) => item.id === nextConversationId))
+      });
+    });
+
+    await page.route("**/conversations/*/messages?**", async (route) => {
+      const url = new URL(route.request().url());
+      const conversationId = url.pathname.split("/")[2] || "";
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: messagesByConversation[conversationId] || []
+        })
+      });
+    });
+
+    page.on("dialog", async (dialog) => {
+      if (dialog.type() === "confirm") {
+        await dialog.accept();
+      }
+    });
+
+    await page.goto("/");
+    await page.waitForSelector("text=AgentArk", { timeout: 15_000 });
+
+    const chatNav = page.locator("text=Chat").first();
+    if (await chatNav.isVisible()) {
+      await chatNav.click();
+    }
+
+    await expect(page.locator("text=Current conversation reply.")).toBeVisible({ timeout: 10_000 });
+
+    const currentConversationCard = page
+      .locator(".conversation-card", { hasText: "Current chat slated for delete" })
+      .first();
+    await expect(currentConversationCard).toBeVisible({ timeout: 10_000 });
+    await currentConversationCard.locator(".conversation-card-menu").click();
+    await page.getByRole("menuitem", { name: "Delete chat" }).click();
+
+    await expect(page.locator("text=Chat deleted.")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("text=Next conversation reply.")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("text=Current conversation reply.")).not.toBeVisible();
   });
 });

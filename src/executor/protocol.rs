@@ -24,6 +24,24 @@ pub struct ExecutorStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackUpdateRequest {
+    pub release_tag: String,
+    pub release_version: String,
+    pub release_repo: String,
+    pub image_repository: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackUpdateResponse {
+    pub status: String,
+    pub message: String,
+    #[serde(default)]
+    pub release_tag: Option<String>,
+    #[serde(default)]
+    pub release_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeExecuteFilePayload {
     pub filename: String,
     pub bytes_b64: String,

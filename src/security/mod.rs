@@ -31,12 +31,12 @@ use regex::Regex;
 use std::collections::HashSet;
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let a = left.get(idx).copied().unwrap_or(0);
+        let b = right.get(idx).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
     }
     diff == 0
 }

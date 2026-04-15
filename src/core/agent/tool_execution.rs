@@ -3557,7 +3557,7 @@ Requirements:\n\
     fn trigger_arkpulse_refresh(&self, reason: &'static str) {
         let api_key = self.api_key.clone();
         let base_url = Self::internal_api_base_url();
-        tokio::spawn(async move {
+        crate::spawn_logged!("src/core/agent/tool_execution.rs:3560", async move {
             let client = match crate::core::net::build_internal_control_client(4) {
                 Ok(c) => c,
                 Err(e) => {
@@ -3991,9 +3991,14 @@ Requirements:\n\
             .flat_map(|action| action.authorization.access.integration_ids.clone())
             .collect();
         let integration_aliases = self.load_tool_integration_aliases().await;
-        let enabled_ids: HashSet<String> = integration_aliases.values().cloned().collect();
+        let mut ready_ids = HashSet::new();
+        for integration_id in integration_aliases.values() {
+            if self.integrations.is_ready(integration_id).await {
+                ready_ids.insert(integration_id.clone());
+            }
+        }
 
-        for integration_id in &enabled_ids {
+        for integration_id in &ready_ids {
             let Some(integration) = self.integrations.get(integration_id) else {
                 continue;
             };
@@ -4011,7 +4016,7 @@ Requirements:\n\
         }
 
         for (tool_name, integration_id) in integration_aliases {
-            if !enabled_ids.contains(&integration_id) {
+            if !ready_ids.contains(&integration_id) {
                 continue;
             }
             if !existing.insert(tool_name.clone()) {
@@ -5273,7 +5278,7 @@ Requirements:\n\
                     let whatsapp_config = whatsapp_config.clone();
                     let agent_name = agent_name.clone();
                     let message = msg.clone();
-                    tokio::spawn(async move {
+                    crate::spawn_logged!("src/core/agent/tool_execution.rs:5281", async move {
                         send_app_deploy_progress_to_conversation(
                             &request_channel,
                             conversation_id.as_deref(),
@@ -5367,50 +5372,16 @@ Requirements:\n\
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let include_moltbook_external = external_sources
-            .iter()
-            .any(|source| source.eq_ignore_ascii_case("moltbook"))
-            || query.to_ascii_lowercase().contains("moltbook");
 
         let mut sections: Vec<String> = Vec::new();
         let mut learning_seed_ids: Vec<String> = Vec::new();
 
         if include_semantic {
-            let semantic_lines = match self
-                .memory
-                .retrieve_relevant(query, limit.min(5), project_id)
-                .await
-            {
-                Ok(memories) => memories
-                    .into_iter()
-                    .filter(|memory| {
-                        include_moltbook_external
-                            || !matches!(
-                                &memory.memory_type,
-                                crate::memory::MemoryType::Episodic { context }
-                                    if context.channel.eq_ignore_ascii_case("moltbook")
-                            )
-                    })
-                    .take(limit)
-                    .map(|m| format!("- {}", safe_truncate(&m.content, 220)))
-                    .collect::<Vec<_>>(),
-                Err(e) => {
-                    tracing::warn!("memory_lookup retrieval failed: {}", e);
-                    Vec::new()
-                }
-            };
-
-            if !semantic_lines.is_empty() {
-                sections.push(format!("## Relevant Memory\n{}", semantic_lines.join("\n")));
-            }
-        }
-
-        if include_lessons {
             match self
                 .storage
                 .search_experience_items(
                     query,
-                    &["constraint", "personal_fact", "lesson"],
+                    &["constraint", "personal_fact"],
                     project_id,
                     conversation_id,
                     limit as u64,
@@ -5434,9 +5405,45 @@ Requirements:\n\
                         })
                         .collect::<Vec<_>>();
                     sections.push(format!(
-                        "## Learned Constraints and Lessons\n{}",
+                        "## Learned Facts and Constraints\n{}",
                         lines.join("\n")
                     ));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("memory_lookup semantic learning search failed: {}", error);
+                }
+            }
+        }
+
+        if include_lessons {
+            match self
+                .storage
+                .search_experience_items(
+                    query,
+                    &["lesson"],
+                    project_id,
+                    conversation_id,
+                    limit as u64,
+                )
+                .await
+            {
+                Ok(hits) if !hits.is_empty() => {
+                    learning_seed_ids.extend(hits.iter().map(|hit| hit.item.id.clone()));
+                    let lines = hits
+                        .iter()
+                        .take(limit)
+                        .map(|hit| {
+                            format!(
+                                "- {} (match {:.2}, confidence {:.0}%): {}",
+                                safe_truncate(&hit.item.title, 80),
+                                hit.score,
+                                hit.item.confidence * 100.0,
+                                safe_truncate(&hit.item.content, 180)
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    sections.push(format!("## Learned Lessons\n{}", lines.join("\n")));
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -9068,7 +9075,11 @@ Requirements:\n\
         let public_base_url = self.load_public_base_url().await;
         let integration_aliases = self.load_tool_integration_aliases().await;
         let handlers = default_tool_handlers();
-        let mut actions = self.runtime.list_actions().await.unwrap_or_default();
+        let mut actions = self
+            .runtime
+            .list_enabled_actions()
+            .await
+            .unwrap_or_default();
         self.append_dynamic_integration_actions(&mut actions).await;
         let action_map = actions
             .into_iter()
@@ -9554,7 +9565,7 @@ Requirements:\n\
                         let session_id = notification.session_id.clone();
                         let msg = notification.message.clone();
                         let _screenshot = notification.screenshot.clone(); // screenshots sent via channel-specific methods
-                        tokio::spawn(async move {
+                        crate::spawn_logged!("src/core/agent/tool_execution.rs:9568", async move {
                             let handoff_relative = format!("/ui/browser-handoff/{}", session_id);
                             let absolutize = |base: &str| -> String {
                                 if handoff_relative.starts_with('/') {

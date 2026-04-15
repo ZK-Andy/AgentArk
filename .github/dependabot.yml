@@ -4,22 +4,70 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - rust
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: npm
     directory: "/frontend"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+      day: monday
+      time: "09:15"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - frontend
+    groups:
+      frontend-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+      day: monday
+      time: "09:30"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - ci
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+      day: monday
+      time: "09:45"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+      - docker
+    groups:
+      docker-dependencies:
+        patterns:
+          - "*"

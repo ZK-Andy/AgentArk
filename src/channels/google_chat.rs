@@ -186,12 +186,16 @@ async fn send_message_to_destination(
     if let Some(thread_key) = destination.thread_key.as_deref() {
         body["thread"] = serde_json::json!({ "threadKey": thread_key });
     }
-    let response = http_client()?
-        .post(&url)
-        .bearer_auth(&config.access_token)
-        .json(&body)
-        .send()
-        .await?;
+    let client = http_client()?;
+    let response = super::outbound_rate_limit::send_with_bounded_retries(
+        "google_chat",
+        "post_message",
+        client
+            .post(&url)
+            .bearer_auth(&config.access_token)
+            .json(&body),
+    )
+    .await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();

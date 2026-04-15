@@ -6,7 +6,7 @@ use crate::actions::ActionDef;
 use crate::core::llm::{LlmClient, LlmProvider};
 use crate::core::orchestra::SubAgentType;
 use crate::core::prompt_policy::delegated_policy_v2_block;
-use crate::memory::MemoryEntry;
+use crate::core::PromptMemory;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -99,7 +99,7 @@ impl SpecialistAgent {
         &self,
         task: &str,
         context: &str,
-        memories: &[MemoryEntry],
+        memories: &[PromptMemory],
         available_actions: &[ActionDef],
         system_prompt_override: Option<String>,
     ) -> Result<String> {

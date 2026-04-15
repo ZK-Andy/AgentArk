@@ -32,8 +32,10 @@ if "%1"=="lowmem" goto lowmem
 goto usage
 
 :start
+call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk...
 docker compose up -d
+call :verify_lightpanda || exit /b 1
 echo.
 echo AgentArk is running!
 echo   Web UI:  http://localhost:8990
@@ -47,9 +49,11 @@ goto end
 :tunnel
 if "%2"=="setup" goto tunnel_setup
 
+call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk with remote access...
 set AGENTARK_TUNNEL=true
 docker compose up -d
+call :verify_lightpanda || exit /b 1
 echo.
 echo AgentArk is starting with secure tunnel!
 echo.
@@ -87,6 +91,7 @@ if "!TOKEN!"=="" (
 echo TUNNEL_TOKEN=!TOKEN!>> .env
 echo Token saved to .env
 echo.
+call :ensure_postgres_password || exit /b 1
 echo Starting AgentArk with permanent tunnel...
 set AGENTARK_TUNNEL=true
 docker compose up -d
@@ -104,6 +109,7 @@ goto end
 :restart
 echo Restarting AgentArk...
 docker compose restart
+call :verify_lightpanda || exit /b 1
 goto end
 
 :logs
@@ -111,16 +117,20 @@ docker compose logs -f
 goto end
 
 :update
+call :ensure_postgres_password || exit /b 1
 echo Updating AgentArk (your data will be preserved)...
 docker compose pull
 docker compose up -d
+call :verify_lightpanda || exit /b 1
 echo Update complete! Your data is intact.
 goto end
 
 :build
+call :ensure_postgres_password || exit /b 1
 echo Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...
 if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+call :verify_lightpanda || exit /b 1
 echo Local build complete! Your data is intact.
 goto end
 
@@ -155,6 +165,43 @@ echo To restore full resources later:
 echo   del %USERPROFILE%\.wslconfig
 echo   wsl --shutdown
 goto end
+
+:verify_lightpanda
+echo Verifying bundled Lightpanda runtime...
+set "LIGHTPANDA_RETRIES=20"
+:verify_lightpanda_loop
+docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Lightpanda is available inside the AgentArk runtime.
+    exit /b 0
+)
+set /a LIGHTPANDA_RETRIES-=1
+if %LIGHTPANDA_RETRIES% LEQ 0 (
+    echo Lightpanda is missing from the bundled AgentArk runtime. Update or rebuild before relying on the free search fallback.
+    exit /b 1
+)
+timeout /t 2 >nul
+goto verify_lightpanda_loop
+
+:ensure_postgres_password
+if not exist .env (
+    if exist .env.example copy .env.example .env >nul
+)
+set "HAS_PG_PASS="
+if exist .env (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if /I "%%A"=="AGENTARK_POSTGRES_PASSWORD" if not "%%B"=="" set "HAS_PG_PASS=1"
+    )
+)
+if defined HAS_PG_PASS exit /b 0
+set "PGPASS="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$rng=[Security.Cryptography.RandomNumberGenerator]::Create(); $bytes=New-Object byte[] 24; $rng.GetBytes($bytes); $value=(($bytes | ForEach-Object { $_.ToString('x2') }) -join ''); $envPath=Join-Path (Get-Location) '.env'; if (Test-Path $envPath) { $lines=Get-Content $envPath; if ($lines -match '^AGENTARK_POSTGRES_PASSWORD=') { $lines=$lines -replace '^AGENTARK_POSTGRES_PASSWORD=.*$', ('AGENTARK_POSTGRES_PASSWORD=' + $value); Set-Content -Path $envPath -Value $lines } else { Add-Content -Path $envPath -Value ('AGENTARK_POSTGRES_PASSWORD=' + $value) } } else { Set-Content -Path $envPath -Value ('AGENTARK_POSTGRES_PASSWORD=' + $value) }; $rng.Dispose(); Write-Output $value"`) do set "PGPASS=%%P"
+if not defined PGPASS (
+    echo Failed to generate a local Postgres password.
+    exit /b 1
+)
+echo Generated a local Postgres password and saved it to .env
+exit /b 0
 
 :usage
 echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|status^|lowmem]
