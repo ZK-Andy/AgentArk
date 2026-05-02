@@ -73,11 +73,11 @@ function formatWhen(raw?: string): string {
 const DRAWER_VIEWS: Array<{ view: DrawerView; label: string; detail: string }> = [
   { view: "tasks", label: "Tasks", detail: "Durable execution queue and approvals." },
   { view: "apps", label: "Apps", detail: "Built artifacts and deployed surfaces." },
-  { view: "documents", label: "Files", detail: "Knowledge, uploads, and project documents." },
+  { view: "documents", label: "Files", detail: "Knowledge, uploads, and workspace documents." },
   { view: "skills", label: "Skills", detail: "Reusable capabilities and imports." },
   { view: "swarm", label: "Agents", detail: "Specialist agents and live roster." },
   { view: "trace", label: "Trace", detail: "Execution history and tool telemetry." },
-  { view: "status", label: "Watchers", detail: "Background monitors and triggers." },
+  { view: "status", label: "Background Work", detail: "Monitors, reminders, and follow-ups." },
   { view: "goals", label: "Goals", detail: "Long-running intent and outcomes." },
 ];
 
@@ -100,11 +100,6 @@ export function WorkspaceHub({
     queryFn: api.getTrace,
     refetchInterval: interval,
   });
-  const projectsQ = useQuery({
-    queryKey: ["workspace-projects"],
-    queryFn: () => api.rawGet("/projects"),
-    refetchInterval: interval,
-  });
   const appsQ = useQuery({
     queryKey: ["apps-manager"],
     queryFn: () => api.rawGet("/apps"),
@@ -113,7 +108,6 @@ export function WorkspaceHub({
 
   const tasks = useMemo(() => pickTasks(tasksQ.data), [tasksQ.data]);
   const traces = useMemo(() => pickTraceHistory(traceQ.data), [traceQ.data]);
-  const projects = useMemo(() => pickRecords(projectsQ.data, "projects"), [projectsQ.data]);
   const appsPayload = useMemo(() => asRecord(appsQ.data), [appsQ.data]);
   const apps = useMemo(() => pickRecords(appsPayload, "apps"), [appsPayload]);
   const restoreInfo = useMemo(() => asRecord(appsPayload.restore), [appsPayload]);
@@ -216,13 +210,6 @@ export function WorkspaceHub({
                 {entry.label}
               </Button>
             ))}
-            <Button
-              size="small"
-              variant="text"
-              onClick={() => onNavigateToView("projects")}
-            >
-              Projects
-            </Button>
           </Stack>
         </Stack>
       </Box>
@@ -309,13 +296,12 @@ export function WorkspaceHub({
                     Context
                   </Typography>
                   <Typography variant="h6" sx={{ fontWeight: 650 }}>
-                    Projects, artifacts, and recent runs.
+                    Artifacts, apps, and recent runs.
                   </Typography>
                 </Box>
                 <Stack direction="row" spacing={0.75} useFlexGap sx={{
                   flexWrap: "wrap"
                 }}>
-                  <Chip size="small" label={`${projects.length} projects`} />
                   <Chip size="small" label={`${activeApps.length} live apps`} />
                   {restoringApps.length > 0 ? (
                     <Chip size="small" color="info" label={`${restoringApps.length} restoring`} />
@@ -347,9 +333,6 @@ export function WorkspaceHub({
                 <Stack direction="row" spacing={1} useFlexGap sx={{
                   flexWrap: "wrap"
                 }}>
-                  <Button size="small" variant="outlined" onClick={() => onNavigateToView("projects")} sx={{ textTransform: "none" }}>
-                    Open Projects
-                  </Button>
                   <Button size="small" variant="outlined" onClick={() => setDrawerView("trace")} sx={{ textTransform: "none" }}>
                     Open Trace
                   </Button>

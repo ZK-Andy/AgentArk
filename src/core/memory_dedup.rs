@@ -34,6 +34,7 @@ const MERGED_MEMORY_REDACTION_MARKERS: &[&str] = &[
     "[REDACTED_CERTIFICATE]",
 ];
 const EQUIVALENCE_JUDGE_TIMEOUT_SECS: u64 = 8;
+const EQUIVALENCE_JUDGE_MAX_OUTPUT_TOKENS: u32 = 256;
 
 /// Historical auto-accept threshold kept visible for tuning, but production
 /// merge decisions still require an equivalence verdict. Embeddings retrieve
@@ -128,7 +129,8 @@ impl SemanticEquivalenceJudge for LlmEquivalenceJudge {
         let user = build_equivalence_prompt(a, b);
         match tokio::time::timeout(
             std::time::Duration::from_secs(EQUIVALENCE_JUDGE_TIMEOUT_SECS),
-            self.llm.chat_with_system(system, &user),
+            self.llm
+                .chat_classifier_bounded(system, &user, EQUIVALENCE_JUDGE_MAX_OUTPUT_TOKENS),
         )
         .await
         {
@@ -407,13 +409,13 @@ fn append_merged_phrasing(
 /// the user appears to assert simultaneously, rather than an update).
 pub fn build_equivalence_prompt(a: &str, b: &str) -> String {
     format!(
-        "You are checking whether two stored user memories describe the same user attribute or subject so that one should unify with or supersede the other in a canonical record.\n\n\
-         Memory A:\n{a}\n\n\
-         Memory B:\n{b}\n\n\
+        "You are checking whether an existing stored user memory and a newer candidate user memory describe the same user attribute or subject so that the newer candidate should unify with or supersede the existing canonical record.\n\n\
+         Existing memory A:\n{a}\n\n\
+         Newer candidate memory B:\n{b}\n\n\
          Answer with a single JSON object of the form {{\"equivalent\": true|false, \"rationale\": \"...\"}}.\n\
          Rules:\n\
          - Return true when both memories are about the same user attribute, preference, identity, location, workflow, or relationship — even when one refines, corrects, or updates the other, and even when one is more specific than the other. The point is whether they belong on the same canonical row.\n\
-         - Return true for paraphrases, clarifications, and value updates of the same underlying fact.\n\
+         - Return true for paraphrases, clarifications, and value updates of the same underlying fact, including later polarity changes for the same preference or attribute.\n\
          - Return false when the subjects or attributes differ (e.g. the user's name vs the user's location vs the user's employer).\n\
          - Return false when the two memories directly negate each other in a way the user is asserting at the same time rather than as an update.\n\
          - Decide on meaning, not on shared words. Different wording about the same attribute is still the same attribute; similar wording about different attributes is not.\n\
@@ -689,6 +691,19 @@ mod tests {
             parse_equivalence_response("{\"equivalent\": \"maybe\"}"),
             EquivalenceVerdict::Uncertain
         );
+    }
+
+    #[test]
+    fn equivalence_prompt_treats_later_preference_polarity_as_update() {
+        let prompt = build_equivalence_prompt(
+            "The user prefers one interface theme.",
+            "The user now prefers a different interface theme.",
+        );
+
+        assert!(prompt.contains("same user attribute or subject"));
+        assert!(prompt.contains("newer candidate"));
+        assert!(prompt.contains("later polarity changes"));
+        assert!(prompt.contains("same preference or attribute"));
     }
 
     #[tokio::test]

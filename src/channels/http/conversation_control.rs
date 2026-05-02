@@ -8,7 +8,7 @@ pub(super) async fn list_conversations(
     const SIDEBAR_CONVERSATION_PAGE_SIZE: u64 = 20;
     const STARRED_CONVERSATION_LIMIT: u64 = 3;
     let storage = { state.agent.read().await.storage.clone() };
-    let project_id = params.get("project_id").map(|s| s.as_str());
+    let project_id: Option<&str> = None;
     let sidebar_mode = params
         .get("sidebar")
         .map(|value| {
@@ -56,7 +56,7 @@ pub(super) async fn list_conversations(
                 .map(|c| {
                     serde_json::json!({
                         "id": c.id, "title": c.title, "channel": c.channel,
-                        "project_id": c.project_id, "created_at": c.created_at,
+                        "created_at": c.created_at,
                         "updated_at": c.updated_at, "message_count": c.message_count,
                         "archived": c.archived, "starred": c.starred,
                     })
@@ -78,7 +78,7 @@ pub(super) async fn list_conversations(
                         .map(|c| {
                             serde_json::json!({
                                 "id": c.id, "title": c.title, "channel": c.channel,
-                                "project_id": c.project_id, "created_at": c.created_at,
+                                "created_at": c.created_at,
                                 "updated_at": c.updated_at, "message_count": c.message_count,
                                 "archived": c.archived, "starred": c.starred,
                             })
@@ -125,10 +125,6 @@ pub(super) async fn create_conversation_endpoint(
         .and_then(|v| v.as_str())
         .unwrap_or("web")
         .to_string();
-    let project_id = request
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
     let now = chrono::Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -136,7 +132,7 @@ pub(super) async fn create_conversation_endpoint(
         id: id.clone(),
         title,
         channel,
-        project_id,
+        project_id: None,
         created_at: now.clone(),
         updated_at: now,
         message_count: 0,
@@ -173,7 +169,7 @@ pub(super) async fn get_conversation_endpoint(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "id": conv.id, "title": conv.title, "channel": conv.channel,
-                    "project_id": conv.project_id, "created_at": conv.created_at,
+                    "created_at": conv.created_at,
                     "updated_at": conv.updated_at, "message_count": conv.message_count,
                     "archived": conv.archived, "starred": conv.starred,
                     "workspace": workspace,
@@ -215,10 +211,7 @@ pub(super) async fn update_conversation_endpoint(
             .into_response();
     }
     let storage = { state.agent.read().await.storage.clone() };
-    match storage
-        .update_conversation(&id, title, None, starred)
-        .await
-    {
+    match storage.update_conversation(&id, title, None, starred).await {
         Ok(updated) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -413,216 +406,6 @@ pub(super) async fn get_conversation_messages(
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({"messages": list}))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-// ==================== Project Endpoints ====================
-
-pub(super) async fn list_projects_endpoint(State(state): State<AppState>) -> Response {
-    let agent = state.agent.read().await;
-    match agent.storage.list_projects().await {
-        Ok(projects) => {
-            let list: Vec<serde_json::Value> = projects
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "id": p.id, "name": p.name, "description": p.description,
-                        "system_prompt": p.system_prompt, "personality": p.personality,
-                        "tools_filter": p.tools_filter, "active": p.active,
-                        "created_at": p.created_at, "updated_at": p.updated_at,
-                    })
-                })
-                .collect();
-            (StatusCode::OK, Json(serde_json::json!({"projects": list}))).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-pub(super) async fn create_project_endpoint(
-    State(state): State<AppState>,
-    Json(request): Json<serde_json::Value>,
-) -> Response {
-    let name = match request.get("name").and_then(|v| v.as_str()) {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Name required".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    let id = uuid::Uuid::new_v4().to_string();
-    let proj = crate::storage::entities::project::Model {
-        id: id.clone(),
-        name,
-        description: request
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        system_prompt: request
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        personality: request
-            .get("personality")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        tools_filter: request
-            .get("tools_filter")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        active: true,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let agent = state.agent.read().await;
-    match agent.storage.create_project(&proj).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"id": id, "status": "ok"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-pub(super) async fn get_project_endpoint(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let agent = state.agent.read().await;
-    match agent.storage.get_project(&id).await {
-        Ok(Some(p)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": p.id, "name": p.name, "description": p.description,
-                "system_prompt": p.system_prompt, "personality": p.personality,
-                "tools_filter": p.tools_filter, "active": p.active,
-            })),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Project not found".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-pub(super) async fn update_project_endpoint(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<serde_json::Value>,
-) -> Response {
-    let agent = state.agent.read().await;
-    let existing = match agent.storage.get_project(&id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: "Not found".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let updated = crate::storage::entities::project::Model {
-        id: id.clone(),
-        name: request
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&existing.name)
-            .to_string(),
-        description: request
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&existing.description)
-            .to_string(),
-        system_prompt: request
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or(existing.system_prompt),
-        personality: request
-            .get("personality")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or(existing.personality),
-        tools_filter: request
-            .get("tools_filter")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or(existing.tools_filter),
-        active: request
-            .get("active")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(existing.active),
-        created_at: existing.created_at,
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-    match agent.storage.update_project(&updated).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-pub(super) async fn delete_project_endpoint(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
-    let agent = state.agent.read().await;
-    match agent.storage.delete_project(&id).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

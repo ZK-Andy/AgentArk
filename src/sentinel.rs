@@ -98,6 +98,37 @@ static WATCHER_TRIGGER_TIMEOUT_SECS: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(45)
 });
 
+fn watcher_browse_search_fallback_args(
+    watcher: &crate::core::watcher::Watcher,
+) -> Option<serde_json::Value> {
+    if !watcher.poll_action.eq_ignore_ascii_case("browse") {
+        return None;
+    }
+    let url = watcher
+        .poll_arguments
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let description = watcher.description.trim();
+    let query = if !description.is_empty() && !url.is_empty() {
+        format!("{} {}", description, url)
+    } else if !description.is_empty() {
+        description.to_string()
+    } else if !url.is_empty() {
+        url.to_string()
+    } else {
+        String::new()
+    };
+    if query.trim().is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "query": query,
+        "num_results": 8
+    }))
+}
+
 struct PulseRunGuard;
 
 impl Drop for PulseRunGuard {
@@ -456,6 +487,14 @@ pub enum DoctorReadonlyInvestigationTopic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorManagedAppOperation {
+    CompilePythonRequirements,
+    GenerateCargoLockfile,
+    RemoveNpmInstallHooks,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DoctorRemediationSpec {
     TunnelStartVerify,
@@ -465,6 +504,10 @@ pub enum DoctorRemediationSpec {
     },
     ShellCommand {
         command: String,
+    },
+    ManagedAppOperation {
+        app_id: String,
+        operation: DoctorManagedAppOperation,
     },
     ReadonlyInvestigation {
         topic: DoctorReadonlyInvestigationTopic,
@@ -1746,8 +1789,9 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                             suspicious.join(" | "),
                             "Install hooks can execute arbitrary code during deployment.",
                             fix_command.clone(),
-                            DoctorRemediationSpec::ShellCommand {
-                                command: fix_command,
+                            DoctorRemediationSpec::ManagedAppOperation {
+                                app_id: app.id.clone(),
+                                operation: DoctorManagedAppOperation::RemoveNpmInstallHooks,
                             },
                         );
                     }
@@ -1769,8 +1813,9 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                 format!("{} has Cargo.toml but no Cargo.lock", app.app_dir.display()),
                 "Rust dependency set is not pinned for reproducible builds.",
                 fix_command.clone(),
-                DoctorRemediationSpec::ShellCommand {
-                    command: fix_command,
+                DoctorRemediationSpec::ManagedAppOperation {
+                    app_id: app.id.clone(),
+                    operation: DoctorManagedAppOperation::GenerateCargoLockfile,
                 },
             );
         }
@@ -1788,10 +1833,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                     "Git/path Rust dependency detected",
                     "Cargo.toml contains git/path dependency sources".to_string(),
                     "Non-registry dependency sources increase trust and drift risk.",
-                    fix_command.clone(),
-                    DoctorRemediationSpec::ShellCommand {
-                        command: fix_command,
-                    },
+                    fix_command,
                 );
             }
         }
@@ -1830,8 +1872,9 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                     unpinned.into_iter().take(8).collect::<Vec<_>>().join(", "),
                     "Floating versions can introduce breaking or vulnerable transitive updates.",
                     fix_command.clone(),
-                    DoctorRemediationSpec::ShellCommand {
-                        command: fix_command,
+                    DoctorRemediationSpec::ManagedAppOperation {
+                        app_id: app.id.clone(),
+                        operation: DoctorManagedAppOperation::CompilePythonRequirements,
                     },
                 );
             }
@@ -1852,10 +1895,7 @@ fn run_dependency_and_supply_checks_for_app(app: &AppEndpoint, findings: &mut Ve
                         .collect::<Vec<_>>()
                         .join(", "),
                     "Direct remote package sources bypass curated index trust controls.",
-                    fix_command.clone(),
-                    DoctorRemediationSpec::ShellCommand {
-                        command: fix_command,
-                    },
+                    fix_command,
                 );
             }
         }
@@ -1930,10 +1970,7 @@ fn run_secret_scan_for_app(app: &AppEndpoint, findings: &mut Vec<DoctorFinding>)
                 "Potential secret exposure",
                 format!("Matched {} in {}", kind, rel),
                 "Sensitive credentials may be hardcoded or stored in deploy artifact.",
-                fix_command.clone(),
-                DoctorRemediationSpec::ShellCommand {
-                    command: fix_command,
-                },
+                fix_command,
             );
         }
     }
@@ -2425,7 +2462,7 @@ async fn run_resource_checks(
                 "Could not inspect durable knowledge growth",
                 errors.join(" | "),
                 "Storage growth could not be evaluated for durable documents and memories.",
-                "Open ArkPulse again after verifying Postgres connectivity and count queries"
+                "Verify Postgres connectivity and count-query permissions, then review durable knowledge growth."
                     .to_string(),
             );
             None
@@ -3331,6 +3368,8 @@ pub struct SentinelConfig {
     pub integration_sync_interval: u64,
     /// How often to consolidate execution experiences into learned memory (seconds)
     pub experience_consolidation_interval: u64,
+    /// How often to compact idle background-session state (seconds)
+    pub background_session_consolidation_interval: u64,
     /// How often to reflect on consolidated execution runs and extract heuristics (seconds)
     pub heuristic_reflection_interval: u64,
     /// How often to induce procedural patterns from learned procedures (seconds)
@@ -3357,7 +3396,8 @@ impl Default for SentinelConfig {
             scheduler_interval: 30,
             watcher_interval: 15 * 60,
             integration_sync_interval: 120,
-            experience_consolidation_interval: 600,
+            experience_consolidation_interval: 1800,
+            background_session_consolidation_interval: 1800,
             heuristic_reflection_interval: 750,
             pattern_induction_interval: 900,
             candidate_generation_interval: 1200,
@@ -3544,6 +3584,39 @@ pub fn start(
                 .await;
             }
         })
+    });
+
+    handles.push({
+        let agent = agent.clone();
+        let mut shutdown = shutdown_rx.clone();
+        crate::spawn_logged!(
+            "src/sentinel.rs:background_session_consolidation",
+            async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                    config.background_session_consolidation_interval,
+                ));
+                interval.tick().await;
+                loop {
+                    if !tick_or_shutdown(&mut interval, &mut shutdown).await {
+                        break;
+                    }
+                    if is_agent_autonomy_paused(&agent).await {
+                        continue;
+                    }
+                    run_with_busy_deferral(
+                        &agent,
+                        "background_session_consolidation",
+                        MAINTENANCE_DEFER_MINUTES,
+                        MAINTENANCE_MAX_DEFERS,
+                        || {
+                            let agent = agent.clone();
+                            async move { run_background_session_consolidation_job(&agent).await }
+                        },
+                    )
+                    .await;
+                }
+            }
+        )
     });
 
     handles.push({
@@ -3895,7 +3968,7 @@ pub fn start(
     });
 
     tracing::info!(
-        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
+        "ArkSentinel started: scheduler={}s, watchers={}s, integration_sync={}s, experience_learning={}s, background_session_consolidation={}s, heuristic_reflection={}s, pattern_induction={}s, candidate_generation={}s, pulse={}s, auto_analysis={}s, container_reaper={}s",
         config.scheduler_interval,
         config.watcher_interval,
         if config.integration_sync_interval > 0 {
@@ -3904,6 +3977,7 @@ pub fn start(
             "off".to_string()
         },
         config.experience_consolidation_interval,
+        config.background_session_consolidation_interval,
         config.heuristic_reflection_interval,
         config.pattern_induction_interval,
         config.candidate_generation_interval,
@@ -4099,6 +4173,9 @@ async fn run_watchers(agent: &SharedAgent) {
     let due_watchers = watcher_manager.get_due_watchers().await;
 
     for watcher in due_watchers {
+        let Some(watcher) = watcher_manager.begin_poll(watcher.id).await else {
+            continue;
+        };
         let poll_result = {
             let authorization =
                 crate::core::automation::runtime_authorization_context_from_arguments(
@@ -4115,7 +4192,7 @@ async fn run_watchers(agent: &SharedAgent) {
             {
                 Err(anyhow::anyhow!(error))
             } else {
-                match tokio::time::timeout(
+                let poll_attempt = match tokio::time::timeout(
                     Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
                     runtime.execute_action_with_context(
                         &watcher.poll_action,
@@ -4130,11 +4207,46 @@ async fn run_watchers(agent: &SharedAgent) {
                         "Watcher poll timed out after {} seconds",
                         *WATCHER_POLL_TIMEOUT_SECS
                     )),
+                };
+                match poll_attempt {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        if let Some(fallback_args) = watcher_browse_search_fallback_args(&watcher) {
+                            let fallback_result = tokio::time::timeout(
+                                Duration::from_secs(*WATCHER_POLL_TIMEOUT_SECS),
+                                runtime.execute_action_with_context(
+                                    "web_search",
+                                    &fallback_args,
+                                    &authorization,
+                                ),
+                            )
+                            .await;
+                            match fallback_result {
+                                Ok(Ok(search_output)) => Ok(format!(
+                                    "Browse failed ({}). Search fallback used for this watcher poll.\n\n{}",
+                                    error_text, search_output
+                                )),
+                                Ok(Err(search_error)) => Err(anyhow::anyhow!(
+                                    "{}; search fallback failed: {}",
+                                    error_text,
+                                    search_error
+                                )),
+                                Err(_) => Err(anyhow::anyhow!(
+                                    "{}; search fallback timed out after {} seconds",
+                                    error_text,
+                                    *WATCHER_POLL_TIMEOUT_SECS
+                                )),
+                            }
+                        } else {
+                            Err(error)
+                        }
+                    }
                 }
             }
         };
 
-        let new_count = watcher.poll_count + 1;
+        let new_count = watcher.poll_count;
 
         match poll_result {
             Ok(result) => {
@@ -4314,12 +4426,19 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
         let agent = agent.read().await;
         agent.storage.clone()
     };
+    let deferred_memory_processed = {
+        let agent_snapshot = Agent::snapshot(agent).await;
+        agent_snapshot
+            .process_deferred_user_memory_capture_candidates()
+            .await
+    };
     match crate::core::learning::run_experience_consolidation(&storage).await {
         Ok(processed) if processed > 0 => {
             let completed_at = chrono::Utc::now();
             tracing::info!(
-                "ArkSentinel: experience consolidation processed {} run(s)",
-                processed
+                "ArkSentinel: experience consolidation processed {} run(s), {} memory candidate(s)",
+                processed,
+                deferred_memory_processed
             );
             persist_background_learning_job_result(
                 &storage,
@@ -4329,12 +4448,39 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
                     started_at,
                     completed_at,
                     format!(
-                        "Consolidated {} experience run(s) into reusable learning.",
-                        processed
+                        "Consolidated {} experience run(s) and {} deferred memory candidate(s).",
+                        processed, deferred_memory_processed
                     ),
                     true,
                     serde_json::json!({
                         "experience_runs_processed": processed,
+                        "deferred_memory_candidates_processed": deferred_memory_processed,
+                    }),
+                ),
+            )
+            .await;
+        }
+        Ok(_) if deferred_memory_processed > 0 => {
+            let completed_at = chrono::Utc::now();
+            tracing::info!(
+                "ArkSentinel: experience consolidation processed {} deferred memory candidate(s)",
+                deferred_memory_processed
+            );
+            persist_background_learning_job_result(
+                &storage,
+                background_learning_job_update(
+                    "experience_consolidation",
+                    "completed",
+                    started_at,
+                    completed_at,
+                    format!(
+                        "Processed {} deferred memory candidate(s).",
+                        deferred_memory_processed
+                    ),
+                    true,
+                    serde_json::json!({
+                        "experience_runs_processed": 0,
+                        "deferred_memory_candidates_processed": deferred_memory_processed,
                     }),
                 ),
             )
@@ -4353,6 +4499,7 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
                     false,
                     serde_json::json!({
                         "experience_runs_processed": 0,
+                        "deferred_memory_candidates_processed": deferred_memory_processed,
                     }),
                 ),
             )
@@ -4378,6 +4525,13 @@ async fn run_experience_consolidation_job(agent: &SharedAgent) {
             .await;
         }
     }
+}
+
+async fn run_background_session_consolidation_job(agent: &SharedAgent) {
+    let agent_snapshot = Agent::snapshot(agent).await;
+    agent_snapshot
+        .maybe_consolidate_idle_background_sessions()
+        .await;
 }
 
 async fn run_pattern_induction_job(agent: &SharedAgent) {

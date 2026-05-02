@@ -394,8 +394,10 @@ impl Agent {
             };
         }
 
-        if assessment.delivery_policy == "in_app_only" && !delivery_channel.is_empty() {
-            delivery_channel.clear();
+        if assessment.delivery_policy == "in_app_only"
+            && delivery_channel != AUTOMATION_IN_APP_NOTIFICATION_CHANNEL
+        {
+            delivery_channel = AUTOMATION_IN_APP_NOTIFICATION_CHANNEL.to_string();
             notes.push(
                 "Planner policy: delivery stays in-app only because no external notification channel was requested."
                     .to_string(),
@@ -412,6 +414,7 @@ impl Agent {
 
         if !delivery_channel.is_empty()
             && delivery_channel != "preferred"
+            && delivery_channel != AUTOMATION_IN_APP_NOTIFICATION_CHANNEL
             && !is_external_notification_channel(&delivery_channel)
         {
             delivery_channel = "preferred".to_string();

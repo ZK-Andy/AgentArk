@@ -176,6 +176,45 @@ pub fn openai_provider_label(base_url: Option<&str>) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheCapability {
+    None,
+    OpenAiAutomatic,
+    OpenAiExplicitKey,
+    AnthropicCacheControl,
+    OpenRouterAnthropicCacheControl,
+    OpenRouterProviderSpecific,
+}
+
+pub fn prompt_cache_capability_for_openai_request(
+    provider_label: &'static str,
+    is_openrouter: bool,
+    model: &str,
+) -> PromptCacheCapability {
+    match provider_label {
+        OPENAI_PROVIDER_ID | OPENAI_SUBSCRIPTION_PROVIDER_ID => {
+            PromptCacheCapability::OpenAiExplicitKey
+        }
+        OPENROUTER_PROVIDER_ID if is_openrouter => {
+            let route_provider = model
+                .split('/')
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let route_discovery = provider_descriptor(route_provider.as_str())
+                .map(|descriptor| descriptor.capabilities.discovery);
+            if matches!(route_discovery, Some(ProviderDiscoveryKind::Anthropic)) {
+                PromptCacheCapability::OpenRouterAnthropicCacheControl
+            } else {
+                PromptCacheCapability::OpenRouterProviderSpecific
+            }
+        }
+        _ => PromptCacheCapability::None,
+    }
+}
+
 pub fn display_openai_base_url(base_url: Option<&String>) -> Option<String> {
     match base_url {
         Some(url) if is_codex_cli_base_url(url) => None,
@@ -446,14 +485,17 @@ pub struct ResolvedOpenAiRequestConfig {
     pub provider_label: &'static str,
     pub is_openrouter: bool,
     pub uses_codex_cli_oauth: bool,
+    pub prompt_cache_capability: PromptCacheCapability,
 }
 
 pub async fn resolve_openai_request_config(
     client: &reqwest::Client,
     configured_api_key: &str,
     base_url: Option<&str>,
+    model: &str,
 ) -> Result<ResolvedOpenAiRequestConfig> {
     let provider_label = openai_provider_label(base_url);
+    let is_openrouter = base_url.is_some_and(is_openrouter_base_url);
     let uses_codex_cli_oauth = base_url.is_some_and(is_codex_cli_base_url);
     let api_key = if uses_codex_cli_oauth {
         resolve_codex_cli_api_key(client, false)
@@ -482,16 +524,23 @@ pub async fn resolve_openai_request_config(
             .trim_end_matches('/')
             .to_string(),
         provider_label,
-        is_openrouter: base_url.is_some_and(is_openrouter_base_url),
+        is_openrouter,
         uses_codex_cli_oauth,
+        prompt_cache_capability: prompt_cache_capability_for_openai_request(
+            provider_label,
+            is_openrouter,
+            model,
+        ),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_openai_base_url, openai_provider_label, CODEX_CLI_BASE_URL,
-        HUGGINGFACE_API_BASE_URL, OPENROUTER_API_BASE_URL,
+        normalize_openai_base_url, openai_provider_label,
+        prompt_cache_capability_for_openai_request, PromptCacheCapability, CODEX_CLI_BASE_URL,
+        HUGGINGFACE_API_BASE_URL, OPENAI_PROVIDER_ID, OPENROUTER_API_BASE_URL,
+        OPENROUTER_PROVIDER_ID,
     };
 
     #[test]
@@ -507,6 +556,30 @@ mod tests {
         assert_eq!(
             normalize_openai_base_url("openrouter", None).unwrap(),
             Some(OPENROUTER_API_BASE_URL.to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_cache_capability_is_resolved_from_provider_model_tuple() {
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(OPENAI_PROVIDER_ID, false, "gpt-5"),
+            PromptCacheCapability::OpenAiExplicitKey
+        );
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(
+                OPENROUTER_PROVIDER_ID,
+                true,
+                "anthropic/claude-sonnet-4.6"
+            ),
+            PromptCacheCapability::OpenRouterAnthropicCacheControl
+        );
+        assert_eq!(
+            prompt_cache_capability_for_openai_request(
+                OPENROUTER_PROVIDER_ID,
+                true,
+                "deepseek/deepseek-v4-pro"
+            ),
+            PromptCacheCapability::OpenRouterProviderSpecific
         );
     }
 

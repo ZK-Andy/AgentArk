@@ -537,48 +537,6 @@ impl Agent {
         }
     }
 
-    pub(super) async fn stored_preferred_notification_channel(&self) -> Option<String> {
-        let value = self
-            .storage
-            .get("daily_brief_channel")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| is_external_notification_channel(value))?;
-        if self.notification_channel_is_configured_any(&value).await {
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    pub(super) async fn resolve_single_notification_channel(
-        &self,
-        requested: Option<&str>,
-    ) -> Option<String> {
-        if let Some(channel) = requested
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase())
-            .filter(|value| is_external_notification_channel(value))
-        {
-            if self.notification_channel_is_configured_any(&channel).await {
-                return Some(channel);
-            }
-        }
-
-        if let Some(preferred) = self.stored_preferred_notification_channel().await {
-            return Some(preferred);
-        }
-
-        self.configured_notification_channels()
-            .await
-            .into_iter()
-            .next()
-    }
-
     pub(super) async fn notification_channel_is_configured_any(&self, channel: &str) -> bool {
         let channel = channel.trim().to_ascii_lowercase();
         if channel.is_empty() || !is_external_notification_channel(&channel) {
@@ -1026,9 +984,9 @@ impl Agent {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
 
-        let preferred = Self::preferred_notification_override_value(preferred_override)
-            .or(self.stored_preferred_notification_override().await);
-        if let Some(preferred) = preferred {
+        let stored_preferred = self.stored_preferred_notification_override().await;
+        let hinted_preferred = Self::preferred_notification_override_value(preferred_override);
+        for preferred in [stored_preferred, hinted_preferred].into_iter().flatten() {
             let eligible = if push_only {
                 is_push_notification_channel(&preferred)
                     && self.push_channel_is_configured(&preferred)
@@ -1169,9 +1127,9 @@ impl Agent {
         );
         if attempts.is_empty() {
             attempts.push(NotificationDispatchOutcome {
-                channel: "push".to_string(),
-                success: false,
-                error: Some("No connected notification integrations available".to_string()),
+                channel: "web".to_string(),
+                success: true,
+                error: None,
             });
         }
         attempts
@@ -1184,6 +1142,131 @@ impl Agent {
         let _ = self
             .notify_preferred_channel_with_hint(message, None, true)
             .await;
+    }
+
+    pub(super) async fn execute_direct_notify_user_tool(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let message = arguments
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                crate::actions::structured_action_error(
+                    crate::actions::ActionErrorDomain::Channel,
+                    crate::actions::ActionErrorReason::MissingInput,
+                    "notify_user requires a non-empty `message`",
+                )
+            })?;
+        let title = arguments
+            .get("title")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let delivery_channel = arguments
+            .get("delivery_channel")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+
+        let full_message = if let Some(title) = title {
+            format!("{}\n\n{}", title, message)
+        } else {
+            message.to_string()
+        };
+
+        let Some(delivery_channel) = delivery_channel else {
+            return Ok(full_message);
+        };
+
+        let in_app_title = title.unwrap_or("AgentArk Notification");
+        let in_app = self
+            .emit_notification_with_status(in_app_title, message, "info", "agent")
+            .await;
+
+        let mut attempts = Vec::new();
+        let external_requested = is_external_notification_channel(&delivery_channel);
+        if external_requested
+            && !self
+                .notification_channel_is_configured_any(&delivery_channel)
+                .await
+        {
+            attempts.push(NotificationDispatchOutcome {
+                channel: delivery_channel.clone(),
+                success: false,
+                error: Some(
+                    crate::channels::ChannelError::not_connected(
+                        delivery_channel.clone(),
+                        format!(
+                            "{} delivery is not connected",
+                            notification_channel_display_name(&delivery_channel)
+                        ),
+                    )
+                    .to_string(),
+                ),
+            });
+        }
+
+        if delivery_channel != "web" && delivery_channel != "in_app" {
+            let preferred_hint = if delivery_channel == "preferred" {
+                None
+            } else {
+                Some(delivery_channel.as_str())
+            };
+            attempts.extend(
+                self.notify_preferred_channel_reported_with_hint(
+                    &full_message,
+                    preferred_hint,
+                    true,
+                )
+                .await,
+            );
+        }
+
+        let delivered_channel = attempts
+            .iter()
+            .find(|attempt| attempt.success && attempt.channel != "web")
+            .map(|attempt| attempt.channel.clone());
+        let detail = if let Some(channel) = delivered_channel.as_deref() {
+            format!(
+                "Notification delivered via {}.",
+                notification_channel_display_name(channel)
+            )
+        } else if in_app.success {
+            "Notification kept in-app.".to_string()
+        } else {
+            "Notification delivery failed.".to_string()
+        };
+
+        Ok(format!(
+            "{}{}",
+            crate::runtime::TOOL_COMPLETION_MARKER,
+            serde_json::json!({
+                "tool": "notify_user",
+                "status": if delivered_channel.is_some() || in_app.success { "completed" } else { "failed" },
+                "detail": detail,
+                "data": {
+                    "requested_channel": delivery_channel,
+                    "delivered_channel": delivered_channel,
+                    "in_app": {
+                        "channel": in_app.channel,
+                        "success": in_app.success,
+                        "error": in_app.error,
+                    },
+                    "attempts": attempts
+                        .into_iter()
+                        .map(|attempt| serde_json::json!({
+                            "channel": attempt.channel,
+                            "success": attempt.success,
+                            "error": attempt.error,
+                        }))
+                        .collect::<Vec<_>>(),
+                }
+            })
+        ))
     }
 
     pub(super) fn sanitize_outbound_notification_message(

@@ -1,5 +1,7 @@
 use super::*;
 
+const SETTINGS_EMBEDDINGS_HEALTH_TIMEOUT_MS: u64 = 250;
+
 /// Get current settings
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
     let (config, storage, config_dir, data_dir, embedding_client, gmail_enabled, workspace_enabled) = {
@@ -69,9 +71,29 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Settings
     let embeddings_has_api_key =
         !embeddings_cfg.api_key.is_empty() && embeddings_cfg.api_key != "[ENCRYPTED]";
     let embeddings_status = if let Some(client) = embedding_client.as_ref() {
-        match client.health_check().await {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(SETTINGS_EMBEDDINGS_HEALTH_TIMEOUT_MS),
+            client.health_check(),
+        )
+        .await
+        {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => match embeddings_cfg.provider {
+                EmbeddingsProviderKind::Disabled => {
+                    "Embeddings are disabled; retrieval uses lexical fallback.".to_string()
+                }
+                EmbeddingsProviderKind::LocalHf => format!(
+                    "Local embeddings sidecar is configured for {} and is still responding.",
+                    embeddings_model
+                ),
+                EmbeddingsProviderKind::Ollama => {
+                    "Ollama embeddings are configured and are still responding.".to_string()
+                }
+                EmbeddingsProviderKind::OpenaiCompatible => {
+                    "External embeddings are configured.".to_string()
+                }
+            },
         }
     } else {
         match embeddings_cfg.provider {
@@ -4231,7 +4253,7 @@ pub(super) async fn test_llm_connection(provider: &LlmProvider) -> Result<(), St
             model,
         } => {
             let mut request_config =
-                resolve_openai_request_config(&client, api_key, base_url.as_deref())
+                resolve_openai_request_config(&client, api_key, base_url.as_deref(), model)
                     .await
                     .map_err(|e| e.to_string())?;
             if request_config.uses_codex_cli_oauth {
@@ -5353,7 +5375,7 @@ pub(super) async fn fetch_openai_catalog_models(
     base_url: Option<&str>,
     api_key: &str,
 ) -> std::result::Result<Vec<serde_json::Value>, String> {
-    let mut request_config = resolve_openai_request_config(client, api_key, base_url)
+    let mut request_config = resolve_openai_request_config(client, api_key, base_url, "")
         .await
         .map_err(|e| e.to_string())?;
     let endpoint = format!("{}/models", request_config.base_url);

@@ -33,13 +33,6 @@ test.describe("Tasks UI", () => {
     const resumedAssistant = "Resumed from the Tasks panel and finished in chat.";
     let resumed = false;
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/tasks?**", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -57,8 +50,7 @@ test.describe("Tasks UI", () => {
                 _origin: "chat",
                 message: userMessage,
                 channel: "web",
-                conversation_id: conversationId,
-                project_id: null
+                conversation_id: conversationId
               }
             }
           ]
@@ -75,7 +67,6 @@ test.describe("Tasks UI", () => {
               id: conversationId,
               title: "Tasks panel resume chat",
               channel: "web",
-              project_id: null,
               created_at: "2026-03-31T01:00:00.000Z",
               updated_at: "2026-03-31T01:03:00.000Z",
               message_count: resumed ? 2 : 1,
@@ -96,7 +87,6 @@ test.describe("Tasks UI", () => {
           id: conversationId,
           title: "Tasks panel resume chat",
           channel: "web",
-          project_id: null,
           created_at: "2026-03-31T01:00:00.000Z",
           updated_at: "2026-03-31T01:03:00.000Z",
           message_count: resumed ? 2 : 1

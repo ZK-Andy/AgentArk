@@ -9,50 +9,25 @@ import {
   ButtonBase,
   Checkbox,
   Chip,
-  CircularProgress,
-  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
-  Divider,
   FormControlLabel,
-  IconButton,
-  Link,
-  ListItemText,
   MenuItem,
   Stack,
   Switch,
-  Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Tabs,
   TextField,
-  Tooltip,
   Typography,
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
-import ArrowDropDownRoundedIcon from "@mui/icons-material/ArrowDropDownRounded";
-import AutorenewRoundedIcon from "@mui/icons-material/AutorenewRounded";
 import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
-import CloseIcon from "@mui/icons-material/Close";
 import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 import ErrorOutlineRoundedIcon from "@mui/icons-material/ErrorOutlineRounded";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
-import MoreVertIcon from "@mui/icons-material/MoreVert";
-import OpenInFullRoundedIcon from "@mui/icons-material/OpenInFullRounded";
-import RadioButtonUncheckedRoundedIcon from "@mui/icons-material/RadioButtonUncheckedRounded";
-import SettingsRoundedIcon from "@mui/icons-material/SettingsRounded";
-import StarBorderRoundedIcon from "@mui/icons-material/StarBorderRounded";
-import StarRoundedIcon from "@mui/icons-material/StarRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -66,33 +41,15 @@ import {
   getTunnelPanelResumeMessage,
   getTunnelPanelStartMessage,
   getTunnelPanelStartingMessage,
-  getTunnelPanelWarning,
   getTunnelProviderHelp,
-  getTunnelStartButtonLabel,
-  getTunnelStopButtonLabel,
-  getTunnelUrlFieldLabel,
 } from "../../lib/tunnelAccess";
 import {
-  formatUiDateOnly,
-  formatUiDateRange,
   formatUiDateTime,
-  formatUiDateTimeMeta,
-  formatUiRelativeDateTimeMeta,
 } from "../../lib/dateFormat";
-import {
-  isBackgroundSessionVisibleInUi,
-  isOneShotReminderTask,
-  taskActionDisplay,
-  taskKind,
-  taskKindLabel,
-} from "../../lib/backgroundSessions";
 import type {
   ArkPulseRemediationSpec,
   ArkPulseRunFixRequest,
-  BackgroundSessionSummary,
-  Task,
 } from "../../types";
-import { useUiStore } from "../../store/uiStore";
 import {
   asRecord,
   errMessage,
@@ -104,35 +61,23 @@ import {
   type JsonRecord,
 } from "./pageHelpers";
 import {
-  formatBytes,
   humanTs,
   KeyValuePanel,
-  RowOpsMenu,
 } from "./workspaceUiBits";
 import {
-  asRecords,
-  boolText,
   DEVELOPER_MODE_EVENT,
   getDeveloperModeEnabled,
-  humanizeStatusLabel,
   OLLAMA_DEFAULT_BASE_URL,
   OPENROUTER_DEFAULT_BASE_URL,
   REFRESH_MS,
   setDeveloperModeEnabled,
 } from "./workspaceCore";
 import {
-  ADVANCED_SENTINEL_SIGNAL_OPTIONS,
-  MODEL_PROVIDER_OPTIONS,
-  TRUST_APPROVAL_PRESETS,
-  type TrustApprovalPreset,
-} from "./settingsConstants";
-import {
-  AUTO_APPROVE_ACTION_OPTIONS,
+  arkPulseManualFollowupText,
   arkPulseRemediationFootnote,
   arkPulseRunActionLabel,
   collapseInlineWhitespace,
   describeArkPulseRemediation,
-  formatDurationClock,
   formatDurationFromSeconds,
   formatTimestampForHumans,
   formatTraceDuration,
@@ -146,9 +91,6 @@ import {
   SEARCH_PROVIDER_OPTIONS,
   titleCaseLabel,
   truncateUiText,
-  tunnelCheckAlertSeverity,
-  tunnelCheckChipColor,
-  tunnelCheckLabel,
 } from "./settingsPageHelpers";
 import {
   CompanionDevicesPanel,
@@ -158,6 +100,11 @@ import {
   MemoryPage,
   ObservabilityPanel,
   PluginSdkPanel,
+  SettingsAdvancedPanel,
+  SettingsModelsPanel,
+  SettingsSecurityPanel,
+  SettingsDataLifecyclePanel,
+  SettingsUpdatesPanel,
   TracePage,
   WebhooksPanel,
 } from "./settingsLazyPanels";
@@ -191,7 +138,7 @@ import {
   fetchSettingsUpdateStatus,
   fetchTunnelProviders,
   fetchTunnelStatus,
-  prefetchSettingsPageData,
+  prefetchSettingsTabData,
   SETTINGS_CACHE_GC_TIME_MS,
   SETTINGS_QUERY_KEYS,
 } from "./settingsData";
@@ -201,10 +148,7 @@ import {
   settingsTabSupportsSave,
   type SettingsPageProps,
 } from "./settingsMeta";
-import {
-  preloadCommonSettingsPanels,
-  preloadSettingsTab,
-} from "./workspacePreload";
+import { preloadSettingsTab } from "./workspacePreload";
 
 const RESTART_NOTICE_DURATION_MS = 10_000;
 const UPDATE_NOTICE_DURATION_MS = 120_000;
@@ -382,7 +326,6 @@ export default function SettingsPage({
   const [vaultEditorKey, setVaultEditorKey] = useState("");
   const [vaultEditorValue, setVaultEditorValue] = useState("");
   const [showVaultSecretValue, setShowVaultSecretValue] = useState(false);
-  const [securityLogsDialogOpen, setSecurityLogsDialogOpen] = useState(false);
   const [selectedPulseEvent, setSelectedPulseEvent] =
     useState<JsonRecord | null>(null);
   const [activePulseFixId, setActivePulseFixId] = useState<string | null>(null);
@@ -398,14 +341,6 @@ export default function SettingsPage({
   );
   const [savedDeveloperModeEnabled, setSavedDeveloperModeEnabledState] =
     useState(getDeveloperModeEnabled);
-  const [trustPresetId, setTrustPresetId] = useState(
-    TRUST_APPROVAL_PRESETS[0]?.id ?? "run_terminal_command",
-  );
-  const [trustPresetDetail, setTrustPresetDetail] = useState("ls -la");
-  const [trustUseAdvancedInput, setTrustUseAdvancedInput] = useState(false);
-  const [trustActionKind, setTrustActionKind] = useState("shell");
-  const [trustPayloadJson, setTrustPayloadJson] = useState("{}");
-  const [trustResult, setTrustResult] = useState<JsonRecord | null>(null);
   const [tunnelSelectedProviderId, setTunnelSelectedProviderId] = useState("");
   const [tunnelDraftValues, setTunnelDraftValues] = useState<
     Record<string, string>
@@ -418,13 +353,19 @@ export default function SettingsPage({
   } | null>(null);
   const [resumeTunnelStartAfterPassword, setResumeTunnelStartAfterPassword] =
     useState(false);
+  const modelTabActive = tab === 1;
+  const mediaTabActive = tab === 3;
   const securityTabActive = tab === 4;
   const advancedTabActive = tab === 5;
   const observabilityTabActive = tab === 6;
-  const pulseTabActive = tab === 9;
   const standaloneArkPulse = standaloneSurface === "arkpulse";
+  const pulseTabActive = standaloneArkPulse || tab === 9;
   const updatesTabActive = tab === 25;
-  const backgroundSettingsDataEnabled = !standaloneArkPulse;
+  const setupTabActive = tab === 0;
+  const channelsTabActive = tab === 20;
+  const needsAvailableChannels = setupTabActive || channelsTabActive;
+  const needsMediaSettings = setupTabActive || mediaTabActive;
+  const needsModelSettings = setupTabActive || modelTabActive;
 
   useEffect(() => {
     const nextTab = resolveInitialSettingsTab(initialTab);
@@ -433,15 +374,10 @@ export default function SettingsPage({
 
   useEffect(() => {
     preloadSettingsTab(tab);
-  }, [tab]);
-
-  useEffect(() => {
-    if (standaloneArkPulse) return;
-    preloadCommonSettingsPanels();
-    prefetchSettingsPageData(queryClient);
-    const timer = window.setTimeout(preloadCommonSettingsPanels, 260);
-    return () => window.clearTimeout(timer);
-  }, [queryClient, standaloneArkPulse]);
+    if (!standaloneArkPulse) {
+      prefetchSettingsTabData(queryClient, tab);
+    }
+  }, [queryClient, standaloneArkPulse, tab]);
 
   useEffect(() => {
     const refreshDeveloperMode = () => {
@@ -519,28 +455,31 @@ export default function SettingsPage({
   const availableChannelsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.availableMessagingChannels,
     queryFn: fetchAvailableMessagingChannels,
+    enabled: needsAvailableChannels,
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    refetchInterval: needsAvailableChannels && autoRefresh ? REFRESH_MS : false,
   });
   const mediaQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.media,
     queryFn: fetchSettingsMedia,
+    enabled: needsMediaSettings,
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    refetchInterval: needsMediaSettings && autoRefresh ? REFRESH_MS : false,
   });
   const modelsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.models,
     queryFn: fetchModels,
+    enabled: needsModelSettings,
     staleTime: CORE_SETTINGS_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
-    refetchInterval: autoRefresh ? REFRESH_MS : false,
+    refetchInterval: needsModelSettings && autoRefresh ? REFRESH_MS : false,
   });
   const updateStatusQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.updateStatus,
     queryFn: fetchSettingsUpdateStatus,
-    enabled: updatesTabActive || backgroundSettingsDataEnabled,
+    enabled: updatesTabActive,
     staleTime: 60_000,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: false,
@@ -549,7 +488,7 @@ export default function SettingsPage({
   const apiKeyQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.apiKey,
     queryFn: fetchSettingsApiKey,
-    enabled: advancedTabActive || backgroundSettingsDataEnabled,
+    enabled: advancedTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: advancedTabActive ? 10000 : false,
@@ -558,7 +497,7 @@ export default function SettingsPage({
   const settingsAutonomyQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.autonomySettings,
     queryFn: fetchSettingsAutonomy,
-    enabled: advancedTabActive || backgroundSettingsDataEnabled,
+    enabled: advancedTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: advancedTabActive && autoRefresh ? REFRESH_MS : false,
@@ -567,7 +506,7 @@ export default function SettingsPage({
   const settingsEvolutionQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.evolution,
     queryFn: fetchSettingsEvolution,
-    enabled: advancedTabActive || backgroundSettingsDataEnabled,
+    enabled: advancedTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: advancedTabActive && autoRefresh ? REFRESH_MS : false,
@@ -576,7 +515,7 @@ export default function SettingsPage({
   const settingsSentinelQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.sentinel,
     queryFn: fetchSettingsSentinel,
-    enabled: advancedTabActive || backgroundSettingsDataEnabled,
+    enabled: advancedTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: advancedTabActive && autoRefresh ? REFRESH_MS : false,
@@ -585,7 +524,7 @@ export default function SettingsPage({
   const tunnelQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.tunnelStatus,
     queryFn: fetchTunnelStatus,
-    enabled: securityTabActive || backgroundSettingsDataEnabled,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -593,7 +532,7 @@ export default function SettingsPage({
   const tunnelProvidersQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.tunnelProviders,
     queryFn: fetchTunnelProviders,
-    enabled: securityTabActive || backgroundSettingsDataEnabled,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -601,7 +540,7 @@ export default function SettingsPage({
   const securityStatusQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityStatus,
     queryFn: fetchSecurityStatus,
-    enabled: securityTabActive || backgroundSettingsDataEnabled,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -609,22 +548,16 @@ export default function SettingsPage({
   const abuseReviewsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityAbuseReviews,
     queryFn: fetchSecurityAbuseReviews,
-    enabled: securityTabActive || backgroundSettingsDataEnabled,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
   });
   const abuseReviews = pickRecords(abuseReviewsQ.data, "reviews");
-  const securityLogsQ = useQuery({
-    queryKey: ["settings-security-logs-dialog"],
-    queryFn: () => api.rawGet("/security/logs?limit=80"),
-    enabled: tab === 4 && securityLogsDialogOpen,
-    refetchInterval: securityLogsDialogOpen && autoRefresh ? REFRESH_MS : false,
-  });
   const observabilityLogsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.observabilityLogs,
     queryFn: fetchSettingsObservabilityLogs,
-    enabled: observabilityTabActive || backgroundSettingsDataEnabled,
+    enabled: observabilityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: observabilityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -632,7 +565,7 @@ export default function SettingsPage({
   const vaultSecretsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.secrets,
     queryFn: fetchSettingsSecrets,
-    enabled: securityTabActive || backgroundSettingsDataEnabled,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: false,
@@ -640,7 +573,7 @@ export default function SettingsPage({
   const pulseQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.arkPulseLog,
     queryFn: fetchArkPulseLog,
-    enabled: pulseTabActive || backgroundSettingsDataEnabled,
+    enabled: pulseTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: pulseTabActive
@@ -786,7 +719,7 @@ export default function SettingsPage({
 
     auto_approve_csv: "",
     model_privacy_default_mode: "default_redact",
-    model_privacy_current_chat_pii_policy: "raw_current_turn",
+    model_privacy_current_chat_pii_policy: "mask_chat_pii",
     model_privacy_request_scoped_sensitive_approval_enabled: true,
 
     default_image_provider: "",
@@ -1030,21 +963,6 @@ export default function SettingsPage({
     return parsed;
   }
 
-  function parseBoundedFloat(
-    value: string,
-    label: string,
-    min: number,
-    max: number,
-  ): number {
-    const trimmed = value.trim();
-    if (!trimmed) throw new Error(`${label} is required.`);
-    const parsed = Number(trimmed);
-    if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
-      throw new Error(`${label} must be between ${min} and ${max}.`);
-    }
-    return parsed;
-  }
-
   function recordToStringMap(value: unknown): Record<string, string> {
     const raw = asRecord(value);
     const out: Record<string, string> = {};
@@ -1244,7 +1162,7 @@ export default function SettingsPage({
       ),
       model_privacy_current_chat_pii_policy: str(
         settings.current_chat_pii_policy,
-        "raw_current_turn",
+        "mask_chat_pii",
       ),
       model_privacy_request_scoped_sensitive_approval_enabled:
         settings.request_scoped_sensitive_approval_enabled == null
@@ -1730,7 +1648,7 @@ export default function SettingsPage({
         default_model_input_mode:
           form.model_privacy_default_mode || "default_redact",
         current_chat_pii_policy:
-          form.model_privacy_current_chat_pii_policy || "raw_current_turn",
+          form.model_privacy_current_chat_pii_policy || "mask_chat_pii",
         request_scoped_sensitive_approval_enabled:
           form.model_privacy_request_scoped_sensitive_approval_enabled,
 
@@ -2762,6 +2680,15 @@ export default function SettingsPage({
     modelSlotsLive.length === 0 &&
     stableModelSlots.length > 0 &&
     (modelsQ.isFetching || !!modelsRefreshIssue);
+  const activeSettingsDataLoading =
+    !standaloneArkPulse &&
+    (settingsQ.isLoading ||
+      (needsMediaSettings && mediaQ.isLoading) ||
+      (needsModelSettings && modelsQ.isLoading));
+  const activeSettingsDataError =
+    settingsQ.error ||
+    (needsMediaSettings ? mediaQ.error : null) ||
+    (needsModelSettings ? modelsQ.error : null);
 
   const apiKeyPayload = asRecord(apiKeyQ.data);
   const settingsAutonomyPayload = asRecord(settingsAutonomyQ.data);
@@ -2843,10 +2770,6 @@ export default function SettingsPage({
           typeof value === "string" && value.trim().length > 0,
       )
     : [];
-  const selectedTunnelDescription = str(
-    selectedTunnelProviderRecord?.description,
-    "",
-  ).trim();
   const selectedTunnelAvailable = toBool(
     selectedTunnelProviderRecord?.available,
   );
@@ -2855,19 +2778,6 @@ export default function SettingsPage({
   );
   const selectedTunnelMeta = getTunnelAccessMeta(selectedTunnelProviderRecord);
   const activeTunnelMeta = getTunnelAccessMeta(tunnel);
-  const recommendedPublicTunnelProvider = useMemo(() => {
-    const publicProviders = tunnelProviders.filter(
-      (provider) => !getTunnelAccessMeta(provider).isPrivate,
-    );
-    return (
-      publicProviders.find(
-        (provider) => toBool(provider.available) && toBool(provider.configured),
-      ) ||
-      publicProviders.find((provider) => toBool(provider.available)) ||
-      publicProviders[0] ||
-      null
-    );
-  }, [tunnelProviders]);
   const tunnelProviderOptions = useMemo(() => {
     if (showTunnelAdvanced) return tunnelProviders;
     const keepIds = new Set(
@@ -2948,7 +2858,6 @@ export default function SettingsPage({
     setTunnelPanelNotice(null);
   }, [tunnelSelectedProviderId, serverSelectedTunnelProviderId]);
 
-  const securityLogs = pickRecords(securityLogsQ.data, "logs");
   const usingDefaultMasterPassword = toBool(sec.using_default);
   const hasCustomMasterPassword =
     toBool(sec.master_password_set) && !usingDefaultMasterPassword;
@@ -2994,11 +2903,6 @@ export default function SettingsPage({
             : selectedTunnelMeta.isPrivate
               ? "Only your connected devices will be able to reach it."
               : "Password-protected sign-in page will be available at the public link.";
-  const tunnelHasDetails =
-    advancedTunnelConfigFields.length > 0 ||
-    selectedTunnelDescription.length > 0 ||
-    selectedTunnelHelp.length > 0 ||
-    tunnelGuidanceText.length > 0;
   const vaultSummaryText = hasCustomMasterPassword
     ? `${vaultSecrets.length} stored secret${vaultSecrets.length === 1 ? "" : "s"}. Password is required only for protected add or delete actions.`
     : `${vaultSecrets.length} stored secret${vaultSecrets.length === 1 ? "" : "s"}. Secrets stay encrypted even without a custom password.`;
@@ -3031,9 +2935,9 @@ export default function SettingsPage({
   );
   const selectedPulseFindings = useMemo(
     () =>
-      pickRecords(selectedPulseDetails, "doctor_findings").filter((f) =>
-        isUserActionableDoctorFinding(f),
-      ),
+      pickRecords(selectedPulseDetails, "doctor_findings")
+        .map((row, findingIndex) => ({ row, findingIndex }))
+        .filter((finding) => isUserActionableDoctorFinding(finding.row)),
     [selectedPulseDetails],
   );
   const selectedPulseScore = num(selectedPulseDetails.doctor_score, -1);
@@ -3061,7 +2965,7 @@ export default function SettingsPage({
         severity: "warning" as const,
         title: `${selectedPulseFindings.length} ${issueLabel} need attention.`,
         detail:
-          "Use the recommended remediation under each issue, then run ArkPulse again.",
+          "Run only verified ArkPulse actions; findings without a runnable remediation are manual follow-up.",
       };
     }
     return {
@@ -3223,25 +3127,6 @@ export default function SettingsPage({
     if (s === "low") return "info";
     if (s === "ok" || s === "info") return "success";
     return "default";
-  }
-
-  function securityEventTypeLabel(eventType: string): string {
-    const normalized = (eventType || "").trim().toLowerCase();
-    if (!normalized) return "Unknown";
-    return normalized
-      .replace(/_/g, " ")
-      .replace(/\b\w/g, (m) => m.toUpperCase());
-  }
-
-  function securitySeverityAccent(sev: string): string {
-    const s = (sev || "").trim().toLowerCase();
-    if (s === "critical" || s === "high" || s === "error")
-      return "var(--ui-rgba-248-113-113-900)";
-    if (s === "medium" || s === "warn" || s === "warning")
-      return "var(--ui-rgba-251-191-36-880)";
-    if (s === "low") return "var(--ui-rgba-56-189-248-880)";
-    if (s === "ok" || s === "info") return "var(--ui-rgba-52-211-153-880)";
-    return "var(--ui-rgba-255-255-255-200)";
   }
 
   function pulseScanStatusColor(
@@ -3661,12 +3546,14 @@ export default function SettingsPage({
         event_timestamp: payload.eventTimestamp || undefined,
         finding_index: payload.findingIndex,
       };
-      const fixCommand = payload.fixCommand.trim();
-      if (fixCommand) {
-        body.fix_command = fixCommand;
-      }
-      if (payload.remediation) {
-        body.remediation = payload.remediation;
+      if (!payload.eventTimestamp || !Number.isFinite(payload.findingIndex)) {
+        const fixCommand = payload.fixCommand.trim();
+        if (fixCommand) {
+          body.fix_command = fixCommand;
+        }
+        if (payload.remediation) {
+          body.remediation = payload.remediation;
+        }
       }
       const out = asRecord(await api.rawPost("/arkpulse/fix", body));
       const status = str(out.status, "").toLowerCase();
@@ -3682,7 +3569,6 @@ export default function SettingsPage({
     onSuccess: async (raw) => {
       const message = str(raw.message, "").trim();
       const output = str(raw.output, "").trim();
-      const mode = str(raw.mode, "").trim().toLowerCase();
       if (message && output) {
         setSuccess(`${message}\n\n${output}`);
       } else if (message) {
@@ -3690,22 +3576,7 @@ export default function SettingsPage({
       } else {
         setSuccess("ArkPulse fix completed.");
       }
-      const baselineEventId = latestPulseEventId;
       setSelectedPulseEvent(null);
-      if (!pulseRunning) {
-        setPulsePollState({
-          baselineEventId,
-          deadlineAt: Date.now() + 2 * 60 * 1000,
-        });
-        if (mode !== "app_restart") {
-          try {
-            await api.rawPost("/arkpulse/trigger", {});
-          } catch (e) {
-            setPulsePollState(null);
-            setError(`Fix ran, but ArkPulse refresh failed: ${errMessage(e)}`);
-          }
-        }
-      }
       await queryClient.invalidateQueries({ queryKey: ["arkpulse-log"] });
       await queryClient.invalidateQueries({ queryKey: ["tunnel-status"] });
       await queryClient.invalidateQueries({
@@ -3717,14 +3588,6 @@ export default function SettingsPage({
     },
     onError: (e) => setError(errMessage(e)),
   });
-  const trustEvaluateMutation = useMutation({
-    mutationFn: (payload: { action_kind: string; payload: unknown }) =>
-      api.rawPost("/autonomy/trust/evaluate", payload),
-  });
-  const selectedTrustPreset =
-    TRUST_APPROVAL_PRESETS.find((item) => item.id === trustPresetId) ??
-    TRUST_APPROVAL_PRESETS[0];
-
   const decideAbuseReviewMutation = useMutation({
     mutationFn: (payload: { sourceKeyHash: string; decision: "approve" | "reject" }) =>
       api.rawPost(
@@ -5228,953 +5091,70 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 1 ? (
-              <Stack
-                spacing={1.5}
-                data-tour-target="settings-models"
-                sx={{ minHeight: 0 }}
-              >
-                <Box sx={{ minHeight: 0 }}>
-                  <Stack spacing={1.5}>
-                    <Tabs
-                      value={modelsSectionTab}
-                      onChange={(_, value) =>
-                        setModelsSectionTab(value as "pool" | "embeddings")
-                      }
-                      variant="scrollable"
-                      scrollButtons="auto"
-                      sx={{
-                        minHeight: 0,
-                        "& .MuiTabs-indicator": {
-                          height: 2,
-                        },
-                      }}
-                    >
-                      <Tab value="pool" label="Model Pool" />
-                      <Tab value="embeddings" label="Embeddings" />
-                    </Tabs>
-
-                    {modelsSectionTab === "pool" ? (
-                      <Box sx={{ minHeight: 0 }}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Models",
-                          title: "Model Pool",
-                          description:
-                            "Configure the models AgentArk uses for primary, fast, code, research, and fallback work.",
-                          action: (
-                            <Button
-                              size="small"
-                              variant="contained"
-                              onClick={openAddModel}
-                            >
-                              Add Model
-                            </Button>
-                          ),
-                        })}
-
-                        <Stack
-                          direction="row"
-                          spacing={2}
-                          sx={{
-                            alignItems: "center",
-                            mb: 1,
-                          }}
-                        >
-                          <FormControlLabel
-                            control={
-                              <Switch
-                                checked={form.smart_routing}
-                                onChange={(e) =>
-                                  setField("smart_routing", e.target.checked)
-                                }
-                              />
-                            }
-                            label="Smart Routing"
-                          />
-                          <Typography
-                            variant="caption"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            When off, the agent uses the primary model for
-                            everything.
-                          </Typography>
-                        </Stack>
-
-                        {modelsQ.isLoading && modelSlots.length === 0 ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Loading models...
-                          </Typography>
-                        ) : modelsRefreshIssue && modelSlots.length === 0 ? (
-                          <Alert severity="warning">
-                            Could not refresh model list right now. Please retry
-                            in a moment.
-                          </Alert>
-                        ) : modelSlots.length === 0 ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            No models configured. Add a model to complete setup.
-                          </Typography>
-                        ) : (
-                          <Stack spacing={1}>
-                            {showingModelFallback ? (
-                              <Alert severity="info">
-                                Showing last known model list while refresh is
-                                in progress.
-                              </Alert>
-                            ) : null}
-                            <TableContainer className="table-shell settings-models-table-shell">
-                              <Table size="small">
-                                <TableHead>
-                                  <TableRow>
-                                    <TableCell>Label</TableCell>
-                                    <TableCell>Role</TableCell>
-                                    <TableCell>Provider</TableCell>
-                                    <TableCell>Model</TableCell>
-                                    <TableCell>Enabled</TableCell>
-                                    <TableCell>API Key</TableCell>
-                                    <TableCell align="right">Ops</TableCell>
-                                  </TableRow>
-                                </TableHead>
-                                <TableBody>
-                                  {modelSlots.map((slot) => {
-                                    const id = str(slot.id, "");
-                                    const enabled = toBool(slot.enabled);
-                                    return (
-                                      <TableRow key={id}>
-                                        <TableCell>
-                                          {str(slot.label, "-")}
-                                        </TableCell>
-                                        <TableCell>
-                                          {str(slot.role, "-")}
-                                        </TableCell>
-                                        <TableCell>
-                                          {str(slot.provider, "-")}
-                                        </TableCell>
-                                        <TableCell
-                                          sx={{ wordBreak: "break-word" }}
-                                        >
-                                          {str(slot.model, "-")}
-                                        </TableCell>
-                                        <TableCell>
-                                          {enabled ? "yes" : "no"}
-                                        </TableCell>
-                                        <TableCell>
-                                          {toBool(slot.has_api_key)
-                                            ? "configured"
-                                            : "-"}
-                                        </TableCell>
-                                        <TableCell align="right">
-                                          <RowOpsMenu
-                                            actions={[
-                                              {
-                                                label: "Edit",
-                                                onClick: () =>
-                                                  openEditModel(slot),
-                                              },
-                                              {
-                                                label: enabled
-                                                  ? "Disable"
-                                                  : "Enable",
-                                                disabled:
-                                                  toggleModelEnabledMutation.isPending,
-                                                onClick: async () => {
-                                                  setError(null);
-                                                  try {
-                                                    await toggleModelEnabledMutation.mutateAsync(
-                                                      slot,
-                                                    );
-                                                  } catch (e) {
-                                                    setError(errMessage(e));
-                                                  }
-                                                },
-                                              },
-                                              {
-                                                label: "Delete",
-                                                tone: "error",
-                                                divider: true,
-                                                disabled:
-                                                  deleteModelMutation.isPending,
-                                                onClick: async () => {
-                                                  const ok = window.confirm(
-                                                    "Delete this model slot?",
-                                                  );
-                                                  if (!ok) return;
-                                                  setError(null);
-                                                  try {
-                                                    await deleteModelMutation.mutateAsync(
-                                                      slot,
-                                                    );
-                                                  } catch (e) {
-                                                    setError(errMessage(e));
-                                                  }
-                                                },
-                                              },
-                                            ]}
-                                            ariaLabel="Model options"
-                                          />
-                                        </TableCell>
-                                      </TableRow>
-                                    );
-                                  })}
-                                </TableBody>
-                              </Table>
-                            </TableContainer>
-                          </Stack>
-                        )}
-                      </Box>
-                    ) : (
-                      <Stack spacing={1.5}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Models",
-                          title: "Embeddings",
-                          description:
-                            "Choose the backend used for local memory, retrieval, and document embeddings.",
-                        })}
-
-                        <Stack
-                          direction="row"
-                          spacing={1}
-                          useFlexGap
-                          sx={{
-                            flexWrap: "wrap",
-                          }}
-                        >
-                          <Chip
-                            size="small"
-                            variant="outlined"
-                            label={
-                              embeddingsProvider === "local-hf"
-                                ? "Local Hugging Face"
-                                : embeddingsProvider === "ollama"
-                                  ? "External Ollama"
-                                  : embeddingsDisabled
-                                    ? "Disabled"
-                                    : "External Provider"
-                            }
-                          />
-                          <Chip
-                            size="small"
-                            variant="outlined"
-                            label={
-                              form.embeddings_model.trim() ||
-                              "No model selected"
-                            }
-                          />
-                          {embeddingsProvider === "openai-compatible" ? (
-                            <Chip
-                              size="small"
-                              variant="outlined"
-                              color={
-                                form.embeddings_api_key.trim() ||
-                                embeddingsHasApiKey
-                                  ? "success"
-                                  : "default"
-                              }
-                              label={
-                                form.embeddings_api_key.trim() ||
-                                embeddingsHasApiKey
-                                  ? "API key configured"
-                                  : "No API key"
-                              }
-                            />
-                          ) : null}
-                        </Stack>
-
-                        {embeddingsStatus ? (
-                          <Alert
-                            severity={
-                              /failed|unavailable|error/i.test(embeddingsStatus)
-                                ? "error"
-                                : /ready/i.test(embeddingsStatus)
-                                  ? "success"
-                                  : /download|initializ|configured|reachable/i.test(
-                                        embeddingsStatus,
-                                      )
-                                    ? "info"
-                                    : "warning"
-                            }
-                          >
-                            {embeddingsStatus}
-                          </Alert>
-                        ) : null}
-
-                        <Grid2 container spacing={1.5}>
-                          <Grid2 size={{ xs: 12, md: 4 }}>
-                            <TextField
-                              label="Provider"
-                              select
-                              value={form.embeddings_provider}
-                              onChange={(e) =>
-                                setField("embeddings_provider", e.target.value)
-                              }
-                              fullWidth
-                              size="small"
-                            >
-                              <MenuItem value="disabled">
-                                Disabled
-                              </MenuItem>
-                              <MenuItem value="local-hf">
-                                Local Hugging Face
-                              </MenuItem>
-                              <MenuItem value="openai-compatible">
-                                External OpenAI-compatible
-                              </MenuItem>
-                              <MenuItem value="ollama">
-                                External Ollama
-                              </MenuItem>
-                            </TextField>
-                          </Grid2>
-                          {!embeddingsIsLocal && !embeddingsDisabled ? (
-                            <Grid2 size={{ xs: 12, md: 8 }}>
-                              <TextField
-                                label="Embedding Model"
-                                value={form.embeddings_model}
-                                onChange={(e) =>
-                                  setField("embeddings_model", e.target.value)
-                                }
-                                fullWidth
-                                size="small"
-                                placeholder={
-                                  embeddingsIsOllama
-                                    ? "nomic-embed-text"
-                                    : "text-embedding-3-small"
-                                }
-                                helperText={
-                                  embeddingsIsOllama
-                                    ? "Example: nomic-embed-text"
-                                    : "Use the model name exposed by your external /embeddings provider."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
-
-                          {embeddingsIsExternal ? (
-                            <Grid2 size={{ xs: 12, md: 8 }}>
-                              <TextField
-                                label={
-                                  embeddingsIsOllama
-                                    ? "Base URL"
-                                    : "Base URL (optional)"
-                                }
-                                value={form.embeddings_base_url}
-                                onChange={(e) =>
-                                  setField(
-                                    "embeddings_base_url",
-                                    e.target.value,
-                                  )
-                                }
-                                fullWidth
-                                size="small"
-                                placeholder={
-                                  embeddingsIsOllama
-                                    ? "http://host.docker.internal:11434"
-                                    : "https://api.openai.com/v1"
-                                }
-                                helperText={
-                                  embeddingsIsOllama
-                                    ? "Point this at a user-managed Ollama server. AgentArk does not bundle Ollama."
-                                    : "Leave blank to use the provider default. Set this when using another OpenAI-compatible embeddings endpoint."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
-
-                          {embeddingsProvider === "openai-compatible" ? (
-                            <Grid2 size={{ xs: 12, md: 4 }}>
-                              <TextField
-                                label="API Key (optional)"
-                                value={form.embeddings_api_key}
-                                onChange={(e) =>
-                                  setField("embeddings_api_key", e.target.value)
-                                }
-                                fullWidth
-                                size="small"
-                                type="password"
-                                helperText={
-                                  embeddingsHasApiKey
-                                    ? "Leave blank to keep the current key."
-                                    : "Only required if your external provider needs authentication."
-                                }
-                              />
-                            </Grid2>
-                          ) : null}
-                        </Grid2>
-
-                        {embeddingsIsLocal ? (
-                          <Alert
-                            severity="info"
-                            icon={<InfoOutlinedIcon fontSize="inherit" />}
-                          >
-                            Local embeddings use the built-in default model{" "}
-                            {LOCAL_EMBEDDINGS_MODEL} and initialize only when
-                            dense retrieval is used. The model runs in the
-                            AgentArk embeddings sidecar, isolated from the
-                            main chat server, and no Ollama service is required.
-                          </Alert>
-                        ) : null}
-                        {embeddingsDisabled ? (
-                          <Alert
-                            severity="info"
-                            icon={<InfoOutlinedIcon fontSize="inherit" />}
-                          >
-                            Dense embeddings are disabled. Memory, document,
-                            and action retrieval use lexical fallback until a
-                            dense provider is enabled.
-                          </Alert>
-                        ) : null}
-                      </Stack>
-                    )}
-                  </Stack>
-                </Box>
-
-                <Dialog
-                  open={modelDialogOpen}
-                  onClose={() => setModelDialogOpen(false)}
-                  fullWidth
-                  maxWidth="sm"
-                >
-                  <DialogTitle>
-                    {modelEditingId ? "Edit Model" : "Add Model"}
-                  </DialogTitle>
-                  <DialogContent>
-                    <Stack spacing={1.5} sx={{ mt: 1 }}>
-                      <TextField
-                        label="Label"
-                        value={modelForm.label}
-                        onChange={(e) =>
-                          setModelForm((p) => ({ ...p, label: e.target.value }))
-                        }
-                        fullWidth
-                      />
-                      <TextField
-                        label="Role"
-                        select
-                        value={modelForm.role}
-                        onChange={(e) =>
-                          setModelForm((p) => ({ ...p, role: e.target.value }))
-                        }
-                        fullWidth
-                      >
-                        <MenuItem value="primary">primary</MenuItem>
-                        <MenuItem value="fast">fast</MenuItem>
-                        <MenuItem value="code">code</MenuItem>
-                        <MenuItem value="research">research</MenuItem>
-                        <MenuItem value="fallback">fallback</MenuItem>
-                      </TextField>
-                      <TextField
-                        label="Provider"
-                        select
-                        value={modelForm.provider}
-                        onChange={(e) =>
-                          setModelForm((p) => ({
-                            ...p,
-                            provider: e.target.value,
-                          }))
-                        }
-                        fullWidth
-                      >
-                        <MenuItem value="">Select provider</MenuItem>
-                        {modelForm.provider === "openai-subscription" ? (
-                          <MenuItem
-                            value="openai-subscription"
-                            sx={{ display: "none" }}
-                          >
-                            openai-subscription
-                          </MenuItem>
-                        ) : null}
-                        {MODEL_PROVIDER_OPTIONS.map((provider) => (
-                          <MenuItem key={provider.value} value={provider.value}>
-                            {provider.label}
-                          </MenuItem>
-                        ))}
-                      </TextField>
-                      <Autocomplete
-                        freeSolo
-                        options={modelOptions}
-                        loading={discoverModelsQ.isFetching}
-                        value={modelForm.model}
-                        onChange={(_, v) =>
-                          setModelForm((p) => ({
-                            ...p,
-                            model: String(v ?? ""),
-                          }))
-                        }
-                        inputValue={modelForm.model}
-                        onInputChange={(_, v) =>
-                          setModelForm((p) => ({ ...p, model: v }))
-                        }
-                        renderOption={(props, option) => {
-                          const name = modelOptionNames.get(option);
-                          return (
-                            <li {...props}>
-                              <ListItemText
-                                primary={name || option}
-                                secondary={
-                                  name && name !== option ? option : undefined
-                                }
-                              />
-                            </li>
-                          );
-                        }}
-                        renderInput={(params) => (
-                          <TextField
-                            {...params}
-                            label="Model"
-                            fullWidth
-                            placeholder={
-                              modelForm.provider === "openai-subscription"
-                                ? "Choose or enter OpenAI model id"
-                                : "Choose or enter model id"
-                            }
-                            helperText={
-                              modelForm.provider === "openai-compatible" &&
-                              !modelForm.base_url.trim()
-                                ? "Set a Base URL in Advanced to auto-discover models, or type a model ID manually."
-                                : discoverModelsQ.isFetching
-                                  ? "Loading provider models. You can still type any model ID."
-                                  : "You can type any model ID even if it is not listed."
-                            }
-                          />
-                        )}
-                      />
-                      {modelForm.provider === "openai-subscription" ? (
-                        <Stack spacing={1}>
-                          <Alert severity="info">
-                            Connect your OpenAI subscription with browser OAuth.
-                            You can reconnect any time, especially if auth
-                            expires.
-                            <br />
-                            <br />
-                            <strong>First time?</strong> Enable device code auth
-                            in your OpenAI account: go to{" "}
-                            <a
-                              href="https://chatgpt.com/settings/security"
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              style={{ color: "inherit" }}
-                            >
-                              chatgpt.com/settings/security
-                            </a>{" "}
-                            {"->"} toggle{" "}
-                            <strong>"Enable device code authorization"</strong>{" "}
-                            on.
-                          </Alert>
-                          <Stack direction="row" spacing={1}>
-                            <Button
-                              variant="contained"
-                              size="small"
-                              onClick={startOpenaiSubscriptionOAuth}
-                              disabled={codexAuthBusy}
-                            >
-                              {codexAuthBusy
-                                ? "Starting..."
-                                : modelEditingId
-                                  ? "Reconnect OAuth"
-                                  : "Connect via Browser"}
-                            </Button>
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              onClick={checkOpenaiSubscriptionOAuthStatus}
-                              disabled={codexAuthBusy}
-                            >
-                              Check Status
-                            </Button>
-                            <Button
-                              variant="text"
-                              size="small"
-                              onClick={() => {
-                                const authUrl = (
-                                  openaiSubAuth?.authUrl || ""
-                                ).trim();
-                                if (!authUrl) return;
-                                window.open(
-                                  authUrl,
-                                  "_blank",
-                                  "noopener,noreferrer",
-                                );
-                              }}
-                              disabled={
-                                codexAuthBusy ||
-                                !(openaiSubAuth?.authUrl || "").trim()
-                              }
-                            >
-                              Open URL
-                            </Button>
-                          </Stack>
-                          {(openaiSubAuth?.deviceCode || "").trim() ? (
-                            <Stack
-                              direction="row"
-                              spacing={0.8}
-                              sx={{
-                                alignItems: "center",
-                                minWidth: 0,
-                              }}
-                            >
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
-                              >
-                                Device code:
-                              </Typography>
-                              <Typography
-                                variant="caption"
-                                component="code"
-                                sx={{
-                                  px: 0.8,
-                                  py: 0.2,
-                                  borderRadius: 1,
-                                  bgcolor: "var(--ui-rgba-0-0-0-220)",
-                                  fontFamily:
-                                    "ui-monospace, SFMono-Regular, Menlo, monospace",
-                                }}
-                              >
-                                {(openaiSubAuth?.deviceCode || "").trim()}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={async () => {
-                                  try {
-                                    await navigator.clipboard.writeText(
-                                      (openaiSubAuth?.deviceCode || "").trim(),
-                                    );
-                                    setSuccess("Device code copied.");
-                                  } catch {
-                                    setError("Could not copy device code.");
-                                  }
-                                }}
-                                aria-label="Copy device code"
-                              >
-                                <ContentCopyRoundedIcon fontSize="inherit" />
-                              </IconButton>
-                            </Stack>
-                          ) : null}
-                          {(openaiSubAuth?.authUrl || "").trim() ? (
-                            <Stack
-                              direction="row"
-                              spacing={0.8}
-                              sx={{
-                                alignItems: "center",
-                                minWidth: 0,
-                              }}
-                            >
-                              <Link
-                                href={(openaiSubAuth?.authUrl || "").trim()}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                underline="hover"
-                                sx={{
-                                  fontSize: "0.75rem",
-                                  wordBreak: "break-all",
-                                  flex: 1,
-                                  minWidth: 0,
-                                }}
-                              >
-                                {(openaiSubAuth?.authUrl || "").trim()}
-                              </Link>
-                              <IconButton
-                                size="small"
-                                onClick={async () => {
-                                  try {
-                                    await navigator.clipboard.writeText(
-                                      (openaiSubAuth?.authUrl || "").trim(),
-                                    );
-                                    setSuccess("OAuth URL copied.");
-                                  } catch {
-                                    setError("Could not copy URL.");
-                                  }
-                                }}
-                                aria-label="Copy OAuth URL"
-                              >
-                                <ContentCopyRoundedIcon fontSize="inherit" />
-                              </IconButton>
-                            </Stack>
-                          ) : null}
-                          {openaiSubAuth &&
-                          !openaiSubAuth.openedBrowser &&
-                          (openaiSubAuth.authUrl || "").trim() ? (
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: "warning.main",
-                              }}
-                            >
-                              Browser did not open automatically. Click "Open
-                              URL" above to complete sign-in.
-                            </Typography>
-                          ) : null}
-                          {openaiSubAuth?.running ? (
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: "info.main",
-                              }}
-                            >
-                              Login is in progress. Finish auth in
-                              browser/device flow, then click Check Status.
-                            </Typography>
-                          ) : null}
-                          {openaiSubAuth?.message ? (
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: "text.secondary",
-                              }}
-                            >
-                              {openaiSubAuth.message}
-                            </Typography>
-                          ) : null}
-                        </Stack>
-                      ) : (
-                        <Stack spacing={1}>
-                          <TextField
-                            label="API Key (optional)"
-                            value={modelForm.api_key}
-                            onChange={(e) => {
-                              const nextValue = e.target.value;
-                              setModelClearApiKey(false);
-                              setModelForm((p) => ({
-                                ...p,
-                                api_key: nextValue,
-                              }));
-                            }}
-                            fullWidth
-                            type="password"
-                            helperText={
-                              modelEditingId
-                                ? modelCanReuseExistingKey
-                                  ? "Leave blank to keep the current key."
-                                  : "Provider or base URL changed. Blank will not reuse the old key."
-                                : undefined
-                            }
-                          />
-                          {showClearSavedKeyAction ? (
-                            <Stack
-                              direction="row"
-                              spacing={1}
-                              useFlexGap
-                              sx={{
-                                alignItems: "center",
-                                flexWrap: "wrap",
-                              }}
-                            >
-                              <Chip
-                                size="small"
-                                color={
-                                  modelClearSavedKeyPending
-                                    ? "warning"
-                                    : "success"
-                                }
-                                variant="outlined"
-                                label={
-                                  modelClearSavedKeyPending
-                                    ? "Saved key will be removed"
-                                    : "Saved key on file"
-                                }
-                              />
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                color={
-                                  modelClearSavedKeyPending
-                                    ? "inherit"
-                                    : "warning"
-                                }
-                                onClick={() => {
-                                  setModelForm((p) => ({ ...p, api_key: "" }));
-                                  setModelClearApiKey((prev) => !prev);
-                                }}
-                              >
-                                {modelClearSavedKeyPending
-                                  ? "Keep saved key"
-                                  : "Clear saved key"}
-                              </Button>
-                            </Stack>
-                          ) : null}
-                          {modelNeedsReplacementKeyWarning ? (
-                            <Alert
-                              severity="warning"
-                              icon={<InfoOutlinedIcon fontSize="inherit" />}
-                            >
-                              This edit changes the provider or base URL. The
-                              previously saved key for this slot will not be
-                              reused. Add a replacement key before saving, or
-                              the slot will be saved without one.
-                            </Alert>
-                          ) : null}
-                          {modelClearSavedKeyPending ? (
-                            <Alert
-                              severity="warning"
-                              icon={<InfoOutlinedIcon fontSize="inherit" />}
-                            >
-                              The saved key for this slot will be removed when
-                              you save. Runs may fail until you add a new key.
-                            </Alert>
-                          ) : null}
-                        </Stack>
-                      )}
-                      <Accordion
-                        expanded={modelAdvancedOpen}
-                        onChange={(_, expanded) =>
-                          setModelAdvancedOpen(expanded)
-                        }
-                        disableGutters
-                      >
-                        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                          <Typography variant="body2">Advanced</Typography>
-                        </AccordionSummary>
-                        <AccordionDetails>
-                          {[
-                            "ollama",
-                            "openrouter",
-                            "openai-compatible",
-                            "huggingface",
-                          ].includes(modelForm.provider) ? (
-                            <TextField
-                              label={
-                                modelForm.provider === "openai-compatible"
-                                  ? "Base URL"
-                                  : "Base URL (optional)"
-                              }
-                              value={modelForm.base_url}
-                              onChange={(e) =>
-                                setModelForm((p) => ({
-                                  ...p,
-                                  base_url: e.target.value,
-                                }))
-                              }
-                              fullWidth
-                              helperText={
-                                modelForm.provider === "openrouter"
-                                  ? `Example: ${OPENROUTER_DEFAULT_BASE_URL}`
-                                  : modelForm.provider === "ollama"
-                                    ? `Example: ${OLLAMA_DEFAULT_BASE_URL}`
-                                    : modelForm.provider === "huggingface"
-                                      ? "Default: https://api-inference.huggingface.co/v1 - use your HF token as the API key"
-                                      : "Required for OpenAI-compatible providers."
-                              }
-                            />
-                          ) : (
-                            <Typography
-                              variant="caption"
-                              sx={{
-                                color: "text.secondary",
-                              }}
-                            >
-                              No advanced provider settings for this model.
-                            </Typography>
-                          )}
-                        </AccordionDetails>
-                      </Accordion>
-                      <FormControlLabel
-                        control={
-                          <Switch
-                            checked={modelForm.enabled}
-                            onChange={(e) =>
-                              setModelForm((p) => ({
-                                ...p,
-                                enabled: e.target.checked,
-                              }))
-                            }
-                          />
-                        }
-                        label="Enabled"
-                      />
-                      {modelConnectionTestResult ? (
-                        <Alert
-                          severity={
-                            modelConnectionTestResult.ok ? "success" : "warning"
-                          }
-                        >
-                          {modelConnectionTestResult.message}
-                        </Alert>
-                      ) : null}
-                      {modelTestConnectionHint ? (
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: "text.secondary",
-                          }}
-                        >
-                          {modelTestConnectionHint}
-                        </Typography>
-                      ) : null}
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        sx={{
-                          justifyContent: "flex-end",
-                        }}
-                      >
-                        <Button onClick={() => setModelDialogOpen(false)}>
-                          Cancel
-                        </Button>
-                        <Button
-                          variant="outlined"
-                          onClick={async () => {
-                            setError(null);
-                            setModelConnectionTestResult(null);
-                            try {
-                              await testModelConnectionMutation.mutateAsync();
-                            } catch (e) {
-                              setError(errMessage(e));
-                            }
-                          }}
-                          disabled={
-                            !canTestModelConnection ||
-                            saveModelMutation.isPending ||
-                            testModelConnectionMutation.isPending
-                          }
-                        >
-                          {testModelConnectionMutation.isPending
-                            ? "Testing..."
-                            : "Test Connection"}
-                        </Button>
-                        <Button
-                          variant="contained"
-                          onClick={async () => {
-                            setError(null);
-                            setModelConnectivityWarning(null);
-                            setModelConnectionTestResult(null);
-                            try {
-                              await saveModelMutation.mutateAsync();
-                            } catch (e) {
-                              setError(errMessage(e));
-                            }
-                          }}
-                          disabled={
-                            saveModelMutation.isPending ||
-                            testModelConnectionMutation.isPending
-                          }
-                        >
-                          {saveModelMutation.isPending ? "Saving..." : "Save"}
-                        </Button>
-                      </Stack>
-                    </Stack>
-                  </DialogContent>
-                </Dialog>
-              </Stack>
+              <WorkspaceLazyPanel message="Loading models...">
+                <SettingsModelsPanel
+                  modelsSectionTab={modelsSectionTab}
+                  setModelsSectionTab={setModelsSectionTab}
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                  openAddModel={openAddModel}
+                  form={form}
+                  setField={setField}
+                  modelsQ={modelsQ}
+                  modelSlots={modelSlots}
+                  modelsRefreshIssue={modelsRefreshIssue}
+                  showingModelFallback={showingModelFallback}
+                  toggleModelEnabledMutation={toggleModelEnabledMutation}
+                  setError={setError}
+                  deleteModelMutation={deleteModelMutation}
+                  openEditModel={openEditModel}
+                  embeddingsProvider={embeddingsProvider}
+                  embeddingsDisabled={embeddingsDisabled}
+                  embeddingsHasApiKey={embeddingsHasApiKey}
+                  embeddingsStatus={embeddingsStatus}
+                  embeddingsIsLocal={embeddingsIsLocal}
+                  embeddingsIsOllama={embeddingsIsOllama}
+                  embeddingsIsExternal={embeddingsIsExternal}
+                  modelDialogOpen={modelDialogOpen}
+                  setModelDialogOpen={setModelDialogOpen}
+                  modelForm={modelForm}
+                  setModelForm={setModelForm}
+                  modelEditingId={modelEditingId}
+                  modelCanReuseExistingKey={modelCanReuseExistingKey}
+                  showClearSavedKeyAction={showClearSavedKeyAction}
+                  modelClearSavedKeyPending={modelClearSavedKeyPending}
+                  setModelClearApiKey={setModelClearApiKey}
+                  modelNeedsReplacementKeyWarning={modelNeedsReplacementKeyWarning}
+                  modelAdvancedOpen={modelAdvancedOpen}
+                  setModelAdvancedOpen={setModelAdvancedOpen}
+                  modelConnectionTestResult={modelConnectionTestResult}
+                  setModelConnectionTestResult={setModelConnectionTestResult}
+                  modelTestConnectionHint={modelTestConnectionHint}
+                  testModelConnectionMutation={testModelConnectionMutation}
+                  canTestModelConnection={canTestModelConnection}
+                  saveModelMutation={saveModelMutation}
+                  setModelConnectivityWarning={setModelConnectivityWarning}
+                  openaiSubAuth={openaiSubAuth}
+                  codexAuthBusy={codexAuthBusy}
+                  startOpenaiSubscriptionOAuth={startOpenaiSubscriptionOAuth}
+                  checkOpenaiSubscriptionOAuthStatus={
+                    checkOpenaiSubscriptionOAuthStatus
+                  }
+                  discoverModelsQ={discoverModelsQ}
+                  modelOptions={modelOptions}
+                  modelOptionNames={modelOptionNames}
+                  setSuccess={setSuccess}
+                />
+              </WorkspaceLazyPanel>
             ) : null}
-
             {tab === 3 ? (
-              <MediaSettingsPanel
-                form={form}
-                setField={setField}
-                configuredProviders={configuredProviders}
-                renderSettingsSectionIntro={renderSettingsSectionIntro}
-              />
+              <WorkspaceLazyPanel message="Loading media settings...">
+                <MediaSettingsPanel
+                  form={form}
+                  setField={setField}
+                  configuredProviders={configuredProviders}
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                />
+              </WorkspaceLazyPanel>
             ) : null}
 
             {tab === 24 ? (
@@ -6244,2875 +5224,180 @@ export default function SettingsPage({
             ) : null}
 
             {tab === 4 ? (
-              <Grid2 container spacing={1.5}>
-                <Grid2 size={{ xs: 12, lg: 12 }}>
-                  <Box
-                    sx={{
-                      display: "grid",
-                      gap: 2,
-                      alignItems: "start",
-                      gridTemplateColumns: {
-                        xs: "minmax(0, 1fr)",
-                        lg: "minmax(0, 1.45fr) minmax(320px, 1fr)",
-                      },
-                      gridTemplateAreas: {
-                        xs: showInternalServiceSection
-                          ? '"security" "abuse" "internal" "remote" "vault" "privacy"'
-                          : '"security" "abuse" "remote" "vault" "privacy"',
-                        lg: showInternalServiceSection
-                          ? '"security internal" "abuse abuse" "remote vault" "privacy privacy"'
-                          : '"security vault" "abuse abuse" "remote vault" "privacy privacy"',
-                      },
-                    }}
-                  >
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "security" }}
-                    >
-                      <Stack spacing={1}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Security & Master Password",
-                          description:
-                            "Protect operator access, control remote sign-in, and manage the primary instance password.",
-                        })}
-                        {securityStatusQ.isLoading ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Loading security status...
-                          </Typography>
-                        ) : securityStatusQ.error ? (
-                          <Alert severity="error">
-                            {errMessage(securityStatusQ.error)}
-                          </Alert>
-                        ) : hasCustomMasterPassword ? (
-                          <Stack spacing={1.1}>
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                            >
-                              <Button
-                                variant="contained"
-                                size="large"
-                                onClick={() => openPasswordDialog("change")}
-                                disabled={passwordMutationPending}
-                              >
-                                Change Password
-                              </Button>
-                              <Button
-                                color="error"
-                                variant="outlined"
-                                size="large"
-                                onClick={() => openPasswordDialog("remove")}
-                                disabled={passwordMutationPending}
-                              >
-                                Remove Password
-                              </Button>
-                            </Stack>
-                          </Stack>
-                        ) : null}
-                      </Stack>
-                    </Box>
-
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "abuse" }}
-                    >
-                      <Stack spacing={1.1}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Abuse Review",
-                          description:
-                            "Resume or pause sources that repeatedly tripped the inbound semantic guard.",
-                          action: (
-                            <Chip
-                              size="small"
-                              color={abuseReviews.length > 0 ? "warning" : "success"}
-                              variant="outlined"
-                              label={`${abuseReviews.length} waiting`}
-                            />
-                          ),
-                        })}
-                        {abuseReviewsQ.isLoading ? (
-                          <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                            Loading review queue...
-                          </Typography>
-                        ) : abuseReviewsQ.error ? (
-                          <Alert severity="error">{errMessage(abuseReviewsQ.error)}</Alert>
-                        ) : abuseReviews.length === 0 ? (
-                          <Alert severity="success" sx={{ py: 0.25 }}>
-                            No sources are paused or waiting for review.
-                          </Alert>
-                        ) : (
-                          <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
-                            <Table size="small" sx={{ tableLayout: "fixed", width: "100%" }}>
-                              <TableHead>
-                                <TableRow>
-                                  <TableCell sx={{ width: "22%" }}>Status</TableCell>
-                                  <TableCell sx={{ width: "24%" }}>Source</TableCell>
-                                  <TableCell sx={{ width: "16%" }}>Trips</TableCell>
-                                  <TableCell sx={{ width: "18%" }}>Updated</TableCell>
-                                  <TableCell sx={{ width: "20%" }} align="right">
-                                    Decision
-                                  </TableCell>
-                                </TableRow>
-                              </TableHead>
-                              <TableBody>
-                                {abuseReviews.map((row, index) => {
-                                  const sourceKeyHash = str(row.source_key_hash, "");
-                                  const status = str(row.status, "");
-                                  const source = str(row.channel_id, "channel");
-                                  const identity = str(row.user_identity, "").trim();
-                                  const updatedAt = humanTs(str(row.last_updated, ""));
-                                  const pending = decideAbuseReviewMutation.isPending;
-                                  return (
-                                    <TableRow key={sourceKeyHash || `abuse-review-${index}`}>
-                                      <TableCell>
-                                        <Chip
-                                          size="small"
-                                          color={status === "paused" ? "error" : "warning"}
-                                          variant="outlined"
-                                          label={status === "paused" ? "Paused" : "Pending review"}
-                                        />
-                                      </TableCell>
-                                      <TableCell sx={{ overflow: "hidden" }}>
-                                        <Typography variant="body2" noWrap title={identity ? `${source} / ${identity}` : source}>
-                                          {identity ? `${source} / ${identity}` : source}
-                                        </Typography>
-                                        <Typography variant="caption" sx={{ color: "text.secondary" }} noWrap title={sourceKeyHash}>
-                                          {sourceKeyHash.slice(0, 12)}
-                                        </Typography>
-                                      </TableCell>
-                                      <TableCell>{num(row.trip_count, 0)}</TableCell>
-                                      <TableCell>
-                                        <Typography variant="caption" title={updatedAt.tip}>
-                                          {updatedAt.label}
-                                        </Typography>
-                                      </TableCell>
-                                      <TableCell align="right">
-                                        <Stack direction="row" spacing={0.75} sx={{ justifyContent: "flex-end" }}>
-                                          <Button
-                                            size="small"
-                                            variant="outlined"
-                                            disabled={pending || !sourceKeyHash}
-                                            onClick={() =>
-                                              decideAbuseReviewMutation.mutate({
-                                                sourceKeyHash,
-                                                decision: "reject",
-                                              })
-                                            }
-                                          >
-                                            Pause
-                                          </Button>
-                                          <Button
-                                            size="small"
-                                            variant="contained"
-                                            disabled={pending || !sourceKeyHash}
-                                            onClick={() =>
-                                              decideAbuseReviewMutation.mutate({
-                                                sourceKeyHash,
-                                                decision: "approve",
-                                              })
-                                            }
-                                          >
-                                            Resume
-                                          </Button>
-                                        </Stack>
-                                      </TableCell>
-                                    </TableRow>
-                                  );
-                                })}
-                              </TableBody>
-                            </Table>
-                          </TableContainer>
-                        )}
-                      </Stack>
-                    </Box>
-
-                    {showInternalServiceSection ? (
-                      <Box
-                        className="list-shell"
-                        sx={{ minHeight: 0, gridArea: "internal" }}
-                      >
-                      <Stack spacing={1.25}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Internal Service Credentials",
-                          description: internalServiceDescription,
-                          action: internalServiceRotationSupported ? (
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              useFlexGap
-                              sx={{ flexWrap: "wrap" }}
-                            >
-                              <Chip size="small" label="Manual rotation" />
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label="Restart required"
-                              />
-                            </Stack>
-                          ) : undefined,
-                        })}
-                        {securityStatusQ.isLoading ? (
-                          <Typography
-                            variant="body2"
-                            sx={{ color: "text.secondary" }}
-                          >
-                            Loading internal credential status...
-                          </Typography>
-                        ) : securityStatusQ.error ? (
-                          <Alert severity="error">
-                            {errMessage(securityStatusQ.error)}
-                          </Alert>
-                        ) : internalServiceTokens.length === 0 ? (
-                          <Typography
-                            variant="body2"
-                            sx={{ color: "text.secondary" }}
-                          >
-                            Internal executor and workspace credentials are not
-                            available on this runtime.
-                          </Typography>
-                        ) : (
-                          <Stack spacing={1.1}>
-                            <Stack
-                              divider={
-                                <Divider
-                                  flexItem
-                                  sx={{ borderColor: "divider" }}
-                                />
-                              }
-                              spacing={0}
-                            >
-                              {internalServiceTokens.map((row, index) => {
-                                const item = asRecord(row);
-                                const updatedAt = humanTs(
-                                  str(item.updated_at, ""),
-                                );
-                                const managedByEnv = toBool(
-                                  item.managed_by_env,
-                                );
-                                const configured = toBool(item.configured);
-                                return (
-                                  <Stack
-                                    key={str(item.id, `token-${index}`)}
-                                    direction={{ xs: "column", sm: "row" }}
-                                    spacing={1}
-                                    sx={{ py: 1 }}
-                                  >
-                                    <Stack
-                                      spacing={0.35}
-                                      sx={{ minWidth: 0, flex: 1 }}
-                                    >
-                                      <Typography
-                                        variant="body2"
-                                        sx={{ fontWeight: 600 }}
-                                      >
-                                        {str(item.label, "Internal service")}
-                                      </Typography>
-                                      <Typography
-                                        variant="caption"
-                                        sx={{ color: "text.secondary" }}
-                                      >
-                                        {managedByEnv
-                                          ? `Managed by ${str(item.env_var, "environment configuration")}`
-                                          : "Stored in the AgentArk config volume"}
-                                      </Typography>
-                                    </Stack>
-                                    <Stack
-                                      direction="row"
-                                      spacing={0.75}
-                                      useFlexGap
-                                      sx={{
-                                        flexWrap: "wrap",
-                                        alignItems: "center",
-                                      }}
-                                    >
-                                      <Chip
-                                        size="small"
-                                        color={
-                                          configured ? "success" : "warning"
-                                        }
-                                        label={
-                                          configured ? "Configured" : "Missing"
-                                        }
-                                      />
-                                      <Chip
-                                        size="small"
-                                        variant="outlined"
-                                        label={
-                                          managedByEnv
-                                            ? "Env managed"
-                                            : `Updated ${updatedAt.label}`
-                                        }
-                                        title={
-                                          managedByEnv
-                                            ? undefined
-                                            : updatedAt.tip
-                                        }
-                                      />
-                                    </Stack>
-                                  </Stack>
-                                );
-                              })}
-                            </Stack>
-                            {internalServiceRotationSupported ? (
-                              <Alert severity="info">
-                                Rotation rewrites both credentials together,
-                                then restarts control, executor, and workspace
-                                immediately. Active work can be interrupted
-                                while the stack comes back.
-                              </Alert>
-                            ) : null}
-                            {internalServiceRotationSupported ? (
-                              <Stack
-                                direction={{ xs: "column", sm: "row" }}
-                                spacing={1}
-                                useFlexGap
-                                sx={{ flexWrap: "wrap" }}
-                              >
-                                <Button
-                                  variant="outlined"
-                                  color="warning"
-                                  size="large"
-                                  disabled={
-                                    rotateInternalServiceTokensMutation.isPending ||
-                                    !!restartNotice
-                                  }
-                                  onClick={openRotateInternalCredentialsDialog}
-                                >
-                                  {rotateInternalServiceTokensMutation.isPending
-                                    ? "Rotating..."
-                                    : "Rotate Internal Credentials"}
-                                </Button>
-                              </Stack>
-                            ) : null}
-                          </Stack>
-                        )}
-                      </Stack>
-                      </Box>
-                    ) : null}
-
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "remote" }}
-                    >
-                      <Stack spacing={1.25}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Remote Access",
-                          description:
-                            "Only expose remote sign-in when you need it, and keep the access method and posture visible.",
-                          action: (
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              useFlexGap
-                              sx={{
-                                flexWrap: "wrap",
-                              }}
-                            >
-                              <Chip
-                                size="small"
-                                color={tunnelSummaryTone}
-                                label={tunnelStateLabel}
-                              />
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label={tunnelAccessLabel}
-                              />
-                            </Stack>
-                          ),
-                        })}
-                        {tunnelQ.isLoading || tunnelProvidersQ.isLoading ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Loading tunnel settings...
-                          </Typography>
-                        ) : tunnelQ.error || tunnelProvidersQ.error ? (
-                          <Alert severity="error">
-                            {errMessage(
-                              tunnelQ.error || tunnelProvidersQ.error,
-                            )}
-                          </Alert>
-                        ) : (
-                          <Stack spacing={1.1}>
-                            <Alert
-                              severity={tunnelSummaryTone}
-                              sx={{
-                                py: 0.25,
-                                "& .MuiAlert-message": { width: "100%" },
-                              }}
-                            >
-                              <Stack spacing={0.35}>
-                                <Typography
-                                  variant="body2"
-                                  sx={{ fontWeight: 600 }}
-                                >
-                                  {tunnelPrimaryText}
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{
-                                    color: "inherit",
-                                  }}
-                                >
-                                  {tunnelPrimaryDetail}
-                                </Typography>
-                              </Stack>
-                            </Alert>
-                            <TextField
-                              label="Access method"
-                              select
-                              size="small"
-                              fullWidth
-                              value={
-                                tunnelSelectedProviderId ||
-                                serverSelectedTunnelProviderId
-                              }
-                              onChange={(e) => {
-                                const next = e.target.value;
-                                syncTunnelDraftFromPayload(
-                                  tunnelProvidersPayload,
-                                  next,
-                                );
-                              }}
-                            >
-                              {tunnelProviderOptions.map((provider) => {
-                                const id = str(provider.id, "");
-                                const label = str(
-                                  provider.label,
-                                  id || "Provider",
-                                );
-                                const available = toBool(provider.available);
-                                return (
-                                  <MenuItem key={id} value={id}>
-                                    {available
-                                      ? label
-                                      : `${label} (not available)`}
-                                  </MenuItem>
-                                );
-                              })}
-                            </TextField>
-                            {basicTunnelConfigFields.map((field) => {
-                              const key = str(field.key, "");
-                              const inputType = str(field.input_type, "text");
-                              const options = Array.isArray(field.options)
-                                ? field.options.filter(
-                                    (value): value is string =>
-                                      typeof value === "string",
-                                  )
-                                : [];
-                              const value = tunnelDraftValues[key] ?? "";
-                              const storedSecret =
-                                inputType === "password" &&
-                                selectedTunnelStoredSecretFields.includes(key);
-                              const helperText =
-                                inputType === "password" &&
-                                storedSecret &&
-                                !value.trim()
-                                  ? "A value is already saved. Enter a new value only if you want to replace it."
-                                  : undefined;
-                              return (
-                                <TextField
-                                  key={key}
-                                  label={str(field.label, key || "Field")}
-                                  value={value}
-                                  onChange={(e) =>
-                                    setTunnelDraftValues((prev) => ({
-                                      ...prev,
-                                      [key]: e.target.value,
-                                    }))
-                                  }
-                                  fullWidth
-                                  size="small"
-                                  required={toBool(field.required)}
-                                  placeholder={
-                                    str(field.placeholder, "") || undefined
-                                  }
-                                  type={
-                                    inputType === "password"
-                                      ? "password"
-                                      : "text"
-                                  }
-                                  multiline={inputType === "textarea"}
-                                  minRows={
-                                    inputType === "textarea" ? 3 : undefined
-                                  }
-                                  select={inputType === "select"}
-                                  helperText={helperText}
-                                >
-                                  {inputType === "select"
-                                    ? options.map((option) => (
-                                        <MenuItem key={option} value={option}>
-                                          {option}
-                                        </MenuItem>
-                                      ))
-                                    : null}
-                                </TextField>
-                              );
-                            })}
-                            {tunnelPanelNotice ? (
-                              <Alert severity={tunnelPanelNotice.severity}>
-                                {tunnelPanelNotice.text}
-                              </Alert>
-                            ) : null}
-                            {str(tunnel.error, "").trim() ? (
-                              <Alert severity="error">
-                                {str(tunnel.error)}
-                              </Alert>
-                            ) : null}
-                            {tunnelSetupChecks.length > 0
-                              ? renderSettingsInlineCard({
-                                  eyebrow: "Remote access",
-                                  title: "Before remote access can start",
-                                  description:
-                                    "This checklist shows what is still missing, with the exact fix for each step.",
-                                  tone: "info",
-                                  children: (
-                                    <Stack spacing={1}>
-                                      {tunnelSetupChecks.map(
-                                        (rawCheck, index) => {
-                                          const check = asRecord(rawCheck);
-                                          const status = str(
-                                            check.status,
-                                            "info",
-                                          );
-                                          const detail = str(check.detail, "");
-                                          const remediation = str(
-                                            check.remediation,
-                                            "",
-                                          ).trim();
-                                          return (
-                                            <Alert
-                                              key={`${str(check.id, `check-${index}`)}-${index}`}
-                                              severity={tunnelCheckAlertSeverity(
-                                                status,
-                                              )}
-                                              sx={{
-                                                py: 0.25,
-                                                "& .MuiAlert-message": {
-                                                  width: "100%",
-                                                },
-                                              }}
-                                            >
-                                              <Stack spacing={0.45}>
-                                                <Stack
-                                                  direction="row"
-                                                  spacing={0.75}
-                                                  useFlexGap
-                                                  sx={{
-                                                    alignItems: "center",
-                                                    flexWrap: "wrap",
-                                                  }}
-                                                >
-                                                  <Chip
-                                                    size="small"
-                                                    color={tunnelCheckChipColor(
-                                                      status,
-                                                    )}
-                                                    label={tunnelCheckLabel(
-                                                      status,
-                                                    )}
-                                                  />
-                                                  <Typography
-                                                    variant="body2"
-                                                    sx={{ fontWeight: 600 }}
-                                                  >
-                                                    {str(
-                                                      check.label,
-                                                      "Setup step",
-                                                    )}
-                                                  </Typography>
-                                                </Stack>
-                                                {detail ? (
-                                                  <Typography
-                                                    variant="body2"
-                                                    sx={{
-                                                      color: "inherit",
-                                                    }}
-                                                  >
-                                                    {detail}
-                                                  </Typography>
-                                                ) : null}
-                                                {remediation ? (
-                                                  <Typography
-                                                    variant="caption"
-                                                    sx={{
-                                                      color: "inherit",
-                                                      opacity: 0.85,
-                                                    }}
-                                                  >
-                                                    {remediation}
-                                                  </Typography>
-                                                ) : null}
-                                              </Stack>
-                                            </Alert>
-                                          );
-                                        },
-                                      )}
-                                    </Stack>
-                                  ),
-                                })
-                              : null}
-                            {str(tunnel.url, "").trim() ? (
-                              <TextField
-                                label={getTunnelUrlFieldLabel(
-                                  selectedTunnelMeta,
-                                )}
-                                value={str(tunnel.url)}
-                                fullWidth
-                                size="small"
-                                slotProps={{
-                                  input: { readOnly: true },
-                                }}
-                              />
-                            ) : null}
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                              useFlexGap
-                              sx={{
-                                flexWrap: "wrap",
-                              }}
-                            >
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={handleTunnelProviderSave}
-                                disabled={tunnelSaveMutation.isPending}
-                              >
-                                {tunnelSaveMutation.isPending
-                                  ? "Saving..."
-                                  : "Save"}
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={handleTunnelProviderTest}
-                                disabled={
-                                  tunnelSaveMutation.isPending ||
-                                  tunnelTestMutation.isPending
-                                }
-                              >
-                                {tunnelTestMutation.isPending
-                                  ? "Checking..."
-                                  : "Check setup"}
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="contained"
-                                onClick={handleTunnelStart}
-                                disabled={
-                                  tunnelSaveMutation.isPending ||
-                                  tunnelStartMutation.isPending ||
-                                  toBool(tunnel.active) ||
-                                  !selectedTunnelAvailable
-                                }
-                              >
-                                {tunnelStartMutation.isPending
-                                  ? "Starting..."
-                                  : getTunnelStartButtonLabel(
-                                      selectedTunnelMeta,
-                                      hasCustomMasterPassword,
-                                    )}
-                              </Button>
-                              <Button
-                                size="small"
-                                onClick={handleTunnelStop}
-                                disabled={
-                                  tunnelStopMutation.isPending ||
-                                  !toBool(tunnel.active)
-                                }
-                              >
-                                {tunnelStopMutation.isPending
-                                  ? "Stopping..."
-                                  : getTunnelStopButtonLabel(
-                                      selectedTunnelMeta,
-                                    )}
-                              </Button>
-                              <Button
-                                size="small"
-                                onClick={async () => {
-                                  const url = str(tunnel.url, "");
-                                  if (!url) return;
-                                  await navigator.clipboard.writeText(url);
-                                  setSuccess("Tunnel URL copied.");
-                                }}
-                                disabled={!str(tunnel.url, "").trim()}
-                              >
-                                Copy link
-                              </Button>
-                              <Button
-                                size="small"
-                                variant="outlined"
-                                onClick={() => {
-                                  const url = str(tunnel.url, "").trim();
-                                  if (!url) return;
-                                  window.open(
-                                    url,
-                                    "_blank",
-                                    "noopener,noreferrer",
-                                  );
-                                }}
-                                disabled={!str(tunnel.url, "").trim()}
-                              >
-                                Open link
-                              </Button>
-                            </Stack>
-                            {advancedTunnelConfigFields.length > 0 ? (
-                              <Accordion
-                                expanded={showTunnelAdvanced}
-                                onChange={(_, expanded) =>
-                                  setShowTunnelAdvanced(expanded)
-                                }
-                                disableGutters
-                                sx={{
-                                  background: "transparent",
-                                  boxShadow: "none",
-                                  border: "1px solid var(--ui-rgba-62-143-214-180)",
-                                  borderRadius: 1,
-                                }}
-                              >
-                                <AccordionSummary
-                                  expandIcon={<ExpandMoreIcon />}
-                                >
-                                  <Typography
-                                    variant="body2"
-                                    sx={{ fontWeight: 600 }}
-                                  >
-                                    Advanced configuration
-                                  </Typography>
-                                </AccordionSummary>
-                                <AccordionDetails sx={{ pt: 0 }}>
-                                  <Stack spacing={1}>
-                                    {advancedTunnelConfigFields.map((field) => {
-                                      const key = str(field.key, "");
-                                      const inputType = str(
-                                        field.input_type,
-                                        "text",
-                                      );
-                                      const value =
-                                        tunnelDraftValues[key] ?? "";
-                                      return (
-                                        <TextField
-                                          key={key}
-                                          label={str(
-                                            field.label,
-                                            key || "Field",
-                                          )}
-                                          value={value}
-                                          onChange={(e) =>
-                                            setTunnelDraftValues((prev) => ({
-                                              ...prev,
-                                              [key]: e.target.value,
-                                            }))
-                                          }
-                                          fullWidth
-                                          size="small"
-                                          required={toBool(field.required)}
-                                          placeholder={
-                                            str(field.placeholder, "") ||
-                                            undefined
-                                          }
-                                          type={
-                                            inputType === "password"
-                                              ? "password"
-                                              : "text"
-                                          }
-                                        />
-                                      );
-                                    })}
-                                  </Stack>
-                                </AccordionDetails>
-                              </Accordion>
-                            ) : null}
-                            {hasCustomMasterPassword &&
-                            getTunnelPanelWarning(selectedTunnelMeta) ? (
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
-                              >
-                                {getTunnelPanelWarning(selectedTunnelMeta)}
-                              </Typography>
-                            ) : null}
-                          </Stack>
-                        )}
-                      </Stack>
-                    </Box>
-
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "vault" }}
-                    >
-                      <Stack spacing={1}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Secrets vault",
-                          description: vaultSummaryText,
-                          info: "Save private keys and tokens here so AgentArk can use them without showing the raw value in normal screens.",
-                          action: (
-                            <Chip
-                              size="small"
-                              variant="outlined"
-                              label={`${vaultSecrets.length} saved`}
-                            />
-                          ),
-                        })}
-                        {hasCustomMasterPassword ? (
-                          <TextField
-                            label="Master password for protected edits"
-                            value={vaultPassword}
-                            onChange={(e) => setVaultPassword(e.target.value)}
-                            fullWidth
-                            size="small"
-                            type="password"
-                          />
-                        ) : (
-                          <Typography
-                            variant="caption"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Using built-in local encryption. Set a custom
-                            password only if you want password-protected sign-in
-                            and remote access.
-                          </Typography>
-                        )}
-                        <Stack
-                          direction={{ xs: "column", sm: "row" }}
-                          spacing={1}
-                        >
-                          <Button
-                            size="small"
-                            onClick={async () => {
-                              setError(null);
-                              await queryClient.invalidateQueries({
-                                queryKey: ["settings-secrets"],
-                              });
-                            }}
-                            disabled={vaultSecretsQ.isLoading}
-                          >
-                            Refresh
-                          </Button>
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            onClick={openVaultEditor}
-                          >
-                            Add Custom Secret
-                          </Button>
-                        </Stack>
-
-                        {vaultSecretsQ.isLoading ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Loading secrets...
-                          </Typography>
-                        ) : vaultSecretsQ.error ? (
-                          <Alert severity="error">
-                            {errMessage(vaultSecretsQ.error)}
-                          </Alert>
-                        ) : vaultSecrets.length === 0 ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            No encrypted secrets stored yet.
-                          </Typography>
-                        ) : (
-                          <TableContainer
-                            className="table-shell"
-                            sx={{ width: "100%", overflowX: "auto" }}
-                          >
-                            <Table
-                              size="small"
-                              sx={{ tableLayout: "fixed", width: "100%" }}
-                            >
-                              <TableHead>
-                                <TableRow>
-                                  <TableCell sx={{ width: "35%" }}>
-                                    Key
-                                  </TableCell>
-                                  <TableCell sx={{ width: "20%" }}>
-                                    Source
-                                  </TableCell>
-                                  <TableCell sx={{ width: "25%" }}>
-                                    Value
-                                  </TableCell>
-                                  <TableCell
-                                    sx={{ width: "20%" }}
-                                    align="right"
-                                  >
-                                    Ops
-                                  </TableCell>
-                                </TableRow>
-                              </TableHead>
-                              <TableBody>
-                                {vaultSecrets.map((row, idx) => {
-                                  const key = str(row.key, "");
-                                  const storageKey = str(row.storage_key, key);
-                                  const displayKey = str(row.key, storageKey);
-                                  const shownValue = str(row.masked, "");
-                                  const source = str(row.source, "custom");
-                                  const sourceLabel = str(row.source_label, "")
-                                    .trim();
-                                  const deletable = toBool(row.deletable);
-                                  return (
-                                    <TableRow key={`${storageKey}-${idx}`}>
-                                      <TableCell
-                                        sx={{
-                                          fontFamily:
-                                            "ui-monospace, SFMono-Regular, Menlo, monospace",
-                                          fontSize: "0.8rem",
-                                          overflow: "hidden",
-                                          textOverflow: "ellipsis",
-                                          whiteSpace: "nowrap",
-                                        }}
-                                        title={displayKey}
-                                      >
-                                        {displayKey}
-                                      </TableCell>
-                                      <TableCell sx={{ whiteSpace: "nowrap" }}>
-                                        <Typography
-                                          variant="body2"
-                                        >
-                                          {sourceLabel ||
-                                            source.replace(/[-_]+/g, " ")}
-                                        </Typography>
-                                      </TableCell>
-                                      <TableCell sx={{ overflow: "hidden" }}>
-                                        <Typography
-                                          variant="body2"
-                                          title={shownValue}
-                                          sx={{
-                                            whiteSpace: "nowrap",
-                                            overflow: "hidden",
-                                            textOverflow: "ellipsis",
-                                          }}
-                                        >
-                                          {shownValue || "-"}
-                                        </Typography>
-                                      </TableCell>
-                                      <TableCell
-                                        align="right"
-                                        sx={{ whiteSpace: "nowrap" }}
-                                      >
-                                        <Stack
-                                          direction="row"
-                                          spacing={0.5}
-                                          sx={{
-                                            justifyContent: "flex-end",
-                                          }}
-                                        >
-                                          {deletable ? (
-                                            <Button
-                                              size="small"
-                                              color="error"
-                                              sx={{
-                                                minWidth: 72,
-                                                whiteSpace: "nowrap",
-                                              }}
-                                              onClick={async () => {
-                                                const ok = window.confirm(
-                                                  `Delete secret '${displayKey}'?`,
-                                                );
-                                                if (!ok) return;
-                                                const pw =
-                                                  resolveVaultPasswordForSensitiveOps();
-                                                if (pw === null) return;
-                                                setError(null);
-                                                try {
-                                                  await deleteVaultSecretMutation.mutateAsync(
-                                                    {
-                                                      key: storageKey,
-                                                      password: pw || undefined,
-                                                    },
-                                                  );
-                                                } catch {
-                                                  // handled by mutation onError
-                                                }
-                                              }}
-                                              disabled={
-                                                deleteVaultSecretMutation.isPending
-                                              }
-                                            >
-                                              Delete
-                                            </Button>
-                                          ) : (
-                                            <Typography
-                                              variant="caption"
-                                              sx={{
-                                                color: "text.secondary",
-                                              }}
-                                            >
-                                              Managed elsewhere
-                                            </Typography>
-                                          )}
-                                        </Stack>
-                                      </TableCell>
-                                    </TableRow>
-                                  );
-                                })}
-                              </TableBody>
-                            </Table>
-                          </TableContainer>
-                        )}
-                      </Stack>
-                    </Box>
-
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0, gridArea: "privacy" }}
-                    >
-                      <Stack spacing={1.5}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Model Privacy Boundary",
-                          description:
-                            "Control what sensitive content can enter model prompts, and whether chat can pause for one-time approval when read-only tools uncover person-linked data.",
-                          action: (
-                            <Chip
-                              size="small"
-                              color={
-                                form.model_privacy_request_scoped_sensitive_approval_enabled
-                                  ? "warning"
-                                  : "default"
-                              }
-                              variant="outlined"
-                              label={
-                                form.model_privacy_request_scoped_sensitive_approval_enabled
-                                  ? "Approval cards on"
-                                  : "Approval cards off"
-                              }
-                            />
-                          ),
-                        })}
-                        <Alert severity="info" sx={{ py: 0.25 }}>
-                          Secrets are still never sent to the model. When
-                          approval cards are enabled, chat pauses and shows
-                          Approve/Reject buttons before the model can inspect
-                          sensitive read-only tool results for a single request.
-                        </Alert>
-                        <Grid2 container spacing={1.5}>
-                          <Grid2 size={{ xs: 12, md: 6 }}>
-                            <TextField
-                              fullWidth
-                              select
-                              size="small"
-                              label="Retrieved context handling"
-                              value={form.model_privacy_default_mode}
-                              onChange={(e) =>
-                                setField(
-                                  "model_privacy_default_mode",
-                                  e.target.value,
-                                )
-                              }
-                              helperText="Applies to history, memories, tool output, documents, and helper-model prompts."
-                            >
-                              <MenuItem value="default_redact">
-                                Default redact
-                              </MenuItem>
-                              <MenuItem value="zero_exposure">
-                                Zero exposure
-                              </MenuItem>
-                              <MenuItem value="secrets_only">
-                                Secrets only
-                              </MenuItem>
-                            </TextField>
-                          </Grid2>
-                          <Grid2 size={{ xs: 12, md: 6 }}>
-                            <TextField
-                              fullWidth
-                              select
-                              size="small"
-                              label="Current chat handling"
-                              value={form.model_privacy_current_chat_pii_policy}
-                              onChange={(e) =>
-                                setField(
-                                  "model_privacy_current_chat_pii_policy",
-                                  e.target.value,
-                                )
-                              }
-                              helperText="Choose whether the active user message stays raw, gets masked, or is blocked when sensitive."
-                            >
-                              <MenuItem value="raw_current_turn">
-                                Raw current turn
-                              </MenuItem>
-                              <MenuItem value="mask_chat_pii">
-                                Mask chat PII
-                              </MenuItem>
-                              <MenuItem value="block_sensitive_chat">
-                                Block sensitive chat
-                              </MenuItem>
-                            </TextField>
-                          </Grid2>
-                        </Grid2>
-                        <FormControlLabel
-                          control={
-                            <Switch
-                              checked={
-                                form.model_privacy_request_scoped_sensitive_approval_enabled
-                              }
-                              onChange={(e) =>
-                                setField(
-                                  "model_privacy_request_scoped_sensitive_approval_enabled",
-                                  e.target.checked,
-                                )
-                              }
-                            />
-                          }
-                          label="Show approve/reject cards for sensitive read-only tool results"
-                        />
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: "text.secondary",
-                          }}
-                        >
-                          Approvals are request-scoped only. Reject keeps the
-                          data masked. Approve reveals non-secret sensitive
-                          context for that single follow-up turn.
-                        </Typography>
-                      </Stack>
-                    </Box>
-                  </Box>
-                </Grid2>
-
-              </Grid2>
-            ) : null}
-
-            {tab === 5 ? (
-              <Stack spacing={2.5}>
-                {restartNotice
-                  ? renderSettingsInlineCard({
-                      eyebrow: "Restarting",
-                      title: "AgentArk is coming back online",
-                      description: restartNotice.text,
-                      tone: "info",
-                      action: (
-                        <Chip
-                          size="small"
-                          icon={<AutorenewRoundedIcon />}
-                          label={restartNotice.etaLabel}
-                          color="info"
-                          variant="outlined"
-                        />
-                      ),
-                    })
-                  : null}
-                {/* -- Warning banner -- */}
-                {renderSettingsInlineCard({
-                  eyebrow: "Advanced",
-                  title: "Use with care",
-                  description:
-                    "These controls can affect stability, security, or how the product behaves. Change them only if you understand the effect.",
-                  fullWidthCopy: true,
-                  tone: "warning",
-                })}
-
-                {/* -- System Controls group -- */}
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <SettingsRoundedIcon
-                        sx={{ fontSize: 16, color: "var(--ui-rgba-244-245-247-820)" }}
-                      />
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">
-                        System Controls
-                      </div>
-                      <div className="adv-group-header-sub">
-                        Core runtime and interface options.
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="adv-row">
-                    <Stack spacing={0.35} sx={{ minWidth: 0 }}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Autonomy Pause
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Pause autonomous background work from this settings
-                        surface. Scheduled reminders still fire.
-                      </Typography>
-                      {settingsAutonomyQ.error ? (
-                        <Alert severity="error" sx={{ mt: 0.75 }}>
-                          {errMessage(settingsAutonomyQ.error)}
-                        </Alert>
-                      ) : settingsAutonomyPaused ? (
-                        <Alert severity="warning" sx={{ mt: 0.75 }}>
-                          Autonomy is paused. ArkPulse, watchers, background
-                          learning, suggestion scans, and proactive
-                          optimizations stay paused until you resume it.
-                        </Alert>
-                      ) : null}
-                    </Stack>
-                    <Stack
-                      direction={{ xs: "column", sm: "row" }}
-                      spacing={1}
-                      sx={{
-                        alignItems: { xs: "stretch", sm: "center" },
-                        flexShrink: 0,
-                      }}
-                    >
-                      <Chip
-                        size="small"
-                        color={settingsAutonomyPaused ? "warning" : "success"}
-                        label={settingsAutonomyModeLabel}
-                      />
-                      <Button
-                        size="small"
-                        color={settingsAutonomyPaused ? "success" : "warning"}
-                        variant="outlined"
-                        onClick={() => {
-                          if (settingsAutonomyPaused) {
-                            void handleResumeAutonomy();
-                            return;
-                          }
-                          setError(null);
-                          setSuccess(null);
-                          setAutonomyPauseDialogOpen(true);
-                        }}
-                        disabled={
-                          settingsAutonomyQ.isLoading ||
-                          !!settingsAutonomyQ.error ||
-                          settingsAutonomyMutation.isPending
-                        }
-                        sx={{ whiteSpace: "nowrap" }}
-                      >
-                        {settingsAutonomyMutation.isPending
-                          ? settingsAutonomyPaused
-                            ? "Resuming..."
-                            : "Pausing..."
-                          : settingsAutonomyPaused
-                            ? "Resume autonomy"
-                            : "Pause autonomy"}
-                      </Button>
-                    </Stack>
-                  </div>
-
-                  <div className="adv-row">
-                    <Stack spacing={0.2}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Restart AgentArk
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Restarts AgentArk to apply runtime and security changes.
-                      </Typography>
-                    </Stack>
-                    <Button
-                      size="small"
-                      color="warning"
-                      variant="outlined"
-                      onClick={openRestartDialog}
-                      disabled={restartMutation.isPending || !!restartNotice}
-                      sx={{ whiteSpace: "nowrap" }}
-                    >
-                      Restart AgentArk
-                    </Button>
-                  </div>
-
-                  <div className="adv-row">
-                    <Stack spacing={0.2}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Developer Mode
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Enables raw SKILL.md editing after you save. Keep off for
-                        beginner-friendly forms.
-                      </Typography>
-                    </Stack>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={developerModeEnabled}
-                          onChange={(e) => {
-                            const next = e.target.checked;
-                            setDeveloperModeEnabledState(next);
-                            setError(null);
-                            setSuccess(null);
-                          }}
-                        />
-                      }
-                      label={developerModeEnabled ? "On" : "Off"}
-                      sx={{ mr: 0 }}
-                    />
-                  </div>
-
-                  <div className="adv-row">
-                    <Stack spacing={0.2}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Guided Tour
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Re-run the onboarding walkthrough to review core
-                        features.
-                      </Typography>
-                    </Stack>
-                    <Button
-                      size="small"
-                      variant="outlined"
-                      onClick={() => {
-                        try {
-                          window.localStorage.setItem(
-                            "agentark.tour.completed",
-                            "0",
-                          );
-                        } catch {}
-                        const { startTour } = useUiStore.getState();
-                        startTour();
-                      }}
-                      sx={{ whiteSpace: "nowrap" }}
-                    >
-                      Restart Tour
-                    </Button>
-                  </div>
-                </Box>
-
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <StarRoundedIcon
-                        sx={{ fontSize: 16, color: "var(--ui-rgba-244-245-247-820)" }}
-                      />
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">ArkSentinel</div>
-                      <div className="adv-group-header-sub">
-                        These switches decide where ArkSentinel learns from and
-                        what kinds of follow-up it can suggest.
-                      </div>
-                    </div>
-                  </div>
-                  {settingsSentinelQ.error ? (
-                    <Alert severity="error" sx={{ mb: 1.5 }}>
-                      {errMessage(settingsSentinelQ.error)}
-                    </Alert>
-                  ) : null}
-                  {settingsAutonomyPaused ? (
-                    <Alert severity="warning" sx={{ mb: 1.5 }}>
-                      ArkSentinel preferences stay saved here, but follow-up
-                      scanning is paused until autonomy is active again.
-                    </Alert>
-                  ) : null}
-                  {ADVANCED_SENTINEL_SIGNAL_OPTIONS.map((item) => {
-                    const isMainSentinelSwitch = item.key === "enabled";
-                    const storedEnabled =
-                      settingsSentinel[item.key] == null
-                        ? true
-                        : toBool(settingsSentinel[item.key]);
-                    const checked = isMainSentinelSwitch
-                      ? storedEnabled
-                      : settingsSentinelEnabled && storedEnabled;
-                    return (
-                      <div className="adv-row" key={item.key}>
-                        <Stack spacing={0.2}>
-                          <Typography
-                            variant="body2"
-                            sx={{ fontWeight: 600 }}
-                          >
-                            {item.label}
-                          </Typography>
-                          <Typography
-                            variant="caption"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            {item.description}
-                          </Typography>
-                        </Stack>
-                        <FormControlLabel
-                          control={
-                            <Switch
-                              checked={checked}
-                              onChange={(event) => {
-                                if (
-                                  item.key === "enabled" &&
-                                  !event.target.checked
-                                ) {
-                                  setError(null);
-                                  setSuccess(null);
-                                  setSentinelDisableDialogOpen(true);
-                                  return;
-                                }
-                                if (
-                                  item.key === "watch_in_app" &&
-                                  !event.target.checked
-                                ) {
-                                  setError(null);
-                                  setSuccess(null);
-                                  setSentinelInAppDisableDialogOpen(true);
-                                  return;
-                                }
-                                const nextChecked = event.target.checked;
-                                const payload: JsonRecord =
-                                  item.key === "enabled" && nextChecked
-                                    ? {
-                                        enabled: true,
-                                        watch_in_app: true,
-                                        watch_connected_services: true,
-                                        infer_new_automations: true,
-                                      }
-                                    : ({
-                                        [item.key]: nextChecked,
-                                      } as JsonRecord);
-                                void updateSettingsSentinel(
-                                  payload,
-                                  item.key === "enabled" && nextChecked
-                                    ? "ArkSentinel and all signal switches are on."
-                                    : nextChecked
-                                      ? item.enabledMessage
-                                      : item.disabledMessage,
-                                );
-                              }}
-                              disabled={
-                                settingsSentinelQ.isLoading ||
-                                !!settingsSentinelQ.error ||
-                                settingsSentinelMutation.isPending ||
-                                (!isMainSentinelSwitch &&
-                                  !settingsSentinelEnabled)
-                              }
-                            />
-                          }
-                          label={checked ? "On" : "Off"}
-                          sx={{ mr: 0 }}
-                        />
-                      </div>
-                    );
-                  })}
-                </Box>
-
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <AutorenewRoundedIcon
-                        sx={{ fontSize: 16, color: "var(--ui-rgba-244-245-247-820)" }}
-                      />
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">ArkEvolve</div>
-                      <div className="adv-group-header-sub">
-                        Controls whether AgentArk learns from completed work and
-                        tests reviewed improvements in the background.
-                      </div>
-                    </div>
-                  </div>
-                  {settingsEvolutionQ.error ? (
-                    <Alert severity="error" sx={{ mb: 1.5 }}>
-                      {errMessage(settingsEvolutionQ.error)}
-                    </Alert>
-                  ) : null}
-                  {settingsAutonomyPaused ? (
-                    <Alert severity="warning" sx={{ mb: 1.5 }}>
-                      Self-evolve can stay on, but its background passes will
-                      remain paused until autonomy is active again.
-                    </Alert>
-                  ) : null}
-                  <div className="adv-row">
-                    <Stack spacing={0.2}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Self-evolve
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        Controls heuristic reflection, consolidation, candidate
-                        generation, and active canary experiments.
-                      </Typography>
-                    </Stack>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={settingsSelfEvolveEnabled}
-                          onChange={(event) => {
-                            if (event.target.checked) {
-                              void handleEnableSelfEvolve();
-                              return;
-                            }
-                            setError(null);
-                            setSuccess(null);
-                            setSelfEvolveDisableDialogOpen(true);
-                          }}
-                          disabled={
-                            settingsEvolutionQ.isLoading ||
-                            !!settingsEvolutionQ.error ||
-                            settingsEvolutionMutation.isPending
-                          }
-                        />
-                      }
-                      label={settingsSelfEvolveEnabled ? "On" : "Off"}
-                      sx={{ mr: 0 }}
-                    />
-                  </div>
-                  <Accordion disableGutters sx={{ mt: 1 }}>
-                    <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                      <Stack spacing={0.2}>
-                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                          Readiness gates
-                        </Typography>
-                        <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                          Human review and auto-run stay separate. Auto-run
-                          requires stronger repeated evidence.
-                        </Typography>
-                      </Stack>
-                    </AccordionSummary>
-                    <AccordionDetails>
-                      <Alert severity="info" sx={{ borderRadius: 1, mb: 1.25 }}>
-                        For normal use, leave these defaults alone. Lower values
-                        make ArkEvolve suggest changes sooner; higher values make
-                        it wait for more proof.
-                      </Alert>
-                      <Grid2 container spacing={1.25}>
-                        {[
-                          ["min_review_samples", "Review samples", "Runs needed before a suggestion can be approved"],
-                          ["min_auto_samples", "Auto-run samples", "Runs needed before automatic use is even considered"],
-                          ["min_review_success_rate_pct", "Review success %", "Minimum success rate for review"],
-                          ["min_auto_success_rate_pct", "Auto-run success %", "Minimum success rate for auto-run"],
-                          ["max_review_correction_rate_pct", "Review correction %", "Maximum correction rate for review"],
-                          ["max_auto_correction_rate_pct", "Auto-run correction %", "Maximum correction rate for auto-run"],
-                          ["min_candidate_review_confidence_pct", "Candidate confidence %", "Minimum confidence before review"],
-                          ["max_review_trust_score", "Review risk score", "Highest trust risk allowed for review"],
-                          ["max_auto_trust_score", "Auto-run risk score", "Highest trust risk allowed for auto-run"],
-                        ].map(([key, label, helper]) => (
-                          <Grid2 key={key} size={{ xs: 12, sm: 6, lg: 4 }}>
-                            <TextField
-                              fullWidth
-                              size="small"
-                              type="number"
-                              label={label}
-                              value={readinessPolicyDraft[key] ?? ""}
-                              onChange={(event) =>
-                                setReadinessPolicyDraft((draft) => ({
-                                  ...draft,
-                                  [key]: event.target.value,
-                                }))
-                              }
-                              helperText={helper}
-                              disabled={
-                                settingsEvolutionQ.isLoading ||
-                                !!settingsEvolutionQ.error ||
-                                settingsEvolutionMutation.isPending
-                              }
-                            />
-                          </Grid2>
-                        ))}
-                        <Grid2 size={{ xs: 12 }}>
-                          <Stack
-                            direction={{ xs: "column", sm: "row" }}
-                            spacing={1}
-                            sx={{ justifyContent: "flex-end" }}
-                          >
-                            <Button
-                              size="small"
-                              color="inherit"
-                              onClick={() =>
-                                setReadinessPolicyDraft(
-                                  readinessPolicyToDraft(settingsReadinessPolicy),
-                                )
-                              }
-                              disabled={
-                                settingsEvolutionQ.isLoading ||
-                                settingsEvolutionMutation.isPending
-                              }
-                            >
-                              Reset
-                            </Button>
-                            <Button
-                              size="small"
-                              variant="contained"
-                              onClick={() => void submitReadinessPolicyDraft()}
-                              disabled={
-                                settingsEvolutionQ.isLoading ||
-                                !!settingsEvolutionQ.error ||
-                                settingsEvolutionMutation.isPending
-                              }
-                            >
-                              Save gates
-                            </Button>
-                          </Stack>
-                        </Grid2>
-                      </Grid2>
-                    </AccordionDetails>
-                  </Accordion>
-                </Box>
-
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <CheckCircleRoundedIcon
-                        sx={{ fontSize: 16, color: "var(--ui-rgba-244-245-247-820)" }}
-                      />
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">
-                        App Deploy Defaults
-                      </div>
-                      <div className="adv-group-header-sub">
-                        Deployment defaults that should stay separate from
-                        ArkSentinel and ArkEvolve.
-                      </div>
-                    </div>
-                  </div>
-                  {settingsEvolutionQ.error ? (
-                    <Alert severity="error" sx={{ mb: 1.5 }}>
-                      {errMessage(settingsEvolutionQ.error)}
-                    </Alert>
-                  ) : null}
-                  <div className="adv-row">
-                    <Stack spacing={0.2}>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        Default app access guard
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          color: "text.secondary",
-                        }}
-                      >
-                        New app deploy and public-link flows start with the
-                        access guard on unless a request explicitly overrides
-                        it.
-                      </Typography>
-                    </Stack>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={settingsDefaultGuardEnabled}
-                          onChange={(event) =>
-                            void updateSettingsEvolution(
-                              {
-                                deploy_guard_default: event.target.checked,
-                              },
-                              event.target.checked
-                                ? "New app deploys will start with the access guard on by default."
-                                : "New app deploys will leave the access guard off by default.",
-                            )
-                          }
-                          disabled={
-                            settingsEvolutionQ.isLoading ||
-                            !!settingsEvolutionQ.error ||
-                            settingsEvolutionMutation.isPending
-                          }
-                        />
-                      }
-                      label={settingsDefaultGuardEnabled ? "On" : "Off"}
-                      sx={{ mr: 0 }}
-                    />
-                  </div>
-                </Box>
-
-                {/* -- Permissions group -- */}
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <span style={{ fontSize: 15 }}>&#128274;</span>
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">Permissions</div>
-                      <div className="adv-group-header-sub">
-                        Action approval and auto-approve settings.
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Auto-Approve Skills */}
-                  <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
-                    Auto-Approve Skills
-                  </Typography>
-                  <Typography
-                    variant="caption"
-                    sx={{
-                      color: "text.secondary",
-                      display: "block",
-                      mb: 1.5,
-                    }}
-                  >
-                    Select action-name overrides that can run without a separate
-                    approval prompt. Dangerous actions stay approval-gated even
-                    if typed manually.
-                  </Typography>
-                  {(() => {
-                    const blockedEntries = findBlockedAutoApproveEntries(
-                      form.auto_approve_csv,
-                    );
-                    const set = new Set(
-                      sanitizeAutoApproveList(
-                        parseCsvList(form.auto_approve_csv),
-                      ),
-                    );
-                    const update = (name: string, checked: boolean) => {
-                      const next = new Set(set);
-                      if (checked) next.add(name);
-                      else next.delete(name);
-                      setField(
-                        "auto_approve_csv",
-                        sanitizeAutoApproveList(Array.from(next).sort()).join(
-                          ", ",
-                        ),
-                      );
-                    };
-                    return (
-                      <>
-                        {blockedEntries.length > 0 ? (
-                          <Alert severity="warning" sx={{ mb: 1.5 }}>
-                            These actions always require approval and will be
-                            ignored here:{" "}
-                            {blockedEntries
-                              .map((name) => `\`${name}\``)
-                              .join(", ")}
-                            .
-                          </Alert>
-                        ) : null}
-                        <Grid2 container spacing={1}>
-                          {AUTO_APPROVE_ACTION_OPTIONS.map((name) => {
-                            const active = set.has(name);
-                            return (
-                              <Grid2 key={name} size={{ xs: 6, md: 4, lg: 3 }}>
-                                <div
-                                  className={`adv-skill-pill${active ? " active" : ""}`}
-                                  onClick={() => update(name, !active)}
-                                >
-                                  <Typography
-                                    variant="caption"
-                                    sx={{
-                                      fontFamily: "'JetBrains Mono', monospace",
-                                      fontSize: "0.7rem",
-                                      letterSpacing: 0,
-                                    }}
-                                  >
-                                    {name}
-                                  </Typography>
-                                  <Switch
-                                    size="small"
-                                    checked={active}
-                                    onChange={(e) =>
-                                      update(name, e.target.checked)
-                                    }
-                                  />
-                                </div>
-                              </Grid2>
-                            );
-                          })}
-                        </Grid2>
-                        <TextField
-                          label="Custom (CSV)"
-                          value={form.auto_approve_csv}
-                          onChange={(e) =>
-                            setField("auto_approve_csv", e.target.value)
-                          }
-                          fullWidth
-                          size="small"
-                          placeholder="comma separated action names"
-                          helperText="Always blocked here: shell, file_write, code_execute, lan_discover, gmail_send, and similar sensitive actions."
-                          sx={{ mt: 1.5 }}
-                        />
-                      </>
-                    );
-                  })()}
-                </Box>
-
-                {/* -- API Access group -- */}
-                <Box className="adv-group">
-                  <div className="adv-group-header">
-                    <div className="adv-group-header-icon">
-                      <span style={{ fontSize: 15 }}>&#128273;</span>
-                    </div>
-                    <div>
-                      <div className="adv-group-header-title">API Access</div>
-                      <div className="adv-group-header-sub">
-                        HTTP API key management.
-                      </div>
-                    </div>
-                  </div>
-
-                  {apiKeyQ.isLoading ? (
-                    <Typography
-                      variant="body2"
-                      sx={{
-                        color: "text.secondary",
-                      }}
-                    >
-                      Loading API key...
-                    </Typography>
-                  ) : apiKeyQ.error ? (
-                    <Alert severity="error">{errMessage(apiKeyQ.error)}</Alert>
-                  ) : (
-                    <Stack spacing={1.5}>
-                      <Stack
-                        direction="row"
-                        spacing={2}
-                        sx={{
-                          alignItems: "center",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: "text.secondary",
-                            flex: "1 1 auto",
-                          }}
-                        >
-                          Used as{" "}
-                          <code
-                            style={{
-                              background: "var(--ui-rgba-255-255-255-060)",
-                              padding: "1px 5px",
-                              borderRadius: 2,
-                              fontSize: "0.72rem",
-                              color: "var(--ui-rgba-244-245-247-900)",
-                            }}
-                          >
-                            Authorization: Bearer &lt;key&gt;
-                          </code>{" "}
-                          for all HTTP requests.
-                        </Typography>
-                        <Chip
-                          size="small"
-                          color={
-                            apiKeyRemainingSeconds > 0 ? "info" : "warning"
-                          }
-                          label={`Rotates in ${formatDurationClock(apiKeyRemainingSeconds)}`}
-                        />
-                      </Stack>
-                      {apiKeyRotated ? (
-                        <Chip
-                          size="small"
-                          color="success"
-                          label="API key rotated automatically"
-                        />
-                      ) : null}
-                      <TextField
-                        label="Key"
-                        value={
-                          apiKeyRevealed
-                            ? str(apiKeyPayload.key, "")
-                            : str(apiKeyPayload.masked, "")
-                        }
-                        fullWidth
-                        size="small"
-                        slotProps={{
-                          input: {
-                            readOnly: true,
-                            sx: {
-                              fontFamily:
-                                "'JetBrains Mono', 'Fira Code', monospace",
-                              fontSize: "0.78rem",
-                              letterSpacing: 0,
-                            },
-                          },
-                        }}
-                      />
-                      {apiKeyIssuedAtUnix > 0
-                        ? (() => {
-                            const { label: issuedLabel, tip: issuedTip } =
-                              humanTs(
-                                new Date(
-                                  apiKeyIssuedAtUnix * 1000,
-                                ).toISOString(),
-                              );
-                            return (
-                              <Tooltip title={issuedTip} placement="top">
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    cursor: "default",
-                                  }}
-                                >
-                                  Issued {issuedLabel}
-                                </Typography>
-                              </Tooltip>
-                            );
-                          })()
-                        : null}
-                      {apiKeyExpiresAtUnix > 0
-                        ? (() => {
-                            const { label: expiresLabel, tip: expiresTip } =
-                              humanTs(
-                                new Date(
-                                  apiKeyExpiresAtUnix * 1000,
-                                ).toISOString(),
-                              );
-                            return (
-                              <Tooltip title={expiresTip} placement="top">
-                                <Typography
-                                  variant="caption"
-                                  sx={{
-                                    color: "text.secondary",
-                                    cursor: "default",
-                                  }}
-                                >
-                                  Expires {expiresLabel}
-                                </Typography>
-                              </Tooltip>
-                            );
-                          })()
-                        : null}
-                      <Stack direction="row" spacing={1}>
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          onClick={() => setApiKeyRevealed((v) => !v)}
-                        >
-                          {apiKeyRevealed ? "Hide" : "Reveal"}
-                        </Button>
-                        <Button
-                          size="small"
-                          variant="outlined"
-                          onClick={async () => {
-                            const key = str(apiKeyPayload.key, "");
-                            if (!key) return;
-                            await navigator.clipboard.writeText(key);
-                            setSuccess("API key copied.");
-                          }}
-                          disabled={!str(apiKeyPayload.key, "").trim()}
-                        >
-                          Copy
-                        </Button>
-                        <Button
-                          size="small"
-                          color="warning"
-                          variant="outlined"
-                          onClick={async () => {
-                            const ok = window.confirm(
-                              "Regenerate API key? Old key will stop working.",
-                            );
-                            if (!ok) return;
-                            setError(null);
-                            setSuccess(null);
-                            try {
-                              await regenerateApiKeyMutation.mutateAsync();
-                              setApiKeyRevealed(true);
-                              setSuccess("API key regenerated.");
-                            } catch (e) {
-                              setError(errMessage(e));
-                            }
-                          }}
-                          disabled={regenerateApiKeyMutation.isPending}
-                        >
-                          Regenerate
-                        </Button>
-                      </Stack>
-                    </Stack>
-                  )}
-                </Box>
-              </Stack>
-            ) : null}
-
-            {tab === 14 ? (
-              <Stack spacing={2.5}>
-                <Alert
-                  severity={
-                    foreverLifecycleRules.length > 0 ? "warning" : "info"
+              <WorkspaceLazyPanel message="Loading security settings...">
+                <SettingsSecurityPanel
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                  securityStatusQ={securityStatusQ}
+                  hasCustomMasterPassword={hasCustomMasterPassword}
+                  passwordMutationPending={passwordMutationPending}
+                  openPasswordDialog={openPasswordDialog}
+                  abuseReviews={abuseReviews}
+                  abuseReviewsQ={abuseReviewsQ}
+                  decideAbuseReviewMutation={decideAbuseReviewMutation}
+                  showInternalServiceSection={showInternalServiceSection}
+                  internalServiceDescription={internalServiceDescription}
+                  internalServiceRotationSupported={
+                    internalServiceRotationSupported
                   }
-                >
-                  <Stack spacing={0.35}>
-                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                      Data cleanup is enabled by default, but every cleanup
-                      category can be disabled.
-                    </Typography>
-                    <Typography
-                      variant="body2"
-                      sx={{
-                        color: "inherit",
-                      }}
-                    >
-                      {foreverLifecycleRules.length > 0
-                        ? `Forever is enabled for ${foreverLifecycleSummary}.`
-                        : "Set any retention field below to 0 if you intentionally want to keep that data forever."}{" "}
-                      Keeping rows forever or far beyond the defaults can
-                      increase DB size, slow queries, and make the server feel
-                      heavier over time.
-                    </Typography>
-                  </Stack>
-                </Alert>
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    <Stack
-                      direction="row"
-                      spacing={1}
-                      useFlexGap
-                      sx={{
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <Chip
-                        size="small"
-                        color={dataCleanupEnabled ? "success" : "default"}
-                        label={
-                          dataCleanupEnabled
-                            ? "Cleanup active"
-                            : "Cleanup paused"
-                        }
-                      />
-                      <Chip
-                        size="small"
-                        variant="outlined"
-                        label={
-                          form.data_lifecycle_notifications_cleanup_enabled
-                            ? "Notifications on"
-                            : "Notifications off"
-                        }
-                      />
-                      <Chip
-                        size="small"
-                        variant="outlined"
-                        label={
-                          form.data_lifecycle_logs_cleanup_enabled
-                            ? "Logs & traces on"
-                            : "Logs & traces off"
-                        }
-                      />
-                    </Stack>
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={form.data_lifecycle_cleanup_enabled}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_cleanup_enabled",
-                              e.target.checked,
-                            )
-                          }
-                        />
-                      }
-                      label="Enable data cleanup"
-                    />
-                  </Stack>
-                </Box>
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    {renderSettingsSectionIntro({
-                      eyebrow: "Lifecycle",
-                      title: "Memory Behavior",
-                      description:
-                        "Retention controls for durable memory, audit history, staged candidates, and memory checks.",
-                    })}
-                    <Alert severity="info">
-                      ArkMemory is the normal memory surface. These settings
-                      only change how long memory records and evidence are
-                      retained.
-                    </Alert>
-                    <Grid2 container spacing={1.5}>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Inactive memory rows (days)"
-                          value={
-                            form.data_lifecycle_experience_item_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_experience_item_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Active memories are never auto-deleted. 0 keeps inactive rows too."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Memory ledger (days)"
-                          value={form.data_lifecycle_recall_event_retention_days}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_recall_event_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Audit history for memory changes."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Memory checks (days)"
-                          value={form.data_lifecycle_recall_test_retention_days}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_recall_test_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Generated checks for stored memory."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Staged candidates (days)"
-                          value={
-                            form.data_lifecycle_learning_candidate_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_learning_candidate_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Review queue and rejected candidates."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Experience runs (days)"
-                          value={form.data_lifecycle_experience_run_retention_days}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_experience_run_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Session evidence used for learning."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Experience edges (days)"
-                          value={
-                            form.data_lifecycle_experience_edge_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_experience_edge_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Lineage and supersedes links."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Inactive patterns (days)"
-                          value={
-                            form.data_lifecycle_procedural_pattern_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_procedural_pattern_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Active and draft learned patterns are never auto-deleted."
-                          slotProps={{ htmlInput: { min: 0, step: 1 } }}
-                        />
-                      </Grid2>
-                    </Grid2>
-                  </Stack>
-                </Box>
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    {renderSettingsSectionIntro({
-                      eyebrow: "Lifecycle",
-                      title: "Notifications",
-                      description:
-                        "Set retention and cleanup cadence for in-product notifications stored by the system.",
-                    })}
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={
-                            form.data_lifecycle_notifications_cleanup_enabled
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_notifications_cleanup_enabled",
-                              e.target.checked,
-                            )
-                          }
-                        />
-                      }
-                      label="Enable notification cleanup"
-                    />
-                    <Grid2
-                      container
-                      spacing={1.5}
-                      sx={{
-                        opacity: notificationsCleanupInputsEnabled ? 1 : 0.55,
-                        pointerEvents: notificationsCleanupInputsEnabled
-                          ? "auto"
-                          : "none",
-                        transition: "opacity 0.2s",
-                      }}
-                    >
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Retention (days)"
-                          value={
-                            form.data_lifecycle_notifications_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_notifications_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps notifications forever."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Cleanup cadence (seconds)"
-                          value={
-                            form.data_lifecycle_notification_cleanup_interval_secs
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_notification_cleanup_interval_secs",
-                              e.target.value,
-                            )
-                          }
-                          helperText="How often stale notifications are purged."
-                          slotProps={{
-                            htmlInput: { min: 300, step: 60 },
-                          }}
-                        />
-                      </Grid2>
-                    </Grid2>
-                  </Stack>
-                </Box>
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    {renderSettingsSectionIntro({
-                      eyebrow: "Lifecycle",
-                      title: "Logs & Traces",
-                      description:
-                        "Retention windows for operational data. Use 0 only when you intentionally want to keep a category forever.",
-                    })}
-                    <FormControlLabel
-                      control={
-                        <Switch
-                          checked={form.data_lifecycle_logs_cleanup_enabled}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_logs_cleanup_enabled",
-                              e.target.checked,
-                            )
-                          }
-                        />
-                      }
-                      label="Enable logs, traces, task, and message cleanup"
-                    />
-                    <Grid2
-                      container
-                      spacing={1.5}
-                      sx={{
-                        opacity: logsCleanupInputsEnabled ? 1 : 0.55,
-                        pointerEvents: logsCleanupInputsEnabled
-                          ? "auto"
-                          : "none",
-                        transition: "opacity 0.2s",
-                      }}
-                    >
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Execution traces (days)"
-                          value={
-                            form.data_lifecycle_execution_trace_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_execution_trace_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all traces."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Execution runs (days)"
-                          value={
-                            form.data_lifecycle_execution_run_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_execution_run_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all execution runs, checkpoints, and tool attempts."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Background sessions (days)"
-                          value={
-                            form.data_lifecycle_background_session_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_background_session_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps closed background sessions forever."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Browser sessions (days)"
-                          value={
-                            form.data_lifecycle_browser_session_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_browser_session_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps completed and failed browser sessions forever."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Automation runs (days)"
-                          value={
-                            form.data_lifecycle_automation_run_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_automation_run_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps automation history forever."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Execution proofs (days)"
-                          value={
-                            form.data_lifecycle_execution_proof_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_execution_proof_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all proofs."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Operational logs (days)"
-                          value={
-                            form.data_lifecycle_operational_log_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_operational_log_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all operational logs."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Security logs (days)"
-                          value={
-                            form.data_lifecycle_security_log_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_security_log_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Used by both housekeeping and idle cleanup."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Approval logs (days)"
-                          value={
-                            form.data_lifecycle_approval_log_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_approval_log_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all approval history."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Delegations (days)"
-                          value={
-                            form.data_lifecycle_swarm_delegation_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_swarm_delegation_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all delegation records."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="LLM usage (days)"
-                          value={form.data_lifecycle_llm_usage_retention_days}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_llm_usage_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all token/accounting usage."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Completed tasks (days)"
-                          value={
-                            form.data_lifecycle_terminal_task_retention_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_terminal_task_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Recurring cron tasks are never purged."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Conversations (days)"
-                          value={form.data_lifecycle_message_retention_days}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_message_retention_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="0 keeps all messages and conversation history."
-                          slotProps={{
-                            htmlInput: { min: 0, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                    </Grid2>
-                  </Stack>
-                </Box>
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    {renderSettingsSectionIntro({
-                      eyebrow: "Lifecycle",
-                      title: "Cleanup Cadence",
-                      description:
-                        "Configure how often housekeeping runs and when idle security cleanup is allowed to start.",
-                    })}
-                    <Grid2
-                      container
-                      spacing={1.5}
-                      sx={{
-                        opacity: logsCleanupInputsEnabled ? 1 : 0.55,
-                        pointerEvents: logsCleanupInputsEnabled
-                          ? "auto"
-                          : "none",
-                        transition: "opacity 0.2s",
-                      }}
-                    >
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Housekeeping cadence (seconds)"
-                          value={form.data_lifecycle_housekeeping_interval_secs}
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_housekeeping_interval_secs",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Used for trace, log, task, and message cleanup passes."
-                          slotProps={{
-                            htmlInput: { min: 300, step: 60 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Security cleanup cadence (days)"
-                          value={
-                            form.data_lifecycle_security_cleanup_interval_days
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_security_cleanup_interval_days",
-                              e.target.value,
-                            )
-                          }
-                          helperText="How often the idle security-log cleanup may run."
-                          slotProps={{
-                            htmlInput: { min: 1, step: 1 },
-                          }}
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 4 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          type="number"
-                          label="Security idle threshold (seconds)"
-                          value={
-                            form.data_lifecycle_security_cleanup_idle_threshold_secs
-                          }
-                          onChange={(e) =>
-                            setField(
-                              "data_lifecycle_security_cleanup_idle_threshold_secs",
-                              e.target.value,
-                            )
-                          }
-                          helperText="Server must stay idle this long before the security sweep runs."
-                          slotProps={{
-                            htmlInput: { min: 60, step: 60 },
-                          }}
-                        />
-                      </Grid2>
-                    </Grid2>
-                  </Stack>
-                </Box>
-              </Stack>
+                  internalServiceTokens={internalServiceTokens}
+                  openRotateInternalCredentialsDialog={
+                    openRotateInternalCredentialsDialog
+                  }
+                  tunnelQ={tunnelQ}
+                  tunnelProvidersQ={tunnelProvidersQ}
+                  tunnel={tunnel}
+                  tunnelProvidersPayload={tunnelProvidersPayload}
+                  selectedTunnelMeta={selectedTunnelMeta}
+                  selectedTunnelStoredSecretFields={
+                    selectedTunnelStoredSecretFields
+                  }
+                  showTunnelAdvanced={showTunnelAdvanced}
+                  setShowTunnelAdvanced={setShowTunnelAdvanced}
+                  tunnelDraftValues={tunnelDraftValues}
+                  setTunnelDraftValues={setTunnelDraftValues}
+                  tunnelSelectedProviderId={tunnelSelectedProviderId}
+                  tunnelPanelNotice={tunnelPanelNotice}
+                  serverSelectedTunnelProviderId={serverSelectedTunnelProviderId}
+                  tunnelSummaryTone={tunnelSummaryTone}
+                  tunnelStateLabel={tunnelStateLabel}
+                  tunnelAccessLabel={tunnelAccessLabel}
+                  tunnelPrimaryText={tunnelPrimaryText}
+                  tunnelPrimaryDetail={tunnelPrimaryDetail}
+                  tunnelProviderOptions={tunnelProviderOptions}
+                  basicTunnelConfigFields={basicTunnelConfigFields}
+                  advancedTunnelConfigFields={advancedTunnelConfigFields}
+                  selectedTunnelAvailable={selectedTunnelAvailable}
+                  tunnelSetupChecks={tunnelSetupChecks}
+                  renderSettingsInlineCard={renderSettingsInlineCard}
+                  tunnelSaveMutation={tunnelSaveMutation}
+                  tunnelTestMutation={tunnelTestMutation}
+                  tunnelStartMutation={tunnelStartMutation}
+                  tunnelStopMutation={tunnelStopMutation}
+                  handleTunnelStart={handleTunnelStart}
+                  handleTunnelStop={handleTunnelStop}
+                  syncTunnelDraftFromPayload={syncTunnelDraftFromPayload}
+                  handleTunnelProviderSave={handleTunnelProviderSave}
+                  handleTunnelProviderTest={handleTunnelProviderTest}
+                  rotateInternalServiceTokensMutation={
+                    rotateInternalServiceTokensMutation
+                  }
+                  restartNotice={restartNotice}
+                  vaultSummaryText={vaultSummaryText}
+                  vaultSecrets={vaultSecrets}
+                  vaultPassword={vaultPassword}
+                  setVaultPassword={setVaultPassword}
+                  vaultSecretsQ={vaultSecretsQ}
+                  queryClient={queryClient}
+                  openVaultEditor={openVaultEditor}
+                  deleteVaultSecretMutation={deleteVaultSecretMutation}
+                  resolveVaultPasswordForSensitiveOps={
+                    resolveVaultPasswordForSensitiveOps
+                  }
+                  form={form}
+                  setField={setField}
+                  setError={setError}
+                  setSuccess={setSuccess}
+                />
+              </WorkspaceLazyPanel>
             ) : null}
-
+            {tab === 5 ? (
+              <WorkspaceLazyPanel message="Loading advanced settings...">
+                <SettingsAdvancedPanel
+                  restartNotice={restartNotice}
+                  renderSettingsInlineCard={renderSettingsInlineCard}
+                  settingsAutonomyQ={settingsAutonomyQ}
+                  settingsAutonomyPaused={settingsAutonomyPaused}
+                  settingsAutonomyModeLabel={settingsAutonomyModeLabel}
+                  handleResumeAutonomy={handleResumeAutonomy}
+                  setAutonomyPauseDialogOpen={setAutonomyPauseDialogOpen}
+                  settingsAutonomyMutation={settingsAutonomyMutation}
+                  openRestartDialog={openRestartDialog}
+                  restartMutation={restartMutation}
+                  developerModeEnabled={developerModeEnabled}
+                  setDeveloperModeEnabledState={setDeveloperModeEnabledState}
+                  setError={setError}
+                  setSuccess={setSuccess}
+                  settingsSentinelQ={settingsSentinelQ}
+                  settingsSentinel={settingsSentinel}
+                  settingsSentinelEnabled={settingsSentinelEnabled}
+                  setSentinelDisableDialogOpen={setSentinelDisableDialogOpen}
+                  setSentinelInAppDisableDialogOpen={
+                    setSentinelInAppDisableDialogOpen
+                  }
+                  updateSettingsSentinel={updateSettingsSentinel}
+                  settingsSentinelMutation={settingsSentinelMutation}
+                  settingsEvolutionQ={settingsEvolutionQ}
+                  settingsSelfEvolveEnabled={settingsSelfEvolveEnabled}
+                  handleEnableSelfEvolve={handleEnableSelfEvolve}
+                  setSelfEvolveDisableDialogOpen={setSelfEvolveDisableDialogOpen}
+                  settingsEvolutionMutation={settingsEvolutionMutation}
+                  readinessPolicyDraft={readinessPolicyDraft}
+                  setReadinessPolicyDraft={setReadinessPolicyDraft}
+                  readinessPolicyToDraft={readinessPolicyToDraft}
+                  settingsReadinessPolicy={settingsReadinessPolicy}
+                  submitReadinessPolicyDraft={submitReadinessPolicyDraft}
+                  settingsDefaultGuardEnabled={settingsDefaultGuardEnabled}
+                  updateSettingsEvolution={updateSettingsEvolution}
+                  findBlockedAutoApproveEntries={findBlockedAutoApproveEntries}
+                  parseCsvList={parseCsvList}
+                  sanitizeAutoApproveList={sanitizeAutoApproveList}
+                  form={form}
+                  setField={setField}
+                  apiKeyQ={apiKeyQ}
+                  apiKeyRemainingSeconds={apiKeyRemainingSeconds}
+                  apiKeyRotated={apiKeyRotated}
+                  apiKeyRevealed={apiKeyRevealed}
+                  setApiKeyRevealed={setApiKeyRevealed}
+                  apiKeyPayload={apiKeyPayload}
+                  apiKeyIssuedAtUnix={apiKeyIssuedAtUnix}
+                  apiKeyExpiresAtUnix={apiKeyExpiresAtUnix}
+                  regenerateApiKeyMutation={regenerateApiKeyMutation}
+                />
+              </WorkspaceLazyPanel>
+            ) : null}
+            {tab === 14 ? (
+              <WorkspaceLazyPanel message="Loading data cleanup...">
+                <SettingsDataLifecyclePanel
+                  form={form}
+                  setField={(key, value) => setField(key, value)}
+                  foreverLifecycleRules={foreverLifecycleRules}
+                  foreverLifecycleSummary={foreverLifecycleSummary}
+                  dataCleanupEnabled={dataCleanupEnabled}
+                  notificationsCleanupInputsEnabled={
+                    notificationsCleanupInputsEnabled
+                  }
+                  logsCleanupInputsEnabled={logsCleanupInputsEnabled}
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                />
+              </WorkspaceLazyPanel>
+            ) : null}
             {tab === 25 ? (
-              <Stack spacing={2.5}>
-                {restartNotice
-                  ? renderSettingsInlineCard({
-                      eyebrow: "Restarting",
-                      title: "AgentArk is coming back online",
-                      description: restartNotice.text,
-                      tone: "info",
-                      action: (
-                        <Chip
-                          size="small"
-                          icon={<AutorenewRoundedIcon />}
-                          label={restartNotice.etaLabel}
-                          color="info"
-                          variant="outlined"
-                        />
-                      ),
-                    })
-                  : null}
-
-                {renderSettingsInlineCard({
-                  eyebrow: "Updates",
-                  title: "Managed release updates",
-                  description:
-                    "Updating restarts AgentArk. Pending chats, running jobs, and in-flight approvals can be interrupted. Stored data and conversation history remain on this machine.",
-                  tone: "warning",
-                  fullWidthCopy: true,
-                })}
-
-                <Box className="list-shell">
-                  <Stack spacing={2}>
-                    {renderSettingsSectionIntro({
-                      eyebrow: "Updates",
-                      title: "Release status",
-                      description:
-                        "Track the installed version and the latest tagged release without polling GitHub on every page refresh.",
-                      action:
-                        updateStatus?.state === "available" &&
-                        updateStatus.apply_supported ? (
-                          <Button
-                            size="small"
-                            variant="contained"
-                            color="warning"
-                            disabled={
-                              updateAgentArkMutation.isPending ||
-                              !!restartNotice
-                            }
-                            onClick={async () => {
-                              const ok = window.confirm(
-                                "Update AgentArk and restart now? Pending chats, running jobs, and in-flight approvals can be interrupted.",
-                              );
-                              if (!ok) return;
-                              setError(null);
-                              setSuccess(null);
-                              setRestartNotice(null);
-                              try {
-                                await updateAgentArkMutation.mutateAsync();
-                                void monitorRestartRecovery(
-                                  UPDATE_NOTICE_DURATION_MS,
-                                );
-                              } catch (e) {
-                                setError(errMessage(e));
-                              }
-                            }}
-                          >
-                            {updateAgentArkMutation.isPending
-                              ? "Starting..."
-                              : "Update and Restart"}
-                          </Button>
-                        ) : null,
-                    })}
-
-                    {updateStatusQ.isLoading && !updateStatus ? (
-                      <Alert severity="info">
-                        Checking the latest release.
-                      </Alert>
-                    ) : updateStatusQ.error ? (
-                      <Alert severity="error">
-                        {errMessage(updateStatusQ.error)}
-                      </Alert>
-                    ) : null}
-
-                    <Grid2 container spacing={1.5}>
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          label="Installed version"
-                          value={str(updateStatusQ.data?.version, "Unknown")}
-                          disabled
-                        />
-                      </Grid2>
-                      <Grid2 size={{ xs: 12, md: 6 }}>
-                        <TextField
-                          fullWidth
-                          size="small"
-                          label="Latest release"
-                          value={str(
-                            updateStatus?.latest_version,
-                            "Unavailable",
-                          )}
-                          disabled
-                        />
-                      </Grid2>
-                    </Grid2>
-
-                    {updateStatus?.checked_at ? (
-                      <Typography
-                        variant="caption"
-                        sx={{ color: "text.secondary" }}
-                      >
-                        Last checked {updateCheckedAtLabel}
-                      </Typography>
-                    ) : null}
-
-                    {updateStatus?.release_url ? (
-                      <Link
-                        href={updateStatus.release_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        underline="hover"
-                      >
-                        Open release notes
-                      </Link>
-                    ) : null}
-
-                    {(() => {
-                      if (!updateStatus) {
-                        return null;
-                      }
-                      if (updateStatus.state === "available") {
-                        return (
-                          <Alert severity="warning">
-                            A newer tagged release is available.
-                            {updateStatus.apply_supported
-                              ? " Start the update here when you are ready for a restart."
-                              : ` ${updateStatus.apply_message || "Update this deployment from the CLI instead."}`}
-                          </Alert>
-                        );
-                      }
-                      if (updateStatus.state === "current") {
-                        return (
-                          <Alert severity="success">
-                            This installation is already on the latest tagged
-                            release.
-                          </Alert>
-                        );
-                      }
-                      if (updateStatus.state === "unavailable") {
-                        return (
-                          <Alert severity="info">
-                            Update status is unavailable for this deployment.
-                            This is expected while release metadata is private
-                            or temporarily unreachable.
-                          </Alert>
-                        );
-                      }
-                      return (
-                        <Alert severity="info">
-                          Checking release metadata.
-                        </Alert>
-                      );
-                    })()}
-                  </Stack>
-                </Box>
-              </Stack>
+              <WorkspaceLazyPanel message="Loading updates...">
+                <SettingsUpdatesPanel
+                  restartNotice={restartNotice}
+                  renderSettingsInlineCard={renderSettingsInlineCard}
+                  renderSettingsSectionIntro={renderSettingsSectionIntro}
+                  updateStatus={updateStatus}
+                  updateCheckedAtLabel={updateCheckedAtLabel}
+                  updateStatusQ={updateStatusQ}
+                  updateAgentArkPending={updateAgentArkMutation.isPending}
+                  onUpdateAndRestart={async () => {
+                    const ok = window.confirm(
+                      "Update AgentArk and restart now? Pending chats, running jobs, and in-flight approvals can be interrupted.",
+                    );
+                    if (!ok) return;
+                    setError(null);
+                    setSuccess(null);
+                    setRestartNotice(null);
+                    try {
+                      await updateAgentArkMutation.mutateAsync();
+                      void monitorRestartRecovery(UPDATE_NOTICE_DURATION_MS);
+                    } catch (e) {
+                      setError(errMessage(e));
+                    }
+                  }}
+                />
+              </WorkspaceLazyPanel>
             ) : null}
 
             {tab === 6 ? (
@@ -9267,8 +5552,6 @@ export default function SettingsPage({
               <WorkspaceLazyPanel message="Loading memory...">
                 <MemoryPage
                   autoRefresh={autoRefresh}
-                  projects={[]}
-                  activeProjectId=""
                   showHeader={false}
                 />
               </WorkspaceLazyPanel>
@@ -9693,8 +5976,8 @@ export default function SettingsPage({
               </Box>
             ) : (
               <Grid2 container spacing={1.25}>
-                {selectedPulseFindings.slice(0, 20).map((f, idx) => {
-                  const fr = asRecord(f);
+                {selectedPulseFindings.slice(0, 20).map((finding, idx) => {
+                  const fr = finding.row;
                   const sev = str(fr.severity, "");
                   const title = str(fr.title, "Issue");
                   const target = str(fr.target, "-");
@@ -9823,104 +6106,116 @@ export default function SettingsPage({
                               {fix}
                             </Typography>
                           </Box>
-                          <Stack
-                            direction="row"
-                            spacing={1}
-                            useFlexGap
-                            sx={{
-                              flexWrap: "wrap",
-                            }}
-                          >
-                            <Button
-                              size="small"
-                              variant="outlined"
+                          {!canRunFix ? (
+                            <Alert
+                              severity="warning"
+                              icon={<ErrorOutlineRoundedIcon />}
+                            >
+                              <Typography variant="body2">
+                                {arkPulseManualFollowupText()}
+                              </Typography>
+                            </Alert>
+                          ) : (
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              useFlexGap
                               sx={{
-                                borderRadius: "8px",
-                                textTransform: "none",
-                              }}
-                              disabled={!canCopyFix}
-                              onClick={async () => {
-                                setError(null);
-                                setSuccess(null);
-                                try {
-                                  await copyClipboardText(fix);
-                                  setSuccess("Remediation copied.");
-                                } catch (e) {
-                                  setError(errMessage(e));
-                                }
+                                flexWrap: "wrap",
                               }}
                             >
-                              Copy next step
-                            </Button>
-                            <Button
-                              size="small"
-                              variant="contained"
-                              sx={{
-                                borderRadius: "8px",
-                                textTransform: "none",
-                              }}
-                              disabled={
-                                !canRunFix || runPulseFixMutation.isPending
-                              }
-                              onClick={async () => {
-                                setError(null);
-                                setSuccess(null);
-                                setActivePulseFixId(fixActionId);
-                                setPulseFixResultsById((prev) => {
-                                  if (!prev[fixActionId]) return prev;
-                                  const next = { ...prev };
-                                  delete next[fixActionId];
-                                  return next;
-                                });
-                                try {
-                                  const result =
-                                    await runPulseFixMutation.mutateAsync({
-                                    fixCommand: rawFixCommand,
-                                    remediation: typedRemediation,
-                                    issueTitle: title,
-                                    target,
-                                    eventTimestamp: str(
-                                      selectedPulseEvent?.timestamp,
-                                      "",
-                                    ),
-                                    findingIndex: idx,
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                startIcon={
+                                  <ContentCopyRoundedIcon fontSize="small" />
+                                }
+                                sx={{
+                                  borderRadius: "8px",
+                                  textTransform: "none",
+                                }}
+                                disabled={!canCopyFix}
+                                onClick={async () => {
+                                  setError(null);
+                                  setSuccess(null);
+                                  try {
+                                    await copyClipboardText(fix);
+                                    setSuccess("Remediation copied.");
+                                  } catch (e) {
+                                    setError(errMessage(e));
+                                  }
+                                }}
+                              >
+                                Copy next step
+                              </Button>
+                              <Button
+                                size="small"
+                                variant="contained"
+                                sx={{
+                                  borderRadius: "8px",
+                                  textTransform: "none",
+                                }}
+                                disabled={runPulseFixMutation.isPending}
+                                onClick={async () => {
+                                  setError(null);
+                                  setSuccess(null);
+                                  setActivePulseFixId(fixActionId);
+                                  setPulseFixResultsById((prev) => {
+                                    if (!prev[fixActionId]) return prev;
+                                    const next = { ...prev };
+                                    delete next[fixActionId];
+                                    return next;
                                   });
-                                  setPulseFixResultsById((prev) => ({
-                                    ...prev,
-                                    [fixActionId]: {
-                                      severity: "success",
-                                      message:
-                                        str(
-                                          result.message,
+                                  try {
+                                    const result =
+                                      await runPulseFixMutation.mutateAsync({
+                                        fixCommand: rawFixCommand,
+                                        remediation: typedRemediation,
+                                        issueTitle: title,
+                                        target,
+                                        eventTimestamp: str(
+                                          selectedPulseEvent?.timestamp,
+                                          "",
+                                        ),
+                                        findingIndex: finding.findingIndex,
+                                      });
+                                    setPulseFixResultsById((prev) => ({
+                                      ...prev,
+                                      [fixActionId]: {
+                                        severity: "success",
+                                        message:
+                                          str(
+                                            result.message,
+                                            "ArkPulse diagnostic completed.",
+                                          ).trim() ||
                                           "ArkPulse diagnostic completed.",
-                                        ).trim() ||
-                                        "ArkPulse diagnostic completed.",
-                                      output: str(result.output, "").trim(),
-                                      timestamp: new Date().toISOString(),
-                                    },
-                                  }));
-                                } catch (e) {
-                                  setPulseFixResultsById((prev) => ({
-                                    ...prev,
-                                    [fixActionId]: {
-                                      severity: "error",
-                                      message: errMessage(e),
-                                      output: "",
-                                      timestamp: new Date().toISOString(),
-                                    },
-                                  }));
-                                } finally {
-                                  setActivePulseFixId((prev) =>
-                                    prev === fixActionId ? null : prev,
-                                  );
-                                }
-                              }}
-                            >
-                              {fixBusy
-                                ? "Running..."
-                                : arkPulseRunActionLabel(displayRemediation)}
-                            </Button>
-                          </Stack>
+                                        output: str(result.output, "").trim(),
+                                        timestamp: new Date().toISOString(),
+                                      },
+                                    }));
+                                  } catch (e) {
+                                    setPulseFixResultsById((prev) => ({
+                                      ...prev,
+                                      [fixActionId]: {
+                                        severity: "error",
+                                        message: errMessage(e),
+                                        output: "",
+                                        timestamp: new Date().toISOString(),
+                                      },
+                                    }));
+                                  } finally {
+                                    setActivePulseFixId((prev) =>
+                                      prev === fixActionId ? null : prev,
+                                    );
+                                  }
+                                }}
+                              >
+                                {fixBusy
+                                  ? "Running..."
+                                  : arkPulseRunActionLabel(displayRemediation)}
+                              </Button>
+                            </Stack>
+                          )}
                           {inlineFixResult ? (
                             <Alert
                               severity={inlineFixResult.severity}
@@ -10289,7 +6584,7 @@ export default function SettingsPage({
           </Stack>
         </DialogContent>
       </Dialog>
-      {!standaloneArkPulse && (settingsQ.isLoading || mediaQ.isLoading) ? (
+      {activeSettingsDataLoading ? (
         <Typography
           variant="body2"
           sx={{
@@ -10758,9 +7053,9 @@ export default function SettingsPage({
           </Button>
         </DialogActions>
       </Dialog>
-      {settingsQ.error || mediaQ.error || modelsQ.error ? (
+      {activeSettingsDataError ? (
         <Alert severity="error">
-          {errMessage(settingsQ.error || mediaQ.error || modelsQ.error)}
+          {errMessage(activeSettingsDataError)}
         </Alert>
       ) : null}
       {error ? <Alert severity="error">{error}</Alert> : null}

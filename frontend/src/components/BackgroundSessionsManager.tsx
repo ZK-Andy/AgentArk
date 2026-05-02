@@ -180,16 +180,29 @@ function RowOpsMenu({ actions, ariaLabel = "Row actions" }: { actions: RowMenuAc
   const closeMenu = () => setAnchorEl(null);
   return (
     <>
-      <IconButton size="small" aria-label={ariaLabel} onClick={(e) => setAnchorEl(e.currentTarget)}>
+      <IconButton
+        size="small"
+        aria-label={ariaLabel}
+        onClick={(event) => {
+          event.stopPropagation();
+          setAnchorEl(event.currentTarget);
+        }}
+      >
         <MoreVertIcon fontSize="small" />
       </IconButton>
-      <Menu anchorEl={anchorEl} open={open} onClose={closeMenu}>
+      <Menu
+        anchorEl={anchorEl}
+        open={open}
+        onClose={closeMenu}
+        onClick={(event) => event.stopPropagation()}
+      >
         {actions.map((action, idx) => (
           <MenuItem
             key={`${action.label}-${idx}`}
             divider={action.divider}
             disabled={action.disabled}
-            onClick={() => {
+            onClick={(event) => {
+              event.stopPropagation();
               closeMenu();
               if (action.disabled) return;
               void action.onClick();
@@ -399,6 +412,23 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
     onError: (error) => setNotice({ kind: "error", text: errMessage(error) }),
   });
 
+  const deleteLinkedWatcherMutation = useMutation({
+    mutationFn: (watcherId: string) =>
+      api.rawDelete(`/watchers/${encodeURIComponent(watcherId)}`),
+    onSuccess: async () => {
+      setNotice({
+        kind: "success",
+        text: "Watcher deleted.",
+      });
+      await queryClient.invalidateQueries({ queryKey: ["background-sessions"] });
+      await queryClient.invalidateQueries({ queryKey: ["background-session-detail"] });
+      await queryClient.invalidateQueries({ queryKey: ["background-session-selectable-watchers"] });
+      await queryClient.invalidateQueries({ queryKey: ["background-sessions-watcher-links"] });
+      await queryClient.invalidateQueries({ queryKey: ["watchers-page-watchers"] });
+    },
+    onError: (error) => setNotice({ kind: "error", text: errMessage(error) }),
+  });
+
   const saveMutation = useMutation({
     mutationFn: async (nextForm: SessionFormState) => {
       const payload = {
@@ -491,7 +521,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
       <WorkspacePageHeader
         eyebrow="Operations"
         title="Sessions"
-        description="Durable work created through chat and kept here for inspection, pause/resume control, and linked task or watcher management."
+        description="Durable work created through chat. Some sessions manage linked watcher pollers; the poller runtime also appears on the Background Work page."
       />
       {/* Compact stat strip */}
       <Box className="list-shell stat-strip">
@@ -573,7 +603,7 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                   divider: true,
                   onClick: () => {
                     const confirmed = window.confirm(
-                      "Delete this background session? Linked tasks and watchers will be detached but not deleted.",
+                      "Delete this background session? Linked tasks will be detached. Linked watchers will be deleted from both Sessions and Watchers.",
                     );
                     if (!confirmed) return;
                     actionMutation.mutate({ kind: "delete", sessionId: session.id });
@@ -642,7 +672,14 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                       variant="caption"
                       sx={{ color: "text.secondary", pl: "15px", display: "block" }}
                     >
-                      Created {formatTimestamp(session.created_at)} &middot; Updated {formatTimestamp(session.updated_at)} &middot; Last activity {formatTimestamp(session.last_activity_at)}
+                      Background session
+                      {session.counts?.watchers_total
+                        ? ` - manages ${session.counts.watchers_total} watcher poller${session.counts.watchers_total === 1 ? "" : "s"}`
+                        : ""}
+                      {session.counts?.tasks_total
+                        ? ` - tracks ${session.counts.tasks_total} task${session.counts.tasks_total === 1 ? "" : "s"}`
+                        : ""}
+                      {` - Created ${formatTimestamp(session.created_at)} - Last activity ${formatTimestamp(session.last_activity_at)}`}
                     </Typography>
                   </ButtonBase>
                   <Box sx={{ flexShrink: 0, pt: 1.15 }}>
@@ -970,6 +1007,17 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
 
               {detailTab === "overview" ? (
                 <Stack spacing={1.5}>
+                  {selectedSession.counts.watchers_total > 0 ? (
+                    <Alert severity="info" variant="outlined">
+                      This is the durable management session for{" "}
+                      {selectedSession.counts.watchers_total} linked watcher
+                      poller
+                      {selectedSession.counts.watchers_total === 1 ? "" : "s"}.
+                      The watcher page shows the polling runtime; this session
+                      keeps the work inspectable and controllable over time.
+                    </Alert>
+                  ) : null}
+
                   {selectedSession.summary ? (
                     <Box
                       sx={{
@@ -1137,7 +1185,26 @@ export function BackgroundSessionsManager({ autoRefresh }: { autoRefresh: boolea
                                 <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap title={watcher.description}>
                                   {watcher.description}
                                 </Typography>
-                                <Chip size="small" label={statusLabel(watcher.status)} color={chipColor(watcher.status)} />
+                                <Stack direction="row" spacing={0.5} sx={{ alignItems: "center", flexShrink: 0 }}>
+                                  <Chip size="small" label={statusLabel(watcher.status)} color={chipColor(watcher.status)} />
+                                  <RowOpsMenu
+                                    ariaLabel="Linked watcher options"
+                                    actions={[
+                                      {
+                                        label: "Delete watcher",
+                                        tone: "error",
+                                        disabled: deleteLinkedWatcherMutation.isPending,
+                                        onClick: () => {
+                                          const confirmed = window.confirm(
+                                            "Delete this watcher? It will be removed from both Sessions and Watchers.",
+                                          );
+                                          if (!confirmed) return;
+                                          deleteLinkedWatcherMutation.mutate(watcher.id);
+                                        },
+                                      },
+                                    ]}
+                                  />
+                                </Stack>
                               </Stack>
                               <Typography variant="caption" sx={{
                                 color: "text.secondary"

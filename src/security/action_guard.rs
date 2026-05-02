@@ -938,17 +938,22 @@ impl ActionGuard {
     pub fn parse_permission(s: &str) -> Permission {
         match s.trim().to_lowercase().as_str() {
             "network" => Permission::Network,
-            "file_read" | "fileread" | "read" => Permission::FileRead,
-            "file_write" | "filewrite" | "write" | "filesystem" => Permission::FileWrite,
+            "file_read" | "file-read" | "fileread" | "read" => Permission::FileRead,
+            "file_write" | "file-write" | "filewrite" | "write" | "filesystem" => {
+                Permission::FileWrite
+            }
             "shell" | "bash" | "command" => Permission::Shell,
             "clipboard" => Permission::Clipboard,
             "scheduler" | "schedule" | "cron" => Permission::Scheduler,
             "gmail" | "email" => Permission::Gmail,
-            "code_execute" | "code" | "execute" => Permission::CodeExecute,
-            "local_network_discovery" | "lan_discovery" | "lan_discover" => {
-                Permission::LocalNetworkDiscovery
-            }
-            "image_generation" | "image" => Permission::ImageGeneration,
+            "code_execute" | "code-execute" | "code" | "execute" => Permission::CodeExecute,
+            "local_network_discovery"
+            | "local-network-discovery"
+            | "lan_discovery"
+            | "lan-discovery"
+            | "lan_discover"
+            | "lan-discover" => Permission::LocalNetworkDiscovery,
+            "image_generation" | "image-generation" | "image" => Permission::ImageGeneration,
             "research" => Permission::Research,
             other => Permission::Custom(other.to_string()),
         }
@@ -1453,6 +1458,30 @@ mod tests {
         assert!(perms.contains(&Permission::Network));
         assert!(perms.contains(&Permission::Shell));
         assert!(perms.contains(&Permission::Gmail));
+    }
+
+    #[test]
+    fn test_parse_permissions_accepts_hyphenated_builtin_aliases() {
+        assert_eq!(
+            ActionGuard::parse_permission("file-read"),
+            Permission::FileRead
+        );
+        assert_eq!(
+            ActionGuard::parse_permission("file-write"),
+            Permission::FileWrite
+        );
+        assert_eq!(
+            ActionGuard::parse_permission("code-execute"),
+            Permission::CodeExecute
+        );
+        assert_eq!(
+            ActionGuard::parse_permission("local-network-discovery"),
+            Permission::LocalNetworkDiscovery
+        );
+        assert_eq!(
+            ActionGuard::parse_permission("image-generation"),
+            Permission::ImageGeneration
+        );
     }
 
     #[test]

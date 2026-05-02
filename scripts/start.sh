@@ -25,49 +25,13 @@ CYAN='\033[0;36m'
 RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
-AGENTARK_LOCAL_ENV="${AGENTARK_LOCAL_ENV:-.agentark/local.env}"
 
 compose() {
-    docker compose --env-file "$AGENTARK_LOCAL_ENV" "$@"
+    docker compose "$@"
 }
 
 compose_dev() {
-    docker compose --env-file "$AGENTARK_LOCAL_ENV" -f docker-compose.yml -f docker-compose.dev.yml "$@"
-}
-
-read_env_value() {
-    local key="$1"
-    local file="$2"
-    [ -f "$file" ] || return 0
-    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
-}
-
-upsert_managed_env_value() {
-    local key="$1"
-    local value="$2"
-    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
-    if [ -f "$AGENTARK_LOCAL_ENV" ] && grep -q "^${key}=" "$AGENTARK_LOCAL_ENV"; then
-        local escaped
-        escaped="$(printf '%s' "$value" | sed 's/[&|]/\\&/g')"
-        sed -i.bak "s|^${key}=.*|${key}=${escaped}|" "$AGENTARK_LOCAL_ENV"
-        rm -f "${AGENTARK_LOCAL_ENV}.bak"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$AGENTARK_LOCAL_ENV"
-    fi
-}
-
-ensure_postgres_password() {
-    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
-    touch "$AGENTARK_LOCAL_ENV"
-    if grep -q '^AGENTARK_POSTGRES_PASSWORD=' "$AGENTARK_LOCAL_ENV"; then
-        local tmp_file
-        tmp_file="$(mktemp)"
-        grep -v '^AGENTARK_POSTGRES_PASSWORD=' "$AGENTARK_LOCAL_ENV" > "$tmp_file"
-        cat "$tmp_file" > "$AGENTARK_LOCAL_ENV"
-        rm -f "$tmp_file"
-    fi
-    unset AGENTARK_POSTGRES_PASSWORD
-    echo -e "${GREEN}Local Postgres password is managed inside the Docker volume agentark-secrets.${NC}"
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml "$@"
 }
 
 verify_lightpanda_runtime() {
@@ -88,16 +52,36 @@ verify_lightpanda_runtime() {
 }
 
 verify_lightpanda_runtime_async() {
-    mkdir -p "$(dirname "$AGENTARK_LOCAL_ENV")"
-    (verify_lightpanda_runtime > "$(dirname "$AGENTARK_LOCAL_ENV")/lightpanda-check.log" 2>&1 || true) &
+    (verify_lightpanda_runtime > /tmp/agentark-lightpanda-check.log 2>&1 || true) &
+}
+
+verify_gepa_optimizer_runtime() {
+    local attempts=20
+
+    echo -e "${CYAN}Verifying bundled GEPA optimizer runtime...${NC}"
+    while [ "$attempts" -gt 0 ]; do
+        if compose exec -T agentark-control sh -lc '/opt/agentark-gepa/bin/python -c "import dspy" >/dev/null 2>&1' >/dev/null 2>&1; then
+            echo -e "${GREEN}GEPA optimizer is available inside the AgentArk runtime.${NC}"
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+
+    echo -e "${RED}GEPA optimizer is missing from the bundled AgentArk runtime. Update or rebuild before running ArkEvolve GEPA.${NC}"
+    return 1
+}
+
+verify_gepa_optimizer_runtime_async() {
+    (verify_gepa_optimizer_runtime > /tmp/agentark-gepa-check.log 2>&1 || true) &
 }
 
 case "${1:-start}" in
     start)
-        ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk...${NC}"
         compose up -d
         verify_lightpanda_runtime_async
+        verify_gepa_optimizer_runtime_async
         echo ""
         echo -e "${GREEN}AgentArk is running!${NC}"
         echo -e "  Web UI:  ${CYAN}http://localhost:8990${NC}"
@@ -133,15 +117,15 @@ case "${1:-start}" in
                 exit 0
             fi
 
-            upsert_managed_env_value TUNNEL_TOKEN "$token"
-            echo -e "${GREEN}Token saved to ${AGENTARK_LOCAL_ENV}${NC}"
+            echo -e "${YELLOW}Permanent tunnel tokens are stored inside AgentArk settings.${NC}"
+            echo -e "Open ${BOLD}Web UI -> Settings -> Remote Access${NC} and paste the token there."
             echo ""
         fi
 
-        ensure_postgres_password || exit 1
         echo -e "${GREEN}Starting AgentArk with remote access...${NC}"
-        AGENTARK_TUNNEL=true compose up -d
+        (export AGENTARK_TUNNEL=true; compose up -d)
         verify_lightpanda_runtime_async
+        verify_gepa_optimizer_runtime_async
         echo ""
         echo -e "${GREEN}AgentArk is starting with secure tunnel!${NC}"
         echo ""
@@ -149,19 +133,8 @@ case "${1:-start}" in
         echo -e "  Remote:  ${CYAN}Your Cloudflare URL will appear in the Web UI${NC}"
         echo ""
 
-        # Check if named or quick tunnel
-        if [ -f "$AGENTARK_LOCAL_ENV" ]; then
-            set -a
-            . "$AGENTARK_LOCAL_ENV" 2>/dev/null || true
-            set +a
-        fi
-        if [ -n "$TUNNEL_TOKEN" ]; then
-            echo -e "  Using:   ${CYAN}Permanent custom domain (configured in Cloudflare)${NC}"
-        else
-            echo -e "  Using:   ${CYAN}Quick tunnel (random URL, changes on restart)${NC}"
-            echo -e "  ${YELLOW}For a permanent URL, run:${NC}"
-            echo -e "    ${BOLD}./scripts/start.sh tunnel setup${NC}"
-        fi
+        echo -e "  Using:   ${CYAN}Remote access settings from AgentArk${NC}"
+        echo -e "  ${YELLOW}For a permanent URL, configure Settings -> Remote Access in the Web UI.${NC}"
         echo ""
         echo -e "  Manage the tunnel from: ${BOLD}Web UI → Settings → Remote Access${NC}"
         echo ""
@@ -176,23 +149,24 @@ case "${1:-start}" in
         echo -e "${YELLOW}Restarting AgentArk...${NC}"
         compose restart agentark-control agentark-workspace agentark-executor agentark-embeddings
         verify_lightpanda_runtime_async
+        verify_gepa_optimizer_runtime_async
         ;;
     logs)
         compose logs -f
         ;;
     update)
-        ensure_postgres_password || exit 1
         echo -e "${YELLOW}Updating AgentArk (your data will be preserved)...${NC}"
         compose pull
         compose up -d
         verify_lightpanda_runtime_async
+        verify_gepa_optimizer_runtime_async
         echo -e "${GREEN}Update complete! Your data is intact.${NC}"
         ;;
     build)
-        ensure_postgres_password || exit 1
         echo -e "${YELLOW}Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...${NC}"
-        AGENTARK_IMAGE=${AGENTARK_IMAGE:-agentark:dev} compose_dev up -d --build --force-recreate
+        (export AGENTARK_IMAGE="${AGENTARK_IMAGE:-agentark:dev}"; compose_dev up -d --build --force-recreate)
         verify_lightpanda_runtime_async
+        verify_gepa_optimizer_runtime_async
         echo -e "${GREEN}Local build complete! Your data is intact.${NC}"
         ;;
     backup)

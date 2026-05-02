@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};

@@ -2,17 +2,19 @@
 //! Based on arXiv:2512.17102 "SAGE: Self-Improving Agent with Action Library"
 
 pub mod app;
+pub mod arkorbit;
 pub mod calendar;
 pub mod gmail;
 pub mod google_workspace;
 pub mod lan;
 pub mod research;
 pub mod search;
+pub mod vercel;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use crate::runtime::SandboxMode;
 
@@ -20,7 +22,7 @@ pub const ACTION_CATALOG_EMBEDDING_DIM: usize = 384;
 #[allow(unused_imports)]
 pub use gmail::{gmail_reply, gmail_scan};
 #[allow(unused_imports)]
-pub use research::{ResearchArgs, ResearchClient, ResearchDepth, ResearchResult, execute_research};
+pub use research::{execute_research, ResearchArgs, ResearchClient, ResearchDepth, ResearchResult};
 #[allow(unused_imports)]
 pub use search::{SearchBackend, SearchClient, SearchConfig, SearchResponse, SearchResult};
 
@@ -193,6 +195,262 @@ pub enum ActionExecutionSurface {
     Test,
     #[default]
     Internal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionErrorDomain {
+    Action,
+    Auth,
+    Integration,
+    Channel,
+    App,
+    Search,
+    Scheduler,
+    Watcher,
+}
+
+impl ActionErrorDomain {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::Auth => "auth",
+            Self::Integration => "integration",
+            Self::Channel => "channel",
+            Self::App => "app",
+            Self::Search => "search",
+            Self::Scheduler => "scheduler",
+            Self::Watcher => "watcher",
+        }
+    }
+}
+
+impl fmt::Display for ActionErrorDomain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_key())
+    }
+}
+
+impl FromStr for ActionErrorDomain {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "action" => Ok(Self::Action),
+            "auth" => Ok(Self::Auth),
+            "integration" => Ok(Self::Integration),
+            "channel" => Ok(Self::Channel),
+            "app" => Ok(Self::App),
+            "search" => Ok(Self::Search),
+            "scheduler" => Ok(Self::Scheduler),
+            "watcher" => Ok(Self::Watcher),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionErrorReason {
+    MissingInput,
+    InvalidInput,
+    NotFound,
+    NotConnected,
+    Unavailable,
+    PermissionDenied,
+    Ambiguous,
+    RateLimited,
+    Timeout,
+    Failed,
+}
+
+impl ActionErrorReason {
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::MissingInput => "missing_input",
+            Self::InvalidInput => "invalid_input",
+            Self::NotFound => "not_found",
+            Self::NotConnected => "not_connected",
+            Self::Unavailable => "unavailable",
+            Self::PermissionDenied => "permission_denied",
+            Self::Ambiguous => "ambiguous",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for ActionErrorReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_key())
+    }
+}
+
+impl FromStr for ActionErrorReason {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "missing_input" => Ok(Self::MissingInput),
+            "invalid_input" => Ok(Self::InvalidInput),
+            "not_found" => Ok(Self::NotFound),
+            "not_connected" => Ok(Self::NotConnected),
+            "unavailable" => Ok(Self::Unavailable),
+            "permission_denied" => Ok(Self::PermissionDenied),
+            "ambiguous" => Ok(Self::Ambiguous),
+            "rate_limited" => Ok(Self::RateLimited),
+            "timeout" => Ok(Self::Timeout),
+            "failed" => Ok(Self::Failed),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionError {
+    #[error("ERR/{domain}/{reason}: {message}")]
+    Structured {
+        domain: ActionErrorDomain,
+        reason: ActionErrorReason,
+        message: String,
+    },
+}
+
+impl ActionError {
+    pub fn new(
+        domain: ActionErrorDomain,
+        reason: ActionErrorReason,
+        message: impl AsRef<str>,
+    ) -> Self {
+        let message = message.as_ref().trim();
+        Self::Structured {
+            domain,
+            reason,
+            message: if message.is_empty() {
+                "Action failed".to_string()
+            } else {
+                message.to_string()
+            },
+        }
+    }
+
+    pub fn domain(&self) -> ActionErrorDomain {
+        match self {
+            Self::Structured { domain, .. } => *domain,
+        }
+    }
+
+    pub fn reason(&self) -> ActionErrorReason {
+        match self {
+            Self::Structured { reason, .. } => *reason,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Structured { message, .. } => message,
+        }
+    }
+
+    pub fn code(&self) -> String {
+        format!("{}_{}", self.domain().as_key(), self.reason().as_key())
+    }
+
+    pub fn err_prefix(&self) -> String {
+        format!("ERR/{}/{}", self.domain().as_key(), self.reason().as_key())
+    }
+
+    pub fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+pub fn structured_action_error_text(
+    domain: ActionErrorDomain,
+    reason: ActionErrorReason,
+    message: impl AsRef<str>,
+) -> String {
+    ActionError::new(domain, reason, message).to_string()
+}
+
+pub fn structured_action_error(
+    domain: ActionErrorDomain,
+    reason: ActionErrorReason,
+    message: impl AsRef<str>,
+) -> anyhow::Error {
+    ActionError::new(domain, reason, message).into_anyhow()
+}
+
+pub fn action_error_domain_for_action_name(action_name: &str) -> ActionErrorDomain {
+    let name = action_name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "notify_user" => ActionErrorDomain::Channel,
+        "schedule_task" => ActionErrorDomain::Scheduler,
+        "watch" => ActionErrorDomain::Watcher,
+        "web_search" | "research" | "page_fetch" => ActionErrorDomain::Search,
+        "app_deploy" | "app_restart" | "app_stop" | "app_delete" => ActionErrorDomain::App,
+        "gmail_scan"
+        | "gmail_reply"
+        | "calendar_today"
+        | "calendar_list"
+        | "calendar_create"
+        | "calendar_free"
+        | "connector_request"
+        | "extension_pack_connect"
+        | "extension_pack_invoke" => ActionErrorDomain::Integration,
+        _ => ActionErrorDomain::Action,
+    }
+}
+
+pub fn structured_action_error_text_for_action(
+    action_name: &str,
+    reason: ActionErrorReason,
+    message: impl AsRef<str>,
+) -> String {
+    structured_action_error_text(
+        action_error_domain_for_action_name(action_name),
+        reason,
+        message,
+    )
+}
+
+pub fn structured_action_error_for_action(
+    action_name: &str,
+    reason: ActionErrorReason,
+    message: impl AsRef<str>,
+) -> anyhow::Error {
+    structured_action_error(
+        action_error_domain_for_action_name(action_name),
+        reason,
+        message,
+    )
+}
+
+pub fn is_structured_action_error_text(message: &str) -> bool {
+    message.trim_start().starts_with("ERR/")
+}
+
+pub fn parse_structured_action_error_text(message: &str) -> Option<ActionError> {
+    let trimmed = message.trim();
+    let rest = trimmed.strip_prefix("ERR/")?;
+    let (domain, rest) = rest.split_once('/')?;
+    let (reason, message) = rest.split_once(':')?;
+    Some(ActionError::new(
+        ActionErrorDomain::from_str(domain).ok()?,
+        ActionErrorReason::from_str(reason).ok()?,
+        message,
+    ))
+}
+
+pub fn ensure_structured_action_error_text(action_name: &str, message: impl AsRef<str>) -> String {
+    let message = message.as_ref();
+    if is_structured_action_error_text(message) {
+        message.trim().to_string()
+    } else {
+        structured_action_error_text_for_action(action_name, ActionErrorReason::Failed, message)
+    }
 }
 
 impl ActionExecutionSurface {
@@ -417,15 +675,12 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
         | "list_tasks"
         | "list_watchers"
         | "list_integrations"
-        | "app_inspect"
-        | "agentark_inspect"
+        | "ark_inspect"
         | "postgres_schema_inspect"
         | "postgres_query_readonly" => {
             meta.role = PlannerActionRole::Inspection;
             meta.integration_class = if name == "file_read" {
                 PlannerIntegrationClass::Filesystem
-            } else if name == "app_inspect" {
-                PlannerIntegrationClass::App
             } else if name == "postgres_schema_inspect" || name == "postgres_query_readonly" {
                 PlannerIntegrationClass::Analytics
             } else {
@@ -472,6 +727,8 @@ pub fn planner_metadata_for_action(action: &ActionDef) -> ActionPlannerMetadata 
     if capabilities.contains("capability_inventory")
         || capabilities.contains("watcher_inventory")
         || capabilities.contains("integration_inventory")
+        || capabilities.contains("app_registry")
+        || capabilities.contains("app_inventory")
         || capabilities.contains("platform_observability")
         || capabilities.contains("database_readonly")
         || capabilities.contains("session_history")
@@ -799,5 +1056,58 @@ mod tests {
         };
 
         assert!(!action_requires_nontrivial_direct_execution(&action));
+    }
+
+    #[test]
+    fn structured_action_errors_use_machine_readable_prefixes() {
+        let error = structured_action_error_text(
+            ActionErrorDomain::Channel,
+            ActionErrorReason::NotConnected,
+            "Telegram delivery is not connected",
+        );
+
+        assert_eq!(
+            error,
+            "ERR/channel/not_connected: Telegram delivery is not connected"
+        );
+        assert!(is_structured_action_error_text(&error));
+    }
+
+    #[test]
+    fn structured_action_errors_are_typed_under_anyhow() {
+        let error = structured_action_error(
+            ActionErrorDomain::Channel,
+            ActionErrorReason::NotConnected,
+            "Telegram delivery is not connected",
+        );
+        let typed = error
+            .downcast_ref::<ActionError>()
+            .expect("structured action error should downcast");
+
+        assert_eq!(typed.code(), "channel_not_connected");
+        assert_eq!(typed.err_prefix(), "ERR/channel/not_connected");
+        assert_eq!(
+            typed.to_string(),
+            "ERR/channel/not_connected: Telegram delivery is not connected"
+        );
+    }
+
+    #[test]
+    fn structured_action_error_text_parses_back_to_type() {
+        let parsed =
+            parse_structured_action_error_text("ERR/search/timeout: search provider timed out")
+                .expect("structured action error should parse");
+
+        assert_eq!(parsed.domain(), ActionErrorDomain::Search);
+        assert_eq!(parsed.reason(), ActionErrorReason::Timeout);
+        assert_eq!(parsed.code(), "search_timeout");
+        assert_eq!(parsed.message(), "search provider timed out");
+    }
+
+    #[test]
+    fn unstructured_action_errors_are_wrapped_by_action_domain() {
+        let error = ensure_structured_action_error_text("web_search", "provider timed out");
+
+        assert_eq!(error, "ERR/search/failed: provider timed out");
     }
 }

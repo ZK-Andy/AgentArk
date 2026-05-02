@@ -11,7 +11,7 @@
 #   scripts\start.bat
 #
 # Low-memory systems (2-4 GB RAM):
-#   docker compose --env-file .agentark/local.env -f docker-compose.yml -f docker-compose.lowmem.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 #
 # Local source builds:
 #   AGENTARK_IMAGE=agentark:dev docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
@@ -109,7 +109,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "127.0.0.1:8990:8990"
+      - "8990:8990"
       - "127.0.0.1:8992:8992"
       - "127.0.0.1:${AGENTARK_BROWSER_HANDOFF_PORT:-6080}:6080"
     volumes:

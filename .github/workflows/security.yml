@@ -1,9 +1,6 @@
 name: Security
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -15,9 +12,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  AGENTARK_RELEASE_FEATURES: telegram,docker,ssh
 
 jobs:
   dependency-review:

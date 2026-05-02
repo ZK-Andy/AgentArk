@@ -1,0 +1,266 @@
+// File view for source_read / source_write / file_edit etc.
+// Renders syntax-colored file content when it is available.
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import Box from "@mui/material/Box";
+import IconButton from "@mui/material/IconButton";
+import Tooltip from "@mui/material/Tooltip";
+import Typography from "@mui/material/Typography";
+import ContentCopyRounded from "@mui/icons-material/ContentCopyRounded";
+
+import type { ChatStepCard } from "../types";
+import { extractFilePath } from "../dispatch";
+import { guessCodeLanguage, renderCodeBlockLines } from "../codeHighlight";
+
+export interface FileViewProps {
+  card: ChatStepCard;
+  snippetPath?: string;
+  snippetContent?: string;
+  /** True while the agent is actively streaming content into this file. Drives
+   * a "writing" indicator and auto-scroll-to-bottom so the user watches the
+   * latest line append (Bolt/Lovable-style). */
+  live?: boolean;
+}
+
+function pickCardContent(card: ChatStepCard): string {
+  return (
+    card.payloadView?.body ||
+    card.rawDetailFull ||
+    card.detailFull ||
+    card.detail ||
+    ""
+  );
+}
+
+function tryParseRecord(raw: string): Record<string, unknown> | null {
+  const trimmed = (raw || "").trim();
+  if (!trimmed || !trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function str(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function normalizePath(value: string): string {
+  return (value || "").trim().replace(/\\/g, "/").toLowerCase();
+}
+
+function recordPath(record: Record<string, unknown>): string {
+  return str(record.path) || str(record.file) || str(record.name);
+}
+
+function recordMatchesPath(
+  record: Record<string, unknown>,
+  targetPath: string,
+): boolean {
+  const target = normalizePath(targetPath);
+  if (!target) return true;
+  const candidate = normalizePath(recordPath(record));
+  return !candidate || candidate === target || candidate.endsWith(`/${target}`) || target.endsWith(`/${candidate}`);
+}
+
+function sourceContentFromRecord(
+  record: Record<string, unknown>,
+  targetPath: string,
+): string {
+  if (!recordMatchesPath(record, targetPath)) return "";
+  const snapshot = str(record.content_snapshot);
+  if (snapshot) return snapshot;
+  const delta = str(record.content_delta);
+  if (delta) return delta;
+  const fileContent =
+    str(record.raw_content) || str(record.file_content) || str(record.text);
+  if (fileContent) return fileContent;
+  const kind = str(record.kind).trim().toLowerCase();
+  const hasFileIdentity = Boolean(recordPath(record));
+  const content = str(record.content);
+  if (
+    content &&
+    hasFileIdentity &&
+    (kind === "draft_file" || kind === "file_write" || !str(record.tool_name))
+  ) {
+    return content;
+  }
+  return "";
+}
+
+function structuredCardContent(card: ChatStepCard, path: string): string {
+  const candidates = [
+    card.payloadView?.body || "",
+    card.rawDetailFull || "",
+    card.detailFull || "",
+    card.detail || "",
+  ];
+  for (const candidate of candidates) {
+    const parsed = tryParseRecord(candidate);
+    if (!parsed) continue;
+    const content = sourceContentFromRecord(parsed, path);
+    if (content) return content;
+  }
+  return "";
+}
+
+function pickContent(
+  card: ChatStepCard,
+  path: string,
+  snippetPath?: string,
+  snippetContent?: string,
+): string {
+  const snippet = snippetContent || "";
+  if (snippet.trim()) {
+    const cardPath = normalizePath(path);
+    const candidatePath = normalizePath(snippetPath || "");
+    if (
+      !candidatePath ||
+      candidatePath === cardPath ||
+      candidatePath.endsWith(`/${cardPath}`) ||
+      cardPath.endsWith(`/${candidatePath}`)
+    ) {
+      return snippet;
+    }
+  }
+  const structured = structuredCardContent(card, path);
+  if (structured) return structured;
+  if (snippetPath && snippetPath.trim()) return "";
+  return pickCardContent(card);
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function languageLabel(path: string, body: string): string {
+  switch (guessCodeLanguage(path, body)) {
+    case "markup":
+      return "HTML";
+    case "css":
+      return "CSS";
+    case "json":
+      return "JSON";
+    case "python":
+      return "Python";
+    case "sql":
+      return "SQL";
+    case "shell":
+      return "Shell";
+    case "markdown":
+      return "Markdown";
+    case "config":
+      return "Config";
+    case "script":
+      return "Code";
+    default:
+      return "Text";
+  }
+}
+
+export function FileView({
+  card,
+  snippetPath,
+  snippetContent,
+  live = false,
+}: FileViewProps) {
+  const path =
+    (snippetPath && snippetPath.trim()) || extractFilePath(card) || card.label;
+  const body = pickContent(card, path, snippetPath, snippetContent);
+  const byteCount = useMemo(() => new Blob([body || ""]).size, [body]);
+  const meta = body
+    ? `${languageLabel(path, body)} / ${formatBytes(byteCount)}`
+    : (card.kind || "").toLowerCase();
+  const [copied, setCopied] = useState(false);
+  const preRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  // Auto-scroll the body so the freshly-streamed line stays visible while the
+  // agent is writing. Only fires while `live` is true; static viewing keeps
+  // the user's scroll position untouched.
+  useEffect(() => {
+    if (!live) return;
+    const node = preRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [body, live]);
+
+  async function handleCopy() {
+    if (!body) return;
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be denied in insecure contexts.
+    }
+  }
+
+  return (
+    <Box className={`cview cview-file${live ? " is-live" : ""}`}>
+      <Box className="cview-file-head">
+        <span className="cview-file-icon" aria-hidden="true">
+          {"</>"}
+        </span>
+        <span className="cview-file-path" title={path}>
+          {path}
+        </span>
+        {live ? (
+          <span
+            className="cview-file-live"
+            title="Agent is writing this file"
+            aria-live="polite"
+          >
+            <span className="cview-file-live-dot" aria-hidden="true" />
+            writing
+          </span>
+        ) : null}
+        {meta ? <span className="cview-file-meta">{meta}</span> : null}
+        <span className="cview-file-actions">
+          <Tooltip title={copied ? "Copied" : "Copy file contents"} placement="top" arrow>
+            <span>
+              <IconButton
+                className="cview-file-copy"
+                size="small"
+                onClick={handleCopy}
+                disabled={!body}
+                aria-label="Copy file contents"
+              >
+                <ContentCopyRounded fontSize="inherit" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </span>
+      </Box>
+      {body ? (
+        <pre ref={preRef} className="code-viewer-pre cview-file-body">
+          <code>{renderCodeBlockLines(body, { fileName: path })}</code>
+          {live ? (
+            <span className="cview-file-caret" aria-hidden="true">
+              |
+            </span>
+          ) : null}
+        </pre>
+      ) : (
+        <Typography variant="body2" className="cview-file-empty">
+          {live
+            ? "Drafting file..."
+            : "File contents not captured for this step."}
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+export default FileView;

@@ -12,7 +12,7 @@
 //! membership, exact-match hostnames) — nothing about attacker phrasing or
 //! anticipated wording.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::core::net::{
@@ -32,7 +32,6 @@ pub struct ToolArgsGuardConfig {
     pub host_whitelist: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl ToolArgsGuardConfig {
     fn normalized_entries(&self) -> Vec<String> {
         self.host_whitelist
@@ -63,20 +62,26 @@ impl ToolArgsGuardConfig {
 /// with `into_error` if it prefers the existing error-return style; the
 /// typed variant exists so the caller (and future telemetry layer) can log
 /// a structured reason rather than string-matching error messages.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
 pub enum GuardDenial {
+    #[error("disallowed_hostname")]
     DisallowedHostname,
+    #[error("private_or_local_ip")]
     PrivateOrLocalIp,
+    #[error("dns_resolution_failed")]
     DnsResolutionFailed,
+    #[error("invalid_url")]
     InvalidUrl,
+    #[error("scheme_not_https")]
     SchemeNotHttps,
+    #[error("userinfo_not_allowed")]
     UserinfoNotAllowed,
+    #[error("non_standard_port")]
     NonStandardPort,
+    #[error("host_missing")]
     HostMissing,
 }
 
-#[allow(dead_code)]
 impl GuardDenial {
     pub fn reason_code(&self) -> &'static str {
         match self {
@@ -92,7 +97,7 @@ impl GuardDenial {
     }
 
     pub fn into_error(self) -> anyhow::Error {
-        anyhow!("tool argument denied ({})", self.reason_code())
+        crate::security::SecurityError::tool_argument_denied(self.reason_code()).into_anyhow()
     }
 }
 
@@ -105,7 +110,6 @@ impl GuardDenial {
 /// scheme, userinfo, non-443 port) stand regardless of whitelist membership
 /// — those are not "internal host" concerns and widening them would weaken
 /// the posture for whitelisted entries.
-#[allow(dead_code)]
 pub async fn check_outward_url(
     raw_url: &str,
     config: &ToolArgsGuardConfig,
@@ -179,7 +183,6 @@ pub async fn check_outward_url(
 
 /// Convenience wrapper that returns `Result<Url>` for callers that already
 /// use `anyhow::Error` throughout.
-#[allow(dead_code)]
 pub async fn check_outward_url_anyhow(
     raw_url: &str,
     config: &ToolArgsGuardConfig,
@@ -266,6 +269,23 @@ mod tests {
         assert_eq!(
             GuardDenial::DisallowedHostname.reason_code(),
             "disallowed_hostname"
+        );
+    }
+
+    #[test]
+    fn denial_into_error_preserves_security_error_type() {
+        let error = GuardDenial::PrivateOrLocalIp.into_error();
+        let typed = error
+            .downcast_ref::<crate::security::SecurityError>()
+            .expect("guard denial should downcast to SecurityError");
+
+        assert_eq!(
+            typed.code(),
+            "security_tool_argument_denied_private_or_local_ip"
+        );
+        assert_eq!(
+            typed.to_string(),
+            "ERR/security/tool_argument_denied: tool argument denied (private_or_local_ip)"
         );
     }
 }

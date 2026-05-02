@@ -64,7 +64,6 @@ type ChatPendingLaunch = {
   launchMode: "message" | "resume_task";
   message?: string;
   conversationId?: string;
-  projectId?: string;
   taskId?: string;
   source?: string;
 };
@@ -833,7 +832,6 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
     const argumentsObj = asRecord(task.arguments);
     const taskId = str(task.id, "").trim();
     const conversationId = str(argumentsObj.conversation_id, "").trim();
-    const projectId = str(argumentsObj.project_id, "").trim();
     if (!taskId || !conversationId) {
       window.alert(
         "This chat task is missing its conversation metadata and cannot be resumed in chat.",
@@ -844,7 +842,6 @@ export default function TasksPage({ autoRefresh }: TasksPageProps) {
       createdAt: Date.now(),
       launchMode: "resume_task",
       conversationId,
-      projectId,
       taskId,
     });
     if (typeof window !== "undefined") {

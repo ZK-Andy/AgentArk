@@ -98,47 +98,6 @@ release_version_from_tag() {
     printf '%s' "${1#v}"
 }
 
-ensure_env_file() {
-    if [ ! -f "${SOURCE_DIR}/.env" ] && [ -f "${SOURCE_DIR}/.env.example" ]; then
-        cp "${SOURCE_DIR}/.env.example" "${SOURCE_DIR}/.env"
-    fi
-    if [ ! -f "${SOURCE_DIR}/.env" ]; then
-        : > "${SOURCE_DIR}/.env"
-    fi
-}
-
-upsert_env_value() {
-    local key="$1"
-    local value="$2"
-    local tmp_file
-    ensure_env_file
-    tmp_file="$(mktemp)"
-    awk -v key="${key}" -v value="${value}" '
-        BEGIN { written = 0 }
-        $0 ~ ("^" key "=") {
-            print key "=" value
-            written = 1
-            next
-        }
-        { print }
-        END {
-            if (!written) {
-                print key "=" value
-            }
-        }
-    ' "${SOURCE_DIR}/.env" > "${tmp_file}"
-    mv "${tmp_file}" "${SOURCE_DIR}/.env"
-}
-
-pin_release_env() {
-    local release_tag="$1"
-    local release_version
-    release_version="$(release_version_from_tag "${release_tag}")"
-    upsert_env_value "AGENTARK_IMAGE" "${IMAGE_REPOSITORY}:${release_version}"
-    upsert_env_value "AGENTARK_RELEASE_REPO" "${RELEASE_REPO}"
-    upsert_env_value "AGENTARK_RELEASE_TAG" "${release_tag}"
-}
-
 ensure_clean_checkout() {
     local tracked_changes
     tracked_changes="$(docker_git git -C /work/source status --porcelain --untracked-files=no 2>/dev/null || true)"
@@ -184,6 +143,21 @@ verify_lightpanda_runtime() {
     return 1
 }
 
+verify_gepa_optimizer_runtime() {
+    local attempts=20
+    echo -e "${CYAN}Verifying bundled GEPA optimizer runtime...${NC}"
+    while [ "${attempts}" -gt 0 ]; do
+        if docker compose exec -T agentark-control sh -lc '/opt/agentark-gepa/bin/python -c "import dspy" >/dev/null 2>&1' >/dev/null 2>&1; then
+            echo -e "${GREEN}GEPA optimizer is available inside the AgentArk runtime.${NC}"
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+    echo -e "${RED}GEPA optimizer is missing from the bundled AgentArk runtime. Update or rebuild the image before running ArkEvolve GEPA.${NC}"
+    return 1
+}
+
 if command -v docker >/dev/null 2>&1; then
     echo -e "${GREEN}[1/4] Docker found.${NC}"
 else
@@ -223,7 +197,8 @@ if [ ! -f "${SOURCE_DIR}/docker-compose.yml" ]; then
     exit 1
 fi
 
-pin_release_env "${TARGET_RELEASE_TAG}"
+AGENTARK_IMAGE="${IMAGE_REPOSITORY}:$(release_version_from_tag "${TARGET_RELEASE_TAG}")"
+export AGENTARK_IMAGE AGENTARK_RELEASE_REPO="${RELEASE_REPO}" AGENTARK_RELEASE_TAG="${TARGET_RELEASE_TAG}"
 echo -e "${GREEN}[3/4] Source checkout ready at ${SOURCE_DIR}${NC}"
 
 cat > "${INSTALL_DIR}/agentark" << 'SCRIPT_EOF'
@@ -256,6 +231,7 @@ echo -e "${GREEN}[4/4] Starting AgentArk...${NC}"
 ${COMPOSE} pull
 ${COMPOSE} up -d
 verify_lightpanda_runtime
+verify_gepa_optimizer_runtime
 
 echo ""
 echo -e "${BOLD}=========================================${NC}"

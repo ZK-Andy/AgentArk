@@ -16,32 +16,20 @@ import {
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef, useState, type ChangeEvent } from "react";
+import { useRef, useState, type ChangeEvent } from "react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
-import {
-  buildProjectNameById,
-  projectScopeLabel,
-  withProjectScope,
-  WorkspaceProjectScopeBar,
-} from "./projectScope";
-import { errMessage, pickRecords, str, type JsonRecord } from "./pageHelpers";
+import { errMessage, pickRecords, str } from "./pageHelpers";
 import { formatBytes, humanTs, RowOpsMenu } from "./workspaceUiBits";
 
 const REFRESH_MS = 8000;
 
 type DocumentsPageProps = {
   autoRefresh: boolean;
-  projects: JsonRecord[];
-  activeProjectId: string;
-  onNavigateToView?: (view: string, replace?: boolean) => void;
 };
 
 export default function DocumentsPage({
   autoRefresh,
-  projects,
-  activeProjectId,
-  onNavigateToView,
 }: DocumentsPageProps) {
   const queryClient = useQueryClient();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -50,16 +38,10 @@ export default function DocumentsPage({
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const projectMap = useMemo(() => buildProjectNameById(projects), [projects]);
-  const activeScopeLabel = projectScopeLabel(activeProjectId, projectMap);
-  const documentsPath = useMemo(
-    () => withProjectScope("/documents?limit=100", activeProjectId),
-    [activeProjectId],
-  );
 
   const docsQ = useQuery({
-    queryKey: ["documents-manager", activeProjectId],
-    queryFn: () => api.rawGet(documentsPath),
+    queryKey: ["documents-manager"],
+    queryFn: () => api.rawGet("/documents?limit=100"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
@@ -68,8 +50,6 @@ export default function DocumentsPage({
       if (!selectedFile) throw new Error("No file selected");
       const formData = new FormData();
       formData.append("file", selectedFile, selectedFile.name);
-      if (activeProjectId.trim())
-        formData.append("project_id", activeProjectId.trim());
       return api.rawPostForm("/documents/upload-file", formData);
     },
     onSuccess: async () => {
@@ -108,7 +88,7 @@ export default function DocumentsPage({
       <WorkspacePageHeader
         eyebrow="Data"
         title="Documents"
-        description={`Showing files for ${activeScopeLabel}.`}
+        description="Showing workspace files."
         actions={
           <Button
             variant="contained"
@@ -122,11 +102,6 @@ export default function DocumentsPage({
             Upload Document
           </Button>
         }
-      />
-      <WorkspaceProjectScopeBar
-        activeProjectId={activeProjectId}
-        projects={projects}
-        onNavigateToView={onNavigateToView}
       />
       <Box className="list-shell">
         <Dialog
@@ -168,9 +143,6 @@ export default function DocumentsPage({
                   {error}
                 </Alert>
               ) : null}
-              <Alert severity="info" sx={{ py: 0.5 }}>
-                This upload will be added to {activeScopeLabel}.
-              </Alert>
               <Stack direction="row" spacing={1}>
                 <Button
                   variant="outlined"
@@ -238,7 +210,6 @@ export default function DocumentsPage({
             <TableHead>
               <TableRow>
                 <TableCell>Filename</TableCell>
-                <TableCell>Project</TableCell>
                 <TableCell>Type</TableCell>
                 <TableCell>Chunks</TableCell>
                 <TableCell>Size</TableCell>
@@ -249,29 +220,23 @@ export default function DocumentsPage({
             <TableBody>
               {docs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={6}>
                     <Typography
                       variant="body2"
                       sx={{
                         color: "text.secondary",
                       }}
                     >
-                      {activeProjectId
-                        ? "No documents in this project yet. Upload a file to start its workspace."
-                        : 'No documents yet. Click "Upload Document" to add your first file.'}
+                      No documents yet. Click "Upload Document" to add your first file.
                     </Typography>
                   </TableCell>
                 </TableRow>
               ) : (
                 docs.map((doc) => {
                   const id = str(doc.id, "");
-                  const pid = str(doc.project_id, "");
                   return (
                     <TableRow key={id}>
                       <TableCell>{str(doc.filename)}</TableCell>
-                      <TableCell>
-                        {pid ? projectMap.get(pid) || pid : "-"}
-                      </TableCell>
                       <TableCell>{str(doc.content_type)}</TableCell>
                       <TableCell>{str(doc.chunk_count)}</TableCell>
                       <TableCell>{formatBytes(doc.file_size)}</TableCell>

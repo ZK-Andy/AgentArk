@@ -14,6 +14,243 @@ fn action_supports_code_mutation(action: &crate::actions::ActionDef) -> bool {
         && matches!(metadata.integration_class, PlannerIntegrationClass::Code)
 }
 
+fn watcher_cadence_label(interval_secs: u64) -> String {
+    if interval_secs == 0 {
+        return "as often as the watcher scheduler allows".to_string();
+    }
+    if interval_secs == 1 {
+        return "every second".to_string();
+    }
+    if interval_secs < 60 {
+        return format!("every {} seconds", interval_secs);
+    }
+    if interval_secs == 60 {
+        return "every minute".to_string();
+    }
+    if interval_secs < 3600 {
+        let minutes = interval_secs / 60;
+        let seconds = interval_secs % 60;
+        if seconds == 0 {
+            return format!("every {} minutes", minutes);
+        }
+        return format!("every {} minutes {} seconds", minutes, seconds);
+    }
+    if interval_secs == 3600 {
+        return "hourly".to_string();
+    }
+    if interval_secs == 12 * 3600 {
+        return "twice a day".to_string();
+    }
+    if interval_secs == 24 * 3600 {
+        return "daily".to_string();
+    }
+    if interval_secs < 24 * 3600 {
+        let hours = interval_secs / 3600;
+        let minutes = (interval_secs % 3600) / 60;
+        if minutes == 0 {
+            return format!("every {} hours", hours);
+        }
+        return format!("every {} hours {} minutes", hours, minutes);
+    }
+
+    let days = interval_secs / (24 * 3600);
+    let hours = (interval_secs % (24 * 3600)) / 3600;
+    if hours == 0 {
+        format!("every {} days", days)
+    } else {
+        format!("every {} days {} hours", days, hours)
+    }
+}
+
+fn watcher_delivery_sentence_fragment(notify_channel: &str) -> String {
+    let normalized = notify_channel.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == AUTOMATION_IN_APP_NOTIFICATION_CHANNEL {
+        "in app only".to_string()
+    } else if normalized == "preferred" {
+        "through the preferred connected channel, falling back to in-app notification".to_string()
+    } else {
+        watcher_delivery_label(&normalized)
+    }
+}
+
+fn schedule_task_batch_item_arguments(
+    arguments: &serde_json::Value,
+) -> Option<Result<Vec<serde_json::Value>>> {
+    let items = arguments.get("items")?;
+    let Some(items) = items.as_array().filter(|items| !items.is_empty()) else {
+        return Some(Err(anyhow::anyhow!(
+            "schedule_task.items must be a non-empty array"
+        )));
+    };
+    let inherited_keys = [
+        "task",
+        "report_to",
+        "action",
+        "action_arguments",
+        "allow_duplicate",
+        "validation",
+        "max_attempts",
+        "stall_timeout_secs",
+        "retry_backoff_secs",
+        "automation_policy",
+    ];
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(item_obj) = item.as_object() else {
+            return Some(Err(anyhow::anyhow!(
+                "schedule_task.items[{}] must be an object",
+                index
+            )));
+        };
+        let mut merged = serde_json::Map::new();
+        for key in inherited_keys {
+            if let Some(value) = arguments.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+        for (key, value) in item_obj {
+            merged.insert(key.clone(), value.clone());
+        }
+        merged.remove("items");
+        let merged = serde_json::Value::Object(merged);
+        let has_task_ref = merged
+            .get("task")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || merged
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+        let has_schedule = merged
+            .get("cron")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            || merged
+                .get("at")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+        if !has_task_ref || !has_schedule {
+            return Some(Err(anyhow::anyhow!(
+                "schedule_task.items[{}] must identify a task and a schedule",
+                index
+            )));
+        }
+        out.push(merged);
+    }
+    Some(Ok(out))
+}
+
+fn watch_batch_item_arguments(
+    arguments: &serde_json::Value,
+) -> Option<Result<Vec<serde_json::Value>>> {
+    let items = arguments.get("items")?;
+    let Some(items) = items.as_array().filter(|items| !items.is_empty()) else {
+        return Some(Err(anyhow::anyhow!(
+            "watch.items must be a non-empty array"
+        )));
+    };
+    let inherited_keys = [
+        "description",
+        "poll_action",
+        "poll_arguments",
+        "condition",
+        "on_trigger",
+        "interval_secs",
+        "timeout_secs",
+        "timeout_hours",
+        "timeout_days",
+        "until_stopped",
+        "notify_channel",
+        "allow_duplicate",
+        "validation",
+        "max_attempts",
+        "stall_timeout_secs",
+        "retry_backoff_secs",
+        "automation_policy",
+    ];
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(item_obj) = item.as_object() else {
+            return Some(Err(anyhow::anyhow!(
+                "watch.items[{}] must be an object",
+                index
+            )));
+        };
+        let mut merged = serde_json::Map::new();
+        for key in inherited_keys {
+            if let Some(value) = arguments.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+        for (key, value) in item_obj {
+            merged.insert(key.clone(), value.clone());
+        }
+        merged.remove("items");
+        let merged = serde_json::Value::Object(merged);
+        let updates_existing = merged
+            .get("watcher_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let can_create = merged
+            .get("description")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+            && merged
+                .get("poll_action")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            && merged.get("condition").is_some()
+            && merged
+                .get("on_trigger")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+        if !updates_existing && !can_create {
+            return Some(Err(anyhow::anyhow!(
+                "watch.items[{}] must either identify a watcher_id or include description, poll_action, condition, and on_trigger",
+                index
+            )));
+        }
+        out.push(merged);
+    }
+    Some(Ok(out))
+}
+
+fn schedule_task_completion_data(result: &str) -> Option<serde_json::Value> {
+    let payload = result
+        .trim_start()
+        .strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER)?
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("data")
+        .cloned()
+}
+
+fn strip_tool_completion_marker_line(result: &str) -> String {
+    let trimmed = result.trim_start();
+    if trimmed
+        .strip_prefix(crate::runtime::TOOL_COMPLETION_MARKER)
+        .is_some()
+    {
+        trimmed.lines().skip(1).collect::<Vec<_>>().join("\n")
+    } else {
+        result.to_string()
+    }
+    .trim()
+    .to_string()
+}
+
 impl Agent {
     /// Add a task to the autonomous queue
     pub async fn add_task(&self, mut task: super::task::Task) -> Result<()> {
@@ -2007,7 +2244,7 @@ impl Agent {
         if let Some(status) = event_status {
             lines.push(format!("Status: {}", status));
         }
-        lines.push(format!("Task ID: {}", task.id));
+        lines.push("Saved in Tasks.".to_string());
         if let Some(url) = event_url {
             lines.push(format!("Reference: {}", url));
         }
@@ -2044,7 +2281,7 @@ impl Agent {
         if message.trim().is_empty() {
             return;
         }
-        if report_to.is_empty() {
+        if report_to.is_empty() || report_to == AUTOMATION_IN_APP_NOTIFICATION_CHANNEL {
             if !is_webhook {
                 self.emit_notification("Scheduled Task Result", message, "info", "scheduler")
                     .await;
@@ -2073,16 +2310,40 @@ impl Agent {
             }
             return;
         }
-        if is_external_notification_channel(&report_to)
-            && !self
-                .notification_channel_is_configured_any(&report_to)
-                .await
-        {
+        if is_external_notification_channel(&report_to) {
+            let outcomes = self
+                .notify_preferred_channel_reported_with_hint(
+                    message,
+                    Some(&report_to),
+                    !super::task::task_is_scheduled_reminder(task),
+                )
+                .await;
+            if outcomes.iter().any(|outcome| {
+                outcome.success && is_external_notification_channel(&outcome.channel)
+            }) {
+                return;
+            }
             let delivery_label = notification_channel_display_name(&report_to);
-            let body = format!(
-                "Task '{}' completed. {} delivery is not connected, so the result stayed in-app.\n\nConnect Telegram, WhatsApp, Slack, or another channel in Settings > Channels before expecting push updates.\n\n{}",
-                task.description, delivery_label, message
-            );
+            let errors = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.error.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            let body = if errors.is_empty() {
+                format!(
+                    "Task '{}' completed. {} delivery and fallback delivery were unavailable, so the result stayed in-app.\n\n{}",
+                    task.description, delivery_label, message
+                )
+            } else {
+                format!(
+                    "Task '{}' completed. {} delivery and fallback delivery were unavailable, so the result stayed in-app.\n\nDelivery errors: {}\n\n{}",
+                    task.description,
+                    delivery_label,
+                    errors.join("; "),
+                    message
+                )
+            };
             if is_webhook {
                 self.emit_notification_forced("Delivery Setup Needed", &body, "warning", "webhook")
                     .await;
@@ -2262,12 +2523,10 @@ impl Agent {
             );
         }
 
+        let task_agent = Agent::snapshot(agent).await;
         let execution = tokio::time::timeout(
             std::time::Duration::from_secs(policy.stall_timeout_secs),
-            async {
-                let agent_guard = agent.read().await;
-                agent_guard.execute_task(&task).await
-            },
+            task_agent.execute_task(&task),
         )
         .await;
         let finished_at = chrono::Utc::now();
@@ -2424,8 +2683,7 @@ impl Agent {
                     );
                 }
                 if let Some(ref value) = output {
-                    let agent_guard = agent.read().await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .finalize_task(
                             task.id,
                             super::task::TaskStatus::Completed,
@@ -2439,11 +2697,11 @@ impl Agent {
                             error
                         );
                     }
-                    agent_guard.deliver_task_output(&task, value).await;
-                    agent_guard
+                    task_agent.deliver_task_output(&task, value).await;
+                    task_agent
                         .maybe_emit_webhook_task_completion_notification(&task, Some(value), None)
                         .await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .dispatch_plugin_event(
                             "task.completed",
                             Self::task_completion_plugin_payload(
@@ -2462,18 +2720,16 @@ impl Agent {
                         );
                     }
                 } else if let Err(error) = {
-                    let agent_guard = agent.read().await;
-                    agent_guard
+                    task_agent
                         .finalize_task(task.id, super::task::TaskStatus::Completed, None)
                         .await
                 } {
                     tracing::warn!("Failed to finalize completed task '{}': {}", task.id, error);
                 } else {
-                    let agent_guard = agent.read().await;
-                    agent_guard
+                    task_agent
                         .maybe_emit_webhook_task_completion_notification(&task, None, None)
                         .await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .dispatch_plugin_event(
                             "task.completed",
                             Self::task_completion_plugin_payload(
@@ -2521,8 +2777,7 @@ impl Agent {
                     .map(|value| automation_truncate_text(value, 240))
                     .or_else(|| error_text.clone())
                     .unwrap_or_else(|| critique.summary.clone());
-                let agent_guard = agent.read().await;
-                if let Err(error) = agent_guard
+                if let Err(error) = task_agent
                     .reschedule_task_retry(&task, retry_at, &summary, attempt)
                     .await
                 {
@@ -2560,8 +2815,7 @@ impl Agent {
                             error
                         );
                     }
-                    let agent_guard = agent.read().await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .finalize_task(
                             task.id,
                             task_status.clone(),
@@ -2598,21 +2852,20 @@ impl Agent {
                         );
                     }
                     let final_result = output.clone().or_else(|| error_text.clone());
-                    let agent_guard = agent.read().await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .finalize_task(task.id, task_status, final_result)
                         .await
                     {
                         tracing::warn!("Failed to finalize failed task '{}': {}", task.id, error);
                     }
-                    agent_guard
+                    task_agent
                         .maybe_emit_webhook_task_completion_notification(
                             &task,
                             output.as_deref(),
                             Some(&critique.summary),
                         )
                         .await;
-                    if let Err(error) = agent_guard
+                    if let Err(error) = task_agent
                         .dispatch_plugin_event(
                             "task.failed",
                             Self::task_completion_plugin_payload(
@@ -2870,15 +3123,15 @@ impl Agent {
             .preferred_watcher_notification_channel_hint(&watcher)
             .await;
         if requested_channel == "preferred" {
-            for outcome in self
+            let outcomes = self
                 .notify_preferred_channel_reported_with_hint(
                     &notify_text,
                     preferred_hint.as_deref(),
                     true,
                 )
-                .await
-            {
-                if outcome.success {
+                .await;
+            for outcome in outcomes {
+                if outcome.success && is_external_notification_channel(&outcome.channel) {
                     if let Some(image) = notification_image.as_ref() {
                         let image_outcome = self
                             .try_send_notification_image_reported(
@@ -2910,27 +3163,63 @@ impl Agent {
                     )
                     .await;
             }
+        } else if requested_channel.is_empty()
+            || requested_channel == AUTOMATION_IN_APP_NOTIFICATION_CHANNEL
+        {
+            self.watcher_manager
+                .push_notification_attempt(
+                    watcher.id,
+                    super::watcher::WatcherNotificationAttempt {
+                        attempted_at: chrono::Utc::now(),
+                        channel: "web".to_string(),
+                        success: true,
+                        message: in_app_notify_text,
+                        error: None,
+                    },
+                )
+                .await;
         } else if !requested_channel.is_empty() {
-            if is_external_notification_channel(&requested_channel)
-                && !self
-                    .notification_channel_is_configured_any(&requested_channel)
-                    .await
-            {
-                self.watcher_manager
-                    .push_notification_attempt(
-                        watcher.id,
-                        super::watcher::WatcherNotificationAttempt {
-                            attempted_at: chrono::Utc::now(),
-                            channel: requested_channel.clone(),
-                            success: false,
-                            message: notify_text.clone(),
-                            error: Some(format!(
-                                "{} delivery is not connected. Connect Telegram, WhatsApp, Slack, or another channel in Settings > Channels before expecting push updates.",
-                                notification_channel_display_name(&requested_channel)
-                            )),
-                        },
+            if is_external_notification_channel(&requested_channel) {
+                let outcomes = self
+                    .notify_preferred_channel_reported_with_hint(
+                        &notify_text,
+                        Some(&requested_channel),
+                        true,
                     )
                     .await;
+                for outcome in outcomes {
+                    if outcome.success && is_external_notification_channel(&outcome.channel) {
+                        if let Some(image) = notification_image.as_ref() {
+                            let image_outcome = self
+                                .try_send_notification_image_reported(
+                                    &outcome.channel,
+                                    &notify_text,
+                                    image,
+                                )
+                                .await;
+                            if !image_outcome.success {
+                                tracing::warn!(
+                                    "Watcher '{}' image notification failed via '{}': {:?}",
+                                    watcher.id,
+                                    image_outcome.channel,
+                                    image_outcome.error
+                                );
+                            }
+                        }
+                    }
+                    self.watcher_manager
+                        .push_notification_attempt(
+                            watcher.id,
+                            super::watcher::WatcherNotificationAttempt {
+                                attempted_at: chrono::Utc::now(),
+                                channel: outcome.channel,
+                                success: outcome.success,
+                                message: notify_text.clone(),
+                                error: outcome.error,
+                            },
+                        )
+                        .await;
+                }
                 return;
             }
             let outcome = self
@@ -3961,6 +4250,97 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         project_id: Option<&str>,
         authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Option<String> {
+        if let Some(batch_items) = schedule_task_batch_item_arguments(arguments) {
+            let batch_items = match batch_items {
+                Ok(items) => items,
+                Err(error) => return Some(error.to_string()),
+            };
+            for item_args in &batch_items {
+                if let Err(message) = self
+                    .authorize_automation_tool_call("schedule_task", item_args, authorization)
+                    .await
+                {
+                    return Some(message);
+                }
+            }
+
+            let mut task_records = Vec::new();
+            let mut summary_lines = Vec::new();
+            for (index, item_args) in batch_items.iter().enumerate() {
+                let Some(result) = Box::pin(self.handle_schedule_task(
+                    item_args,
+                    request_channel,
+                    conversation_id,
+                    project_id,
+                    authorization,
+                ))
+                .await
+                else {
+                    return Some(format!(
+                        "Failed to schedule item {} of {}.",
+                        index + 1,
+                        batch_items.len()
+                    ));
+                };
+                let Some(data) = schedule_task_completion_data(&result) else {
+                    let readable = strip_tool_completion_marker_line(&result);
+                    if task_records.is_empty() {
+                        return Some(readable);
+                    }
+                    return Some(format!(
+                        "Saved {} of {} scheduled item(s), then item {} needed attention:\n{}",
+                        task_records.len(),
+                        batch_items.len(),
+                        index + 1,
+                        readable
+                    ));
+                };
+                let task_title = data
+                    .get("task")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("Scheduled task");
+                let schedule = data
+                    .get("schedule")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("scheduled time");
+                summary_lines.push(format!("- {} ({})", task_title, schedule));
+                task_records.push(data);
+            }
+
+            let object_refs = task_records
+                .iter()
+                .filter_map(|record| {
+                    record
+                        .get("task_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|id| serde_json::json!({ "kind": "task", "id": id }))
+                })
+                .collect::<Vec<_>>();
+            let count = task_records.len();
+            let completion_detail = format!("Saved {} scheduled task(s).", count);
+            return Some(format!(
+                "{}\n{}\n{}",
+                render_tool_completion_marker_with_data(
+                    "schedule_task",
+                    "completed",
+                    &completion_detail,
+                    serde_json::json!({
+                        "task_count": count,
+                        "tasks": task_records,
+                        "object_refs": object_refs,
+                    }),
+                ),
+                completion_detail,
+                summary_lines.join("\n")
+            ));
+        }
+
         if let Err(message) = self
             .authorize_automation_tool_call("schedule_task", arguments, authorization)
             .await
@@ -4308,17 +4688,17 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             }
         };
 
-        let schedule_desc = if let Some(ref cron) = cron_expr {
-            format!("recurring (cron: {})", cron)
+        let schedule_desc = if cron_expr.is_some() {
+            "recurring schedule".to_string()
         } else if let Some(at) = scheduled_for {
             format!("one-time at {}", at.format("%Y-%m-%d %H:%M"))
         } else {
             "unknown".to_string()
         };
-        let action_word = if reused_existing {
-            "Updated existing task"
+        let action_sentence = if reused_existing {
+            "Updated the existing scheduled task."
         } else {
-            "Task scheduled successfully"
+            "Scheduled the task."
         };
         let duplicate_note = if removed_duplicates > 0 {
             format!(
@@ -4360,32 +4740,33 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         } else {
             report_to.clone()
         };
+        let report_label = watcher_delivery_label(&display_report_to);
         let completion_detail = format!(
-            "Task: {}; action: {}; schedule: {}; report to: {}; task id: {}",
-            task_desc,
-            action_name,
-            schedule_desc,
-            watcher_delivery_label(&display_report_to),
-            task_id
+            "{} It will run on a {} and report via {}.",
+            action_sentence, schedule_desc, report_label
         );
 
         Some(format!(
-            "{}{}!\n\nTask: {}\nAction: {}\nSchedule: {}\nReport to: {}\nTask ID: `{}`{}{}",
+            "{}\n{}\n\nTask: {}\nSchedule: {}\nReport to: {}{}{}",
             render_tool_completion_marker_with_data(
                 "schedule_task",
                 "completed",
                 &completion_detail,
                 serde_json::json!({
+                    "kind": "task",
                     "task_id": task_id.to_string(),
                     "background_session_id": background_session_id,
+                    "action": action_name.clone(),
+                    "task": task_desc.clone(),
+                    "schedule": schedule_desc.clone(),
+                    "notification": report_label.clone(),
+                    "cron": cron_expr.clone(),
                 }),
             ),
-            action_word,
+            action_sentence,
             task_desc,
-            action_name,
             schedule_desc,
-            watcher_delivery_label(&display_report_to),
-            task_id,
+            report_label,
             duplicate_note,
             planner_note
         ))
@@ -4519,6 +4900,97 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         project_id: Option<&str>,
         authorization: Option<&crate::actions::ActionAuthorizationContext>,
     ) -> Option<String> {
+        if let Some(batch_items) = watch_batch_item_arguments(arguments) {
+            let batch_items = match batch_items {
+                Ok(items) => items,
+                Err(error) => return Some(error.to_string()),
+            };
+            for item_args in &batch_items {
+                if let Err(message) = self
+                    .authorize_automation_tool_call("watch", item_args, authorization)
+                    .await
+                {
+                    return Some(message);
+                }
+            }
+
+            let mut watcher_records = Vec::new();
+            let mut summary_lines = Vec::new();
+            for (index, item_args) in batch_items.iter().enumerate() {
+                let Some(result) = Box::pin(self.handle_watch(
+                    item_args,
+                    request_channel,
+                    conversation_id,
+                    project_id,
+                    authorization,
+                ))
+                .await
+                else {
+                    return Some(format!(
+                        "Failed to create watcher item {} of {}.",
+                        index + 1,
+                        batch_items.len()
+                    ));
+                };
+                let Some(data) = schedule_task_completion_data(&result) else {
+                    let readable = strip_tool_completion_marker_line(&result);
+                    if watcher_records.is_empty() {
+                        return Some(readable);
+                    }
+                    return Some(format!(
+                        "Saved {} of {} watcher item(s), then item {} needed attention:\n{}",
+                        watcher_records.len(),
+                        batch_items.len(),
+                        index + 1,
+                        readable
+                    ));
+                };
+                let description = data
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("Watcher");
+                let cadence = data
+                    .get("cadence")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("scheduled cadence");
+                summary_lines.push(format!("- {} ({})", description, cadence));
+                watcher_records.push(data);
+            }
+
+            let object_refs = watcher_records
+                .iter()
+                .filter_map(|record| {
+                    record
+                        .get("watcher_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|id| serde_json::json!({ "kind": "watcher", "id": id }))
+                })
+                .collect::<Vec<_>>();
+            let count = watcher_records.len();
+            let completion_detail = format!("Saved {} watcher(s).", count);
+            return Some(format!(
+                "{}\n{}\n{}",
+                render_tool_completion_marker_with_data(
+                    "watch",
+                    "completed",
+                    &completion_detail,
+                    serde_json::json!({
+                        "watcher_count": count,
+                        "watchers": watcher_records,
+                        "object_refs": object_refs,
+                    }),
+                ),
+                completion_detail,
+                summary_lines.join("\n")
+            ));
+        }
+
         if let Err(message) = self
             .authorize_automation_tool_call("watch", arguments, authorization)
             .await
@@ -4934,15 +5406,15 @@ Return: 1 short status paragraph + 3 bullet next steps.",
             ""
         };
         let delivery_note = if notify_channel == "preferred" {
-            "\n\nExternal delivery is optional. If you later connect a notification channel, ask me to update this watcher and I will reuse it instead of creating a duplicate."
+            "\n\nExternal delivery is optional. If you later connect or remove notification channels, this watcher resolves the available channel at delivery time and otherwise keeps using in-app notifications."
         } else {
             ""
         };
 
-        let action_word = if reused_existing {
-            "Updated existing watcher"
+        let action_sentence = if reused_existing {
+            "Updated the existing background watcher."
         } else {
-            "Spawned a watcher"
+            "Created the background watcher."
         };
         let duplicate_note = if removed_duplicates > 0 {
             format!(
@@ -4952,46 +5424,172 @@ Return: 1 short status paragraph + 3 bullet next steps.",
         } else {
             String::new()
         };
+        let cadence_desc = watcher_cadence_label(interval_secs);
+        let delivery_desc = watcher_delivery_label(&display_notify_channel);
+        let delivery_fragment = watcher_delivery_sentence_fragment(&display_notify_channel);
+        let trigger_desc = on_trigger
+            .trim()
+            .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'));
+        let watch_target = description
+            .trim()
+            .trim_end_matches(|ch| matches!(ch, '.' | '!' | '?'));
+        let target_sentence = if watch_target.is_empty() {
+            String::new()
+        } else {
+            format!(" Target: {}.", watch_target)
+        };
+        let target_block = if watch_target.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nTarget: {}", watch_target)
+        };
         let completion_detail = format!(
-            "Polls {}; interval: {} seconds; notify via: {}; duration: {}; watcher id: {}",
-            poll_action,
-            interval_secs,
-            watcher_delivery_label(&display_notify_channel),
-            duration_desc,
-            id
+            "{} It will check {} and notify {} when: {}.{}",
+            action_sentence,
+            cadence_desc,
+            delivery_fragment,
+            if trigger_desc.is_empty() {
+                "the condition is met"
+            } else {
+                trigger_desc
+            },
+            target_sentence
         );
 
         Some(format!(
-            "{}{} to:\n\n\
-             1. **Poll** `{}` every {} seconds\n\
-             2. **When found**: {}\n\
-             3. **Notify via**: {}\n\n\
-             Will watch for up to {}.{}{}{}\n\n\
-             Watcher ID: `{}`{}",
+            "{}\n{}\n\n\
+             It will check {} and notify {} when: {}.{}\n\n\
+             - Cadence: {}\n\
+             - Notifications: {}\n\
+             - Duration: {}\n\n\
+             You can stop or edit it from Watchers.{}{}{}{}",
             render_tool_completion_marker_with_data(
                 "watch",
                 "completed",
                 &completion_detail,
                 serde_json::json!({
+                    "kind": "watcher",
                     "watcher_id": id.to_string(),
                     "background_session_id": background_session_id,
+                    "description": description.clone(),
+                    "cadence": cadence_desc.clone(),
+                    "duration": duration_desc.clone(),
+                    "notification": delivery_desc.clone(),
                 }),
             ),
-            action_word,
-            poll_action,
-            interval_secs,
-            on_trigger,
-            watcher_delivery_label(&display_notify_channel),
+            action_sentence,
+            cadence_desc,
+            delivery_fragment,
+            if trigger_desc.is_empty() {
+                "the condition is met"
+            } else {
+                trigger_desc
+            },
+            target_block,
+            cadence_desc,
+            delivery_desc,
             duration_desc,
             duration_note,
             delivery_note,
             planner_note,
-            id,
             duplicate_note
         ))
     }
 
     pub(crate) fn watcher_followup_worker(&self) -> WatcherFollowupWorker {
         WatcherFollowupWorker::from_agent(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_batch_items_inherit_and_override_delivery_route() {
+        let args = serde_json::json!({
+            "report_to": "preferred",
+            "action": "notify_user",
+            "action_arguments": {"message": "Reminder"},
+            "items": [
+                {
+                    "task": "Meeting with Steve",
+                    "at": "2026-06-30T03:30:00+05:30"
+                },
+                {
+                    "task": "Private in-app reminder",
+                    "at": "2026-09-30T03:30:00+05:30",
+                    "report_to": "in_app"
+                }
+            ]
+        });
+
+        let items = schedule_task_batch_item_arguments(&args)
+            .expect("batch should be detected")
+            .expect("batch should validate");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("report_to").and_then(|v| v.as_str()),
+            Some("preferred")
+        );
+        assert_eq!(
+            items[1].get("report_to").and_then(|v| v.as_str()),
+            Some("in_app")
+        );
+        assert_eq!(
+            items[0].get("action").and_then(|v| v.as_str()),
+            Some("notify_user")
+        );
+        assert_eq!(
+            items[1].get("action").and_then(|v| v.as_str()),
+            Some("notify_user")
+        );
+    }
+
+    #[test]
+    fn watcher_batch_items_inherit_and_override_notification_route() {
+        let args = serde_json::json!({
+            "poll_action": "web_search",
+            "poll_arguments": {"query": "provider pricing pages"},
+            "condition": {
+                "type": "material_change",
+                "summary": "pricing or plan tiers changed"
+            },
+            "on_trigger": "Notify with the changed pricing details.",
+            "interval_secs": 43200,
+            "notify_channel": "preferred",
+            "items": [
+                {
+                    "description": "Monitor provider pricing"
+                },
+                {
+                    "description": "Monitor internal dashboard status",
+                    "notify_channel": "in_app"
+                }
+            ]
+        });
+
+        let items = watch_batch_item_arguments(&args)
+            .expect("batch should be detected")
+            .expect("batch should validate");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("notify_channel").and_then(|v| v.as_str()),
+            Some("preferred")
+        );
+        assert_eq!(
+            items[1].get("notify_channel").and_then(|v| v.as_str()),
+            Some("in_app")
+        );
+        assert_eq!(
+            items[0].get("interval_secs").and_then(|v| v.as_i64()),
+            Some(43200)
+        );
+        assert_eq!(
+            items[1].get("poll_action").and_then(|v| v.as_str()),
+            Some("web_search")
+        );
     }
 }

@@ -1,29 +1,493 @@
 use super::*;
 
-#[derive(Clone)]
-struct ArkEvolveTurnRecordInput {
-    run_id: String,
-    trace_id: String,
-    message: String,
-    response: String,
-    channel: String,
-    conversation_id: Option<String>,
-    project_id: Option<String>,
-    model_used: String,
-    run_status: String,
-    user_outcome: crate::core::UserFacingOutcome,
-    degradation: Vec<crate::core::DegradationNote>,
-    attempted_models: Vec<crate::core::ModelAttemptRecord>,
-    turn_records: Vec<AgentTurnRecord>,
-    turn_plan: Option<ExecutionPlan>,
-}
+const DIRECT_CONVERSATION_VERSION: &str = "direct_conversation_v1";
+const DIRECT_CONTEXT_MODEL_USED: &str = "direct_context";
+const DIRECT_MEMORY_MODEL_USED: &str = "direct_memory";
+const DIRECT_CONVERSATION_MODEL_USED: &str = "direct_conversation";
+const DIRECT_CONVERSATION_TIMEOUT_MS: u64 = 30_000;
+const DIRECT_CONVERSATION_MAX_CANDIDATES: usize = 2;
+const DIRECT_CONVERSATION_RECENT_MESSAGES: usize = 6;
+const DIRECT_CONVERSATION_RECENT_ARTIFACTS: usize = 3;
+const INBOUND_CLASSIFIER_RECENT_ARTIFACTS: usize = 4;
+const DIRECT_MEMORY_MAX_ITEMS: u64 = 24;
+const DIRECT_MEMORY_MAX_LIST_ITEMS: usize = 5;
+const DIRECT_LOCAL_ANSWER_MIN_SCORE: f32 = 0.70;
+const DIRECT_LOCAL_ANSWER_MIN_MARGIN: f32 = 0.04;
+const DEFERRED_CHAT_PERSISTENCE_MAX_CONCURRENCY: usize = 8;
+const DEFERRED_CHAT_PERSISTENCE_ATTEMPTS: usize = 3;
+const DEFERRED_CHAT_PERSISTENCE_ATTEMPT_TIMEOUT_SECS: u64 = 45;
+const DEFERRED_CHAT_PERSISTENCE_WARN_PENDING: usize = 64;
+
+static DEFERRED_CHAT_PERSISTENCE_SEMAPHORE: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            DEFERRED_CHAT_PERSISTENCE_MAX_CONCURRENCY,
+        ))
+    });
+static DEFERRED_CHAT_PERSISTENCE_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Default)]
+struct DirectConversationRuntimeState {
+    routing_trusted: bool,
+    has_attachments: bool,
+    has_secret_offered: bool,
+    has_pending_actions: bool,
+    has_pending_credential_prompt: bool,
+    user_message_already_recorded: bool,
+    skip_inbound_security_precheck: bool,
+    supported_surface: bool,
+}
+
+fn attachment_hint_is_visual(attachment: &ChatAttachmentHint) -> bool {
+    let kind = attachment.kind.trim().to_ascii_lowercase();
+    let content_type = attachment
+        .content_type
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    kind.contains("visual") || kind.contains("image") || content_type.starts_with("image/")
+}
+
+fn truncate_for_attachment_memory_source(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn attachment_only_visual_memory_capture_source(
+    message: &str,
+    response: &str,
+    request_hints: &RequestExecutionHints,
+) -> Option<String> {
+    if !message.trim().is_empty() {
+        return None;
+    }
+    if !request_hints
+        .attachments
+        .iter()
+        .any(attachment_hint_is_visual)
+    {
+        return None;
+    }
+    let response = response.trim();
+    if response.is_empty() {
+        return None;
+    }
+
+    let visual_analysis = truncate_for_attachment_memory_source(response, 1_100);
+    Some(format!(
+        "Memory extraction input for a visual-only user turn. Analyze only durable user preferences or reusable workflow constraints that are supported by the visual analysis below. Do not store that the user sent an attachment or omitted text. Do not store one-off image contents, identities, sensitive traits, credentials, or guesses.\n\nVisual analysis:\n{}",
+        visual_analysis
+    ))
+}
+
+fn redact_chat_message_for_storage(secret_scrubbed_message: &str) -> String {
+    let mut redactor = crate::security::pii::PiiRedactor::new();
+    redactor.redact_emails = false;
+    redactor.redact_phones = false;
+    redactor.redact_ips = false;
+    redactor.redact(secret_scrubbed_message)
+}
+
+fn has_contact_info_for_memory_capture(secret_scrubbed_message: &str) -> bool {
+    let mut redactor = crate::security::pii::PiiRedactor::new();
+    redactor.redact_ssn = false;
+    redactor.redact_credit_cards = false;
+    redactor.redact_ips = false;
+    redactor.redact(secret_scrubbed_message) != secret_scrubbed_message
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DirectConversationModelOutput {
+    #[serde(default)]
+    can_answer_directly: bool,
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    decline_kind: Option<DirectConversationDeclineKind>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DirectConversationDeclineKind {
+    ExternalInfo,
+    LiveState,
+    ProductHelp,
+    SavedUserFacts,
+    ArtifactOrFile,
+    MutationOrDurable,
+    MissingContext,
+    UnsafeOrAuth,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug)]
+enum DirectConversationResponse {
+    Answer(String),
+    Declined {
+        kind: Option<DirectConversationDeclineKind>,
+        rationale: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnExecutionPath {
+    DirectReply,
+    AgentLoop,
+}
+
+fn turn_execution_path_from_routing(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+    state: DirectConversationRuntimeState,
+) -> TurnExecutionPath {
+    if should_use_direct_conversation_path(routing, state) {
+        TurnExecutionPath::DirectReply
+    } else {
+        TurnExecutionPath::AgentLoop
+    }
+}
+
+fn neutralize_direct_reply_routing_after_direct_decline(
+    routing: Option<&mut crate::security::intent_classifier::InboundRoutingSignal>,
+    state: DirectConversationRuntimeState,
+    decline_kind: Option<DirectConversationDeclineKind>,
+    original_user_message: &str,
+    decline_rationale: Option<&str>,
+) -> bool {
+    let Some(signal) = routing else {
+        return false;
+    };
+    if turn_execution_path_from_routing(Some(&*signal), state) != TurnExecutionPath::DirectReply {
+        return false;
+    }
+
+    signal.should_execute = true;
+    signal.tool_use_expected = true;
+    signal.semantic_queries.clear();
+    signal.required_capabilities.clear();
+
+    let compact_user_message = original_user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let compact_user_message = compact_user_message.trim();
+    let build_decline_query = |capability: &str| -> String {
+        if compact_user_message.is_empty() {
+            capability.to_string()
+        } else {
+            format!(
+                "{} for current user request: {}",
+                capability,
+                safe_truncate(compact_user_message, 260)
+            )
+        }
+    };
+    let add_decline_query =
+        |signal: &mut crate::security::intent_classifier::InboundRoutingSignal,
+         capability: &str| {
+            let query = build_decline_query(capability);
+            signal.semantic_queries.push(safe_truncate(&query, 360));
+            signal
+                .required_capabilities
+                .push(safe_truncate(&query, 220));
+            query
+        };
+    let set_decline_goal =
+        |signal: &mut crate::security::intent_classifier::InboundRoutingSignal,
+         capability: &str,
+         expected_outcome: &str,
+         durability: &str,
+         groundings: Vec<String>,
+         side_effect: &str| {
+            let query = add_decline_query(signal, capability);
+            signal.goals = vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: safe_truncate(capability, 160),
+                capability_query: safe_truncate(&query, 180),
+                expected_outcome: safe_truncate(expected_outcome, 180),
+                durability: durability.to_string(),
+                groundings,
+                side_effect: side_effect.to_string(),
+                dependencies: Vec::new(),
+            }];
+        };
+
+    match decline_kind.unwrap_or(DirectConversationDeclineKind::Unknown) {
+        DirectConversationDeclineKind::ExternalInfo => {
+            signal.current_answer_expected = true;
+            signal.external_info_expected = true;
+            set_decline_goal(
+                signal,
+                "external public information lookup",
+                "A grounded answer from public external information",
+                "none",
+                vec!["external_info".to_string()],
+                "none",
+            );
+        }
+        DirectConversationDeclineKind::LiveState
+        | DirectConversationDeclineKind::ArtifactOrFile => {
+            signal.current_answer_expected = true;
+            signal.live_state_expected = true;
+            set_decline_goal(
+                signal,
+                "live local state or artifact inspection",
+                "A grounded answer from current local state or artifacts",
+                "none",
+                vec!["local_state".to_string()],
+                "none",
+            );
+        }
+        DirectConversationDeclineKind::ProductHelp => {
+            signal.current_answer_expected = true;
+            signal.product_help_expected = true;
+            set_decline_goal(
+                signal,
+                "product documentation or capability lookup",
+                "A grounded product-help answer",
+                "none",
+                vec!["product_help".to_string()],
+                "none",
+            );
+        }
+        DirectConversationDeclineKind::SavedUserFacts => {
+            signal.current_answer_expected = true;
+            signal.saved_user_facts_expected = true;
+            set_decline_goal(
+                signal,
+                "saved user fact or preference lookup",
+                "A grounded answer from saved user facts or preferences",
+                "none",
+                vec!["user_memory".to_string()],
+                "none",
+            );
+        }
+        DirectConversationDeclineKind::MutationOrDurable => {
+            signal.current_answer_expected = false;
+            signal.durable_work_expected = true;
+            set_decline_goal(
+                signal,
+                "durable action planning",
+                "The requested durable action is planned or executed",
+                "persistent_work",
+                Vec::new(),
+                "write",
+            );
+        }
+        DirectConversationDeclineKind::MissingContext
+        | DirectConversationDeclineKind::UnsafeOrAuth
+        | DirectConversationDeclineKind::Unknown => {
+            signal.current_answer_expected = false;
+            if !compact_user_message.is_empty() {
+                signal
+                    .semantic_queries
+                    .push(safe_truncate(compact_user_message, 360));
+            }
+            signal.goals = vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Route current request through execution planning".to_string(),
+                capability_query: safe_truncate(compact_user_message, 180),
+                expected_outcome: "The current request is handled outside the direct reply path"
+                    .to_string(),
+                durability: "none".to_string(),
+                groundings: Vec::new(),
+                side_effect: "write".to_string(),
+                dependencies: Vec::new(),
+            }];
+        }
+    }
+    signal.multi_goal = signal.has_multiple_goals();
+    signal.durable_work_expected = signal.has_durable_goal();
+    signal.tool_use_expected = signal.has_executable_goal();
+    signal.should_execute = signal.tool_use_expected;
+    signal.rationale = Some(
+        match decline_rationale
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(rationale) => format!(
+                "Direct response path semantically declined: {}; route through execution planning.",
+                safe_truncate(rationale, 180)
+            ),
+            None => "Direct response path semantically declined; route through execution planning."
+                .to_string(),
+        },
+    );
+    true
+}
+
+fn direct_runtime_state_allows_immediate_reply(state: DirectConversationRuntimeState) -> bool {
+    state.routing_trusted
+        && !state.has_attachments
+        && !state.has_secret_offered
+        && !state.has_pending_actions
+        && !state.has_pending_credential_prompt
+        && !state.user_message_already_recorded
+        && !state.skip_inbound_security_precheck
+        && state.supported_surface
+}
+
+fn should_enqueue_semantic_user_memory_capture(
+    message: &str,
+    state: DirectConversationRuntimeState,
+    turn_path: TurnExecutionPath,
+) -> bool {
+    let _ = (message, state, turn_path);
+    false
+}
+
+fn routing_is_transient_read_only_lookup(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+) -> bool {
+    let Some(signal) = routing else {
+        return false;
+    };
+    signal.has_transient_read_only_lookup()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectMemoryLookupKind {
+    Identity,
+    Location,
+    Timezone,
+    Preference,
+    Contact,
+    Constraint,
+    Any,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectLocalAnswerMode {
+    PreviousUserMessage,
+    PreviousAssistantMessage,
+    RecentConversationSummary,
+}
+
+impl DirectLocalAnswerMode {
+    fn canonical_text(self) -> &'static str {
+        match self {
+            Self::PreviousUserMessage => {
+                "The user asks to recall, quote, restate, identify, or answer with the immediately previous user message or question from this conversation."
+            }
+            Self::PreviousAssistantMessage => {
+                "The user asks to recall, quote, restate, identify, or answer with the assistant's immediately previous response from this conversation."
+            }
+            Self::RecentConversationSummary => {
+                "The user asks for a concise summary, recap, or description of the recent visible conversation history."
+            }
+        }
+    }
+}
+
+fn direct_local_answer_mode_query(
+    routing: &crate::security::intent_classifier::InboundRoutingSignal,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    parts.extend(routing.semantic_queries.iter().map(String::as_str));
+    for goal in &routing.goals {
+        parts.push(goal.intent_summary.as_str());
+        parts.push(goal.capability_query.as_str());
+        parts.push(goal.expected_outcome.as_str());
+    }
+    let query = parts
+        .into_iter()
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!query.trim().is_empty()).then_some(query)
+}
+
+impl DirectMemoryLookupKind {
+    fn from_routing_value(value: Option<&str>) -> Self {
+        match value.unwrap_or_default().trim() {
+            "identity" => Self::Identity,
+            "location" => Self::Location,
+            "timezone" => Self::Timezone,
+            "preference" => Self::Preference,
+            "contact" => Self::Contact,
+            "constraint" => Self::Constraint,
+            _ => Self::Any,
+        }
+    }
+
+    fn as_memory_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Identity => Some("identity"),
+            Self::Location => Some("location"),
+            Self::Timezone => Some("timezone"),
+            Self::Preference => Some("preference"),
+            Self::Contact => Some("contact"),
+            Self::Constraint => Some("constraint"),
+            Self::Any => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Location => "location",
+            Self::Timezone => "timezone",
+            Self::Preference => "preference",
+            Self::Contact => "contact detail",
+            Self::Constraint => "operating constraint",
+            Self::Any => "saved fact",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectMemoryCandidate {
+    lookup_kind: DirectMemoryLookupKind,
+    value: String,
+    content: String,
+    scope_rank: u8,
+    confidence: f64,
+    support_count: i32,
+    updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 struct TurnPipelineUsageSnapshot {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
     cost_usd: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredExchangePersistenceKind {
+    TurnPipeline,
+    Immediate,
+}
+
+#[derive(Clone)]
+struct DeferredExchangePersistence {
+    kind: DeferredExchangePersistenceKind,
+    trace_snapshot: ExecutionTrace,
+    message: String,
+    response: String,
+    channel: String,
+    conversation_key: String,
+    project_id: Option<String>,
+    model_used: String,
+    user_message_already_recorded: bool,
+    memory_capture_allowed: bool,
+    memory_capture_source: Option<String>,
+    user_message_id: String,
+    assistant_message_id: String,
+    user_timestamp: String,
+    assistant_timestamp: String,
+    is_new_conversation: bool,
+    conversation_title: Option<String>,
+    user_outcome: crate::core::UserFacingOutcome,
 }
 
 impl TurnPipelineUsageSnapshot {
@@ -37,357 +501,652 @@ impl TurnPipelineUsageSnapshot {
     }
 }
 
-fn arkevolve_hash(parts: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"arkevolve");
-    for part in parts {
-        hasher.update([0u8]);
-        hasher.update(part.as_bytes());
-    }
-    hex::encode(hasher.finalize())
-}
-
-fn arkevolve_tool_sequence(records: &[AgentTurnRecord]) -> Vec<serde_json::Value> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let tool_name = record.action_name.as_deref()?.trim();
-            if tool_name.is_empty() {
-                return None;
-            }
-            Some(serde_json::json!({
-                "goal_id": record.goal_id,
-                "tool_name": tool_name,
-                "status": match record.outcome {
-                    AgentTurnOutcomeKind::Succeeded => "success",
-                    AgentTurnOutcomeKind::NeedsClarification => "needs_input",
-                    AgentTurnOutcomeKind::RespondedWithoutTool => "no_handler",
-                    AgentTurnOutcomeKind::Abandoned => "blocked",
-                    AgentTurnOutcomeKind::Skipped => "cancelled",
-                },
-                "side_effect": record.side_effect.clone(),
-                "object_kind": record.resolved_object_ref.as_ref().map(|value| &value.kind),
-            }))
-        })
-        .collect()
-}
-
-fn arkevolve_task_type(records: &[AgentTurnRecord]) -> String {
-    records
-        .iter()
-        .filter_map(|record| record.action_name.as_deref())
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_else(|| "conversation".to_string())
-}
-
-fn arkevolve_intent_key(message: &str, task_type: &str, records: &[AgentTurnRecord]) -> String {
-    let semantic_parts = records
-        .iter()
-        .filter_map(|record| {
-            let action = record.action_name.as_deref()?.trim();
-            if action.is_empty() {
-                return None;
-            }
-            let object_kind = record
-                .resolved_object_ref
-                .as_ref()
-                .map(|value| format!("{:?}", value.kind))
-                .unwrap_or_default();
-            Some(format!("{}:{}", action.to_ascii_lowercase(), object_kind))
-        })
-        .collect::<Vec<_>>();
-    if semantic_parts.is_empty() {
-        return crate::core::learning::derive_intent_key(message, task_type);
-    }
-    let joined = semantic_parts.join("|");
-    format!(
-        "{}::{}",
-        task_type,
-        &arkevolve_hash(&[joined.as_str()])[..16]
-    )
-}
-
-fn arkevolve_execution_status(run_status: &str) -> crate::core::ExecutionRunStatus {
-    match run_status.trim().to_ascii_lowercase().as_str() {
-        "completed" => crate::core::ExecutionRunStatus::Completed,
-        "completed_degraded" | "degraded" => crate::core::ExecutionRunStatus::Degraded,
-        "needs_input" => crate::core::ExecutionRunStatus::NeedsInput,
-        "blocked" => crate::core::ExecutionRunStatus::Blocked,
-        "needs_stronger_model" => crate::core::ExecutionRunStatus::NeedsStrongerModel,
-        "platform_failed" => crate::core::ExecutionRunStatus::PlatformFailed,
-        _ => crate::core::ExecutionRunStatus::Degraded,
-    }
-}
-
-fn arkevolve_success_state(
-    status: &crate::core::ExecutionRunStatus,
+fn memory_capture_source_with_completed_work_context(
+    message: &str,
+    response: &str,
     records: &[AgentTurnRecord],
-) -> &'static str {
-    let has_success = records
-        .iter()
-        .any(|record| record.outcome == AgentTurnOutcomeKind::Succeeded);
-    let has_terminal_failure = records.iter().any(|record| {
-        matches!(
-            record.outcome,
-            AgentTurnOutcomeKind::Abandoned | AgentTurnOutcomeKind::Skipped
-        )
-    });
-    let has_non_terminal_direct_response = records.iter().any(|record| {
-        matches!(
-            record.outcome,
-            AgentTurnOutcomeKind::RespondedWithoutTool | AgentTurnOutcomeKind::NeedsClarification
-        )
-    });
-    let degraded_without_terminal_failure = !has_terminal_failure
-        && (has_success || has_non_terminal_direct_response || records.is_empty());
-    match status {
-        crate::core::ExecutionRunStatus::Completed => "accepted",
-        crate::core::ExecutionRunStatus::Degraded if degraded_without_terminal_failure => {
-            "accepted"
-        }
-        _ => "failed",
-    }
-}
-
-fn arkevolve_record_status(outcome: &AgentTurnOutcomeKind) -> crate::core::ToolOutcomeStatus {
-    match outcome {
-        AgentTurnOutcomeKind::Succeeded => crate::core::ToolOutcomeStatus::Success,
-        AgentTurnOutcomeKind::NeedsClarification => crate::core::ToolOutcomeStatus::NeedsInput,
-        AgentTurnOutcomeKind::RespondedWithoutTool => crate::core::ToolOutcomeStatus::NoHandler,
-        AgentTurnOutcomeKind::Abandoned => crate::core::ToolOutcomeStatus::Blocked,
-        AgentTurnOutcomeKind::Skipped => crate::core::ToolOutcomeStatus::Cancelled,
-    }
-}
-
-fn arkevolve_learning_signal(
-    input: &ArkEvolveTurnRecordInput,
-    tool_sequence: &[serde_json::Value],
-    success_state: &str,
-) -> serde_json::Value {
-    let successful_goals = input
-        .turn_records
+    turn_plan: Option<&ExecutionPlan>,
+) -> Option<String> {
+    let completed_work = records
         .iter()
         .filter(|record| record.outcome == AgentTurnOutcomeKind::Succeeded)
-        .count();
-    let failed_goals = input
-        .turn_records
-        .iter()
         .filter(|record| {
-            matches!(
-                record.outcome,
-                AgentTurnOutcomeKind::Abandoned | AgentTurnOutcomeKind::Skipped
-            )
+            record
+                .side_effect
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty() && value != "none")
+                || record.resolved_object_ref.is_some()
         })
-        .count();
-    let has_tool_evidence = !tool_sequence.is_empty();
-    let has_failure_evidence = failed_goals > 0 || success_state == "failed";
-    serde_json::json!({
-        "procedure_eligible": has_tool_evidence || successful_goals > 0 || has_failure_evidence,
-        "global_learning": true,
-        "scope_policy": "global",
-        "tool_evidence_count": tool_sequence.len(),
-        "successful_goal_count": successful_goals,
-        "failed_goal_count": failed_goals,
-        "degradation_count": input.degradation.len(),
-        "recorded_without_blocking_chat": true,
+        .map(|record| {
+            serde_json::json!({
+                "goal_id": &record.goal_id,
+                "action": record.action_name.as_ref(),
+                "side_effect": record.side_effect.as_ref(),
+                "object_ref": record.resolved_object_ref.as_ref(),
+                "output": record.tool_output.as_ref().map(|value| {
+                    safe_truncate(&value.to_string(), 900)
+                }),
+            })
+        })
+        .collect::<Vec<_>>();
+    if completed_work.is_empty() {
+        return None;
+    }
+
+    let plan_summary = turn_plan.map(|plan| {
+        serde_json::json!({
+            "summary": &plan.summary,
+            "steps": plan.steps.iter().map(|step| {
+                serde_json::json!({
+                    "title": &step.title,
+                    "description": &step.description,
+                    "action": step.action.as_ref(),
+                    "status": step.status.as_ref(),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    });
+
+    Some(format!(
+        "Memory extraction input for a turn that also created or updated durable work objects.\n\
+         The durable work records below already own their task-specific schedules, watcher conditions, notification routes, targets, execution state, and follow-up instructions. Do not store those object-specific details as ArkMemory. Only extract durable user facts, stable preferences, reusable constraints, or cross-context workflow rules that remain useful independently of these created work objects.\n\n\
+         User message:\n{}\n\n\
+         Assistant response:\n{}\n\n\
+         Durable work created or updated this turn:\n{}\n\n\
+         Turn plan:\n{}",
+        safe_truncate(message, 1800),
+        safe_truncate(response, 1400),
+        serde_json::to_string_pretty(&completed_work).unwrap_or_default(),
+        plan_summary
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| "null".to_string())
+    ))
+}
+
+fn should_use_direct_conversation_path(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+    state: DirectConversationRuntimeState,
+) -> bool {
+    if !direct_runtime_state_allows_immediate_reply(state) {
+        return false;
+    }
+
+    let Some(signal) = routing else {
+        return false;
+    };
+
+    signal.is_conversational_only()
+}
+
+fn should_acknowledge_direct_memory_capture(
+    routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+    state: DirectConversationRuntimeState,
+    memory_capture_allowed: bool,
+) -> bool {
+    if !memory_capture_allowed || !direct_runtime_state_allows_immediate_reply(state) {
+        return false;
+    }
+    let Some(signal) = routing else {
+        return false;
+    };
+    signal.current_answer_expected
+        && !signal.has_executable_goal()
+        && !signal.has_multiple_goals()
+        && signal.goals.len() <= 1
+        && !signal
+            .goals
+            .iter()
+            .any(|goal| !goal.dependencies.is_empty())
+        && !signal.saved_user_facts_expected
+        && !signal.product_help_expected
+        && !signal.live_state_expected
+        && !signal.external_info_expected
+}
+
+fn direct_memory_scope_rank(
+    item: &crate::storage::experience_item::Model,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+) -> u8 {
+    let project_rank = if project_id.is_some() && item.project_id.as_deref() == project_id {
+        1u8
+    } else {
+        0u8
+    };
+    let conversation_rank =
+        if conversation_id.is_some() && item.conversation_id.as_deref() == conversation_id {
+            2u8
+        } else {
+            0u8
+        };
+    project_rank + conversation_rank
+}
+
+fn direct_memory_value_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn direct_memory_candidate_from_item(
+    item: &crate::storage::experience_item::Model,
+    lookup_kind: DirectMemoryLookupKind,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<DirectMemoryCandidate> {
+    if !should_inject_learned_user_memory(item, now) {
+        return None;
+    }
+    let item_kind = learned_user_memory_lookup_kind(item);
+    if let Some(required_kind) = lookup_kind.as_memory_kind() {
+        if item_kind != required_kind {
+            return None;
+        }
+    }
+    let value = learned_user_memory_value(item)?;
+    let value = crate::security::redact_secret_input(&value).text;
+    let value = safe_truncate(value.trim(), 220);
+    if value.is_empty() {
+        return None;
+    }
+    let content = format_learned_user_memory_for_prompt(item, now)
+        .unwrap_or_else(|| format!("- [{}] {}", lookup_kind.label(), safe_truncate(&value, 180)));
+    Some(DirectMemoryCandidate {
+        lookup_kind,
+        value,
+        content,
+        scope_rank: direct_memory_scope_rank(item, project_id, conversation_id),
+        confidence: item.confidence,
+        support_count: item.support_count,
+        updated_at: item.updated_at.clone(),
     })
 }
 
-async fn persist_arkevolve_turn_recording(
-    storage: crate::storage::Storage,
-    input: ArkEvolveTurnRecordInput,
-) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let execution_status = arkevolve_execution_status(&input.run_status);
-    let success_state = arkevolve_success_state(&execution_status, &input.turn_records);
-    let task_type = arkevolve_task_type(&input.turn_records);
-    let intent_key = arkevolve_intent_key(&input.message, &task_type, &input.turn_records);
-    let tool_sequence = arkevolve_tool_sequence(&input.turn_records);
-    let tool_sequence_json = serde_json::Value::Array(tool_sequence.clone());
-    let tool_sequence_digest = if tool_sequence.is_empty() {
-        None
-    } else {
-        let canonical = serde_json::to_string(&tool_sequence_json).unwrap_or_default();
-        Some(arkevolve_hash(&[canonical.as_str()])[..24].to_string())
-    };
-    let learning_signal = arkevolve_learning_signal(&input, &tool_sequence, success_state);
-    let run = crate::core::ExecutionRun {
-        id: input.run_id.clone(),
-        kind: "chat_turn".to_string(),
-        request_id: Some(input.run_id.clone()),
-        status: execution_status.clone(),
-        current_stage: execution_status.as_str().to_string(),
-        lease_owner: None,
-        lease_expires_at: None,
-        attempt: 0,
-        deadline_at: None,
-        cancellation_requested: false,
-        degradation: input.degradation.clone(),
-        last_error: (success_state == "failed")
-            .then(|| input.user_outcome.message.clone())
-            .filter(|value| !value.trim().is_empty()),
-        result_summary: Some(safe_truncate(&input.response, 500)),
-        trace_id: Some(input.trace_id.clone()),
-        conversation_id: input.conversation_id.clone(),
-        channel: Some(input.channel.clone()),
-        request_message: Some(input.message.clone()),
-        attempted_models: input.attempted_models.clone(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    storage.insert_execution_run(&run).await?;
-
-    let experience_run_id = format!("exprun-{}", &arkevolve_hash(&[input.run_id.as_str()])[..24]);
-    storage
-        .upsert_experience_run(&crate::storage::experience_run::Model {
-            id: experience_run_id.clone(),
-            execution_run_id: Some(input.run_id.clone()),
-            trace_id: Some(input.trace_id.clone()),
-            conversation_id: input.conversation_id.clone(),
-            project_id: None,
-            channel: input.channel.clone(),
-            scope: "global".to_string(),
-            intent_key,
-            task_type: Some(task_type.clone()),
-            request_text: Some(safe_truncate(&input.message, 600)),
-            tool_sequence_digest: tool_sequence_digest.clone(),
-            tool_sequence_json: tool_sequence_json.clone(),
-            strategy_version: None,
-            policy_version: None,
-            prompt_version: None,
-            model_slot: Some(input.model_used.clone()),
-            success_state: success_state.to_string(),
-            correction_state: "none".to_string(),
-            outcome_summary: Some(safe_truncate(&input.response, 800)),
-            failure_reason: (success_state == "failed").then(|| {
-                input
-                    .user_outcome
-                    .reason_code
-                    .clone()
-                    .unwrap_or_else(|| safe_truncate(&input.user_outcome.message, 240))
-            }),
-            metadata: serde_json::json!({
-                "source": "agent_turn_loop",
-                "learning_signal": learning_signal,
-                "source_project_id": input.project_id.clone(),
-                "source_conversation_id": input.conversation_id.clone(),
-                "turn_plan": input.turn_plan.clone(),
-                "turn_records": input.turn_records.clone(),
-                "user_outcome": input.user_outcome.clone(),
-            }),
-            consolidated: false,
-            accepted_at: (success_state == "accepted").then(|| now.clone()),
-            corrected_at: None,
-            heuristic_reflected: false,
-            heuristic_reflection_status: Some("pending".to_string()),
-            heuristic_reflection_attempted_at: None,
-            heuristic_reflection_completed_at: None,
-            heuristic_lesson_id: None,
-            heuristic_reflection_error: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        })
-        .await?;
-
-    for (index, record) in input
-        .turn_records
+fn sorted_direct_memory_candidates(
+    items: &[crate::storage::experience_item::Model],
+    lookup_kind: DirectMemoryLookupKind,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<DirectMemoryCandidate> {
+    let mut candidates = items
         .iter()
-        .filter(|record| {
-            record
-                .action_name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty())
+        .filter_map(|item| {
+            direct_memory_candidate_from_item(item, lookup_kind, project_id, conversation_id, now)
         })
-        .enumerate()
-    {
-        let tool_name = record.action_name.as_deref().unwrap_or("tool").trim();
-        let status = arkevolve_record_status(&record.outcome);
-        let attempt = crate::core::ToolAttempt {
-            id: format!(
-                "tool-{}",
-                &arkevolve_hash(&[input.run_id.as_str(), tool_name, &index.to_string()])[..24]
-            ),
-            run_id: input.run_id.clone(),
-            sequence_no: index as u32,
-            tool_name: tool_name.to_string(),
-            status: status.clone(),
-            failure_class: None,
-            retryable: false,
-            side_effect_level: record
-                .side_effect
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string(),
-            idempotency_key: None,
-            arguments_json: serde_json::to_string(&serde_json::json!({
-                "goal_id": record.goal_id,
-                "resolved_object_ref": record.resolved_object_ref.as_ref(),
-            }))?,
-            output_json: serde_json::to_string(
-                &record
-                    .tool_output
-                    .clone()
-                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
-            )?,
-            started_at: now.clone(),
-            completed_at: Some(now.clone()),
-            error_text: record
-                .reason
-                .clone()
-                .or_else(|| record.clarification_question.clone()),
-        };
-        storage.append_tool_attempt(&attempt).await?;
-        let edge_type = if status == crate::core::ToolOutcomeStatus::Success {
-            "succeeded_with"
-        } else {
-            "failed_with"
-        };
-        storage
-            .upsert_experience_edge(&crate::storage::experience_edge::Model {
-                id: format!(
-                    "edge-{}",
-                    &arkevolve_hash(&[
-                        input.run_id.as_str(),
-                        edge_type,
-                        tool_name,
-                        &index.to_string()
-                    ])[..24]
-                ),
-                source_ref: experience_run_id.clone(),
-                source_kind: "experience_run".to_string(),
-                target_ref: tool_name.to_string(),
-                target_kind: "tool".to_string(),
-                edge_type: edge_type.to_string(),
-                weight: if edge_type == "succeeded_with" {
-                    1.0
-                } else {
-                    0.35
-                },
-                source_run_id: Some(experience_run_id.clone()),
-                metadata: serde_json::json!({
-                    "goal_id": record.goal_id,
-                    "status": status.as_str(),
-                    "global_learning": true,
-                }),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .await?;
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .scope_rank
+            .cmp(&left.scope_rank)
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| right.support_count.cmp(&left.support_count))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
+    candidates
+}
+
+fn direct_memory_answer_from_candidates(
+    candidates: &[DirectMemoryCandidate],
+    lookup_kind: DirectMemoryLookupKind,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
     }
-    Ok(())
+    if lookup_kind == DirectMemoryLookupKind::Any {
+        let mut seen = HashSet::new();
+        let facts = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let key = direct_memory_value_key(&candidate.content);
+                seen.insert(key).then(|| candidate.content.clone())
+            })
+            .take(DIRECT_MEMORY_MAX_LIST_ITEMS)
+            .collect::<Vec<_>>();
+        return match facts.len() {
+            0 => None,
+            1 => Some(format!("I have this saved about you:\n{}", facts[0].trim())),
+            _ => Some(format!(
+                "I have these saved facts about you:\n{}",
+                facts.join("\n")
+            )),
+        };
+    }
+
+    let best_scope_rank = candidates[0].scope_rank;
+    let best = candidates
+        .iter()
+        .filter(|candidate| candidate.scope_rank == best_scope_rank)
+        .collect::<Vec<_>>();
+    let distinct_values = best
+        .iter()
+        .map(|candidate| direct_memory_value_key(&candidate.value))
+        .collect::<HashSet<_>>();
+    if distinct_values.len() != 1 {
+        return None;
+    }
+
+    let value = best[0].value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "I have this saved {} for you: {}.",
+        best[0].lookup_kind.label(),
+        value
+    ))
+}
+
+fn select_direct_memory_answer(
+    items: &[crate::storage::experience_item::Model],
+    profile_lookup_kind: Option<&str>,
+    project_id: Option<&str>,
+    conversation_id: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let lookup_kind = DirectMemoryLookupKind::from_routing_value(profile_lookup_kind);
+    let candidates =
+        sorted_direct_memory_candidates(items, lookup_kind, project_id, conversation_id, now);
+    direct_memory_answer_from_candidates(&candidates, lookup_kind)
+}
+
+fn extract_direct_conversation_json_object(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+    let start = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| if ch == '{' { Some(idx) } else { None })?;
+    let end = trimmed.char_indices().rev().find_map(|(idx, ch)| {
+        if ch == '}' {
+            Some(idx + ch.len_utf8())
+        } else {
+            None
+        }
+    })?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..end])
+        .ok()
+        .filter(|value| value.is_object())
+}
+
+fn direct_conversation_system_prompt() -> String {
+    format!(
+        "You are {name}. This is a no-tool direct conversation path. \
+Answer only from the user message, visible recent conversation, saved user facts, and product identity supplied in this prompt. \
+Do not claim to inspect live state, files, tools, integrations, web pages, documents, apps, logs, clocks, or external systems. \
+Do not state or imply persistence of newly supplied user facts unless they are already present in saved_user_facts; acknowledge new self-information plainly instead. \
+If the request needs tool use, live/current/external information, mutation, scheduling, deployment, integration work, files, code execution, approvals, attachments, or missing context, set can_answer_directly=false instead of writing a refusal, and set decline_kind to the closest semantic class: external_info, live_state, product_help, saved_user_facts, artifact_or_file, mutation_or_durable, missing_context, unsafe_or_auth, or unknown. \
+If recent_actionable_artifacts are supplied and the user is asking about, debugging, validating, fixing, changing, or continuing work on one of them, set can_answer_directly=false with decline_kind=artifact_or_file instead of pretending to inspect it. \
+Return only compact JSON with this exact shape: {{\"can_answer_directly\":true,\"answer\":\"final user-facing response\",\"decline_kind\":null,\"rationale\":\"brief reason\"}} or {{\"can_answer_directly\":false,\"answer\":\"\",\"decline_kind\":\"external_info\",\"rationale\":\"brief reason\"}}. \
+Do not mention routing, policies, classifiers, this direct path, or the full agent loop in the answer.",
+        name = crate::branding::PRODUCT_NAME
+    )
+}
+
+fn direct_conversation_user_prompt(
+    message: &str,
+    conversation_key: &str,
+    recent_messages: &[serde_json::Value],
+    recent_artifacts: &[serde_json::Value],
+    saved_user_facts_context: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "conversation_id": conversation_key,
+        "product_identity": {
+            "name": crate::branding::PRODUCT_NAME,
+        },
+        "recent_messages": recent_messages,
+        "recent_actionable_artifacts": recent_artifacts,
+        "saved_user_facts": saved_user_facts_context,
+        "user_message": message,
+    })
+    .to_string()
 }
 
 impl Agent {
-    fn spawn_arkevolve_turn_recording(&self, input: ArkEvolveTurnRecordInput) {
-        let storage = self.storage.clone();
-        tokio::spawn(async move {
-            if let Err(error) = persist_arkevolve_turn_recording(storage, input).await {
-                tracing::warn!("ArkEvolve turn evidence recording failed: {}", error);
-            }
+    async fn direct_conversation_recent_messages(
+        &self,
+        conversation_key: &str,
+    ) -> Vec<serde_json::Value> {
+        let history = self.conversation_history.read().await;
+        let Some(messages) = history.get(conversation_key) else {
+            return Vec::new();
+        };
+        let mut recent = messages
+            .iter()
+            .rev()
+            .take(DIRECT_CONVERSATION_RECENT_MESSAGES)
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role.clone(),
+                    "content": safe_truncate(
+                        &crate::security::redact_secret_input(&message.content).text,
+                        700,
+                    ),
+                    "timestamp": message._timestamp,
+                })
+            })
+            .collect::<Vec<_>>();
+        recent.reverse();
+        recent
+    }
+
+    async fn classify_direct_local_answer_mode(
+        &self,
+        routing: &crate::security::intent_classifier::InboundRoutingSignal,
+    ) -> Option<DirectLocalAnswerMode> {
+        let embedder = self.embedding_client.as_deref()?;
+        let query = direct_local_answer_mode_query(routing)?;
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        let modes = [
+            DirectLocalAnswerMode::PreviousUserMessage,
+            DirectLocalAnswerMode::PreviousAssistantMessage,
+            DirectLocalAnswerMode::RecentConversationSummary,
+        ];
+        let mut texts = Vec::with_capacity(modes.len() + 1);
+        texts.push(query.to_string());
+        texts.extend(modes.iter().map(|mode| mode.canonical_text().to_string()));
+        let embeddings = embedder.embed_texts(&texts).await.ok()?;
+        let message_embedding = embeddings.first()?;
+        let mut scored = modes
+            .iter()
+            .zip(embeddings.iter().skip(1))
+            .filter_map(|(mode, embedding)| {
+                let score = crate::core::document_search::normalized_embedding_similarity(
+                    message_embedding.as_slice(),
+                    embedding.as_slice(),
+                )?;
+                Some((*mode, score))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
+        let (mode, score) = *scored.first()?;
+        let competing = scored.get(1).map(|(_, score)| *score).unwrap_or(0.0);
+        if score >= DIRECT_LOCAL_ANSWER_MIN_SCORE
+            && score - competing >= DIRECT_LOCAL_ANSWER_MIN_MARGIN
+        {
+            Some(mode)
+        } else {
+            None
+        }
+    }
+
+    async fn run_direct_local_conversation_response(
+        &self,
+        routing: &crate::security::intent_classifier::InboundRoutingSignal,
+        message: &str,
+        conversation_key: &str,
+    ) -> Option<String> {
+        let mode = self.classify_direct_local_answer_mode(routing).await?;
+        let history = self.conversation_history.read().await;
+        let messages = history.get(conversation_key)?;
+        let current_message = message.trim();
+        let previous_for_role = |role: &str| {
+            messages.iter().rev().find_map(|item| {
+                if !item.role.eq_ignore_ascii_case(role) {
+                    return None;
+                }
+                let content = crate::security::redact_secret_input(&item.content).text;
+                let content = content.trim();
+                if content.is_empty() || content == current_message {
+                    return None;
+                }
+                Some(safe_truncate(content, 700))
+            })
+        };
+        match mode {
+            DirectLocalAnswerMode::PreviousUserMessage => {
+                let previous = previous_for_role("user")?;
+                let label = if previous.trim_end().ends_with('?') {
+                    "question"
+                } else {
+                    "message"
+                };
+                Some(format!("Your previous {label} was: \"{previous}\""))
+            }
+            DirectLocalAnswerMode::PreviousAssistantMessage => {
+                let previous = previous_for_role("assistant")?;
+                Some(format!("My previous response was: \"{previous}\""))
+            }
+            DirectLocalAnswerMode::RecentConversationSummary => {
+                let recent = messages
+                    .iter()
+                    .rev()
+                    .filter_map(|item| {
+                        let role = if item.role.eq_ignore_ascii_case("user") {
+                            "You"
+                        } else if item.role.eq_ignore_ascii_case("assistant") {
+                            crate::branding::PRODUCT_NAME
+                        } else {
+                            return None;
+                        };
+                        let content = crate::security::redact_secret_input(&item.content).text;
+                        let content = content.trim();
+                        if content.is_empty() || content == current_message {
+                            return None;
+                        }
+                        Some(format!("{}: {}", role, safe_truncate(content, 260)))
+                    })
+                    .take(6)
+                    .collect::<Vec<_>>();
+                if recent.is_empty() {
+                    return None;
+                }
+                let summary = recent.into_iter().rev().collect::<Vec<_>>().join("\n");
+                Some(format!("Recent conversation:\n{summary}"))
+            }
+        }
+    }
+
+    async fn run_direct_memory_response(
+        &self,
+        routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Option<String> {
+        let signal = routing?;
+        if !signal.saved_user_facts_expected {
+            return None;
+        }
+        let items = match self
+            .storage
+            .list_active_experience_items(
+                SAVED_USER_FACT_PROMPT_KINDS,
+                project_id,
+                Some(conversation_key),
+                DIRECT_MEMORY_MAX_ITEMS,
+            )
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::debug!("Direct memory lookup failed: {}", error);
+                return None;
+            }
+        };
+        select_direct_memory_answer(
+            &items,
+            signal.profile_lookup_kind.as_deref(),
+            project_id,
+            Some(conversation_key),
+            chrono::Utc::now(),
+        )
+    }
+
+    async fn run_direct_conversation_response(
+        &self,
+        channel: &str,
+        message: &str,
+        conversation_key: &str,
+        project_id: Option<&str>,
+        skip_context_lookup: bool,
+    ) -> std::result::Result<DirectConversationResponse, crate::core::UserFacingOutcome> {
+        let recent_messages = self
+            .direct_conversation_recent_messages(conversation_key)
+            .await;
+        let saved_user_facts_context = if skip_context_lookup {
+            None
+        } else {
+            self.build_saved_user_facts_context(project_id, Some(conversation_key), message)
+                .await
+        };
+        let recent_artifacts = if skip_context_lookup {
+            Vec::new()
+        } else {
+            Self::conversation_artifacts_for_prompt(
+                &self.load_recent_artifact_contexts(conversation_key).await,
+                DIRECT_CONVERSATION_RECENT_ARTIFACTS,
+            )
+        };
+        let user_prompt = direct_conversation_user_prompt(
+            message,
+            conversation_key,
+            &recent_messages,
+            &recent_artifacts,
+            saved_user_facts_context.as_deref(),
+        );
+        let response = self
+            .supervised_internal_chat_detailed(
+                channel,
+                "direct_conversation",
+                DIRECT_CONVERSATION_VERSION,
+                &ModelRole::Fast,
+                self.llm_candidates_for_role(&ModelRole::Fast),
+                &direct_conversation_system_prompt(),
+                &user_prompt,
+                &[],
+                &[],
+                DIRECT_CONVERSATION_TIMEOUT_MS,
+                DIRECT_CONVERSATION_MAX_CANDIDATES,
+            )
+            .await?;
+
+        let answer = response.content.trim();
+        if answer.is_empty() {
+            tracing::warn!(
+                "Direct conversation responder returned an empty direct answer; falling back to agent loop"
+            );
+            return Ok(DirectConversationResponse::Declined {
+                kind: Some(DirectConversationDeclineKind::Unknown),
+                rationale: Some("empty model output".to_string()),
+            });
+        }
+        let Some(parsed) = extract_direct_conversation_json_object(answer)
+            .and_then(|value| serde_json::from_value::<DirectConversationModelOutput>(value).ok())
+        else {
+            tracing::warn!(
+                "Direct conversation responder returned non-JSON output; falling back to agent loop"
+            );
+            return Ok(DirectConversationResponse::Declined {
+                kind: Some(DirectConversationDeclineKind::Unknown),
+                rationale: Some("non-JSON model output".to_string()),
+            });
+        };
+        if !parsed.can_answer_directly {
+            if let Some(rationale) = parsed.rationale.as_deref() {
+                tracing::info!(
+                    rationale = %safe_truncate(rationale, 240),
+                    "Direct conversation responder requested agent loop fallback"
+                );
+            }
+            return Ok(DirectConversationResponse::Declined {
+                kind: parsed.decline_kind,
+                rationale: parsed.rationale,
+            });
+        }
+        let parsed_answer = parsed.answer.trim();
+        if !parsed_answer.is_empty() {
+            return Ok(DirectConversationResponse::Answer(
+                parsed_answer.to_string(),
+            ));
+        }
+        tracing::warn!(
+            "Direct conversation responder returned an empty structured answer; falling back to agent loop"
+        );
+        Ok(DirectConversationResponse::Declined {
+            kind: Some(DirectConversationDeclineKind::Unknown),
+            rationale: Some("empty structured answer".to_string()),
+        })
+    }
+
+    async fn respond_if_abuse_tracker_suppressed(
+        &self,
+        channel: &str,
+        stored_user_message: &str,
+        conversation_key: &str,
+        is_new_conversation: bool,
+        project_id: Option<&str>,
+        user_message_already_recorded: bool,
+    ) -> Result<Option<ProcessedMessage>> {
+        let abuse_source = crate::security::abuse_tracker::SourceKey {
+            channel_id: channel.to_string(),
+            user_identity: None,
+        };
+        let abuse_tracker = crate::security::abuse_tracker::AbuseTracker::new(
+            self.storage.db(),
+            self.config.security.abuse_tracker.clone(),
+        );
+        match abuse_tracker.current_status(&abuse_source).await {
+            Ok(status) if status.should_suppress_responses() => {
+                let reply = match status {
+                    crate::security::abuse_tracker::TrackerStatus::PendingApproval => {
+                        "This channel is paused pending an operator review. Please wait - your administrator will decide whether to resume or pause further messages."
+                    }
+                    crate::security::abuse_tracker::TrackerStatus::Paused => {
+                        "This channel has been paused by an operator. Please contact your administrator."
+                    }
+                    crate::security::abuse_tracker::TrackerStatus::Normal => unreachable!(),
+                };
+                let processed = self
+                    .persist_immediate_exchange(
+                        stored_user_message,
+                        reply,
+                        ImmediateExchangeContext {
+                            channel,
+                            conversation_key,
+                            is_new_conversation,
+                            project_id,
+                            model_used: "security_guard",
+                            user_message_already_recorded,
+                            memory_capture_allowed: false,
+                            memory_capture_source: None,
+                        },
+                    )
+                    .await?;
+                Ok(Some(processed))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "security.abuse",
+                    channel = %channel,
+                    error = %error,
+                    "abuse_tracker status lookup failed; continuing with inbound guard"
+                );
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Process an incoming message and generate a response
@@ -566,21 +1325,15 @@ impl Agent {
         message: &str,
         channel: &str,
         conversation_id: Option<&str>,
-        project_id: Option<&str>,
+        _project_id: Option<&str>,
         mut request_hints: RequestExecutionHints,
         user_message_already_recorded: bool,
         skip_inbound_security_precheck: bool,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<ProcessedMessage> {
+        let project_id: Option<&str> = None;
         let _active_request = self.track_active_message_request();
         *self.last_activity.write().await = Some(chrono::Utc::now());
-
-        let early_safe_message = crate::security::redact_secret_input(message).text;
-        let (resolved_conversation_id, is_new_conversation) = self
-            .resolve_conversation_id(channel, conversation_id, project_id, &early_safe_message)
-            .await?;
-        let conversation_key = resolved_conversation_id.clone();
-        self.maybe_consolidate_idle_background_sessions().await;
 
         let secret_redaction = crate::security::redact_secret_input(message);
         if secret_redaction.had_secret() {
@@ -590,10 +1343,60 @@ impl Agent {
                 secret_redaction.redactions.len()
             );
         }
-        let message_storage = secret_redaction.text.clone();
+        let message_storage = redact_chat_message_for_storage(&secret_redaction.text);
+        let contact_info_memory_candidate =
+            !secret_redaction.had_secret() && has_contact_info_for_memory_capture(&message_storage);
+        let early_safe_message = message_storage.clone();
+        let (resolved_conversation_id, is_new_conversation) = self
+            .resolve_conversation_id(channel, conversation_id, project_id, &early_safe_message)
+            .await?;
+        let conversation_key = resolved_conversation_id.clone();
 
         let mut memory_capture_allowed = false;
+        let mut memory_capture_allowed_from_semantic_probe = false;
+        let mut inbound_routing_trusted = false;
+        let mut inbound_direct_response: Option<String> = None;
         if !skip_inbound_security_precheck {
+            if secret_redaction.had_secret() {
+                if let Some(processed) = self
+                    .respond_if_abuse_tracker_suppressed(
+                        channel,
+                        &message_storage,
+                        &conversation_key,
+                        is_new_conversation,
+                        project_id,
+                        user_message_already_recorded,
+                    )
+                    .await?
+                {
+                    return Ok(processed);
+                }
+                let pending_chat_credential_prompt =
+                    self.pending_chat_credential_prompt(&conversation_key).await;
+                let safe_reply = if pending_chat_credential_prompt.is_some() {
+                    "I redacted the secret from this chat message. Submit credentials through the secure credential form instead; I can't use, test, or save secrets pasted into normal chat."
+                } else {
+                    "I redacted the secret from this chat message. I can't use, test, or save secrets pasted into normal chat. Add credentials through the secure Settings or integration credential flow, then tell me what you want to do."
+                };
+                let processed = self
+                    .persist_immediate_exchange(
+                        &message_storage,
+                        safe_reply,
+                        ImmediateExchangeContext {
+                            channel,
+                            conversation_key: &conversation_key,
+                            is_new_conversation,
+                            project_id,
+                            model_used: "secret_input_guard",
+                            user_message_already_recorded,
+                            memory_capture_allowed: false,
+                            memory_capture_source: None,
+                        },
+                    )
+                    .await?;
+                return Ok(processed);
+            }
+
             if let Some(tx) = stream_tx.as_ref() {
                 queue_stream_event(
                     tx,
@@ -609,6 +1412,7 @@ impl Agent {
                     is_new_conversation,
                     project_id,
                     user_message_already_recorded,
+                    stream_tx.as_ref(),
                 )
                 .await?
             {
@@ -616,8 +1420,13 @@ impl Agent {
                 InboundSecurityPrecheck::Continue {
                     memory_capture_allowed: should_capture,
                     routing,
+                    routing_trusted,
+                    direct_response,
                 } => {
                     memory_capture_allowed = should_capture;
+                    inbound_routing_trusted = routing_trusted;
+                    inbound_direct_response = direct_response;
+                    request_hints.routing_trusted = routing_trusted;
                     if let Some(routing) = routing {
                         request_hints.routing = Some(routing);
                     }
@@ -636,6 +1445,7 @@ impl Agent {
             {
                 crate::security::SecretInputType::PrivateKeyMaterial => "private_key_material",
                 crate::security::SecretInputType::ApiKeyOrToken => "api_key_or_token",
+                crate::security::SecretInputType::PaymentCredential => "payment_credential",
             };
             request_hints.secret_offered = Some(SecretOfferedHint {
                 kind: kind.to_string(),
@@ -643,9 +1453,342 @@ impl Agent {
                 secure_prompt_pending,
             });
         }
+        if contact_info_memory_candidate {
+            memory_capture_allowed = true;
+        }
 
         let turn_started_at = chrono::Utc::now();
         let usage_before_turn = self.turn_pipeline_usage_snapshot().await;
+        let direct_candidate_state = DirectConversationRuntimeState {
+            routing_trusted: inbound_routing_trusted,
+            has_attachments: !request_hints.attachments.is_empty(),
+            has_secret_offered: request_hints.secret_offered.is_some(),
+            has_pending_actions: false,
+            has_pending_credential_prompt: false,
+            user_message_already_recorded,
+            skip_inbound_security_precheck,
+            supported_surface: matches!(
+                request_hints.execution_surface,
+                ActionExecutionSurface::Chat | ActionExecutionSurface::Api
+            ),
+        };
+        let new_empty_conversation = is_new_conversation && !user_message_already_recorded;
+        let direct_candidate_path = turn_execution_path_from_routing(
+            request_hints.routing.as_ref(),
+            direct_candidate_state,
+        );
+        let direct_memory_ack_signal = memory_capture_allowed;
+        if !memory_capture_allowed
+            && !secret_redaction.had_secret()
+            && !routing_is_transient_read_only_lookup(request_hints.routing.as_ref())
+            && should_enqueue_semantic_user_memory_capture(
+                message_storage.as_str(),
+                direct_candidate_state,
+                direct_candidate_path,
+            )
+        {
+            memory_capture_allowed = true;
+            memory_capture_allowed_from_semantic_probe = true;
+        }
+        let raw_memory_capture_source = if memory_capture_allowed && !secret_redaction.had_secret()
+        {
+            Some(message_storage.as_str())
+        } else {
+            None
+        };
+        let direct_reply_read_only_yield_check_needed = request_hints
+            .routing
+            .as_ref()
+            .map(super::action_selection::routing_signal_has_read_only_retrieval_need)
+            .unwrap_or(false)
+            || !direct_candidate_state.routing_trusted;
+        if direct_candidate_path == TurnExecutionPath::DirectReply
+            && direct_reply_read_only_yield_check_needed
+            && self
+                .direct_reply_should_yield_to_read_only_action(
+                    message_storage.as_str(),
+                    &request_hints,
+                )
+                .await
+        {
+            request_hints.force_agent_loop = true;
+        }
+
+        let direct_memory_candidate_available = should_acknowledge_direct_memory_capture(
+            request_hints.routing.as_ref(),
+            direct_candidate_state,
+            direct_memory_ack_signal,
+        );
+
+        if !request_hints.force_agent_loop
+            && (direct_candidate_path == TurnExecutionPath::DirectReply
+                || direct_memory_candidate_available)
+        {
+            let mut direct_conversation_declined = false;
+            let mut direct_conversation_decline_kind = None;
+            let mut direct_conversation_decline_rationale: Option<String> = None;
+            let pending_actions = if new_empty_conversation {
+                Vec::new()
+            } else {
+                self.pending_conversation_actions(&conversation_key).await
+            };
+            let pending_credential_prompt = if new_empty_conversation {
+                false
+            } else {
+                self.pending_chat_credential_prompt(&conversation_key)
+                    .await
+                    .is_some()
+            };
+            let direct_state = DirectConversationRuntimeState {
+                has_pending_actions: !pending_actions.is_empty(),
+                has_pending_credential_prompt: pending_credential_prompt,
+                ..direct_candidate_state
+            };
+            let direct_reply_available =
+                turn_execution_path_from_routing(request_hints.routing.as_ref(), direct_state)
+                    == TurnExecutionPath::DirectReply;
+            let direct_memory_ack_available = should_acknowledge_direct_memory_capture(
+                request_hints.routing.as_ref(),
+                direct_state,
+                direct_memory_ack_signal,
+            );
+            if direct_reply_available || direct_memory_ack_available {
+                if direct_memory_ack_available {
+                    let usage_delta = self
+                        .turn_pipeline_usage_snapshot()
+                        .await
+                        .delta_since(usage_before_turn);
+                    return self
+                        .persist_turn_pipeline_exchange(
+                            message_storage.as_str(),
+                            "Got it. I'll remember that.",
+                            ImmediateExchangeContext {
+                                channel,
+                                conversation_key: &conversation_key,
+                                is_new_conversation,
+                                project_id,
+                                model_used: DIRECT_MEMORY_MODEL_USED,
+                                user_message_already_recorded,
+                                memory_capture_allowed,
+                                memory_capture_source: raw_memory_capture_source,
+                            },
+                            crate::core::ExecutionRunStatus::Completed.as_str(),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            turn_started_at,
+                            usage_delta,
+                        )
+                        .await;
+                }
+                if let Some(response) = self
+                    .run_direct_memory_response(
+                        request_hints.routing.as_ref(),
+                        &conversation_key,
+                        project_id,
+                    )
+                    .await
+                {
+                    let usage_delta = self
+                        .turn_pipeline_usage_snapshot()
+                        .await
+                        .delta_since(usage_before_turn);
+                    return self
+                        .persist_turn_pipeline_exchange(
+                            message_storage.as_str(),
+                            &response,
+                            ImmediateExchangeContext {
+                                channel,
+                                conversation_key: &conversation_key,
+                                is_new_conversation,
+                                project_id,
+                                model_used: DIRECT_MEMORY_MODEL_USED,
+                                user_message_already_recorded,
+                                memory_capture_allowed,
+                                memory_capture_source: raw_memory_capture_source,
+                            },
+                            crate::core::ExecutionRunStatus::Completed.as_str(),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            turn_started_at,
+                            usage_delta,
+                        )
+                        .await;
+                }
+                let direct_local_response = match request_hints.routing.as_ref() {
+                    Some(routing) => {
+                        self.run_direct_local_conversation_response(
+                            routing,
+                            message_storage.as_str(),
+                            &conversation_key,
+                        )
+                        .await
+                    }
+                    None => None,
+                };
+                if let Some(response) = direct_local_response {
+                    let usage_delta = self
+                        .turn_pipeline_usage_snapshot()
+                        .await
+                        .delta_since(usage_before_turn);
+                    return self
+                        .persist_turn_pipeline_exchange(
+                            message_storage.as_str(),
+                            &response,
+                            ImmediateExchangeContext {
+                                channel,
+                                conversation_key: &conversation_key,
+                                is_new_conversation,
+                                project_id,
+                                model_used: DIRECT_CONTEXT_MODEL_USED,
+                                user_message_already_recorded,
+                                memory_capture_allowed,
+                                memory_capture_source: raw_memory_capture_source,
+                            },
+                            crate::core::ExecutionRunStatus::Completed.as_str(),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            turn_started_at,
+                            usage_delta,
+                        )
+                        .await;
+                }
+                if let Some(response) = inbound_direct_response
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let usage_delta = self
+                        .turn_pipeline_usage_snapshot()
+                        .await
+                        .delta_since(usage_before_turn);
+                    return self
+                        .persist_turn_pipeline_exchange(
+                            message_storage.as_str(),
+                            response,
+                            ImmediateExchangeContext {
+                                channel,
+                                conversation_key: &conversation_key,
+                                is_new_conversation,
+                                project_id,
+                                model_used: "inbound_classifier_direct",
+                                user_message_already_recorded,
+                                memory_capture_allowed,
+                                memory_capture_source: raw_memory_capture_source,
+                            },
+                            crate::core::ExecutionRunStatus::Completed.as_str(),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            turn_started_at,
+                            usage_delta,
+                        )
+                        .await;
+                }
+                if let Some(tx) = stream_tx.as_ref() {
+                    queue_stream_event(
+                        tx,
+                        StreamEvent::Thinking("Answering directly...".to_string()),
+                    );
+                }
+                match self
+                    .run_direct_conversation_response(
+                        channel,
+                        message_storage.as_str(),
+                        &conversation_key,
+                        project_id,
+                        new_empty_conversation,
+                    )
+                    .await
+                {
+                    Ok(DirectConversationResponse::Answer(response)) => {
+                        let usage_delta = self
+                            .turn_pipeline_usage_snapshot()
+                            .await
+                            .delta_since(usage_before_turn);
+                        return self
+                            .persist_turn_pipeline_exchange(
+                                message_storage.as_str(),
+                                &response,
+                                ImmediateExchangeContext {
+                                    channel,
+                                    conversation_key: &conversation_key,
+                                    is_new_conversation,
+                                    project_id,
+                                    model_used: DIRECT_CONVERSATION_MODEL_USED,
+                                    user_message_already_recorded,
+                                    memory_capture_allowed,
+                                    memory_capture_source: raw_memory_capture_source,
+                                },
+                                crate::core::ExecutionRunStatus::Completed.as_str(),
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                turn_started_at,
+                                usage_delta,
+                            )
+                            .await;
+                    }
+                    Ok(DirectConversationResponse::Declined { kind, rationale }) => {
+                        direct_conversation_decline_kind = kind;
+                        direct_conversation_decline_rationale = rationale.clone();
+                        if let Some(rationale) = rationale.as_deref() {
+                            tracing::info!(
+                                decline_kind = ?kind,
+                                rationale = %safe_truncate(rationale, 240),
+                                "Direct conversation path declined by semantic responder; falling back to agent loop"
+                            );
+                        } else {
+                            tracing::info!(
+                                decline_kind = ?kind,
+                                "Direct conversation path declined by semantic responder; falling back to agent loop"
+                            );
+                        }
+                        direct_conversation_declined = true;
+                    }
+                    Err(outcome) => {
+                        direct_conversation_declined = true;
+                        tracing::warn!(
+                            reason = %safe_truncate(&outcome.message, 240),
+                            "Direct conversation path failed; falling back to agent loop"
+                        );
+                    }
+                }
+            }
+            if direct_conversation_declined {
+                request_hints.force_agent_loop = true;
+                if neutralize_direct_reply_routing_after_direct_decline(
+                    request_hints.routing.as_mut(),
+                    direct_state,
+                    direct_conversation_decline_kind,
+                    message_storage.as_str(),
+                    direct_conversation_decline_rationale.as_deref(),
+                ) {
+                    tracing::info!(
+                        "Direct conversation decline invalidated direct-reply routing; enabling execution planning"
+                    );
+                }
+                if memory_capture_allowed_from_semantic_probe
+                    && routing_is_transient_read_only_lookup(request_hints.routing.as_ref())
+                {
+                    memory_capture_allowed = false;
+                }
+            }
+        }
+
+        if is_new_conversation && !conversation_key.is_empty() {
+            self.ensure_conversation_row_for_turn(
+                &conversation_key,
+                channel,
+                project_id,
+                message_storage.as_str(),
+                None,
+            )
+            .await?;
+        }
+
         match self
             .run_agent_turn_loop_for_chat(
                 channel,
@@ -662,6 +1805,30 @@ impl Agent {
                     .turn_pipeline_usage_snapshot()
                     .await
                     .delta_since(usage_before_turn);
+                let attachment_memory_source = attachment_only_visual_memory_capture_source(
+                    message_storage.as_str(),
+                    &processed.response,
+                    &request_hints,
+                );
+                let durable_work_memory_source = memory_capture_source_with_completed_work_context(
+                    message_storage.as_str(),
+                    &processed.response,
+                    &processed.turn_records,
+                    processed.turn_plan.as_ref(),
+                );
+                let run_allows_memory_capture = processed
+                    .run_status
+                    .as_deref()
+                    .map(|status| matches!(status, "completed" | "completed_degraded"))
+                    .unwrap_or(true);
+                let memory_capture_source = if run_allows_memory_capture {
+                    attachment_memory_source
+                        .as_deref()
+                        .or(durable_work_memory_source.as_deref())
+                        .or(raw_memory_capture_source)
+                } else {
+                    None
+                };
                 self.persist_turn_pipeline_exchange(
                     message_storage.as_str(),
                     &processed.response,
@@ -672,7 +1839,9 @@ impl Agent {
                         project_id,
                         model_used: "agent_turn_loop",
                         user_message_already_recorded,
-                        memory_capture_allowed,
+                        memory_capture_allowed: run_allows_memory_capture
+                            && (memory_capture_allowed || attachment_memory_source.is_some()),
+                        memory_capture_source,
                     },
                     processed.run_status.as_deref().unwrap_or("completed"),
                     processed.trace_steps.clone(),
@@ -706,7 +1875,8 @@ impl Agent {
                         project_id,
                         model_used: "agent_turn_loop_failed",
                         user_message_already_recorded,
-                        memory_capture_allowed,
+                        memory_capture_allowed: false,
+                        memory_capture_source: None,
                     },
                     crate::core::ExecutionRunStatus::PlatformFailed.as_str(),
                     Vec::new(),
@@ -728,6 +1898,275 @@ impl Agent {
             total_tokens: trace.total_tokens,
             cost_usd: trace.cost_usd,
         }
+    }
+
+    async fn ensure_conversation_row_for_turn(
+        &self,
+        conversation_id: &str,
+        channel: &str,
+        project_id: Option<&str>,
+        message_preview: &str,
+        conversation_title: Option<&str>,
+    ) -> Result<()> {
+        let conversation_id = conversation_id.trim();
+        if conversation_id.is_empty() {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let title = conversation_title
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| safe_truncate(value, 80))
+            .unwrap_or_else(|| safe_truncate(message_preview, 50));
+        let conv = crate::storage::entities::conversation::Model {
+            id: conversation_id.to_string(),
+            title,
+            channel: channel.to_string(),
+            project_id: project_id.map(str::to_string),
+            created_at: now.clone(),
+            updated_at: now,
+            message_count: 0,
+            archived: false,
+            starred: false,
+        };
+        self.storage.create_conversation_if_absent(&conv).await?;
+        Ok(())
+    }
+
+    async fn remember_completed_trace_snapshot(
+        &self,
+        trace_snapshot: ExecutionTrace,
+        update_last_trace: bool,
+    ) {
+        if trace_snapshot.id.trim().is_empty() {
+            return;
+        }
+
+        {
+            let mut history = self.trace_history.write().await;
+            history.retain(|item| item.id != trace_snapshot.id);
+            history.insert(0, trace_snapshot.clone());
+            if history.len() > 100 {
+                history.truncate(100);
+            }
+        }
+
+        if update_last_trace {
+            *self.last_trace.write().await = trace_snapshot;
+        }
+    }
+
+    fn spawn_deferred_exchange_persistence(&self, job: DeferredExchangePersistence) {
+        let agent = self.clone();
+        let trace_id = job.trace_snapshot.id.clone();
+        let pending = DEFERRED_CHAT_PERSISTENCE_PENDING
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if pending >= DEFERRED_CHAT_PERSISTENCE_WARN_PENDING {
+            tracing::warn!(
+                pending,
+                "Deferred chat persistence backlog is high; responses are still unblocked"
+            );
+        }
+
+        tokio::spawn(async move {
+            let semaphore = DEFERRED_CHAT_PERSISTENCE_SEMAPHORE.clone();
+            let _permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    DEFERRED_CHAT_PERSISTENCE_PENDING
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        trace_id,
+                        "Deferred chat persistence limiter closed before persistence could run"
+                    );
+                    return;
+                }
+            };
+
+            let mut last_error: Option<String> = None;
+            let mut persisted = false;
+            for attempt in 1..=DEFERRED_CHAT_PERSISTENCE_ATTEMPTS {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(DEFERRED_CHAT_PERSISTENCE_ATTEMPT_TIMEOUT_SECS),
+                    agent.persist_deferred_exchange_once(job.clone()),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        persisted = true;
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        last_error = Some(error.to_string());
+                    }
+                    Err(_) => {
+                        last_error = Some(format!(
+                            "attempt timed out after {} seconds",
+                            DEFERRED_CHAT_PERSISTENCE_ATTEMPT_TIMEOUT_SECS
+                        ));
+                    }
+                }
+
+                if attempt < DEFERRED_CHAT_PERSISTENCE_ATTEMPTS {
+                    let delay_secs = match attempt {
+                        1 => 1,
+                        2 => 3,
+                        _ => 8,
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
+            }
+
+            if !persisted {
+                tracing::error!(
+                    trace_id,
+                    error = last_error.as_deref().unwrap_or("unknown"),
+                    "Deferred chat persistence failed after retries"
+                );
+            }
+            DEFERRED_CHAT_PERSISTENCE_PENDING
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    async fn persist_deferred_exchange_once(&self, job: DeferredExchangePersistence) -> Result<()> {
+        let trace_id = job.trace_snapshot.id.clone();
+        self.persist_completed_trace_snapshot_durable(&job.trace_snapshot)
+            .await?;
+
+        if job.kind == DeferredExchangePersistenceKind::Immediate {
+            let started_payload = serde_json::json!({
+                "flow_kind": "immediate",
+                "message_chars": job.message.chars().count(),
+                "resumed": job.user_message_already_recorded,
+            });
+            self.log_operational_event(operational::OperationalEvent {
+                event_type: "agent_request",
+                channel: &job.channel,
+                success: true,
+                outcome: "started",
+                trace_id: Some(&trace_id),
+                conversation_id: Some(&job.conversation_key),
+                tool_name: None,
+                latency_ms: Some(0),
+                arguments: None,
+                payload: Some(&started_payload),
+                strategy_version: None,
+                policy_version: None,
+                prompt_version: None,
+                specialist_prompt_version: None,
+                model_slot: Some(&job.model_used),
+            })
+            .await;
+
+            let completed_payload = serde_json::json!({
+                "response_chars": job.response.chars().count(),
+                "tool_calls": 0,
+                "degradation_notes": 0,
+                "status": "completed",
+            });
+            self.log_operational_event(operational::OperationalEvent {
+                event_type: "response_complete",
+                channel: &job.channel,
+                success: true,
+                outcome: "completed",
+                trace_id: Some(&trace_id),
+                conversation_id: Some(&job.conversation_key),
+                tool_name: None,
+                latency_ms: Some(0),
+                arguments: None,
+                payload: Some(&completed_payload),
+                strategy_version: None,
+                policy_version: None,
+                prompt_version: None,
+                specialist_prompt_version: None,
+                model_slot: Some(&job.model_used),
+            })
+            .await;
+        }
+
+        if !job.conversation_key.is_empty() {
+            if job.is_new_conversation {
+                self.ensure_conversation_row_for_turn(
+                    &job.conversation_key,
+                    &job.channel,
+                    job.project_id.as_deref(),
+                    &job.message,
+                    job.conversation_title.as_deref(),
+                )
+                .await?;
+            }
+            if !job.user_message_already_recorded {
+                let user_msg = crate::storage::entities::message::Model {
+                    id: job.user_message_id.clone(),
+                    conversation_id: job.conversation_key.clone(),
+                    role: "user".to_string(),
+                    content: job.message.clone(),
+                    timestamp: job.user_timestamp.clone(),
+                    model_used: None,
+                    trace_id: Some(trace_id.clone()),
+                };
+                self.encrypted_storage
+                    .insert_message_encrypted_if_absent(&user_msg)
+                    .await?;
+                if job.memory_capture_allowed {
+                    let memory_source = job
+                        .memory_capture_source
+                        .as_deref()
+                        .unwrap_or(job.message.as_str());
+                    self.mark_user_memory_capture_candidate(
+                        memory_source,
+                        &job.channel,
+                        Some(&job.conversation_key),
+                        job.project_id.as_deref(),
+                        Some(&user_msg.id),
+                    )
+                    .await;
+                }
+            }
+
+            let asst_msg = crate::storage::entities::message::Model {
+                id: job.assistant_message_id.clone(),
+                conversation_id: job.conversation_key.clone(),
+                role: "assistant".to_string(),
+                content: job.response.clone(),
+                timestamp: job.assistant_timestamp.clone(),
+                model_used: Some(job.model_used.clone()),
+                trace_id: Some(trace_id.clone()),
+            };
+            self.encrypted_storage
+                .insert_message_encrypted_if_absent(&asst_msg)
+                .await?;
+
+            if job.is_new_conversation {
+                if let Some(title) = job.conversation_title.as_deref() {
+                    self.storage
+                        .update_conversation(&job.conversation_key, Some(title), None, None)
+                        .await?;
+                }
+            }
+
+            self.sync_background_session_after_response(
+                &job.conversation_key,
+                &job.message,
+                &job.response,
+            )
+            .await;
+            self.sync_pending_resilience_followup(
+                &job.conversation_key,
+                &job.message,
+                &job.channel,
+                job.project_id.as_deref(),
+                &job.user_outcome,
+            )
+            .await;
+        }
+
+        self.record_completed_interaction_for_self_tune().await;
+        Ok(())
     }
 
     async fn persist_turn_pipeline_exchange(
@@ -754,12 +2193,36 @@ impl Agent {
             );
         }
         let safe_response = filtered_response.text;
+        let is_direct_memory = context.model_used == DIRECT_MEMORY_MODEL_USED;
+        let is_direct_conversation = context.model_used == DIRECT_CONVERSATION_MODEL_USED;
+        let flow_label = if is_direct_memory {
+            "Direct memory"
+        } else if is_direct_conversation {
+            "Direct conversation"
+        } else {
+            "Agent turn loop"
+        };
+        let complexity = if is_direct_memory {
+            "direct_memory"
+        } else if is_direct_conversation {
+            "direct_conversation"
+        } else {
+            "agent_turn_loop"
+        };
+        let first_content_source = if is_direct_memory {
+            "direct_memory_first_content"
+        } else if is_direct_conversation {
+            "direct_conversation_first_content"
+        } else {
+            "agent_turn_loop_first_content"
+        };
         let mut steps = Vec::with_capacity(trace_steps.len() + 3);
         steps.push(ExecutionStep {
             icon: "[turn]".to_string(),
             title: "Turn Request".to_string(),
             detail: format!(
-                "Agent turn loop | Channel: {} | Length: {} chars",
+                "{} | Channel: {} | Length: {} chars",
+                flow_label,
                 context.channel,
                 message.chars().count()
             ),
@@ -781,7 +2244,7 @@ impl Agent {
                 serde_json::json!({
                     "metric": "time_to_first_token",
                     "duration_ms": first_content_ms,
-                    "source": "agent_turn_loop_first_content"
+                    "source": first_content_source
                 })
                 .to_string(),
             ),
@@ -815,11 +2278,12 @@ impl Agent {
             output_tokens: usage_delta.output_tokens,
             total_tokens: usage_delta.total_tokens,
             cost_usd: usage_delta.cost_usd,
-            complexity: Some("agent_turn_loop".to_string()),
+            complexity: Some(complexity.to_string()),
             plan: turn_plan.clone(),
         }));
-        self.seed_execution_trace_snapshot(&trace_ref).await;
-        self.persist_completed_trace(&trace_ref).await;
+        let trace_snapshot = trace_ref.read().await.clone();
+        self.remember_completed_trace_snapshot(trace_snapshot.clone(), true)
+            .await;
 
         {
             let mut history = self.conversation_history.write().await;
@@ -845,58 +2309,8 @@ impl Agent {
 
         let mut conversation_title: Option<String> = None;
         if !context.conversation_key.is_empty() {
-            if !context.user_message_already_recorded {
-                let now = chrono::Utc::now().to_rfc3339();
-                let user_msg = crate::storage::entities::message::Model {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    conversation_id: context.conversation_key.to_string(),
-                    role: "user".to_string(),
-                    content: message.to_string(),
-                    timestamp: now.clone(),
-                    model_used: None,
-                    trace_id: Some(trace_id.clone()),
-                };
-                if let Err(error) = self
-                    .encrypted_storage
-                    .insert_message_encrypted(&user_msg)
-                    .await
-                {
-                    tracing::warn!("Failed to persist turn-path user message: {}", error);
-                }
-                if context.memory_capture_allowed {
-                    self.spawn_user_memory_capture(
-                        message,
-                        context.channel,
-                        Some(context.conversation_key),
-                        context.project_id,
-                        Some(&user_msg.id),
-                    );
-                }
-            }
-
-            let asst_msg = crate::storage::entities::message::Model {
-                id: uuid::Uuid::new_v4().to_string(),
-                conversation_id: context.conversation_key.to_string(),
-                role: "assistant".to_string(),
-                content: safe_response.clone(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                model_used: Some(context.model_used.to_string()),
-                trace_id: Some(trace_id.clone()),
-            };
-            if let Err(error) = self
-                .encrypted_storage
-                .insert_message_encrypted(&asst_msg)
-                .await
-            {
-                tracing::warn!("Failed to persist turn-path assistant message: {}", error);
-            }
-
             if context.is_new_conversation {
                 let title = self.generate_conversation_title(message);
-                let _ = self
-                    .storage
-                    .update_conversation(context.conversation_key, Some(&title), Some(2), None)
-                    .await;
                 *self.last_conversation_title.write().await = Some(title.clone());
                 conversation_title = Some(title);
             } else {
@@ -905,14 +2319,6 @@ impl Agent {
         }
 
         *self.last_conversation_id.write().await = Some(context.conversation_key.to_string());
-        if !context.conversation_key.is_empty() {
-            self.sync_background_session_after_response(
-                context.conversation_key,
-                message,
-                &safe_response,
-            )
-            .await;
-        }
 
         let user_outcome = self
             .build_response_heuristic_outcome(&safe_response, &[], &[], None)
@@ -920,16 +2326,6 @@ impl Agent {
                 self.execution_supervisor
                     .build_success_outcome(&safe_response, &[], &[])
             });
-        if !context.conversation_key.is_empty() {
-            self.sync_pending_resilience_followup(
-                context.conversation_key,
-                message,
-                context.channel,
-                context.project_id,
-                &user_outcome,
-            )
-            .await;
-        }
         let final_run_status = if run_status.trim().is_empty() {
             Self::execution_run_status_for_outcome(&user_outcome)
                 .as_str()
@@ -937,22 +2333,25 @@ impl Agent {
         } else {
             run_status.trim().to_string()
         };
-        self.spawn_arkevolve_turn_recording(ArkEvolveTurnRecordInput {
-            run_id: run_id.clone(),
-            trace_id: trace_id.clone(),
+        self.spawn_deferred_exchange_persistence(DeferredExchangePersistence {
+            kind: DeferredExchangePersistenceKind::TurnPipeline,
+            trace_snapshot,
             message: message.to_string(),
             response: safe_response.clone(),
             channel: context.channel.to_string(),
-            conversation_id: (!context.conversation_key.trim().is_empty())
-                .then(|| context.conversation_key.to_string()),
+            conversation_key: context.conversation_key.to_string(),
             project_id: context.project_id.map(str::to_string),
             model_used: context.model_used.to_string(),
-            run_status: final_run_status.clone(),
+            user_message_already_recorded: context.user_message_already_recorded,
+            memory_capture_allowed: context.memory_capture_allowed,
+            memory_capture_source: context.memory_capture_source.map(str::to_string),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            assistant_message_id: uuid::Uuid::new_v4().to_string(),
+            user_timestamp: chrono::Utc::now().to_rfc3339(),
+            assistant_timestamp: chrono::Utc::now().to_rfc3339(),
+            is_new_conversation: context.is_new_conversation,
+            conversation_title: conversation_title.clone(),
             user_outcome: user_outcome.clone(),
-            degradation: user_outcome.degradation.clone(),
-            attempted_models: user_outcome.attempted_models.clone(),
-            turn_records: turn_records.clone(),
-            turn_plan: turn_plan.clone(),
         });
 
         Ok(ProcessedMessage {
@@ -1174,6 +2573,41 @@ impl Agent {
         .await
     }
 
+    /// Build a structured surface-context JSON for the inbound classifier.
+    ///
+    /// We intentionally describe the surface in capability terms — what the
+    /// user can do here — not in any user-facing language. The classifier
+    /// reasons from the structural shape (which capability clusters are
+    /// available) rather than from any phrase. Returns `None` when the
+    /// channel does not correspond to a known structural surface, so the
+    /// general inbound prompt is unchanged for ordinary chat traffic.
+    pub(super) async fn build_inbound_surface_context(
+        &self,
+        channel: &str,
+    ) -> Option<serde_json::Value> {
+        if channel != "arkorbit" {
+            return None;
+        }
+        let user_id = self.identity.did().to_string();
+        let orbit_count = self
+            .arkorbit
+            .list_orbits(&user_id)
+            .await
+            .map(|orbits| orbits.len())
+            .unwrap_or(0);
+        Some(serde_json::json!({
+            "surface": "arkorbit_canvas",
+            "orbit_count": orbit_count,
+            "scope_policy": "an orbit must be explicitly selected or created before durable orbit file authoring",
+            "orbit_file_namespace": ["index.html", "orbit.json", "mod/", "data/", "assets/"],
+            "security_model": "Orbit browser code runs in a sandboxed iframe. Do not place credentials or session material in orbit files; authenticated retrieval must happen through authorized server-side tools before writing safe display data.",
+            "available_capability_clusters": [
+                "arkorbit_file_authoring",
+            ],
+            "description": "User is on a per-user orbit canvas where the agent can create durable HTML, JavaScript, CSS, data, and asset files rendered in a sandboxed iframe."
+        }))
+    }
+
     pub(super) async fn run_inbound_security_precheck(
         &self,
         classification_message: &str,
@@ -1183,6 +2617,7 @@ impl Agent {
         is_new_conversation: bool,
         project_id: Option<&str>,
         user_message_already_recorded: bool,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Result<InboundSecurityPrecheck> {
         // Abuse-tracker short-circuit: if this source is currently in
         // pending-approval or paused status from prior guard trips, decline
@@ -1218,6 +2653,7 @@ impl Agent {
                             model_used: "security_guard",
                             user_message_already_recorded,
                             memory_capture_allowed: false,
+                            memory_capture_source: None,
                         },
                     )
                     .await?;
@@ -1237,6 +2673,168 @@ impl Agent {
         // Intent-based inbound guard. The classifier sees the already-redacted
         // storage form, then normalization removes unicode obfuscation controls.
         let normalized_for_guard = crate::security::normalize_for_analysis(classification_message);
+        let new_empty_conversation = is_new_conversation && !user_message_already_recorded;
+        let recent_artifacts = if new_empty_conversation {
+            Vec::new()
+        } else {
+            Self::conversation_artifacts_for_prompt(
+                &self.load_recent_artifact_contexts(conversation_key).await,
+                INBOUND_CLASSIFIER_RECENT_ARTIFACTS,
+            )
+        };
+        let recent_artifacts_context = (!recent_artifacts.is_empty())
+            .then(|| serde_json::Value::Array(recent_artifacts.clone()));
+        let mut recent_messages_context = if new_empty_conversation {
+            Vec::new()
+        } else {
+            self.recent_messages_for_intent_gating(conversation_key, stored_user_message)
+                .await
+                .into_iter()
+                .rev()
+                .take(4)
+                .map(|message| {
+                    serde_json::json!({
+                        "role": message.role,
+                        "content": safe_truncate(
+                            &crate::security::redact_secret_input(&message.content).text,
+                            360,
+                        ),
+                        "timestamp": message._timestamp,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        recent_messages_context.reverse();
+        let recent_messages_context_value = (!recent_messages_context.is_empty())
+            .then(|| serde_json::Value::Array(recent_messages_context.clone()));
+        let embedding_context = (!recent_messages_context.is_empty()
+            || recent_artifacts_context.is_some())
+        .then(|| {
+            serde_json::json!({
+                "recent_messages": recent_messages_context_value.clone(),
+                "recent_actionable_artifacts": recent_artifacts_context,
+            })
+            .to_string()
+        });
+        if let Some(embedder) = self.embedding_client.as_deref() {
+            match crate::security::embedding_classifier::classify_inbound_embedding_fast(
+                embedder,
+                &normalized_for_guard,
+                embedding_context.as_deref(),
+                Some(self.data_dir.as_path()),
+            )
+            .await
+            {
+                Ok(Some(fast)) => {
+                    tracing::info!(
+                        target: "security.inbound",
+                        category = ?fast.category,
+                        concept = %fast.concept,
+                        score = fast.score,
+                        margin = fast.margin,
+                        "inbound embedding classifier accepted high-confidence fast path"
+                    );
+                    match &fast.decision.verdict {
+                        crate::security::intent_classifier::IntentVerdict::Block {
+                            message: safe_reply,
+                            rule_id,
+                            severity,
+                        } => {
+                            self.security_events.record_injection_attempt();
+                            tracing::warn!(
+                                target: "security.inbound",
+                                rule_id = %rule_id,
+                                severity = severity,
+                                channel = %channel,
+                                "inbound embedding classifier blocked message"
+                            );
+                            let source_label = inbound_security_source_label(channel);
+                            let alert_msg = format!(
+                                "Security guard blocked a message from {} (rule {}).",
+                                &source_label, rule_id
+                            );
+                            self.emit_notification("Security Alert", &alert_msg, "error", "security")
+                                .await;
+                            self.notify_preferred_channel(&alert_msg).await;
+                            match abuse_tracker.record_trip(&abuse_source).await {
+                                Ok(outcome) if outcome.newly_pending => {
+                                    let escalation = format!(
+                                        "Security escalation: {} reached {} guard trips in the configured window. Operator approval required to resume.",
+                                        &source_label, outcome.trip_count_in_window
+                                    );
+                                    self.emit_notification(
+                                        "Security approval required",
+                                        &escalation,
+                                        "error",
+                                        "security",
+                                    )
+                                    .await;
+                                    self.notify_preferred_channel(&escalation).await;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "security.abuse",
+                                        channel = %channel,
+                                        error = %error,
+                                        "abuse_tracker.record_trip failed after embedding block; block applied but escalation state not updated"
+                                    );
+                                }
+                            }
+                            let processed = self
+                                .persist_immediate_exchange(
+                                    stored_user_message,
+                                    safe_reply,
+                                    ImmediateExchangeContext {
+                                        channel,
+                                        conversation_key,
+                                        is_new_conversation,
+                                        project_id,
+                                        model_used: "security_embedding_guard",
+                                        user_message_already_recorded,
+                                        memory_capture_allowed: false,
+                                        memory_capture_source: None,
+                                    },
+                                )
+                                .await?;
+                            return Ok(InboundSecurityPrecheck::Respond(processed));
+                        }
+                        crate::security::intent_classifier::IntentVerdict::Allow => {
+                            return Ok(InboundSecurityPrecheck::Continue {
+                                memory_capture_allowed: fast
+                                    .decision
+                                    .memory_capture
+                                    .should_capture,
+                                routing: Some(fast.decision.routing),
+                                routing_trusted: true,
+                                direct_response: None,
+                            });
+                        }
+                        crate::security::intent_classifier::IntentVerdict::AllowWithUncheckedTag {
+                            ..
+                        } => {
+                            return Ok(InboundSecurityPrecheck::Continue {
+                                memory_capture_allowed: false,
+                                routing: Some(fast.decision.routing),
+                                routing_trusted: false,
+                                direct_response: None,
+                            });
+                        }
+                        crate::security::intent_classifier::IntentVerdict::RouterUnavailable {
+                            ..
+                        } => {}
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "security.inbound",
+                        error = %error,
+                        "inbound embedding classifier unavailable; falling back to LLM classifier"
+                    );
+                }
+            }
+        }
         let pending_actions_for_guard = self.pending_conversation_actions(conversation_key).await;
         let trusted_prior_assistant_message = if pending_actions_for_guard.is_empty() {
             None
@@ -1258,13 +2856,24 @@ impl Agent {
         if inbound_candidates.is_empty() {
             inbound_candidates.push(self.primary_llm_candidate());
         }
+        // Per-call structural surface context. The chat handler routes the
+        // ArkOrbit OrbitChat panel through `channel == "arkorbit"`. When we
+        // see that channel we hand the classifier a structured JSON
+        // describing the surface and orbit file-authoring capability. The
+        // classifier reasons from that context, never from a phrase or
+        // keyword list.
+        let surface_context = self.build_inbound_surface_context(channel).await;
         let mut inbound_decision = None;
         for candidate in inbound_candidates.iter().take(2) {
             let decision = crate::security::intent_classifier::classify_inbound_with_metadata(
                 &candidate.client,
                 &inbound_policy,
                 &normalized_for_guard,
+                recent_messages_context_value.as_ref(),
                 trusted_prior_assistant_message.as_deref(),
+                surface_context.as_ref(),
+                recent_artifacts_context.as_ref(),
+                stream_tx,
             )
             .await;
             if matches!(
@@ -1290,6 +2899,7 @@ impl Agent {
                 },
                 memory_capture: Default::default(),
                 routing: Default::default(),
+                direct_response: None,
             }
         });
         let memory_capture_allowed = inbound_decision.memory_capture.should_capture;
@@ -1354,6 +2964,7 @@ impl Agent {
                             model_used: "security_guard",
                             user_message_already_recorded,
                             memory_capture_allowed: false,
+                            memory_capture_source: None,
                         },
                     )
                     .await?;
@@ -1373,6 +2984,8 @@ impl Agent {
                 Ok(InboundSecurityPrecheck::Continue {
                     memory_capture_allowed: false,
                     routing: Some(routing),
+                    routing_trusted: false,
+                    direct_response: None,
                 })
             }
             crate::security::intent_classifier::IntentVerdict::RouterUnavailable { reason } => {
@@ -1383,14 +2996,23 @@ impl Agent {
                     "inbound intent router unavailable; continuing without routing hints"
                 );
                 Ok(InboundSecurityPrecheck::Continue {
+                    // A timed-out router must not fan out into the memory
+                    // extractor for every operational/read-only request. When
+                    // routing is unavailable, later direct-reply gating may
+                    // still opt into semantic memory capture for conversational
+                    // turns, but agent-loop/tool turns stay lean.
                     memory_capture_allowed: false,
                     routing: None,
+                    routing_trusted: false,
+                    direct_response: None,
                 })
             }
             crate::security::intent_classifier::IntentVerdict::Allow => {
                 Ok(InboundSecurityPrecheck::Continue {
                     memory_capture_allowed,
                     routing: Some(routing),
+                    routing_trusted: true,
+                    direct_response: inbound_decision.direct_response.clone(),
                 })
             }
         }
@@ -1455,66 +3077,20 @@ impl Agent {
             complexity: Some("immediate".to_string()),
             plan: None,
         }));
-        self.seed_execution_trace_snapshot(&trace_ref).await;
-        self.log_operational_event(operational::OperationalEvent {
-            event_type: "agent_request",
-            channel: context.channel,
-            success: true,
-            outcome: "started",
-            trace_id: Some(&trace_id),
-            conversation_id: Some(context.conversation_key),
-            tool_name: None,
-            latency_ms: Some(0),
-            arguments: None,
-            payload: Some(&serde_json::json!({
-                "flow_kind": "immediate",
-                "message_chars": message.chars().count(),
-                "resumed": context.user_message_already_recorded,
-            })),
-            strategy_version: None,
-            policy_version: None,
-            prompt_version: None,
-            classifier_prompt_version: None,
-            specialist_prompt_version: None,
-            model_slot: Some(context.model_used),
-        })
-        .await;
+        let trace_snapshot = trace_ref.read().await.clone();
+        self.remember_completed_trace_snapshot(trace_snapshot.clone(), true)
+            .await;
         tracing::info!(
             "Request started: trace={} channel={} flow=immediate resumed={}",
             trace_id,
             context.channel,
             context.user_message_already_recorded
         );
-        self.log_operational_event(operational::OperationalEvent {
-            event_type: "response_complete",
-            channel: context.channel,
-            success: true,
-            outcome: "completed",
-            trace_id: Some(&trace_id),
-            conversation_id: Some(context.conversation_key),
-            tool_name: None,
-            latency_ms: Some(0),
-            arguments: None,
-            payload: Some(&serde_json::json!({
-                "response_chars": safe_response.chars().count(),
-                "tool_calls": 0,
-                "degradation_notes": 0,
-                "status": "completed",
-            })),
-            strategy_version: None,
-            policy_version: None,
-            prompt_version: None,
-            classifier_prompt_version: None,
-            specialist_prompt_version: None,
-            model_slot: Some(context.model_used),
-        })
-        .await;
         tracing::info!(
             "Request completed: trace={} channel={} status=completed duration=0ms tools=0",
             trace_id,
             context.channel
         );
-        self.persist_completed_trace(&trace_ref).await;
 
         // Mirror normal chat persistence path for immediate shortcut responses.
         {
@@ -1541,58 +3117,8 @@ impl Agent {
 
         let mut conversation_title: Option<String> = None;
         if !context.conversation_key.is_empty() {
-            if !context.user_message_already_recorded {
-                let now = chrono::Utc::now().to_rfc3339();
-                let user_msg = crate::storage::entities::message::Model {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    conversation_id: context.conversation_key.to_string(),
-                    role: "user".to_string(),
-                    content: message.to_string(),
-                    timestamp: now.clone(),
-                    model_used: None,
-                    trace_id: Some(trace_id.clone()),
-                };
-                if let Err(e) = self
-                    .encrypted_storage
-                    .insert_message_encrypted(&user_msg)
-                    .await
-                {
-                    tracing::warn!("Failed to persist immediate-path user message: {}", e);
-                }
-                if context.memory_capture_allowed {
-                    self.spawn_user_memory_capture(
-                        message,
-                        context.channel,
-                        Some(context.conversation_key),
-                        context.project_id,
-                        Some(&user_msg.id),
-                    );
-                }
-            }
-
-            let asst_msg = crate::storage::entities::message::Model {
-                id: uuid::Uuid::new_v4().to_string(),
-                conversation_id: context.conversation_key.to_string(),
-                role: "assistant".to_string(),
-                content: safe_response.clone(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                model_used: Some(context.model_used.to_string()),
-                trace_id: Some(trace_id.clone()),
-            };
-            if let Err(e) = self
-                .encrypted_storage
-                .insert_message_encrypted(&asst_msg)
-                .await
-            {
-                tracing::warn!("Failed to persist immediate-path assistant message: {}", e);
-            }
-
             if context.is_new_conversation {
                 let title = self.generate_conversation_title(message);
-                let _ = self
-                    .storage
-                    .update_conversation(context.conversation_key, Some(&title), Some(2), None)
-                    .await;
                 *self.last_conversation_title.write().await = Some(title.clone());
                 conversation_title = Some(title);
             } else {
@@ -1601,14 +3127,6 @@ impl Agent {
         }
 
         *self.last_conversation_id.write().await = Some(context.conversation_key.to_string());
-        if !context.conversation_key.is_empty() {
-            self.sync_background_session_after_response(
-                context.conversation_key,
-                message,
-                &safe_response,
-            )
-            .await;
-        }
 
         let user_outcome = self
             .build_response_heuristic_outcome(&safe_response, &[], &[], None)
@@ -1616,17 +3134,27 @@ impl Agent {
                 self.execution_supervisor
                     .build_success_outcome(&safe_response, &[], &[])
             });
-        if !context.conversation_key.is_empty() {
-            self.sync_pending_resilience_followup(
-                context.conversation_key,
-                message,
-                context.channel,
-                context.project_id,
-                &user_outcome,
-            )
-            .await;
-        }
         let run_status = Self::execution_run_status_for_outcome(&user_outcome);
+        self.spawn_deferred_exchange_persistence(DeferredExchangePersistence {
+            kind: DeferredExchangePersistenceKind::Immediate,
+            trace_snapshot,
+            message: message.to_string(),
+            response: safe_response.clone(),
+            channel: context.channel.to_string(),
+            conversation_key: context.conversation_key.to_string(),
+            project_id: context.project_id.map(str::to_string),
+            model_used: context.model_used.to_string(),
+            user_message_already_recorded: context.user_message_already_recorded,
+            memory_capture_allowed: context.memory_capture_allowed,
+            memory_capture_source: context.memory_capture_source.map(str::to_string),
+            user_message_id: uuid::Uuid::new_v4().to_string(),
+            assistant_message_id: uuid::Uuid::new_v4().to_string(),
+            user_timestamp: chrono::Utc::now().to_rfc3339(),
+            assistant_timestamp: chrono::Utc::now().to_rfc3339(),
+            is_new_conversation: context.is_new_conversation,
+            conversation_title: conversation_title.clone(),
+            user_outcome: user_outcome.clone(),
+        });
 
         Ok(ProcessedMessage {
             response: safe_response,
@@ -1652,18 +3180,14 @@ impl Agent {
             return;
         }
 
-        {
-            let mut history = self.trace_history.write().await;
-            history.retain(|item| item.id != trace_snapshot.id);
-            history.insert(0, trace_snapshot.clone());
-            if history.len() > 100 {
-                history.truncate(100);
-            }
-        }
+        self.remember_completed_trace_snapshot(
+            trace_snapshot.clone(),
+            !Arc::ptr_eq(trace_ref, &self.last_trace),
+        )
+        .await;
 
         if let Err(e) = self
-            .encrypted_storage
-            .insert_execution_trace_encrypted(&trace_snapshot)
+            .persist_completed_trace_snapshot_durable(&trace_snapshot)
             .await
         {
             tracing::warn!(
@@ -1671,8 +3195,18 @@ impl Agent {
                 trace_snapshot.id,
                 e
             );
+        } else {
+            self.record_completed_interaction_for_self_tune().await;
         }
+    }
 
+    async fn persist_completed_trace_snapshot_durable(
+        &self,
+        trace_snapshot: &ExecutionTrace,
+    ) -> Result<()> {
+        self.encrypted_storage
+            .insert_execution_trace_encrypted(trace_snapshot)
+            .await?;
         let observability_endpoint = crate::core::observability::normalize_observability_endpoint(
             &self.config.observability.provider,
             &self.config.observability.endpoint,
@@ -1693,7 +3227,7 @@ impl Agent {
                 &self.config_dir,
                 &self.data_dir,
                 &self.storage,
-                &trace_snapshot,
+                trace_snapshot,
                 "trace_completed",
             )
             .await
@@ -1716,10 +3250,10 @@ impl Agent {
             }
         }
 
-        if !Arc::ptr_eq(trace_ref, &self.last_trace) {
-            *self.last_trace.write().await = trace_snapshot;
-        }
+        Ok(())
+    }
 
+    async fn record_completed_interaction_for_self_tune(&self) {
         // Self-tune: track interaction for adaptive learning
         crate::core::self_tune::on_interaction_completed(
             &self.storage,
@@ -1727,5 +3261,608 @@ impl Agent {
             &self.llm,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn direct_state() -> DirectConversationRuntimeState {
+        DirectConversationRuntimeState {
+            routing_trusted: true,
+            supported_surface: true,
+            ..Default::default()
+        }
+    }
+
+    fn routing_signal(
+        should_execute: bool,
+        tool_use_expected: bool,
+        current_answer_expected: bool,
+        durable_work_expected: bool,
+        multi_goal: bool,
+        goal_durabilities: &[&str],
+    ) -> crate::security::intent_classifier::InboundRoutingSignal {
+        crate::security::intent_classifier::InboundRoutingSignal {
+            should_execute,
+            tool_use_expected,
+            multi_goal,
+            durable_work_expected,
+            current_answer_expected,
+            semantic_queries: vec!["Respond conversationally".to_string()],
+            required_capabilities: vec!["Direct text response".to_string()],
+            rationale: Some("No execution is required.".to_string()),
+            saved_user_facts_expected: false,
+            product_help_expected: false,
+            live_state_expected: false,
+            external_info_expected: false,
+            profile_lookup_kind: None,
+            goals: goal_durabilities
+                .iter()
+                .enumerate()
+                .map(|(index, durability)| {
+                    let durable = durability.trim() != "none";
+                    crate::security::intent_classifier::InboundTurnGoal {
+                        id: format!("g{}", index + 1),
+                        intent_summary: "Provide a direct response".to_string(),
+                        capability_query: "Direct text response".to_string(),
+                        expected_outcome: "A concise answer in the current chat turn".to_string(),
+                        durability: durability.to_string(),
+                        side_effect: if durable || should_execute || tool_use_expected {
+                            "write".to_string()
+                        } else {
+                            "none".to_string()
+                        },
+                        dependencies: Vec::new(),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn memory_item(
+        id: &str,
+        memory_kind: &str,
+        value: &str,
+        sensitivity: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> crate::storage::experience_item::Model {
+        crate::storage::experience_item::Model {
+            id: id.to_string(),
+            kind: memory_kind.to_string(),
+            scope: if conversation_id.is_some() {
+                "conversation".to_string()
+            } else if project_id.is_some() {
+                "project".to_string()
+            } else {
+                "global".to_string()
+            },
+            project_id: project_id.map(str::to_string),
+            conversation_id: conversation_id.map(str::to_string),
+            title: format!("Saved {}", memory_kind),
+            content: value.to_string(),
+            normalized_key: id.to_string(),
+            confidence: 0.95,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata: serde_json::json!({
+                "memory_kind": memory_kind,
+                "sensitivity": sensitivity,
+                "durability": "permanent",
+            }),
+            last_supported_at: None,
+            last_contradicted_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            embedding: None,
+        }
+    }
+
+    fn visual_attachment_hints() -> RequestExecutionHints {
+        RequestExecutionHints {
+            attachments: vec![ChatAttachmentHint {
+                upload_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                kind: "visual".to_string(),
+                content_type: Some("image/png".to_string()),
+                document_id: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_visual_attachment_can_seed_memory_capture_from_analysis() {
+        let source = attachment_only_visual_memory_capture_source(
+            "",
+            "The screenshot shows a preference for dense, terminal-like dark UI.",
+            &visual_attachment_hints(),
+        )
+        .expect("empty visual-only turn should provide a memory analysis source");
+
+        assert!(source.contains("visual-only user turn"));
+        assert!(source.contains("dense, terminal-like dark UI"));
+    }
+
+    #[test]
+    fn visual_attachment_with_message_does_not_switch_to_preference_capture() {
+        let source = attachment_only_visual_memory_capture_source(
+            "Fix the layout shown here.",
+            "The screenshot shows a dense, terminal-like dark UI.",
+            &visual_attachment_hints(),
+        );
+
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn chat_storage_preserves_contact_info_but_redacts_high_risk_pii() {
+        let stored = redact_chat_message_for_storage(
+            "Email me at user@example.com, call 555-123-4567, ssn 123-45-6789, card 4111 1111 1111 1111, host 192.168.1.100",
+        );
+
+        assert!(stored.contains("user@example.com"));
+        assert!(stored.contains("555-123-4567"));
+        assert!(stored.contains("192.168.1.100"));
+        assert!(stored.contains("[SSN]"));
+        assert!(stored.contains("[CARD]"));
+    }
+
+    #[test]
+    fn contact_info_can_trigger_semantic_memory_capture_without_phrase_rules() {
+        assert!(has_contact_info_for_memory_capture(
+            "Reach me at user@example.com"
+        ));
+        assert!(has_contact_info_for_memory_capture("555-123-4567"));
+        assert!(!has_contact_info_for_memory_capture("SSN 123-45-6789"));
+        assert!(!has_contact_info_for_memory_capture("server 192.168.1.100"));
+    }
+
+    #[test]
+    fn direct_conversation_allows_semantic_no_tool_routing() {
+        let routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        assert!(should_use_direct_conversation_path(
+            Some(&routing),
+            direct_state()
+        ));
+        assert_eq!(
+            turn_execution_path_from_routing(Some(&routing), direct_state()),
+            TurnExecutionPath::DirectReply
+        );
+    }
+
+    #[test]
+    fn direct_decline_neutralizes_stale_direct_reply_routing() {
+        let mut routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        assert!(neutralize_direct_reply_routing_after_direct_decline(
+            Some(&mut routing),
+            direct_state(),
+            None,
+            "Inspect the recent run and tell me what failed",
+            None
+        ));
+        assert!(!routing.current_answer_expected);
+        assert!(routing.should_execute);
+        assert!(routing.tool_use_expected);
+        assert_eq!(
+            turn_execution_path_from_routing(Some(&routing), direct_state()),
+            TurnExecutionPath::AgentLoop
+        );
+    }
+
+    #[test]
+    fn direct_decline_preserves_read_only_external_info_routing() {
+        let mut routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        assert!(neutralize_direct_reply_routing_after_direct_decline(
+            Some(&mut routing),
+            direct_state(),
+            Some(DirectConversationDeclineKind::ExternalInfo),
+            "Find the latest release notes for the SDK",
+            Some("Needs public current information.")
+        ));
+        assert!(routing.current_answer_expected);
+        assert!(routing.should_execute);
+        assert!(routing.tool_use_expected);
+        assert!(routing.external_info_expected);
+        assert!(!routing.durable_work_expected);
+        assert_eq!(routing.semantic_queries.len(), 1);
+        assert!(routing.semantic_queries[0].contains("Find the latest release notes"));
+        assert_eq!(
+            routing.required_capabilities,
+            vec![
+                "external public information lookup for current user request: Find the latest release notes for the SDK"
+                    .to_string()
+            ]
+        );
+        assert!(
+            routing
+                .rationale
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Needs public current information")
+        );
+    }
+
+    #[test]
+    fn direct_conversation_requires_trusted_routing() {
+        let routing = routing_signal(false, false, true, false, false, &["none"]);
+        let state = DirectConversationRuntimeState {
+            routing_trusted: false,
+            ..direct_state()
+        };
+
+        assert!(!should_use_direct_conversation_path(Some(&routing), state));
+        assert!(!should_use_direct_conversation_path(None, direct_state()));
+    }
+
+    #[test]
+    fn direct_conversation_blocks_execution_and_tool_work() {
+        let execute = routing_signal(true, false, true, false, false, &["none"]);
+        let tool = routing_signal(false, true, true, false, false, &["none"]);
+
+        assert!(!should_use_direct_conversation_path(
+            Some(&execute),
+            direct_state()
+        ));
+        assert!(!should_use_direct_conversation_path(
+            Some(&tool),
+            direct_state()
+        ));
+    }
+
+    #[test]
+    fn direct_conversation_blocks_durable_or_multi_goal_work() {
+        let durable_goal = routing_signal(false, false, true, false, false, &["deployment"]);
+        let multiple_goals = routing_signal(false, false, true, false, false, &["none", "none"]);
+
+        for signal in [durable_goal, multiple_goals] {
+            assert!(!should_use_direct_conversation_path(
+                Some(&signal),
+                direct_state()
+            ));
+        }
+    }
+
+    #[test]
+    fn mixed_social_and_app_work_routing_cannot_use_direct_reply_path() {
+        let mut mixed = routing_signal(true, true, true, true, false, &["deployment"]);
+        mixed.semantic_queries =
+            vec!["Friendly conversational opening plus requested browser app delivery".to_string()];
+        mixed.required_capabilities =
+            vec!["Generate and host a persistent runnable application".to_string()];
+
+        assert_eq!(
+            turn_execution_path_from_routing(Some(&mixed), direct_state()),
+            TurnExecutionPath::AgentLoop
+        );
+        assert!(!should_use_direct_conversation_path(
+            Some(&mixed),
+            direct_state()
+        ));
+    }
+
+    #[test]
+    fn direct_conversation_blocks_runtime_state_that_needs_full_loop() {
+        let routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        for state in [
+            DirectConversationRuntimeState {
+                has_attachments: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                has_secret_offered: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                has_pending_actions: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                has_pending_credential_prompt: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                user_message_already_recorded: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                skip_inbound_security_precheck: true,
+                ..direct_state()
+            },
+            DirectConversationRuntimeState {
+                supported_surface: false,
+                ..direct_state()
+            },
+        ] {
+            assert!(!should_use_direct_conversation_path(Some(&routing), state));
+        }
+    }
+
+    #[test]
+    fn direct_memory_capture_ack_uses_trusted_direct_memory_signal() {
+        let routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        assert!(should_acknowledge_direct_memory_capture(
+            Some(&routing),
+            direct_state(),
+            true
+        ));
+        assert!(!should_acknowledge_direct_memory_capture(
+            Some(&routing),
+            direct_state(),
+            false
+        ));
+    }
+
+    #[test]
+    fn direct_memory_capture_ack_uses_canonical_conversational_goal_shape() {
+        let routing = routing_signal(false, false, true, false, false, &["none"]);
+
+        assert!(should_acknowledge_direct_memory_capture(
+            Some(&routing),
+            direct_state(),
+            true
+        ));
+        assert!(should_use_direct_conversation_path(
+            Some(&routing),
+            direct_state()
+        ));
+    }
+
+    #[test]
+    fn direct_memory_capture_ack_does_not_hide_lookup_or_external_work() {
+        let mut saved_lookup = routing_signal(false, false, true, false, false, &["none"]);
+        saved_lookup.saved_user_facts_expected = true;
+        saved_lookup.goals[0].groundings = vec!["user_memory".to_string()];
+        let mut external = routing_signal(false, false, true, false, false, &["none"]);
+        external.external_info_expected = true;
+        external.goals[0].groundings = vec!["external_info".to_string()];
+        let tool = routing_signal(false, true, true, false, false, &["none"]);
+        let execute = routing_signal(true, false, true, false, false, &["none"]);
+
+        for signal in [saved_lookup, external, tool, execute] {
+            assert!(!should_acknowledge_direct_memory_capture(
+                Some(&signal),
+                direct_state(),
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn transient_read_only_lookup_does_not_need_speculative_memory_probe() {
+        let mut external = routing_signal(true, true, true, false, false, &["none"]);
+        external.external_info_expected = true;
+        external.goals[0].groundings = vec!["external_info".to_string()];
+        external.goals[0].side_effect = "none".to_string();
+        let mut live_state = routing_signal(true, true, true, false, false, &["none"]);
+        live_state.live_state_expected = true;
+        live_state.goals[0].groundings = vec!["local_state".to_string()];
+        live_state.goals[0].side_effect = "none".to_string();
+        let mut saved_lookup = external.clone();
+        saved_lookup.saved_user_facts_expected = true;
+        saved_lookup.goals[0].groundings = vec!["user_memory".to_string()];
+
+        assert!(routing_is_transient_read_only_lookup(Some(&external)));
+        assert!(routing_is_transient_read_only_lookup(Some(&live_state)));
+        assert!(!routing_is_transient_read_only_lookup(Some(&saved_lookup)));
+    }
+
+    #[test]
+    fn speculative_memory_probe_does_not_run_without_router_memory_signal() {
+        assert!(!should_enqueue_semantic_user_memory_capture(
+            "I prefer concise status updates.",
+            direct_state(),
+            TurnExecutionPath::DirectReply
+        ));
+        assert!(!should_enqueue_semantic_user_memory_capture(
+            "what current apps do i have",
+            direct_state(),
+            TurnExecutionPath::AgentLoop
+        ));
+    }
+
+    #[test]
+    fn direct_conversation_legacy_json_output_still_parses_for_fallback() {
+        let fallback = extract_direct_conversation_json_object(
+            r#"{"can_answer_directly":false,"answer":"","rationale":"needs tools"}"#,
+        )
+        .and_then(|value| serde_json::from_value::<DirectConversationModelOutput>(value).ok())
+        .expect("fallback JSON should parse");
+        assert!(!fallback.can_answer_directly);
+        assert!(fallback.answer.is_empty());
+        assert!(fallback.decline_kind.is_none());
+    }
+
+    #[test]
+    fn direct_conversation_prompt_uses_structured_decline_contract() {
+        let prompt = direct_conversation_system_prompt();
+
+        assert!(prompt.contains("\"can_answer_directly\":false"));
+        assert!(prompt.contains("\"decline_kind\":\"external_info\""));
+        assert!(prompt.contains("external_info, live_state, product_help"));
+        assert!(prompt.contains("set can_answer_directly=false"));
+        assert!(prompt.contains("Do not state or imply persistence"));
+        assert!(!prompt.contains("say that this needs the full agent loop"));
+    }
+
+    #[test]
+    fn direct_local_answer_mode_query_uses_routing_signal_not_raw_message() {
+        let routing = crate::security::intent_classifier::InboundRoutingSignal {
+            semantic_queries: vec![
+                "Recall the immediately previous user question in this conversation".to_string(),
+            ],
+            goals: vec![crate::security::intent_classifier::InboundTurnGoal {
+                id: "g1".to_string(),
+                intent_summary: "Identify the previous user turn".to_string(),
+                capability_query: "Visible conversation history lookup".to_string(),
+                expected_outcome: "Answer with the prior user message".to_string(),
+                durability: "none".to_string(),
+                dependencies: Vec::new(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let query = direct_local_answer_mode_query(&routing).expect("routing query");
+        assert!(query.contains("previous user question"));
+        assert!(query.contains("prior user message"));
+    }
+
+    #[test]
+    fn direct_conversation_plain_refusal_is_not_structured_direct_answer() {
+        let parsed =
+            extract_direct_conversation_json_object("I cannot use live tools from this path.")
+                .and_then(|value| {
+                    serde_json::from_value::<DirectConversationModelOutput>(value).ok()
+                });
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn direct_conversation_prompt_includes_recent_actionable_artifacts() {
+        let recent_artifacts = vec![serde_json::json!({
+            "artifact_type": "app",
+            "artifact_id": "838430cf",
+            "title": "Public Webcam Monitor",
+            "related_actions": ["ark_inspect", "file_write", "app_restart"]
+        })];
+        let prompt = direct_conversation_user_prompt(
+            "the page keeps refreshing with no stable camera feed",
+            "conversation-1",
+            &[],
+            &recent_artifacts,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&prompt).expect("prompt json");
+        assert_eq!(
+            value["recent_actionable_artifacts"][0]["title"],
+            "Public Webcam Monitor"
+        );
+        assert_eq!(
+            value["recent_actionable_artifacts"][0]["related_actions"][2],
+            "app_restart"
+        );
+    }
+
+    #[test]
+    fn direct_memory_answer_returns_single_safe_identity() {
+        let items = vec![memory_item(
+            "memory-1",
+            "identity",
+            "user_name: Mira",
+            "personal_identifier",
+            None,
+            None,
+        )];
+
+        let answer = select_direct_memory_answer(
+            &items,
+            Some("identity"),
+            None,
+            Some("conversation-1"),
+            chrono::Utc::now(),
+        )
+        .expect("safe identity memory should answer directly");
+
+        assert!(answer.contains("Mira"));
+    }
+
+    #[test]
+    fn direct_memory_answer_rejects_sensitive_memory() {
+        let items = vec![memory_item(
+            "memory-1",
+            "identity",
+            "private_detail: sensitive value",
+            "sensitive",
+            None,
+            None,
+        )];
+
+        assert!(
+            select_direct_memory_answer(
+                &items,
+                Some("identity"),
+                None,
+                Some("conversation-1"),
+                chrono::Utc::now(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_memory_answer_rejects_conflicting_same_scope_values() {
+        let items = vec![
+            memory_item(
+                "memory-1",
+                "identity",
+                "user_name: Mira",
+                "personal_identifier",
+                None,
+                None,
+            ),
+            memory_item(
+                "memory-2",
+                "identity",
+                "user_name: Robin",
+                "personal_identifier",
+                None,
+                None,
+            ),
+        ];
+
+        assert!(
+            select_direct_memory_answer(
+                &items,
+                Some("identity"),
+                None,
+                Some("conversation-1"),
+                chrono::Utc::now(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn direct_memory_answer_prefers_more_specific_scope() {
+        let items = vec![
+            memory_item(
+                "global-memory",
+                "identity",
+                "user_name: Mira",
+                "personal_identifier",
+                None,
+                None,
+            ),
+            memory_item(
+                "conversation-memory",
+                "identity",
+                "user_name: Robin",
+                "personal_identifier",
+                None,
+                Some("conversation-1"),
+            ),
+        ];
+
+        let answer = select_direct_memory_answer(
+            &items,
+            Some("identity"),
+            None,
+            Some("conversation-1"),
+            chrono::Utc::now(),
+        )
+        .expect("specific scoped memory should answer directly");
+
+        assert!(answer.contains("Robin"));
+        assert!(!answer.contains("Mira"));
     }
 }

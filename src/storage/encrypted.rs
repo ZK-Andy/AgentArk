@@ -142,16 +142,6 @@ impl EncryptedStorage {
         Ok(self.decrypt_fact_content(facts))
     }
 
-    /// Get only global-scope facts and decrypt their content.
-    pub async fn get_global_facts_decrypted(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<super::LearnedFactRecord>> {
-        let facts = self.storage.get_global_facts(limit, offset).await?;
-        Ok(self.decrypt_fact_content(facts))
-    }
-
     // ==================== Encrypted KV Store ====================
 
     /// Set an encrypted value in the KV store
@@ -176,6 +166,10 @@ impl EncryptedStorage {
 
     pub async fn insert_message_encrypted(&self, msg: &message::Model) -> Result<()> {
         self.storage.insert_message(msg).await
+    }
+
+    pub async fn insert_message_encrypted_if_absent(&self, msg: &message::Model) -> Result<bool> {
+        self.storage.insert_message_if_absent(msg).await
     }
 
     pub async fn get_messages_decrypted(

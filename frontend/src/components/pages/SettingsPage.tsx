@@ -13,11 +13,8 @@ import {
   getSelectedSettingsNav,
   SettingsNavigation,
 } from "./settingsNavigation";
-import { prefetchSettingsPageData } from "./settingsData";
-import {
-  preloadCommonSettingsPanels,
-  preloadSettingsTab,
-} from "./workspacePreload";
+import { prefetchSettingsTabData } from "./settingsData";
+import { preloadSettingsTab } from "./workspacePreload";
 
 const SettingsPageFull = lazy(() => import("./SettingsPageFull"));
 
@@ -53,22 +50,20 @@ export default function SettingsPage({
 
   useEffect(() => {
     if (standaloneSurface === "arkpulse") return;
-    preloadCommonSettingsPanels();
-    prefetchSettingsPageData(queryClient);
-  }, [queryClient, standaloneSurface]);
+    preloadSettingsTab(tab);
+    prefetchSettingsTabData(queryClient, tab);
+  }, [queryClient, standaloneSurface, tab]);
 
   const openFullEditor = () => {
-    preloadCommonSettingsPanels();
-    prefetchSettingsPageData(queryClient);
+    preloadSettingsTab(tab);
+    prefetchSettingsTabData(queryClient, tab);
     setFullEditorOpen(true);
   };
 
   const changeTab = (nextTabRaw: number) => {
     const nextTab = normalizeSettingsTab(nextTabRaw);
     preloadSettingsTab(nextTab);
-    if (nextTab !== 0) {
-      prefetchSettingsPageData(queryClient);
-    }
+    prefetchSettingsTabData(queryClient, nextTab);
     setTab(nextTab);
     setFullEditorOpen(nextTab !== 0);
   };

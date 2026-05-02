@@ -35,58 +35,7 @@ release_version_from_tag() {
     printf '%s' "${1#v}"
 }
 
-ensure_env_file() {
-    if [ ! -f "${SOURCE_DIR}/.env" ] && [ -f "${SOURCE_DIR}/.env.example" ]; then
-        cp "${SOURCE_DIR}/.env.example" "${SOURCE_DIR}/.env"
-    fi
-    if [ ! -f "${SOURCE_DIR}/.env" ]; then
-        : > "${SOURCE_DIR}/.env"
-    fi
-}
-
-upsert_env_value() {
-    local key="$1"
-    local value="$2"
-    local file="${SOURCE_DIR}/.env"
-    local tmp_file
-    ensure_env_file
-    tmp_file="$(mktemp)"
-    awk -v key="${key}" -v value="${value}" '
-        BEGIN { written = 0 }
-        $0 ~ ("^" key "=") {
-            print key "=" value
-            written = 1
-            next
-        }
-        { print }
-        END {
-            if (!written) {
-                print key "=" value
-            }
-        }
-    ' "${file}" > "${tmp_file}"
-    mv "${tmp_file}" "${file}"
-}
-
-pin_release_env() {
-    local release_tag="$1"
-    local release_version
-    release_version="$(release_version_from_tag "${release_tag}")"
-    upsert_env_value "AGENTARK_IMAGE" "${IMAGE_REPOSITORY}:${release_version}"
-    upsert_env_value "AGENTARK_RELEASE_REPO" "${RELEASE_REPO}"
-    upsert_env_value "AGENTARK_RELEASE_TAG" "${release_tag}"
-}
-
 current_release_tag() {
-    local env_tag
-    env_tag="$(
-        awk -F= '$1 == "AGENTARK_RELEASE_TAG" { print $2 }' "${SOURCE_DIR}/.env" 2>/dev/null \
-            | tail -n 1
-    )"
-    if [ -n "${env_tag}" ]; then
-        printf '%s\n' "${env_tag}"
-        return 0
-    fi
     docker_git_in_install git -C /work/source describe --tags --exact-match 2>/dev/null || true
 }
 
@@ -104,7 +53,22 @@ checkout_release_tag() {
     ensure_clean_checkout
     docker_git_in_install git -C /work/source fetch --tags --force origin
     docker_git_in_install git -C /work/source checkout --force "${release_tag}"
-    pin_release_env "${release_tag}"
+}
+
+run_start_script() {
+    local release_tag
+    release_tag="${AGENTARK_RELEASE_TAG:-$(current_release_tag)}"
+    if [ -n "${release_tag}" ]; then
+        (
+            cd "${SOURCE_DIR}" &&
+            AGENTARK_IMAGE="${IMAGE_REPOSITORY}:$(release_version_from_tag "${release_tag}")" \
+            AGENTARK_RELEASE_REPO="${RELEASE_REPO}" \
+            AGENTARK_RELEASE_TAG="${release_tag}" \
+            ./scripts/start.sh "$@"
+        )
+    else
+        (cd "${SOURCE_DIR}" && ./scripts/start.sh "$@")
+    fi
 }
 
 cached_latest_release_tag() {
@@ -175,16 +139,16 @@ case "${1:-help}" in
         docker exec agentark-control /app/agentark --pulse
         ;;
     start)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh start)
+        run_start_script start
         ;;
     tunnel)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh tunnel "${2:-}")
+        run_start_script tunnel "${2:-}"
         ;;
     stop)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh stop)
+        run_start_script stop
         ;;
     restart)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh restart)
+        run_start_script restart
         ;;
     update)
         target_tag="${AGENTARK_RELEASE_TAG:-$(latest_release_tag)}"
@@ -194,13 +158,13 @@ case "${1:-help}" in
         fi
         echo -e "${CYAN}Updating AgentArk to ${target_tag}...${NC}"
         checkout_release_tag "${target_tag}"
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh update)
+        AGENTARK_RELEASE_TAG="${target_tag}" run_start_script update
         ;;
     logs)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh logs)
+        run_start_script logs
         ;;
     status)
-        (cd "${SOURCE_DIR}" && ./scripts/start.sh status)
+        run_start_script status
         ;;
     setup)
         docker exec -it agentark-control /app/agentark --setup
@@ -210,7 +174,7 @@ case "${1:-help}" in
         echo -e "${BOLD}Your data volumes and source checkout will be preserved.${NC}"
         read -r -p "Continue? [y/N] " confirm
         if [ "${confirm}" = "y" ] || [ "${confirm}" = "Y" ]; then
-            (cd "${SOURCE_DIR}" && docker compose down)
+            run_start_script stop
             rm -f /usr/local/bin/agentark 2>/dev/null || true
             echo -e "${GREEN}Removed. Data volumes kept. Source remains in ${SOURCE_DIR}.${NC}"
         fi

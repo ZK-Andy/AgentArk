@@ -6,16 +6,12 @@ import {
   type ReactNode,
 } from "react";
 import SettingsPage from "./pages/SettingsPage";
-import type { JsonRecord } from "./pages/pageHelpers";
 
 type WorkspaceViewOutletProps = {
   view: string;
   autoRefresh: boolean;
   settingsInitialTab?: number | null;
-  projects: JsonRecord[];
-  activeProjectId: string;
   onNavigateToView?: (view: string, replace?: boolean) => void;
-  onOpenProjectWorkspace: (projectId: string) => void;
 };
 
 type LoadedPage = ComponentType<any>;
@@ -35,21 +31,20 @@ pageCache.set("settings", SettingsPage as LoadedPage);
 
 const loadAppsPage: PageLoader = () => import("./pages/AppsPage");
 const loadAnalyticsPage: PageLoader = () => import("./pages/AnalyticsPage");
+const loadArkOrbitPage: PageLoader = () => import("./pages/ArkOrbitPage");
 const loadArkPulsePage: PageLoader = () => import("./pages/ArkPulsePage");
 const loadArkMemoryPage: PageLoader = () => import("./pages/ArkMemoryPage");
+const loadArkReflectPage: PageLoader = () => import("./pages/ArkReflectPage");
 const loadAutonomyPage: PageLoader = () => import("./pages/AutonomyPage");
 const loadDocumentsPage: PageLoader = () => import("./pages/DocumentsPage");
 const loadEvolutionPage: PageLoader = () => import("./pages/EvolutionPage");
 const loadGoalsPage: PageLoader = () => import("./pages/GoalsPage");
-const loadProjectsPage: PageLoader = () => import("./pages/ProjectsPage");
 const loadSkillsPage: PageLoader = () => import("./pages/SkillsPage");
 const loadTasksPage: PageLoader = () => import("./pages/TasksPage");
 const loadTracePage: PageLoader = () => import("./pages/TracePage");
 const loadWatchersPage: PageLoader = () => import("./pages/WatchersPage");
-const loadBackgroundSessionsManager: PageLoader = () =>
-  import("./BackgroundSessionsManager").then((module) => ({
-    default: module.BackgroundSessionsManager as LoadedPage,
-  }));
+const loadBrowserSessionsPage: PageLoader = () =>
+  import("./pages/BrowserSessionsPage");
 const loadSentinelPanel: PageLoader = () =>
   import("./SentinelPanel").then((module) => ({
     default: module.SentinelPanel as LoadedPage,
@@ -197,10 +192,10 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   },
   sessions: {
     componentKey: "sessions",
-    message: "Loading sessions...",
-    load: loadBackgroundSessionsManager,
-    render: (BackgroundSessionsManager, { autoRefresh }) => (
-      <BackgroundSessionsManager autoRefresh={autoRefresh} />
+    message: "Loading browser sessions...",
+    load: loadBrowserSessionsPage,
+    render: (BrowserSessionsPage, { autoRefresh }) => (
+      <BrowserSessionsPage autoRefresh={autoRefresh} />
     ),
   },
   skills: {
@@ -258,41 +253,9 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
     componentKey: "documents",
     message: "Loading documents...",
     load: loadDocumentsPage,
-    render: (
-      DocumentsPage,
-      {
-      autoRefresh,
-      projects,
-      activeProjectId,
-      onNavigateToView,
-      },
-    ) => (
+    render: (DocumentsPage, { autoRefresh }) => (
       <DocumentsPage
         autoRefresh={autoRefresh}
-        projects={projects}
-        activeProjectId={activeProjectId}
-        onNavigateToView={onNavigateToView}
-      />
-    ),
-  },
-  projects: {
-    componentKey: "projects",
-    message: "Loading projects...",
-    load: loadProjectsPage,
-    render: (
-      ProjectsPage,
-      {
-      autoRefresh,
-      projects,
-      activeProjectId,
-      onOpenProjectWorkspace,
-      },
-    ) => (
-      <ProjectsPage
-        autoRefresh={autoRefresh}
-        projects={projects}
-        activeProjectId={activeProjectId}
-        onOpenProjectWorkspace={onOpenProjectWorkspace}
       />
     ),
   },
@@ -314,7 +277,7 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
   },
   status: {
     componentKey: "status",
-    message: "Loading watchers...",
+    message: "Loading background work...",
     load: loadWatchersPage,
     render: (WatchersPage, { autoRefresh }) => (
       <WatchersPage autoRefresh={autoRefresh} />
@@ -336,6 +299,12 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
       <ArkPulsePage autoRefresh={autoRefresh} />
     ),
   },
+  arkorbit: {
+    componentKey: "arkorbit",
+    message: "Loading Orbit...",
+    load: loadArkOrbitPage,
+    render: (ArkOrbitPage) => <ArkOrbitPage />,
+  },
   search: settingsRoute("Loading search settings...", 24),
   settings: {
     componentKey: "settings",
@@ -349,21 +318,19 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
     componentKey: "arkmemory",
     message: "Loading memory...",
     load: loadArkMemoryPage,
-    render: (
-      ArkMemoryPage,
-      {
-      autoRefresh,
-      projects,
-      activeProjectId,
-      onNavigateToView,
-      },
-    ) => (
+    render: (ArkMemoryPage, { autoRefresh, onNavigateToView }) => (
       <ArkMemoryPage
         autoRefresh={autoRefresh}
-        projects={projects}
-        activeProjectId={activeProjectId}
         onNavigateToView={onNavigateToView}
       />
+    ),
+  },
+  arkreflect: {
+    componentKey: "arkreflect",
+    message: "Loading ArkReflect...",
+    load: loadArkReflectPage,
+    render: (ArkReflectPage, { autoRefresh }) => (
+      <ArkReflectPage autoRefresh={autoRefresh} />
     ),
   },
 };

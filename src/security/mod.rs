@@ -24,6 +24,7 @@
 pub mod abuse_tracker;
 pub mod action_guard;
 pub mod capabilities;
+pub mod embedding_classifier;
 pub mod intent_classifier;
 pub mod model_hardening;
 pub mod model_input;
@@ -53,6 +54,48 @@ pub use trust_boundary::{
     canonical_capabilities, redact_json_secrets, sanitize_input_schema, sanitize_untrusted_html,
     sanitize_untrusted_output, scan_untrusted_text,
 };
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, thiserror::Error)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SecurityError {
+    #[error("ERR/security/invalid_input: {message}")]
+    InvalidInput { message: String },
+    #[error("ERR/security/permission_denied: {message}")]
+    PermissionDenied { code: String, message: String },
+    #[error("ERR/security/tool_argument_denied: tool argument denied ({reason_code})")]
+    ToolArgumentDenied { reason_code: String },
+    #[error("ERR/security/secret_detected: {message}")]
+    SecretDetected { message: String },
+    #[error("ERR/security/failed: {message}")]
+    Failed { message: String },
+}
+
+impl SecurityError {
+    pub fn tool_argument_denied(reason_code: impl Into<String>) -> Self {
+        Self::ToolArgumentDenied {
+            reason_code: reason_code.into(),
+        }
+    }
+
+    pub fn code(&self) -> String {
+        match self {
+            Self::InvalidInput { .. } => "security_invalid_input".to_string(),
+            Self::PermissionDenied { code, .. } if !code.trim().is_empty() => {
+                format!("security_{}", code.trim())
+            }
+            Self::PermissionDenied { .. } => "security_permission_denied".to_string(),
+            Self::ToolArgumentDenied { reason_code } => {
+                format!("security_tool_argument_denied_{}", reason_code)
+            }
+            Self::SecretDetected { .. } => "security_secret_detected".to_string(),
+            Self::Failed { .. } => "security_failed".to_string(),
+        }
+    }
+
+    pub fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -111,6 +154,7 @@ impl SecurityGuard {
 pub enum SecretInputType {
     PrivateKeyMaterial,
     ApiKeyOrToken,
+    PaymentCredential,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,8 +230,12 @@ static URL_SECRET_QUERY_PATTERN: Lazy<Regex> = Lazy::new(|| {
     )
     .unwrap()
 });
+static PAYMENT_NUMBER_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d(?:[\s.-]?\d){11,18}\b").unwrap());
+static SHORT_NUMERIC_CODE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{3,4}\b").unwrap());
 const OPAQUE_TOKEN_MIN_CHARS: usize = 20;
 const OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR: f64 = 3.0;
+const PAYMENT_CODE_PROXIMITY_BYTES: usize = 96;
 
 fn push_secret_kind(kinds: &mut Vec<SecretInputType>, kind: SecretInputType) {
     if !kinds.contains(&kind) {
@@ -291,6 +339,23 @@ fn is_likely_identifier_slug(value: &str) -> bool {
         })
 }
 
+fn is_likely_public_slug_filename(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some((stem, extension)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty()
+        || extension.len() < 2
+        || extension.len() > 8
+        || !extension
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        return false;
+    }
+    is_likely_identifier_slug(stem)
+}
+
 fn is_identifier_segment(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -321,6 +386,7 @@ fn is_opaque_token_shape(value: &str) -> bool {
         && !trimmed.chars().any(char::is_whitespace)
         && trimmed.chars().all(opaque_token_shape_char)
         && !is_likely_identifier_slug(trimmed)
+        && !is_likely_public_slug_filename(trimmed)
         && !is_likely_code_expression_token(trimmed)
         && opaque_token_has_secret_signal(trimmed)
         && shannon_entropy_bits_per_char(trimmed) >= OPAQUE_TOKEN_ENTROPY_BITS_PER_CHAR
@@ -373,6 +439,195 @@ fn apply_opaque_token_redaction(
     *text = redacted;
     redactions.push(format!("opaque_token x{}", count));
     push_secret_kind(kinds, SecretInputType::ApiKeyOrToken);
+}
+
+#[derive(Clone, Copy)]
+struct RedactionSpan {
+    start: usize,
+    end: usize,
+}
+
+fn digit_count(value: &str) -> usize {
+    value.chars().filter(|ch| ch.is_ascii_digit()).count()
+}
+
+fn digits_only(value: &str) -> String {
+    value.chars().filter(|ch| ch.is_ascii_digit()).collect()
+}
+
+fn char_before(text: &str, idx: usize) -> Option<char> {
+    text[..idx].chars().next_back()
+}
+
+fn char_after(text: &str, idx: usize) -> Option<char> {
+    text[idx..].chars().next()
+}
+
+fn numeric_literal_prefix_char(ch: char) -> bool {
+    ch.is_ascii_digit() || matches!(ch, '.' | '_')
+}
+
+fn numeric_literal_suffix_char(ch: char) -> bool {
+    ch.is_ascii_digit() || ch == '_'
+}
+
+fn decimal_numeric_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some((left, right)) = trimmed.split_once('.') else {
+        return false;
+    };
+    !left.is_empty()
+        && !right.is_empty()
+        && !right.contains('.')
+        && left.chars().all(|ch| ch.is_ascii_digit())
+        && right.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn numeric_span_is_decimal_literal(source: &str, span: RedactionSpan) -> bool {
+    if char_before(source, span.start).is_some_and(numeric_literal_prefix_char)
+        || char_after(source, span.end).is_some_and(numeric_literal_suffix_char)
+    {
+        return true;
+    }
+    decimal_numeric_literal(&source[span.start..span.end])
+}
+
+fn luhn_valid(digits: &str) -> bool {
+    if digits.len() < 8 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let mut sum = 0u32;
+    let mut double = false;
+    for ch in digits.chars().rev() {
+        let Some(mut value) = ch.to_digit(10) else {
+            return false;
+        };
+        if double {
+            value *= 2;
+            if value > 9 {
+                value -= 9;
+            }
+        }
+        sum += value;
+        double = !double;
+    }
+    sum % 10 == 0
+}
+
+fn spans_overlap(left: RedactionSpan, right: RedactionSpan) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn spans_are_near(left: RedactionSpan, right: RedactionSpan, max_distance: usize) -> bool {
+    if spans_overlap(left, right) {
+        return true;
+    }
+    let distance = if left.end <= right.start {
+        right.start.saturating_sub(left.end)
+    } else {
+        left.start.saturating_sub(right.end)
+    };
+    distance <= max_distance
+}
+
+fn apply_payment_credential_redaction(
+    text: &mut String,
+    redactions: &mut Vec<String>,
+    kinds: &mut Vec<SecretInputType>,
+) {
+    let source = text.clone();
+    let candidate_spans: Vec<(RedactionSpan, bool)> = PAYMENT_NUMBER_PATTERN
+        .find_iter(&source)
+        .filter(|matched| {
+            let span = RedactionSpan {
+                start: matched.start(),
+                end: matched.end(),
+            };
+            if numeric_span_is_decimal_literal(&source, span) {
+                return false;
+            }
+            let digits = digit_count(matched.as_str());
+            (12..=19).contains(&digits)
+        })
+        .map(|matched| {
+            (
+                RedactionSpan {
+                    start: matched.start(),
+                    end: matched.end(),
+                },
+                luhn_valid(&digits_only(matched.as_str())),
+            )
+        })
+        .collect();
+
+    if candidate_spans.is_empty() {
+        return;
+    }
+
+    let short_code_spans: Vec<RedactionSpan> = SHORT_NUMERIC_CODE_PATTERN
+        .find_iter(&source)
+        .map(|matched| RedactionSpan {
+            start: matched.start(),
+            end: matched.end(),
+        })
+        .collect();
+
+    let mut spans: Vec<RedactionSpan> = candidate_spans
+        .iter()
+        .filter(|(payment_span, valid_luhn)| {
+            *valid_luhn
+                || short_code_spans.iter().any(|code_span| {
+                    !spans_overlap(*payment_span, *code_span)
+                        && spans_are_near(*payment_span, *code_span, PAYMENT_CODE_PROXIMITY_BYTES)
+                })
+        })
+        .map(|(span, _)| *span)
+        .collect();
+
+    if spans.is_empty() {
+        return;
+    }
+
+    let payment_number_spans = spans.clone();
+    for matched in SHORT_NUMERIC_CODE_PATTERN.find_iter(&source) {
+        let code_span = RedactionSpan {
+            start: matched.start(),
+            end: matched.end(),
+        };
+        if payment_number_spans
+            .iter()
+            .any(|payment_span| spans_overlap(*payment_span, code_span))
+        {
+            continue;
+        }
+        if payment_number_spans.iter().any(|payment_span| {
+            spans_are_near(*payment_span, code_span, PAYMENT_CODE_PROXIMITY_BYTES)
+        }) {
+            spans.push(code_span);
+        }
+    }
+
+    spans.sort_by_key(|span| (span.start, span.end));
+    let mut redacted = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    for span in spans {
+        if span.start < cursor {
+            continue;
+        }
+        redacted.push_str(&source[cursor..span.start]);
+        redacted.push_str("[REDACTED_PAYMENT_DATA]");
+        cursor = span.end;
+        count += 1;
+    }
+    redacted.push_str(&source[cursor..]);
+
+    if count == 0 {
+        return;
+    }
+    *text = redacted;
+    redactions.push(format!("payment_credential x{}", count));
+    push_secret_kind(kinds, SecretInputType::PaymentCredential);
 }
 
 pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
@@ -497,6 +752,7 @@ pub fn redact_secret_input(text: &str) -> SecretRedactionResult {
         "secret_query_param",
         SecretInputType::ApiKeyOrToken,
     );
+    apply_payment_credential_redaction(&mut redacted, &mut redactions, &mut kinds);
     apply_opaque_token_redaction(&mut redacted, &mut redactions, &mut kinds);
 
     SecretRedactionResult {
@@ -607,6 +863,20 @@ mod tests {
     }
 
     #[test]
+    fn test_secret_redaction_keeps_public_url_slug_filenames() {
+        let message = concat!(
+            "Trevi https://www.skylinewebcams.com/en/webcam/italia/lazio/roma/fontana-di-trevi.html ",
+            "Rialto https://www.skylinewebcams.com/en/webcam/italia/veneto/venezia/rialto-canal-grande.html"
+        );
+        let result = redact_secret_input(message);
+
+        assert!(!result.had_secret());
+        assert_eq!(result.text, message);
+        assert!(result.text.contains("fontana-di-trevi.html"));
+        assert!(result.text.contains("rialto-canal-grande.html"));
+    }
+
+    #[test]
     fn test_secret_redaction_keeps_sentence_with_internal_identifier() {
         let message = "Inspect memory_capture_events and capture model health";
         let result = redact_secret_input(message);
@@ -631,5 +901,59 @@ mod tests {
         assert!(result.had_secret());
         assert!(result.text.contains("token=[REDACTED_SECRET]"));
         assert!(!result.text.contains("supersecretvalue123456"));
+    }
+
+    #[test]
+    fn test_secret_redaction_masks_payment_credentials_by_shape() {
+        let result = redact_secret_input("Use 4242 4242 4242 4242 with 899 at checkout");
+
+        assert!(result.had_secret());
+        assert_eq!(
+            result.primary_kind(),
+            Some(SecretInputType::PaymentCredential)
+        );
+        assert!(!result.text.contains("4242 4242 4242 4242"));
+        assert!(!result.text.contains("899"));
+        assert!(result.text.contains("[REDACTED_PAYMENT_DATA]"));
+
+        let punctuated = redact_secret_input("Use 4242 4242 4242 4242.");
+        assert!(punctuated.had_secret());
+        assert!(punctuated.text.contains("[REDACTED_PAYMENT_DATA]."));
+    }
+
+    #[test]
+    fn test_secret_redaction_masks_compact_payment_like_values() {
+        let result = redact_secret_input("123412342344 899");
+
+        assert!(result.had_secret());
+        assert!(!result.text.contains("123412342344"));
+        assert!(!result.text.contains("899"));
+    }
+
+    #[test]
+    fn test_secret_redaction_keeps_decimal_telemetry_values() {
+        for input in [
+            r#""cost_usd": 0.012934658880000002"#,
+            r#""cost_usd":"0.21772148112000006""#,
+            r#""value":0.29229803162999984"#,
+        ] {
+            let result = redact_secret_input(input);
+            assert!(!result.had_secret(), "unexpected redaction for {input}");
+            assert_eq!(result.text, input);
+        }
+    }
+
+    #[test]
+    fn security_errors_have_machine_readable_codes() {
+        let error = SecurityError::tool_argument_denied("private_or_local_ip");
+
+        assert_eq!(
+            error.code(),
+            "security_tool_argument_denied_private_or_local_ip"
+        );
+        assert_eq!(
+            error.to_string(),
+            "ERR/security/tool_argument_denied: tool argument denied (private_or_local_ip)"
+        );
     }
 }

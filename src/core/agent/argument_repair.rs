@@ -12,8 +12,8 @@
 use super::*;
 
 /// Intent context passed into LLM-based argument repair so the model can fill
-/// missing required fields semantically — using the user's underlying meaning
-/// plus the routing classifier's signals plus the active turn-plan goals —
+/// missing required fields semantically: using the user's underlying meaning
+/// plus the routing classifier's signals plus the active turn-plan goals,
 /// rather than guessing from the surface phrasing of the user message alone.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ArgumentRepairContext {
@@ -295,10 +295,7 @@ mod tests {
             .collect();
         let mut properties = serde_json::Map::new();
         for field in required {
-            properties.insert(
-                (*field).to_string(),
-                serde_json::json!({"type": "string"}),
-            );
+            properties.insert((*field).to_string(), serde_json::json!({"type": "string"}));
         }
         crate::actions::ActionDef {
             name: name.to_string(),
@@ -334,9 +331,9 @@ mod tests {
 
     #[test]
     fn required_argument_present_treats_blank_strings_as_absent() {
-        assert!(!required_argument_present(Some(&serde_json::Value::String(
-            "   ".into()
-        ))));
+        assert!(!required_argument_present(Some(
+            &serde_json::Value::String("   ".into())
+        )));
         assert!(required_argument_present(Some(&serde_json::Value::String(
             "a".into()
         ))));
@@ -353,16 +350,8 @@ mod tests {
     #[test]
     fn repair_memo_key_is_stable_under_field_reordering() {
         let payload: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        let key_a = repair_memo_key(
-            "file_write",
-            &["path".into(), "content".into()],
-            &payload,
-        );
-        let key_b = repair_memo_key(
-            "file_write",
-            &["content".into(), "path".into()],
-            &payload,
-        );
+        let key_a = repair_memo_key("file_write", &["path".into(), "content".into()], &payload);
+        let key_b = repair_memo_key("file_write", &["content".into(), "path".into()], &payload);
         assert_eq!(key_a, key_b);
     }
 

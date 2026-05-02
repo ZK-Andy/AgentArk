@@ -1,4 +1,5 @@
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import {
   Accordion,
   AccordionDetails,
@@ -7,6 +8,7 @@ import {
   Box,
   Button,
   Chip,
+  IconButton,
   Stack,
   Tab,
   Table,
@@ -16,6 +18,7 @@ import {
   TableHead,
   TableRow,
   Tabs,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -23,7 +26,6 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import MemoryPage from "./MemoryPage";
-import { withProjectScope } from "./projectScope";
 import {
   asRecord,
   errMessage,
@@ -139,15 +141,11 @@ function replayGateLabel(status: string): string {
 
 type ArkMemoryPageProps = {
   autoRefresh: boolean;
-  projects: JsonRecord[];
-  activeProjectId: string;
   onNavigateToView?: (view: string, replace?: boolean) => void;
 };
 
 export default function ArkMemoryPage({
   autoRefresh,
-  projects,
-  activeProjectId,
   onNavigateToView,
 }: ArkMemoryPageProps) {
   const queryClient = useQueryClient();
@@ -169,32 +167,24 @@ export default function ArkMemoryPage({
   };
 
   const summaryQ = useQuery({
-    queryKey: ["arkmemory-summary", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/summary", activeProjectId)),
+    queryKey: ["arkmemory-summary"],
+    queryFn: () => api.rawGet("/arkmemory/summary"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const queueQ = useQuery({
-    queryKey: ["arkmemory-queue", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/queue?limit=50", activeProjectId)),
+    queryKey: ["arkmemory-queue"],
+    queryFn: () => api.rawGet("/arkmemory/queue?limit=50"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const ledgerQ = useQuery({
-    queryKey: ["arkmemory-ledger", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/arkmemory/ledger?limit=80", activeProjectId)),
+    queryKey: ["arkmemory-ledger"],
+    queryFn: () => api.rawGet("/arkmemory/ledger?limit=80"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
   const approveQueueMutation = useMutation({
     mutationFn: (id: string) =>
-      api.rawPost(
-        withProjectScope(
-          `/arkmemory/queue/${encodeURIComponent(id)}/approve`,
-          activeProjectId,
-        ),
-      ),
+      api.rawPost(`/arkmemory/queue/${encodeURIComponent(id)}/approve`),
     onSuccess: async () => {
       setNotice("Memory queue item applied.");
       await invalidateArkMemory();
@@ -202,12 +192,7 @@ export default function ArkMemoryPage({
   });
   const rejectQueueMutation = useMutation({
     mutationFn: (id: string) =>
-      api.rawPost(
-        withProjectScope(
-          `/arkmemory/queue/${encodeURIComponent(id)}/reject`,
-          activeProjectId,
-        ),
-      ),
+      api.rawPost(`/arkmemory/queue/${encodeURIComponent(id)}/reject`),
     onSuccess: async () => {
       setNotice("Memory queue item rejected.");
       await invalidateArkMemory();
@@ -215,12 +200,7 @@ export default function ArkMemoryPage({
   });
   const rollbackMutation = useMutation({
     mutationFn: (id: string) =>
-      api.rawPost(
-        withProjectScope(
-          `/arkmemory/ledger/${encodeURIComponent(id)}/rollback`,
-          activeProjectId,
-        ),
-      ),
+      api.rawPost(`/arkmemory/ledger/${encodeURIComponent(id)}/rollback`),
     onSuccess: async () => {
       setNotice("Memory restored from history.");
       await invalidateArkMemory();
@@ -304,16 +284,13 @@ export default function ArkMemoryPage({
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="ArkCore"
+        eyebrow="Ark Core"
         title="ArkMemory"
-        descriptionNoWrap
         description={
           <>
-            Current facts, preferences, user data, and knowledge.
-            <span className="workspace-page-note">
-              New memories may take a little time to appear while ArkMemory
-              consolidates background signals outside the active chat.
-            </span>
+            ArkMemory is what the agent remembers about you and your work.
+            <br />
+            It stores facts, preferences, recurring patterns, and useful knowledge gathered from your chats and from background signals across AgentArk.
           </>
         }
       />
@@ -325,6 +302,28 @@ export default function ArkMemoryPage({
       {firstError ? (
         <Alert severity="error">{errMessage(firstError)}</Alert>
       ) : null}
+      <Stack
+        direction="row"
+        spacing={0.45}
+        sx={{ alignItems: "center", color: "text.secondary" }}
+      >
+        <Tooltip
+          title="ArkMemory consolidates background signals outside the active chat, so newly saved memories take a little time to show up here."
+          arrow
+          placement="top-start"
+        >
+          <IconButton
+            size="small"
+            aria-label="ArkMemory consolidation timing details"
+            sx={{ p: 0.2, color: "text.secondary" }}
+          >
+            <InfoOutlinedIcon sx={{ fontSize: 16 }} />
+          </IconButton>
+        </Tooltip>
+        <Typography variant="body2" sx={{ color: "text.secondary" }}>
+          New memories may take a moment to appear.
+        </Typography>
+      </Stack>
 
       <Box className="list-shell stat-strip">
         {statItems.map((item) => (
@@ -364,8 +363,6 @@ export default function ArkMemoryPage({
       {memoryTab === "current" ? (
         <MemoryPage
           autoRefresh={autoRefresh}
-          projects={projects}
-          activeProjectId={activeProjectId}
           showHeader={false}
           showScopeControls={false}
           onNavigateToView={onNavigateToView}

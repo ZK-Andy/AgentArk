@@ -7,8 +7,8 @@ use anyhow::Result;
 use std::path::Path;
 
 pub mod agent;
-pub mod classifier_prompt_evolution;
 pub mod coding_guidelines;
+pub mod gepa_bridge;
 pub mod policy_evolution;
 pub mod prompt_evolution;
 pub mod replay_gate;
@@ -19,13 +19,6 @@ pub mod strategy_runtime;
 pub mod tools;
 
 pub use agent::{SelfEvolveAgent, SelfEvolveConfig};
-pub use classifier_prompt_evolution::{
-    ClassifierPromptBundleDiffSummary, ClassifierPromptBundleProfile,
-    ClassifierPromptEvolutionConfig, ClassifierPromptEvolutionEngine,
-    ClassifierPromptEvolutionResult, CLASSIFIER_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
-    CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY, CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
-    CLASSIFIER_PROMPT_BUNDLE_PROFILE_CANARY_KEY, CLASSIFIER_PROMPT_BUNDLE_PROFILE_KEY,
-};
 pub use policy_evolution::{
     PolicyEvolutionConfig, PolicyEvolutionEngine, ROUTING_COMPLEXITY_POLICY_KEY,
 };

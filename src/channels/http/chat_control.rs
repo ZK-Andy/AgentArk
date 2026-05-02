@@ -1,4 +1,179 @@
 use super::*;
+use futures::FutureExt as _;
+
+static CHAT_WORKER_RUNTIME: OnceLock<std::result::Result<Arc<tokio::runtime::Runtime>, String>> =
+    OnceLock::new();
+static CHAT_WORKER_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+// Keep long model/tool turns off the control-plane runtime so health and UI APIs stay responsive.
+fn chat_worker_thread_count() -> usize {
+    std::env::var("AGENTARK_CHAT_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(4)
+                .max(2)
+        })
+        .clamp(1, 64)
+}
+
+fn chat_worker_max_concurrency() -> usize {
+    std::env::var("AGENTARK_CHAT_WORKER_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(chat_worker_thread_count)
+        .clamp(1, 64)
+}
+
+fn chat_turn_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_CHAT_TURN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 30)
+        .unwrap_or(900)
+        .min(7_200)
+}
+
+fn chat_worker_queue_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_CHAT_WORKER_QUEUE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(15)
+        .min(300)
+}
+
+fn chat_worker_permits() -> Arc<tokio::sync::Semaphore> {
+    CHAT_WORKER_PERMITS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(chat_worker_max_concurrency())))
+        .clone()
+}
+
+fn chat_worker_runtime() -> std::result::Result<Arc<tokio::runtime::Runtime>, String> {
+    CHAT_WORKER_RUNTIME
+        .get_or_init(|| {
+            let worker_threads = chat_worker_thread_count();
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .thread_name("agentark-chat-worker")
+                .enable_all()
+                .build()
+                .map(|runtime| {
+                    tracing::info!(worker_threads, "Started dedicated chat worker runtime");
+                    Arc::new(runtime)
+                })
+                .map_err(|error| format!("Failed to start chat worker runtime: {}", error))
+        })
+        .clone()
+}
+
+fn chat_worker_panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+async fn run_chat_worker_task<F, T>(
+    task_name: &'static str,
+    future: F,
+) -> std::result::Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = chat_worker_runtime()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let permits = chat_worker_permits();
+        let queue_timeout_secs = chat_worker_queue_timeout_secs();
+        let _permit = match tokio::time::timeout(
+            Duration::from_secs(queue_timeout_secs),
+            permits.acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                let _ = tx.send(Err("Chat worker concurrency limiter closed".to_string()));
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(Err(format!(
+                    "Chat worker queue timed out after {} seconds",
+                    queue_timeout_secs
+                )));
+                return;
+            }
+        };
+        let timeout_secs = chat_turn_timeout_secs();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            std::panic::AssertUnwindSafe(future).catch_unwind(),
+        )
+        .await;
+        let result = match outcome {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(payload)) => {
+                let panic = chat_worker_panic_payload_to_string(payload);
+                tracing::error!(
+                    task = task_name,
+                    panic = %panic,
+                    "Chat worker task panicked"
+                );
+                Err(format!("Chat worker task panicked: {}", panic))
+            }
+            Err(_) => Err(format!(
+                "Chat worker task '{}' timed out after {} seconds",
+                task_name, timeout_secs
+            )),
+        };
+        let _ = tx.send(result);
+    });
+    rx.await
+        .map_err(|_| format!("Chat worker task '{}' ended without a result", task_name))?
+}
+
+fn spawn_chat_worker_logged<F>(
+    task_name: &'static str,
+    future: F,
+) -> std::result::Result<(), String>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: crate::core::spawn::SpawnLoggedOutcome + Send + 'static,
+{
+    let runtime = chat_worker_runtime()?;
+    runtime.spawn(async move {
+        let permits = chat_worker_permits();
+        let _permit = match permits.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::error!(task = task_name, "Chat worker concurrency limiter closed");
+                return;
+            }
+        };
+        match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+            Ok(output) => {
+                crate::core::spawn::SpawnLoggedOutcome::log_if_error(output, task_name);
+            }
+            Err(payload) => {
+                tracing::error!(
+                    task = task_name,
+                    panic = %chat_worker_panic_payload_to_string(payload),
+                    "Chat worker task panicked"
+                );
+            }
+        }
+    });
+    Ok(())
+}
 
 pub(super) fn conversation_not_found_response() -> Response {
     (
@@ -16,15 +191,37 @@ pub(super) fn build_request_execution_hints(
     direct_user_intent: bool,
     attachments: Vec<crate::core::ChatAttachmentHint>,
 ) -> crate::core::RequestExecutionHints {
+    build_request_execution_hints_with_arkorbit(
+        caller,
+        surface,
+        direct_user_intent,
+        attachments,
+        None,
+    )
+}
+
+/// Variant that also threads ArkOrbit per-call context through to the agent
+/// loop. The context is structural (orbit id, widget summary, optional
+/// `agent_instructions`); routing/inference are unchanged.
+pub(super) fn build_request_execution_hints_with_arkorbit(
+    caller: Option<&crate::actions::ActionCallerPrincipal>,
+    surface: crate::actions::ActionExecutionSurface,
+    direct_user_intent: bool,
+    attachments: Vec<crate::core::ChatAttachmentHint>,
+    arkorbit_context: Option<serde_json::Value>,
+) -> crate::core::RequestExecutionHints {
     crate::core::RequestExecutionHints {
         caller_principal: caller.cloned(),
         execution_surface: surface,
         direct_user_intent,
         routing: None,
+        routing_trusted: false,
         intent_plan: None,
+        force_agent_loop: false,
         secret_offered: None,
         attachments,
         saved_user_facts_context: None,
+        arkorbit_context,
     }
 }
 
@@ -48,12 +245,12 @@ pub(super) async fn resolve_chat_request_conversation_id(
     state: &AppState,
     channel: &str,
     conversation_id: Option<&str>,
-    project_id: Option<&str>,
+    _project_id: Option<&str>,
     message: &str,
 ) -> std::result::Result<String, Response> {
     let agent = state.agent.read().await;
     match agent
-        .ensure_conversation_id_for_request(channel, conversation_id, project_id, message)
+        .ensure_conversation_id_for_request(channel, conversation_id, None, message)
         .await
     {
         Ok(conversation_id) => Ok(conversation_id),
@@ -82,26 +279,35 @@ pub(super) async fn chat(
         return response;
     }
 
-    let resolved_conversation_id = match resolve_chat_request_conversation_id(
-        &state,
-        &request.channel,
-        request.conversation_id.as_deref(),
-        request.project_id.as_deref(),
-        &request.message,
-    )
-    .await
+    if let Some(existing_conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
     {
-        Ok(conversation_id) => conversation_id,
-        Err(response) => return response,
-    };
-    request.conversation_id = Some(resolved_conversation_id);
+        let resolved_conversation_id = match resolve_chat_request_conversation_id(
+            &state,
+            &request.channel,
+            Some(existing_conversation_id.as_str()),
+            None,
+            &request.message,
+        )
+        .await
+        {
+            Ok(conversation_id) => conversation_id,
+            Err(response) => return response,
+        };
+        request.conversation_id = Some(resolved_conversation_id);
+    } else {
+        request.conversation_id = None;
+    }
 
     tracing::info!(
-        "HTTP /chat request: channel={}, msg={}chars, conv_id={:?}, project={:?}",
+        "HTTP /chat request: channel={}, msg={}chars, conv_id={:?}",
         request.channel,
         request.message.len(),
         request.conversation_id.as_deref().unwrap_or("-"),
-        request.project_id.as_deref().unwrap_or("-"),
     );
 
     // Internal escape hatch only. The product UX is the secure credential form.
@@ -406,18 +612,34 @@ pub(super) async fn chat(
     let message = request.message.clone();
     let channel = request.channel.clone();
     let conversation_id = request.conversation_id.clone();
-    let project_id = request.project_id.clone();
+    let project_id: Option<String> = None;
+    let execution_mode = request
+        .execution_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(64).collect::<String>());
+    if let Some(execution_mode) = execution_mode.as_deref() {
+        tracing::debug!(
+            execution_mode,
+            "Chat request included client execution mode hint"
+        );
+    }
     if request.attachments_present && request.attachments.is_empty() {
         tracing::debug!(
             "Chat request indicated attachments were present, but no structured attachment hints were supplied"
         );
     }
+    if request.arkorbit_context.is_some() {
+        tracing::debug!("Chat request included ArkOrbit structural context");
+    }
     let attachments = request.attachments.clone();
+    let arkorbit_context = request.arkorbit_context.clone();
     let caller_principal = maybe_caller.as_ref().map(|Extension(value)| value.clone());
     let agent_for_chat = state.agent.clone();
 
     let result = {
-        let worker = tokio::spawn(async move {
+        let worker = run_chat_worker_task("http_chat_turn", async move {
             let agent_snapshot = Agent::snapshot(&agent_for_chat).await;
             agent_snapshot
                 .process_message_with_meta_and_hints(
@@ -425,43 +647,42 @@ pub(super) async fn chat(
                     &channel,
                     conversation_id.as_deref(),
                     project_id.as_deref(),
-                    build_request_execution_hints(
+                    build_request_execution_hints_with_arkorbit(
                         caller_principal.as_ref(),
                         crate::actions::ActionExecutionSurface::Chat,
                         true,
                         attachments,
+                        arkorbit_context,
                     ),
                 )
                 .await
-        });
-        match worker.await {
+        })
+        .await;
+        match worker {
             Ok(result) => result,
             Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
         }
     };
 
     match result {
-        Ok(processed) => {
-            spawn_autonomy_analysis_tick(state.agent.clone(), "chat_event");
-            (
-                StatusCode::OK,
-                Json(ChatResponse {
-                    response: processed.response,
-                    proof_id: None,
-                    conversation_id: processed.conversation_id.or(original_conversation_id),
-                    conversation_title: processed.conversation_title,
-                    run_id: processed.run_id,
-                    run_status: processed.run_status,
-                    trace_id: processed.trace_id,
-                    total_tokens: processed.total_tokens,
-                    choices: processed.choices,
-                    degradation: processed.degradation,
-                    attempted_models: processed.attempted_models,
-                    user_outcome: processed.user_outcome,
-                }),
-            )
-                .into_response()
-        }
+        Ok(processed) => (
+            StatusCode::OK,
+            Json(ChatResponse {
+                response: processed.response,
+                proof_id: None,
+                conversation_id: processed.conversation_id.or(original_conversation_id),
+                conversation_title: processed.conversation_title,
+                run_id: processed.run_id,
+                run_status: processed.run_status,
+                trace_id: processed.trace_id,
+                total_tokens: processed.total_tokens,
+                choices: processed.choices,
+                degradation: processed.degradation,
+                attempted_models: processed.attempted_models,
+                user_outcome: processed.user_outcome,
+            }),
+        )
+            .into_response(),
         Err(e) => {
             if e.to_string() == "Conversation not found" {
                 return conversation_not_found_response();
@@ -677,7 +898,6 @@ pub(super) fn normalize_stream_event_for_sse(
             description,
             work_type,
             conversation_id,
-            project_id,
         } => (
             Some((
                 "task_started",
@@ -687,7 +907,6 @@ pub(super) fn normalize_stream_event_for_sse(
                     "status": "in_progress",
                     "work_type": work_type,
                     "conversation_id": conversation_id,
-                    "project_id": project_id,
                 }),
             )),
             String::new(),
@@ -714,6 +933,33 @@ pub(super) fn normalize_stream_event_for_sse(
                     detail,
                 )
             }
+        }
+        crate::core::StreamEvent::ReasoningDelta {
+            phase,
+            content_delta,
+            done,
+        } => {
+            let normalized_phase = phase.trim();
+            let content = content_delta;
+            let stream_key = if normalized_phase.is_empty() {
+                "reasoning:active".to_string()
+            } else {
+                format!("reasoning:{}", normalized_phase)
+            };
+            (
+                Some((
+                    "reasoning_delta",
+                    serde_json::json!({
+                        "kind": "reasoning_delta",
+                        "phase": normalized_phase,
+                        "content": content.clone(),
+                        "content_delta": content,
+                        "done": done,
+                        "stream_key": stream_key,
+                    }),
+                )),
+                String::new(),
+            )
         }
         crate::core::StreamEvent::ToolStart { name, payload } => {
             let payload_json = if let Some(payload) = payload {
@@ -846,7 +1092,10 @@ pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event 
                 merged.insert("title".to_string(), serde_json::json!("Thinking"));
             }
             if !merged.contains_key("__streamKey") {
-                merged.insert("__streamKey".to_string(), serde_json::json!("public-thinking"));
+                merged.insert(
+                    "__streamKey".to_string(),
+                    serde_json::json!("public-thinking"),
+                );
             }
             merged
         }
@@ -889,26 +1138,31 @@ pub(super) fn run_event_to_sse_event(run_event: crate::core::RunEvent) -> Event 
                     .and_then(|value| value.as_str())
                     .unwrap_or_default(),
             );
+            let mut merged = serde_json::Map::new();
+            merged.insert("name".to_string(), serde_json::json!(name));
+            merged.insert("content".to_string(), serde_json::json!(content));
+            if let Some(obj) = run_event.payload.as_object() {
+                for (key, value) in obj {
+                    if matches!(key.as_str(), "name" | "content" | "payload") {
+                        continue;
+                    }
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
             if let Some(inner) = run_event
                 .payload
                 .get("payload")
                 .and_then(|value| value.as_object())
             {
-                let mut merged = serde_json::Map::new();
-                merged.insert("name".to_string(), serde_json::json!(name));
-                merged.insert("content".to_string(), serde_json::json!(content));
                 for (key, value) in inner {
+                    if matches!(key.as_str(), "name" | "content") {
+                        continue;
+                    }
                     merged.insert(key.clone(), value.clone());
                 }
                 merged
             } else {
-                serde_json::json!({
-                    "name": name,
-                    "content": content,
-                })
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
+                merged
             }
         }
         "tool_result" => {
@@ -1199,12 +1453,928 @@ pub(super) fn deep_research_notification_details(
     }
 }
 
+fn deep_research_plan_id(task_id: &str) -> String {
+    let suffix = task_id
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(8)
+        .collect::<String>();
+    if suffix.is_empty() {
+        "deep-research-plan".to_string()
+    } else {
+        format!("deep-research-{}", suffix)
+    }
+}
+
+fn deep_research_topic_label(message: &str) -> String {
+    let label = truncate_stream_task_text(message.trim(), 120);
+    if label.is_empty() {
+        "this topic".to_string()
+    } else {
+        label
+    }
+}
+
+fn default_deep_research_plan(message: &str, task_id: &str) -> crate::core::ExecutionPlan {
+    let topic = deep_research_topic_label(message);
+    crate::core::ExecutionPlan {
+        plan_id: deep_research_plan_id(task_id),
+        revision: 1,
+        summary: format!(
+            "Investigate {} with search, source reading, verification, and a cited synthesis.",
+            topic
+        ),
+        steps: vec![
+            crate::core::PlanStep {
+                id: 1,
+                title: "Scope the research question".to_string(),
+                description:
+                    "Confirm the topic, source strategy, freshness needs, and verification criteria."
+                        .to_string(),
+                action: None,
+                arguments: None,
+                tool_hint: Some("research".to_string()),
+                status: Some(crate::core::PlanStepStatus::Pending),
+                substeps: Vec::new(),
+            },
+            crate::core::PlanStep {
+                id: 2,
+                title: "Search across source angles".to_string(),
+                description:
+                    "Collect primary, recent, comparative, and risk-focused source candidates."
+                        .to_string(),
+                action: Some("research".to_string()),
+                arguments: Some(serde_json::json!({
+                    "query": message,
+                    "depth": "deep",
+                })),
+                tool_hint: Some("research".to_string()),
+                status: Some(crate::core::PlanStepStatus::Pending),
+                substeps: Vec::new(),
+            },
+            crate::core::PlanStep {
+                id: 3,
+                title: "Read and verify evidence".to_string(),
+                description:
+                    "Open selected sources, extract evidence, and track gaps or contradictions."
+                        .to_string(),
+                action: Some("research".to_string()),
+                arguments: Some(serde_json::json!({
+                    "query": message,
+                    "depth": "deep",
+                })),
+                tool_hint: Some("research".to_string()),
+                status: Some(crate::core::PlanStepStatus::Pending),
+                substeps: Vec::new(),
+            },
+            crate::core::PlanStep {
+                id: 4,
+                title: "Synthesize cited report".to_string(),
+                description:
+                    "Compare findings, call out unresolved issues, and produce the final answer with sources."
+                        .to_string(),
+                action: Some("research".to_string()),
+                arguments: Some(serde_json::json!({
+                    "query": message,
+                    "depth": "deep",
+                })),
+                tool_hint: Some("research".to_string()),
+                status: Some(crate::core::PlanStepStatus::Pending),
+                substeps: Vec::new(),
+            },
+        ],
+    }
+}
+
+fn normalize_deep_research_plan(
+    mut plan: crate::core::ExecutionPlan,
+    message: &str,
+    task_id: &str,
+) -> crate::core::ExecutionPlan {
+    if plan.plan_id.trim().is_empty() {
+        plan.plan_id = deep_research_plan_id(task_id);
+    }
+    if plan.revision == 0 {
+        plan.revision = 1;
+    }
+    if plan.summary.trim().is_empty() {
+        plan.summary = default_deep_research_plan(message, task_id).summary;
+    }
+    if plan.steps.is_empty() {
+        plan.steps = default_deep_research_plan(message, task_id).steps;
+    }
+    for (index, step) in plan.steps.iter_mut().enumerate() {
+        if step.id == 0 {
+            step.id = index + 1;
+        }
+        if step.title.trim().is_empty() {
+            step.title = format!("Research step {}", index + 1);
+        }
+        if step.status.is_none() {
+            step.status = Some(crate::core::PlanStepStatus::Pending);
+        }
+    }
+    plan
+}
+
+fn deep_research_plan_from_value(
+    value: Option<&serde_json::Value>,
+    message: &str,
+    task_id: &str,
+) -> crate::core::ExecutionPlan {
+    value
+        .cloned()
+        .and_then(|raw| serde_json::from_value::<crate::core::ExecutionPlan>(raw).ok())
+        .map(|plan| normalize_deep_research_plan(plan, message, task_id))
+        .unwrap_or_else(|| default_deep_research_plan(message, task_id))
+}
+
+fn deep_research_step_for_phase(plan: &crate::core::ExecutionPlan, phase: &str) -> (usize, String) {
+    let count = plan.steps.len().max(1);
+    let ordinal = match phase.trim().to_ascii_lowercase().as_str() {
+        "planning" => 1,
+        "searching" | "ranking" => {
+            if count >= 4 {
+                2
+            } else {
+                1
+            }
+        }
+        "reading" => {
+            if count >= 4 {
+                3
+            } else if count >= 3 {
+                2
+            } else {
+                count
+            }
+        }
+        "synthesis" => count,
+        _ => count.min(2),
+    }
+    .clamp(1, count);
+
+    plan.steps
+        .get(ordinal - 1)
+        .map(|step| (step.id, step.title.clone()))
+        .unwrap_or((ordinal, format!("Research step {}", ordinal)))
+}
+
+async fn send_deep_research_plan_step_update(
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
+    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
+    run_id: &str,
+    channel: &str,
+    plan: &crate::core::ExecutionPlan,
+    step_id: usize,
+    step_title: String,
+    status: &str,
+    detail: impl Into<String>,
+) {
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "plan_step_update",
+        serde_json::json!({
+            "step_type": "plan_step_update",
+            "plan_id": plan.plan_id,
+            "revision": plan.revision,
+            "step_id": step_id,
+            "step_title": step_title,
+            "status": status,
+            "detail": detail.into(),
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+}
+
+async fn persist_deep_research_chat_message(
+    agent: &Agent,
+    conversation_id: Option<&str>,
+    role: &str,
+    content: &str,
+    model_used: Option<&str>,
+    trace_id: Option<&str>,
+) {
+    let Some(conversation_id) = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let should_update_title = role == "user"
+        && agent
+            .storage
+            .get_conversation(conversation_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|conversation| {
+                conversation.message_count == 0 || conversation.title.trim() == "New Chat"
+            })
+            .unwrap_or(false);
+    let message = crate::storage::entities::message::Model {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: conversation_id.to_string(),
+        role: role.to_string(),
+        content: content.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        model_used: model_used.map(str::to_string),
+        trace_id: trace_id.map(str::to_string),
+    };
+    if let Err(error) = agent
+        .encrypted_storage
+        .insert_message_encrypted(&message)
+        .await
+    {
+        tracing::warn!(
+            "Failed to persist deep research {} message for conversation '{}': {}",
+            role,
+            conversation_id,
+            error
+        );
+        return;
+    }
+    if should_update_title {
+        let title = truncate_stream_task_text(content, 48);
+        if !title.trim().is_empty() {
+            let _ = agent
+                .storage
+                .update_conversation(conversation_id, Some(&title), None, None)
+                .await;
+        }
+    }
+}
+
+fn deep_research_setup_issue(error_text: &str) -> bool {
+    let normalized = error_text
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains(
+        crate::actions::search::SEARCH_PROVIDER_SETUP_REQUIRED_MESSAGE
+            .to_ascii_lowercase()
+            .as_str(),
+    ) || normalized.contains("no search backend")
+        || normalized.contains("search backend") && normalized.contains("not configured")
+        || normalized.contains("no usable sources")
+        || normalized.contains("all search angles failed")
+        || normalized.contains("available search backends")
+}
+
+fn deep_research_error_message(error: &anyhow::Error) -> String {
+    let error_text = error.to_string();
+    if deep_research_setup_issue(&error_text) {
+        format!(
+            "Deep research stopped because AgentArk does not have a reliable search backend available for this run. Configure a reachable SearXNG instance or an API-backed search provider such as Serper, Brave Search API, Exa, Tavily, Perplexity, or Firecrawl in Search Settings, then retry this research task.\n\nDetails: {}",
+            truncate_stream_task_text(&error_text, 900)
+        )
+    } else {
+        format!(
+            "Deep research stopped before it could produce a trustworthy cited report. I did not synthesize an answer without usable source evidence.\n\nDetails: {}",
+            truncate_stream_task_text(&error_text, 900)
+        )
+    }
+}
+
+async fn prepare_deep_research_plan_confirmation(
+    app_state: &AppState,
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
+    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
+    run_storage: &crate::storage::Storage,
+    run_id: &str,
+    channel: &str,
+    message: &str,
+    conversation_id: Option<&str>,
+    _project_id: Option<&str>,
+    attachments: &[crate::core::ChatAttachmentHint],
+) -> anyhow::Result<()> {
+    let task_id = uuid::Uuid::new_v4();
+    let plan = default_deep_research_plan(message, &task_id.to_string());
+    let plan_json = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
+    let description = format!(
+        "Deep research: {}",
+        truncate_stream_task_text(&deep_research_topic_label(message), 96)
+    );
+    let mut task = crate::core::Task::new(
+        description.clone(),
+        "chat_request".to_string(),
+        serde_json::json!({
+            "_task_kind": "chat_request",
+            "_origin": "chat",
+            "_work_type": "research",
+            "_pause_kind": "plan_confirmation",
+            "_plan_preview": {
+                "original_plan": plan_json,
+                "current_plan": plan_json,
+                "source": "deep_research"
+            },
+            "message": message,
+            "channel": channel,
+            "conversation_id": conversation_id,
+            "deep_research": true,
+            "attachments_present": !attachments.is_empty(),
+            "attachments": attachments,
+        }),
+    );
+    task.id = task_id;
+    task.status = crate::core::TaskStatus::Paused;
+    task.capabilities = vec!["network".to_string(), "research".to_string()];
+
+    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
+    persist_deep_research_chat_message(
+        &agent_snapshot,
+        conversation_id,
+        "user",
+        message,
+        None,
+        None,
+    )
+    .await;
+    agent_snapshot.add_task(task.clone()).await?;
+
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "task_started",
+        serde_json::json!({
+            "task_id": task.id.to_string(),
+            "description": task.description,
+            "status": "paused",
+            "work_type": "research",
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::Critical,
+    )
+    .await;
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "plan_generated",
+        serde_json::json!({
+            "step_type": "plan_generated",
+            "task_id": task.id.to_string(),
+            "source": "deep_research",
+            "plan": plan,
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "plan_ready_for_confirmation",
+        serde_json::json!({
+            "step_type": "plan_ready_for_confirmation",
+            "task_id": task.id.to_string(),
+            "source": "deep_research",
+            "plan": plan,
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::Critical,
+    )
+    .await;
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "task_status",
+        serde_json::json!({
+            "task_id": task.id.to_string(),
+            "description": description,
+            "status": "paused",
+            "work_type": "research",
+            "result_preview": "Deep research plan is awaiting confirmation.",
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+    upsert_chat_stream_execution_run(
+        run_storage,
+        run_id,
+        conversation_id,
+        channel,
+        message,
+        crate::core::ExecutionRunStatus::NeedsInput,
+        Some("Deep research plan is awaiting confirmation.".to_string()),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await;
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "run_status",
+        serde_json::json!({
+            "run_id": run_id,
+            "run_status": "needs_input",
+            "trace_id": serde_json::Value::Null,
+            "summary": "Deep research plan is awaiting confirmation.",
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+    Ok(())
+}
+
+async fn run_approved_deep_research_stream(
+    app_state: &AppState,
+    tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, std::convert::Infallible>>,
+    live_runs: &std::sync::Arc<crate::core::LiveRunRegistry>,
+    run_storage: &crate::storage::Storage,
+    run_id: &str,
+    channel: &str,
+    message: &str,
+    conversation_id: Option<&str>,
+    _project_id: Option<&str>,
+    task: &StreamedChatTask,
+    started_at: std::time::Instant,
+) -> anyhow::Result<()> {
+    let task_uuid = uuid::Uuid::parse_str(&task.task_id)
+        .map_err(|error| anyhow::anyhow!("Invalid deep research task id: {}", error))?;
+    let plan = deep_research_plan_from_value(task.plan_override.as_ref(), message, &task.task_id);
+
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "task_status",
+        serde_json::json!({
+            "task_id": task.task_id,
+            "description": task.description,
+            "status": "in_progress",
+            "work_type": task.work_type,
+            "conversation_id": conversation_id,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+    send_chat_stream_event(
+        tx,
+        live_runs,
+        run_id,
+        "chat",
+        channel,
+        "tool_start",
+        serde_json::json!({
+            "name": "research",
+            "query": message,
+            "depth": "deep",
+            "plan_id": plan.plan_id,
+            "plan_revision": plan.revision,
+        }),
+        crate::core::RunEventPriority::High,
+    )
+    .await;
+
+    let agent_snapshot = Agent::snapshot(&app_state.agent).await;
+    let search_config = crate::runtime::build_search_config(
+        &agent_snapshot.config_dir,
+        Some(&agent_snapshot.storage),
+    )
+    .await;
+    drop(agent_snapshot);
+
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::actions::research::ResearchProgressUpdate>();
+    let progress = crate::actions::research::ResearchProgressReporter::new(progress_tx);
+    let progress_forwarder = {
+        let tx = tx.clone();
+        let live_runs = live_runs.clone();
+        let run_id = run_id.to_string();
+        let channel = channel.to_string();
+        let plan = plan.clone();
+        crate::spawn_logged!("src/channels/http.rs:deep_research_progress", async move {
+            while let Some(update) = progress_rx.recv().await {
+                let (step_id, step_title) = deep_research_step_for_phase(&plan, &update.phase);
+                send_deep_research_plan_step_update(
+                    &tx,
+                    &live_runs,
+                    &run_id,
+                    &channel,
+                    &plan,
+                    step_id,
+                    step_title.clone(),
+                    &update.status,
+                    update.detail.clone(),
+                )
+                .await;
+                send_chat_stream_event(
+                    &tx,
+                    &live_runs,
+                    &run_id,
+                    "chat",
+                    &channel,
+                    "tool_progress",
+                    serde_json::json!({
+                        "name": "research",
+                        "content": update.detail,
+                        "kind": "phase_status",
+                        "phase": update.phase,
+                        "label": update.label,
+                        "detail": update.detail,
+                        "status": update.status,
+                        "elapsed_secs": update.elapsed_secs,
+                        "stream_key": update.stream_key,
+                        "plan_id": plan.plan_id,
+                        "plan_revision": plan.revision,
+                        "plan_step_id": step_id,
+                        "plan_step_title": step_title,
+                    }),
+                    crate::core::RunEventPriority::Normal,
+                )
+                .await;
+            }
+        })
+    };
+
+    let research_args = crate::actions::research::ResearchArgs {
+        query: message.to_string(),
+        max_sources: 5,
+        _include_sources: true,
+        backend: None,
+        depth: crate::actions::research::ResearchDepth::Deep,
+        min_primary_sources: 0,
+        freshness_window_days: None,
+        followup_rounds: 0,
+    };
+    let research_result = crate::actions::research::execute_research_with_progress(
+        &research_args,
+        &search_config,
+        Some(&progress),
+    )
+    .await;
+    drop(progress);
+    let _ = progress_forwarder.await;
+
+    match research_result {
+        Ok(output) => {
+            for step in &plan.steps {
+                send_deep_research_plan_step_update(
+                    tx,
+                    live_runs,
+                    run_id,
+                    channel,
+                    &plan,
+                    step.id,
+                    step.title.clone(),
+                    "completed",
+                    "Research step completed.",
+                )
+                .await;
+            }
+
+            let agent_snapshot = Agent::snapshot(&app_state.agent).await;
+            persist_deep_research_chat_message(
+                &agent_snapshot,
+                conversation_id,
+                "assistant",
+                &output,
+                Some("deep_research"),
+                None,
+            )
+            .await;
+            agent_snapshot
+                .finalize_task(
+                    task_uuid,
+                    crate::core::TaskStatus::Completed,
+                    Some(truncate_stream_task_text(&output, 400)),
+                )
+                .await?;
+            let user_outcome =
+                agent_snapshot
+                    .execution_supervisor
+                    .build_success_outcome(&output, &[], &[]);
+            let topic = deep_research_topic_label(message);
+            agent_snapshot
+                .emit_notification(
+                    "Deep research completed",
+                    &format!(
+                        "{} is ready. Open Chat to review the completed report.",
+                        topic
+                    ),
+                    "info",
+                    "deep_research",
+                )
+                .await;
+
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "tool_result",
+                serde_json::json!({
+                    "name": "research",
+                    "content": "Deep research completed with a cited report.",
+                    "plan_id": plan.plan_id,
+                    "plan_revision": plan.revision,
+                }),
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "task_status",
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "description": task.description,
+                    "status": "completed",
+                    "work_type": task.work_type,
+                    "result_preview": truncate_stream_task_text(&output, 400),
+                    "conversation_id": conversation_id,
+                }),
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            upsert_chat_stream_execution_run(
+                run_storage,
+                run_id,
+                conversation_id,
+                channel,
+                message,
+                crate::core::ExecutionRunStatus::Completed,
+                Some(truncate_stream_task_text(&output, 1200)),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "content",
+                serde_json::json!({
+                    "content": output,
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                    "run_status": "completed",
+                    "trace_id": serde_json::Value::Null,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_ms": duration_ms,
+                    "time_to_first_token_ms": duration_ms.max(1),
+                    "degradation": [],
+                    "attempted_models": [],
+                    "user_outcome": user_outcome,
+                }),
+                crate::core::RunEventPriority::Critical,
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "run_status",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "run_status": "completed",
+                    "trace_id": serde_json::Value::Null,
+                    "duration_ms": duration_ms,
+                    "time_to_first_token_ms": duration_ms.max(1),
+                    "degradation": [],
+                    "attempted_models": [],
+                    "user_outcome": user_outcome,
+                }),
+                crate::core::RunEventPriority::Critical,
+            )
+            .await;
+            Ok(())
+        }
+        Err(error) => {
+            let message_text = deep_research_error_message(&error);
+            let error_text = error.to_string();
+            let setup_issue = deep_research_setup_issue(&error_text);
+            let failed_phase = if setup_issue {
+                "searching"
+            } else {
+                "synthesis"
+            };
+            let (step_id, step_title) = deep_research_step_for_phase(&plan, failed_phase);
+            send_deep_research_plan_step_update(
+                tx,
+                live_runs,
+                run_id,
+                channel,
+                &plan,
+                step_id,
+                step_title,
+                "failed",
+                message_text.clone(),
+            )
+            .await;
+
+            let degradation = vec![crate::core::DegradationNote {
+                kind: if setup_issue {
+                    "search_provider_setup".to_string()
+                } else {
+                    "deep_research_failed".to_string()
+                },
+                summary: if setup_issue {
+                    "search backend setup needed".to_string()
+                } else {
+                    "deep research failed".to_string()
+                },
+                detail: Some(error_text.clone()),
+            }];
+            let agent_snapshot = Agent::snapshot(&app_state.agent).await;
+            persist_deep_research_chat_message(
+                &agent_snapshot,
+                conversation_id,
+                "assistant",
+                &message_text,
+                Some("deep_research"),
+                None,
+            )
+            .await;
+            agent_snapshot
+                .finalize_task(
+                    task_uuid,
+                    crate::core::TaskStatus::Failed {
+                        error: message_text.clone(),
+                    },
+                    Some(truncate_stream_task_text(&message_text, 400)),
+                )
+                .await?;
+            let user_outcome = if setup_issue {
+                agent_snapshot
+                    .execution_supervisor
+                    .build_integration_outcome(&message_text, &degradation, &[])
+            } else {
+                agent_snapshot
+                    .execution_supervisor
+                    .build_service_outage_outcome(
+                        &message_text,
+                        "deep_research_failed",
+                        &degradation,
+                        &[],
+                    )
+            };
+            agent_snapshot
+                .emit_notification(
+                    "Deep research failed",
+                    "The research run stopped before producing a trustworthy cited report. Open Chat to review the issue.",
+                    if setup_issue { "warning" } else { "error" },
+                    "deep_research",
+                )
+                .await;
+
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "tool_progress",
+                serde_json::json!({
+                    "name": "research",
+                    "content": message_text,
+                    "kind": "phase_status",
+                    "phase": failed_phase,
+                    "label": "Research stopped",
+                    "detail": message_text,
+                    "status": "failed",
+                    "elapsed_secs": started_at.elapsed().as_secs(),
+                    "stream_key": "phase-status:research:failed",
+                    "plan_id": plan.plan_id,
+                    "plan_revision": plan.revision,
+                    "plan_step_id": step_id,
+                }),
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "task_status",
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "description": task.description,
+                    "status": "failed",
+                    "work_type": task.work_type,
+                    "result_preview": truncate_stream_task_text(&message_text, 400),
+                    "conversation_id": conversation_id,
+                }),
+                crate::core::RunEventPriority::High,
+            )
+            .await;
+            let run_status = if setup_issue {
+                crate::core::ExecutionRunStatus::NeedsInput
+            } else {
+                crate::core::ExecutionRunStatus::Degraded
+            };
+            upsert_chat_stream_execution_run(
+                run_storage,
+                run_id,
+                conversation_id,
+                channel,
+                message,
+                run_status.clone(),
+                Some(message_text.clone()),
+                Some(error_text),
+                None,
+                degradation.clone(),
+                Vec::new(),
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "content",
+                serde_json::json!({
+                    "content": message_text,
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                    "run_status": run_status.as_str(),
+                    "trace_id": serde_json::Value::Null,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "duration_ms": started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    "time_to_first_token_ms": started_at.elapsed().as_millis().min(u64::MAX as u128).max(1) as u64,
+                    "degradation": degradation,
+                    "attempted_models": [],
+                    "user_outcome": user_outcome,
+                }),
+                crate::core::RunEventPriority::Critical,
+            )
+            .await;
+            send_chat_stream_event(
+                tx,
+                live_runs,
+                run_id,
+                "chat",
+                channel,
+                "run_status",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "run_status": run_status.as_str(),
+                    "trace_id": serde_json::Value::Null,
+                    "degradation": degradation,
+                    "attempted_models": [],
+                    "user_outcome": user_outcome,
+                }),
+                crate::core::RunEventPriority::Critical,
+            )
+            .await;
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct StreamedChatTask {
     pub(super) task_id: String,
     pub(super) description: String,
     pub(super) work_type: String,
     pub(super) user_message_already_recorded: bool,
+    pub(super) plan_override: Option<serde_json::Value>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1219,11 +2389,14 @@ pub(super) struct ChatStreamRunRequest {
     pub(super) message: String,
     pub(super) channel: String,
     pub(super) conversation_id: Option<String>,
-    pub(super) project_id: Option<String>,
     pub(super) deep_research: bool,
+    pub(super) plan_confirmation_mode: Option<String>,
     pub(super) attachments: Vec<crate::core::ChatAttachmentHint>,
     pub(super) caller_principal: Option<crate::actions::ActionCallerPrincipal>,
     pub(super) task_mode: ChatStreamTaskMode,
+    /// Per-call ArkOrbit structural context. Threaded into request hints so
+    /// the agent loop can read it without changing model selection.
+    pub(super) arkorbit_context: Option<serde_json::Value>,
 }
 
 async fn send_chat_stream_event(
@@ -1330,13 +2503,41 @@ async fn upsert_chat_stream_execution_run(
     attempted_models: Vec<crate::core::ModelAttemptRecord>,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
-    let created_at = storage
-        .load_execution_run(run_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|run| run.created_at)
-        .unwrap_or_else(|| now.clone());
+    let normalized_conversation_id = conversation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(conversation_id) = normalized_conversation_id.as_deref() {
+        let conversation = crate::storage::entities::conversation::Model {
+            id: conversation_id.to_string(),
+            title: truncate_stream_task_text(message, 80),
+            channel: channel.to_string(),
+            project_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            message_count: 0,
+            archived: false,
+            starred: false,
+        };
+        if let Err(error) = storage.create_conversation_if_absent(&conversation).await {
+            tracing::warn!(
+                "Failed to ensure chat stream conversation '{}' before run persistence: {}",
+                conversation_id,
+                error
+            );
+        }
+    }
+    let created_at = if status == crate::core::ExecutionRunStatus::Accepted {
+        now.clone()
+    } else {
+        storage
+            .load_execution_run(run_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|run| run.created_at)
+            .unwrap_or_else(|| now.clone())
+    };
     let run = crate::core::ExecutionRun {
         id: run_id.to_string(),
         kind: "chat".to_string(),
@@ -1352,10 +2553,7 @@ async fn upsert_chat_stream_execution_run(
         last_error,
         result_summary,
         trace_id,
-        conversation_id: conversation_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
+        conversation_id: normalized_conversation_id,
         channel: Some(channel.to_string()),
         request_message: Some(truncate_stream_task_text(message, 2000)),
         attempted_models,
@@ -1379,17 +2577,19 @@ pub(super) fn spawn_chat_stream_response(
     let message = request.message.clone();
     let channel = request.channel.clone();
     let conversation_id = request.conversation_id.clone();
-    let project_id = request.project_id.clone();
+    let project_id: Option<String> = None;
     let deep_research = request.deep_research;
+    let plan_confirmation_mode = request.plan_confirmation_mode.clone();
     let attachments = request.attachments.clone();
     let caller_principal = request.caller_principal.clone();
+    let arkorbit_context = request.arkorbit_context.clone();
     let task_mode = request.task_mode.clone();
     let app_state = state.clone();
     let stream_request_id = uuid::Uuid::new_v4().to_string();
     let stream_started_at = Instant::now();
     let time_to_first_token_ms = Arc::new(AtomicU64::new(0));
 
-    crate::spawn_logged!("src/channels/http.rs:14787", async move {
+    if let Err(error) = spawn_chat_worker_logged("http_chat_stream_turn", async move {
         let (live_runs, run_storage) = {
             let agent = app_state.agent.read().await;
             (agent.live_run_registry(), agent.storage.clone())
@@ -1408,6 +2608,7 @@ pub(super) fn spawn_chat_stream_response(
             Vec::new(),
         )
         .await;
+        let task_mode_create_if_needed = matches!(&task_mode, ChatStreamTaskMode::CreateIfNeeded);
         let tracked_task = match task_mode {
             ChatStreamTaskMode::CreateIfNeeded => None,
             ChatStreamTaskMode::Existing(task) => {
@@ -1416,7 +2617,6 @@ pub(super) fn spawn_chat_stream_response(
                     description: task.description.clone(),
                     work_type: task.work_type.clone(),
                     conversation_id: conversation_id.clone(),
-                    project_id: project_id.clone(),
                 };
                 let (maybe_event, _) = normalize_stream_event_for_sse(task_started, "");
                 if let Some((event_name, payload)) = maybe_event {
@@ -1441,7 +2641,7 @@ pub(super) fn spawn_chat_stream_response(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("")
+            .unwrap_or(stream_request_id.as_str())
             .to_string();
         if let Some(previous) = replace_chat_conversation_cancellation_sender(
             &app_state,
@@ -1552,6 +2752,7 @@ pub(super) fn spawn_chat_stream_response(
                                 description: description.clone(),
                                 work_type: work_type.clone(),
                                 user_message_already_recorded: false,
+                                plan_override: None,
                             });
                         }
                         bind_chat_task_cancellation_sender(&app_state, task_id, cancel_tx.clone())
@@ -1651,6 +2852,152 @@ pub(super) fn spawn_chat_stream_response(
         )
         .await;
 
+        let deep_research_plan_first = deep_research
+            && plan_confirmation_mode.as_deref() == Some("before_execution")
+            && task_mode_create_if_needed;
+        if deep_research_plan_first {
+            let result = prepare_deep_research_plan_confirmation(
+                &app_state,
+                &tx,
+                &live_runs,
+                &run_storage,
+                &stream_request_id,
+                &channel,
+                &message,
+                conversation_id.as_deref(),
+                project_id.as_deref(),
+                &attachments,
+            )
+            .await;
+            if let Err(error) = result {
+                let error_text = error.to_string();
+                send_chat_stream_event(
+                    &tx,
+                    &live_runs,
+                    &stream_request_id,
+                    "chat",
+                    &channel,
+                    "error",
+                    serde_json::json!({ "error": error_text }),
+                    crate::core::RunEventPriority::Critical,
+                )
+                .await;
+                upsert_chat_stream_execution_run(
+                    &run_storage,
+                    &stream_request_id,
+                    conversation_id.as_deref(),
+                    &channel,
+                    &message,
+                    crate::core::ExecutionRunStatus::PlatformFailed,
+                    Some("Deep research could not prepare a reviewable plan.".to_string()),
+                    Some(error_text),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await;
+            }
+            send_chat_stream_event(
+                &tx,
+                &live_runs,
+                &stream_request_id,
+                "chat",
+                &channel,
+                "done",
+                serde_json::json!({}),
+                crate::core::RunEventPriority::Critical,
+            )
+            .await;
+            {
+                let mut trace = trace_ref.write().await;
+                trace.completed_at = Some(chrono::Utc::now());
+            }
+            unregister_chat_conversation_cancellation(
+                &app_state,
+                &registered_conversation_id,
+                &stream_request_id,
+            )
+            .await;
+            drop(stream_tx);
+            let _ = trace_poller.await;
+            let _ = stream_forwarder.await;
+            return;
+        }
+
+        if deep_research {
+            let existing_task = tracked_task_ref.read().await.clone();
+            if let Some(task) = existing_task.as_ref() {
+                let result = run_approved_deep_research_stream(
+                    &app_state,
+                    &tx,
+                    &live_runs,
+                    &run_storage,
+                    &stream_request_id,
+                    &channel,
+                    &message,
+                    conversation_id.as_deref(),
+                    project_id.as_deref(),
+                    task,
+                    stream_started_at,
+                )
+                .await;
+                if let Err(error) = result {
+                    let error_text = error.to_string();
+                    send_chat_stream_event(
+                        &tx,
+                        &live_runs,
+                        &stream_request_id,
+                        "chat",
+                        &channel,
+                        "error",
+                        serde_json::json!({ "error": error_text }),
+                        crate::core::RunEventPriority::Critical,
+                    )
+                    .await;
+                    upsert_chat_stream_execution_run(
+                        &run_storage,
+                        &stream_request_id,
+                        conversation_id.as_deref(),
+                        &channel,
+                        &message,
+                        crate::core::ExecutionRunStatus::PlatformFailed,
+                        Some("Deep research hit a framework-level failure.".to_string()),
+                        Some(error_text),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await;
+                }
+                unregister_chat_task_cancellation(&app_state, &task.task_id).await;
+                unregister_chat_conversation_cancellation(
+                    &app_state,
+                    &registered_conversation_id,
+                    &stream_request_id,
+                )
+                .await;
+                send_chat_stream_event(
+                    &tx,
+                    &live_runs,
+                    &stream_request_id,
+                    "chat",
+                    &channel,
+                    "done",
+                    serde_json::json!({}),
+                    crate::core::RunEventPriority::Critical,
+                )
+                .await;
+                {
+                    let mut trace = trace_ref.write().await;
+                    trace.completed_at = Some(chrono::Utc::now());
+                }
+                drop(stream_tx);
+                let _ = trace_poller.await;
+                let _ = stream_forwarder.await;
+                return;
+            }
+        }
+
         let tracked_task_snapshot = tracked_task_ref.read().await.clone();
         let user_message_already_recorded = tracked_task_snapshot
             .as_ref()
@@ -1665,6 +3012,7 @@ pub(super) fn spawn_chat_stream_response(
             let trace_ref = trace_ref.clone();
             let attachments = attachments.clone();
             let caller_principal = caller_principal.clone();
+            let arkorbit_context = arkorbit_context.clone();
             tokio::spawn(async move {
                 let agent_snapshot = Agent::snapshot(&agent_ref).await;
                 if user_message_already_recorded {
@@ -1676,11 +3024,12 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            build_request_execution_hints(
+                            build_request_execution_hints_with_arkorbit(
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
                                 attachments.clone(),
+                                arkorbit_context.clone(),
                             ),
                         )
                         .await
@@ -1693,11 +3042,12 @@ pub(super) fn spawn_chat_stream_response(
                             project_id.as_deref(),
                             trace_ref,
                             stream_tx,
-                            build_request_execution_hints(
+                            build_request_execution_hints_with_arkorbit(
                                 caller_principal.as_ref(),
                                 crate::actions::ActionExecutionSurface::Chat,
                                 true,
                                 attachments,
+                                arkorbit_context,
                             ),
                         )
                         .await
@@ -1706,6 +3056,7 @@ pub(super) fn spawn_chat_stream_response(
         };
 
         let mut was_cancelled = false;
+        let timeout_secs = chat_turn_timeout_secs();
         let result = tokio::select! {
             worker = &mut process_handle => {
                 match worker {
@@ -1716,6 +3067,11 @@ pub(super) fn spawn_chat_stream_response(
                     }
                     Err(error) => Err(anyhow::anyhow!("Chat worker failed: {}", error)),
                 }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                process_handle.abort();
+                let _ = process_handle.await;
+                Err(anyhow::anyhow!("Chat run timed out after {} seconds", timeout_secs))
             }
             changed = cancel_rx.changed() => {
                 if changed.is_ok() && *cancel_rx.borrow() {
@@ -1743,6 +3099,7 @@ pub(super) fn spawn_chat_stream_response(
             }
         }
 
+        trace_poller.abort();
         let _ = trace_poller.await;
         let _ = stream_forwarder.await;
 
@@ -1861,7 +3218,6 @@ pub(super) fn spawn_chat_stream_response(
                             "work_type": task.work_type.clone(),
                             "result_preview": result_preview,
                             "conversation_id": resolved_conversation_id.clone(),
-                            "project_id": project_id.clone(),
                         }),
                         crate::core::RunEventPriority::High,
                     )
@@ -1892,8 +3248,10 @@ pub(super) fn spawn_chat_stream_response(
                     let synthetic_first_token_ms = stream_started_at
                         .elapsed()
                         .as_millis()
-                        .min(u64::MAX as u128) as u64;
-                    time_to_first_token_ms.store(synthetic_first_token_ms.max(1), Ordering::Relaxed);
+                        .min(u64::MAX as u128)
+                        as u64;
+                    time_to_first_token_ms
+                        .store(synthetic_first_token_ms.max(1), Ordering::Relaxed);
                     send_chat_stream_synthetic_tokens(
                         &tx,
                         &live_runs,
@@ -1936,20 +3294,16 @@ pub(super) fn spawn_chat_stream_response(
                     processed.total_tokens
                 };
                 let effective_run_id = stream_request_id.clone();
-                upsert_chat_stream_execution_run(
-                    &run_storage,
-                    &effective_run_id,
-                    resolved_conversation_id.as_deref(),
-                    &channel,
-                    &message,
-                    chat_stream_execution_status(processed.run_status.as_deref()),
-                    Some(truncate_stream_task_text(&processed.response, 1200)),
-                    None,
-                    processed.trace_id.clone(),
-                    processed.degradation.clone(),
-                    processed.attempted_models.clone(),
-                )
-                .await;
+                let persist_run_storage = run_storage.clone();
+                let persist_run_id = effective_run_id.clone();
+                let persist_conversation_id = resolved_conversation_id.clone();
+                let persist_channel = channel.clone();
+                let persist_message = message.clone();
+                let persist_status = chat_stream_execution_status(processed.run_status.as_deref());
+                let persist_summary = Some(truncate_stream_task_text(&processed.response, 1200));
+                let persist_trace_id = processed.trace_id.clone();
+                let persist_degradation = processed.degradation.clone();
+                let persist_attempted_models = processed.attempted_models.clone();
                 let mut content = serde_json::json!({
                     "content": processed.response,
                     "conversation_id": resolved_conversation_id,
@@ -2006,6 +3360,25 @@ pub(super) fn spawn_chat_stream_response(
                     crate::core::RunEventPriority::Critical,
                 )
                 .await;
+                crate::spawn_logged!(
+                    "src/channels/http/chat_control.rs:persist_stream_success_run",
+                    async move {
+                        upsert_chat_stream_execution_run(
+                            &persist_run_storage,
+                            &persist_run_id,
+                            persist_conversation_id.as_deref(),
+                            &persist_channel,
+                            &persist_message,
+                            persist_status,
+                            persist_summary,
+                            None,
+                            persist_trace_id,
+                            persist_degradation,
+                            persist_attempted_models,
+                        )
+                        .await;
+                    }
+                );
             }
             Err(error) if was_cancelled => {
                 if let Some(task) = tracked_task.as_ref() {
@@ -2072,7 +3445,6 @@ pub(super) fn spawn_chat_stream_response(
                             "work_type": task.work_type.clone(),
                             "result_preview": result_preview,
                             "conversation_id": conversation_id.clone(),
-                            "project_id": project_id.clone(),
                         }),
                         crate::core::RunEventPriority::High,
                     )
@@ -2162,7 +3534,6 @@ pub(super) fn spawn_chat_stream_response(
                             "work_type": task.work_type.clone(),
                             "result_preview": truncate_stream_task_text(&error_text, 400),
                             "conversation_id": conversation_id.clone(),
-                            "project_id": project_id.clone(),
                         }),
                         crate::core::RunEventPriority::High,
                     )
@@ -2237,7 +3608,10 @@ pub(super) fn spawn_chat_stream_response(
             crate::core::RunEventPriority::Critical,
         )
         .await;
-    });
+    }) {
+        tracing::error!("Failed to dispatch chat stream worker: {}", error);
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, error);
+    }
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Sse::new(cap_sse_lifetime(stream))
@@ -2250,7 +3624,6 @@ pub(super) struct ResumableChatTaskRequest {
     pub(super) message: String,
     pub(super) channel: String,
     pub(super) conversation_id: String,
-    pub(super) project_id: Option<String>,
     pub(super) deep_research: bool,
     pub(super) work_type: String,
     pub(super) stored_plan_override: Option<serde_json::Value>,
@@ -2266,7 +3639,7 @@ pub(super) struct ResumeChatTaskStreamRequest {
 pub(super) fn backfill_chat_task_origin_metadata(
     task: &mut crate::core::Task,
     conversation_id: Option<&str>,
-    project_id: Option<&str>,
+    _project_id: Option<&str>,
 ) -> Option<String> {
     let mut arguments = task.arguments.as_object().cloned().unwrap_or_default();
     let mut changed = false;
@@ -2285,18 +3658,6 @@ pub(super) fn backfill_chat_task_origin_metadata(
                 "conversation_id".to_string(),
                 serde_json::json!(cid.to_string()),
             );
-            changed = true;
-        }
-    }
-
-    if let Some(pid) = project_id.map(str::trim).filter(|value| !value.is_empty()) {
-        let current = arguments
-            .get("project_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim();
-        if current != pid {
-            arguments.insert("project_id".to_string(), serde_json::json!(pid.to_string()));
             changed = true;
         }
     }
@@ -2388,12 +3749,6 @@ pub(super) fn extract_resumable_web_chat_task(
         );
     }
 
-    let project_id = arguments
-        .get("project_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
     let deep_research = arguments
         .get("deep_research")
         .and_then(|value| value.as_bool())
@@ -2427,7 +3782,6 @@ pub(super) fn extract_resumable_web_chat_task(
         message,
         channel,
         conversation_id,
-        project_id,
         deep_research,
         work_type,
         stored_plan_override,
@@ -2447,23 +3801,36 @@ pub(super) async fn chat_stream(
             "Chat stream request indicated attachments were present, but no structured attachment hints were supplied"
         );
     }
+    if request.arkorbit_context.is_some() {
+        tracing::debug!("Chat stream request included ArkOrbit structural context");
+    }
     if let Some(response) = validate_chat_message_size(&request.message) {
         return response;
     }
 
-    let resolved_conversation_id = match resolve_chat_request_conversation_id(
-        &state,
-        &request.channel,
-        request.conversation_id.as_deref(),
-        request.project_id.as_deref(),
-        &request.message,
-    )
-    .await
+    if let Some(existing_conversation_id) = request
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
     {
-        Ok(conversation_id) => conversation_id,
-        Err(response) => return response,
-    };
-    request.conversation_id = Some(resolved_conversation_id);
+        let resolved_conversation_id = match resolve_chat_request_conversation_id(
+            &state,
+            &request.channel,
+            Some(existing_conversation_id.as_str()),
+            None,
+            &request.message,
+        )
+        .await
+        {
+            Ok(conversation_id) => conversation_id,
+            Err(response) => return response,
+        };
+        request.conversation_id = Some(resolved_conversation_id);
+    } else {
+        request.conversation_id = None;
+    }
 
     tracing::info!(
         "HTTP /chat/stream request: channel={}, msg={}chars, conv_id={:?}",
@@ -2795,11 +4162,12 @@ pub(super) async fn chat_stream(
             message: request.message,
             channel: request.channel,
             conversation_id: request.conversation_id,
-            project_id: request.project_id,
             deep_research: request.deep_research,
+            plan_confirmation_mode: request.plan_confirmation_mode,
             attachments: request.attachments,
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::CreateIfNeeded,
+            arkorbit_context: request.arkorbit_context,
         },
     )
 }
@@ -2813,15 +4181,8 @@ pub(super) async fn clear_chat(
         .get("channel")
         .and_then(|v| v.as_str())
         .unwrap_or("web");
-    let project_id = request.get("project_id").and_then(|v| v.as_str());
     let agent = Agent::snapshot(&state.agent).await;
-    if let Some(pid) = project_id {
-        agent
-            .clear_conversation_for_project(channel, Some(pid))
-            .await;
-    } else {
-        agent.clear_conversation_history(channel).await;
-    }
+    agent.clear_conversation_history(channel).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "status": "cleared" })),

@@ -116,6 +116,12 @@ pub struct SpecialistPromptEvolutionResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExternalSpecialistPromptCandidate {
+    pub source: String,
+    pub bundle: SpecialistPromptBundleProfile,
+}
+
 impl Default for SpecialistPromptBundleProfile {
     fn default() -> Self {
         let mut bundle = Self {
@@ -169,6 +175,10 @@ pub fn parse_specialist_prompt_bundle_profile(raw: &[u8]) -> Option<SpecialistPr
     let mut bundle = serde_json::from_slice::<SpecialistPromptBundleProfile>(raw).ok()?;
     sanitize_specialist_prompt_bundle(&mut bundle);
     Some(bundle)
+}
+
+pub fn embedded_specialist_prompt_benchmark_profile_json() -> &'static str {
+    BENCHMARK_PROFILE_JSON
 }
 
 pub fn compose_specialist_prompt_version(bundle_version: &str) -> String {
@@ -238,6 +248,39 @@ impl SpecialistPromptEvolutionEngine {
             )
             .await,
         );
+
+        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
+            .await
+    }
+
+    pub async fn evaluate_external_specialist_prompt_candidates(
+        &self,
+        user_request: &str,
+        current_bundle_raw: Option<&[u8]>,
+        candidates: Vec<ExternalSpecialistPromptCandidate>,
+    ) -> Result<SpecialistPromptEvolutionResult> {
+        let baseline_bundle = self.load_baseline_bundle(current_bundle_raw)?;
+        let benchmark = self.load_benchmark_suite().await?;
+        let baseline_eval = self.evaluate_bundle(&baseline_bundle, &benchmark).await;
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| CandidateSpecialistBundle {
+                source: candidate.source,
+                bundle: candidate.bundle,
+            })
+            .collect::<Vec<_>>();
+        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
+            .await
+    }
+
+    async fn evaluate_candidate_set(
+        &self,
+        user_request: &str,
+        baseline_bundle: SpecialistPromptBundleProfile,
+        baseline_eval: BundleEvaluation,
+        benchmark: &SpecialistPromptBenchmarkProfile,
+        mut candidates: Vec<CandidateSpecialistBundle>,
+    ) -> Result<SpecialistPromptEvolutionResult> {
         if candidates.len() > self.config.max_candidates.max(1) {
             candidates.truncate(self.config.max_candidates.max(1));
         }
@@ -256,28 +299,16 @@ impl SpecialistPromptEvolutionEngine {
         }
 
         let evaluated_candidates = candidates.len();
-        let mut best: Option<(CandidateSpecialistBundle, BundleEvaluation, PairedStats)> = None;
+        let mut evaluated = Vec::new();
         for candidate in candidates {
             let eval = self.evaluate_bundle(&candidate.bundle, &benchmark).await;
             let paired = paired_stats(&baseline_eval.case_scores, &eval.case_scores);
-            let replace = match &best {
-                None => true,
-                Some((_, best_eval, best_paired)) => {
-                    eval.combined_score > best_eval.combined_score
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins > best_paired.wins)
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins == best_paired.wins
-                            && paired.p_value < best_paired.p_value)
-                }
-            };
-            if replace {
-                best = Some((candidate, eval, paired));
-            }
+            evaluated.push((candidate, eval, paired));
         }
 
         let (mut best_candidate, best_eval, best_stats) =
-            best.context("missing best specialist prompt candidate")?;
+            select_best_specialist_candidate(evaluated)
+                .context("missing best specialist prompt candidate")?;
         best_candidate.bundle.version = format!(
             "specialist-prompt-{}",
             short_hash(&[
@@ -1048,6 +1079,69 @@ fn paired_stats(baseline_scores: &[f64], candidate_scores: &[f64]) -> PairedStat
         p_value: one_sided_sign_test_p_value(wins, losses),
         score_gain,
     }
+}
+
+fn select_best_specialist_candidate(
+    evaluated: Vec<(CandidateSpecialistBundle, BundleEvaluation, PairedStats)>,
+) -> Option<(CandidateSpecialistBundle, BundleEvaluation, PairedStats)> {
+    if evaluated.is_empty() {
+        return None;
+    }
+    let mut nondominated = Vec::new();
+    'candidate: for idx in 0..evaluated.len() {
+        for other_idx in 0..evaluated.len() {
+            if idx == other_idx {
+                continue;
+            }
+            if specialist_candidate_dominates(&evaluated[other_idx], &evaluated[idx]) {
+                continue 'candidate;
+            }
+        }
+        nondominated.push(idx);
+    }
+    let pool = if nondominated.is_empty() {
+        (0..evaluated.len()).collect::<Vec<_>>()
+    } else {
+        nondominated
+    };
+    let mut best_idx = pool[0];
+    for idx in pool.into_iter().skip(1) {
+        if specialist_candidate_preferred(&evaluated[idx], &evaluated[best_idx]) {
+            best_idx = idx;
+        }
+    }
+    evaluated.into_iter().nth(best_idx)
+}
+
+fn specialist_candidate_dominates(
+    left: &(CandidateSpecialistBundle, BundleEvaluation, PairedStats),
+    right: &(CandidateSpecialistBundle, BundleEvaluation, PairedStats),
+) -> bool {
+    let (_, left_eval, left_stats) = left;
+    let (_, right_eval, right_stats) = right;
+    let better_or_equal = left_eval.combined_score + 0.0001 >= right_eval.combined_score
+        && left_stats.wins >= right_stats.wins
+        && left_stats.losses <= right_stats.losses
+        && left_stats.p_value <= right_stats.p_value + 0.0001;
+    let strictly_better = left_eval.combined_score > right_eval.combined_score + 0.0001
+        || left_stats.wins > right_stats.wins
+        || left_stats.losses < right_stats.losses
+        || left_stats.p_value + 0.0001 < right_stats.p_value;
+    better_or_equal && strictly_better
+}
+
+fn specialist_candidate_preferred(
+    left: &(CandidateSpecialistBundle, BundleEvaluation, PairedStats),
+    right: &(CandidateSpecialistBundle, BundleEvaluation, PairedStats),
+) -> bool {
+    let (_, left_eval, left_stats) = left;
+    let (_, right_eval, right_stats) = right;
+    left_eval.combined_score > right_eval.combined_score
+        || (f64_eq(left_eval.combined_score, right_eval.combined_score)
+            && left_stats.wins > right_stats.wins)
+        || (f64_eq(left_eval.combined_score, right_eval.combined_score)
+            && left_stats.wins == right_stats.wins
+            && left_stats.p_value < right_stats.p_value)
 }
 
 fn one_sided_sign_test_p_value(wins: usize, losses: usize) -> f64 {

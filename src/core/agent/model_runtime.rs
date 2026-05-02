@@ -21,27 +21,6 @@ fn diversify_model_attempt_providers(
 }
 
 impl Agent {
-    pub(super) async fn seed_execution_trace_snapshot(
-        &self,
-        trace_ref: &Arc<RwLock<ExecutionTrace>>,
-    ) {
-        let snapshot = trace_ref.read().await.clone();
-        if snapshot.id.trim().is_empty() {
-            return;
-        }
-        if let Err(error) = self
-            .encrypted_storage
-            .insert_execution_trace_encrypted(&snapshot)
-            .await
-        {
-            tracing::warn!(
-                "Failed to seed execution trace '{}': {}",
-                snapshot.id,
-                error
-            );
-        }
-    }
-
     pub(super) fn model_role_label(role: &ModelRole) -> &'static str {
         match role {
             ModelRole::Primary => "Primary",
@@ -321,7 +300,7 @@ impl Agent {
         actions: &[crate::actions::ActionDef],
         timeout_ms: u64,
         max_candidates: usize,
-    ) -> Result<super::llm::LlmResponse, String> {
+    ) -> Result<super::llm::LlmResponse, crate::core::UserFacingOutcome> {
         self.supervised_internal_chat_detailed_with_stream(
             channel,
             usage_label,
@@ -354,7 +333,7 @@ impl Agent {
         timeout_ms: u64,
         max_candidates: usize,
         stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
-    ) -> Result<super::llm::LlmResponse, String> {
+    ) -> Result<super::llm::LlmResponse, crate::core::UserFacingOutcome> {
         if candidates.is_empty() {
             candidates = self.llm_candidates_for_role(preferred_role);
         }
@@ -378,7 +357,7 @@ impl Agent {
         for (idx, candidate) in candidates.iter().take(max_candidates.max(1)).enumerate() {
             let started = std::time::Instant::now();
             let result = if let Some(token_tx) = stream_tx.clone() {
-                crate::core::execution::execute_supervised_transport_chat_stream(
+                crate::core::execution::execute_supervised_transport_chat_stream_with_policy(
                     &self.execution_supervisor,
                     &candidate.client,
                     &request,
@@ -388,10 +367,12 @@ impl Agent {
                     actions,
                     Some(timeout_ms.max(1)),
                     token_tx,
+                    &self.config.model_privacy,
+                    false,
                 )
                 .await
             } else {
-                super::execute_supervised_transport_chat(
+                crate::core::execution::execute_supervised_transport_chat_with_policy(
                     &self.execution_supervisor,
                     &candidate.client,
                     &request,
@@ -400,6 +381,8 @@ impl Agent {
                     memories,
                     actions,
                     Some(timeout_ms.max(1)),
+                    &self.config.model_privacy,
+                    false,
                 )
                 .await
             };
@@ -446,7 +429,7 @@ impl Agent {
             request_kind,
             failure_outcome.user_outcome.message
         );
-        Err(failure_outcome.user_outcome.message)
+        Err(failure_outcome.user_outcome)
     }
 
     pub(super) fn execution_candidate_descriptor(

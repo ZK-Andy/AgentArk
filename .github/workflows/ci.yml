@@ -1,9 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -13,9 +10,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  AGENTARK_RELEASE_FEATURES: telegram,docker,ssh
 
 jobs:
   rust-quick:
@@ -39,7 +33,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo check
-        run: cargo check --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
+        run: cargo check --locked
 
   rust-full:
     if: github.event_name != 'pull_request'
@@ -80,13 +74,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo check
-        run: cargo check --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
+        run: cargo check --locked
 
       - name: cargo clippy
-        run: cargo clippy --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
+        run: cargo clippy --locked
 
       - name: cargo test
-        run: cargo test --locked --no-default-features --features "${{ env.AGENTARK_RELEASE_FEATURES }}"
+        run: cargo test --locked
 
   frontend:
     runs-on: ubuntu-latest

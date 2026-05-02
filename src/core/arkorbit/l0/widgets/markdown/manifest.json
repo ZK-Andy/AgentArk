@@ -1,0 +1,5 @@
+{
+  "name": "markdown",
+  "description": "Simple markdown-backed surface for introductory orbit content.",
+  "entry": "index.js"
+}

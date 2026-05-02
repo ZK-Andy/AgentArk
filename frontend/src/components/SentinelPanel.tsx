@@ -182,10 +182,6 @@ function proposalConversationId(proposal: SentinelProposal): string {
   return str(proposalMetadata(proposal).conversation_id, "").trim();
 }
 
-function proposalProjectId(proposal: SentinelProposal): string {
-  return str(proposalMetadata(proposal).project_id, "").trim();
-}
-
 function proposalHasRunnableAction(proposal: SentinelProposal): boolean {
   return !!proposal.action && !!str(proposal.action.action_kind, "").trim();
 }
@@ -278,7 +274,6 @@ function storeChatPendingLaunch(snapshot: {
   launchMode: "message";
   message: string;
   conversationId?: string;
-  projectId?: string;
   source?: string;
 }): void {
   if (typeof window === "undefined") return;
@@ -431,9 +426,9 @@ export function SentinelPanel({
         : openProposals.length > 0
           ? "Review the suggested next steps below or leave them for later."
           : connectedServicesCount === 0 && inAppEventCount === 0
-            ? "ArkSentinel is watching for follow-ups. Anything worth your attention will appear here."
+            ? "ArkSentinel is watching and learning quietly in the background. Anything worth your attention will show up here."
             : connectedServicesCount === 0
-              ? `ArkSentinel is watching AgentArk activity and has ${inAppEventCount} in-app signal${inAppEventCount === 1 ? "" : "s"} on file. Nothing needs your attention right now.`
+              ? `ArkSentinel has noticed ${inAppEventCount} thing${inAppEventCount === 1 ? "" : "s"} so far, but nothing needs you right now. Connect an account or app and it will start watching that too.`
             : currentAutonomyMode === "auto"
               ? `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and can handle lightweight routine work for you.`
               : `ArkSentinel is quietly watching your ${connectedServicesCount} connected service${connectedServicesCount === 1 ? "" : "s"} and will ask before it acts.`;
@@ -545,7 +540,6 @@ export function SentinelPanel({
       launchMode: "message",
       message: choice.submitText,
       conversationId,
-      projectId: proposalProjectId(proposal) || undefined,
       source: "sentinel",
     });
     void dismissMutation.mutateAsync(proposal.id).catch(() => undefined);
@@ -558,10 +552,17 @@ export function SentinelPanel({
     <>
       <WorkspacePageShell spacing={1.5}>
         <WorkspacePageHeader
-          eyebrow="Ark Autonomy"
+          eyebrow="Ark Core"
           title="ArkSentinel"
-          descriptionNoWrap
-          description="Sentinel watches your connected services for things worth your attention and suggests safe next actions - you stay in control."
+          description={
+            <>
+              ArkSentinel keeps an eye on everything you and the agent are doing.
+              <br />
+              Through experience learning, it remembers what's worked before so the agent gets better over time.
+              <br />
+              When something needs you, it shows up here as a suggestion you can approve or skip.
+            </>
+          }
           actions={
             <Stack
               direction="row"

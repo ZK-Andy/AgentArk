@@ -73,7 +73,6 @@ type AutomationRun = {
   error?: string | null;
   next_retry_at?: string | null;
   conversation_id?: string | null;
-  project_id?: string | null;
   view: string;
 };
 
@@ -835,8 +834,8 @@ export function OverviewPane({ navigateToView, serverStatus, serverError, server
                     {`${activeBackgroundSessions.length} background session${activeBackgroundSessions.length === 1 ? "" : "s"} currently have ongoing work or supervision state.`}
                   </Typography>
                 </Box>
-                  <Button variant="outlined" size="small" onClick={() => navigateToView("sessions")}>
-                    Open Sessions
+                  <Button variant="outlined" size="small" onClick={() => navigateToView("status")}>
+                    Open Background Work
                   </Button>
                 </Stack>
                 <Stack spacing={0.75}>

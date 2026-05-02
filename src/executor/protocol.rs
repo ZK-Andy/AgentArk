@@ -82,7 +82,15 @@ pub struct CodeExecuteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppDeployRequest {
     #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
     pub files: BTreeMap<String, String>,
+    #[serde(default)]
+    pub file_patches: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub delete_paths: Vec<String>,
     #[serde(default)]
     pub repo_url: Option<String>,
     #[serde(default)]
@@ -91,6 +99,20 @@ pub struct AppDeployRequest {
     pub repo_subdir: Option<String>,
     #[serde(default)]
     pub service_mode: Option<String>,
+    #[serde(default)]
+    pub deploy_target: Option<String>,
+    #[serde(default)]
+    pub production: Option<bool>,
+    #[serde(default)]
+    pub vercel_project_mode: Option<String>,
+    #[serde(default)]
+    pub vercel_project_id: Option<String>,
+    #[serde(default)]
+    pub vercel_team_id: Option<String>,
+    #[serde(default)]
+    pub build_command: Option<String>,
+    #[serde(default)]
+    pub output_dir: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]

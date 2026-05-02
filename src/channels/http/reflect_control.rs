@@ -1,0 +1,2925 @@
+//! ArkReflect retrospective API.
+
+use super::sentinel_panel;
+use super::*;
+
+use crate::core::arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitChatTranscriptSummary};
+use crate::core::{EmbeddingClient, TaskStatus};
+use crate::storage::entities::{
+    arkpulse_event, conversation, experience_item, llm_usage, message, procedural_pattern,
+    semantic_work_unit, task,
+};
+use crate::storage::Storage;
+use sea_orm::entity::prelude::PgVector;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::time::MissedTickBehavior;
+
+const REFLECT_MAX_CONVERSATIONS: u64 = 120;
+const REFLECT_MAX_MESSAGES_PER_CONVERSATION: u64 = 80;
+const REFLECT_MAX_ORBITS: usize = 80;
+const REFLECT_MAX_TRANSCRIPTS_PER_ORBIT: usize = 16;
+const REFLECT_MAX_EXPERIENCE_ITEMS: u64 = 200;
+const REFLECT_MAX_PROCEDURAL_PATTERNS: u64 = 160;
+const REFLECT_MAX_TASKS: u64 = 220;
+const REFLECT_MAX_WATCHERS: usize = 160;
+const REFLECT_MAX_SENTINEL_ITEMS: usize = 120;
+const REFLECT_MAX_PULSE_EVENTS: u64 = 160;
+const REFLECT_MAX_LINEAGE_ROWS: usize = 160;
+const REFLECT_MAX_LLM_USAGE_ROWS: u64 = 4000;
+const REFLECT_MAX_UNITS: u64 = 700;
+const REFLECT_BASELINE_MAX_UNITS: u64 = 5000;
+const REFLECT_MAX_CLUSTERS: usize = 8;
+const REFLECT_KMEANS_ROUNDS: usize = 8;
+const REFLECT_EMBED_TEXT_CHARS: usize = 16_000;
+const REFLECT_PREVIEW_CHARS: usize = 260;
+const REFLECT_CACHE_RETENTION_DAYS: i64 = 400;
+const REFLECT_EMBED_TIMEOUT: Duration = Duration::from_secs(20);
+const REFLECT_DB_TIMEOUT: Duration = Duration::from_secs(12);
+const REFLECT_FS_TIMEOUT: Duration = Duration::from_secs(8);
+const REFLECT_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+const REFLECT_CLUSTER_TIMEOUT: Duration = Duration::from_secs(4);
+const REFLECT_CLUSTER_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+const REFLECT_RELATED_HISTORY_TIMEOUT: Duration = Duration::from_millis(500);
+const REFLECT_RELATED_HISTORY_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+const REFLECT_IDLE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const REFLECT_IDLE_LOOKBACK_DAYS: i64 = 35;
+const REFLECT_STALE_AFTER_SECS: i64 = 60 * 60;
+const REFLECT_REFRESH_LEASE_KEY: &str = "arkreflect_refresh_lease_v1";
+const REFLECT_REFRESH_LEASE_TTL_SECS: i64 = 180;
+const REFLECT_RELATED_HISTORY_LIMIT: u64 = 8;
+const REFLECT_RELATED_HISTORY_DISPLAY_LIMIT: usize = 3;
+const REFLECT_RELATED_HISTORY_MAX_DISTANCE: f64 = 0.32;
+const REFLECT_BASELINE_LOOKBACK_DAYS: i64 = 183;
+
+static REFLECT_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static REFLECT_IDLE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+static REFLECT_REFRESH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static REFLECT_REFRESH_STATUS: OnceLock<Arc<RwLock<ReflectRefreshStatus>>> = OnceLock::new();
+static REFLECT_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReflectPeriod {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl ReflectPeriod {
+    fn from_query(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "daily" | "day" => Self::Daily,
+            "monthly" | "month" => Self::Monthly,
+            _ => Self::Weekly,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+
+    fn default_window(
+        self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        match self {
+            Self::Daily => (now - chrono::Duration::days(1), now),
+            Self::Weekly => (now - chrono::Duration::days(7), now),
+            Self::Monthly => (now - chrono::Duration::days(31), now),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectUnitResponse {
+    id: String,
+    source_kind: String,
+    source_label: String,
+    channel: String,
+    title: String,
+    summary: String,
+    content_preview: String,
+    occurred_at: String,
+    message_count: i32,
+    has_embedding: bool,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectRelatedUnitResponse {
+    id: String,
+    source_label: String,
+    title: String,
+    occurred_at: String,
+    similarity: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectRelatedHistory {
+    mode: String,
+    similar_count: usize,
+    most_recent_at: Option<String>,
+    top_similarity: Option<f64>,
+    detail: String,
+    items: Vec<ReflectRelatedUnitResponse>,
+}
+
+impl ReflectRelatedHistory {
+    fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            mode: "unavailable".to_string(),
+            similar_count: 0,
+            most_recent_at: None,
+            top_similarity: None,
+            detail: detail.into(),
+            items: Vec::new(),
+        }
+    }
+
+    fn new_this_period() -> Self {
+        Self {
+            mode: "new".to_string(),
+            similar_count: 0,
+            most_recent_at: None,
+            top_similarity: None,
+            detail: "No close match was found in earlier or later reflection history.".to_string(),
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectClusterResponse {
+    id: String,
+    #[serde(skip)]
+    representative_unit_id: String,
+    #[serde(skip)]
+    centroid_embedding: Option<PgVector>,
+    label: String,
+    plain_summary: String,
+    unit_count: usize,
+    message_count: i32,
+    source_mix: BTreeMap<String, usize>,
+    color: String,
+    related_history: ReflectRelatedHistory,
+    units: Vec<ReflectUnitResponse>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct ReflectSourceCounts {
+    main_chat: usize,
+    orbit_chat: usize,
+    memory: usize,
+    procedures: usize,
+    apps: usize,
+    goals: usize,
+    watchers: usize,
+    sentinel: usize,
+    arkpulse: usize,
+    arkevolve: usize,
+    usage: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectEmbeddingStatus {
+    mode: String,
+    embedded_units: usize,
+    total_units: usize,
+    detail: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReflectRefreshStatus {
+    running: bool,
+    status: String,
+    trigger: Option<String>,
+    period: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    requested_at: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    last_error: Option<String>,
+    last_source_counts: ReflectSourceCounts,
+    sequence: u64,
+}
+
+impl Default for ReflectRefreshStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            status: "idle".to_string(),
+            trigger: None,
+            period: None,
+            from: None,
+            to: None,
+            requested_at: None,
+            started_at: None,
+            completed_at: None,
+            last_error: None,
+            last_source_counts: ReflectSourceCounts::default(),
+            sequence: 0,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectCacheStatus {
+    mode: String,
+    cached_units: usize,
+    stale: bool,
+    detail: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectResponse {
+    period: ReflectPeriod,
+    from: String,
+    to: String,
+    generated_at: String,
+    source_counts: ReflectSourceCounts,
+    baseline_source_counts: ReflectSourceCounts,
+    embedding_status: ReflectEmbeddingStatus,
+    refresh_status: ReflectRefreshStatus,
+    cache_status: ReflectCacheStatus,
+    clusters: Vec<ReflectClusterResponse>,
+    unclustered_units: Vec<ReflectUnitResponse>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectRefreshStartResponse {
+    accepted: bool,
+    running: bool,
+    status: String,
+    detail: String,
+    refresh_status: ReflectRefreshStatus,
+}
+
+#[derive(Debug, Clone)]
+struct ReflectCandidateUnit {
+    source_kind: String,
+    source_id: String,
+    conversation_id: Option<String>,
+    project_id: Option<String>,
+    channel: String,
+    title: String,
+    summary: String,
+    content_preview: String,
+    embedding_text: String,
+    occurred_at: String,
+    period_start: Option<String>,
+    period_end: Option<String>,
+    message_count: i32,
+    metadata: serde_json::Value,
+    inherited_embedding: Option<PgVector>,
+}
+
+#[derive(Debug, Clone)]
+struct ReflectRefreshRequest {
+    period: ReflectPeriod,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+}
+
+struct ReflectInFlightGuard;
+
+impl Drop for ReflectInFlightGuard {
+    fn drop(&mut self) {
+        REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+fn refresh_status_store() -> &'static Arc<RwLock<ReflectRefreshStatus>> {
+    REFLECT_REFRESH_STATUS.get_or_init(|| Arc::new(RwLock::new(ReflectRefreshStatus::default())))
+}
+
+async fn current_refresh_status() -> ReflectRefreshStatus {
+    refresh_status_store().read().await.clone()
+}
+
+async fn update_refresh_status(
+    update: impl FnOnce(&mut ReflectRefreshStatus),
+) -> ReflectRefreshStatus {
+    let mut status = refresh_status_store().write().await;
+    update(&mut status);
+    status.clone()
+}
+
+fn parse_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn query_time(
+    params: &HashMap<String, String>,
+    key: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    params.get(key).and_then(|value| parse_time(value))
+}
+
+fn parse_bool_param(params: &HashMap<String, String>, key: &str) -> bool {
+    params
+        .get(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    values
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("Untitled work")
+        .to_string()
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn stable_unit_id(source_kind: &str, source_id: &str) -> String {
+    format!(
+        "reflect-{}",
+        stable_hash(&format!("{}:{}", source_kind, source_id))
+            .chars()
+            .take(32)
+            .collect::<String>()
+    )
+}
+
+fn in_window(
+    value: &str,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    parse_time(value)
+        .map(|dt| dt >= from && dt < to)
+        .unwrap_or(false)
+}
+
+fn day_key(value: &str) -> Option<String> {
+    parse_time(value).map(|dt| dt.format("%Y-%m-%d").to_string())
+}
+
+fn source_label(source_kind: &str, channel: &str) -> String {
+    match source_kind {
+        "conversation" => "Chat".to_string(),
+        "orbit_chat" => "Orbit".to_string(),
+        "experience_item" => "Memory".to_string(),
+        "procedural_pattern" => "Learned workflow".to_string(),
+        "app" => "Apps".to_string(),
+        "goal" => "Goals".to_string(),
+        "watcher" => "Watchers".to_string(),
+        "sentinel" => "Sentinel".to_string(),
+        "arkpulse" => "ArkPulse".to_string(),
+        "arkevolve" => "ArkEvolve".to_string(),
+        "llm_usage" => "Usage".to_string(),
+        _ if !channel.trim().is_empty() => channel.trim().to_string(),
+        _ => "Work".to_string(),
+    }
+}
+
+fn increment_source_count(counts: &mut ReflectSourceCounts, source_kind: &str) {
+    match source_kind {
+        "conversation" => counts.main_chat += 1,
+        "orbit_chat" => counts.orbit_chat += 1,
+        "experience_item" => counts.memory += 1,
+        "procedural_pattern" => counts.procedures += 1,
+        "app" => counts.apps += 1,
+        "goal" => counts.goals += 1,
+        "watcher" => counts.watchers += 1,
+        "sentinel" => counts.sentinel += 1,
+        "arkpulse" => counts.arkpulse += 1,
+        "arkevolve" => counts.arkevolve += 1,
+        "llm_usage" => counts.usage += 1,
+        _ => {}
+    }
+}
+
+fn source_counts_from_units(units: &[semantic_work_unit::Model]) -> ReflectSourceCounts {
+    let mut counts = ReflectSourceCounts::default();
+    for unit in units {
+        increment_source_count(&mut counts, &unit.source_kind);
+    }
+    counts
+}
+
+fn unit_to_response(unit: &semantic_work_unit::Model) -> ReflectUnitResponse {
+    ReflectUnitResponse {
+        id: unit.id.clone(),
+        source_kind: unit.source_kind.clone(),
+        source_label: source_label(&unit.source_kind, &unit.channel),
+        channel: unit.channel.clone(),
+        title: unit.title.clone(),
+        summary: unit.summary.clone(),
+        content_preview: unit.content_preview.clone(),
+        occurred_at: unit.occurred_at.clone(),
+        message_count: unit.message_count,
+        has_embedding: unit.embedding.is_some(),
+        metadata: unit.metadata.clone(),
+    }
+}
+
+fn message_excerpt(messages: &[message::Model], role: &str, reverse: bool) -> String {
+    let iter: Box<dyn Iterator<Item = &message::Model>> = if reverse {
+        Box::new(messages.iter().rev())
+    } else {
+        Box::new(messages.iter())
+    };
+    iter.filter(|message| message.role == role)
+        .map(|message| message.content.trim())
+        .find(|content| !content.is_empty())
+        .map(|content| truncate_chars(content, REFLECT_PREVIEW_CHARS))
+        .unwrap_or_default()
+}
+
+fn orbit_message_excerpt(messages: &[OrbitChatMessage], role: &str, reverse: bool) -> String {
+    let iter: Box<dyn Iterator<Item = &OrbitChatMessage>> = if reverse {
+        Box::new(messages.iter().rev())
+    } else {
+        Box::new(messages.iter())
+    };
+    iter.filter(|message| message.role == role)
+        .map(|message| message.content.trim())
+        .find(|content| !content.is_empty())
+        .map(|content| truncate_chars(content, REFLECT_PREVIEW_CHARS))
+        .unwrap_or_default()
+}
+
+fn filter_orbit_messages_between(
+    messages: Vec<OrbitChatMessage>,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Vec<OrbitChatMessage> {
+    messages
+        .into_iter()
+        .filter(|message| in_window(&message.created_at, from, to))
+        .take(REFLECT_MAX_MESSAGES_PER_CONVERSATION as usize)
+        .collect()
+}
+
+fn conversation_candidate(
+    conversation: &conversation::Model,
+    messages: Vec<message::Model>,
+) -> Option<ReflectCandidateUnit> {
+    if messages.is_empty() {
+        return None;
+    }
+    let first_user = message_excerpt(&messages, "user", false);
+    let last_user = message_excerpt(&messages, "user", true);
+    let last_assistant = message_excerpt(&messages, "assistant", true);
+    let title = first_non_empty([
+        conversation.title.as_str(),
+        first_user.as_str(),
+        last_user.as_str(),
+    ]);
+    let summary = if last_assistant.is_empty() {
+        first_non_empty([last_user.as_str(), first_user.as_str(), title.as_str()])
+    } else {
+        last_assistant
+    };
+    let content_preview =
+        first_non_empty([first_user.as_str(), last_user.as_str(), summary.as_str()]);
+    let mut transcript = String::new();
+    for message in messages
+        .iter()
+        .take(REFLECT_MAX_MESSAGES_PER_CONVERSATION as usize)
+    {
+        if !message.content.trim().is_empty() {
+            transcript.push_str(&message.role);
+            transcript.push_str(": ");
+            transcript.push_str(message.content.trim());
+            transcript.push('\n');
+        }
+        if transcript.chars().count() >= REFLECT_EMBED_TEXT_CHARS {
+            break;
+        }
+    }
+    let first_at = messages
+        .first()
+        .map(|message| message.timestamp.clone())
+        .unwrap_or_else(|| conversation.created_at.clone());
+    let last_at = messages
+        .last()
+        .map(|message| message.timestamp.clone())
+        .unwrap_or_else(|| conversation.updated_at.clone());
+    let embedding_text = truncate_chars(
+        &format!(
+            "Title: {}\nChannel: {}\nConversation summary: {}\nConversation content:\n{}",
+            title, conversation.channel, summary, transcript
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "conversation".to_string(),
+        source_id: format!(
+            "{}:{}",
+            conversation.id,
+            day_key(&last_at).unwrap_or_else(|| stable_hash(&last_at).chars().take(10).collect())
+        ),
+        conversation_id: Some(conversation.id.clone()),
+        project_id: conversation.project_id.clone(),
+        channel: conversation.channel.clone(),
+        title,
+        summary,
+        content_preview,
+        embedding_text,
+        occurred_at: last_at.clone(),
+        period_start: Some(first_at),
+        period_end: Some(last_at),
+        message_count: messages.len().min(i32::MAX as usize) as i32,
+        metadata: serde_json::json!({ "conversation_id": conversation.id }),
+        inherited_embedding: None,
+    })
+}
+
+fn conversation_candidates(
+    conversation: &conversation::Model,
+    messages: Vec<message::Model>,
+) -> Vec<ReflectCandidateUnit> {
+    let mut by_day = BTreeMap::<String, Vec<message::Model>>::new();
+    for message in messages {
+        let Some(day) = day_key(&message.timestamp) else {
+            continue;
+        };
+        by_day.entry(day).or_default().push(message);
+    }
+    by_day
+        .into_values()
+        .filter_map(|daily_messages| conversation_candidate(conversation, daily_messages))
+        .collect()
+}
+
+fn orbit_candidate(
+    orbit: &Orbit,
+    transcript: &OrbitChatTranscriptSummary,
+    messages: Vec<OrbitChatMessage>,
+) -> Option<ReflectCandidateUnit> {
+    if messages.is_empty() {
+        return None;
+    }
+    let first_user = orbit_message_excerpt(&messages, "user", false);
+    let last_user = orbit_message_excerpt(&messages, "user", true);
+    let last_assistant = orbit_message_excerpt(&messages, "assistant", true);
+    let transcript_title = first_non_empty([
+        transcript.title.as_str(),
+        first_user.as_str(),
+        last_user.as_str(),
+    ]);
+    let title = format!("{}: {}", orbit.name.trim(), transcript_title);
+    let summary = if last_assistant.is_empty() {
+        first_non_empty([
+            last_user.as_str(),
+            first_user.as_str(),
+            transcript_title.as_str(),
+        ])
+    } else {
+        last_assistant
+    };
+    let content_preview =
+        first_non_empty([first_user.as_str(), last_user.as_str(), summary.as_str()]);
+    let mut transcript_text = String::new();
+    for message in messages
+        .iter()
+        .take(REFLECT_MAX_MESSAGES_PER_CONVERSATION as usize)
+    {
+        if !message.content.trim().is_empty() {
+            transcript_text.push_str(&message.role);
+            transcript_text.push_str(": ");
+            transcript_text.push_str(message.content.trim());
+            transcript_text.push('\n');
+        }
+        if transcript_text.chars().count() >= REFLECT_EMBED_TEXT_CHARS {
+            break;
+        }
+    }
+    let first_at = messages
+        .first()
+        .map(|message| message.created_at.clone())
+        .unwrap_or_else(|| transcript.created_at.clone());
+    let last_at = messages
+        .last()
+        .map(|message| message.created_at.clone())
+        .unwrap_or_else(|| transcript.updated_at.clone());
+    let embedding_text = truncate_chars(
+        &format!(
+            "Orbit: {}\nTranscript: {}\nOrbit chat summary: {}\nOrbit chat content:\n{}",
+            orbit.name, transcript_title, summary, transcript_text
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "orbit_chat".to_string(),
+        source_id: format!(
+            "{}:{}:{}",
+            orbit.id,
+            transcript.id,
+            day_key(&last_at).unwrap_or_else(|| stable_hash(&last_at).chars().take(10).collect())
+        ),
+        conversation_id: None,
+        project_id: None,
+        channel: "arkorbit".to_string(),
+        title,
+        summary,
+        content_preview,
+        embedding_text,
+        occurred_at: last_at.clone(),
+        period_start: Some(first_at),
+        period_end: Some(last_at),
+        message_count: messages.len().min(i32::MAX as usize) as i32,
+        metadata: serde_json::json!({
+            "orbit_id": orbit.id,
+            "orbit_name": orbit.name,
+            "transcript_id": transcript.id,
+            "current": transcript.current
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn orbit_candidates(
+    orbit: &Orbit,
+    transcript: &OrbitChatTranscriptSummary,
+    messages: Vec<OrbitChatMessage>,
+) -> Vec<ReflectCandidateUnit> {
+    let mut by_day = BTreeMap::<String, Vec<OrbitChatMessage>>::new();
+    for message in messages {
+        let Some(day) = day_key(&message.created_at) else {
+            continue;
+        };
+        by_day.entry(day).or_default().push(message);
+    }
+    by_day
+        .into_values()
+        .filter_map(|daily_messages| orbit_candidate(orbit, transcript, daily_messages))
+        .collect()
+}
+
+fn experience_item_candidate(item: experience_item::Model) -> ReflectCandidateUnit {
+    let title = first_non_empty([item.title.as_str(), item.content.as_str()]);
+    let summary = first_non_empty([item.content.as_str(), item.title.as_str()]);
+    let updated_at = item.updated_at.clone();
+    let embedding_text = truncate_chars(
+        &format!(
+            "Memory kind: {}\nTitle: {}\nContent: {}\nMetadata: {}",
+            item.kind, title, summary, item.metadata
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    ReflectCandidateUnit {
+        source_kind: "experience_item".to_string(),
+        source_id: item.id,
+        conversation_id: item.conversation_id,
+        project_id: item.project_id,
+        channel: "memory".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: updated_at.clone(),
+        period_start: item.last_supported_at.clone(),
+        period_end: Some(updated_at),
+        message_count: item.support_count,
+        metadata: serde_json::json!({
+            "kind": item.kind,
+            "confidence": item.confidence,
+            "support_count": item.support_count
+        }),
+        inherited_embedding: item.embedding,
+    }
+}
+
+fn procedural_pattern_candidate(pattern: procedural_pattern::Model) -> ReflectCandidateUnit {
+    let title = first_non_empty([
+        pattern.title.as_str(),
+        pattern.trigger_summary.as_str(),
+        pattern.summary.as_str(),
+    ]);
+    let summary = first_non_empty([
+        pattern.summary.as_str(),
+        pattern.trigger_summary.as_str(),
+        pattern.title.as_str(),
+    ]);
+    let updated_at = pattern.updated_at.clone();
+    let embedding_text = truncate_chars(
+        &format!(
+            "Workflow: {}\nTrigger: {}\nSummary: {}\nSteps: {}\nTools: {}",
+            title,
+            pattern.trigger_summary,
+            pattern.summary,
+            pattern.steps_json,
+            pattern.tool_sequence_json
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    ReflectCandidateUnit {
+        source_kind: "procedural_pattern".to_string(),
+        source_id: pattern.id,
+        conversation_id: pattern.conversation_id,
+        project_id: pattern.project_id,
+        channel: "learning".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: updated_at.clone(),
+        period_start: pattern.last_validated_at.clone(),
+        period_end: Some(updated_at),
+        message_count: pattern.sample_count,
+        metadata: serde_json::json!({
+            "intent_key": pattern.intent_key,
+            "sample_count": pattern.sample_count,
+            "success_rate": pattern.success_rate
+        }),
+        inherited_embedding: None,
+    }
+}
+
+fn app_candidate(
+    app: &serde_json::Value,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    let id = app.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let created_at = app
+        .get("created_at")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if !in_window(created_at, from, to) {
+        return None;
+    }
+    let title = first_non_empty([
+        app.get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+        id,
+    ]);
+    let runtime_mode = app
+        .get("runtime_mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("registered");
+    let quality = app
+        .get("quality_report_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unavailable");
+    let summary = format!(
+        "Built app '{}' with runtime {} and quality status {}.",
+        title, runtime_mode, quality
+    );
+    let embedding_text = truncate_chars(
+        &format!(
+            "App built: {}\nRuntime: {}\nQuality: {}\nStatic: {}\nEnabled: {}",
+            title,
+            runtime_mode,
+            quality,
+            app.get("is_static")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            app.get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "app".to_string(),
+        source_id: id.to_string(),
+        conversation_id: None,
+        project_id: None,
+        channel: "apps".to_string(),
+        title,
+        summary: summary.clone(),
+        content_preview: summary,
+        embedding_text,
+        occurred_at: created_at.to_string(),
+        period_start: Some(created_at.to_string()),
+        period_end: Some(created_at.to_string()),
+        message_count: 1,
+        metadata: serde_json::json!({
+            "app_id": id,
+            "runtime_mode": runtime_mode,
+            "quality_report_status": quality
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn goal_candidate(
+    row: task::Model,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    if !row.action.eq_ignore_ascii_case("goal") || !in_window(&row.updated_at, from, to) {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&row.arguments)
+        .unwrap_or(serde_json::Value::Null);
+    let goal_text = args
+        .get("goal")
+        .and_then(|value| value.as_str())
+        .unwrap_or(row.description.as_str())
+        .to_string();
+    let goal_id = args
+        .get("goal_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(row.id.as_str())
+        .to_string();
+    let title = first_non_empty([goal_text.as_str(), row.description.as_str()]);
+    let status = serde_json::from_str::<serde_json::Value>(&row.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or(row.status.clone());
+    let due = row
+        .scheduled_for
+        .as_deref()
+        .map(|value| format!(" Due {}.", value))
+        .unwrap_or_default();
+    let summary = format!("Tracked goal is currently {}.{}", status, due);
+    let embedding_text = truncate_chars(
+        &format!(
+            "Goal: {}\nStatus: {}\nDue: {}\nResult: {}",
+            title,
+            status,
+            row.scheduled_for.as_deref().unwrap_or("not set"),
+            row.result.as_deref().unwrap_or("")
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "goal".to_string(),
+        source_id: goal_id.clone(),
+        conversation_id: None,
+        project_id: None,
+        channel: "goals".to_string(),
+        title,
+        summary: summary.clone(),
+        content_preview: summary,
+        embedding_text,
+        occurred_at: row.updated_at.clone(),
+        period_start: Some(row.created_at.clone()),
+        period_end: Some(row.updated_at),
+        message_count: 1,
+        metadata: serde_json::json!({
+            "task_id": row.id,
+            "goal_id": goal_id,
+            "status": status,
+            "scheduled_for": row.scheduled_for
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn watcher_status_label(status: &crate::core::watcher::WatcherStatus) -> String {
+    match status {
+        crate::core::watcher::WatcherStatus::Active => "active".to_string(),
+        crate::core::watcher::WatcherStatus::Paused => "paused".to_string(),
+        crate::core::watcher::WatcherStatus::Triggered => "triggered".to_string(),
+        crate::core::watcher::WatcherStatus::TimedOut => "timed out".to_string(),
+        crate::core::watcher::WatcherStatus::Cancelled => "cancelled".to_string(),
+        crate::core::watcher::WatcherStatus::Failed { .. } => "failed".to_string(),
+    }
+}
+
+fn watcher_candidate(
+    watcher: crate::core::watcher::Watcher,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    let occurred = watcher
+        .last_poll_at
+        .clone()
+        .unwrap_or_else(|| watcher.created_at.clone())
+        .to_rfc3339();
+    if !in_window(&occurred, from, to) {
+        return None;
+    }
+    let status = watcher_status_label(&watcher.status);
+    let condition_summary = watcher.condition.summary();
+    let title = first_non_empty([watcher.description.as_str(), condition_summary.as_str()]);
+    let summary = format!(
+        "Watcher is {} after {} poll{}.",
+        status,
+        watcher.poll_count,
+        if watcher.poll_count == 1 { "" } else { "s" }
+    );
+    let embedding_text = truncate_chars(
+        &format!(
+            "Watcher: {}\nPoll action: {}\nCondition: {}\nStatus: {}\nOn trigger: {}\nLast outcome: {:?}",
+            title,
+            watcher.poll_action,
+            condition_summary,
+            status,
+            watcher.on_trigger,
+            watcher.last_poll_outcome
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "watcher".to_string(),
+        source_id: watcher.id.to_string(),
+        conversation_id: None,
+        project_id: None,
+        channel: "background".to_string(),
+        title,
+        summary: summary.clone(),
+        content_preview: watcher
+            .last_result
+            .as_deref()
+            .or(watcher.last_error.as_deref())
+            .map(|value| truncate_chars(value, REFLECT_PREVIEW_CHARS))
+            .unwrap_or(summary),
+        embedding_text,
+        occurred_at: occurred,
+        period_start: Some(watcher.created_at.to_rfc3339()),
+        period_end: watcher.last_poll_at.clone().map(|value| value.to_rfc3339()),
+        message_count: watcher.poll_count.min(i32::MAX as u32) as i32,
+        metadata: serde_json::json!({
+            "watcher_id": watcher.id.to_string(),
+            "status": status,
+            "poll_action": watcher.poll_action,
+            "poll_count": watcher.poll_count
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn supervisor_watcher_candidate(
+    state: crate::core::automation::AutomationSupervisorState,
+    live_watcher_ids: &HashSet<String>,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    if state.automation_kind != "watcher" || live_watcher_ids.contains(&state.automation_id) {
+        return None;
+    }
+    let occurred = state
+        .last_run_at
+        .clone()
+        .or_else(|| state.created_at.clone())?;
+    if !in_window(&occurred, from, to) {
+        return None;
+    }
+    let title = first_non_empty([state.title.as_str(), state.action.as_str()]);
+    let summary = format!(
+        "Historical watcher is {} after {} attempt{}.",
+        state.status,
+        state.attempt_count,
+        if state.attempt_count == 1 { "" } else { "s" }
+    );
+    let embedding_text = truncate_chars(
+        &format!(
+            "Watcher history: {}\nAction: {}\nStatus: {}\nLast error: {}",
+            title,
+            state.action,
+            state.status,
+            state.last_error.as_deref().unwrap_or("")
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "watcher".to_string(),
+        source_id: state.automation_id.clone(),
+        conversation_id: state.origin.conversation_id,
+        project_id: state.origin.project_id,
+        channel: "background".to_string(),
+        title,
+        summary: summary.clone(),
+        content_preview: state
+            .last_error
+            .as_deref()
+            .map(|value| truncate_chars(value, REFLECT_PREVIEW_CHARS))
+            .unwrap_or(summary),
+        embedding_text,
+        occurred_at: occurred,
+        period_start: state.created_at,
+        period_end: state.last_run_at,
+        message_count: state.attempt_count.min(i32::MAX as u32) as i32,
+        metadata: serde_json::json!({
+            "watcher_id": state.automation_id,
+            "status": state.status,
+            "history_only": true
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn sentinel_observation_candidate(
+    item: sentinel_panel::SentinelObservation,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    if !in_window(&item.updated_at, from, to) {
+        return None;
+    }
+    let title = first_non_empty([item.title.as_str(), item.kind.as_str()]);
+    let summary = first_non_empty([item.detail.as_str(), item.title.as_str()]);
+    let embedding_text = truncate_chars(
+        &format!(
+            "Sentinel observation: {}\nKind: {}\nDetail: {}\nSource: {}",
+            title,
+            item.kind,
+            item.detail,
+            item.source_label.as_deref().unwrap_or("")
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "sentinel".to_string(),
+        source_id: format!("observation:{}", item.id),
+        conversation_id: None,
+        project_id: None,
+        channel: "sentinel".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: item.updated_at.clone(),
+        period_start: Some(item.created_at),
+        period_end: Some(item.updated_at),
+        message_count: 1,
+        metadata: serde_json::json!({
+            "sentinel_id": item.id,
+            "kind": item.kind,
+            "priority": item.priority,
+            "confidence": item.confidence
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn sentinel_proposal_candidate(
+    item: sentinel_panel::SentinelProposal,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    if !in_window(&item.updated_at, from, to) {
+        return None;
+    }
+    let title = first_non_empty([item.title.as_str(), item.proposal_kind.as_str()]);
+    let summary = first_non_empty([
+        item.detail.as_str(),
+        item.rationale.as_str(),
+        item.title.as_str(),
+    ]);
+    let embedding_text = truncate_chars(
+        &format!(
+            "Sentinel proposal: {}\nKind: {}\nStatus: {}\nDetail: {}\nRationale: {}\nLast run: {}",
+            title,
+            item.proposal_kind,
+            item.status,
+            item.detail,
+            item.rationale,
+            item.last_run_summary.as_deref().unwrap_or("")
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "sentinel".to_string(),
+        source_id: format!("proposal:{}", item.id),
+        conversation_id: None,
+        project_id: None,
+        channel: "sentinel".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: item.updated_at.clone(),
+        period_start: Some(item.created_at),
+        period_end: Some(item.updated_at),
+        message_count: 1,
+        metadata: serde_json::json!({
+            "sentinel_id": item.id,
+            "proposal_kind": item.proposal_kind,
+            "status": item.status,
+            "priority": item.priority,
+            "confidence": item.confidence
+        }),
+        inherited_embedding: None,
+    })
+}
+
+fn arkpulse_candidate(event: arkpulse_event::Model) -> ReflectCandidateUnit {
+    let title = first_non_empty([event.message.as_str(), event.status.as_str()]);
+    let summary = first_non_empty([event.summary.as_str(), event.message.as_str()]);
+    let embedding_text = truncate_chars(
+        &format!(
+            "ArkPulse status: {}\nMessage: {}\nSummary: {}\nFlags: {}\nDetails: {}",
+            event.status, event.message, event.summary, event.flags_json, event.details_json
+        ),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    ReflectCandidateUnit {
+        source_kind: "arkpulse".to_string(),
+        source_id: event.id,
+        conversation_id: None,
+        project_id: None,
+        channel: "arkpulse".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: event.timestamp.clone(),
+        period_start: Some(event.timestamp.clone()),
+        period_end: Some(event.timestamp),
+        message_count: event
+            .overdue_tasks
+            .saturating_add(event.failed_tasks)
+            .max(1),
+        metadata: serde_json::json!({
+            "status": event.status,
+            "overdue_tasks": event.overdue_tasks,
+            "failed_tasks": event.failed_tasks
+        }),
+        inherited_embedding: None,
+    }
+}
+
+fn lineage_time(value: &serde_json::Value) -> Option<String> {
+    [
+        "timestamp",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "promoted_at",
+        "evaluated_at",
+        "updated_at",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        value
+            .get(key)
+            .and_then(|entry| entry.as_str())
+            .map(str::to_string)
+    })
+}
+
+fn lineage_candidate(
+    kind: &str,
+    value: serde_json::Value,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> Option<ReflectCandidateUnit> {
+    let occurred = lineage_time(&value)?;
+    if !in_window(&occurred, from, to) {
+        return None;
+    }
+    let raw = serde_json::to_string(&value).unwrap_or_default();
+    let id = value
+        .get("id")
+        .or_else(|| value.get("lineage_entry_id"))
+        .or_else(|| value.get("candidate_version"))
+        .or_else(|| value.get("version"))
+        .and_then(|entry| entry.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| stable_hash(&raw).chars().take(32).collect());
+    let title = first_non_empty([
+        value
+            .get("title")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default(),
+        value
+            .get("summary")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default(),
+        value
+            .get("status")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default(),
+        kind,
+    ]);
+    let summary = first_non_empty([
+        value
+            .get("summary")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default(),
+        value
+            .get("decision")
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default(),
+        raw.as_str(),
+    ]);
+    let embedding_text = truncate_chars(
+        &format!("ArkEvolve lineage kind: {}\nEntry: {}", kind, raw),
+        REFLECT_EMBED_TEXT_CHARS,
+    );
+    Some(ReflectCandidateUnit {
+        source_kind: "arkevolve".to_string(),
+        source_id: format!("{}:{}", kind, id),
+        conversation_id: None,
+        project_id: None,
+        channel: "arkevolve".to_string(),
+        title,
+        summary: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&summary, REFLECT_PREVIEW_CHARS),
+        embedding_text,
+        occurred_at: occurred.clone(),
+        period_start: Some(occurred.clone()),
+        period_end: Some(occurred),
+        message_count: 1,
+        metadata: serde_json::json!({
+            "lineage_kind": kind
+        }),
+        inherited_embedding: None,
+    })
+}
+
+#[derive(Default)]
+struct UsageBucket {
+    requests: i32,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    cost_usd: f64,
+    missing_cost: bool,
+    models: BTreeMap<String, i32>,
+    channels: BTreeMap<String, i32>,
+}
+
+fn usage_candidates(rows: Vec<llm_usage::Model>) -> Vec<ReflectCandidateUnit> {
+    let mut buckets = BTreeMap::<String, UsageBucket>::new();
+    for row in rows {
+        let Some(dt) = parse_time(&row.created_at) else {
+            continue;
+        };
+        let day = dt.format("%Y-%m-%d").to_string();
+        let bucket = buckets.entry(day).or_default();
+        bucket.requests += 1;
+        bucket.prompt_tokens += row.prompt_tokens.max(0) as i64;
+        bucket.completion_tokens += row.completion_tokens.max(0) as i64;
+        bucket.total_tokens += row.total_tokens.max(0) as i64;
+        if let Some(cost) = row.cost_usd {
+            bucket.cost_usd += cost.max(0.0);
+        } else {
+            bucket.missing_cost = true;
+        }
+        *bucket.models.entry(row.model).or_default() += 1;
+        *bucket.channels.entry(row.channel).or_default() += 1;
+    }
+    buckets
+        .into_iter()
+        .map(|(day, bucket)| {
+            let top_model = bucket
+                .models
+                .iter()
+                .max_by_key(|(_, count)| **count)
+                .map(|(model, _)| model.clone())
+                .unwrap_or_else(|| "unknown model".to_string());
+            let top_channel = bucket
+                .channels
+                .iter()
+                .max_by_key(|(_, count)| **count)
+                .map(|(channel, _)| channel.clone())
+                .unwrap_or_else(|| "unknown channel".to_string());
+            let occurred_at = format!("{}T12:00:00Z", day);
+            let cost_text = if bucket.missing_cost {
+                "partial cost data".to_string()
+            } else {
+                format!("${:.4}", bucket.cost_usd)
+            };
+            let title = format!("LLM usage on {}", day);
+            let summary = format!(
+                "{} request{} used {} tokens with {}.",
+                bucket.requests,
+                if bucket.requests == 1 { "" } else { "s" },
+                bucket.total_tokens,
+                cost_text
+            );
+            let embedding_text = truncate_chars(
+                &format!(
+                    "Usage day: {}\nRequests: {}\nTotal tokens: {}\nPrompt tokens: {}\nCompletion tokens: {}\nTop model: {}\nTop channel: {}\nCost: {}",
+                    day,
+                    bucket.requests,
+                    bucket.total_tokens,
+                    bucket.prompt_tokens,
+                    bucket.completion_tokens,
+                    top_model,
+                    top_channel,
+                    cost_text
+                ),
+                REFLECT_EMBED_TEXT_CHARS,
+            );
+            ReflectCandidateUnit {
+                source_kind: "llm_usage".to_string(),
+                source_id: day.clone(),
+                conversation_id: None,
+                project_id: None,
+                channel: "analytics".to_string(),
+                title,
+                summary: summary.clone(),
+                content_preview: summary,
+                embedding_text,
+                occurred_at,
+                period_start: Some(format!("{}T00:00:00Z", day)),
+                period_end: Some(format!("{}T23:59:59Z", day)),
+                message_count: bucket.requests,
+                metadata: serde_json::json!({
+                    "requests": bucket.requests,
+                    "prompt_tokens": bucket.prompt_tokens,
+                    "completion_tokens": bucket.completion_tokens,
+                    "total_tokens": bucket.total_tokens,
+                    "cost_usd": if bucket.missing_cost { serde_json::Value::Null } else { serde_json::json!(bucket.cost_usd) },
+                    "top_model": top_model,
+                    "top_channel": top_channel
+                }),
+                inherited_embedding: None,
+            }
+        })
+        .collect()
+}
+
+async fn embedding_for_candidate(
+    storage: &Storage,
+    embedder: Option<&EmbeddingClient>,
+    candidate: &ReflectCandidateUnit,
+    id: &str,
+    text_hash: &str,
+) -> Option<PgVector> {
+    if let Ok(Ok(Some(existing))) =
+        tokio::time::timeout(REFLECT_DB_TIMEOUT, storage.get_semantic_work_unit(id)).await
+    {
+        if existing.text_hash == text_hash {
+            if let Some(embedding) = existing.embedding {
+                return Some(embedding);
+            }
+        }
+    }
+    if let Some(embedding) = candidate.inherited_embedding.clone() {
+        return Some(embedding);
+    }
+    let Some(embedder) = embedder else {
+        return None;
+    };
+    let input = candidate.embedding_text.trim();
+    if input.is_empty() {
+        return None;
+    }
+    match tokio::time::timeout(
+        REFLECT_EMBED_TIMEOUT,
+        embedder.embed_texts(&[input.to_string()]),
+    )
+    .await
+    {
+        Ok(Ok(mut embeddings)) => embeddings.pop(),
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "semantic work unit embedding failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(target: "arkreflect", "semantic work unit embedding timed out");
+            None
+        }
+    }
+}
+
+async fn upsert_candidate(
+    storage: &Storage,
+    embedder: Option<&EmbeddingClient>,
+    candidate: ReflectCandidateUnit,
+) -> bool {
+    let id = stable_unit_id(&candidate.source_kind, &candidate.source_id);
+    let text_hash = stable_hash(&candidate.embedding_text);
+    let embedding = embedding_for_candidate(storage, embedder, &candidate, &id, &text_hash).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut metadata = candidate.metadata;
+    if let Some(object) = metadata.as_object_mut() {
+        if let Some(embedding) = embedding.as_ref() {
+            object.insert(
+                "embedding_dim".to_string(),
+                serde_json::json!(embedding.as_slice().len()),
+            );
+        }
+    }
+    let model = semantic_work_unit::Model {
+        id,
+        source_kind: candidate.source_kind,
+        source_id: candidate.source_id,
+        conversation_id: candidate.conversation_id,
+        project_id: candidate.project_id,
+        channel: candidate.channel,
+        title: truncate_chars(&candidate.title, 180),
+        summary: truncate_chars(&candidate.summary, REFLECT_PREVIEW_CHARS),
+        content_preview: truncate_chars(&candidate.content_preview, REFLECT_PREVIEW_CHARS),
+        text_hash,
+        occurred_at: candidate.occurred_at,
+        period_start: candidate.period_start,
+        period_end: candidate.period_end,
+        message_count: candidate.message_count.max(0),
+        metadata,
+        created_at: now.clone(),
+        updated_at: now,
+        embedding,
+    };
+    match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.upsert_semantic_work_unit(&model),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "arkreflect", error = %error, "failed to upsert semantic work unit");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(target: "arkreflect", "semantic work unit upsert timed out");
+            false
+        }
+    }
+}
+
+async fn upsert_candidates(
+    storage: &Storage,
+    embedder: Option<&EmbeddingClient>,
+    candidates: impl IntoIterator<Item = ReflectCandidateUnit>,
+    counts: &mut ReflectSourceCounts,
+) {
+    for candidate in candidates {
+        let source_kind = candidate.source_kind.clone();
+        if upsert_candidate(storage, embedder, candidate).await {
+            increment_source_count(counts, &source_kind);
+        }
+    }
+}
+
+async fn list_orbit_transcripts_blocking(
+    arkorbit: ArkOrbitService,
+    orbit_id: String,
+) -> Vec<OrbitChatTranscriptSummary> {
+    match tokio::time::timeout(
+        REFLECT_FS_TIMEOUT,
+        tokio::task::spawn_blocking(move || arkorbit.list_orbit_chat_transcripts(&orbit_id)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(transcripts))) => transcripts,
+        Ok(Ok(Err(error))) => {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to list ArkOrbit transcripts");
+            Vec::new()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "arkreflect", error = %error, "ArkOrbit transcript listing task failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!(target: "arkreflect", "ArkOrbit transcript listing timed out");
+            Vec::new()
+        }
+    }
+}
+
+async fn read_orbit_transcript_blocking(
+    arkorbit: ArkOrbitService,
+    orbit_id: String,
+    transcript_id: String,
+) -> Vec<OrbitChatMessage> {
+    match tokio::time::timeout(
+        REFLECT_FS_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            arkorbit.read_orbit_chat_transcript(
+                &orbit_id,
+                &transcript_id,
+                REFLECT_MAX_MESSAGES_PER_CONVERSATION as usize,
+            )
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(messages))) => messages,
+        Ok(Ok(Err(error))) => {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to read ArkOrbit transcript");
+            Vec::new()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "arkreflect", error = %error, "ArkOrbit transcript read task failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!(target: "arkreflect", "ArkOrbit transcript read timed out");
+            Vec::new()
+        }
+    }
+}
+
+async fn read_lineage_file(path_rel: &str, limit: usize) -> Vec<serde_json::Value> {
+    tokio::time::timeout(REFLECT_FS_TIMEOUT, read_recent_jsonl(path_rel, limit))
+        .await
+        .unwrap_or_default()
+}
+
+async fn refresh_reflect_units(
+    storage: &Storage,
+    embedder: Option<&EmbeddingClient>,
+    arkorbit: &ArkOrbitService,
+    user_id: &str,
+    app_registry: &crate::actions::app::AppRegistry,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> ReflectSourceCounts {
+    let mut counts = ReflectSourceCounts::default();
+    let from_s = from.to_rfc3339();
+    let to_s = to.to_rfc3339();
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::days(REFLECT_CACHE_RETENTION_DAYS)).to_rfc3339();
+    if let Ok(Err(error)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.delete_semantic_work_units_before(&cutoff),
+    )
+    .await
+    {
+        tracing::debug!(target: "arkreflect", error = %error, "semantic work unit retention cleanup failed");
+    }
+
+    if let Ok(Ok(conversations)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_conversations_updated_between(&from_s, &to_s, REFLECT_MAX_CONVERSATIONS),
+    )
+    .await
+    {
+        for conversation in conversations {
+            let messages = tokio::time::timeout(
+                REFLECT_DB_TIMEOUT,
+                storage.get_messages_between(
+                    &conversation.id,
+                    &from_s,
+                    &to_s,
+                    REFLECT_MAX_MESSAGES_PER_CONVERSATION,
+                ),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .unwrap_or_default();
+            upsert_candidates(
+                storage,
+                embedder,
+                conversation_candidates(&conversation, messages),
+                &mut counts,
+            )
+            .await;
+        }
+    }
+
+    if let Ok(orbits) =
+        tokio::time::timeout(REFLECT_DB_TIMEOUT, arkorbit.list_orbits(user_id)).await
+    {
+        if let Ok(orbits) = orbits {
+            for orbit in orbits.into_iter().take(REFLECT_MAX_ORBITS) {
+                let transcripts =
+                    list_orbit_transcripts_blocking(arkorbit.clone(), orbit.id.clone()).await;
+                for transcript in transcripts
+                    .into_iter()
+                    .take(REFLECT_MAX_TRANSCRIPTS_PER_ORBIT)
+                {
+                    if !in_window(&transcript.updated_at, from, to) {
+                        continue;
+                    }
+                    let messages = read_orbit_transcript_blocking(
+                        arkorbit.clone(),
+                        orbit.id.clone(),
+                        transcript.id.clone(),
+                    )
+                    .await;
+                    let messages = filter_orbit_messages_between(messages, from, to);
+                    upsert_candidates(
+                        storage,
+                        embedder,
+                        orbit_candidates(&orbit, &transcript, messages),
+                        &mut counts,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    if let Ok(Ok(items)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_experience_items_between(&from_s, &to_s, REFLECT_MAX_EXPERIENCE_ITEMS),
+    )
+    .await
+    {
+        upsert_candidates(
+            storage,
+            embedder,
+            items.into_iter().map(experience_item_candidate),
+            &mut counts,
+        )
+        .await;
+    }
+
+    if let Ok(Ok(patterns)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_procedural_patterns_between(&from_s, &to_s, REFLECT_MAX_PROCEDURAL_PATTERNS),
+    )
+    .await
+    {
+        upsert_candidates(
+            storage,
+            embedder,
+            patterns.into_iter().map(procedural_pattern_candidate),
+            &mut counts,
+        )
+        .await;
+    }
+
+    let apps = tokio::time::timeout(REFLECT_DB_TIMEOUT, app_registry.list())
+        .await
+        .unwrap_or_default();
+    let app_candidates = apps
+        .into_iter()
+        .filter_map(|app| app_candidate(&app, from, to))
+        .collect::<Vec<_>>();
+    upsert_candidates(storage, embedder, app_candidates, &mut counts).await;
+
+    if let Ok(Ok(tasks)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_tasks_updated_between(&from_s, &to_s, REFLECT_MAX_TASKS),
+    )
+    .await
+    {
+        upsert_candidates(
+            storage,
+            embedder,
+            tasks
+                .into_iter()
+                .filter_map(|row| goal_candidate(row, from, to)),
+            &mut counts,
+        )
+        .await;
+    }
+
+    let watchers = tokio::time::timeout(REFLECT_DB_TIMEOUT, storage.list_watchers())
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .unwrap_or_default();
+    let live_watcher_ids = watchers
+        .iter()
+        .map(|watcher| watcher.id.to_string())
+        .collect::<HashSet<_>>();
+    upsert_candidates(
+        storage,
+        embedder,
+        watchers
+            .into_iter()
+            .take(REFLECT_MAX_WATCHERS)
+            .filter_map(|watcher| watcher_candidate(watcher, from, to)),
+        &mut counts,
+    )
+    .await;
+
+    let supervisor_states = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_automation_supervisor_states(),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .unwrap_or_default();
+    upsert_candidates(
+        storage,
+        embedder,
+        supervisor_states
+            .into_iter()
+            .take(REFLECT_MAX_WATCHERS)
+            .filter_map(|state| supervisor_watcher_candidate(state, &live_watcher_ids, from, to)),
+        &mut counts,
+    )
+    .await;
+
+    let observations = sentinel_panel::load_observations(storage).await;
+    upsert_candidates(
+        storage,
+        embedder,
+        observations
+            .into_iter()
+            .take(REFLECT_MAX_SENTINEL_ITEMS)
+            .filter_map(|item| sentinel_observation_candidate(item, from, to)),
+        &mut counts,
+    )
+    .await;
+    let proposals = sentinel_panel::load_proposals(storage).await;
+    upsert_candidates(
+        storage,
+        embedder,
+        proposals
+            .into_iter()
+            .take(REFLECT_MAX_SENTINEL_ITEMS)
+            .filter_map(|item| sentinel_proposal_candidate(item, from, to)),
+        &mut counts,
+    )
+    .await;
+
+    if let Ok(Ok(events)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_arkpulse_events_between(&from_s, &to_s, REFLECT_MAX_PULSE_EVENTS),
+    )
+    .await
+    {
+        upsert_candidates(
+            storage,
+            embedder,
+            events.into_iter().map(arkpulse_candidate),
+            &mut counts,
+        )
+        .await;
+    }
+
+    let routing_lineage =
+        read_lineage_file(ROUTING_POLICY_LINEAGE_REL_PATH, REFLECT_MAX_LINEAGE_ROWS).await;
+    let prompt_lineage =
+        read_lineage_file(PROMPT_BUNDLE_LINEAGE_REL_PATH, REFLECT_MAX_LINEAGE_ROWS).await;
+    let specialist_lineage = read_lineage_file(
+        SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH,
+        REFLECT_MAX_LINEAGE_ROWS,
+    )
+    .await;
+    upsert_candidates(
+        storage,
+        embedder,
+        routing_lineage
+            .into_iter()
+            .filter_map(|value| lineage_candidate("routing_policy", value, from, to))
+            .chain(
+                prompt_lineage
+                    .into_iter()
+                    .filter_map(|value| lineage_candidate("prompt_bundle", value, from, to)),
+            )
+            .chain(specialist_lineage.into_iter().filter_map(|value| {
+                lineage_candidate("specialist_prompt_bundle", value, from, to)
+            })),
+        &mut counts,
+    )
+    .await;
+
+    if let Ok(Ok(rows)) = tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_llm_usage_between(&from_s, &to_s, REFLECT_MAX_LLM_USAGE_ROWS),
+    )
+    .await
+    {
+        upsert_candidates(storage, embedder, usage_candidates(rows), &mut counts).await;
+    }
+
+    counts
+}
+
+fn normalized_vector(embedding: &PgVector, dimension: usize) -> Option<Vec<f32>> {
+    let slice = embedding.as_slice();
+    if slice.len() != dimension {
+        return None;
+    }
+    let mut values = slice.to_vec();
+    let norm = values
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        return None;
+    }
+    for value in &mut values {
+        *value = (*value as f64 / norm) as f32;
+    }
+    Some(values)
+}
+
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot = a
+        .iter()
+        .zip(b.iter())
+        .map(|(left, right)| (*left as f64) * (*right as f64))
+        .sum::<f64>();
+    (1.0 - dot.clamp(-1.0, 1.0)) as f32
+}
+
+fn choose_seed_vectors(vectors: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
+    let mut seeds = Vec::new();
+    if vectors.is_empty() || k == 0 {
+        return seeds;
+    }
+    seeds.push(vectors[0].clone());
+    while seeds.len() < k && seeds.len() < vectors.len() {
+        let next = vectors
+            .iter()
+            .filter(|candidate| {
+                !seeds
+                    .iter()
+                    .any(|seed| cosine_distance(seed, candidate) <= 0.000_01)
+            })
+            .max_by(|a, b| {
+                let da = seeds
+                    .iter()
+                    .map(|seed| cosine_distance(seed, a))
+                    .fold(f32::INFINITY, f32::min);
+                let db = seeds
+                    .iter()
+                    .map(|seed| cosine_distance(seed, b))
+                    .fold(f32::INFINITY, f32::min);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        if let Some(next) = next {
+            seeds.push(next);
+        } else {
+            break;
+        }
+    }
+    seeds
+}
+
+fn recompute_centroid(
+    assignments: &[usize],
+    vectors: &[Vec<f32>],
+    cluster: usize,
+    dimension: usize,
+) -> Option<Vec<f32>> {
+    let mut centroid = vec![0.0f64; dimension];
+    let mut count = 0usize;
+    for (idx, vector) in vectors.iter().enumerate() {
+        if assignments.get(idx).copied() != Some(cluster) {
+            continue;
+        }
+        count += 1;
+        for (slot, value) in centroid.iter_mut().zip(vector.iter()) {
+            *slot += *value as f64;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut centroid = centroid
+        .into_iter()
+        .map(|value| (value / count as f64) as f32)
+        .collect::<Vec<_>>();
+    let norm = centroid
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt();
+    if norm <= f64::EPSILON {
+        return None;
+    }
+    for value in &mut centroid {
+        *value = (*value as f64 / norm) as f32;
+    }
+    Some(centroid)
+}
+
+fn centroid_for_local_indices(
+    indices: &[usize],
+    vectors: &[Vec<f32>],
+    dimension: usize,
+) -> Option<Vec<f32>> {
+    if indices.is_empty() || dimension == 0 {
+        return None;
+    }
+    let mut centroid = vec![0.0f64; dimension];
+    let mut count = 0usize;
+    for idx in indices {
+        let Some(vector) = vectors.get(*idx) else {
+            continue;
+        };
+        count += 1;
+        for (slot, value) in centroid.iter_mut().zip(vector.iter()) {
+            *slot += *value as f64;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut centroid = centroid
+        .into_iter()
+        .map(|value| (value / count as f64) as f32)
+        .collect::<Vec<_>>();
+    let norm = centroid
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt();
+    if norm <= f64::EPSILON {
+        return None;
+    }
+    for value in &mut centroid {
+        *value = (*value as f64 / norm) as f32;
+    }
+    Some(centroid)
+}
+
+fn assign_vectors(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
+    vectors
+        .iter()
+        .map(|vector| {
+            centroids
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    cosine_distance(vector, a)
+                        .partial_cmp(&cosine_distance(vector, b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn cluster_assignments(vectors: &[Vec<f32>]) -> Vec<usize> {
+    if vectors.is_empty() {
+        return Vec::new();
+    }
+    if vectors.len() <= 2 {
+        return (0..vectors.len()).collect();
+    }
+    let k = REFLECT_MAX_CLUSTERS
+        .min(vectors.len())
+        .min((vectors.len() as f64).sqrt().ceil().max(2.0) as usize);
+    let dimension = vectors[0].len();
+    let mut centroids = choose_seed_vectors(vectors, k);
+    if centroids.is_empty() {
+        return vec![0; vectors.len()];
+    }
+    let mut assignments = assign_vectors(vectors, &centroids);
+    for _ in 0..REFLECT_KMEANS_ROUNDS {
+        let next_centroids = (0..centroids.len())
+            .map(|cluster| {
+                recompute_centroid(&assignments, vectors, cluster, dimension)
+                    .unwrap_or_else(|| centroids[cluster].clone())
+            })
+            .collect::<Vec<_>>();
+        centroids = next_centroids;
+        assignments = assign_vectors(vectors, &centroids);
+    }
+    assignments
+}
+
+fn representative_index(indices: &[usize], vectors: &[Vec<f32>]) -> usize {
+    if indices.len() <= 1 {
+        return indices[0];
+    }
+    indices
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            let da = indices
+                .iter()
+                .copied()
+                .filter(|other| other != a)
+                .map(|other| cosine_distance(&vectors[*a], &vectors[other]))
+                .sum::<f32>();
+            let db = indices
+                .iter()
+                .copied()
+                .filter(|other| other != b)
+                .map(|other| cosine_distance(&vectors[*b], &vectors[other]))
+                .sum::<f32>();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(indices[0])
+}
+
+fn reflect_palette(index: usize) -> String {
+    const COLORS: &[&str] = &[
+        "#2F80ED", "#00A676", "#B55CFF", "#FF7A45", "#00A8A8", "#D94F70", "#7A6FF0", "#C58A00",
+    ];
+    COLORS[index % COLORS.len()].to_string()
+}
+
+fn build_clusters(
+    units: &[semantic_work_unit::Model],
+) -> (
+    Vec<ReflectClusterResponse>,
+    Vec<ReflectUnitResponse>,
+    ReflectEmbeddingStatus,
+) {
+    let dimension = units
+        .iter()
+        .filter_map(|unit| unit.embedding.as_ref())
+        .map(|embedding| embedding.as_slice().len())
+        .find(|dimension| *dimension > 0)
+        .unwrap_or(0);
+
+    let mut embedded_units = Vec::<(usize, Vec<f32>)>::new();
+    let mut mismatched_dimensions = 0usize;
+    if dimension > 0 {
+        for (idx, unit) in units.iter().enumerate() {
+            match unit
+                .embedding
+                .as_ref()
+                .and_then(|embedding| normalized_vector(embedding, dimension))
+            {
+                Some(embedding) => embedded_units.push((idx, embedding)),
+                None if unit.embedding.is_some() => mismatched_dimensions += 1,
+                None => {}
+            }
+        }
+    }
+
+    let embedded_count = embedded_units.len();
+    if embedded_units.len() < 2 {
+        let clusters = units
+            .iter()
+            .take(REFLECT_MAX_CLUSTERS)
+            .enumerate()
+            .map(|(idx, unit)| {
+                let mut source_mix = BTreeMap::new();
+                source_mix.insert(source_label(&unit.source_kind, &unit.channel), 1);
+                ReflectClusterResponse {
+                    id: format!("activity-{}", idx + 1),
+                    representative_unit_id: unit.id.clone(),
+                    centroid_embedding: unit.embedding.clone(),
+                    label: unit.title.clone(),
+                    plain_summary: unit.summary.clone(),
+                    unit_count: 1,
+                    message_count: unit.message_count,
+                    source_mix,
+                    color: reflect_palette(idx),
+                    related_history: ReflectRelatedHistory::unavailable(
+                        "Semantic history comparison needs an embedded representative item.",
+                    ),
+                    units: vec![unit_to_response(unit)],
+                }
+            })
+            .collect::<Vec<_>>();
+        let used = clusters
+            .iter()
+            .flat_map(|cluster| cluster.units.iter().map(|unit| unit.id.clone()))
+            .collect::<HashSet<_>>();
+        let unclustered = units
+            .iter()
+            .filter(|unit| !used.contains(&unit.id))
+            .map(unit_to_response)
+            .collect::<Vec<_>>();
+        return (
+            clusters,
+            unclustered,
+            ReflectEmbeddingStatus {
+                mode: "activity".to_string(),
+                embedded_units: embedded_count,
+                total_units: units.len(),
+                detail: "ArkReflect is showing cached activity while background semantic grouping catches up.".to_string(),
+            },
+        );
+    }
+
+    let vectors = embedded_units
+        .iter()
+        .map(|(_, vector)| vector.clone())
+        .collect::<Vec<_>>();
+    let assignments = cluster_assignments(&vectors);
+    let mut cluster_to_local_indices: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (local_idx, cluster) in assignments.iter().copied().enumerate() {
+        cluster_to_local_indices
+            .entry(cluster)
+            .or_default()
+            .push(local_idx);
+    }
+
+    let mut groups = cluster_to_local_indices
+        .into_values()
+        .map(|local_indices| {
+            let global_indices = local_indices
+                .iter()
+                .filter_map(|local_idx| embedded_units.get(*local_idx).map(|(idx, _)| *idx))
+                .collect::<Vec<_>>();
+            (local_indices, global_indices)
+        })
+        .filter(|(_, global_indices)| !global_indices.is_empty())
+        .collect::<Vec<_>>();
+    groups.sort_by(|(_, a), (_, b)| b.len().cmp(&a.len()));
+
+    let mut used = HashSet::new();
+    let clusters = groups
+        .into_iter()
+        .take(REFLECT_MAX_CLUSTERS)
+        .enumerate()
+        .map(|(idx, (local_indices, global_indices))| {
+            let local_representative = representative_index(&local_indices, &vectors);
+            let representative_global = embedded_units
+                .get(local_representative)
+                .map(|(global_idx, _)| *global_idx)
+                .unwrap_or(global_indices[0]);
+            let representative = &units[representative_global];
+            let mut source_mix = BTreeMap::new();
+            let mut message_count = 0i32;
+            let mut cluster_units = global_indices
+                .iter()
+                .map(|global_idx| {
+                    let unit = &units[*global_idx];
+                    used.insert(unit.id.clone());
+                    *source_mix
+                        .entry(source_label(&unit.source_kind, &unit.channel))
+                        .or_insert(0) += 1;
+                    message_count = message_count.saturating_add(unit.message_count.max(0));
+                    unit_to_response(unit)
+                })
+                .collect::<Vec<_>>();
+            cluster_units.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at));
+            let source_count = source_mix.len();
+            ReflectClusterResponse {
+                id: format!("cluster-{}", idx + 1),
+                representative_unit_id: representative.id.clone(),
+                centroid_embedding: centroid_for_local_indices(
+                    &local_indices,
+                    &vectors,
+                    vectors.first().map(|vector| vector.len()).unwrap_or(0),
+                )
+                .map(PgVector::from),
+                label: representative.title.clone(),
+                plain_summary: format!(
+                    "{} related item{} across {} source{}.",
+                    cluster_units.len(),
+                    if cluster_units.len() == 1 { "" } else { "s" },
+                    source_count,
+                    if source_count == 1 { "" } else { "s" }
+                ),
+                unit_count: cluster_units.len(),
+                message_count,
+                source_mix,
+                color: reflect_palette(idx),
+                related_history: ReflectRelatedHistory::unavailable(
+                    "Related history has not been checked for this cluster yet.",
+                ),
+                units: cluster_units,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let unclustered = units
+        .iter()
+        .filter(|unit| !used.contains(&unit.id))
+        .map(unit_to_response)
+        .collect::<Vec<_>>();
+
+    let detail = if mismatched_dimensions > 0 {
+        format!(
+            "Semantic grouping is active. {} cached embedding{} used a different dimension and will be refreshed by the background pass.",
+            mismatched_dimensions,
+            if mismatched_dimensions == 1 { "" } else { "s" }
+        )
+    } else {
+        "Semantic grouping is based on local derived work-unit embeddings for this time range."
+            .to_string()
+    };
+
+    (
+        clusters,
+        unclustered,
+        ReflectEmbeddingStatus {
+            mode: "semantic".to_string(),
+            embedded_units: embedded_count,
+            total_units: units.len(),
+            detail,
+        },
+    )
+}
+
+fn reflect_cluster_semaphore() -> Arc<Semaphore> {
+    REFLECT_CLUSTER_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+}
+
+fn build_activity_cluster_fallback(
+    units: &[semantic_work_unit::Model],
+    detail: impl Into<String>,
+) -> (
+    Vec<ReflectClusterResponse>,
+    Vec<ReflectUnitResponse>,
+    ReflectEmbeddingStatus,
+) {
+    let clusters = units
+        .iter()
+        .take(REFLECT_MAX_CLUSTERS)
+        .enumerate()
+        .map(|(idx, unit)| {
+            let mut source_mix = BTreeMap::new();
+            source_mix.insert(source_label(&unit.source_kind, &unit.channel), 1);
+            ReflectClusterResponse {
+                id: format!("activity-{}", idx + 1),
+                representative_unit_id: unit.id.clone(),
+                centroid_embedding: unit.embedding.clone(),
+                label: unit.title.clone(),
+                plain_summary: unit.summary.clone(),
+                unit_count: 1,
+                message_count: unit.message_count,
+                source_mix,
+                color: reflect_palette(idx),
+                related_history: ReflectRelatedHistory::unavailable(
+                    "Semantic history comparison needs completed cluster grouping.",
+                ),
+                units: vec![unit_to_response(unit)],
+            }
+        })
+        .collect::<Vec<_>>();
+    let used = clusters
+        .iter()
+        .flat_map(|cluster| cluster.units.iter().map(|unit| unit.id.clone()))
+        .collect::<HashSet<_>>();
+    let unclustered = units
+        .iter()
+        .filter(|unit| !used.contains(&unit.id))
+        .map(unit_to_response)
+        .collect::<Vec<_>>();
+    (
+        clusters,
+        unclustered,
+        ReflectEmbeddingStatus {
+            mode: "activity".to_string(),
+            embedded_units: units.iter().filter(|unit| unit.embedding.is_some()).count(),
+            total_units: units.len(),
+            detail: detail.into(),
+        },
+    )
+}
+
+async fn build_clusters_bounded(
+    units: Vec<semantic_work_unit::Model>,
+) -> (
+    Vec<ReflectClusterResponse>,
+    Vec<ReflectUnitResponse>,
+    ReflectEmbeddingStatus,
+) {
+    let fallback_units = units.clone();
+    let permit = match tokio::time::timeout(
+        REFLECT_CLUSTER_QUEUE_TIMEOUT,
+        reflect_cluster_semaphore().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return build_activity_cluster_fallback(
+                &fallback_units,
+                "Semantic grouping is temporarily unavailable; showing cached activity instead.",
+            );
+        }
+        Err(_) => {
+            return build_activity_cluster_fallback(
+                &fallback_units,
+                "Semantic grouping is busy; showing cached activity instead.",
+            );
+        }
+    };
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build_clusters(&units)
+    });
+    match tokio::time::timeout(REFLECT_CLUSTER_TIMEOUT, handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "arkreflect", error = %error, "cluster worker failed");
+            build_activity_cluster_fallback(
+                &fallback_units,
+                "Semantic grouping failed; showing cached activity instead.",
+            )
+        }
+        Err(_) => {
+            tracing::warn!(target: "arkreflect", "cluster worker timed out");
+            build_activity_cluster_fallback(
+                &fallback_units,
+                "Semantic grouping took too long; showing cached activity instead.",
+            )
+        }
+    }
+}
+
+async fn enrich_clusters_with_related_history(
+    storage: &Storage,
+    units: &[semantic_work_unit::Model],
+    clusters: &mut [ReflectClusterResponse],
+    from: &str,
+    to: &str,
+) {
+    let by_id = units
+        .iter()
+        .map(|unit| (unit.id.as_str(), unit))
+        .collect::<HashMap<_, _>>();
+    for cluster in clusters {
+        let Some(representative) = by_id.get(cluster.representative_unit_id.as_str()) else {
+            cluster.related_history = ReflectRelatedHistory::unavailable(
+                "Related history could not find this cluster's representative item.",
+            );
+            continue;
+        };
+        let Some(embedding) = cluster
+            .centroid_embedding
+            .as_ref()
+            .or(representative.embedding.as_ref())
+        else {
+            cluster.related_history = ReflectRelatedHistory::unavailable(
+                "Related history needs an embedded representative item.",
+            );
+            continue;
+        };
+        let exclude_ids = cluster
+            .units
+            .iter()
+            .map(|unit| unit.id.clone())
+            .collect::<Vec<_>>();
+        let related = tokio::time::timeout(
+            REFLECT_RELATED_HISTORY_TIMEOUT,
+            storage.nearest_semantic_work_units_outside_window(
+                embedding,
+                from,
+                to,
+                &exclude_ids,
+                REFLECT_RELATED_HISTORY_LIMIT,
+            ),
+        )
+        .await;
+        let rows = match related {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => {
+                tracing::debug!(target: "arkreflect", error = %error, "related history lookup failed");
+                cluster.related_history = ReflectRelatedHistory::unavailable(
+                    "Related history was unavailable for this cluster.",
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!(target: "arkreflect", "related history lookup timed out");
+                cluster.related_history = ReflectRelatedHistory::unavailable(
+                    "Related history took too long and was skipped for this cluster.",
+                );
+                continue;
+            }
+        };
+        let mut items = rows
+            .into_iter()
+            .filter_map(|(unit, distance)| {
+                if distance > REFLECT_RELATED_HISTORY_MAX_DISTANCE {
+                    return None;
+                }
+                Some(ReflectRelatedUnitResponse {
+                    id: unit.id.clone(),
+                    source_label: source_label(&unit.source_kind, &unit.channel),
+                    title: unit.title,
+                    occurred_at: unit.occurred_at,
+                    similarity: (1.0 - distance).clamp(0.0, 1.0),
+                })
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            cluster.related_history = ReflectRelatedHistory::new_this_period();
+            continue;
+        }
+        items.sort_by(|left, right| {
+            right
+                .similarity
+                .partial_cmp(&left.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.occurred_at.cmp(&left.occurred_at))
+        });
+        let similar_count = items.len();
+        let most_recent_at = items.iter().map(|item| item.occurred_at.clone()).max();
+        let top_similarity = items.first().map(|item| item.similarity);
+        let display_items = items
+            .into_iter()
+            .take(REFLECT_RELATED_HISTORY_DISPLAY_LIMIT)
+            .collect::<Vec<_>>();
+        let detail = if let Some(recent) = most_recent_at.as_ref() {
+            format!(
+                "Found {} close match{} in reflection history, most recently {}.",
+                similar_count,
+                if similar_count == 1 { "" } else { "es" },
+                recent
+            )
+        } else {
+            format!(
+                "Found {} close match{} in reflection history.",
+                similar_count,
+                if similar_count == 1 { "" } else { "es" }
+            )
+        };
+        cluster.related_history = ReflectRelatedHistory {
+            mode: "recurring".to_string(),
+            similar_count,
+            most_recent_at,
+            top_similarity,
+            detail,
+            items: display_items,
+        };
+    }
+}
+
+async fn reflect_server_is_idle(state: &AppState) -> bool {
+    if crate::sentinel::is_pulse_running() {
+        return false;
+    }
+    if !state.chat_task_cancellations.read().await.is_empty() {
+        return false;
+    }
+    if !state.action_test_cancellations.read().await.is_empty() {
+        return false;
+    }
+    let tasks = state.tasks.read().await;
+    !tasks
+        .all()
+        .iter()
+        .any(|task| matches!(task.status, TaskStatus::InProgress))
+}
+
+async fn run_reflect_refresh_job(
+    state: AppState,
+    request: ReflectRefreshRequest,
+) -> std::result::Result<ReflectSourceCounts, String> {
+    let (storage, embedder, arkorbit, user_id, app_registry) = {
+        let agent = state.agent.read().await;
+        (
+            agent.storage.clone(),
+            agent.embedding_client.clone(),
+            agent.arkorbit.clone(),
+            agent.identity.did().to_string(),
+            state.app_registry.clone(),
+        )
+    };
+    Ok(refresh_reflect_units(
+        &storage,
+        embedder.as_deref(),
+        &arkorbit,
+        &user_id,
+        &app_registry,
+        request.from,
+        request.to,
+    )
+    .await)
+}
+
+async fn spawn_reflect_refresh(
+    state: AppState,
+    request: ReflectRefreshRequest,
+    trigger: &'static str,
+    require_idle: bool,
+) -> ReflectRefreshStartResponse {
+    if require_idle && !reflect_server_is_idle(&state).await {
+        let refresh_status = update_refresh_status(|status| {
+            status.status = "deferred_busy".to_string();
+            status.trigger = Some(trigger.to_string());
+            status.requested_at = Some(chrono::Utc::now().to_rfc3339());
+            status.period = Some(request.period.as_str().to_string());
+            status.from = Some(request.from.to_rfc3339());
+            status.to = Some(request.to.to_rfc3339());
+        })
+        .await;
+        return ReflectRefreshStartResponse {
+            accepted: false,
+            running: false,
+            status: "deferred_busy".to_string(),
+            detail: "ArkReflect refresh was deferred because foreground work is active."
+                .to_string(),
+            refresh_status,
+        };
+    }
+
+    let lease_storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+
+    if REFLECT_REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let refresh_status = current_refresh_status().await;
+        return ReflectRefreshStartResponse {
+            accepted: false,
+            running: true,
+            status: "already_running".to_string(),
+            detail: "An ArkReflect refresh is already running.".to_string(),
+            refresh_status,
+        };
+    }
+
+    let lease_owner = format!("arkreflect:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+    let lease_guard = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        lease_storage.acquire_kv_lease_guard(
+            REFLECT_REFRESH_LEASE_KEY,
+            &lease_owner,
+            REFLECT_REFRESH_LEASE_TTL_SECS,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => {
+            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+            let refresh_status = current_refresh_status().await;
+            return ReflectRefreshStartResponse {
+                accepted: false,
+                running: true,
+                status: "already_running".to_string(),
+                detail: "An ArkReflect refresh is already running in another worker.".to_string(),
+                refresh_status,
+            };
+        }
+        Ok(Err(error)) => {
+            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+            tracing::warn!(target: "arkreflect", error = %error, "failed to acquire refresh lease");
+            let refresh_status = update_refresh_status(|status| {
+                status.running = false;
+                status.status = "lease_failed".to_string();
+                status.trigger = Some(trigger.to_string());
+                status.requested_at = Some(chrono::Utc::now().to_rfc3339());
+                status.period = Some(request.period.as_str().to_string());
+                status.from = Some(request.from.to_rfc3339());
+                status.to = Some(request.to.to_rfc3339());
+                status.last_error = Some(format!("Failed to acquire refresh lease: {}", error));
+            })
+            .await;
+            return ReflectRefreshStartResponse {
+                accepted: false,
+                running: false,
+                status: "lease_failed".to_string(),
+                detail: "ArkReflect could not acquire its background refresh lease.".to_string(),
+                refresh_status,
+            };
+        }
+        Err(_) => {
+            REFLECT_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+            let refresh_status = update_refresh_status(|status| {
+                status.running = false;
+                status.status = "lease_timed_out".to_string();
+                status.trigger = Some(trigger.to_string());
+                status.requested_at = Some(chrono::Utc::now().to_rfc3339());
+                status.period = Some(request.period.as_str().to_string());
+                status.from = Some(request.from.to_rfc3339());
+                status.to = Some(request.to.to_rfc3339());
+                status.last_error = Some("Timed out acquiring refresh lease".to_string());
+            })
+            .await;
+            return ReflectRefreshStartResponse {
+                accepted: false,
+                running: false,
+                status: "lease_timed_out".to_string(),
+                detail: "ArkReflect timed out before it could acquire its refresh lease."
+                    .to_string(),
+                refresh_status,
+            };
+        }
+    };
+
+    let sequence = REFLECT_REFRESH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    let refresh_status = update_refresh_status(|status| {
+        status.running = true;
+        status.status = "running".to_string();
+        status.trigger = Some(trigger.to_string());
+        status.period = Some(request.period.as_str().to_string());
+        status.from = Some(request.from.to_rfc3339());
+        status.to = Some(request.to.to_rfc3339());
+        status.requested_at = Some(requested_at.clone());
+        status.started_at = Some(requested_at.clone());
+        status.completed_at = None;
+        status.last_error = None;
+        status.sequence = sequence;
+    })
+    .await;
+
+    crate::spawn_logged!("src/channels/http/reflect_control.rs:refresh", async move {
+        let _guard = ReflectInFlightGuard;
+        let result = tokio::time::timeout(
+            REFLECT_REFRESH_TIMEOUT,
+            run_reflect_refresh_job(state, request.clone()),
+        )
+        .await;
+        match result {
+            Ok(Ok(counts)) => {
+                update_refresh_status(|status| {
+                    status.running = false;
+                    status.status = "completed".to_string();
+                    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    status.last_error = None;
+                    status.last_source_counts = counts;
+                })
+                .await;
+            }
+            Ok(Err(error)) => {
+                update_refresh_status(|status| {
+                    status.running = false;
+                    status.status = "failed".to_string();
+                    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    status.last_error = Some(error);
+                })
+                .await;
+            }
+            Err(_) => {
+                update_refresh_status(|status| {
+                    status.running = false;
+                    status.status = "timed_out".to_string();
+                    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    status.last_error = Some(format!(
+                        "Refresh exceeded {} seconds",
+                        REFLECT_REFRESH_TIMEOUT.as_secs()
+                    ));
+                })
+                .await;
+            }
+        }
+        if let Err(error) = lease_storage
+            .release_kv_lease_guard(REFLECT_REFRESH_LEASE_KEY, &lease_guard)
+            .await
+        {
+            tracing::warn!(target: "arkreflect", error = %error, "failed to release refresh lease");
+        }
+    });
+
+    ReflectRefreshStartResponse {
+        accepted: true,
+        running: true,
+        status: "queued".to_string(),
+        detail: "ArkReflect refresh started in the background.".to_string(),
+        refresh_status,
+    }
+}
+
+fn reflect_request_from_params(
+    params: &HashMap<String, String>,
+) -> std::result::Result<ReflectRefreshRequest, Response> {
+    let period = ReflectPeriod::from_query(params.get("period").map(String::as_str));
+    let now = chrono::Utc::now();
+    let (default_from, default_to) = period.default_window(now);
+    let from = query_time(params, "from").unwrap_or(default_from);
+    let to = query_time(params, "to").unwrap_or(default_to);
+    if from >= to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "from must be before to".to_string(),
+            }),
+        )
+            .into_response());
+    }
+    Ok(ReflectRefreshRequest { period, from, to })
+}
+
+fn cache_status_for_units(
+    units: &[semantic_work_unit::Model],
+    refresh_status: &ReflectRefreshStatus,
+) -> ReflectCacheStatus {
+    let latest_unit_at = units
+        .iter()
+        .filter_map(|unit| parse_time(&unit.updated_at))
+        .max();
+    let stale = latest_unit_at
+        .map(|dt| (chrono::Utc::now() - dt).num_seconds() > REFLECT_STALE_AFTER_SECS)
+        .unwrap_or(true);
+    let mode = if units.is_empty() {
+        "empty".to_string()
+    } else if refresh_status.running {
+        "refreshing".to_string()
+    } else if stale {
+        "stale".to_string()
+    } else {
+        "ready".to_string()
+    };
+    let detail = match mode.as_str() {
+        "empty" => "No cached reflection rows exist for this range yet. A background refresh can prepare them.".to_string(),
+        "refreshing" => "Showing cached reflection rows while a background refresh updates this range.".to_string(),
+        "stale" => "Showing cached reflection rows. A background refresh can update recent changes.".to_string(),
+        _ => "Showing cached reflection rows for this range.".to_string(),
+    };
+    ReflectCacheStatus {
+        mode,
+        cached_units: units.len(),
+        stale,
+        detail,
+    }
+}
+
+async fn baseline_source_counts(
+    storage: &Storage,
+    from: chrono::DateTime<chrono::Utc>,
+) -> ReflectSourceCounts {
+    let baseline_from =
+        (from - chrono::Duration::days(REFLECT_BASELINE_LOOKBACK_DAYS)).to_rfc3339();
+    let baseline_to = from.to_rfc3339();
+    tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_semantic_work_units_between(
+            &baseline_from,
+            &baseline_to,
+            REFLECT_BASELINE_MAX_UNITS,
+        ),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .map(|units| source_counts_from_units(&units))
+    .unwrap_or_default()
+}
+
+async fn reflect_idle_loop(state: AppState) {
+    let mut interval = tokio::time::interval(REFLECT_IDLE_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if !reflect_server_is_idle(&state).await {
+            continue;
+        }
+        let now = chrono::Utc::now();
+        let request = ReflectRefreshRequest {
+            period: ReflectPeriod::Monthly,
+            from: now - chrono::Duration::days(REFLECT_IDLE_LOOKBACK_DAYS),
+            to: now,
+        };
+        let _ = spawn_reflect_refresh(state.clone(), request, "idle", true).await;
+    }
+}
+
+pub(super) fn spawn_reflect_idle_loop(state: AppState) {
+    if REFLECT_IDLE_LOOP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    crate::spawn_logged!(
+        "src/channels/http/reflect_control.rs:idle_loop",
+        async move {
+            reflect_idle_loop(state).await;
+        }
+    );
+}
+
+pub(super) async fn ark_reflect_endpoint(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let request = match reflect_request_from_params(&params) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if parse_bool_param(&params, "refresh") {
+        let _ = spawn_reflect_refresh(state.clone(), request.clone(), "query", false).await;
+    }
+    let from_s = request.from.to_rfc3339();
+    let to_s = request.to.to_rfc3339();
+
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    let units = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.list_semantic_work_units_between(&from_s, &to_s, REFLECT_MAX_UNITS),
+    )
+    .await
+    {
+        Ok(Ok(units)) => units,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to load reflection data: {}", error),
+                }),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(ErrorResponse {
+                    error: "Timed out loading reflection data".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let refresh_status = current_refresh_status().await;
+    if units.is_empty() && !refresh_status.running {
+        let _ = spawn_reflect_refresh(state.clone(), request.clone(), "cache_miss", true).await;
+    }
+    let refresh_status = current_refresh_status().await;
+    let source_counts = source_counts_from_units(&units);
+    let baseline_source_counts = baseline_source_counts(&storage, request.from).await;
+    let cache_status = cache_status_for_units(&units, &refresh_status);
+    let (mut clusters, unclustered_units, embedding_status) =
+        build_clusters_bounded(units.clone()).await;
+    if tokio::time::timeout(
+        REFLECT_RELATED_HISTORY_TOTAL_TIMEOUT,
+        enrich_clusters_with_related_history(&storage, &units, &mut clusters, &from_s, &to_s),
+    )
+    .await
+    .is_err()
+    {
+        tracing::debug!(target: "arkreflect", "related history enrichment timed out");
+    }
+    (
+        StatusCode::OK,
+        Json(ReflectResponse {
+            period: request.period,
+            from: from_s,
+            to: to_s,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            source_counts,
+            baseline_source_counts,
+            embedding_status,
+            refresh_status,
+            cache_status,
+            clusters,
+            unclustered_units,
+        }),
+    )
+        .into_response()
+}
+
+pub(super) async fn ark_reflect_refresh_endpoint(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let request = match reflect_request_from_params(&params) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let result = spawn_reflect_refresh(state, request, "manual", false).await;
+    let status = if result.accepted || result.running {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, Json(result)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pg(values: &[f32]) -> PgVector {
+        PgVector::from(values.to_vec())
+    }
+
+    fn unit(id: &str, title: &str, values: &[f32]) -> semantic_work_unit::Model {
+        semantic_work_unit::Model {
+            id: id.to_string(),
+            source_kind: "conversation".to_string(),
+            source_id: id.to_string(),
+            conversation_id: Some(id.to_string()),
+            project_id: None,
+            channel: "web".to_string(),
+            title: title.to_string(),
+            summary: title.to_string(),
+            content_preview: title.to_string(),
+            text_hash: stable_hash(title),
+            occurred_at: "2026-05-02T00:00:00Z".to_string(),
+            period_start: None,
+            period_end: None,
+            message_count: 2,
+            metadata: serde_json::json!({}),
+            created_at: "2026-05-02T00:00:00Z".to_string(),
+            updated_at: "2026-05-02T00:00:00Z".to_string(),
+            embedding: Some(pg(values)),
+        }
+    }
+
+    #[test]
+    fn clusters_by_embedding_geometry_not_wording() {
+        let units = vec![
+            unit("a", "React dashboard work", &[1.0, 0.0, 0.0]),
+            unit("b", "UI chart polish", &[0.96, 0.04, 0.0]),
+            unit("c", "Rust storage layer", &[0.0, 1.0, 0.0]),
+            unit("d", "Database reflection model", &[0.0, 0.96, 0.04]),
+        ];
+        let (clusters, _, status) = build_clusters(&units);
+        assert_eq!(status.mode, "semantic");
+        assert!(clusters.len() >= 2);
+        assert!(clusters.iter().any(|cluster| cluster.unit_count >= 2));
+    }
+}

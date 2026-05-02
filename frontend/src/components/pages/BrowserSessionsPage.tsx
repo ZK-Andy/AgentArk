@@ -1,0 +1,369 @@
+import MoreVertIcon from "@mui/icons-material/MoreVert";
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Stack,
+  Typography,
+} from "@mui/material";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { api } from "../../api/client";
+import { formatUiDateTimeMeta } from "../../lib/dateFormat";
+import type { BrowserSessionSummary } from "../../types";
+import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
+import { errMessage } from "./pageHelpers";
+
+const REFRESH_MS = 8000;
+
+type RowMenuAction = {
+  label: string;
+  onClick: () => void | Promise<void>;
+  disabled?: boolean;
+  tone?: "default" | "warning" | "error";
+  divider?: boolean;
+};
+
+function browserSessionHandoffUrl(sessionId: string): string {
+  return `/ui/browser-handoff/${encodeURIComponent(sessionId)}`;
+}
+
+function formatTimestamp(value?: string | null): string {
+  return formatUiDateTimeMeta(value || "", { fallback: "-" }).label;
+}
+
+function statusLabel(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (!normalized) return "-";
+  if (normalized === "in_progress") return "Running";
+  return normalized
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function statusColor(
+  status: string,
+): "success" | "warning" | "error" | "default" | "info" {
+  const normalized = status.toLowerCase();
+  if (normalized.includes("running") || normalized.includes("progress")) return "info";
+  if (normalized.includes("paused") || normalized.includes("waiting")) return "warning";
+  if (
+    normalized.includes("failed") ||
+    normalized.includes("interrupted") ||
+    normalized.includes("cancelled") ||
+    normalized.includes("canceled")
+  ) {
+    return "error";
+  }
+  if (normalized.includes("completed")) return "success";
+  return "default";
+}
+
+function dotColor(status: string): string {
+  const color = statusColor(status);
+  if (color === "info") return "var(--ui-rgba-57-208-255-850)";
+  if (color === "success") return "var(--ui-rgba-74-210-157-850)";
+  if (color === "warning") return "var(--ui-rgba-255-191-130-850)";
+  if (color === "error") return "var(--ui-rgba-255-100-100-850)";
+  return "var(--ui-rgba-180-200-220-500)";
+}
+
+function isTerminal(session: BrowserSessionSummary): boolean {
+  const status = session.status.toLowerCase();
+  return (
+    status.includes("completed") ||
+    status.includes("failed") ||
+    status.includes("interrupted") ||
+    status.includes("cancelled") ||
+    status.includes("canceled") ||
+    status.includes("stopped")
+  );
+}
+
+function sessionDetailLine(session: BrowserSessionSummary): string {
+  return (
+    session.summary ||
+    session.question ||
+    session.reason ||
+    session.page_title ||
+    session.page_url ||
+    "Live browser session"
+  );
+}
+
+function RowOpsMenu({
+  actions,
+  ariaLabel = "Row actions",
+}: {
+  actions: RowMenuAction[];
+  ariaLabel?: string;
+}) {
+  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
+  const open = Boolean(anchorEl);
+  const closeMenu = () => setAnchorEl(null);
+  return (
+    <>
+      <IconButton
+        size="small"
+        aria-label={ariaLabel}
+        onClick={(event) => {
+          event.stopPropagation();
+          setAnchorEl(event.currentTarget);
+        }}
+      >
+        <MoreVertIcon fontSize="small" />
+      </IconButton>
+      <Menu
+        anchorEl={anchorEl}
+        open={open}
+        onClose={closeMenu}
+        onClick={(event) => event.stopPropagation()}
+      >
+        {actions.map((action, index) => (
+          <MenuItem
+            key={`${action.label}-${index}`}
+            divider={action.divider}
+            disabled={action.disabled}
+            onClick={(event) => {
+              event.stopPropagation();
+              closeMenu();
+              if (action.disabled) return;
+              void action.onClick();
+            }}
+            sx={
+              action.tone === "error"
+                ? { color: "error.main" }
+                : action.tone === "warning"
+                  ? { color: "warning.main" }
+                  : undefined
+            }
+          >
+            {action.label}
+          </MenuItem>
+        ))}
+      </Menu>
+    </>
+  );
+}
+
+export default function BrowserSessionsPage({
+  autoRefresh,
+}: {
+  autoRefresh: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+
+  const sessionsQ = useQuery({
+    queryKey: ["browser-sessions"],
+    queryFn: api.getBrowserSessions,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
+
+  const sessions = useMemo(
+    () => sessionsQ.data?.sessions || [],
+    [sessionsQ.data],
+  );
+  const activeCount = useMemo(
+    () => sessions.filter((session) => !isTerminal(session)).length,
+    [sessions],
+  );
+
+  const invalidate = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["browser-sessions"] }),
+      queryClient.invalidateQueries({ queryKey: ["autonomy-browser-sessions"] }),
+    ]);
+  };
+
+  const actionMutation = useMutation({
+    mutationFn: async ({
+      kind,
+      sessionId,
+    }: {
+      kind: "stop" | "delete";
+      sessionId: string;
+    }) => {
+      if (kind === "stop") return api.stopBrowserSession(sessionId);
+      return api.deleteBrowserSession(sessionId);
+    },
+    onSuccess: invalidate,
+    onError: (err) => setError(errMessage(err)),
+  });
+
+  const rowActions = (session: BrowserSessionSummary): RowMenuAction[] => {
+    const actions: RowMenuAction[] = [];
+    if (!isTerminal(session)) {
+      actions.push({
+        label: "Stop",
+        tone: "warning",
+        disabled: actionMutation.isPending,
+        onClick: () =>
+          actionMutation.mutate({ kind: "stop", sessionId: session.id }),
+      });
+    }
+    actions.push({
+      label: "Delete",
+      tone: "error",
+      divider: actions.length > 0,
+      disabled: actionMutation.isPending,
+      onClick: () => {
+        const confirmed = window.confirm(
+          "Delete this browser session? This closes the live browser and removes the saved session record.",
+        );
+        if (!confirmed) return;
+        actionMutation.mutate({ kind: "delete", sessionId: session.id });
+      },
+    });
+    return actions;
+  };
+
+  return (
+    <WorkspacePageShell spacing={1.5}>
+      <WorkspacePageHeader
+        eyebrow="Operations"
+        title="Browser Sessions"
+        description="Live browser handoffs and background browser runs. Durable monitors, reminders, and recurring checks live under Background Work."
+      />
+
+      <Box className="list-shell stat-strip">
+        {[
+          { label: "Sessions", value: sessions.length },
+          { label: "Active", value: activeCount },
+          { label: "Finished", value: sessions.length - activeCount },
+        ].map((item) => (
+          <div key={item.label} className="stat-strip-item">
+            <span className="stat-strip-label">{item.label}</span>
+            <span className="stat-strip-value">{item.value}</span>
+          </div>
+        ))}
+      </Box>
+
+      <Box className="list-shell">
+        <Stack
+          direction="row"
+          sx={{ justifyContent: "space-between", alignItems: "center", mb: 1 }}
+        >
+          <Typography variant="h6">Browser Sessions</Typography>
+          <Button size="small" onClick={() => void invalidate()}>
+            Refresh
+          </Button>
+        </Stack>
+
+        {sessionsQ.isLoading ? (
+          <Box sx={{ py: 5, textAlign: "center" }}>
+            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+              Loading browser sessions...
+            </Typography>
+          </Box>
+        ) : sessionsQ.error ? (
+          <Alert severity="error">{errMessage(sessionsQ.error)}</Alert>
+        ) : sessions.length === 0 ? (
+          <Box sx={{ py: 8, textAlign: "center" }}>
+            <Typography variant="h6" sx={{ color: "text.secondary" }}>
+              No browser sessions
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary", mt: 0.5 }}>
+              Browser work will appear here when a run needs a live handoff.
+            </Typography>
+          </Box>
+        ) : (
+          <Stack spacing={0.25}>
+            {sessions.map((session) => {
+              const detailLine = sessionDetailLine(session);
+              return (
+                <Box
+                  key={session.id}
+                  sx={{
+                    py: 1.15,
+                    borderBottom: "1px solid",
+                    borderColor: "divider",
+                    display: "flex",
+                    gap: 1,
+                    alignItems: "flex-start",
+                  }}
+                >
+                  <Box
+                    sx={{
+                      width: 7,
+                      height: 7,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      mt: 0.85,
+                      background: dotColor(session.status),
+                    }}
+                  />
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    <Stack
+                      direction="row"
+                      spacing={0.75}
+                      sx={{ alignItems: "center", flexWrap: "wrap", minWidth: 0 }}
+                    >
+                      <Typography
+                        variant="body2"
+                        noWrap
+                        sx={{ fontWeight: 700, minWidth: 160, flex: 1 }}
+                        title={session.task_description}
+                      >
+                        {session.task_description || "Browser session"}
+                      </Typography>
+                      <Chip size="small" variant="outlined" label="Browser" />
+                      <Chip
+                        size="small"
+                        color={statusColor(session.status)}
+                        variant="outlined"
+                        label={statusLabel(session.status)}
+                      />
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() =>
+                          window.open(
+                            browserSessionHandoffUrl(session.id),
+                            "_blank",
+                            "noopener,noreferrer",
+                          )
+                        }
+                      >
+                        Open
+                      </Button>
+                    </Stack>
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", display: "block", mt: 0.25 }}
+                      noWrap
+                      title={detailLine}
+                    >
+                      {detailLine}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      sx={{ color: "text.secondary", display: "block", mt: 0.2 }}
+                    >
+                      Created {formatTimestamp(session.created_at)} - Updated{" "}
+                      {formatTimestamp(session.updated_at)}
+                    </Typography>
+                  </Box>
+                  <Box sx={{ flexShrink: 0 }}>
+                    <RowOpsMenu
+                      actions={rowActions(session)}
+                      ariaLabel="Browser session actions"
+                    />
+                  </Box>
+                </Box>
+              );
+            })}
+          </Stack>
+        )}
+      </Box>
+
+      {error ? <Alert severity="error">{error}</Alert> : null}
+    </WorkspacePageShell>
+  );
+}

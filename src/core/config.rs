@@ -3112,7 +3112,7 @@ impl SecureConfigManager {
     }
 
     fn generate_http_api_key() -> String {
-        use rand::Rng;
+        use rand::RngExt;
         let mut key_bytes = [0u8; 32];
         rand::rng().fill(&mut key_bytes);
         base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key_bytes)

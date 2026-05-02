@@ -1,8 +1,8 @@
 use super::config::{ModelCapabilityTier, ModelCostTier};
-use super::llm::{LlmClient, LlmResponse};
+use super::llm::{LlmClient, LlmResponse, LlmStreamFailure, LlmStreamFailureKind};
 use crate::actions::ActionDef;
 use crate::core::PromptMemory;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -172,6 +172,27 @@ impl FailureKind {
             Self::DelegationFailed => "delegation_failed",
             Self::Panic => "panic",
             Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str_label(value: &str) -> Option<Self> {
+        match value.trim() {
+            "transient_transport" => Some(Self::TransientTransport),
+            "rate_limited" => Some(Self::RateLimited),
+            "authentication" => Some(Self::Authentication),
+            "configuration" => Some(Self::Configuration),
+            "context_window_exceeded" => Some(Self::ContextWindowExceeded),
+            "schema_mismatch" => Some(Self::SchemaMismatch),
+            "tool_contract_failure" => Some(Self::ToolContractFailure),
+            "capability_bound" => Some(Self::CapabilityBound),
+            "upstream_provider" => Some(Self::UpstreamProvider),
+            "timeout" => Some(Self::Timeout),
+            "missing_input" => Some(Self::MissingInput),
+            "internal_post_process" => Some(Self::InternalPostProcess),
+            "delegation_failed" => Some(Self::DelegationFailed),
+            "panic" => Some(Self::Panic),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
         }
     }
 }
@@ -392,10 +413,38 @@ impl ExecutionSupervisor {
         )
     }
 
+    pub fn classify_error(&self, error: &anyhow::Error) -> FailureKind {
+        if let Some(stream_failure) = error.downcast_ref::<LlmStreamFailure>() {
+            return match stream_failure.kind {
+                LlmStreamFailureKind::TotalTimeout | LlmStreamFailureKind::InterChunkStall => {
+                    FailureKind::Timeout
+                }
+                LlmStreamFailureKind::NoFirstDelta
+                | LlmStreamFailureKind::NoUsefulProgress
+                | LlmStreamFailureKind::ChunkErrors
+                | LlmStreamFailureKind::EmptyEnd
+                | LlmStreamFailureKind::NoUsableContent => FailureKind::TransientTransport,
+            };
+        }
+        self.classify_failure(&error.to_string())
+    }
+
     pub fn classify_failure(&self, error_text: &str) -> FailureKind {
         let lower = error_text.trim().to_ascii_lowercase();
         if lower.is_empty() {
             return FailureKind::Unknown;
+        }
+        if let Some(kind_marker) = lower
+            .split("kind=")
+            .nth(1)
+            .map(|tail| {
+                tail.chars()
+                    .take_while(|ch| ch.is_ascii_lowercase() || *ch == '_')
+                    .collect::<String>()
+            })
+            .and_then(|value| FailureKind::from_str_label(&value))
+        {
+            return kind_marker;
         }
         if lower.contains("timed out") || lower.contains("timeout") {
             return FailureKind::Timeout;
@@ -736,15 +785,45 @@ pub async fn execute_supervised_transport_chat(
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
 ) -> Result<LlmResponse> {
+    execute_supervised_transport_chat_with_policy(
+        supervisor,
+        llm,
+        request,
+        system_prompt,
+        user_message,
+        memories,
+        actions,
+        timeout_ms,
+        &crate::security::ModelPrivacyConfig::default(),
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_supervised_transport_chat_with_policy(
+    supervisor: &ExecutionSupervisor,
+    llm: &LlmClient,
+    request: &ExecutionRequest,
+    system_prompt: &str,
+    user_message: &str,
+    memories: &[PromptMemory],
+    actions: &[ActionDef],
+    timeout_ms: Option<u64>,
+    policy: &crate::security::ModelPrivacyConfig,
+    allow_sensitive_context: bool,
+) -> Result<LlmResponse> {
     let max_output_tokens = supervised_request_output_budget(&request.kind);
     let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
         match tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            llm.chat_with_output_limit(
+            llm.chat_for_helper_request_limited(
                 system_prompt,
                 user_message,
                 memories,
                 actions,
+                policy,
+                allow_sensitive_context,
                 max_output_tokens,
             ),
         )
@@ -763,18 +842,20 @@ pub async fn execute_supervised_transport_chat(
             }
         }
     } else {
-        llm.chat_with_output_limit(
+        llm.chat_for_helper_request_limited(
             system_prompt,
             user_message,
             memories,
             actions,
+            policy,
+            allow_sensitive_context,
             max_output_tokens,
         )
         .await
     };
 
     response.map_err(|error| {
-        let failure_kind = supervisor.classify_failure(&error.to_string());
+        let failure_kind = supervisor.classify_error(&error);
         anyhow!(
             "supervised_chat_failed(kind={}, request_kind={}, model={}): {}",
             failure_kind.as_str(),
@@ -786,7 +867,7 @@ pub async fn execute_supervised_transport_chat(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_supervised_transport_chat_stream(
+pub async fn execute_supervised_transport_chat_stream_with_policy(
     supervisor: &ExecutionSupervisor,
     llm: &LlmClient,
     request: &ExecutionRequest,
@@ -796,6 +877,8 @@ pub async fn execute_supervised_transport_chat_stream(
     actions: &[ActionDef],
     timeout_ms: Option<u64>,
     token_tx: tokio::sync::mpsc::Sender<crate::core::agent::StreamEvent>,
+    policy: &crate::security::ModelPrivacyConfig,
+    allow_sensitive_context: bool,
 ) -> Result<LlmResponse> {
     let history: Vec<crate::core::agent::ConversationMessage> = Vec::new();
     let response = if let Some(timeout_ms) = timeout_ms.filter(|value| *value > 0) {
@@ -808,8 +891,8 @@ pub async fn execute_supervised_transport_chat_stream(
                 memories,
                 actions,
                 token_tx,
-                &crate::security::ModelPrivacyConfig::default(),
-                false,
+                policy,
+                allow_sensitive_context,
             ),
         )
         .await
@@ -834,14 +917,14 @@ pub async fn execute_supervised_transport_chat_stream(
             memories,
             actions,
             token_tx,
-            &crate::security::ModelPrivacyConfig::default(),
-            false,
+            policy,
+            allow_sensitive_context,
         )
         .await
     };
 
     response.map_err(|error| {
-        let failure_kind = supervisor.classify_failure(&error.to_string());
+        let failure_kind = supervisor.classify_error(&error);
         anyhow!(
             "supervised_chat_failed(kind={}, request_kind={}, model={}): {}",
             failure_kind.as_str(),
@@ -950,6 +1033,17 @@ mod tests {
         assert_eq!(
             supervisor.classify_failure("invalid schema for function file_write"),
             FailureKind::SchemaMismatch
+        );
+    }
+
+    #[test]
+    fn classify_failure_uses_internal_kind_marker() {
+        let supervisor = ExecutionSupervisor::default();
+        assert_eq!(
+            supervisor.classify_failure(
+                "supervised_chat_failed(kind=transient_transport, request_kind=agent_turn_loop_v1, model=m): provider stream stalled"
+            ),
+            FailureKind::TransientTransport
         );
     }
 

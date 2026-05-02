@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, MatchedPath, Multipart, Path,
         Query, Request, State,
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{
-        sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{any, delete, get, post},
-    Json, Router,
 };
 use chrono::{Datelike, Timelike};
 use futures::{SinkExt, StreamExt};
@@ -26,12 +26,12 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as TungsteniteMessage};
+use tokio_tungstenite::tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 mod actions;
@@ -40,6 +40,7 @@ mod api_docs_control;
 mod api_types;
 mod app_serving;
 mod applications;
+mod arkorbit_control;
 mod arkpulse_control;
 mod auth;
 mod auth_profiles_control;
@@ -71,6 +72,7 @@ mod notification_control;
 mod observability;
 mod plugins;
 mod profile_control;
+mod reflect_control;
 mod runtime_control;
 mod secrets_control;
 mod security_control;
@@ -91,8 +93,8 @@ pub(crate) use autonomy_control::run_autonomy_analysis_tick;
 pub use locked_control::serve_locked;
 
 pub(crate) use self::sentinel_panel::{
-    load_background_learning_feed, record_background_learning_job_result,
-    BackgroundLearningJobUpdate,
+    BackgroundLearningJobUpdate, load_background_learning_feed,
+    record_background_learning_job_result,
 };
 use analytics_control::*;
 use api_docs_control::*;
@@ -116,6 +118,7 @@ use memory_control::*;
 use middleware_control::*;
 use notification_control::*;
 use profile_control::*;
+use reflect_control::*;
 use runtime_control::*;
 use secrets_control::*;
 use server_utils::*;
@@ -138,23 +141,23 @@ use crate::core::config::{
     TunnelTailscaleConfig,
 };
 use crate::core::data_lifecycle::{
-    load_data_lifecycle_settings, save_data_lifecycle_settings, DataLifecycleSettings,
+    DataLifecycleSettings, load_data_lifecycle_settings, save_data_lifecycle_settings,
 };
 use crate::core::llm_provider::{
-    canonical_provider_id, display_openai_base_url, force_refresh_codex_cli_api_key,
-    is_openrouter_base_url, normalize_openai_base_url, openai_provider_label,
-    persist_codex_cli_oauth_tokens, provider_allows_model_discovery, resolve_codex_cli_api_key,
-    resolve_openai_request_config, HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID,
-    OPENAI_DEVICE_REDIRECT_URI, OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL,
-    OPENAI_DEVICE_VERIFY_URL, OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL,
+    HUGGINGFACE_API_BASE_URL, OPENAI_DEVICE_AUTH_CLIENT_ID, OPENAI_DEVICE_REDIRECT_URI,
+    OPENAI_DEVICE_TOKEN_URL, OPENAI_DEVICE_USERCODE_URL, OPENAI_DEVICE_VERIFY_URL,
+    OPENAI_OAUTH_TOKEN_URL, OPENROUTER_API_BASE_URL, canonical_provider_id,
+    display_openai_base_url, force_refresh_codex_cli_api_key, is_openrouter_base_url,
+    normalize_openai_base_url, openai_provider_label, persist_codex_cli_oauth_tokens,
+    provider_allows_model_discovery, resolve_codex_cli_api_key, resolve_openai_request_config,
 };
 use crate::core::self_evolve::skill_evolution::{
     self, SkillImpactAssessment, SkillMetricsSnapshot, SkillWindowDirection,
 };
 use crate::core::{
-    score_action_risk, Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace,
-    LlmProvider, ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task,
-    TaskApproval, TaskQueue, TaskStatus, TrustPolicy, UserProfile,
+    Agent, AutonomySettings, AutopilotMode, ConversationScope, ExecutionTrace, LlmProvider,
+    ModelRole, ModelSlot, RecommendedAction, RiskEnvelope, RiskLevel, Task, TaskApproval,
+    TaskQueue, TaskStatus, TrustPolicy, UserProfile, score_action_risk,
 };
 use crate::hooks;
 
@@ -737,6 +740,8 @@ pub struct AppState {
     pub security_events: Arc<crate::core::SecurityEvents>,
     /// App registry for deployed apps (static + dynamic)
     pub app_registry: crate::actions::app::AppRegistry,
+    /// Short-lived in-process locks for app publish operations.
+    pub app_publish_locks: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Optional internal executor client used when runtime ownership is split out.
     executor_client: Option<Arc<ExecutorClient>>,
     /// Optional internal workspace client used when file authority is split out.
@@ -836,13 +841,23 @@ pub struct ChatRequest {
     #[serde(default = "default_channel")]
     pub channel: String,
     pub conversation_id: Option<String>,
-    pub project_id: Option<String>,
     #[serde(default)]
     pub deep_research: bool,
+    #[serde(default)]
+    pub plan_confirmation_mode: Option<String>,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
     #[serde(default)]
     pub attachments_present: bool,
     #[serde(default)]
     pub attachments: Vec<crate::core::ChatAttachmentHint>,
+    /// ArkOrbit-only: structural context describing the orbit the user is on
+    /// when sending this message (active orbit id + widget summary). Slice 2
+    /// uses this to inject a structural augmentation into the inbound
+    /// classifier prompt so the model can reason about whether the request
+    /// involves the page the user has open. Never freeform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arkorbit_context: Option<serde_json::Value>,
 }
 
 fn default_channel() -> String {
@@ -1483,6 +1498,7 @@ pub async fn serve(
             whatsapp_bridge: Arc::new(RwLock::new(WhatsAppBridgeState::new())),
             security_events: agent_guard.security_events.clone(),
             app_registry: agent_guard.app_registry.clone(),
+            app_publish_locks: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             executor_client,
             workspace_client,
             application_registry: applications::ApplicationLauncherRegistry::default(),
@@ -1493,6 +1509,9 @@ pub async fn serve(
             release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
         }
     };
+
+    spawn_reflect_idle_loop(state.clone());
+    spawn_gepa_auto_loop(state.clone());
 
     // Public routes (no auth required)
     let public_routes = Router::new()
@@ -1544,6 +1563,7 @@ pub async fn serve(
         .route("/webhook/teams", post(teams_webhook_handler))
         // OAuth callback (public - browser redirect from Google/Meta with no auth headers)
         .route("/oauth/callback", get(integrations::oauth_callback))
+        .route("/companion/web", get(companion_control::companion_web))
         .route("/companion/ws", get(companion_control::companion_ws))
         // Deployed apps (public - these are user-facing apps, no auth required)
         .route("/apps/{app_id}", any(serve_app_root))
@@ -1600,6 +1620,18 @@ pub async fn serve(
         )
         .route("/companion/presets", get(companion_control::get_presets))
         .route("/companion/protocol", get(companion_control::get_protocol))
+        .route(
+            "/companion/connectivity",
+            get(companion_control::get_connectivity),
+        )
+        .route(
+            "/companion/connectivity/tunnel/start",
+            post(companion_control::start_companion_tunnel),
+        )
+        .route(
+            "/companion/connectivity/tunnel/stop",
+            post(companion_control::stop_companion_tunnel),
+        )
         .route("/companion/devices", get(companion_control::list_devices))
         .route(
             "/companion/pairing-sessions",
@@ -2181,18 +2213,6 @@ pub async fn serve(
             "/conversations/{id}/messages",
             get(get_conversation_messages),
         )
-        // Project routes
-        .route("/projects", get(list_projects_endpoint))
-        .route("/projects", post(create_project_endpoint))
-        .route("/projects/{id}", get(get_project_endpoint))
-        .route(
-            "/projects/{id}",
-            axum::routing::put(update_project_endpoint),
-        )
-        .route(
-            "/projects/{id}",
-            axum::routing::delete(delete_project_endpoint),
-        )
         // Notification routes
         .route("/notifications", get(list_notifications_endpoint))
         .route("/notifications/stream", get(notification_stream_endpoint))
@@ -2201,6 +2221,8 @@ pub async fn serve(
         .route("/notifications/count", get(notification_count_endpoint))
         // Analytics
         .route("/analytics/llm", get(llm_analytics_endpoint))
+        .route("/reflect", get(ark_reflect_endpoint))
+        .route("/reflect/refresh", post(ark_reflect_refresh_endpoint))
         // Document routes
         .route("/documents", get(list_documents_endpoint))
         .route("/documents/upload", post(upload_document_endpoint))
@@ -2213,6 +2235,66 @@ pub async fn serve(
             axum::routing::delete(delete_document_endpoint),
         )
         .route("/documents/{id}/search", get(search_document_endpoint))
+        // ArkOrbit (per-user limitless canvas) routes
+        .route(
+            "/api/arkorbit/orbits",
+            get(arkorbit_control::list_orbits_endpoint)
+                .post(arkorbit_control::create_orbit_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}",
+            get(arkorbit_control::get_orbit_endpoint)
+                .put(arkorbit_control::update_orbit_endpoint)
+                .delete(arkorbit_control::delete_orbit_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/index",
+            get(arkorbit_control::orbit_index_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/messages",
+            get(arkorbit_control::orbit_messages_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/files",
+            get(arkorbit_control::orbit_files_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/files/{*path}",
+            get(arkorbit_control::orbit_file_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/widgets/{widget_id}",
+            delete(arkorbit_control::delete_orbit_widget_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/fetch",
+            get(arkorbit_control::orbit_public_fetch_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/chat/transcripts",
+            get(arkorbit_control::orbit_chat_transcripts_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/chat/transcripts/{transcript_id}",
+            get(arkorbit_control::orbit_chat_transcript_messages_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/chat/reset",
+            post(arkorbit_control::reset_orbit_chat_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/events",
+            get(arkorbit_control::orbit_events_endpoint),
+        )
+        .route(
+            "/api/arkorbit/orbits/{id}/chat",
+            post(arkorbit_control::orbit_chat_endpoint),
+        )
+        .route(
+            "/api/arkorbit/mod/{orbit_id}/{*path}",
+            get(arkorbit_control::resolve_module_endpoint),
+        )
         // Memory
         .route("/memory/stats", get(memory_stats))
         .route("/memory/facts", get(list_facts))
@@ -2322,12 +2404,17 @@ pub async fn serve(
         .route("/mcp/servers/{id}/refresh", post(refresh_mcp_server))
         // Hosted apps management (protected)
         .route("/api/apps", get(list_apps))
+        .route(
+            "/api/apps/{app_id}/quality_report",
+            get(get_app_quality_report),
+        )
         .route("/api/apps/{app_id}/stop", post(stop_app))
         .route("/api/apps/{app_id}/restart", post(restart_app))
         .route(
             "/api/apps/{app_id}/access-guard",
             post(update_app_access_guard),
         )
+        .route("/api/apps/{app_id}/publish", post(publish_app))
         .route("/api/apps/{app_id}", axum::routing::delete(delete_app))
         .route(
             "/api/applications",
@@ -2632,6 +2719,7 @@ pub async fn serve(
                 Ok(()) => {
                     let mut tunnel = state_for_tunnel.tunnel.write().await;
                     tunnel.selected_app_id = None;
+                    tunnel.exposed_app_ids.clear();
                     tunnel.control_plane_enabled = true;
                     drop(tunnel);
                     tracing::info!("Tunnel auto-started successfully")
@@ -2646,7 +2734,7 @@ pub async fn serve(
             let mut start_infrastructure = false;
             match tunnel::auto_start_selected_app_tunnel(&state_for_tunnel).await {
                 Ok(Some(url)) => tracing::info!(
-                    "Auto-restored app-only public tunnel for saved app selection: {}",
+                    "Auto-restored app-only public tunnel for saved app exposure: {}",
                     url
                 ),
                 Ok(None) => start_infrastructure = true,

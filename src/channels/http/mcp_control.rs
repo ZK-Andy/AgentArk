@@ -121,7 +121,6 @@ pub(super) async fn mcp_handler(
                     .and_then(|v| v.as_str())
                     .unwrap_or("mcp");
                 let conversation_id = args.get("conversation_id").and_then(|v| v.as_str());
-                let project_id = args.get("project_id").and_then(|v| v.as_str());
                 let agent = Agent::snapshot(&state.agent).await;
                 let caller = maybe_caller.as_ref().map(|Extension(value)| value);
                 match agent
@@ -129,7 +128,7 @@ pub(super) async fn mcp_handler(
                         message,
                         channel,
                         conversation_id,
-                        project_id,
+                        None,
                         build_request_execution_hints(
                             caller,
                             crate::actions::ActionExecutionSurface::Api,
@@ -210,9 +209,8 @@ pub(super) async fn mcp_handler(
             "document_search" => {
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                let project_id = args.get("project_id").and_then(|v| v.as_str());
                 let agent = state.agent.read().await;
-                match agent.search_documents(query, limit, project_id).await {
+                match agent.search_documents(query, limit, None).await {
                     Ok(results) => {
                         let items: Vec<serde_json::Value> = results
                             .iter()
@@ -221,7 +219,6 @@ pub(super) async fn mcp_handler(
                                     "document_id": &hit.document_id,
                                     "filename": &hit.filename,
                                     "content_type": &hit.content_type,
-                                    "project_id": &hit.project_id,
                                     "chunk_index": hit.chunk_index,
                                     "content": &hit.content,
                                     "score": hit.score,

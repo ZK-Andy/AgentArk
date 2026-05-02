@@ -10,6 +10,7 @@ remotion_video/
 *.md
 !src/core/product_help_docs/*.md
 !skills/**
+!src/core/arkorbit/l0/**/*.md
 nul
 tests/
 install.sh

@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

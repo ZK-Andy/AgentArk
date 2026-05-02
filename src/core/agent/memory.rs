@@ -4,6 +4,12 @@ use crate::storage::entities::user_preference::{
     MemorySensitivity, classify_saved_memory_sensitivity, normalize_memory_sensitivity,
 };
 
+const USER_MEMORY_CAPTURE_PENDING_STATUS: &str = "pending_consolidation";
+const USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS: &str = "processing_deferred";
+const USER_MEMORY_CAPTURE_COMPLETED_DEFERRED_STATUS: &str = "completed_deferred";
+const USER_MEMORY_CAPTURE_FAILED_DEFERRED_STATUS: &str = "failed_deferred";
+const USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT: u64 = 1;
+
 pub(super) fn saved_memory_sensitivity_from_parts(
     key: Option<&str>,
     value: &str,
@@ -18,7 +24,17 @@ pub(super) fn saved_memory_sensitivity_from_parts(
                 MemorySensitivity::PromptSafe | MemorySensitivity::PersonalIdentifier
             ) =>
         {
-            inferred
+            let key_only_inferred = classify_saved_memory_sensitivity(key, value, None);
+            if key.is_some()
+                && matches!(
+                    key_only_inferred,
+                    MemorySensitivity::PromptSafe | MemorySensitivity::PersonalIdentifier
+                )
+            {
+                inferred
+            } else {
+                MemorySensitivity::Sensitive
+            }
         }
         Some(stored) => stored,
         None => inferred,
@@ -59,6 +75,251 @@ mod saved_memory_sensitivity_tests {
                 Some("crisis_sensitive"),
             ),
             MemorySensitivity::CrisisSensitive
+        );
+    }
+
+    #[test]
+    fn legacy_sensitive_is_not_downgraded_by_kind_alone() {
+        assert_eq!(
+            saved_memory_sensitivity_from_parts(
+                Some("private_detail"),
+                "sensitive value",
+                Some("identity"),
+                Some("sensitive"),
+            ),
+            MemorySensitivity::Sensitive
+        );
+    }
+
+    #[test]
+    fn learned_memory_keys_do_not_use_string_aliases() {
+        assert_ne!(
+            learned_user_memory_keys("user_first_name", "permanent", None, None),
+            learned_user_memory_keys("user_name", "permanent", None, None)
+        );
+
+        let item = crate::storage::experience_item::Model {
+            id: "memory-1".to_string(),
+            kind: "personal_fact".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: None,
+            title: "Learned user memory".to_string(),
+            content: "user_first_name: Debanka".to_string(),
+            normalized_key: "user_memory::user_first_name::permanent".to_string(),
+            confidence: 0.95,
+            support_count: 1,
+            contradiction_count: 0,
+            status: "active".to_string(),
+            metadata: serde_json::json!({
+                "key": "user_first_name",
+                "memory_kind": "identity",
+                "durability": "permanent",
+                "sensitivity": "personal_identifier",
+            }),
+            last_supported_at: None,
+            last_contradicted_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            embedding: None,
+        };
+
+        assert_eq!(
+            learned_user_memory_key(&item).as_deref(),
+            Some("user_first_name")
+        );
+        assert!(learned_user_memory_key_matches(&item, "User First-Name"));
+        assert!(!learned_user_memory_key_matches(&item, "user_name"));
+        assert_eq!(learned_user_memory_lookup_kind(&item), "identity");
+    }
+
+    #[test]
+    fn memory_capture_payload_accepts_mixed_batch_operations() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{
+                "memories": [
+                    {
+                        "key": "preferred_name",
+                        "value": "User goes by Ronny.",
+                        "kind": "identity",
+                        "durability": "permanent",
+                        "scope": "global",
+                        "sensitivity": "personal_identifier",
+                        "confidence": 0.95,
+                        "reason": "durable user identity",
+                        "looks_sensitive": false,
+                        "sensitive_reason": ""
+                    },
+                    {
+                        "key": "legal_name",
+                        "value": "User's legal name is Debanka.",
+                        "kind": "identity",
+                        "durability": "permanent",
+                        "scope": "global",
+                        "sensitivity": "personal_identifier",
+                        "confidence": 0.95,
+                        "reason": "durable user identity",
+                        "looks_sensitive": false,
+                        "sensitive_reason": ""
+                    }
+                ],
+                "retractions": [
+                    {
+                        "key": "old_display_name",
+                        "kind": "identity",
+                        "scope": "global",
+                        "confidence": 0.9,
+                        "reason": "superseded by current self-identification"
+                    }
+                ]
+            }"#,
+        )
+        .expect("valid mixed memory batch should parse");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::Exact
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("retractions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn memory_capture_payload_recovers_single_memory_object_as_batch() {
+        let parsed = parse_user_memory_capture_payload(
+            r#"{
+                "memories": {
+                    "key": "preferred_name",
+                    "value": "User goes by Ronny.",
+                    "kind": "identity",
+                    "durability": "permanent",
+                    "scope": "global",
+                    "sensitivity": "personal_identifier",
+                    "confidence": 0.95,
+                    "reason": "durable user identity",
+                    "looks_sensitive": false,
+                    "sensitive_reason": ""
+                },
+                "retractions": null
+            }"#,
+        )
+        .expect("single memory object should recover to array shape");
+
+        assert_eq!(
+            parsed.disposition,
+            UserMemoryCapturePayloadDisposition::ShapeRecovered
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("memories")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .payload
+                .get("retractions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    fn memory_operation_with_type(operation_type: &str) -> crate::storage::memory_operation::Model {
+        crate::storage::memory_operation::Model {
+            id: format!("memory-operation-{operation_type}"),
+            capture_event_id: None,
+            operation_type: operation_type.to_string(),
+            status: "pending_apply".to_string(),
+            target_memory_id: Some("target-row".to_string()),
+            applied_memory_id: None,
+            key: Some("interface_theme".to_string()),
+            value: Some("dark".to_string()),
+            memory_kind: "preference".to_string(),
+            durability: "permanent".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            conversation_id: None,
+            confidence: 0.95,
+            looks_sensitive: false,
+            sensitive_reason: None,
+            valid_from: None,
+            expires_at: None,
+            review_at: None,
+            rationale: None,
+            evidence_refs: serde_json::json!([]),
+            model_metadata: serde_json::json!({}),
+            apply_metadata: serde_json::json!({}),
+            applied_at: None,
+            reviewed_at: None,
+            review_notes: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn add_operations_do_not_force_default_targets_past_dedup() {
+        let add = memory_operation_with_type("add");
+        assert_eq!(memory_operation_explicit_upsert_target_id(&add), None);
+
+        let update = memory_operation_with_type("update");
+        assert_eq!(
+            memory_operation_explicit_upsert_target_id(&update),
+            Some("target-row")
+        );
+    }
+
+    #[test]
+    fn merged_phrasing_history_is_bounded_and_normalized() {
+        let mut metadata = serde_json::Map::new();
+        for index in 0..(crate::core::memory_dedup::MAX_MERGED_PHRASINGS + 2) {
+            append_learned_user_memory_merged_phrasing(
+                &mut metadata,
+                Some("Interface Theme"),
+                Some(&format!("theme value {index}")),
+                Some("test"),
+                "2026-01-01T00:00:00Z",
+            );
+        }
+
+        let merged = metadata
+            .get("merged_phrasings")
+            .and_then(|value| value.as_array())
+            .expect("merged phrasing history exists");
+        assert_eq!(
+            merged.len(),
+            crate::core::memory_dedup::MAX_MERGED_PHRASINGS
+        );
+        assert_eq!(
+            merged
+                .first()
+                .and_then(|value| value.get("key"))
+                .and_then(|value| value.as_str()),
+            Some("interface_theme")
+        );
+        assert_eq!(
+            merged
+                .first()
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_str()),
+            Some("theme value 2")
         );
     }
 }
@@ -414,6 +675,63 @@ pub(super) fn sanitize_user_memory_metadata_for_storage(
     reason_redacted || merged_phrasings_redacted
 }
 
+pub(super) fn append_learned_user_memory_merged_phrasing(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    key: Option<&str>,
+    value: Option<&str>,
+    source: Option<&str>,
+    now_iso: &str,
+) -> bool {
+    let mut redacted_secret = false;
+    let mut entry = serde_json::Map::new();
+    if let Some(key) = key.and_then(normalize_user_fact_key) {
+        entry.insert("key".to_string(), serde_json::Value::String(key));
+    }
+    if let Some(raw_value) = value {
+        match sanitize_user_memory_metadata_text_for_storage(raw_value, 320) {
+            Some(value) => {
+                if value.redacted_secret {
+                    redacted_secret = true;
+                }
+                entry.insert("value".to_string(), serde_json::Value::String(value.text));
+            }
+            None => {
+                redacted_secret = true;
+            }
+        }
+    }
+    if let Some(source) = source
+        .and_then(|raw| normalize_user_memory_text(raw, 80))
+        .filter(|value| !value.is_empty())
+    {
+        entry.insert("source".to_string(), serde_json::Value::String(source));
+    }
+    entry.insert(
+        "at".to_string(),
+        serde_json::Value::String(now_iso.to_string()),
+    );
+    let duplicate = metadata
+        .get("merged_phrasings")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().any(|item| item.as_object() == Some(&entry)))
+        .unwrap_or(false);
+    if duplicate {
+        return redacted_secret;
+    }
+    let list = metadata
+        .entry("merged_phrasings".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let serde_json::Value::Array(items) = list else {
+        *list = serde_json::Value::Array(vec![serde_json::Value::Object(entry)]);
+        return redacted_secret;
+    };
+    items.push(serde_json::Value::Object(entry));
+    while items.len() > crate::core::memory_dedup::MAX_MERGED_PHRASINGS {
+        items.remove(0);
+    }
+    redacted_secret
+}
+
 pub(super) fn user_memory_json_text_field(
     item: &serde_json::Value,
     field: &str,
@@ -536,6 +854,9 @@ pub(super) fn learned_user_memory_merged_history_contains_key(
     item: &crate::storage::experience_item::Model,
     key: &str,
 ) -> bool {
+    let Some(key) = normalize_user_fact_key(key) else {
+        return false;
+    };
     item.metadata
         .get("merged_phrasings")
         .and_then(|value| value.as_array())
@@ -546,7 +867,7 @@ pub(super) fn learned_user_memory_merged_history_contains_key(
                     .and_then(|value| value.as_str())
                     .and_then(normalize_user_fact_key)
                     .as_deref()
-                    == Some(key)
+                    == Some(key.as_str())
             })
         })
         .unwrap_or(false)
@@ -560,6 +881,20 @@ pub(super) fn learned_user_memory_key(
             .split_once(':')
             .and_then(|(key, _)| normalize_user_memory_text(key, 80))
     })
+}
+
+pub(super) fn learned_user_memory_key_matches(
+    item: &crate::storage::experience_item::Model,
+    key: &str,
+) -> bool {
+    let Some(key) = normalize_user_fact_key(key) else {
+        return false;
+    };
+    learned_user_memory_key(item)
+        .and_then(|existing_key| normalize_user_fact_key(&existing_key))
+        .as_deref()
+        == Some(key.as_str())
+        || learned_user_memory_merged_history_contains_key(item, &key)
 }
 
 pub(super) fn learned_user_memory_value(
@@ -597,6 +932,12 @@ pub(super) fn learned_user_memory_lookup_kind(
         .unwrap_or("other")
 }
 
+pub(super) fn learned_user_memory_durability(
+    item: &crate::storage::experience_item::Model,
+) -> String {
+    ambient_metadata_text_field(item, "durability", 32).unwrap_or_else(|| "permanent".to_string())
+}
+
 pub(super) fn learned_user_memory_sensitivity(
     item: &crate::storage::experience_item::Model,
 ) -> MemorySensitivity {
@@ -627,7 +968,12 @@ async fn build_saved_user_facts_context_from_storage(
 ) -> Option<String> {
     let now = chrono::Utc::now();
     let mut learned_items = storage
-        .list_active_experience_items(SAVED_USER_FACT_PROMPT_KINDS, project_id, conversation_id, 20)
+        .list_active_experience_items(
+            SAVED_USER_FACT_PROMPT_KINDS,
+            project_id,
+            conversation_id,
+            20,
+        )
         .await
         .unwrap_or_default();
     let expired_item_ids = learned_items
@@ -1188,6 +1534,16 @@ pub(super) fn user_memory_operation_scope_explicit(
         .unwrap_or(operation.operation_type != "retract")
 }
 
+pub(super) fn memory_operation_explicit_upsert_target_id(
+    operation: &crate::storage::memory_operation::Model,
+) -> Option<&str> {
+    if operation.operation_type == "update" {
+        operation.target_memory_id.as_deref()
+    } else {
+        None
+    }
+}
+
 pub(super) fn user_memory_operation_semantic_key(
     operation_type: &str,
     key: Option<&str>,
@@ -1399,67 +1755,6 @@ pub(super) fn ambient_intent_metadata_object(
     item.metadata.as_object().cloned().unwrap_or_default()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct UserMemoryCaptureJob {
-    message: String,
-    channel: String,
-    conversation_id: Option<String>,
-    project_id: Option<String>,
-    source_message_id: Option<String>,
-}
-
-impl UserMemoryCaptureJob {
-    pub(super) fn new(
-        message: &str,
-        channel: &str,
-        conversation_id: Option<&str>,
-        project_id: Option<&str>,
-        source_message_id: Option<&str>,
-    ) -> Self {
-        Self {
-            message: message.to_string(),
-            channel: channel.to_string(),
-            conversation_id: conversation_id.map(str::to_string),
-            project_id: project_id.map(str::to_string),
-            source_message_id: source_message_id.map(str::to_string),
-        }
-    }
-}
-
-pub(super) fn user_memory_capture_queue() -> &'static Mutex<VecDeque<UserMemoryCaptureJob>> {
-    USER_MEMORY_CAPTURE_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
-}
-
-pub(super) fn lock_user_memory_capture_queue() -> MutexGuard<'static, VecDeque<UserMemoryCaptureJob>>
-{
-    user_memory_capture_queue()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-pub(super) fn enqueue_user_memory_capture_job(job: UserMemoryCaptureJob) -> usize {
-    let mut queue = lock_user_memory_capture_queue();
-    queue.push_back(job);
-    queue.len()
-}
-
-pub(super) fn next_user_memory_capture_job_or_finish_worker() -> Option<UserMemoryCaptureJob> {
-    let mut queue = lock_user_memory_capture_queue();
-    let next = queue.pop_front();
-    if next.is_none() {
-        USER_MEMORY_CAPTURE_WORKER_ACTIVE.store(false, Ordering::Release);
-    }
-    next
-}
-
-pub(super) struct UserMemoryCaptureWorkerActiveGuard;
-
-impl Drop for UserMemoryCaptureWorkerActiveGuard {
-    fn drop(&mut self) {
-        USER_MEMORY_CAPTURE_WORKER_ACTIVE.store(false, Ordering::Release);
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct UserMemoryCaptureWorker {
     storage: Storage,
@@ -1663,7 +1958,7 @@ impl UserMemoryCaptureWorker {
         let active_items = self
             .storage
             .list_active_experience_items(
-                &["constraint", "personal_fact"],
+                SAVED_USER_FACT_PROMPT_KINDS,
                 project_id,
                 conversation_id,
                 48,
@@ -1685,8 +1980,7 @@ impl UserMemoryCaptureWorker {
                 }
                 continue;
             }
-            let same_key = learned_user_memory_key(&item).as_deref() == Some(key)
-                || learned_user_memory_merged_history_contains_key(&item, key);
+            let same_key = learned_user_memory_key_matches(&item, key);
             let same_kind = learned_user_memory_lookup_kind(&item) == semantic_kind
                 || semantic_kind == "other"
                 || learned_user_memory_lookup_kind(&item) == "other";
@@ -1776,6 +2070,151 @@ impl UserMemoryCaptureWorker {
             .iter()
             .any(|item| item.id == duplicate_id)
             .then(|| duplicate_id.to_string())
+    }
+
+    async fn semantically_matching_user_memory_target_id(
+        &self,
+        key: &str,
+        value: &str,
+        semantic_kind: &str,
+        durability: &str,
+        scope: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+        target_memory_id: Option<&str>,
+    ) -> Option<String> {
+        let active_items = self
+            .storage
+            .list_active_experience_items(
+                SAVED_USER_FACT_PROMPT_KINDS,
+                project_id,
+                conversation_id,
+                64,
+            )
+            .await
+            .ok()?;
+        let now = chrono::Utc::now();
+        let mut candidates = Vec::new();
+        for item in active_items {
+            if !learned_user_memory_active(&item, now) {
+                continue;
+            }
+            if target_memory_id == Some(item.id.as_str()) {
+                continue;
+            }
+            if !learned_user_memory_matches_exact_scope(&item, scope, project_id, conversation_id) {
+                continue;
+            }
+            let item_durability = learned_user_memory_durability(&item);
+            if normalize_user_memory_durability(Some(item_durability.as_str())) != durability {
+                continue;
+            }
+            if learned_user_memory_key_matches(&item, key) {
+                return Some(item.id);
+            }
+            candidates.push(item);
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by(|left, right| {
+            let left_kind = learned_user_memory_lookup_kind(left);
+            let right_kind = learned_user_memory_lookup_kind(right);
+            let left_same_kind =
+                !matches!(semantic_kind, "" | "any" | "other") && left_kind == semantic_kind;
+            let right_same_kind =
+                !matches!(semantic_kind, "" | "any" | "other") && right_kind == semantic_kind;
+            right_same_kind
+                .cmp(&left_same_kind)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.support_count.cmp(&left.support_count))
+        });
+
+        let candidate = self
+            .llm_candidates_for_role(&ModelRole::Fast)
+            .into_iter()
+            .next()?;
+        let candidate_content = format!("{}: {}", key.trim(), value.trim());
+        for item in candidates.into_iter().take(8) {
+            let existing_key = learned_user_memory_key(&item);
+            let existing_value =
+                learned_user_memory_value(&item).unwrap_or_else(|| item.content.clone());
+            let payload = serde_json::json!({
+                "candidate": {
+                    "key": key,
+                    "kind": semantic_kind,
+                    "durability": durability,
+                    "scope": scope,
+                    "content": safe_truncate(&candidate_content, 320),
+                },
+                "existing_memory": {
+                    "id": item.id.clone(),
+                    "key": existing_key,
+                    "kind": learned_user_memory_lookup_kind(&item),
+                    "durability": learned_user_memory_durability(&item),
+                    "scope": item.scope.clone(),
+                    "content": safe_truncate(&existing_value, 320),
+                },
+                "output_shape": {
+                    "same_subject": false,
+                    "confidence": 0.0,
+                    "reason": "brief rationale"
+                }
+            });
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_millis(8_000),
+                candidate.client.chat_with_system_bounded(
+                    concat!(
+                        "You decide whether an existing stored user memory is the same durable ",
+                        "user-memory subject that should be updated by a new candidate. Values may ",
+                        "contradict; contradictory values can still be the same subject if the new ",
+                        "candidate corrects or supersedes the old one. Do not match wording, key ",
+                        "names, punctuation, casing, or value equality. Compare the underlying ",
+                        "subject, scope, specificity, and whether keeping both active would conflict ",
+                        "or duplicate the profile. Return JSON only."
+                    ),
+                    &serde_json::to_string(&payload).unwrap_or_default(),
+                    256,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        "Semantic memory update target check failed for '{}': {}",
+                        key,
+                        error
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "Semantic memory update target check timed out for '{}'",
+                        key
+                    );
+                    continue;
+                }
+            };
+            self.record_llm_usage("memory", "user_fact_memory_update_target_check", &response)
+                .await;
+            let Some(parsed) = extract_json_object_from_text(&response.content) else {
+                continue;
+            };
+            let same_subject = parsed
+                .get("same_subject")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let confidence = parsed
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            if same_subject && confidence >= 0.72 {
+                return Some(item.id);
+            }
+        }
+        None
     }
 
     pub(super) async fn capture_user_facts_with_llm(
@@ -2240,19 +2679,36 @@ impl UserMemoryCaptureWorker {
             let looks_sensitive = model_marked_sensitive;
             let sensitivity =
                 user_memory_capture_item_sensitivity(item, &key, &value, Some(&raw_kind));
+            let semantic_kind = learned_user_memory_semantic_kind(Some(&key), Some(&raw_kind));
             let (resolved_scope, resolved_project_id, resolved_conversation_id) =
                 learned_user_memory_scope_ids(Some(&scope), project_id, conversation_id);
-            let (target_memory_id, _) = learned_user_memory_keys(
+            let (exact_target_memory_id, _) = learned_user_memory_keys(
                 &key,
                 &durability,
                 resolved_project_id,
                 resolved_conversation_id,
             );
+            let target_memory_id = if looks_sensitive {
+                exact_target_memory_id.clone()
+            } else {
+                self.semantically_matching_user_memory_target_id(
+                    &key,
+                    &value,
+                    semantic_kind,
+                    &durability,
+                    resolved_scope,
+                    resolved_project_id,
+                    resolved_conversation_id,
+                    Some(&exact_target_memory_id),
+                )
+                .await
+                .unwrap_or_else(|| exact_target_memory_id.clone())
+            };
             if let Some(existing_id) = self
                 .existing_equivalent_user_memory_id(
                     &key,
                     &value,
-                    learned_user_memory_semantic_kind(Some(&key), Some(&raw_kind)),
+                    semantic_kind,
                     resolved_project_id,
                     resolved_conversation_id,
                     Some(&target_memory_id),
@@ -2600,6 +3056,8 @@ impl UserMemoryCaptureWorker {
                         .value
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("Memory operation is missing value."))?;
+                    let explicit_target_memory_id =
+                        memory_operation_explicit_upsert_target_id(operation);
                     let memory_id = self
                         .upsert_learned_user_memory(
                             key,
@@ -2629,6 +3087,7 @@ impl UserMemoryCaptureWorker {
                                 .model_metadata
                                 .get("sensitivity")
                                 .and_then(|value| value.as_str()),
+                            explicit_target_memory_id,
                         )
                         .await
                         .ok_or_else(|| {
@@ -2815,12 +3274,8 @@ impl UserMemoryCaptureWorker {
         conversation_id: Option<&str>,
         _current_message: &str,
     ) -> Option<String> {
-        build_saved_user_facts_context_from_storage(
-            &self.storage,
-            project_id,
-            conversation_id,
-        )
-        .await
+        build_saved_user_facts_context_from_storage(&self.storage, project_id, conversation_id)
+            .await
     }
 
     pub(super) async fn build_ambient_time_context(&self) -> String {
@@ -2871,6 +3326,7 @@ impl UserMemoryCaptureWorker {
         review_at: Option<chrono::DateTime<chrono::Utc>>,
         reason: Option<&str>,
         sensitivity: Option<&str>,
+        target_memory_id: Option<&str>,
     ) -> Option<String> {
         let Some(key) = normalize_user_fact_key(key) else {
             return None;
@@ -2914,8 +3370,30 @@ impl UserMemoryCaptureWorker {
         );
         let (scope, scoped_project_id, scoped_conversation_id) =
             learned_user_memory_scope_ids(scope, project_id, conversation_id);
-        let (id, normalized_key) =
+        let (default_id, normalized_key) =
             learned_user_memory_keys(&key, &durability, scoped_project_id, scoped_conversation_id);
+        let explicit_target_id = target_memory_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let semantic_target_id = if explicit_target_id.is_none() {
+            self.semantically_matching_user_memory_target_id(
+                &key,
+                &value,
+                semantic_kind,
+                &durability,
+                scope,
+                scoped_project_id,
+                scoped_conversation_id,
+                Some(&default_id),
+            )
+            .await
+        } else {
+            None
+        };
+        let id = explicit_target_id
+            .or(semantic_target_id)
+            .unwrap_or(default_id);
         if let Some(existing_id) = self
             .existing_equivalent_user_memory_id(
                 &key,
@@ -3045,6 +3523,28 @@ impl UserMemoryCaptureWorker {
             .as_ref()
             .map(|item| item.support_count.saturating_add(1))
             .unwrap_or(1);
+        let exact_active_row = existing.as_ref().filter(|item| item.status == "active");
+        if let Some(current) = exact_active_row {
+            let content_changed = current.content != content;
+            let previous_key = learned_user_memory_key(current);
+            let previous_value = learned_user_memory_value(current);
+            let previous_key_changed = previous_key
+                .as_deref()
+                .and_then(normalize_user_fact_key)
+                .as_deref()
+                != Some(key.as_str());
+            if content_changed || previous_key_changed {
+                if append_learned_user_memory_merged_phrasing(
+                    &mut metadata,
+                    previous_key.as_deref(),
+                    previous_value.as_deref(),
+                    Some(source),
+                    &now,
+                ) {
+                    metadata.insert("secret_redacted".to_string(), serde_json::Value::Bool(true));
+                }
+            }
+        }
         let build_memory_item =
             |embedding: Option<PgVector>| crate::storage::experience_item::Model {
                 id: id.clone(),
@@ -3079,7 +3579,6 @@ impl UserMemoryCaptureWorker {
                 embedding,
             };
 
-        let exact_active_row = existing.as_ref().filter(|item| item.status == "active");
         if let Some(current) = exact_active_row {
             let content_changed = current.content != content;
             let embedding = match self.embedding_client.as_deref() {
@@ -4399,15 +4898,11 @@ impl Agent {
         conversation_id: Option<&str>,
         _current_message: &str,
     ) -> Option<String> {
-        build_saved_user_facts_context_from_storage(
-            &self.storage,
-            project_id,
-            conversation_id,
-        )
-        .await
+        build_saved_user_facts_context_from_storage(&self.storage, project_id, conversation_id)
+            .await
     }
 
-    pub(super) fn spawn_user_memory_capture(
+    pub(super) async fn mark_user_memory_capture_candidate(
         &self,
         message: &str,
         channel: &str,
@@ -4415,104 +4910,140 @@ impl Agent {
         project_id: Option<&str>,
         source_message_id: Option<&str>,
     ) {
-        let job = UserMemoryCaptureJob::new(
-            message,
-            channel,
-            conversation_id,
-            project_id,
-            source_message_id,
-        );
-        let queued_jobs = enqueue_user_memory_capture_job(job);
-
-        if USER_MEMORY_CAPTURE_WORKER_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tracing::info!(
-                channel = channel,
-                conversation_id = conversation_id.unwrap_or(""),
-                project_id = project_id.unwrap_or(""),
-                source_message_id = source_message_id.unwrap_or(""),
-                queued_jobs,
-                "Queued user memory capture behind active worker"
-            );
+        let trimmed = message.trim();
+        if trimmed.is_empty() || source_message_id.unwrap_or_default().trim().is_empty() {
             return;
         }
-
-        let worker = UserMemoryCaptureWorker::from_agent(self);
-
-        let spawn_result = std::thread::Builder::new()
-            .name("agentark-user-memory-capture".to_string())
-            .spawn(move || {
-                let _active_guard = UserMemoryCaptureWorkerActiveGuard;
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        tracing::warn!(
-                            error = ?error,
-                            "Failed to start isolated user memory capture runtime"
-                        );
-                        return;
-                    }
-                };
-
-                while let Some(job) = next_user_memory_capture_job_or_finish_worker() {
-                    let message_chars = job.message.chars().count();
-                    tracing::info!(
-                        channel = job.channel.as_str(),
-                        conversation_id = job.conversation_id.as_deref().unwrap_or(""),
-                        project_id = job.project_id.as_deref().unwrap_or(""),
-                        source_message_id = job.source_message_id.as_deref().unwrap_or(""),
-                        message_chars,
-                        "User memory capture worker started"
-                    );
-
-                    let outcome = runtime.block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(
-                                USER_FACT_MEMORY_CAPTURE_WORKER_TIMEOUT_SECS,
-                            ),
-                            worker.capture_user_memory_hints(
-                                &job.message,
-                                &job.channel,
-                                job.conversation_id.as_deref(),
-                                job.project_id.as_deref(),
-                                job.source_message_id.as_deref(),
-                            ),
-                        )
-                        .await
-                    });
-
-                    match outcome {
-                        Ok(()) => tracing::info!(
-                            channel = job.channel.as_str(),
-                            conversation_id = job.conversation_id.as_deref().unwrap_or(""),
-                            project_id = job.project_id.as_deref().unwrap_or(""),
-                            source_message_id = job.source_message_id.as_deref().unwrap_or(""),
-                            "User memory capture worker completed"
-                        ),
-                        Err(_) => tracing::warn!(
-                            channel = job.channel.as_str(),
-                            conversation_id = job.conversation_id.as_deref().unwrap_or(""),
-                            project_id = job.project_id.as_deref().unwrap_or(""),
-                            source_message_id = job.source_message_id.as_deref().unwrap_or(""),
-                            timeout_secs = USER_FACT_MEMORY_CAPTURE_WORKER_TIMEOUT_SECS,
-                            "User memory capture worker timed out"
-                        ),
-                    }
-                }
-            });
-
-        if let Err(error) = spawn_result {
-            USER_MEMORY_CAPTURE_WORKER_ACTIVE.store(false, Ordering::Release);
+        let semantic_capture_key = ambient_stable_hash(&[
+            channel.trim(),
+            conversation_id.unwrap_or_default().trim(),
+            project_id.unwrap_or_default().trim(),
+            trimmed,
+        ]);
+        let pending_source_hash = format!("pending:{}", semantic_capture_key);
+        if self
+            .storage
+            .count_memory_capture_events_by_source_hash(&pending_source_hash)
+            .await
+            .unwrap_or(0)
+            > 0
+        {
+            return;
+        }
+        if self
+            .storage
+            .count_memory_capture_events_by_source_hash(&semantic_capture_key)
+            .await
+            .unwrap_or(0)
+            > 0
+        {
+            return;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let event = crate::storage::memory_capture_event::Model {
+            id: format!("memory-capture-pending-{}", uuid::Uuid::new_v4()),
+            source_message_id: source_message_id.map(str::to_string),
+            conversation_id: conversation_id.map(str::to_string),
+            project_id: project_id.map(str::to_string),
+            channel: channel.to_string(),
+            status: USER_MEMORY_CAPTURE_PENDING_STATUS.to_string(),
+            capture_kind: "user_fact_memory_capture".to_string(),
+            source_hash: pending_source_hash,
+            attempt_metadata: serde_json::json!({
+                "schema_version": 1,
+                "message_chars": trimmed.chars().count(),
+                "semantic_capture_key": semantic_capture_key,
+                "source": USER_LEARNED_MEMORY_CAPTURE_SOURCE,
+                "deferred": true,
+            }),
+            error_history: serde_json::json!([]),
+            replay_count: 0,
+            next_retry_at: None,
+            completed_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if let Err(error) = self.storage.upsert_memory_capture_event(&event).await {
             tracing::warn!(
-                error = ?error,
-                "Failed to spawn isolated user memory capture worker"
+                "Failed to mark deferred memory capture candidate for conversation {:?}: {}",
+                conversation_id,
+                error
             );
         }
+    }
+
+    async fn pending_memory_capture_source_message(
+        &self,
+        event: &crate::storage::memory_capture_event::Model,
+    ) -> Option<crate::storage::entities::message::Model> {
+        let conversation_id = event.conversation_id.as_deref()?.trim();
+        let source_message_id = event.source_message_id.as_deref()?.trim();
+        if conversation_id.is_empty() || source_message_id.is_empty() {
+            return None;
+        }
+        self.encrypted_storage
+            .get_recent_messages_decrypted(conversation_id, 64)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|message| message.id == source_message_id)
+    }
+
+    pub(crate) async fn process_deferred_user_memory_capture_candidates(&self) -> usize {
+        let events = match self
+            .storage
+            .list_memory_capture_events_by_statuses_all_scopes(
+                &[USER_MEMORY_CAPTURE_PENDING_STATUS],
+                USER_MEMORY_CAPTURE_DEFERRED_BATCH_LIMIT,
+            )
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::debug!(
+                    "Failed to load deferred memory capture candidates: {}",
+                    error
+                );
+                return 0;
+            }
+        };
+        let worker = UserMemoryCaptureWorker::from_agent(self);
+        let mut processed = 0usize;
+        for mut event in events {
+            event.status = USER_MEMORY_CAPTURE_PROCESSING_DEFERRED_STATUS.to_string();
+            event.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = self.storage.upsert_memory_capture_event(&event).await;
+
+            let Some(source_message) = self.pending_memory_capture_source_message(&event).await
+            else {
+                event.status = USER_MEMORY_CAPTURE_FAILED_DEFERRED_STATUS.to_string();
+                event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                event.updated_at = chrono::Utc::now().to_rfc3339();
+                event.error_history = serde_json::json!([user_memory_capture_error_entry(
+                    "source_message_missing",
+                    "Deferred memory capture could not find the source chat message.",
+                )]);
+                let _ = self.storage.upsert_memory_capture_event(&event).await;
+                continue;
+            };
+
+            worker
+                .capture_user_memory_hints(
+                    &source_message.content,
+                    event.channel.as_str(),
+                    event.conversation_id.as_deref(),
+                    event.project_id.as_deref(),
+                    event.source_message_id.as_deref(),
+                )
+                .await;
+
+            event.status = USER_MEMORY_CAPTURE_COMPLETED_DEFERRED_STATUS.to_string();
+            event.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            event.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = self.storage.upsert_memory_capture_event(&event).await;
+            processed += 1;
+        }
+        processed
     }
 
     pub(crate) async fn apply_memory_operation_by_id_with_source(

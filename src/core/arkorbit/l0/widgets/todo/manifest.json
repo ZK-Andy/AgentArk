@@ -1,0 +1,5 @@
+{
+  "name": "todo",
+  "description": "Small local todo list primitive for orbit modules.",
+  "entry": "index.js"
+}

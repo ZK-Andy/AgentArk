@@ -655,14 +655,12 @@ export default function AutonomyPage({
           : normalized === "watcher" ||
               normalized === "watchers" ||
               normalized === "status"
-            ? "/ui/watchers"
+            ? "/ui/background-work"
             : normalized === "session" || normalized === "sessions"
               ? "/ui/sessions"
-              : normalized === "trace"
-                ? "/ui/trace"
-                : normalized === "project" || normalized === "projects"
-                  ? "/ui/projects"
-                  : normalized === "document" ||
+            : normalized === "trace"
+              ? "/ui/trace"
+              : normalized === "document" ||
                       normalized === "documents" ||
                       normalized === "file" ||
                       normalized === "files"
@@ -951,7 +949,7 @@ export default function AutonomyPage({
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Core"
+        eyebrow="Ark Core"
         title="Mission Control"
         description="A calm overview of what AgentArk is doing, what needs you, and whether background help is healthy."
         actions={

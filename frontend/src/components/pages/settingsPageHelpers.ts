@@ -167,6 +167,19 @@ export function parseArkPulseRemediationSpec(
     }
     return null;
   }
+  if (kind === "managed_app_operation") {
+    const appId = str(row.app_id, "").trim();
+    const operation = str(row.operation, "").trim().toLowerCase();
+    if (!appId) return null;
+    if (
+      operation === "compile_python_requirements" ||
+      operation === "generate_cargo_lockfile" ||
+      operation === "remove_npm_install_hooks"
+    ) {
+      return { kind: "managed_app_operation", app_id: appId, operation };
+    }
+    return null;
+  }
   if (kind === "shell_command") {
     const command = str(row.command, "").trim();
     if (!command) return null;
@@ -191,6 +204,15 @@ export function describeArkPulseRemediation(
   if (remediation.kind === "readonly_investigation") {
     return "Review failed memory captures and model health";
   }
+  if (remediation.kind === "managed_app_operation") {
+    if (remediation.operation === "compile_python_requirements") {
+      return `Compile pinned Python requirements for app ${remediation.app_id}`;
+    }
+    if (remediation.operation === "generate_cargo_lockfile") {
+      return `Generate Cargo.lock for app ${remediation.app_id}`;
+    }
+    return `Remove npm install lifecycle hooks from app ${remediation.app_id}`;
+  }
   return remediation.command.trim() || "-";
 }
 
@@ -203,84 +225,47 @@ function isArkPulseReadonlyInvestigation(
 export function arkPulseRunActionLabel(
   remediation: ArkPulseRemediationSpec | null,
 ): string {
-  return isArkPulseReadonlyInvestigation(remediation)
-    ? "Run diagnostic"
-    : "Run fix now";
+  if (isArkPulseReadonlyInvestigation(remediation)) return "Run diagnostic";
+  if (remediation?.kind === "managed_app_operation") return "Run app fix";
+  return "Run fix";
 }
 
 export function arkPulseRemediationFootnote(
   remediation: ArkPulseRemediationSpec | null,
   canRunFix: boolean,
 ): string {
+  if (!canRunFix) {
+    return "ArkPulse has no verified executable action for this finding; the recommendation is display-only.";
+  }
   if (!remediation) {
-    return canRunFix
-      ? "Legacy event: ArkPulse is using the saved fix command fallback for this run."
-      : "This next step is advisory only. Copy it and run it manually.";
+    return "This next step is advisory only.";
   }
   if (remediation.kind === "readonly_investigation") {
     return "Runs a read-only diagnostic from ArkPulse and returns a summary here.";
   }
+  if (remediation.kind === "managed_app_operation") {
+    return "Runs a structured app remediation from the stored ArkPulse finding.";
+  }
   return "Runs directly from ArkPulse using the finding's typed remediation.";
 }
 
-function classifyLegacyRunnableArkPulseFixCommand(
-  value: string,
-): ArkPulseRemediationSpec | null {
-  const normalized = (value || "").trim();
-  if (!normalized) return null;
-  const lower = normalized.toLowerCase();
-  if (lower === "-" || lower === "n/a" || lower === "none") return null;
-  if (lower.includes("start tunnel") && lower.includes("/tunnel/status")) {
-    return { kind: "tunnel_start_verify" };
-  }
-  if (lower.includes("restart") && lower.includes("tunnel")) {
-    return { kind: "tunnel_restart_verify" };
-  }
-  const appRestartMatch = normalized.match(
-    /^POST\s+\/api\/apps\/([A-Za-z0-9_-]+)\/restart$/i,
-  );
-  if (appRestartMatch?.[1]) {
-    return { kind: "app_restart", app_id: appRestartMatch[1] };
-  }
-  if (
-    lower.includes("\n") ||
-    lower.includes("\r") ||
-    lower.includes("||") ||
-    lower.includes(";") ||
-    lower.includes("`") ||
-    lower.includes("$(")
-  ) {
-    return null;
-  }
-  const segments = normalized
-    .split("&&")
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0);
-  if (segments.length < 2) return null;
-  const cdSegment = segments[0].toLowerCase();
-  if (!cdSegment.startsWith("cd /app/data/apps/")) return null;
-  const supported = segments.slice(1).every((segment) => {
-    const seg = segment.toLowerCase();
-    return (
-      seg.startsWith("pip-compile requirements.txt") ||
-      seg.startsWith("rg -n ") ||
-      seg === "cargo generate-lockfile" ||
-      seg.startsWith("npm pkg delete ") ||
-      seg.startsWith("mv .env ")
-    );
-  });
-  if (!supported) return null;
-  return { kind: "shell_command", command: normalized };
+export function isRunnableArkPulseRemediation(
+  remediation: ArkPulseRemediationSpec | null,
+): boolean {
+  if (!remediation) return false;
+  return remediation.kind !== "shell_command";
+}
+
+export function arkPulseManualFollowupText(): string {
+  return "Manual follow-up: this finding has no verified executable ArkPulse action. Review the evidence and apply the relevant configuration or code change outside the auto-fix flow.";
 }
 
 export function getRunnableArkPulseRemediation(
   value: unknown,
 ): ArkPulseRemediationSpec | null {
   const row = asRecord(value);
-  return (
-    parseArkPulseRemediationSpec(row.remediation) ??
-    classifyLegacyRunnableArkPulseFixCommand(str(row.fix_command, "").trim())
-  );
+  const remediation = parseArkPulseRemediationSpec(row.remediation);
+  return isRunnableArkPulseRemediation(remediation) ? remediation : null;
 }
 
 export function getArkPulseFixText(value: unknown): string {

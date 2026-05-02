@@ -46,6 +46,23 @@ export function preloadSettingsTab(rawTab?: number | null): void {
     case 3:
       preloadOnce("settings-media", () => import("./MediaSettingsPanel"));
       break;
+    case 1:
+      preloadOnce("settings-models", () => import("./SettingsModelsPanel"));
+      break;
+    case 4:
+      preloadOnce("settings-security", () => import("./SettingsSecurityPanel"));
+      break;
+    case 5:
+      preloadOnce("settings-advanced", () => import("./SettingsAdvancedPanel"));
+      break;
+    case 14:
+      preloadOnce("settings-data-lifecycle", () =>
+        import("./SettingsDataLifecyclePanel"),
+      );
+      break;
+    case 25:
+      preloadOnce("settings-updates", () => import("./SettingsUpdatesPanel"));
+      break;
     case 6:
       preloadOnce("settings-observability", () => import("../ObservabilityPanel"));
       break;

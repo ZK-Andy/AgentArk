@@ -22,14 +22,15 @@ export type WorkspaceView =
   | "autonomy"
   | "evolution"
   | "arkmemory"
+  | "arkreflect"
   | "sentinel"
   | "documents"
-  | "projects"
   | "swarm"
   | "trace"
   | "status"
   | "analytics"
   | "arkpulse"
+  | "arkorbit"
   | "search"
   | "settings";
 

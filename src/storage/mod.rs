@@ -778,11 +778,11 @@ impl Storage {
     const MAX_DOCUMENTS_FOR_SEARCH: u64 = 5_000;
     const MAX_DOCUMENT_CHUNKS_FOR_SEARCH: u64 = 20_000;
     const MAX_LLM_USAGE_ROWS_PER_QUERY: u64 = 5_000;
+    const MAX_LLM_USAGE_ANALYTICS_ROWS: usize = 250_000;
     const MAX_FACT_ROWS_PER_QUERY: u64 = 5_000;
     const MAX_TASK_ROWS_PER_QUERY: u64 = 5_000;
     const MAX_EXPENSE_ROWS_PER_QUERY: u64 = 5_000;
     const MAX_SWARM_DELEGATION_ROWS_PER_QUERY: u64 = 5_000;
-    const MAX_PROJECT_ROWS_PER_QUERY: u64 = 1_000;
     const MAX_EXPERIENCE_RUN_ROWS_PER_QUERY: u64 = 1_000;
     const MAX_EXPERIENCE_ITEM_ROWS_PER_QUERY: u64 = 2_000;
     const MAX_PROCEDURAL_PATTERN_ROWS_PER_QUERY: u64 = 2_000;
@@ -1839,6 +1839,7 @@ impl Storage {
     }
 
     /// List LLM usage rows since a given RFC3339 timestamp (ascending).
+    #[allow(dead_code)]
     pub async fn list_llm_usage_since(&self, since_rfc3339: &str) -> Result<Vec<llm_usage::Model>> {
         let rows = llm_usage::Entity::find()
             .filter(llm_usage::Column::CreatedAt.gte(since_rfc3339.to_string()))
@@ -1847,6 +1848,73 @@ impl Storage {
             .all(&self.db)
             .await?;
         Ok(rows)
+    }
+
+    /// List LLM usage rows inside a bounded time window.
+    #[allow(dead_code)]
+    pub async fn list_llm_usage_between(
+        &self,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+        limit: u64,
+    ) -> Result<Vec<llm_usage::Model>> {
+        let rows = llm_usage::Entity::find()
+            .filter(llm_usage::Column::CreatedAt.gte(from_rfc3339.to_string()))
+            .filter(llm_usage::Column::CreatedAt.lt(to_rfc3339.to_string()))
+            .order_by_asc(llm_usage::Column::CreatedAt)
+            .limit(Self::db_limit(
+                limit.min(Self::MAX_LLM_USAGE_ROWS_PER_QUERY),
+            ))
+            .all(&self.db)
+            .await?;
+        Ok(rows)
+    }
+
+    /// List LLM usage rows for analytics without silently stopping at one page.
+    /// Returns a truncation flag when the server-side safety cap is reached.
+    pub async fn list_llm_usage_window_complete(
+        &self,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+    ) -> Result<(Vec<llm_usage::Model>, bool)> {
+        let mut rows = Vec::new();
+        let mut cursor: Option<(String, String)> = None;
+        loop {
+            let mut query = llm_usage::Entity::find()
+                .filter(llm_usage::Column::CreatedAt.gte(from_rfc3339.to_string()))
+                .filter(llm_usage::Column::CreatedAt.lt(to_rfc3339.to_string()));
+            if let Some((created_at, id)) = cursor.as_ref() {
+                query = query.filter(
+                    Condition::any()
+                        .add(llm_usage::Column::CreatedAt.gt(created_at.clone()))
+                        .add(
+                            Condition::all()
+                                .add(llm_usage::Column::CreatedAt.eq(created_at.clone()))
+                                .add(llm_usage::Column::Id.gt(id.clone())),
+                        ),
+                );
+            }
+            let page = query
+                .order_by_asc(llm_usage::Column::CreatedAt)
+                .order_by_asc(llm_usage::Column::Id)
+                .limit(Self::MAX_LLM_USAGE_ROWS_PER_QUERY)
+                .all(&self.db)
+                .await?;
+            if page.is_empty() {
+                return Ok((rows, false));
+            }
+            let page_len = page.len();
+            for row in page {
+                cursor = Some((row.created_at.clone(), row.id.clone()));
+                if rows.len() >= Self::MAX_LLM_USAGE_ANALYTICS_ROWS {
+                    return Ok((rows, true));
+                }
+                rows.push(row);
+            }
+            if page_len < Self::MAX_LLM_USAGE_ROWS_PER_QUERY as usize {
+                return Ok((rows, false));
+            }
+        }
     }
 
     // ==================== Learned Facts ====================
@@ -1924,28 +1992,6 @@ impl Storage {
             query = query.filter(experience_item::Column::ProjectId.eq(pid));
         }
         let facts = query
-            .limit(Self::db_limit(limit))
-            .offset(Self::db_offset(offset))
-            .all(&self.db)
-            .await?;
-        Ok(facts
-            .into_iter()
-            .map(learned_fact_from_experience_item)
-            .collect())
-    }
-
-    /// Get only global-scope learned facts.
-    pub async fn get_global_facts(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<LearnedFactRecord>> {
-        let facts = experience_item::Entity::find()
-            .filter(experience_item::Column::Status.eq("active"))
-            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]))
-            .filter(experience_item::Column::ProjectId.is_null())
-            .filter(experience_item::Column::ConversationId.is_null())
-            .order_by_desc(experience_item::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
             .all(&self.db)
@@ -2061,8 +2107,12 @@ impl Storage {
         offset: u64,
         project_id: Option<&str>,
     ) -> Result<Vec<user_preference::Model>> {
-        let mut query =
-            user_preference::Entity::find().order_by_desc(user_preference::Column::UpdatedAt);
+        let mut query = user_preference::Entity::find()
+            .filter(
+                user_preference::Column::Sensitivity
+                    .ne(user_preference::SENSITIVITY_PERSONAL_IDENTIFIER),
+            )
+            .order_by_desc(user_preference::Column::UpdatedAt);
         if let Some(pid) = project_id {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
@@ -2079,7 +2129,10 @@ impl Storage {
 
     /// Count user preferences by scope.
     pub async fn count_user_preferences(&self, project_id: Option<&str>) -> Result<u64> {
-        let mut query = user_preference::Entity::find();
+        let mut query = user_preference::Entity::find().filter(
+            user_preference::Column::Sensitivity
+                .ne(user_preference::SENSITIVITY_PERSONAL_IDENTIFIER),
+        );
         if let Some(pid) = project_id {
             query = query.filter(user_preference::Column::ProjectId.eq(pid));
         }
@@ -2646,6 +2699,30 @@ impl Storage {
         Ok(tasks)
     }
 
+    /// List tasks updated inside a bounded time window.
+    #[allow(dead_code)]
+    pub async fn list_tasks_updated_between(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<task::Model>> {
+        let mut tasks = task::Entity::find()
+            .filter(task::Column::UpdatedAt.gte(from.to_string()))
+            .filter(task::Column::UpdatedAt.lt(to.to_string()))
+            .order_by_desc(task::Column::UpdatedAt)
+            .limit(Self::db_limit(limit.min(Self::MAX_TASK_ROWS_PER_QUERY)))
+            .all(&self.db)
+            .await?;
+        for task in &mut tasks {
+            task.description = decrypt_storage_string(&task.description);
+            task.arguments = decrypt_storage_string(&task.arguments);
+            task.approval = decrypt_storage_string(&task.approval);
+            task.result = decrypt_optional_storage_string(task.result.take());
+        }
+        Ok(tasks)
+    }
+
     pub async fn list_automation_runs(
         &self,
         limit: usize,
@@ -2876,6 +2953,56 @@ impl Storage {
             }
         }
         Ok(watchers)
+    }
+
+    pub async fn upsert_watcher(&self, watcher: &crate::core::watcher::Watcher) -> Result<()> {
+        let status = match &watcher.status {
+            crate::core::watcher::WatcherStatus::Active => "active",
+            crate::core::watcher::WatcherStatus::Paused => "paused",
+            crate::core::watcher::WatcherStatus::Triggered => "triggered",
+            crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
+            crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
+            crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
+        };
+        watcher::Entity::insert(watcher::ActiveModel {
+            id: Set(watcher.id.to_string()),
+            status: Set(status.to_string()),
+            created_at: Set(watcher.created_at.to_rfc3339()),
+            updated_at: Set(chrono::Utc::now().to_rfc3339()),
+            payload: Set(serde_json::to_string(watcher)?),
+            lease_owner: Set(None),
+            lease_expires_at: sea_orm::NotSet,
+            lease_version: Set(0),
+            next_retry_at: Set(watcher.next_poll_not_before.map(|value| value.to_rfc3339())),
+            last_run_id: Set(None),
+            consecutive_failures: Set(watcher.consecutive_failures as i32),
+        })
+        .on_conflict(
+            OnConflict::column(watcher::Column::Id)
+                .update_columns([
+                    watcher::Column::Status,
+                    watcher::Column::UpdatedAt,
+                    watcher::Column::Payload,
+                    watcher::Column::NextRetryAt,
+                    watcher::Column::LastRunId,
+                    watcher::Column::ConsecutiveFailures,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_watcher(&self, id: &str) -> Result<()> {
+        let txn = self.db.begin().await?;
+        self.cleanup_automation_records_for_ids(&txn, &[id.to_string()])
+            .await?;
+        watcher::Entity::delete_by_id(id.to_string())
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     pub async fn replace_active_watchers(
@@ -3183,7 +3310,6 @@ impl Storage {
             .collect())
     }
 
-    #[allow(dead_code)]
     pub async fn append_execution_checkpoint(
         &self,
         checkpoint: &crate::core::ExecutionCheckpoint,
@@ -3281,6 +3407,7 @@ impl Storage {
 
     // ==================== Experience Graph ====================
 
+    #[allow(dead_code)]
     pub async fn upsert_experience_run(&self, run: &experience_run::Model) -> Result<()> {
         experience_run::Entity::insert(experience_run::ActiveModel {
             id: Set(run.id.clone()),
@@ -3750,6 +3877,40 @@ impl Storage {
         }
     }
 
+    fn semantic_work_unit_active_model(
+        unit: &semantic_work_unit::Model,
+    ) -> Result<semantic_work_unit::ActiveModel> {
+        Ok(semantic_work_unit::ActiveModel {
+            id: Set(unit.id.clone()),
+            source_kind: Set(unit.source_kind.clone()),
+            source_id: Set(unit.source_id.clone()),
+            conversation_id: Set(unit.conversation_id.clone()),
+            project_id: Set(unit.project_id.clone()),
+            channel: Set(unit.channel.clone()),
+            title: Set(encrypt_storage_string(&unit.title)?),
+            summary: Set(encrypt_storage_string(&unit.summary)?),
+            content_preview: Set(encrypt_storage_string(&unit.content_preview)?),
+            text_hash: Set(unit.text_hash.clone()),
+            occurred_at: Set(unit.occurred_at.clone()),
+            period_start: Set(unit.period_start.clone()),
+            period_end: Set(unit.period_end.clone()),
+            message_count: Set(unit.message_count),
+            metadata: Set(unit.metadata.clone()),
+            created_at: Set(unit.created_at.clone()),
+            updated_at: Set(unit.updated_at.clone()),
+            embedding: Set(unit.embedding.clone()),
+        })
+    }
+
+    fn decrypt_semantic_work_unit(
+        mut unit: semantic_work_unit::Model,
+    ) -> semantic_work_unit::Model {
+        unit.title = decrypt_storage_string(&unit.title);
+        unit.summary = decrypt_storage_string(&unit.summary);
+        unit.content_preview = decrypt_storage_string(&unit.content_preview);
+        unit
+    }
+
     fn recall_event_active_model(event: &recall_event::Model) -> recall_event::ActiveModel {
         recall_event::ActiveModel {
             id: Set(event.id.clone()),
@@ -4107,6 +4268,22 @@ impl Storage {
         Self::update_experience_item_status_conn(&txn, id, status).await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_experience_items_between(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<experience_item::Model>> {
+        Ok(experience_item::Entity::find()
+            .filter(experience_item::Column::UpdatedAt.gte(from.to_string()))
+            .filter(experience_item::Column::UpdatedAt.lt(to.to_string()))
+            .filter(experience_item::Column::Status.eq("active"))
+            .order_by_desc(experience_item::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
     }
 
     pub(crate) async fn begin_experience_memory_write_txn(
@@ -4772,6 +4949,22 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn list_procedural_patterns_between(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<procedural_pattern::Model>> {
+        Ok(procedural_pattern::Entity::find()
+            .filter(procedural_pattern::Column::UpdatedAt.gte(from.to_string()))
+            .filter(procedural_pattern::Column::UpdatedAt.lt(to.to_string()))
+            .filter(procedural_pattern::Column::Status.eq("active"))
+            .order_by_desc(procedural_pattern::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
     #[allow(dead_code)]
     pub async fn search_procedural_patterns(
         &self,
@@ -5064,6 +5257,29 @@ impl Storage {
         };
         Ok(query
             .order_by_desc(memory_capture_event::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn list_memory_capture_events_by_statuses_all_scopes(
+        &self,
+        statuses: &[&str],
+        limit: u64,
+    ) -> Result<Vec<memory_capture_event::Model>> {
+        let mut query = memory_capture_event::Entity::find();
+        if !statuses.is_empty() {
+            query = query.filter(
+                memory_capture_event::Column::Status.is_in(
+                    statuses
+                        .iter()
+                        .map(|status| (*status).to_string())
+                        .collect::<Vec<_>>(),
+                ),
+            );
+        }
+        Ok(query
+            .order_by_asc(memory_capture_event::Column::UpdatedAt)
             .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?)
@@ -6271,6 +6487,194 @@ impl Storage {
         Ok(updated)
     }
 
+    // ==================== Semantic Work Units ====================
+
+    /// Upsert a derived semantic work unit used by reflection and clustering.
+    pub async fn upsert_semantic_work_unit(&self, unit: &semantic_work_unit::Model) -> Result<()> {
+        semantic_work_unit::Entity::insert(Self::semantic_work_unit_active_model(unit)?)
+            .on_conflict(
+                OnConflict::column(semantic_work_unit::Column::Id)
+                    .update_columns([
+                        semantic_work_unit::Column::SourceKind,
+                        semantic_work_unit::Column::SourceId,
+                        semantic_work_unit::Column::ConversationId,
+                        semantic_work_unit::Column::ProjectId,
+                        semantic_work_unit::Column::Channel,
+                        semantic_work_unit::Column::Title,
+                        semantic_work_unit::Column::Summary,
+                        semantic_work_unit::Column::ContentPreview,
+                        semantic_work_unit::Column::TextHash,
+                        semantic_work_unit::Column::OccurredAt,
+                        semantic_work_unit::Column::PeriodStart,
+                        semantic_work_unit::Column::PeriodEnd,
+                        semantic_work_unit::Column::MessageCount,
+                        semantic_work_unit::Column::Metadata,
+                        semantic_work_unit::Column::UpdatedAt,
+                        semantic_work_unit::Column::Embedding,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Read derived semantic work units for a time window.
+    pub async fn list_semantic_work_units_between(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<semantic_work_unit::Model>> {
+        let rows = semantic_work_unit::Entity::find()
+            .filter(semantic_work_unit::Column::OccurredAt.gte(from.to_string()))
+            .filter(semantic_work_unit::Column::OccurredAt.lt(to.to_string()))
+            .order_by_desc(semantic_work_unit::Column::OccurredAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(Self::decrypt_semantic_work_unit)
+            .collect())
+    }
+
+    pub async fn get_semantic_work_unit(
+        &self,
+        id: &str,
+    ) -> Result<Option<semantic_work_unit::Model>> {
+        Ok(semantic_work_unit::Entity::find_by_id(id.to_string())
+            .one(&self.db)
+            .await?
+            .map(Self::decrypt_semantic_work_unit))
+    }
+
+    /// Find semantically similar derived work units outside a selected time window.
+    /// This is intentionally bounded and backed by the semantic_work_units HNSW
+    /// index so ArkReflect can compare the current recap to history without
+    /// scanning old rows.
+    pub async fn nearest_semantic_work_units_outside_window(
+        &self,
+        embedding: &PgVector,
+        from: &str,
+        to: &str,
+        exclude_ids: &[String],
+        limit: u64,
+    ) -> Result<Vec<(semantic_work_unit::Model, f64)>> {
+        if limit == 0 || self.db.get_database_backend() != DbBackend::Postgres {
+            return Ok(Vec::new());
+        }
+        let embedding_sql = pgvector_sql_literal(embedding);
+        let exclude_clause = if exclude_ids.is_empty() {
+            String::new()
+        } else {
+            format!("AND id NOT IN ({})", sql_string_list(exclude_ids))
+        };
+        let sql = format!(
+            "SELECT id, embedding <=> {embedding_sql} AS cosine_distance \
+             FROM semantic_work_units \
+             WHERE embedding IS NOT NULL \
+               AND (occurred_at < {from} OR occurred_at >= {to}) \
+               {exclude_clause} \
+             ORDER BY embedding <=> {embedding_sql} ASC, occurred_at DESC \
+             LIMIT {}",
+            Self::db_limit(limit),
+            from = sql_string_literal(from),
+            to = sql_string_literal(to),
+        );
+        let rows = self
+            .db
+            .query_all(Statement::from_string(DbBackend::Postgres, sql))
+            .await?;
+        let mut scored = Vec::<(String, f64)>::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("", "id")?;
+            let distance: f64 = row.try_get("", "cosine_distance")?;
+            scored.push((id, distance));
+        }
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = scored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let models = semantic_work_unit::Entity::find()
+            .filter(semantic_work_unit::Column::Id.is_in(ids))
+            .all(&self.db)
+            .await?;
+        let mut by_id = models
+            .into_iter()
+            .map(|model| {
+                let model = Self::decrypt_semantic_work_unit(model);
+                (model.id.clone(), model)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(scored
+            .into_iter()
+            .filter_map(|(id, distance)| by_id.remove(&id).map(|model| (model, distance)))
+            .collect())
+    }
+
+    #[allow(dead_code)]
+    pub async fn delete_semantic_work_units_before(&self, cutoff: &str) -> Result<u64> {
+        let result = semantic_work_unit::Entity::delete_many()
+            .filter(semantic_work_unit::Column::OccurredAt.lt(cutoff.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    pub async fn delete_semantic_work_units_for_source(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<u64> {
+        let result = semantic_work_unit::Entity::delete_many()
+            .filter(semantic_work_unit::Column::SourceKind.eq(source_kind.to_string()))
+            .filter(semantic_work_unit::Column::SourceId.eq(source_id.to_string()))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    pub async fn delete_semantic_work_units_for_source_prefix(
+        &self,
+        source_kind: &str,
+        source_id_prefix: &str,
+    ) -> Result<u64> {
+        let prefix = source_id_prefix.trim();
+        if prefix.is_empty() {
+            return Ok(0);
+        }
+        let result = semantic_work_unit::Entity::delete_many()
+            .filter(semantic_work_unit::Column::SourceKind.eq(source_kind.to_string()))
+            .filter(semantic_work_unit::Column::SourceId.contains(format!("{}:", prefix)))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    #[allow(dead_code)]
+    pub async fn delete_semantic_work_units_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<u64> {
+        let result = semantic_work_unit::Entity::delete_many()
+            .filter(
+                Condition::any()
+                    .add(semantic_work_unit::Column::ConversationId.eq(conversation_id.to_string()))
+                    .add(
+                        Condition::all()
+                            .add(semantic_work_unit::Column::SourceKind.eq("conversation"))
+                            .add(
+                                semantic_work_unit::Column::SourceId
+                                    .eq(conversation_id.to_string()),
+                            ),
+                    ),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     // ==================== Conversations ====================
 
     /// Create a new conversation
@@ -6289,6 +6693,28 @@ impl Storage {
         .insert(&self.db)
         .await?;
         Ok(())
+    }
+
+    /// Create a conversation only if another path has not already created it.
+    pub async fn create_conversation_if_absent(
+        &self,
+        conv: &conversation::Model,
+    ) -> Result<bool> {
+        if self.get_conversation(&conv.id).await?.is_some() {
+            return Ok(false);
+        }
+
+        match self.create_conversation(conv).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                let text = error.to_string().to_ascii_lowercase();
+                if text.contains("duplicate key") || text.contains("unique constraint failed") {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     /// List conversations (newest first, paginated)
@@ -6375,6 +6801,23 @@ impl Storage {
             query = query.filter(conversation::Column::Starred.eq(is_starred));
         }
         Ok(query.count(&self.db).await?)
+    }
+
+    /// List conversations touched inside a time window.
+    pub async fn list_conversations_updated_between(
+        &self,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<conversation::Model>> {
+        Ok(conversation::Entity::find()
+            .filter(conversation::Column::UpdatedAt.gte(from.to_string()))
+            .filter(conversation::Column::UpdatedAt.lt(to.to_string()))
+            .filter(conversation::Column::Archived.eq(false))
+            .order_by_desc(conversation::Column::UpdatedAt)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?)
     }
 
     /// Get a single conversation by ID
@@ -6483,6 +6926,18 @@ impl Storage {
             .filter(operational_log::Column::ConversationId.eq(id.to_string()))
             .exec(&txn)
             .await?;
+        semantic_work_unit::Entity::delete_many()
+            .filter(
+                Condition::any()
+                    .add(semantic_work_unit::Column::ConversationId.eq(id.to_string()))
+                    .add(
+                        Condition::all()
+                            .add(semantic_work_unit::Column::SourceKind.eq("conversation"))
+                            .add(semantic_work_unit::Column::SourceId.eq(id.to_string())),
+                    ),
+            )
+            .exec(&txn)
+            .await?;
         if !trace_ids_vec.is_empty() {
             operational_log::Entity::delete_many()
                 .filter(operational_log::Column::TraceId.is_in(trace_ids_vec.clone()))
@@ -6571,6 +7026,33 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert a message only when its stable id has not already been persisted.
+    ///
+    /// This is used by response-first chat persistence retries. A partially
+    /// completed retry must not insert the same chat message twice or increment
+    /// the parent conversation count twice.
+    pub async fn insert_message_if_absent(&self, msg: &message::Model) -> Result<bool> {
+        if message::Entity::find_by_id(msg.id.clone())
+            .one(&self.db)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        match self.insert_message(msg).await {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                let text = error.to_string().to_ascii_lowercase();
+                if text.contains("duplicate key") || text.contains("unique constraint failed") {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// Get messages for a conversation
     pub async fn get_messages(
         &self,
@@ -6583,6 +7065,29 @@ impl Storage {
             .order_by_asc(message::Column::Timestamp)
             .limit(Self::db_limit(limit))
             .offset(Self::db_offset(offset))
+            .all(&self.db)
+            .await?;
+        for msg in &mut msgs {
+            msg.content = decrypt_storage_string(&msg.content);
+        }
+        Ok(msgs)
+    }
+
+    /// Get messages for a conversation inside a bounded time window.
+    #[allow(dead_code)]
+    pub async fn get_messages_between(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        limit: u64,
+    ) -> Result<Vec<message::Model>> {
+        let mut msgs = message::Entity::find()
+            .filter(message::Column::ConversationId.eq(conversation_id))
+            .filter(message::Column::Timestamp.gte(from.to_string()))
+            .filter(message::Column::Timestamp.lt(to.to_string()))
+            .order_by_asc(message::Column::Timestamp)
+            .limit(Self::db_limit(limit))
             .all(&self.db)
             .await?;
         for msg in &mut msgs {
@@ -6666,130 +7171,6 @@ impl Storage {
             .await?
             .is_some();
         Ok(exists)
-    }
-
-    // ==================== Projects ====================
-
-    /// Create a project
-    pub async fn create_project(&self, proj: &project::Model) -> Result<()> {
-        project::ActiveModel {
-            id: Set(proj.id.clone()),
-            name: Set(proj.name.clone()),
-            description: Set(proj.description.clone()),
-            system_prompt: Set(proj.system_prompt.clone()),
-            personality: Set(proj.personality.clone()),
-            tools_filter: Set(proj.tools_filter.clone()),
-            active: Set(proj.active),
-            created_at: Set(proj.created_at.clone()),
-            updated_at: Set(proj.updated_at.clone()),
-        }
-        .insert(&self.db)
-        .await?;
-        Ok(())
-    }
-
-    /// List projects
-    pub async fn list_projects(&self) -> Result<Vec<project::Model>> {
-        let projects = project::Entity::find()
-            .order_by_desc(project::Column::UpdatedAt)
-            .limit(Self::MAX_PROJECT_ROWS_PER_QUERY)
-            .all(&self.db)
-            .await?;
-        Ok(projects)
-    }
-
-    /// Get a project by ID
-    pub async fn get_project(&self, id: &str) -> Result<Option<project::Model>> {
-        let proj = project::Entity::find_by_id(id.to_string())
-            .one(&self.db)
-            .await?;
-        Ok(proj)
-    }
-
-    /// Update a project
-    pub async fn update_project(&self, proj: &project::Model) -> Result<()> {
-        project::ActiveModel {
-            id: Set(proj.id.clone()),
-            name: Set(proj.name.clone()),
-            description: Set(proj.description.clone()),
-            system_prompt: Set(proj.system_prompt.clone()),
-            personality: Set(proj.personality.clone()),
-            tools_filter: Set(proj.tools_filter.clone()),
-            active: Set(proj.active),
-            updated_at: Set(chrono::Utc::now().to_rfc3339()),
-            ..Default::default()
-        }
-        .update(&self.db)
-        .await?;
-        Ok(())
-    }
-
-    /// Delete a project
-    pub async fn delete_project(&self, id: &str) -> Result<()> {
-        let txn = self.db.begin().await?;
-
-        // Documents + chunks
-        let doc_ids: Vec<String> = document::Entity::find()
-            .select_only()
-            .column(document::Column::Id)
-            .filter(document::Column::ProjectId.eq(id))
-            .into_tuple::<String>()
-            .all(&txn)
-            .await?;
-        if !doc_ids.is_empty() {
-            document_chunk::Entity::delete_many()
-                .filter(document_chunk::Column::DocumentId.is_in(doc_ids))
-                .exec(&txn)
-                .await?;
-        }
-        document::Entity::delete_many()
-            .filter(document::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
-
-        // Conversations + messages
-        let conv_ids: Vec<String> = conversation::Entity::find()
-            .select_only()
-            .column(conversation::Column::Id)
-            .filter(conversation::Column::ProjectId.eq(id))
-            .into_tuple::<String>()
-            .all(&txn)
-            .await?;
-        if !conv_ids.is_empty() {
-            message::Entity::delete_many()
-                .filter(message::Column::ConversationId.is_in(conv_ids))
-                .exec(&txn)
-                .await?;
-        }
-        conversation::Entity::delete_many()
-            .filter(conversation::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
-
-        user_preference::Entity::delete_many()
-            .filter(user_preference::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
-        user_data_item::Entity::delete_many()
-            .filter(user_data_item::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
-        knowledge_item::Entity::delete_many()
-            .filter(knowledge_item::Column::ProjectId.eq(id))
-            .exec(&txn)
-            .await?;
-
-        // Finally delete the project row
-        let res = project::Entity::delete_by_id(id.to_string())
-            .exec(&txn)
-            .await?;
-        if res.rows_affected == 0 {
-            txn.rollback().await?;
-            anyhow::bail!("Project not found");
-        }
-
-        txn.commit().await?;
-        Ok(())
     }
 
     // ==================== Documents ====================
@@ -7914,6 +8295,30 @@ impl Storage {
     /// List ArkPulse history rows (newest first).
     pub async fn list_arkpulse_events(&self, limit: u64) -> Result<Vec<arkpulse_event::Model>> {
         let mut rows = arkpulse_event::Entity::find()
+            .order_by_desc(arkpulse_event::Column::Timestamp)
+            .limit(Self::db_limit(limit))
+            .all(&self.db)
+            .await?;
+        for row in &mut rows {
+            row.message = decrypt_storage_string(&row.message);
+            row.summary = decrypt_storage_string(&row.summary);
+            row.flags_json = decrypt_storage_string(&row.flags_json);
+            row.details_json = decrypt_storage_string(&row.details_json);
+        }
+        Ok(rows)
+    }
+
+    /// List ArkPulse history rows inside a bounded time window.
+    #[allow(dead_code)]
+    pub async fn list_arkpulse_events_between(
+        &self,
+        from_rfc3339: &str,
+        to_rfc3339: &str,
+        limit: u64,
+    ) -> Result<Vec<arkpulse_event::Model>> {
+        let mut rows = arkpulse_event::Entity::find()
+            .filter(arkpulse_event::Column::Timestamp.gte(from_rfc3339.to_string()))
+            .filter(arkpulse_event::Column::Timestamp.lt(to_rfc3339.to_string()))
             .order_by_desc(arkpulse_event::Column::Timestamp)
             .limit(Self::db_limit(limit))
             .all(&self.db)

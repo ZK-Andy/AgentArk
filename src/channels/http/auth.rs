@@ -1,5 +1,5 @@
 use super::*;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -322,6 +322,18 @@ pub(super) async fn is_verified_ui_session_request(
     has_valid_ui_session_cookie(state, headers).await
 }
 
+fn is_public_arkorbit_runtime_asset(path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').collect();
+    parts.len() == 7
+        && parts[0].is_empty()
+        && parts[1] == "api"
+        && parts[2] == "arkorbit"
+        && parts[3] == "mod"
+        && uuid::Uuid::parse_str(parts[4]).is_ok()
+        && parts[5] == "runtime"
+        && parts[6] == "host.js"
+}
+
 fn is_container_host_gateway_ip(ip: IpAddr) -> bool {
     static CONTAINER_GATEWAY_IP: OnceLock<Option<IpAddr>> = OnceLock::new();
     *CONTAINER_GATEWAY_IP.get_or_init(detect_container_default_gateway_ip) == Some(ip)
@@ -479,6 +491,10 @@ pub(super) async fn auth_middleware(
     let ip = addr.ip().to_string();
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+
+    if request.method() == Method::GET && is_public_arkorbit_runtime_asset(&path) {
+        return next.run(request).await;
+    }
 
     let expected_key = match sync_http_api_key_state(&state, false).await {
         Ok((info, _rotated)) => info.map(|k| k.key),
@@ -832,5 +848,21 @@ mod tests {
             HeaderValue::from_static("http://localhost:3000/ui/v2"),
         );
         assert!(!is_trusted_local_ui_api_request(&headers, loopback_addr()));
+    }
+
+    #[test]
+    fn arkorbit_runtime_host_is_the_only_public_orbit_module() {
+        let orbit_id = uuid::Uuid::new_v4();
+        assert!(is_public_arkorbit_runtime_asset(&format!(
+            "/api/arkorbit/mod/{}/runtime/host.js",
+            orbit_id
+        )));
+        assert!(!is_public_arkorbit_runtime_asset(&format!(
+            "/api/arkorbit/mod/{}/markdown/index.js",
+            orbit_id
+        )));
+        assert!(!is_public_arkorbit_runtime_asset(
+            "/api/arkorbit/mod/not-a-uuid/runtime/host.js"
+        ));
     }
 }

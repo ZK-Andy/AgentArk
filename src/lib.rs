@@ -9,6 +9,8 @@
 //! - Native GUI (egui) + Telegram integration
 //! - Local-first HTTP API
 
+#![recursion_limit = "256"]
+
 mod actions;
 mod branding;
 mod channels;
@@ -275,10 +277,13 @@ fn cli_chat_request_hints() -> core::RequestExecutionHints {
         execution_surface: actions::ActionExecutionSurface::Chat,
         direct_user_intent: true,
         routing: None,
+        routing_trusted: false,
         intent_plan: None,
+        force_agent_loop: false,
         secret_offered: None,
         attachments: Vec::new(),
         saved_user_facts_context: None,
+        arkorbit_context: None,
     }
 }
 
@@ -772,6 +777,22 @@ fn render_cli_stream_event(
             finish_cli_inline_response(state)?;
             println!("\x1b[3;90m{}\x1b[0m", detail);
         }
+        core::StreamEvent::ReasoningDelta {
+            phase,
+            content_delta,
+            done,
+        } => {
+            finish_cli_inline_response(state)?;
+            if done {
+                println!("\x1b[3;90m[reasoning:{}] done\x1b[0m", phase);
+            } else if !content_delta.trim().is_empty() {
+                println!(
+                    "\x1b[3;90m[reasoning:{}] {}\x1b[0m",
+                    phase,
+                    content_delta.trim()
+                );
+            }
+        }
         core::StreamEvent::ToolStart { name, .. } => {
             finish_cli_inline_response(state)?;
             println!("\x1b[36m[start]\x1b[0m {}", name);
@@ -995,6 +1016,20 @@ fn describe_cli_pulse_remediation(finding: &crate::sentinel::DoctorFinding) -> O
                 }
             })
         }
+        Some(crate::sentinel::DoctorRemediationSpec::ManagedAppOperation {
+            app_id,
+            operation,
+        }) => Some(match operation {
+            crate::sentinel::DoctorManagedAppOperation::CompilePythonRequirements => {
+                format!("Compile pinned Python requirements for app {}", app_id)
+            }
+            crate::sentinel::DoctorManagedAppOperation::GenerateCargoLockfile => {
+                format!("Generate Cargo.lock for app {}", app_id)
+            }
+            crate::sentinel::DoctorManagedAppOperation::RemoveNpmInstallHooks => {
+                format!("Remove npm install lifecycle hooks from app {}", app_id)
+            }
+        }),
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             let normalized = command.trim();
             if normalized.is_empty() {
@@ -1541,8 +1576,8 @@ async fn run_cli_setup(config_dir: &Path, agent: &core::Agent) -> Result<()> {
     println!("Configuration saved to: {}", config_dir.display());
     println!();
     println!("To start your agent:");
-    println!("  GUI mode:      agentark");
     println!("  Headless mode: agentark --headless");
+    println!("  Native GUI:    build with --features gui, then run agentark");
     println!();
     println!("HTTP API will be available at: http://127.0.0.1:8990");
     println!();

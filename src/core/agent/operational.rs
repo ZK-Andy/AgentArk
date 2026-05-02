@@ -14,7 +14,6 @@ pub(crate) struct OperationalEvent<'a> {
     pub strategy_version: Option<&'a str>,
     pub policy_version: Option<&'a str>,
     pub prompt_version: Option<&'a str>,
-    pub classifier_prompt_version: Option<&'a str>,
     pub specialist_prompt_version: Option<&'a str>,
     pub model_slot: Option<&'a str>,
 }
@@ -235,11 +234,7 @@ Rules:\n\
     fn operational_payload_preserves_identifier(key: &str) -> bool {
         matches!(
             key,
-            "strategy_version"
-                | "policy_version"
-                | "prompt_version"
-                | "classifier_prompt_version"
-                | "specialist_prompt_version"
+            "strategy_version" | "policy_version" | "prompt_version" | "specialist_prompt_version"
         )
     }
 
@@ -289,9 +284,7 @@ Rules:\n\
         });
         let payload_text = event.payload.and_then(|v| {
             let mut payload = v.clone();
-            if event.classifier_prompt_version.is_some()
-                || event.specialist_prompt_version.is_some()
-            {
+            if event.specialist_prompt_version.is_some() {
                 let mut object = match payload {
                     serde_json::Value::Object(obj) => obj,
                     other => {
@@ -300,12 +293,6 @@ Rules:\n\
                         obj
                     }
                 };
-                if let Some(version) = event.classifier_prompt_version {
-                    object.insert(
-                        "classifier_prompt_version".to_string(),
-                        serde_json::Value::String(version.to_string()),
-                    );
-                }
                 if let Some(version) = event.specialist_prompt_version {
                     object.insert(
                         "specialist_prompt_version".to_string(),
@@ -345,14 +332,6 @@ Rules:\n\
     ) -> Option<crate::core::self_evolve::PromptBundleProfile> {
         let raw = self.storage.get(key).await.ok().flatten()?;
         crate::core::self_evolve::prompt_evolution::parse_prompt_bundle_profile(&raw)
-    }
-
-    async fn load_classifier_prompt_bundle_by_key(
-        &self,
-        key: &str,
-    ) -> Option<crate::core::self_evolve::ClassifierPromptBundleProfile> {
-        let raw = self.storage.get(key).await.ok().flatten()?;
-        crate::core::self_evolve::classifier_prompt_evolution::parse_classifier_prompt_bundle_profile(&raw)
     }
 
     async fn load_specialist_prompt_bundle_by_key(
@@ -524,50 +503,6 @@ Rules:\n\
         selected
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn active_classifier_prompt_bundle_for_message(
-        &self,
-        message: &str,
-    ) -> crate::core::self_evolve::ClassifierPromptBundleProfile {
-        let mut selected = self
-            .load_classifier_prompt_bundle_by_key(
-                crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_KEY,
-            )
-            .await
-            .unwrap_or_default();
-
-        let canary_state_raw = self
-            .storage
-            .get(crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY)
-            .await
-            .ok()
-            .flatten();
-        if let Some(raw) = canary_state_raw {
-            if let Ok(state) = serde_json::from_slice::<
-                crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
-            >(&raw)
-            {
-                if state.enabled
-                    && crate::core::self_evolve::strategy_runtime::should_use_canary(
-                        &Self::prompt_seed_for_message(message),
-                        state.rollout_percent,
-                    )
-                {
-                    if let Some(canary) = self
-                        .load_classifier_prompt_bundle_by_key(
-                            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
-                        )
-                        .await
-                    {
-                        selected = canary;
-                    }
-                }
-            }
-        }
-
-        selected
-    }
-
     pub(crate) async fn active_specialist_prompt_bundle_for_message(
         &self,
         message: &str,
@@ -646,13 +581,11 @@ mod tests {
     fn operational_payload_preserves_versions_but_redacts_secret_like_text() {
         let fake_key = ["sk", "-1234567890", "abcdefghijklmnop"].concat();
         let payload = serde_json::json!({
-            "classifier_prompt_version": "agent_turn_loop_v1",
             "specialist_prompt_version": "specialist_prompt_v1+specialist-prompt-bundle-default-v1",
             "diagnostic": format!("api_key={fake_key}")
         });
         let sanitized = Agent::sanitize_operational_payload_json(&payload).expect("payload");
 
-        assert!(sanitized.contains("agent_turn_loop_v1"));
         assert!(sanitized.contains("specialist_prompt_v1+specialist-prompt-bundle-default-v1"));
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(!sanitized.contains(&fake_key));

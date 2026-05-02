@@ -16,11 +16,17 @@ pub enum StreamEvent {
         description: String,
         work_type: String,
         conversation_id: Option<String>,
-        project_id: Option<String>,
     },
     Token(String),
     /// Periodic heartbeat during long waits (e.g., non-streaming fallback)
     Thinking(String),
+    /// Live model/planner reasoning preview. This is distinct from assistant
+    /// response tokens so clients can render it as transient progress text.
+    ReasoningDelta {
+        phase: String,
+        content_delta: String,
+        done: bool,
+    },
     ToolStart {
         name: String,
         payload: Option<serde_json::Value>,

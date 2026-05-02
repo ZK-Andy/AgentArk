@@ -43,6 +43,10 @@ const MAX_SURFACE_CHARS: usize = 16_000;
 const ROUTER_WEIGHT: f64 = 0.35;
 const SYNTHESIS_WEIGHT: f64 = 0.25;
 const PRIMARY_RESPONSE_WEIGHT: f64 = 0.40;
+const ROUTER_EVAL_CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 512;
+const DEFAULT_MAX_PROMPT_TOKEN_REGRESSION_RATIO: f64 = 0.10;
+const DEFAULT_MAX_CACHE_SENSITIVE_TOKEN_REGRESSION_RATIO: f64 = 0.10;
+const SUBSTANTIAL_SCORE_GAIN_MULTIPLIER: f64 = 2.0;
 
 const ROUTER_DIRECTNESS_MUTATION: &str = r#"- Prefer direct execution when one action clearly matches the request.
 - Require at least 2 usable sub-agents before needs_delegation=true.
@@ -96,6 +100,8 @@ pub struct PromptEvolutionConfig {
     pub max_candidates: usize,
     pub min_score_gain: f64,
     pub max_sign_test_p_value: f64,
+    pub max_prompt_token_regression_ratio: f64,
+    pub max_cache_sensitive_token_regression_ratio: f64,
 }
 
 impl Default for PromptEvolutionConfig {
@@ -105,8 +111,28 @@ impl Default for PromptEvolutionConfig {
             max_candidates: 8,
             min_score_gain: 0.03,
             max_sign_test_p_value: 0.10,
+            max_prompt_token_regression_ratio: DEFAULT_MAX_PROMPT_TOKEN_REGRESSION_RATIO,
+            max_cache_sensitive_token_regression_ratio:
+                DEFAULT_MAX_CACHE_SENSITIVE_TOKEN_REGRESSION_RATIO,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct PromptEfficiencyMetrics {
+    pub static_prompt_chars: usize,
+    pub estimated_static_prompt_tokens: usize,
+    pub cache_sensitive_chars: usize,
+    pub estimated_cache_sensitive_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct PromptEfficiencyDelta {
+    pub static_prompt_token_delta: i64,
+    pub static_prompt_token_delta_ratio: f64,
+    pub cache_sensitive_token_delta: i64,
+    pub cache_sensitive_token_delta_ratio: f64,
+    pub estimated_cost_delta_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +155,9 @@ pub struct PromptEvolutionResult {
     pub best_candidate_synthesis_score: f64,
     pub baseline_router_invalid_json_rate: f64,
     pub candidate_router_invalid_json_rate: f64,
+    pub baseline_prompt_efficiency: PromptEfficiencyMetrics,
+    pub best_candidate_prompt_efficiency: PromptEfficiencyMetrics,
+    pub prompt_efficiency_delta: PromptEfficiencyDelta,
     pub wins: usize,
     pub losses: usize,
     pub p_value: f64,
@@ -141,6 +170,12 @@ pub struct PromptEvolutionResult {
     pub notes: Vec<String>,
     pub diff_summary: PromptBundleDiffSummary,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalPromptCandidate {
+    pub source: String,
+    pub bundle: PromptBundleProfile,
 }
 
 impl Default for PromptBundleProfile {
@@ -185,6 +220,10 @@ pub fn parse_prompt_bundle_profile(raw: &[u8]) -> Option<PromptBundleProfile> {
     let mut bundle = serde_json::from_slice::<PromptBundleProfile>(raw).ok()?;
     sanitize_prompt_bundle(&mut bundle);
     Some(bundle)
+}
+
+pub fn embedded_prompt_benchmark_profile_json() -> &'static str {
+    BENCHMARK_PROFILE_JSON
 }
 
 pub fn compose_prompt_version(bundle_version: &str) -> String {
@@ -314,6 +353,38 @@ impl PromptEvolutionEngine {
             .await,
         );
 
+        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
+            .await
+    }
+
+    pub async fn evaluate_external_prompt_candidates(
+        &self,
+        user_request: &str,
+        current_bundle_raw: Option<&[u8]>,
+        candidates: Vec<ExternalPromptCandidate>,
+    ) -> Result<PromptEvolutionResult> {
+        let baseline_bundle = self.load_baseline_bundle(current_bundle_raw)?;
+        let benchmark = self.load_benchmark_suite().await?;
+        let baseline_eval = self.evaluate_bundle(&baseline_bundle, &benchmark).await;
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| CandidatePromptBundle {
+                source: candidate.source,
+                bundle: candidate.bundle,
+            })
+            .collect::<Vec<_>>();
+        self.evaluate_candidate_set(user_request, baseline_bundle, baseline_eval, &benchmark, candidates)
+            .await
+    }
+
+    async fn evaluate_candidate_set(
+        &self,
+        user_request: &str,
+        baseline_bundle: PromptBundleProfile,
+        baseline_eval: BundleEvaluation,
+        benchmark: &PromptBenchmarkProfile,
+        mut candidates: Vec<CandidatePromptBundle>,
+    ) -> Result<PromptEvolutionResult> {
         let max_candidates = self.config.max_candidates.max(1);
         if candidates.len() > max_candidates {
             candidates.truncate(max_candidates);
@@ -338,28 +409,16 @@ impl PromptEvolutionEngine {
                 .await;
         }
 
-        let mut best: Option<(CandidatePromptBundle, BundleEvaluation, PairedStats)> = None;
+        let mut evaluated = Vec::new();
         for candidate in candidates {
             let eval = self.evaluate_bundle(&candidate.bundle, &benchmark).await;
             let paired = paired_stats(&baseline_eval.case_scores, &eval.case_scores);
-            let replace = match &best {
-                None => true,
-                Some((_, best_eval, best_paired)) => {
-                    eval.combined_score > best_eval.combined_score
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins > best_paired.wins)
-                        || (f64_eq(eval.combined_score, best_eval.combined_score)
-                            && paired.wins == best_paired.wins
-                            && paired.p_value < best_paired.p_value)
-                }
-            };
-            if replace {
-                best = Some((candidate, eval, paired));
-            }
+            evaluated.push((candidate, eval, paired));
         }
 
         let (mut best_candidate, best_eval, best_stats) =
-            best.context("no best prompt-bundle candidate found")?;
+            select_best_prompt_candidate(evaluated)
+                .context("no best prompt-bundle candidate found")?;
         let diff_summary =
             build_prompt_bundle_diff_summary(&baseline_bundle, &best_candidate.bundle);
         let optimized_surfaces = collect_optimized_surfaces(&diff_summary);
@@ -399,6 +458,12 @@ impl PromptEvolutionEngine {
             candidate_synthesis_score: round4(best_eval.synthesis_score),
             baseline_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
             candidate_router_invalid_json_rate: round4(best_eval.router_invalid_json_rate),
+            baseline_prompt_efficiency: baseline_eval.efficiency,
+            candidate_prompt_efficiency: best_eval.efficiency,
+            prompt_efficiency_delta: prompt_efficiency_delta(
+                baseline_eval.efficiency,
+                best_eval.efficiency,
+            ),
             wins: best_stats.wins,
             losses: best_stats.losses,
             p_value: round4(best_stats.p_value),
@@ -432,6 +497,12 @@ impl PromptEvolutionEngine {
             best_candidate_synthesis_score: round4(best_eval.synthesis_score),
             baseline_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
             candidate_router_invalid_json_rate: round4(best_eval.router_invalid_json_rate),
+            baseline_prompt_efficiency: baseline_eval.efficiency,
+            best_candidate_prompt_efficiency: best_eval.efficiency,
+            prompt_efficiency_delta: prompt_efficiency_delta(
+                baseline_eval.efficiency,
+                best_eval.efficiency,
+            ),
             wins: best_stats.wins,
             losses: best_stats.losses,
             p_value: round4(best_stats.p_value),
@@ -480,6 +551,9 @@ impl PromptEvolutionEngine {
                 candidate_synthesis_score: round4(baseline_eval.synthesis_score),
                 baseline_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
                 candidate_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
+                baseline_prompt_efficiency: baseline_eval.efficiency,
+                candidate_prompt_efficiency: baseline_eval.efficiency,
+                prompt_efficiency_delta: PromptEfficiencyDelta::default(),
                 wins: 0,
                 losses: 0,
                 p_value: 1.0,
@@ -511,6 +585,9 @@ impl PromptEvolutionEngine {
             best_candidate_synthesis_score: round4(baseline_eval.synthesis_score),
             baseline_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
             candidate_router_invalid_json_rate: round4(baseline_eval.router_invalid_json_rate),
+            baseline_prompt_efficiency: baseline_eval.efficiency,
+            best_candidate_prompt_efficiency: baseline_eval.efficiency,
+            prompt_efficiency_delta: PromptEfficiencyDelta::default(),
             wins: 0,
             losses: 0,
             p_value: 1.0,
@@ -779,6 +856,10 @@ Baseline score: {baseline_score:.4}\n\
 Router score: {router_score:.4} | invalid_json_rate={invalid_json_rate:.4}\n\
 Primary response score: {primary_response_score:.4}\n\
 Synthesis score: {synthesis_score:.4}\n\n\
+Efficiency objective order: accuracy and safety first, then prompt-cache stability, static prompt size, estimated token cost, and latency.\n\
+Baseline static prompt tokens: {baseline_static_tokens}\n\
+Baseline cache-sensitive prompt tokens: {baseline_cache_tokens}\n\
+Do not add prompt text unless it improves benchmark behavior enough to justify the extra cache and token cost.\n\n\
 Router misses:\n{router_misses}\n\n\
 Primary response misses:\n{primary_response_misses}\n\n\
 Synthesis misses:\n{synthesis_misses}\n\n\
@@ -798,6 +879,8 @@ Do not return commentary or markdown.",
                 invalid_json_rate = baseline_eval.router_invalid_json_rate,
                 primary_response_score = baseline_eval.primary_response_score,
                 synthesis_score = baseline_eval.synthesis_score,
+                baseline_static_tokens = baseline_eval.efficiency.estimated_static_prompt_tokens,
+                baseline_cache_tokens = baseline_eval.efficiency.estimated_cache_sensitive_tokens,
                 router_misses = if router_misses.is_empty() {
                     "none".to_string()
                 } else {
@@ -818,7 +901,7 @@ Do not return commentary or markdown.",
             let response = match self
                 .llm
                 .chat_with_system(
-                    "You mutate AgentArk prompt bundles for better benchmark performance. Output strict JSON only.",
+                    "You mutate AgentArk prompt bundles for benchmark accuracy first and prompt efficiency second. Output strict JSON only.",
                     &user_prompt,
                 )
                 .await
@@ -926,6 +1009,7 @@ Do not return commentary or markdown.",
             primary_response_score: round4(primary_response_score),
             synthesis_score: round4(synthesis_score),
             router_invalid_json_rate: round4(router_invalid_json_rate),
+            efficiency: prompt_bundle_efficiency(bundle),
             router_cases,
             primary_response_cases,
             synthesis_cases,
@@ -974,7 +1058,11 @@ Do not return commentary or markdown.",
         );
         let response = self
             .llm
-            .chat_with_system(&system_prompt, &user_prompt)
+            .chat_classifier_bounded(
+                &system_prompt,
+                &user_prompt,
+                ROUTER_EVAL_CLASSIFIER_MAX_OUTPUT_TOKENS,
+            )
             .await;
         score_router_case(case, response.ok().as_ref())
     }
@@ -1035,6 +1123,12 @@ struct PromptLineageEntry {
     candidate_synthesis_score: f64,
     baseline_router_invalid_json_rate: f64,
     candidate_router_invalid_json_rate: f64,
+    #[serde(default)]
+    baseline_prompt_efficiency: PromptEfficiencyMetrics,
+    #[serde(default)]
+    candidate_prompt_efficiency: PromptEfficiencyMetrics,
+    #[serde(default)]
+    prompt_efficiency_delta: PromptEfficiencyDelta,
     wins: usize,
     losses: usize,
     p_value: f64,
@@ -1151,6 +1245,7 @@ struct BundleEvaluation {
     primary_response_score: f64,
     synthesis_score: f64,
     router_invalid_json_rate: f64,
+    efficiency: PromptEfficiencyMetrics,
     router_cases: Vec<RouterCaseEvaluation>,
     primary_response_cases: Vec<PrimaryResponseCaseEvaluation>,
     synthesis_cases: Vec<SynthesisCaseEvaluation>,
@@ -1211,6 +1306,76 @@ fn render_template(template: &str, replacements: &[(&str, &str)]) -> String {
         rendered = rendered.replace(&format!("{{{}}}", key), value);
     }
     rendered
+}
+
+fn prompt_bundle_efficiency(bundle: &PromptBundleProfile) -> PromptEfficiencyMetrics {
+    let router_system = render_router_system_prompt(bundle);
+    let primary_system = render_primary_response_system_prompt(bundle);
+    let synthesis_system = render_synthesis_system_prompt(bundle);
+    let cache_sensitive_chars = router_system
+        .len()
+        .saturating_add(primary_system.len())
+        .saturating_add(synthesis_system.len());
+    let static_prompt_chars = cache_sensitive_chars
+        .saturating_add(bundle.router.instruction_template.len())
+        .saturating_add(bundle.primary_response.instruction_template.len())
+        .saturating_add(bundle.delegation_synthesis.instruction_template.len());
+    PromptEfficiencyMetrics {
+        static_prompt_chars,
+        estimated_static_prompt_tokens: estimate_prompt_tokens_from_chars(static_prompt_chars),
+        cache_sensitive_chars,
+        estimated_cache_sensitive_tokens: estimate_prompt_tokens_from_chars(cache_sensitive_chars),
+    }
+}
+
+fn estimate_prompt_tokens_from_chars(chars: usize) -> usize {
+    chars.saturating_add(3) / 4
+}
+
+fn prompt_efficiency_delta(
+    baseline: PromptEfficiencyMetrics,
+    candidate: PromptEfficiencyMetrics,
+) -> PromptEfficiencyDelta {
+    let static_prompt_token_delta = candidate.estimated_static_prompt_tokens as i64
+        - baseline.estimated_static_prompt_tokens as i64;
+    let cache_sensitive_token_delta = candidate.estimated_cache_sensitive_tokens as i64
+        - baseline.estimated_cache_sensitive_tokens as i64;
+    let static_prompt_token_delta_ratio = signed_ratio_delta(
+        baseline.estimated_static_prompt_tokens,
+        candidate.estimated_static_prompt_tokens,
+    );
+    let cache_sensitive_token_delta_ratio = signed_ratio_delta(
+        baseline.estimated_cache_sensitive_tokens,
+        candidate.estimated_cache_sensitive_tokens,
+    );
+    PromptEfficiencyDelta {
+        static_prompt_token_delta,
+        static_prompt_token_delta_ratio,
+        cache_sensitive_token_delta,
+        cache_sensitive_token_delta_ratio,
+        estimated_cost_delta_ratio: static_prompt_token_delta_ratio,
+    }
+}
+
+fn signed_ratio_delta(baseline: usize, candidate: usize) -> f64 {
+    if baseline == 0 {
+        if candidate == 0 {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        candidate as f64 / baseline as f64 - 1.0
+    }
+}
+
+fn prompt_efficiency_better(candidate: &BundleEvaluation, baseline: &BundleEvaluation) -> bool {
+    candidate.efficiency.estimated_cache_sensitive_tokens
+        < baseline.efficiency.estimated_cache_sensitive_tokens
+        || (candidate.efficiency.estimated_cache_sensitive_tokens
+            == baseline.efficiency.estimated_cache_sensitive_tokens
+            && candidate.efficiency.estimated_static_prompt_tokens
+                < baseline.efficiency.estimated_static_prompt_tokens)
 }
 
 fn interpolate_runtime_tokens(text: &str) -> String {
@@ -1809,6 +1974,25 @@ fn build_prompt_notes(
         format!("wins={} losses={}", stats.wins, stats.losses),
         format!("candidate_source={}", source),
     ];
+    let efficiency_delta = prompt_efficiency_delta(baseline.efficiency, candidate.efficiency);
+    notes.push(format!(
+        "baseline_static_prompt_tokens={}",
+        baseline.efficiency.estimated_static_prompt_tokens
+    ));
+    notes.push(format!(
+        "candidate_static_prompt_tokens={}",
+        candidate.efficiency.estimated_static_prompt_tokens
+    ));
+    notes.push(format!(
+        "static_prompt_token_delta={} ({:.2}%)",
+        efficiency_delta.static_prompt_token_delta,
+        efficiency_delta.static_prompt_token_delta_ratio * 100.0
+    ));
+    notes.push(format!(
+        "cache_sensitive_token_delta={} ({:.2}%)",
+        efficiency_delta.cache_sensitive_token_delta,
+        efficiency_delta.cache_sensitive_token_delta_ratio * 100.0
+    ));
     if !diff_summary.router_change_preview.is_empty() {
         notes.push(format!(
             "router_changes={}",
@@ -1849,7 +2033,31 @@ fn prompt_promotion_checks(
         candidate_eval.router_invalid_json_rate
             <= baseline_eval.router_invalid_json_rate + f64::EPSILON,
     );
+    checks.insert(
+        "prompt_efficiency_not_materially_worse",
+        prompt_efficiency_not_materially_worse(config, baseline_eval, candidate_eval, stats),
+    );
     checks
+}
+
+fn prompt_efficiency_not_materially_worse(
+    config: &PromptEvolutionConfig,
+    baseline_eval: &BundleEvaluation,
+    candidate_eval: &BundleEvaluation,
+    stats: &PairedStats,
+) -> bool {
+    let substantial_gain_threshold = if config.min_score_gain > 0.0 {
+        config.min_score_gain * SUBSTANTIAL_SCORE_GAIN_MULTIPLIER
+    } else {
+        0.03
+    };
+    if stats.score_gain >= substantial_gain_threshold {
+        return true;
+    }
+    let delta = prompt_efficiency_delta(baseline_eval.efficiency, candidate_eval.efficiency);
+    delta.static_prompt_token_delta_ratio <= config.max_prompt_token_regression_ratio
+        && delta.cache_sensitive_token_delta_ratio
+            <= config.max_cache_sensitive_token_regression_ratio
 }
 
 fn render_prompt_promotion_gate(checks: &HashMap<&str, bool>) -> String {
@@ -1859,6 +2067,7 @@ fn render_prompt_promotion_gate(checks: &HashMap<&str, bool>) -> String {
         "wins_gt_losses",
         "sign_test",
         "router_invalid_json_not_worse",
+        "prompt_efficiency_not_materially_worse",
     ];
     let failed = ordered
         .iter()
@@ -1892,6 +2101,89 @@ fn paired_stats(baseline_scores: &[f64], candidate_scores: &[f64]) -> PairedStat
         p_value,
         score_gain: round4(candidate_total - baseline_total),
     }
+}
+
+fn select_best_prompt_candidate(
+    evaluated: Vec<(CandidatePromptBundle, BundleEvaluation, PairedStats)>,
+) -> Option<(CandidatePromptBundle, BundleEvaluation, PairedStats)> {
+    if evaluated.is_empty() {
+        return None;
+    }
+    let mut nondominated = Vec::new();
+    'candidate: for idx in 0..evaluated.len() {
+        for other_idx in 0..evaluated.len() {
+            if idx == other_idx {
+                continue;
+            }
+            if prompt_candidate_dominates(&evaluated[other_idx], &evaluated[idx]) {
+                continue 'candidate;
+            }
+        }
+        nondominated.push(idx);
+    }
+    let pool = if nondominated.is_empty() {
+        (0..evaluated.len()).collect::<Vec<_>>()
+    } else {
+        nondominated
+    };
+    let mut best_idx = pool[0];
+    for idx in pool.into_iter().skip(1) {
+        if prompt_candidate_preferred(&evaluated[idx], &evaluated[best_idx]) {
+            best_idx = idx;
+        }
+    }
+    evaluated.into_iter().nth(best_idx)
+}
+
+fn prompt_candidate_dominates(
+    left: &(CandidatePromptBundle, BundleEvaluation, PairedStats),
+    right: &(CandidatePromptBundle, BundleEvaluation, PairedStats),
+) -> bool {
+    let (_, left_eval, left_stats) = left;
+    let (_, right_eval, right_stats) = right;
+    let better_or_equal = left_eval.combined_score + 0.0001 >= right_eval.combined_score
+        && left_eval.router_score + 0.0001 >= right_eval.router_score
+        && left_eval.primary_response_score + 0.0001 >= right_eval.primary_response_score
+        && left_eval.synthesis_score + 0.0001 >= right_eval.synthesis_score
+        && left_eval.router_invalid_json_rate <= right_eval.router_invalid_json_rate + 0.0001
+        && left_eval.efficiency.estimated_static_prompt_tokens
+            <= right_eval.efficiency.estimated_static_prompt_tokens
+        && left_eval.efficiency.estimated_cache_sensitive_tokens
+            <= right_eval.efficiency.estimated_cache_sensitive_tokens
+        && left_stats.wins >= right_stats.wins
+        && left_stats.losses <= right_stats.losses
+        && left_stats.p_value <= right_stats.p_value + 0.0001;
+    let strictly_better = left_eval.combined_score > right_eval.combined_score + 0.0001
+        || left_eval.router_score > right_eval.router_score + 0.0001
+        || left_eval.primary_response_score > right_eval.primary_response_score + 0.0001
+        || left_eval.synthesis_score > right_eval.synthesis_score + 0.0001
+        || left_eval.router_invalid_json_rate + 0.0001 < right_eval.router_invalid_json_rate
+        || left_eval.efficiency.estimated_static_prompt_tokens
+            < right_eval.efficiency.estimated_static_prompt_tokens
+        || left_eval.efficiency.estimated_cache_sensitive_tokens
+            < right_eval.efficiency.estimated_cache_sensitive_tokens
+        || left_stats.wins > right_stats.wins
+        || left_stats.losses < right_stats.losses
+        || left_stats.p_value + 0.0001 < right_stats.p_value;
+    better_or_equal && strictly_better
+}
+
+fn prompt_candidate_preferred(
+    left: &(CandidatePromptBundle, BundleEvaluation, PairedStats),
+    right: &(CandidatePromptBundle, BundleEvaluation, PairedStats),
+) -> bool {
+    let (_, left_eval, left_stats) = left;
+    let (_, right_eval, right_stats) = right;
+    left_eval.combined_score > right_eval.combined_score
+        || (f64_eq(left_eval.combined_score, right_eval.combined_score)
+            && left_stats.wins > right_stats.wins)
+        || (f64_eq(left_eval.combined_score, right_eval.combined_score)
+            && left_stats.wins == right_stats.wins
+            && left_stats.p_value < right_stats.p_value)
+        || (f64_eq(left_eval.combined_score, right_eval.combined_score)
+            && left_stats.wins == right_stats.wins
+            && f64_eq(left_stats.p_value, right_stats.p_value)
+            && prompt_efficiency_better(left_eval, right_eval))
 }
 
 fn one_sided_sign_test_p_value(wins: usize, losses: usize) -> f64 {
@@ -2133,5 +2425,74 @@ mod tests {
         let stats = paired_stats(&baseline_scores, &candidate_scores);
 
         assert_eq!(stats.score_gain, 0.1000);
+    }
+
+    fn bundle_eval_with_efficiency(
+        score: f64,
+        static_tokens: usize,
+        cache_sensitive_tokens: usize,
+    ) -> BundleEvaluation {
+        BundleEvaluation {
+            combined_score: score,
+            router_score: score,
+            primary_response_score: score,
+            synthesis_score: score,
+            router_invalid_json_rate: 0.0,
+            efficiency: PromptEfficiencyMetrics {
+                static_prompt_chars: static_tokens * 4,
+                estimated_static_prompt_tokens: static_tokens,
+                cache_sensitive_chars: cache_sensitive_tokens * 4,
+                estimated_cache_sensitive_tokens: cache_sensitive_tokens,
+            },
+            router_cases: Vec::new(),
+            primary_response_cases: Vec::new(),
+            synthesis_cases: Vec::new(),
+            case_scores: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_bundle_efficiency_tracks_static_and_cache_sensitive_size() {
+        let bundle = PromptBundleProfile::default();
+
+        let efficiency = prompt_bundle_efficiency(&bundle);
+
+        assert!(efficiency.static_prompt_chars >= efficiency.cache_sensitive_chars);
+        assert!(efficiency.estimated_static_prompt_tokens > 0);
+        assert!(efficiency.estimated_cache_sensitive_tokens > 0);
+    }
+
+    #[test]
+    fn prompt_promotion_blocks_material_efficiency_regression_for_small_quality_gain() {
+        let config = PromptEvolutionConfig::default();
+        let baseline = bundle_eval_with_efficiency(0.90, 1_000, 800);
+        let candidate = bundle_eval_with_efficiency(0.94, 1_250, 1_040);
+        let stats = PairedStats {
+            wins: 3,
+            losses: 1,
+            p_value: 0.05,
+            score_gain: 0.04,
+        };
+
+        let checks = prompt_promotion_checks(&config, &baseline, &candidate, &stats);
+
+        assert!(!checks["prompt_efficiency_not_materially_worse"]);
+    }
+
+    #[test]
+    fn prompt_promotion_allows_efficiency_regression_for_substantial_quality_gain() {
+        let config = PromptEvolutionConfig::default();
+        let baseline = bundle_eval_with_efficiency(0.82, 1_000, 800);
+        let candidate = bundle_eval_with_efficiency(0.90, 1_250, 1_040);
+        let stats = PairedStats {
+            wins: 4,
+            losses: 0,
+            p_value: 0.05,
+            score_gain: 0.08,
+        };
+
+        let checks = prompt_promotion_checks(&config, &baseline, &candidate, &stats);
+
+        assert!(checks["prompt_efficiency_not_materially_worse"]);
     }
 }

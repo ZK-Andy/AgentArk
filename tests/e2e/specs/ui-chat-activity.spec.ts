@@ -11,13 +11,6 @@ test.describe("Chat Activity UI @smoke", () => {
       pageErrors.push(String(error));
     });
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/conversations?**", async (route) => {
       const conversations = createdConversationId
         ? [
@@ -25,7 +18,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: createdConversationId,
               title: "Preference capture chat",
               channel: "web",
-              project_id: null,
               created_at: "2026-03-08T13:00:00.000Z",
               updated_at: "2026-03-08T13:00:08.000Z",
               message_count: 2,
@@ -92,7 +84,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: createdConversationId,
           title: "Preference capture chat",
           channel: "web",
-          project_id: null,
           created_at: "2026-03-08T13:00:00.000Z",
           updated_at: "2026-03-08T13:00:08.000Z",
           message_count: 2
@@ -161,7 +152,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: conversationId,
               title: "Framework regression chat",
               channel: "web",
-              project_id: null,
               created_at: createdAt,
               updated_at: updatedAt,
               message_count: 2,
@@ -182,7 +172,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: conversationId,
           title: "Framework regression chat",
           channel: "web",
-          project_id: null,
           created_at: createdAt,
           updated_at: updatedAt,
           message_count: 2
@@ -314,13 +303,6 @@ test.describe("Chat Activity UI @smoke", () => {
 
     await page.setViewportSize({ width: 2100, height: 1200 });
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/conversations?**", async (route) => {
       const conversations = createdConversationId
         ? [
@@ -328,7 +310,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: createdConversationId,
               title: "Payload disclosure chat",
               channel: "web",
-              project_id: null,
               created_at: "2026-03-09T11:30:00.000Z",
               updated_at: "2026-03-09T11:30:08.000Z",
               message_count: 2,
@@ -395,7 +376,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: createdConversationId,
           title: "Payload disclosure chat",
           channel: "web",
-          project_id: null,
           created_at: "2026-03-09T11:30:00.000Z",
           updated_at: "2026-03-09T11:30:08.000Z",
           message_count: 2
@@ -473,7 +453,6 @@ test.describe("Chat Activity UI @smoke", () => {
           JSON.stringify({
             conversationId,
             message: userMessage,
-            projectId: "",
             startedAt: Date.now(),
             mode: "fresh",
             phase: "interrupted",
@@ -493,13 +472,6 @@ test.describe("Chat Activity UI @smoke", () => {
       { conversationId, taskId, userMessage, partialAssistant }
     );
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/tasks?**", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -516,7 +488,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: conversationId,
               title: "Stopped run chat",
               channel: "web",
-              project_id: null,
               created_at: "2026-03-31T01:00:00.000Z",
               updated_at: "2026-03-31T01:02:00.000Z",
               message_count: resumed ? 2 : 1,
@@ -537,7 +508,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: conversationId,
           title: "Stopped run chat",
           channel: "web",
-          project_id: null,
           created_at: "2026-03-31T01:00:00.000Z",
           updated_at: "2026-03-31T01:02:00.000Z",
           message_count: resumed ? 2 : 1
@@ -620,13 +590,6 @@ test.describe("Chat Activity UI @smoke", () => {
 
     await page.setViewportSize({ width: 1440, height: 960 });
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/api/apps", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -648,7 +611,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: createdConversationId,
               title: "Live draft stream chat",
               channel: "web",
-              project_id: null,
               created_at: "2026-03-31T12:00:00.000Z",
               updated_at: "2026-03-31T12:00:12.000Z",
               message_count: 2,
@@ -715,7 +677,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: createdConversationId,
           title: "Live draft stream chat",
           channel: "web",
-          project_id: null,
           created_at: "2026-03-31T12:00:00.000Z",
           updated_at: "2026-03-31T12:00:12.000Z",
           message_count: 2
@@ -781,13 +742,6 @@ test.describe("Chat Activity UI @smoke", () => {
     const taskId = "task-deep-plan";
     const assistantMessage = "Finished the deep research run with verified sources.";
 
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
-
     await page.route("**/api/apps", async (route) => {
       await route.fulfill({
         contentType: "application/json",
@@ -809,7 +763,6 @@ test.describe("Chat Activity UI @smoke", () => {
               id: createdConversationId,
               title: "Deep research preview",
               channel: "web",
-              project_id: null,
               created_at: "2026-04-03T10:00:00.000Z",
               updated_at: resumed ? "2026-04-03T10:03:00.000Z" : "2026-04-03T10:01:00.000Z",
               message_count: resumed ? 2 : 1,
@@ -887,7 +840,6 @@ test.describe("Chat Activity UI @smoke", () => {
           id: createdConversationId,
           title: "Deep research preview",
           channel: "web",
-          project_id: null,
           created_at: "2026-04-03T10:00:00.000Z",
           updated_at: resumed ? "2026-04-03T10:03:10.000Z" : "2026-04-03T10:01:00.000Z",
           message_count: resumed ? 2 : 1
@@ -975,7 +927,6 @@ test.describe("Chat Activity UI @smoke", () => {
         id: currentConversationId,
         title: "Current chat slated for delete",
         channel: "web",
-        project_id: null,
         created_at: createdAt,
         updated_at: updatedAt,
         message_count: 2,
@@ -985,7 +936,6 @@ test.describe("Chat Activity UI @smoke", () => {
         id: nextConversationId,
         title: "Fallback chat after delete",
         channel: "web",
-        project_id: null,
         created_at: createdAt,
         updated_at: "2026-03-12T10:04:00.000Z",
         message_count: 2,
@@ -1035,13 +985,6 @@ test.describe("Chat Activity UI @smoke", () => {
     await page.addInitScript((conversationId: string) => {
       window.sessionStorage.setItem("agentark.chat.lastConversationId", conversationId);
     }, currentConversationId);
-
-    await page.route("**/projects", async (route) => {
-      await route.fulfill({
-        contentType: "application/json",
-        body: JSON.stringify({ projects: [] })
-      });
-    });
 
     await page.route("**/conversations?**", async (route) => {
       await route.fulfill({

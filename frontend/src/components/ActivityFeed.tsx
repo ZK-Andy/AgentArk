@@ -1,6 +1,7 @@
 import { Box, Button, Card, CardContent, Chip, Collapse, Stack, Typography } from "@mui/material";
 import { useState } from "react";
 import type { TraceSummary } from "../types";
+import { formatChannelSource } from "./channelLabels";
 
 type Props = {
   traces: TraceSummary[];
@@ -15,6 +16,7 @@ function humanizeTrace(trace: TraceSummary): string {
     if (message.toLowerCase().includes("send")) return `Sent email: ${message.slice(0, 50)}`;
     return `Processed email: ${message.slice(0, 50)}`;
   }
+  if (channel.includes("arkorbit") || channel === "orbit") return `Orbit: ${message.slice(0, 60)}`;
   if (channel.includes("telegram")) return `Telegram: ${message.slice(0, 60)}`;
   if (channel.includes("whatsapp")) return `WhatsApp: ${message.slice(0, 60)}`;
   if (message.toLowerCase().includes("briefing") || message.toLowerCase().includes("brief")) return "Generated daily briefing";
@@ -167,7 +169,7 @@ export function ActivityFeed({ traces, onViewAll }: Props) {
                             color: "text.secondary",
                             display: "block"
                           }}>
-                          Channel: {trace.channel}
+                          Source: {formatChannelSource(trace.channel)}
                         </Typography>
                       ) : null}
                       <Typography

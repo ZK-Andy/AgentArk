@@ -201,10 +201,6 @@ impl BrowserSessionManager {
         self.integration.is_available().await
     }
 
-    pub fn integration(&self) -> &Arc<BrowserIntegration> {
-        &self.integration
-    }
-
     pub async fn start_session(
         &self,
         task: &str,

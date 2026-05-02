@@ -225,18 +225,7 @@ pub fn redact_json_secrets(value: &Value) -> Value {
         Value::Object(map) => {
             let mut next = serde_json::Map::new();
             for (key, value) in map {
-                let key_lower = key.to_ascii_lowercase();
-                if key_lower.contains("authorization")
-                    || key_lower.contains("token")
-                    || key_lower.contains("secret")
-                    || key_lower.contains("password")
-                    || key_lower.contains("api_key")
-                    || key_lower.contains("apikey")
-                {
-                    next.insert(key.clone(), Value::String("[REDACTED_SECRET]".to_string()));
-                } else {
-                    next.insert(key.clone(), redact_json_secrets(value));
-                }
+                next.insert(key.clone(), redact_json_secrets(value));
             }
             Value::Object(next)
         }
@@ -342,5 +331,50 @@ fn clip_chars(value: &str, max_chars: usize) -> String {
         value.to_string()
     } else {
         format!("{}...", value.chars().take(max_chars).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_secret_redaction_preserves_numeric_token_telemetry() {
+        let value = serde_json::json!({
+            "prompt_tokens": 35200,
+            "completion_tokens": 2654,
+            "total_tokens": 37854,
+            "cost_usd": 0.0123,
+            "credential": "sk-abcdefghijklmnopqrstuvwxyz123456",
+            "nested": {
+                "raw_value": "Bearer abcdefghijklmnopqrstuvwxyz123456",
+                "helper_total_tokens": 91
+            }
+        });
+
+        let redacted = redact_json_secrets(&value);
+
+        assert_eq!(redacted["prompt_tokens"], 35200);
+        assert_eq!(redacted["completion_tokens"], 2654);
+        assert_eq!(redacted["total_tokens"], 37854);
+        assert_eq!(redacted["cost_usd"], 0.0123);
+        assert_eq!(redacted["credential"], "[REDACTED_SECRET]");
+        assert_eq!(redacted["nested"]["raw_value"], "[REDACTED_SECRET]");
+        assert_eq!(redacted["nested"]["helper_total_tokens"], 91);
+    }
+
+    #[test]
+    fn json_secret_redaction_recurses_without_key_name_policy() {
+        let value = serde_json::json!({
+            "telemetry": {
+                "prompt_tokens": 12,
+                "raw_value": "moltbook_sk_abcdefghijklmnopqrstuvwxyz"
+            }
+        });
+
+        let redacted = redact_json_secrets(&value);
+
+        assert_eq!(redacted["telemetry"]["prompt_tokens"], 12);
+        assert_eq!(redacted["telemetry"]["raw_value"], "[REDACTED_SECRET]");
     }
 }

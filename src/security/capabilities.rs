@@ -711,21 +711,31 @@ pub fn observations_from_declared_capabilities(
 ) -> Vec<CapabilityObservation> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
+    let action = crate::actions::ActionDef {
+        name: entity_id.to_string(),
+        capabilities: capabilities.to_vec(),
+        ..crate::actions::ActionDef::default()
+    };
     for raw in capabilities {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let evidence = format!("declared capability '{}'", trimmed);
-        let permission = ActionGuard::parse_permission(trimmed);
-        push_permission_observations(
-            &mut out,
-            &mut seen,
-            layer,
-            entity_id,
-            &permission,
-            &evidence,
+        let handled_structured = push_structured_capability_observations(
+            &mut out, &mut seen, layer, entity_id, &action, trimmed,
         );
+        let permission = ActionGuard::parse_permission(trimmed);
+        if !handled_structured || !matches!(&permission, Permission::Custom(_)) {
+            let evidence = format!("declared capability '{}'", trimmed);
+            push_permission_observations(
+                &mut out,
+                &mut seen,
+                layer,
+                entity_id,
+                &permission,
+                &evidence,
+            );
+        }
     }
     out
 }
@@ -737,7 +747,7 @@ fn push_structured_capability_observations(
     entity_id: &str,
     action: &crate::actions::ActionDef,
     raw: &str,
-) {
+) -> bool {
     let capability = normalize_capability_kind(raw);
     let metadata = action.planner_metadata();
     let evidence = format!("declared action capability '{}'", raw.trim());
@@ -754,6 +764,7 @@ fn push_structured_capability_observations(
                 Some("memory"),
                 &evidence,
             );
+            true
         }
         "documents" => {
             push_observation(
@@ -774,8 +785,9 @@ fn push_structured_capability_observations(
                 Some("documents"),
                 &evidence,
             );
+            true
         }
-        "database-readonly" => {
+        "database-readonly" | "analytics" => {
             push_observation(
                 out,
                 seen,
@@ -785,7 +797,57 @@ fn push_structured_capability_observations(
                 Some("database"),
                 &evidence,
             );
+            true
         }
+        "capability-inventory" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-user-data",
+                Some("capabilities"),
+                &evidence,
+            );
+            true
+        }
+        "watcher-inventory" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-user-data",
+                Some("watchers"),
+                &evidence,
+            );
+            true
+        }
+        "integration-inventory" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-user-data",
+                Some("integrations"),
+                &evidence,
+            );
+            true
+        }
+        "platform-observability" | "session-history" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-user-data",
+                Some("agentark"),
+                &evidence,
+            );
+            true
+        }
+        "product-help" | "documentation" | "time" => true,
         "gmail" => {
             push_observation(
                 out,
@@ -840,6 +902,7 @@ fn push_structured_capability_observations(
                     &evidence,
                 );
             }
+            true
         }
         "google-workspace" => {
             push_observation(
@@ -906,6 +969,7 @@ fn push_structured_capability_observations(
                 }
                 _ => {}
             }
+            true
         }
         "notify" => {
             push_observation(
@@ -917,6 +981,19 @@ fn push_structured_capability_observations(
                 None,
                 &evidence,
             );
+            true
+        }
+        "clipboard-read" | "clipboard-write" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "uses-clipboard",
+                None,
+                &evidence,
+            );
+            true
         }
         "browser" | "browser-automation" => {
             push_observation(
@@ -943,8 +1020,9 @@ fn push_structured_capability_observations(
                     &evidence,
                 );
             }
+            true
         }
-        "local-network-discovery" => {
+        "local-network" | "local-network-discovery" => {
             push_observation(
                 out,
                 seen,
@@ -963,8 +1041,9 @@ fn push_structured_capability_observations(
                 Some("local-network"),
                 &evidence,
             );
+            true
         }
-        "messaging-send" => {
+        "messaging-send" | "telegram" | "whatsapp" => {
             push_observation(
                 out,
                 seen,
@@ -983,8 +1062,9 @@ fn push_structured_capability_observations(
                 None,
                 &evidence,
             );
+            true
         }
-        "broad-network" => {
+        "broad-network" | "search" | "vision-ocr" | "video-generation" => {
             push_observation(
                 out,
                 seen,
@@ -994,6 +1074,156 @@ fn push_structured_capability_observations(
                 None,
                 &evidence,
             );
+            true
+        }
+        "home-assistant" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "local-network",
+                None,
+                &evidence,
+            );
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "calls-network",
+                Some("local-network"),
+                &evidence,
+            );
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "reads-user-data",
+                Some("home-assistant"),
+                &evidence,
+            );
+            true
+        }
+        "home-assistant-control" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "local-network",
+                None,
+                &evidence,
+            );
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "calls-network",
+                Some("local-network"),
+                &evidence,
+            );
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "writes-external",
+                Some("home-assistant"),
+                &evidence,
+            );
+            true
+        }
+        "app-hosting" => {
+            if matches!(metadata.role, crate::actions::PlannerActionRole::Inspection) {
+                push_observation(out, seen, layer, entity_id, "reads-file", None, &evidence);
+            } else {
+                push_observation(out, seen, layer, entity_id, "writes-file", None, &evidence);
+                push_observation(
+                    out,
+                    seen,
+                    layer,
+                    entity_id,
+                    "modifies-persistence",
+                    Some("app"),
+                    &evidence,
+                );
+            }
+            true
+        }
+        "scheduler" | "watcher" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "schedules-task",
+                None,
+                &evidence,
+            );
+            true
+        }
+        "skill-management"
+        | "integration-builder"
+        | "integration-admin"
+        | "goal-management"
+        | "self-evolve" => {
+            if matches!(
+                metadata.role,
+                crate::actions::PlannerActionRole::Inspection
+                    | crate::actions::PlannerActionRole::DataSource
+            ) {
+                push_observation(
+                    out,
+                    seen,
+                    layer,
+                    entity_id,
+                    "reads-user-data",
+                    Some("agentark"),
+                    &evidence,
+                );
+            } else {
+                push_observation(
+                    out,
+                    seen,
+                    layer,
+                    entity_id,
+                    "modifies-persistence",
+                    Some("agentark"),
+                    &evidence,
+                );
+            }
+            true
+        }
+        "pdf-generation" | "document-generation" => {
+            push_observation(out, seen, layer, entity_id, "writes-file", None, &evidence);
+            true
+        }
+        "orchestration" | "swarm" | "delegate" | "multi-agent" | "agent-orchestration" => true,
+        "local-cli" | "ssh" => {
+            push_observation(
+                out,
+                seen,
+                layer,
+                entity_id,
+                "executes-shell",
+                None,
+                &evidence,
+            );
+            if capability == "ssh" {
+                push_observation(
+                    out,
+                    seen,
+                    layer,
+                    entity_id,
+                    "calls-network",
+                    Some("ssh"),
+                    &evidence,
+                );
+            }
+            true
         }
         "requests-secrets" => {
             push_observation(
@@ -1005,6 +1235,7 @@ fn push_structured_capability_observations(
                 None,
                 &evidence,
             );
+            true
         }
         "reads-secrets" => {
             push_observation(
@@ -1016,8 +1247,9 @@ fn push_structured_capability_observations(
                 None,
                 &evidence,
             );
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -1035,25 +1267,127 @@ pub fn observations_from_action_def(
         if trimmed.is_empty() {
             continue;
         }
-        let evidence = format!("declared capability '{}'", trimmed);
-        let permission = ActionGuard::parse_permission(trimmed);
-        push_permission_observations(
-            &mut out,
-            &mut seen,
-            layer,
-            entity_id,
-            &permission,
-            &evidence,
-        );
-        push_structured_capability_observations(
+        let handled_structured = push_structured_capability_observations(
             &mut out, &mut seen, layer, entity_id, action, trimmed,
         );
+        let permission = ActionGuard::parse_permission(trimmed);
+        if !handled_structured || !matches!(&permission, Permission::Custom(_)) {
+            let evidence = format!("declared capability '{}'", trimmed);
+            push_permission_observations(
+                &mut out,
+                &mut seen,
+                layer,
+                entity_id,
+                &permission,
+                &evidence,
+            );
+        }
     }
 
     let access = &action.authorization.access;
     for permission_id in &access.permission_ids {
         let evidence = format!("declared access permission '{}'", permission_id.trim());
         match normalize_capability_kind(permission_id).as_str() {
+            "app-hosting" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "writes-file",
+                    None,
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "modifies-persistence",
+                    Some("app"),
+                    &evidence,
+                );
+            }
+            "browser-auto" | "browser-automation" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "browser-automation",
+                    None,
+                    &evidence,
+                );
+            }
+            "calendar-write" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "calls-network",
+                    Some("googleapis.com"),
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "uses-auth-profile",
+                    None,
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "writes-external",
+                    Some("google_calendar"),
+                    &evidence,
+                );
+            }
+            "capability-acquire" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "modifies-persistence",
+                    Some("agentark"),
+                    &evidence,
+                );
+            }
+            "google-workspace-command" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "calls-network",
+                    Some("googleapis.com"),
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "uses-auth-profile",
+                    None,
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "writes-external",
+                    Some("google_workspace"),
+                    &evidence,
+                );
+            }
             "messaging-send" => {
                 push_observation(
                     &mut out,
@@ -1118,8 +1452,61 @@ pub fn observations_from_action_def(
                     &evidence,
                 );
             }
+            "ssh" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "executes-shell",
+                    None,
+                    &evidence,
+                );
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "calls-network",
+                    Some("ssh"),
+                    &evidence,
+                );
+            }
+            "watcher" => {
+                push_observation(
+                    &mut out,
+                    &mut seen,
+                    layer,
+                    entity_id,
+                    "schedules-task",
+                    None,
+                    &evidence,
+                );
+            }
+            "swarm" => {}
             _ => {}
         }
+    }
+
+    if access.requires_ssh_connection {
+        push_observation(
+            &mut out,
+            &mut seen,
+            layer,
+            entity_id,
+            "executes-shell",
+            None,
+            "action access requires an SSH connection",
+        );
+        push_observation(
+            &mut out,
+            &mut seen,
+            layer,
+            entity_id,
+            "calls-network",
+            Some("ssh"),
+            "action access requires an SSH connection",
+        );
     }
 
     if action.authorization.requires_auth
@@ -1457,6 +1844,166 @@ mod tests {
 
         assert!(selectors.contains("reads-memory"));
         assert!(selectors.contains("reads-user-data:memory"));
+    }
+
+    #[test]
+    fn builtin_action_capability_aliases_do_not_emit_unknown_high_risk() {
+        let aliases = [
+            "agent_orchestration",
+            "analytics",
+            "app_hosting",
+            "capability_inventory",
+            "clipboard_read",
+            "clipboard_write",
+            "code_execute",
+            "database_readonly",
+            "delegate",
+            "document_generation",
+            "documentation",
+            "documents",
+            "file_read",
+            "file_write",
+            "gmail",
+            "goal_management",
+            "google_workspace",
+            "home_assistant",
+            "home_assistant_control",
+            "image_generation",
+            "integration_admin",
+            "integration_builder",
+            "integration_inventory",
+            "local_cli",
+            "local_network",
+            "local_network_discovery",
+            "memory",
+            "multi_agent",
+            "network",
+            "notify",
+            "orchestration",
+            "pdf_generation",
+            "platform_observability",
+            "product_help",
+            "scheduler",
+            "search",
+            "self_evolve",
+            "session_history",
+            "shell",
+            "skill_management",
+            "ssh",
+            "swarm",
+            "telegram",
+            "time",
+            "video_generation",
+            "vision_ocr",
+            "watcher",
+            "watcher_inventory",
+            "whatsapp",
+        ];
+
+        for alias in aliases {
+            let action = crate::actions::ActionDef {
+                name: format!("probe_{}", alias),
+                capabilities: vec![alias.to_string()],
+                ..crate::actions::ActionDef::default()
+            };
+            let selectors =
+                observation_selector_set(&observations_from_action_def("runtime", &action, None));
+            assert!(
+                !selectors.contains("unknown-high-risk"),
+                "built-in capability alias '{}' emitted unknown-high-risk: {:?}",
+                alias,
+                selectors
+            );
+        }
+    }
+
+    #[test]
+    fn declared_action_capability_aliases_do_not_emit_unknown_high_risk() {
+        let capabilities = [
+            "app_hosting".to_string(),
+            "database_readonly".to_string(),
+            "google_workspace".to_string(),
+            "search".to_string(),
+            "vision_ocr".to_string(),
+        ];
+        let selectors = observation_selector_set(&observations_from_declared_capabilities(
+            "custom_api",
+            "declared_alias_probe",
+            &capabilities,
+        ));
+
+        assert!(!selectors.contains("unknown-high-risk"));
+        assert!(selectors.contains("calls-network"));
+        assert!(selectors.contains("reads-user-data:database"));
+    }
+
+    #[test]
+    fn unknown_action_capability_still_maps_to_unknown_high_risk() {
+        let action = crate::actions::ActionDef {
+            name: "custom_unknown".to_string(),
+            capabilities: vec!["totally_new_host_control".to_string()],
+            ..crate::actions::ActionDef::default()
+        };
+        let selectors =
+            observation_selector_set(&observations_from_action_def("runtime", &action, None));
+
+        assert!(selectors.contains("unknown-high-risk"));
+    }
+
+    #[test]
+    fn builtin_access_permission_ids_stay_in_known_vocabulary() {
+        let permission_ids = [
+            "app_hosting",
+            "browser_auto",
+            "calendar_write",
+            "capability_acquire",
+            "google_workspace_command",
+            "ssh",
+            "swarm",
+            "watcher",
+        ];
+
+        for permission_id in permission_ids {
+            let action = crate::actions::ActionDef {
+                name: format!("probe_{}", permission_id),
+                authorization: crate::actions::ActionAuthorization {
+                    access: crate::actions::ActionAccessMetadata {
+                        permission_ids: vec![permission_id.to_string()],
+                        ..crate::actions::ActionAccessMetadata::default()
+                    },
+                    ..crate::actions::ActionAuthorization::default()
+                },
+                ..crate::actions::ActionDef::default()
+            };
+            let selectors =
+                observation_selector_set(&observations_from_action_def("runtime", &action, None));
+            assert!(
+                !selectors.contains("unknown-high-risk"),
+                "built-in access permission '{}' emitted unknown-high-risk: {:?}",
+                permission_id,
+                selectors
+            );
+        }
+    }
+
+    #[test]
+    fn http_get_after_file_read_does_not_trip_unknown_high_risk_policy() {
+        let file_read = crate::actions::ActionDef {
+            name: "file_read".to_string(),
+            capabilities: vec!["file_read".to_string()],
+            ..crate::actions::ActionDef::default()
+        };
+        let http_get = crate::actions::ActionDef {
+            name: "http_get".to_string(),
+            capabilities: vec!["network".to_string(), "search".to_string()],
+            ..crate::actions::ActionDef::default()
+        };
+
+        let prior = observations_from_action_def("runtime", &file_read, None);
+        let candidate = observations_from_action_def("runtime", &http_get, None);
+        let decision = evaluate_capability_correlation(&prior, &candidate);
+
+        assert_eq!(decision.effect, CapabilityCorrelationEffect::Allow);
     }
 
     #[test]

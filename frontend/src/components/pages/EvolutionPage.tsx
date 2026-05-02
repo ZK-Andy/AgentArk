@@ -13,7 +13,6 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
-  MenuItem,
   Stack,
   Switch,
   Tab,
@@ -24,7 +23,6 @@ import {
   TableHead,
   TableRow,
   Tabs,
-  TextField,
   Typography,
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
@@ -129,6 +127,36 @@ function readinessSummary(readiness: JsonRecord | null) {
   return str(readiness.plain_summary, "");
 }
 
+function recordList(value: unknown): JsonRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => asRecord(item))
+    .filter((item) => Object.keys(item).length > 0);
+}
+
+function backgroundImprovementReason(reason: string) {
+  switch (reason) {
+    case "learning_paused":
+      return "Learning is paused.";
+    case "model_or_runtime_not_ready":
+      return "Finish model setup before background improvements can start.";
+    case "budget_paused":
+      return "Paused by the daily cost guardrail.";
+    case "work_already_scheduled":
+      return "A background improvement is already scheduled.";
+    case "waiting_for_quiet_time":
+      return "Waiting until AgentArk is quiet.";
+    case "cooling_down":
+      return "The last check ran recently.";
+    case "waiting_for_more_evidence":
+      return "Collecting more completed work before the next check.";
+    case "queued_for_quiet_time":
+      return "Queued and waiting for quiet time.";
+    default:
+      return reason ? "Background improvement is waiting." : "Watching recent work.";
+  }
+}
+
 export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<EvolutionPageTab>("what");
@@ -209,18 +237,93 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const canary = asRecord(evolution.canary);
   const strategyCanary = asRecord(evolution.strategy_canary);
   const promptCanary = asRecord(evolution.prompt_canary);
-  const classifierCanary = asRecord(evolution.classifier_prompt_canary);
   const specialistCanary = asRecord(evolution.specialist_prompt_canary);
   const learningQueue = asRecord(evolution.learning_queue);
+  const gepaReadiness = asRecord(evolution.gepa_readiness);
+  const gepaBudget = asRecord(gepaReadiness.budget);
+  const gepaAutoState = asRecord(evolution.gepa_auto_state);
+  const gepaLastResult = asRecord(evolution.gepa_last_result);
+  const gepaQueue = asRecord(evolution.gepa_queue);
+  const gepaIssues = Array.isArray(gepaReadiness.issues)
+    ? gepaReadiness.issues
+        .map((item) => str(item, ""))
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : [];
+  const gepaReady = toBool(gepaReadiness.ready);
+  const gepaPythonReady = toBool(gepaReadiness.python_ready);
+  const gepaDspyReady = toBool(gepaReadiness.dspy_ready);
+  const gepaModelReady = toBool(gepaReadiness.model_ready);
+  const gepaProviderReady = toBool(gepaReadiness.provider_key_ready);
+  const gepaPendingItems = recordList(gepaQueue.pending);
+  const gepaRunningItems = recordList(gepaQueue.running);
+  const gepaCompletedItems = recordList(gepaQueue.completed);
+  const gepaFailedItems = recordList(gepaQueue.failed);
+  const gepaPendingJobs = gepaPendingItems.length;
+  const gepaRunningJobs = gepaRunningItems.length;
+  const gepaDailyBudgetUsd = num(gepaBudget.daily_budget_usd, 2);
+  const gepaRemainingBudgetUsd = num(
+    gepaBudget.remaining_today_usd,
+    gepaDailyBudgetUsd,
+  );
+  const gepaBudgetAllowed = toBool(gepaBudget.allowed);
+  const latestGepaQueueRecord = [...gepaCompletedItems, ...gepaFailedItems]
+    .sort((a, b) =>
+      str(b.recorded_at, "").localeCompare(str(a.recorded_at, "")),
+    )[0];
+  const latestGepaRecord =
+    Object.keys(gepaLastResult).length > 0
+      ? gepaLastResult
+      : (latestGepaQueueRecord ?? {});
+  const latestGepaInner = asRecord(latestGepaRecord.result);
+  const latestGepaImport = asRecord(
+    latestGepaInner.import_result ?? latestGepaRecord.import_result,
+  );
+  const latestGepaImportSummary = asRecord(latestGepaImport.summary);
+  const latestGepaCandidateCount =
+    num(latestGepaImportSummary.prompt_candidates, 0) +
+    num(latestGepaImportSummary.specialist_prompt_candidates, 0);
+  const gepaAutoReason = str(gepaAutoState.last_reason, "");
+  const gepaEvidenceSamples = num(gepaAutoState.last_evidence_samples, 0);
+  const backgroundImprovementPaused = !toBool(evolution.self_evolve_enabled);
+  const backgroundImprovementLabel = backgroundImprovementPaused
+    ? "Paused"
+    : gepaRunningJobs > 0
+      ? "Improving now"
+      : gepaPendingJobs > 0
+        ? "Waiting for quiet time"
+        : !gepaReady
+          ? "Needs model setup"
+          : !gepaBudgetAllowed
+            ? "Daily limit reached"
+            : "Automatic";
+  const backgroundImprovementColor = backgroundImprovementPaused
+    ? ("default" as const)
+    : gepaRunningJobs > 0
+      ? ("info" as const)
+      : gepaPendingJobs > 0
+        ? ("warning" as const)
+        : !gepaReady || !gepaBudgetAllowed
+          ? ("warning" as const)
+          : ("success" as const);
+  const backgroundImprovementSummary = backgroundImprovementPaused
+    ? "Learning is paused."
+    : gepaRunningJobs > 0
+      ? "Reviewing recent work and preparing safer prompt candidates."
+      : gepaPendingJobs > 0
+        ? "Queued. It will start after AgentArk has been quiet for a few minutes."
+        : !gepaReady
+          ? "Finish model setup in Models so background improvements can run."
+          : latestGepaCandidateCount > 0
+            ? `${latestGepaCandidateCount} candidate${latestGepaCandidateCount === 1 ? "" : "s"} handed to ArkEvolve safety checks.`
+            : backgroundImprovementReason(gepaAutoReason);
   const promptInsights = asRecord(evolutionDev.prompt_insights);
-  const classifierInsights = asRecord(evolutionDev.classifier_prompt_insights);
+  const classifierInsights = asRecord(
+    evolutionDev.classifier_prompt_insights ?? evolutionDev.classifier_insights,
+  );
   const specialistInsights = asRecord(evolutionDev.specialist_prompt_insights);
   const strategyMetrics = pickRecords(evolutionDev, "strategy_metrics");
   const promptMetrics = pickRecords(evolutionDev, "prompt_metrics");
-  const classifierMetrics = pickRecords(
-    evolutionDev,
-    "classifier_prompt_metrics",
-  );
   const specialistMetrics = pickRecords(
     evolutionDev,
     "specialist_prompt_metrics",
@@ -274,13 +377,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       (row): JsonRecord => ({
         ...row,
         surface: "Prompt",
-        gain: row.score_gain,
-      }),
-    ),
-    ...pickRecords(evolutionDev, "classifier_prompt_lineage_recent").map(
-      (row): JsonRecord => ({
-        ...row,
-        surface: "Classifier",
         gain: row.score_gain,
       }),
     ),
@@ -341,23 +437,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ),
     },
     {
-      key: "classifier",
-      name: "Request classifier",
-      audienceLabel: evolutionSurfaceAudienceLabel("Request classifier"),
-      summary: evolutionSurfaceSummary("Request classifier"),
-      benefit: evolutionSurfaceBenefit("Request classifier"),
-      stableSummary: evolutionSurfaceStableSummary("Request classifier"),
-      enabled: toBool(classifierCanary.enabled),
-      rollout: clampPercent(classifierCanary.rollout_percent),
-      baseline: str(classifierCanary.baseline_version, "-"),
-      candidate: str(classifierCanary.candidate_version, "-"),
-      gate: str(evolution.classifier_prompt_replay_gate_result, "-"),
-      last: str(
-        evolution.classifier_prompt_last_promotion_result,
-        "No classifier promotion yet",
-      ),
-    },
-    {
       key: "specialist",
       name: "Specialist prompts",
       audienceLabel: evolutionSurfaceAudienceLabel("Specialist prompts"),
@@ -389,7 +468,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       return summary.map((line) => `${prefix}: ${line}`);
     }),
     ...stringList(promptInsights.summary),
-    ...stringList(classifierInsights.summary),
     ...stringList(specialistInsights.summary),
   ];
   const metricRows: JsonRecord[] = [
@@ -399,9 +477,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     ...strategyMetrics
       .slice(0, 5)
       .map((row): JsonRecord => ({ ...row, surface: "Routing" })),
-    ...classifierMetrics
-      .slice(0, 3)
-      .map((row): JsonRecord => ({ ...row, surface: "Classifier" })),
     ...specialistMetrics
       .slice(0, 3)
       .map((row): JsonRecord => ({ ...row, surface: "Specialist" })),
@@ -645,6 +720,36 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       },
     ],
   };
+  const lastRoutingOptimization = asRecord(evolutionDev.last_result);
+  const lastRoutingPromoted = toBool(lastRoutingOptimization.promoted);
+  const lastRoutingMode = str(lastRoutingOptimization.promotion_mode, "none");
+  const lastRoutingGate = str(lastRoutingOptimization.promotion_gate, "");
+  const lastRoutingAccuracyGain = num(
+    lastRoutingOptimization.accuracy_gain,
+    Number.NaN,
+  );
+  const lastRoutingSummary =
+    Object.keys(lastRoutingOptimization).length === 0
+      ? "No guided optimization has run yet."
+      : lastRoutingMode === "canary"
+        ? "A routing improvement is being tested on a small share of traffic."
+        : lastRoutingMode === "baseline"
+          ? "The last routing improvement passed checks and is now stable."
+          : lastRoutingPromoted
+            ? "A routing improvement passed offline checks and is waiting on rollout."
+            : lastRoutingGate
+              ? `Last check made no change: ${lastRoutingGate}.`
+              : "Last check made no change.";
+  const statusLoading = evolutionQ.isLoading;
+  const detailLoading = evolutionDevQ.isLoading;
+  const guidedOptimizationDisabled =
+    statusLoading ||
+    detailLoading ||
+    updateEvolutionMutation.isPending ||
+    runEvolutionActionMutation.isPending ||
+    !toBool(evolution.self_evolve_enabled);
+  const hasActiveRoutingCanary = toBool(canary.enabled);
+  const routingRollbackAvailable = toBool(evolution.routing_rollback_available);
 
   async function updateEvolution(payload: JsonRecord, message: string) {
     setError(null);
@@ -667,14 +772,13 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     setSuccess(null);
     try {
       const result = await runEvolutionActionMutation.mutateAsync(payload);
-      setSuccess(`${message}${evolutionTraceIdHint(result)}`);
+      const resultMessage = str(asRecord(result).message, "");
+      setSuccess(`${resultMessage || message}${evolutionTraceIdHint(result)}`);
     } catch (e) {
       setError(errMessage(e));
     }
   }
 
-  const statusLoading = evolutionQ.isLoading;
-  const detailLoading = evolutionDevQ.isLoading;
   const statusError = evolutionQ.error ? errMessage(evolutionQ.error) : "";
   const detailError = evolutionDevQ.error
     ? errMessage(evolutionDevQ.error)
@@ -695,9 +799,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const selectedPatternPrompts = uniqueNonEmptyStrings(
     selectedPatternRuns.map((run) => run.prompt_version),
   );
-  const selectedPatternClassifierPrompts = uniqueNonEmptyStrings(
-    selectedPatternRuns.map((run) => run.classifier_prompt_version),
-  );
   const selectedPatternSpecialistPrompts = uniqueNonEmptyStrings(
     selectedPatternRuns.map((run) => run.specialist_prompt_version),
   );
@@ -705,17 +806,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     { label: "Policy", values: selectedPatternPolicies },
     { label: "Strategy", values: selectedPatternStrategies },
     { label: "Prompt", values: selectedPatternPrompts },
-    { label: "Classifier prompt", values: selectedPatternClassifierPrompts },
     { label: "Specialist prompt", values: selectedPatternSpecialistPrompts },
   ].filter((item) => item.values.length > 1);
 
   return (
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Agent"
+        eyebrow="Ark Core"
         title="ArkEvolve"
-        descriptionNoWrap
-        description="ArkEvolve learns from repeated runs, tests low-risk improvements, and asks before lasting changes become permanent."
+        description={
+          <>
+            ArkEvolve is a continuous self-improvement loop running on your private usage.
+            <br />
+            It generates candidate changes to prompts, routing, and specialists, tests each against your own runs and statistical evidence thresholds, and asks before anything becomes permanent.
+          </>
+        }
         actions={
           <Stack
             direction="row"
@@ -822,6 +927,461 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           },
         ]}
       />
+      <Box className="list-shell" sx={{ p: 1.25 }}>
+        <Stack spacing={1.15}>
+          <Stack
+            direction={{ xs: "column", lg: "row" }}
+            spacing={1}
+            sx={{
+              alignItems: { xs: "flex-start", lg: "center" },
+              justifyContent: "space-between",
+            }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Typography
+                variant="subtitle1"
+                sx={{ color: "#e8f4ff", fontWeight: 700 }}
+              >
+                Improve AgentArk
+              </Typography>
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary", mt: 0.25 }}
+              >
+                Learn from corrected or slow turns, test safer behavior on a
+                small rollout, then approve or roll back from here.
+              </Typography>
+            </Box>
+            <Stack
+              direction="row"
+              spacing={0.75}
+              useFlexGap
+              sx={{ alignItems: "center", flexWrap: "wrap" }}
+            >
+              {!toBool(evolution.self_evolve_enabled) ? (
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={
+                    statusLoading ||
+                    updateEvolutionMutation.isPending ||
+                    runEvolutionActionMutation.isPending
+                  }
+                  onClick={() =>
+                    void updateEvolution(
+                      { self_evolve_enabled: true },
+                      "ArkEvolve learning is on.",
+                    )
+                  }
+                >
+                  Turn on learning
+                </Button>
+              ) : (
+                <Chip size="small" color="success" label="Learning on" />
+              )}
+              <Button
+                size="small"
+                variant="contained"
+                disabled={guidedOptimizationDisabled}
+                onClick={() =>
+                  void runEvolutionAction(
+                    { action: "run_guided_optimization" },
+                    "Optimization check finished.",
+                  )
+                }
+              >
+                Find improvement
+              </Button>
+              <Button
+                size="small"
+                color="inherit"
+                disabled={runEvolutionActionMutation.isPending}
+                onClick={() => setTab("review")}
+              >
+                Review queue
+              </Button>
+              {hasActiveRoutingCanary ? (
+                <>
+                  <Button
+                    size="small"
+                    color="success"
+                    variant="outlined"
+                    disabled={runEvolutionActionMutation.isPending}
+                    onClick={() =>
+                      void runEvolutionAction(
+                        { action: "promote_candidate" },
+                        "Routing test approved as stable.",
+                        "Approve the active routing test as the stable behavior?",
+                      )
+                    }
+                  >
+                    Approve test
+                  </Button>
+                  <Button
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                    disabled={runEvolutionActionMutation.isPending}
+                    onClick={() =>
+                      void runEvolutionAction(
+                        { action: "disable_canary" },
+                        "Routing test stopped.",
+                        "Stop the active routing test and keep the current stable behavior?",
+                      )
+                    }
+                  >
+                    Stop test
+                  </Button>
+                </>
+              ) : null}
+              <Button
+                size="small"
+                color="warning"
+                variant="outlined"
+                disabled={
+                  runEvolutionActionMutation.isPending ||
+                  !routingRollbackAvailable
+                }
+                onClick={() =>
+                  void runEvolutionAction(
+                    { action: "rollback_baseline" },
+                    "Rolled back the last routing policy change.",
+                    "Roll back the last stable routing-policy change if a snapshot is available?",
+                  )
+                }
+              >
+                Roll back
+              </Button>
+            </Stack>
+          </Stack>
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: {
+                xs: "1fr",
+                md: "repeat(4, minmax(0, 1fr))",
+              },
+              borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+            }}
+          >
+            {[
+              {
+                label: "1. Learn",
+                value: toBool(evolution.self_evolve_enabled)
+                  ? "Watching completed work"
+                  : "Paused",
+                helper: "Corrections, failures, tools, memory, and context are saved as evidence.",
+              },
+              {
+                label: "2. Optimize",
+                value: runEvolutionActionMutation.isPending
+                  ? "Checking"
+                  : lastRoutingSummary,
+                helper: Number.isFinite(lastRoutingAccuracyGain)
+                  ? `Last measured accuracy change: ${evolutionGainLabel(
+                      lastRoutingAccuracyGain,
+                    )}.`
+                  : "Accuracy must improve before speed or cost savings matter.",
+              },
+              {
+                label: "3. Test safely",
+                value: hasActiveRoutingCanary
+                  ? `${clampPercent(canary.rollout_percent).toFixed(0)}% rollout`
+                  : "No live routing test",
+                helper: hasActiveRoutingCanary
+                  ? "Only a small share of turns sees the candidate while evidence builds."
+                  : "New candidates stay inactive until they pass gates.",
+              },
+              {
+                label: "4. Decide",
+                value:
+                  needsApprovalCount > 0
+                    ? `${needsApprovalCount} item${needsApprovalCount === 1 ? "" : "s"} waiting`
+                    : routingRollbackAvailable
+                      ? "Rollback ready"
+                      : "Nothing waiting",
+                helper:
+                  needsApprovalCount > 0
+                    ? "Approve only when the evidence looks right, or reject it."
+                    : routingRollbackAvailable
+                      ? "The last stable routing change has a saved restore point."
+                      : "A rollback restore point appears after a routing change is tested.",
+              },
+            ].map((item, idx) => (
+              <Box
+                key={item.label}
+                sx={{
+                  py: 1,
+                  px: { xs: 0, md: 1.1 },
+                  pr: idx === 3 ? 0 : { xs: 0, md: 1.1 },
+                  borderRight:
+                    idx === 3
+                      ? "none"
+                      : {
+                          xs: "none",
+                          md: "1px solid var(--ui-rgba-145-170-205-120)",
+                        },
+                }}
+              >
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    textTransform: "uppercase",
+                    letterSpacing: 0,
+                  }}
+                >
+                  {item.label}
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color: "#e8f4ff",
+                    fontWeight: 650,
+                    mt: 0.2,
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {item.value}
+                </Typography>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    mt: 0.25,
+                  }}
+                >
+                  {item.helper}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+        </Stack>
+      </Box>
+      <Box className="list-shell" sx={{ p: 1.25 }}>
+        <Stack spacing={1.15}>
+          <Stack
+            direction={{ xs: "column", lg: "row" }}
+            spacing={1}
+            sx={{
+              alignItems: { xs: "flex-start", lg: "center" },
+              justifyContent: "space-between",
+            }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Stack
+                direction="row"
+                spacing={0.75}
+                useFlexGap
+                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              >
+                <Typography
+                  variant="subtitle1"
+                  sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                >
+                  Background improvement
+                </Typography>
+                <Chip
+                  size="small"
+                  color={backgroundImprovementColor}
+                  label={backgroundImprovementLabel}
+                />
+              </Stack>
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary", mt: 0.25 }}
+              >
+                AgentArk reviews completed work when the server is quiet and
+                sends useful candidates through ArkEvolve safety checks.
+              </Typography>
+            </Box>
+          </Stack>
+
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: {
+                xs: "1fr",
+                md: "repeat(4, minmax(0, 1fr))",
+              },
+              borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+            }}
+          >
+            {[
+              {
+                label: "Status",
+                value: backgroundImprovementLabel,
+                helper: backgroundImprovementSummary,
+                tone:
+                  backgroundImprovementColor === "success" ? "success" : "default",
+              },
+              {
+                label: "Quiet queue",
+                value:
+                  gepaRunningJobs > 0
+                    ? "Running"
+                    : gepaPendingJobs > 0
+                      ? `${gepaPendingJobs} waiting`
+                      : "Clear",
+                helper:
+                  gepaRunningJobs > 0
+                    ? "A background check is active."
+                    : gepaPendingJobs > 0
+                      ? "It will start after active work settles."
+                      : "No background improvement is queued.",
+                tone:
+                  gepaRunningJobs > 0 || gepaPendingJobs > 0
+                    ? "warning"
+                    : "success",
+              },
+              {
+                label: "Evidence",
+                value:
+                  gepaEvidenceSamples > 0
+                    ? `${gepaEvidenceSamples} fresh sample${gepaEvidenceSamples === 1 ? "" : "s"}`
+                    : "Collecting",
+                helper: "Runs after enough completed work is available.",
+                tone: gepaEvidenceSamples >= 6 ? "success" : "default",
+              },
+              {
+                label: "Daily guardrail",
+                value: `$${gepaRemainingBudgetUsd.toFixed(2)} left`,
+                helper: `${num(gepaBudget.runs_today, 0)} of ${num(
+                  gepaBudget.max_runs_per_day,
+                  1,
+                )} background check${num(gepaBudget.max_runs_per_day, 1) === 1 ? "" : "s"} used today`,
+                tone: gepaBudgetAllowed ? "success" : "warning",
+              },
+            ].map((item, idx) => (
+              <Box
+                key={item.label}
+                sx={{
+                  py: 1,
+                  px: { xs: 0, md: 1.1 },
+                  pr: idx === 3 ? 0 : { xs: 0, md: 1.1 },
+                  borderRight:
+                    idx === 3
+                      ? "none"
+                      : {
+                          xs: "none",
+                          md: "1px solid var(--ui-rgba-145-170-205-120)",
+                        },
+                }}
+              >
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    textTransform: "uppercase",
+                    letterSpacing: 0,
+                  }}
+                >
+                  {item.label}
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    color:
+                      item.tone === "success"
+                        ? "#8ee3b1"
+                        : item.tone === "warning"
+                          ? "#ffd180"
+                          : "#e8f4ff",
+                    fontWeight: 650,
+                    mt: 0.2,
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {item.value}
+                </Typography>
+                <Typography
+                  variant="caption"
+                  sx={{
+                    color: "text.secondary",
+                    display: "block",
+                    mt: 0.25,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {item.helper}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+
+          {!gepaReady && !showArkEvolveInternals ? (
+            <Alert severity="info" sx={{ borderRadius: 1 }}>
+              Background improvement starts automatically after Models has a
+              working primary model.
+            </Alert>
+          ) : null}
+
+          {showArkEvolveInternals ? (
+            <Box
+              sx={{
+                borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
+                pt: 1,
+              }}
+            >
+              <Typography
+                variant="caption"
+                sx={{
+                  color: "text.secondary",
+                  display: "block",
+                  textTransform: "uppercase",
+                  letterSpacing: 0,
+                  mb: 0.75,
+                }}
+              >
+                Optimizer internals
+              </Typography>
+              <Stack
+                direction="row"
+                spacing={0.75}
+                useFlexGap
+                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              >
+                <Chip
+                  size="small"
+                  color={gepaPythonReady ? "success" : "warning"}
+                  label={gepaPythonReady ? "Runtime ready" : "Runtime missing"}
+                />
+                <Chip
+                  size="small"
+                  color={gepaDspyReady ? "success" : "warning"}
+                  label={gepaDspyReady ? "DSPy installed" : "DSPy missing"}
+                />
+                <Chip
+                  size="small"
+                  color={
+                    gepaModelReady && gepaProviderReady ? "success" : "warning"
+                  }
+                  label={
+                    gepaModelReady && gepaProviderReady
+                      ? str(gepaReadiness.model_slot, "Active model")
+                      : "Model not ready"
+                  }
+                />
+                <Chip
+                  size="small"
+                  color={gepaBudgetAllowed ? "success" : "warning"}
+                  label={
+                    gepaBudgetAllowed ? "Budget available" : "Budget paused"
+                  }
+                />
+              </Stack>
+              {gepaIssues.length > 0 ? (
+                <Alert severity="warning" sx={{ borderRadius: 1, mt: 1 }}>
+                  {gepaIssues.slice(0, 3).join(" ")}
+                </Alert>
+              ) : null}
+            </Box>
+          ) : null}
+        </Stack>
+      </Box>
       <Box className="list-shell" sx={{ p: 0.75 }}>
         <Tabs
           value={tab}

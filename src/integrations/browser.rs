@@ -53,6 +53,8 @@ pub struct PageContent {
     pub url: String,
     pub body_text: String,
     pub elements: Vec<PageElement>,
+    #[serde(default)]
+    pub diagnostics: Vec<PageDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,22 @@ pub struct PageElement {
     pub href: String,
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageDiagnostic {
+    #[serde(default)]
+    pub time: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub resource_type: String,
 }
 
 fn browser_target_host_allowed(host: &url::Host<&str>) -> bool {
@@ -122,7 +140,10 @@ fn browser_hosts_match_for_internal_app(
     target: &url::Host<&str>,
     internal: &url::Host<&str>,
 ) -> bool {
-    if target.to_string().eq_ignore_ascii_case(&internal.to_string()) {
+    if target
+        .to_string()
+        .eq_ignore_ascii_case(&internal.to_string())
+    {
         return true;
     }
     browser_host_is_local_or_wildcard(target) && browser_host_is_local_or_wildcard(internal)

@@ -1,0 +1,162 @@
+// Live working view shown while the agent is mid-turn but has not emitted a
+// tool artifact yet.
+
+import { useEffect, useRef, useState } from "react";
+import Box from "@mui/material/Box";
+import Typography from "@mui/material/Typography";
+import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
+
+export interface WorkingViewProps {
+  phaseLabel?: string;
+  detail?: string;
+  startedAt?: string | number | null;
+  tokenPreview?: string;
+  /** Live planner/classifier reasoning text. Surfaced when the assistant
+   * content stream has not started yet. Source of truth: structural
+   * `reasoning_delta` events from the backend, never phrase-matched. */
+  reasoningPreview?: string;
+  /** Structural phase label for the reasoning stream: "classifier" or
+   * "planner". Drives the small label pill above the preview. */
+  reasoningPhase?: string;
+}
+
+const REASONING_PHASE_LABELS: Record<string, string> = {
+  classifier: "Classifying",
+  planner: "Planning",
+  model: "Reasoning",
+};
+
+function normalizeStartedAt(value: WorkingViewProps["startedAt"]): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Number(new Date(value));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+export function WorkingView({
+  phaseLabel,
+  detail,
+  startedAt,
+  tokenPreview,
+  reasoningPreview,
+  reasoningPhase,
+}: WorkingViewProps) {
+  const startedAtMs = normalizeStartedAt(startedAt);
+  const [now, setNow] = useState<number>(() => Date.now());
+  const previewRef = useRef<HTMLPreElement | null>(null);
+  const followPreviewRef = useRef(true);
+  const previewModeRef = useRef("");
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 200);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const elapsedLabel =
+    startedAtMs !== null ? formatElapsed(now - startedAtMs) : "...";
+  const assistantContent =
+    typeof tokenPreview === "string" && tokenPreview.length > 0
+      ? tokenPreview
+      : "";
+  const reasoningContent =
+    typeof reasoningPreview === "string" && reasoningPreview.length > 0
+      ? reasoningPreview
+      : "";
+  // Precedence: real assistant content wins. Reasoning is only shown when
+  // the assistant stream has not started — structural fallback, no phrase
+  // matching.
+  const isReasoning = !assistantContent && Boolean(reasoningContent);
+  const previewContent = assistantContent || reasoningContent;
+  const previewMode = isReasoning
+    ? "reasoning"
+    : assistantContent
+      ? "assistant"
+      : "empty";
+  const reasoningPill =
+    isReasoning && reasoningPhase
+      ? REASONING_PHASE_LABELS[reasoningPhase] || null
+      : null;
+
+  useEffect(() => {
+    if (previewModeRef.current !== previewMode) {
+      previewModeRef.current = previewMode;
+      followPreviewRef.current = true;
+    }
+  }, [previewMode]);
+
+  useEffect(() => {
+    const node = previewRef.current;
+    if (!node || !followPreviewRef.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [previewContent]);
+
+  const handlePreviewScroll = () => {
+    const node = previewRef.current;
+    if (!node) return;
+    const distanceFromBottom =
+      node.scrollHeight - node.scrollTop - node.clientHeight;
+    followPreviewRef.current = distanceFromBottom < 32;
+  };
+
+  return (
+    <Box className="cview cview-working">
+      <Box className="cview-working-head">
+        <Box className="cview-working-icon" aria-hidden="true">
+          <AutoAwesomeRoundedIcon fontSize="small" />
+        </Box>
+        <Typography variant="subtitle1" className="cview-working-label">
+          {phaseLabel || "Working..."}
+        </Typography>
+        <Typography
+          variant="body2"
+          className="cview-working-elapsed"
+          aria-live="polite"
+        >
+          {elapsedLabel}
+        </Typography>
+      </Box>
+      {detail ? (
+        <Typography variant="body2" className="cview-working-detail">
+          {detail}
+        </Typography>
+      ) : null}
+      {reasoningPill ? (
+        <Box className="cview-working-reasoning-pill" aria-live="polite">
+          <Typography variant="caption">{reasoningPill}</Typography>
+        </Box>
+      ) : null}
+      <Box
+        className={
+          isReasoning
+            ? "cview-working-preview cview-working-preview-reasoning"
+            : "cview-working-preview"
+        }
+      >
+        <Box className="cview-working-preview-fade" aria-hidden="true" />
+        {previewContent ? (
+          <pre ref={previewRef} onScroll={handlePreviewScroll}>
+            {previewContent}
+          </pre>
+        ) : (
+          <Typography variant="body2" className="cview-working-preview-empty">
+            Waiting for first tokens...
+          </Typography>
+        )}
+      </Box>
+    </Box>
+  );
+}
+
+export default WorkingView;

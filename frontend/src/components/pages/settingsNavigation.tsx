@@ -65,24 +65,16 @@ export const SETTINGS_NAV_ITEMS = SETTINGS_NAV_GROUPS.flatMap(
 
 export function getSelectedSettingsNav(
   tab: number,
-  latestPulseNavCount: number,
+  _latestPulseNavCount: number,
 ): SettingsNavItem {
   return (
     SETTINGS_NAV_ITEMS.find((item) => item.value === tab) ||
-    (tab === 9
+    (tab === 11
       ? {
-          value: 9,
-          label:
-            latestPulseNavCount > 0
-              ? `ArkPulse (${latestPulseNavCount})`
-              : "ArkPulse",
+          value: 11,
+          label: "Trace",
         }
-      : tab === 11
-        ? {
-            value: 11,
-            label: "Trace",
-          }
-        : SETTINGS_NAV_ITEMS[0])
+      : SETTINGS_NAV_ITEMS[0])
   );
 }
 

@@ -39,6 +39,12 @@ pub struct CandidateReplayGateResult {
     pub min_confidence: f64,
     pub min_support_score: f64,
     pub max_correction_rate: f64,
+    pub usage_samples: usize,
+    pub avg_input_tokens: f64,
+    pub avg_output_tokens: f64,
+    pub avg_total_tokens: f64,
+    pub max_total_tokens: i64,
+    pub avg_cost_usd: f64,
     pub signals: Vec<String>,
 }
 
@@ -54,10 +60,63 @@ struct EvidenceBundle {
     item_count: usize,
     pattern_count: usize,
     run_count: usize,
+    turn_decision_run_count: usize,
+    usage: TurnUsageEvidence,
     signals: Vec<String>,
     items: Vec<experience_item::Model>,
     patterns: Vec<procedural_pattern::Model>,
     runs: Vec<experience_run::Model>,
+}
+
+#[derive(Debug, Default)]
+struct TurnUsageEvidence {
+    samples: usize,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    max_total_tokens: i64,
+    cost_usd: f64,
+}
+
+impl TurnUsageEvidence {
+    fn add(&mut self, value: &Value) {
+        let input_tokens = json_i64_field(value, "input_tokens").unwrap_or_default().max(0);
+        let output_tokens = json_i64_field(value, "output_tokens").unwrap_or_default().max(0);
+        let total_tokens = json_i64_field(value, "total_tokens")
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens))
+            .max(0);
+        let cost_usd = value
+            .get("cost_usd")
+            .and_then(json_f64)
+            .unwrap_or_default()
+            .max(0.0);
+        self.samples = self.samples.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+        self.max_total_tokens = self.max_total_tokens.max(total_tokens);
+        self.cost_usd += cost_usd;
+    }
+
+    fn avg_input_tokens(&self) -> f64 {
+        ratio_i64(self.input_tokens, self.samples)
+    }
+
+    fn avg_output_tokens(&self) -> f64 {
+        ratio_i64(self.output_tokens, self.samples)
+    }
+
+    fn avg_total_tokens(&self) -> f64 {
+        ratio_i64(self.total_tokens, self.samples)
+    }
+
+    fn avg_cost_usd(&self) -> f64 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            self.cost_usd / self.samples as f64
+        }
+    }
 }
 
 impl EvidenceBundle {
@@ -109,6 +168,32 @@ impl EvidenceBundle {
         }
         if experience_run_corrected(&run) {
             self.corrections += 1;
+        }
+        if let Some(turn_decision) = run.metadata.get("turn_decision") {
+            self.turn_decision_run_count += 1;
+            let path = turn_decision
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let task_type = turn_decision
+                .get("task_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let usage_delta = turn_decision.get("usage_delta");
+            if let Some(usage_delta) = usage_delta {
+                self.usage.add(usage_delta);
+            }
+            let total_tokens = usage_delta
+                .and_then(|value| json_i64_field(value, "total_tokens"))
+                .unwrap_or_default();
+            let cost_usd = usage_delta
+                .and_then(|value| value.get("cost_usd"))
+                .and_then(json_f64)
+                .unwrap_or_default();
+            self.signals.push(format!(
+                "turn decision evidence: path={}, task_type={}, total_tokens={}, cost_usd={:.6}",
+                path, task_type, total_tokens, cost_usd
+            ));
         }
         self.signals.push(format!(
             "experience run evidence: success_state={}, correction_state={}",
@@ -254,6 +339,9 @@ fn evaluate_candidate_with_evidence(
         }
         "skill_patch" => evaluate_skill_patch(candidate, evidence, confidence),
         "strategy" | "workflow" => evaluate_structured_candidate(candidate, evidence, confidence),
+        "turn_decision" | "turn_routing_policy" | "routing_policy" => {
+            evaluate_turn_decision_candidate(candidate, evidence, confidence)
+        }
         other => gate_result(
             candidate,
             evidence,
@@ -266,6 +354,63 @@ fn evaluate_candidate_with_evidence(
             ),
         ),
     }
+}
+
+fn evaluate_turn_decision_candidate(
+    candidate: &learning_candidate::Model,
+    evidence: EvidenceBundle,
+    confidence: f64,
+) -> CandidateReplayGateResult {
+    let turn_decision_samples = evidence.turn_decision_run_count;
+    let support_score = support_score(&evidence, confidence);
+    if turn_decision_samples < DEFAULT_MIN_EVIDENCE_SAMPLES {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "needs_more_data",
+            false,
+            "not enough typed turn-decision evidence for approval".to_string(),
+        );
+    }
+    if confidence < DEFAULT_MIN_CONFIDENCE {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            "turn-decision candidate confidence is below replay-gate threshold".to_string(),
+        );
+    }
+    if evidence.correction_rate() > DEFAULT_MAX_CORRECTION_RATE {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            "correction rate in turn-decision evidence is too high".to_string(),
+        );
+    }
+    if support_score < DEFAULT_MIN_SUPPORT_SCORE {
+        return gate_result(
+            candidate,
+            evidence,
+            confidence,
+            "blocked",
+            false,
+            "turn-decision support score is below threshold".to_string(),
+        );
+    }
+    gate_result(
+        candidate,
+        evidence,
+        confidence,
+        "passed",
+        true,
+        "typed turn-decision evidence supports approval".to_string(),
+    )
 }
 
 fn evaluate_structured_candidate(
@@ -596,6 +741,12 @@ fn gate_result(
         min_confidence: DEFAULT_MIN_CONFIDENCE,
         min_support_score: DEFAULT_MIN_SUPPORT_SCORE,
         max_correction_rate: DEFAULT_MAX_CORRECTION_RATE,
+        usage_samples: evidence.usage.samples,
+        avg_input_tokens: round4(evidence.usage.avg_input_tokens()),
+        avg_output_tokens: round4(evidence.usage.avg_output_tokens()),
+        avg_total_tokens: round4(evidence.usage.avg_total_tokens()),
+        max_total_tokens: evidence.usage.max_total_tokens,
+        avg_cost_usd: round4(evidence.usage.avg_cost_usd()),
         signals: evidence.signals.into_iter().take(8).collect(),
     }
 }
@@ -673,11 +824,25 @@ fn json_usize(value: &Value) -> Option<usize> {
     value.as_u64().map(|value| value as usize)
 }
 
+fn json_i64_field(value: &Value, key: &str) -> Option<i64> {
+    value
+        .get(key)
+        .and_then(|field| field.as_i64().or_else(|| field.as_u64().map(|v| v as i64)))
+}
+
 fn json_f64(value: &Value) -> Option<f64> {
     value.as_f64().or_else(|| value.as_u64().map(|v| v as f64))
 }
 
 fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn ratio_i64(numerator: i64, denominator: usize) -> f64 {
     if denominator == 0 {
         0.0
     } else {
@@ -727,6 +892,77 @@ mod tests {
         );
         assert!(!result.allow_approval);
         assert_eq!(result.status, "needs_more_data");
+    }
+
+    fn turn_decision_run(id: &str) -> experience_run::Model {
+        experience_run::Model {
+            id: id.to_string(),
+            execution_run_id: None,
+            trace_id: Some(format!("trace-{id}")),
+            conversation_id: None,
+            project_id: None,
+            channel: "chat".to_string(),
+            scope: "global".to_string(),
+            intent_key: "turn_decision_test".to_string(),
+            task_type: Some("conversation".to_string()),
+            request_text: None,
+            tool_sequence_digest: None,
+            tool_sequence_json: serde_json::json!([]),
+            strategy_version: None,
+            policy_version: None,
+            prompt_version: None,
+            model_slot: Some("direct_memory".to_string()),
+            success_state: "accepted".to_string(),
+            correction_state: "none".to_string(),
+            outcome_summary: None,
+            failure_reason: None,
+            metadata: serde_json::json!({
+                "turn_decision": {
+                    "schema_version": 1,
+                    "objective_order": ["accuracy", "safety", "tokens_latency_cost"],
+                    "path": "direct_memory",
+                    "task_type": "conversation",
+                    "usage_delta": {
+                        "input_tokens": 1200,
+                        "output_tokens": 80,
+                        "total_tokens": 1280,
+                        "cost_usd": 0.002
+                    }
+                }
+            }),
+            consolidated: false,
+            accepted_at: Some("2026-01-01T00:00:00Z".to_string()),
+            corrected_at: None,
+            heuristic_reflected: false,
+            heuristic_reflection_status: None,
+            heuristic_reflection_attempted_at: None,
+            heuristic_reflection_completed_at: None,
+            heuristic_lesson_id: None,
+            heuristic_reflection_error: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn turn_decision_candidate_requires_typed_turn_evidence() {
+        let mut evidence = EvidenceBundle::default();
+        evidence.add_run(turn_decision_run("run-1"));
+        evidence.add_run(turn_decision_run("run-2"));
+        let result = evaluate_candidate_with_evidence(
+            &candidate("turn_decision", 0.9, serde_json::json!({})),
+            evidence,
+        );
+        assert!(result.allow_approval);
+        assert_eq!(result.status, "passed");
+        assert_eq!(result.usage_samples, 2);
+        assert_eq!(result.avg_total_tokens, 1280.0);
+        assert_eq!(result.max_total_tokens, 1280);
+        assert_eq!(result.avg_cost_usd, 0.002);
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.contains("turn decision evidence")));
     }
 
     #[test]

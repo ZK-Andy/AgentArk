@@ -41,59 +41,6 @@ function Get-AgentArkReleaseVersionFromTag {
     return $Tag.TrimStart("v", "V")
 }
 
-function Ensure-AgentArkScriptEnvFile {
-    # Script-managed Compose variables live here. Do not create a root .env.
-    $envPath = Join-Path $SourceDir ".agentark\local.env"
-    $envDir = Split-Path $envPath
-    if (-not (Test-Path $envDir)) {
-        New-Item -ItemType Directory -Path $envDir -Force | Out-Null
-    }
-    if (-not (Test-Path $envPath)) {
-        New-Item -ItemType File -Path $envPath -Force | Out-Null
-    }
-    return $envPath
-}
-
-function Set-AgentArkEnvValue {
-    param(
-        [Parameter(Mandatory = $true)][string]$Key,
-        [Parameter(Mandatory = $true)][string]$Value
-    )
-
-    $envPath = Ensure-AgentArkScriptEnvFile
-    $lines = if (Test-Path $envPath) { [System.Collections.Generic.List[string]](Get-Content $envPath) } else { [System.Collections.Generic.List[string]]::new() }
-    $updated = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -like "$Key=*") {
-            $lines[$i] = "$Key=$Value"
-            $updated = $true
-        }
-    }
-    if (-not $updated) {
-        $lines.Add("$Key=$Value")
-    }
-    Set-Content -Path $envPath -Value $lines -Encoding ASCII
-}
-
-function Set-AgentArkPinnedRelease {
-    param([Parameter(Mandatory = $true)][string]$Tag)
-
-    $version = Get-AgentArkReleaseVersionFromTag $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value "${ImageRepository}:$version"
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "image"
-}
-
-function Set-AgentArkSourceBuildRelease {
-    param([Parameter(Mandatory = $true)][string]$Tag)
-
-    Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value $LocalSourceImage
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "source"
-}
-
 function Assert-AgentArkCleanCheckout {
     $status = & docker run --rm -v "${InstallDir}:/work" -w /work alpine/git git -C /work/source status --porcelain --untracked-files=no 2>$null
     if ($LASTEXITCODE -ne 0) {
@@ -380,12 +327,6 @@ if (-not (Test-Path (Join-Path $SourceDir "docker-compose.yml"))) {
     throw "Missing $SourceDir\docker-compose.yml after checkout."
 }
 
-if ($InstallKind -eq "source") {
-    Set-AgentArkSourceBuildRelease -Tag $TargetReleaseTag
-} else {
-    Set-AgentArkPinnedRelease -Tag $TargetReleaseTag
-}
-$AgentArkEnvFile = Ensure-AgentArkScriptEnvFile
 Write-Host "[4/5] Source checkout ready at $SourceDir" -ForegroundColor Green
 
 $cmdWrapper = @'
@@ -413,20 +354,31 @@ if ($env:AGENTARK_POSTGRES_PORT -match '^\d+$') {
 Write-AgentArkPortWarning -Port $postgresPort -ServiceName "Postgres"
 Write-AgentArkPortWarning -Port 8990 -ServiceName "AgentArk Web UI"
 
+$previousImage = $env:AGENTARK_IMAGE
+$previousRepo = $env:AGENTARK_RELEASE_REPO
+$previousTag = $env:AGENTARK_RELEASE_TAG
+if ($InstallKind -eq "source") {
+    $env:AGENTARK_IMAGE = $LocalSourceImage
+} else {
+    $env:AGENTARK_IMAGE = "${ImageRepository}:$(Get-AgentArkReleaseVersionFromTag $TargetReleaseTag)"
+}
+$env:AGENTARK_RELEASE_REPO = $ReleaseRepo
+$env:AGENTARK_RELEASE_TAG = $TargetReleaseTag
+
 Push-Location $SourceDir
 try {
     Write-Host "[5/5] Starting AgentArk..." -ForegroundColor Green
     if ($InstallKind -eq "source") {
-        & docker compose --env-file $AgentArkEnvFile -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+        & docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to build and start AgentArk from source."
         }
     } else {
-        & docker compose --env-file $AgentArkEnvFile pull
+        & docker compose pull
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to pull AgentArk images."
         }
-        & docker compose --env-file $AgentArkEnvFile up -d
+        & docker compose up -d
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to start AgentArk."
         }
@@ -434,7 +386,7 @@ try {
 
     $lightpandaReady = $false
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        & docker compose --env-file $AgentArkEnvFile exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" *> $null
+        & docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" *> $null
         if ($LASTEXITCODE -eq 0) {
             $lightpandaReady = $true
             break
@@ -444,8 +396,24 @@ try {
     if (-not $lightpandaReady) {
         throw "Lightpanda is missing from the bundled AgentArk runtime. Update or rebuild before relying on the free search fallback."
     }
+
+    $gepaReady = $false
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        & docker compose exec -T agentark-control sh -lc "/opt/agentark-gepa/bin/python -c 'import dspy' >/dev/null 2>&1" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $gepaReady = $true
+            break
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $gepaReady) {
+        throw "GEPA optimizer is missing from the bundled AgentArk runtime. Update or rebuild before running ArkEvolve GEPA."
+    }
 } finally {
     Pop-Location
+    if ($null -eq $previousImage) { Remove-Item Env:\AGENTARK_IMAGE -ErrorAction SilentlyContinue } else { $env:AGENTARK_IMAGE = $previousImage }
+    if ($null -eq $previousRepo) { Remove-Item Env:\AGENTARK_RELEASE_REPO -ErrorAction SilentlyContinue } else { $env:AGENTARK_RELEASE_REPO = $previousRepo }
+    if ($null -eq $previousTag) { Remove-Item Env:\AGENTARK_RELEASE_TAG -ErrorAction SilentlyContinue } else { $env:AGENTARK_RELEASE_TAG = $previousTag }
 }
 
 Write-Host ""

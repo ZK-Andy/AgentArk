@@ -277,7 +277,9 @@ pub(super) async fn ensure_managed_postgres_backup(
             .await;
             return Err(managed_backup_error(
                 &backup_dir,
-                format!("Config archive was created but could not be committed atomically: {error}"),
+                format!(
+                    "Config archive was created but could not be committed atomically: {error}"
+                ),
             ));
         }
     }
@@ -312,7 +314,9 @@ async fn latest_managed_backup(backup_dir: &Path) -> Result<Option<ManagedBackup
             Ok(Some(entry)) => entry,
             Ok(None) => break,
             Err(error) => {
-                return Err(format!("Could not enumerate managed backup directory: {error}"));
+                return Err(format!(
+                    "Could not enumerate managed backup directory: {error}"
+                ));
             }
         };
         let file_name = entry.file_name();
@@ -399,7 +403,10 @@ async fn create_data_archive(data_dir: &Path, output_path: &Path) -> Result<(), 
         .await
         .map_err(|error| format!("Data directory could not be inspected: {error}"))?;
     if !metadata.is_dir() {
-        return Err(format!("Data path is not a directory: {}", data_dir.display()));
+        return Err(format!(
+            "Data path is not a directory: {}",
+            data_dir.display()
+        ));
     }
     let mut command = tokio::process::Command::new("tar");
     command

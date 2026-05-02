@@ -15,8 +15,6 @@ pub(super) const ROUTING_POLICY_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/routing_policy_lineage.jsonl";
 pub(super) const PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/prompt_bundle_lineage.jsonl";
-pub(super) const CLASSIFIER_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
-    ".agentark/self_evolve/classifier_prompt_bundle_lineage.jsonl";
 pub(super) const SPECIALIST_PROMPT_BUNDLE_LINEAGE_REL_PATH: &str =
     ".agentark/self_evolve/specialist_prompt_bundle_lineage.jsonl";
 pub(super) const PROMPT_REPLAY_EVAL_SAMPLE_LIMIT: u64 = 5000;
@@ -32,6 +30,7 @@ pub(super) const CHAT_SUGGESTION_RECENT_MESSAGES_PER_CHAT: usize = 8;
 pub(super) const CHAT_SUGGESTION_OPEN_LIMIT: usize = 24;
 pub(super) const CHAT_SUGGESTION_RETAINED_HISTORY: usize = 80;
 pub(super) const CHAT_SUGGESTION_RETAINED_WATERMARKS: usize = 512;
+pub(super) const CHAT_SUGGESTION_FOREGROUND_COOLDOWN_MINUTES: i64 = 10;
 const CHAT_SUGGESTION_SEMANTIC_DEDUP_TIMEOUT_SECS: u64 = 8;
 pub(super) const OPTIONAL_BACKGROUND_POLL_SECS: u64 = 60;
 // Supervision budget for optional HTTP-side maintenance loops only.
@@ -706,7 +705,10 @@ pub(super) async fn collapse_semantically_equivalent_chat_suggestions(
     {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
-            tracing::debug!("chat_suggestion_dedup: LLM clustering unavailable: {}", error);
+            tracing::debug!(
+                "chat_suggestion_dedup: LLM clustering unavailable: {}",
+                error
+            );
             return 0;
         }
         Err(_) => {
@@ -733,6 +735,19 @@ pub(super) fn chat_suggestion_scan_is_due(
 
 pub(super) async fn server_busy_for_chat_suggestions(state: &AppState) -> bool {
     if server_under_load(state).await {
+        return true;
+    }
+    let recent_foreground_activity = {
+        let agent = state.agent.read().await;
+        let last_activity = agent.last_activity.read().await.clone();
+        last_activity.is_some_and(|last_activity| {
+            chrono::Utc::now()
+                .signed_duration_since(last_activity)
+                .num_minutes()
+                < CHAT_SUGGESTION_FOREGROUND_COOLDOWN_MINUTES
+        })
+    };
+    if recent_foreground_activity {
         return true;
     }
     let active_traces = {
@@ -887,8 +902,13 @@ pub(super) fn build_chat_automation_suggestion_from_inference(
     let detail = chat_suggestion_inference_text(payload, "detail", 260)?;
     let rationale = chat_suggestion_inference_text(payload, "rationale", 220)?;
     let kind_label = suggestion_kind_title(kind);
-    let goal_title = chat_suggestion_inference_text(payload, "goal_title", 140)
-        .unwrap_or_else(|| format!("Launch {} from chat signal", kind_label.to_ascii_lowercase()));
+    let goal_title =
+        chat_suggestion_inference_text(payload, "goal_title", 140).unwrap_or_else(|| {
+            format!(
+                "Launch {} from chat signal",
+                kind_label.to_ascii_lowercase()
+            )
+        });
     let goal_detail = chat_suggestion_inference_text(payload, "goal_detail", 420).or_else(|| {
         Some(format!(
             "Source conversation: {}. Original signal: {}",
@@ -1077,7 +1097,12 @@ Return a concise final outcome after the actual work is done.",
 mod tests {
     use super::*;
 
-    fn test_suggestion(id: &str, title: &str, detail: &str, confidence: f32) -> ChatAutomationSuggestion {
+    fn test_suggestion(
+        id: &str,
+        title: &str,
+        detail: &str,
+        confidence: f32,
+    ) -> ChatAutomationSuggestion {
         ChatAutomationSuggestion {
             id: id.to_string(),
             status: "open".to_string(),
@@ -1171,9 +1196,24 @@ mod tests {
     #[test]
     fn duplicate_groups_keep_distinct_suggestions_outside_group() {
         let mut suggestions = vec![
-            test_suggestion("a", "Create invoice workflow", "Draft monthly invoice automation.", 0.9),
-            test_suggestion("b", "Monitor deployment health", "Watch production app health checks.", 0.9),
-            test_suggestion("c", "Deployment health watcher", "Set up a health-check watcher.", 0.92),
+            test_suggestion(
+                "a",
+                "Create invoice workflow",
+                "Draft monthly invoice automation.",
+                0.9,
+            ),
+            test_suggestion(
+                "b",
+                "Monitor deployment health",
+                "Watch production app health checks.",
+                0.9,
+            ),
+            test_suggestion(
+                "c",
+                "Deployment health watcher",
+                "Set up a health-check watcher.",
+                0.92,
+            ),
         ];
 
         let removed = apply_chat_suggestion_duplicate_groups(

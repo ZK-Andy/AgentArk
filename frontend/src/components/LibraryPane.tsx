@@ -25,7 +25,7 @@ const LIBRARY_VIEWS: Array<{ view: LibraryView; label: string; detail: string }>
   {
     view: "documents",
     label: "Documents",
-    detail: "Project knowledge, uploads, and indexed context.",
+    detail: "Workspace knowledge, uploads, and indexed context.",
   },
   {
     view: "apps",
@@ -77,13 +77,6 @@ export function LibraryPane({ autoRefresh, showAdvanced, onNavigateToView }: Pro
               {entry.label}
             </Button>
           ))}
-          <Button
-            size="small"
-            variant="text"
-            onClick={() => onNavigateToView("projects")}
-          >
-            Projects
-          </Button>
         </Stack>
         <Stack
           direction="row"

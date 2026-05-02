@@ -91,9 +91,49 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
 
     // --- Chat & Status ---
     add("/status", "GET", "Agent status", "Status");
+    add("/health", "GET", "Health check", "Status");
+    add("/readiness", "GET", "Readiness check", "Status");
     add("/chat", "POST", "Chat completion", "Chat");
     add("/chat/stream", "POST", "Streaming chat completion", "Chat");
     add("/chat/clear", "POST", "Clear current chat context", "Chat");
+    add(
+        "/chat/credential-prompt",
+        "GET",
+        "Get pending chat credential prompt",
+        "Chat",
+    );
+    add(
+        "/gateway/channels",
+        "GET",
+        "List channel gateway status",
+        "Gateway",
+    );
+    add(
+        "/gateway/ops",
+        "GET",
+        "Get gateway operational overview",
+        "Gateway",
+    );
+    add(
+        "/gateway/routing",
+        "GET",
+        "Get gateway routing status",
+        "Gateway",
+    );
+    add(
+        "/trace",
+        "GET",
+        "Get latest execution trace summary",
+        "Trace",
+    );
+    add("/trace/{id}", "GET", "Get execution trace detail", "Trace");
+    add("/runs/{id}", "GET", "Get live run detail", "Trace");
+    add(
+        "/runs/{id}/stream",
+        "GET",
+        "Stream live run events",
+        "Trace",
+    );
 
     // --- Skills ---
     add("/skills", "GET", "List skills", "Skills");
@@ -220,6 +260,7 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Recent automation run history",
         "Automation",
     );
+    add("/watchers", "GET", "List watchers", "Watchers");
 
     // --- Goals ---
     add("/goals", "GET", "List goals", "Goals");
@@ -380,9 +421,51 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Check OpenAI Subscription OAuth status",
         "Models",
     );
+    add(
+        "/analytics/llm",
+        "GET",
+        "Get LLM usage, token, cost, model, channel, and purpose analytics",
+        "Analytics",
+    );
+    add(
+        "/reflect",
+        "GET",
+        "Get cached ArkReflect clusters across chat, ArkOrbit, apps, goals, watchers, Sentinel, ArkPulse, ArkEvolve, usage, memory, and workflows",
+        "Analytics",
+    );
+    add(
+        "/reflect/refresh",
+        "POST",
+        "Queue a guarded ArkReflect background refresh for a selected time range",
+        "Analytics",
+    );
 
     // --- Integrations ---
     add("/integrations", "GET", "List integrations", "Integrations");
+    add(
+        "/gmail/status",
+        "GET",
+        "Get Gmail integration status",
+        "Integrations",
+    );
+    add(
+        "/gmail/test",
+        "GET",
+        "Test Gmail integration",
+        "Integrations",
+    );
+    add(
+        "/calendar/status",
+        "GET",
+        "Get calendar integration status",
+        "Integrations",
+    );
+    add(
+        "/calendar/test",
+        "GET",
+        "Test calendar integration",
+        "Integrations",
+    );
     add(
         "/integrations/{id}/auth",
         "GET",
@@ -434,6 +517,16 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "List plugin SDK delivery logs",
         "Plugins",
     );
+    add("/hooks", "GET", "List hooks", "Hooks");
+    add("/hooks/runs", "GET", "List hook runs", "Hooks");
+    add(
+        "/webhooks/events",
+        "GET",
+        "List received webhook events",
+        "Hooks",
+    );
+    add("/ssh/connections", "GET", "List SSH connections", "SSH");
+    add("/ssh/keys", "GET", "List SSH keys", "SSH");
     add(
         "/plugins/{id}",
         "PUT",
@@ -677,12 +770,7 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Notifications",
     );
 
-    // --- Projects & Conversations ---
-    add("/projects", "GET", "List projects", "Projects");
-    add("/projects", "POST", "Create project", "Projects");
-    add("/projects/{id}", "GET", "Get project", "Projects");
-    add("/projects/{id}", "PUT", "Update project", "Projects");
-    add("/projects/{id}", "DELETE", "Delete project", "Projects");
+    // --- Conversations ---
     add(
         "/conversations",
         "GET",
@@ -717,6 +805,12 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "/conversations/{id}/messages",
         "GET",
         "List conversation messages",
+        "Conversations",
+    );
+    add(
+        "/conversations/{id}/latest-run",
+        "GET",
+        "Get latest run for a conversation",
         "Conversations",
     );
 
@@ -844,6 +938,12 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
 
     // --- Apps ---
     add("/api/apps", "GET", "List deployed apps", "Apps");
+    add(
+        "/api/uploads/{upload_id}",
+        "GET",
+        "Get uploaded chat file",
+        "Apps",
+    );
     add("/api/apps/{app_id}/stop", "POST", "Stop app", "Apps");
     add("/api/apps/{app_id}/restart", "POST", "Restart app", "Apps");
     add("/api/apps/{app_id}", "DELETE", "Delete app", "Apps");
@@ -865,6 +965,108 @@ pub(super) fn build_openapi_paths() -> serde_json::Map<String, serde_json::Value
         "Stop a running built-in application launch",
         "Apps",
     );
+    add(
+        "/api/arkorbit/orbits",
+        "GET",
+        "List ArkOrbit workspaces",
+        "ArkOrbit",
+    );
+    add(
+        "/api/arkorbit/orbits/{id}",
+        "GET",
+        "Get ArkOrbit workspace",
+        "ArkOrbit",
+    );
+    add(
+        "/api/arkorbit/orbits/{id}/index",
+        "GET",
+        "Get ArkOrbit workspace index",
+        "ArkOrbit",
+    );
+    add(
+        "/api/arkorbit/orbits/{id}/messages",
+        "GET",
+        "List ArkOrbit workspace messages",
+        "ArkOrbit",
+    );
+    add(
+        "/api/arkorbit/orbits/{id}/files",
+        "GET",
+        "List ArkOrbit workspace files",
+        "ArkOrbit",
+    );
+    add(
+        "/api/arkorbit/orbits/{id}/files/{*path}",
+        "GET",
+        "Get ArkOrbit workspace file",
+        "ArkOrbit",
+    );
+    add(
+        "/browser/sessions",
+        "GET",
+        "List browser sessions",
+        "Browser",
+    );
+    add(
+        "/browser/sessions/{id}",
+        "GET",
+        "Get browser session detail",
+        "Browser",
+    );
+    add(
+        "/browser/sessions/{id}/status",
+        "GET",
+        "Get browser session status",
+        "Browser",
+    );
+    add(
+        "/api/whatsapp-bridge/status",
+        "GET",
+        "Get WhatsApp bridge status",
+        "Channels",
+    );
+    add(
+        "/api/telegram/status",
+        "GET",
+        "Get Telegram channel status",
+        "Channels",
+    );
+
+    if let Some(operation) = paths
+        .get_mut("/analytics/llm")
+        .and_then(|path| path.get_mut("get"))
+        .and_then(|operation| operation.as_object_mut())
+    {
+        operation.insert(
+            "parameters".to_string(),
+            serde_json::json!([
+                {
+                    "name": "range",
+                    "in": "query",
+                    "description": "Relative time window such as 24h, 7d, 30d, or all.",
+                    "schema": { "type": "string" }
+                },
+                {
+                    "name": "bucket",
+                    "in": "query",
+                    "description": "Aggregation bucket for time series.",
+                    "schema": { "type": "string", "enum": ["hour", "day", "week"] }
+                },
+                {
+                    "name": "from",
+                    "in": "query",
+                    "description": "Optional inclusive start timestamp.",
+                    "schema": { "type": "string" }
+                },
+                {
+                    "name": "to",
+                    "in": "query",
+                    "description": "Optional exclusive end timestamp.",
+                    "schema": { "type": "string" }
+                }
+            ]),
+        );
+    }
 
     paths
 }
@@ -897,23 +1099,31 @@ pub(super) async fn openapi_spec(State(state): State<AppState>, headers: HeaderM
         "tags": [
             { "name": "Status", "description": "Agent health and status" },
             { "name": "Chat", "description": "Send messages and stream responses" },
+            { "name": "Gateway", "description": "Messaging gateway status and routing" },
             { "name": "Skills", "description": "Manage agent skills and actions" },
             { "name": "Tasks", "description": "Create, schedule, and manage tasks" },
+            { "name": "Watchers", "description": "Background watcher inventory" },
             { "name": "Goals", "description": "Long-term goal tracking" },
             { "name": "Autonomy", "description": "Autonomous operation settings, briefings, and incidents" },
             { "name": "Settings", "description": "Application settings and API keys" },
             { "name": "Models", "description": "LLM model configuration" },
+            { "name": "Analytics", "description": "Usage, cost, and operational analytics" },
             { "name": "Integrations", "description": "Third-party service connections" },
+            { "name": "Hooks", "description": "Hooks and webhook event history" },
+            { "name": "SSH", "description": "SSH connection inventory" },
             { "name": "Documents", "description": "Document storage and semantic search" },
             { "name": "Memory", "description": "Learned facts, user preferences, user data, and knowledge base" },
             { "name": "Notifications", "description": "Notification inbox and read status" },
-            { "name": "Projects", "description": "Project workspace management" },
             { "name": "Conversations", "description": "Conversation history and messages" },
             { "name": "MCP", "description": "Model Context Protocol servers and tools" },
             { "name": "Security", "description": "Security logs and master password" },
             { "name": "Tunnel", "description": "Remote access providers and status" },
             { "name": "Swarm", "description": "Multi-agent swarm coordination" },
-            { "name": "Apps", "description": "Deployed app management" }
+            { "name": "Apps", "description": "Deployed app management" },
+            { "name": "ArkOrbit", "description": "ArkOrbit workspace inventory" },
+            { "name": "Browser", "description": "Interactive browser session inventory" },
+            { "name": "Channels", "description": "Messaging channel status" },
+            { "name": "Trace", "description": "Execution trace and run inspection" }
         ],
         "paths": build_openapi_paths(),
         "components": {

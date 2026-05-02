@@ -23,6 +23,70 @@ static IPV4_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b").unwrap()
 });
 
+fn char_before(text: &str, idx: usize) -> Option<char> {
+    text[..idx].chars().next_back()
+}
+
+fn char_after(text: &str, idx: usize) -> Option<char> {
+    text[idx..].chars().next()
+}
+
+fn is_numeric_token_prefix_char(ch: char) -> bool {
+    ch.is_ascii_digit() || matches!(ch, '.' | '_')
+}
+
+fn is_numeric_token_suffix_char(ch: char) -> bool {
+    ch.is_ascii_digit() || ch == '_'
+}
+
+fn is_decimal_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some((left, right)) = trimmed.split_once('.') else {
+        return false;
+    };
+    !left.is_empty()
+        && !right.is_empty()
+        && left.chars().all(|ch| ch.is_ascii_digit())
+        && right.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_likely_phone_match(source: &str, start: usize, end: usize) -> bool {
+    if char_before(source, start).is_some_and(is_numeric_token_prefix_char)
+        || char_after(source, end).is_some_and(is_numeric_token_suffix_char)
+    {
+        return false;
+    }
+
+    let value = &source[start..end];
+    if is_decimal_literal(value) {
+        return false;
+    }
+
+    true
+}
+
+fn redact_phone_numbers(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut changed = false;
+
+    for matched in PHONE_RE.find_iter(text) {
+        if !is_likely_phone_match(text, matched.start(), matched.end()) {
+            continue;
+        }
+        output.push_str(&text[cursor..matched.start()]);
+        output.push_str("[PHONE]");
+        cursor = matched.end();
+        changed = true;
+    }
+
+    if !changed {
+        return text.to_string();
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
 /// PII redactor with configurable pattern toggles
 pub struct PiiRedactor {
     pub redact_emails: bool,
@@ -64,7 +128,7 @@ impl PiiRedactor {
             result = EMAIL_RE.replace_all(&result, "[EMAIL]").to_string();
         }
         if self.redact_phones {
-            result = PHONE_RE.replace_all(&result, "[PHONE]").to_string();
+            result = redact_phone_numbers(&result);
         }
         if self.redact_ips {
             result = IPV4_RE.replace_all(&result, "[IP]").to_string();
@@ -94,7 +158,10 @@ mod tests {
     #[test]
     fn test_phone_redaction() {
         assert_eq!(redact_pii("Call 555-123-4567"), "Call [PHONE]");
+        assert_eq!(redact_pii("Call 555-123-4567."), "Call [PHONE].");
         assert!(redact_pii("+1 (555) 987-6543").contains("[PHONE]"));
+        assert!(redact_pii("Call 555.123.4567").contains("[PHONE]"));
+        assert_eq!(redact_pii("Call 5551234567"), "Call [PHONE]");
     }
 
     #[test]
@@ -129,6 +196,18 @@ mod tests {
     fn test_no_false_positives_on_clean_text() {
         let input = "Hello, how are you today?";
         assert_eq!(redact_pii(input), input);
+    }
+
+    #[test]
+    fn test_cost_decimal_telemetry_is_not_phone_redacted() {
+        for input in [
+            r#""cost_usd": 0.012934658880000002"#,
+            r#""cost_usd":0.21772148112000006"#,
+            r#""cost_usd": 0.29229803162999984"#,
+            r#""request_count":97,"cost_usd":0.21772148112000006"#,
+        ] {
+            assert_eq!(redact_pii(input), input);
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ export function normalizeSettingsTab(rawTab?: number | null): number {
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return 0;
   const tab = Math.max(0, Math.trunc(rawTab));
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 9) return 0;
   return tab;
 }
 
@@ -63,9 +64,9 @@ export function settingsTabFromLocation(): number {
     browser: 20,
     failover: 1,
     reliability: 1,
-    gateway: 9,
-    gatewayops: 9,
-    system: 9,
+    gateway: 0,
+    gatewayops: 0,
+    system: 0,
     trace: 11,
   };
   if (normalized in byName) return normalizeSettingsTab(byName[normalized]);

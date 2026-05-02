@@ -314,6 +314,19 @@ pub(super) fn guess_content_type(filename: &str) -> String {
     .to_string()
 }
 
+/// Guess MIME content type for deployed app files.
+///
+/// Output previews intentionally serve source files as text, but app assets
+/// need browser-executable MIME types when `nosniff` is enabled.
+pub(super) fn guess_app_content_type(filename: &str) -> String {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "css" => "text/css; charset=utf-8".to_string(),
+        "js" | "mjs" => "text/javascript; charset=utf-8".to_string(),
+        _ => guess_content_type(filename),
+    }
+}
+
 // ==================== Deployed Apps ====================
 
 pub(super) fn merge_executor_status_fields(
@@ -400,6 +413,31 @@ pub(super) async fn list_apps(State(state): State<AppState>) -> Json<serde_json:
     Json(serde_json::json!({ "apps": apps, "restore": restore }))
 }
 
+pub(super) async fn get_app_quality_report(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> Response {
+    let app_id = app_id.trim();
+    if !is_valid_app_id(app_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(app_dir) = state.app_registry.get_dir(app_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let report_path = app_dir.join(crate::actions::app::APP_QUALITY_REPORT_FILE);
+    let bytes = match tokio::fs::read(report_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub(super) fn is_valid_app_id(app_id: &str) -> bool {
     !app_id.is_empty()
         && app_id.len() <= 64
@@ -472,24 +510,57 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
   const PROXY_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/llm/chat";
   const PUBLIC_FETCH_PATH = "/apps/" + encodeURIComponent(APP_ID) + "/__agentark/http/fetch";
 
+  const extractUrl = (input) => {{
+    try {{
+      if (typeof input === "string") return input;
+      if (input && typeof input.url === "string") return input.url;
+      if (input instanceof URL) return input.toString();
+    }} catch (_) {{}}
+    return "";
+  }};
+  const toAbsoluteUrl = (input) => {{
+    try {{
+      const candidate = extractUrl(input);
+      return candidate ? new URL(candidate, window.location.href).toString() : "";
+    }} catch (_) {{
+      return extractUrl(input);
+    }}
+  }};
+  const shouldProxyPublicRead = (url, method) => {{
+    const inferredMethod = String(method || "GET").toUpperCase();
+    if (inferredMethod !== "GET" && inferredMethod !== "HEAD") {{
+      return false;
+    }}
+    try {{
+      const absolute = new URL(String(url || ""), window.location.href);
+      if ((absolute.protocol !== "http:" && absolute.protocol !== "https:") || absolute.origin === window.location.origin) {{
+        return false;
+      }}
+      const lowerPath = absolute.pathname.toLowerCase();
+      return (
+        !lowerPath.includes("/__agentark/http/fetch") &&
+        !lowerPath.includes("/__agentark/llm/chat") &&
+        !lowerPath.includes("/__agentark/arxiv/search")
+      );
+    }} catch (_) {{
+      return false;
+    }}
+  }};
+  const buildPublicFetchHeaders = (source) => {{
+    const headers = new Headers();
+    const sourceHeaders = new Headers(source || {{}});
+    ["accept", "accept-language", "if-none-match", "if-modified-since", "range"].forEach((name) => {{
+      const value = sourceHeaders.get(name);
+      if (value) {{
+        headers.set(name, value);
+      }}
+    }});
+    headers.set("x-agentark-app-proxy", "raw");
+    return headers;
+  }};
+
   const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
   if (nativeFetch) {{
-    const extractUrl = (input) => {{
-      try {{
-        if (typeof input === "string") return input;
-        if (input && typeof input.url === "string") return input.url;
-        if (input instanceof URL) return input.toString();
-      }} catch (_) {{}}
-      return "";
-    }};
-    const toAbsoluteUrl = (input) => {{
-      try {{
-        const candidate = extractUrl(input);
-        return candidate ? new URL(candidate, window.location.href).toString() : "";
-      }} catch (_) {{
-        return extractUrl(input);
-      }}
-    }};
     const shouldProxyLlm = (url) => {{
       const lower = String(url || "").toLowerCase();
       return (
@@ -503,38 +574,6 @@ pub(super) fn inject_app_runtime_fetch_shims(content: &str, app_id: &str) -> Str
         lower.endsWith("/v1/responses") ||
         lower.endsWith("/v1/completions")
       );
-    }};
-    const shouldProxyPublicRead = (url, method) => {{
-      const inferredMethod = String(method || "GET").toUpperCase();
-      if (inferredMethod !== "GET" && inferredMethod !== "HEAD") {{
-        return false;
-      }}
-      try {{
-        const absolute = new URL(String(url || ""), window.location.href);
-        if ((absolute.protocol !== "http:" && absolute.protocol !== "https:") || absolute.origin === window.location.origin) {{
-          return false;
-        }}
-        const lowerPath = absolute.pathname.toLowerCase();
-        return (
-          !lowerPath.includes("/__agentark/http/fetch") &&
-          !lowerPath.includes("/__agentark/llm/chat") &&
-          !lowerPath.includes("/__agentark/arxiv/search")
-        );
-      }} catch (_) {{
-        return false;
-      }}
-    }};
-    const buildPublicFetchHeaders = (source) => {{
-      const headers = new Headers();
-      const sourceHeaders = new Headers(source || {{}});
-      ["accept", "accept-language", "if-none-match", "if-modified-since", "range"].forEach((name) => {{
-        const value = sourceHeaders.get(name);
-        if (value) {{
-          headers.set(name, value);
-        }}
-      }});
-      headers.set("x-agentark-app-proxy", "raw");
-      return headers;
     }};
     window.fetch = function(input, init) {{
       const targetUrl = extractUrl(input);
@@ -2148,13 +2187,8 @@ pub(super) async fn public_proxy_raw(
 
 pub(super) fn extract_query_param(query: Option<&str>, key: &str) -> Option<String> {
     query.and_then(|q| {
-        url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| {
-            if k == key {
-                Some(v.into_owned())
-            } else {
-                None
-            }
-        })
+        url::form_urlencoded::parse(q.as_bytes())
+            .find_map(|(k, v)| if k == key { Some(v.into_owned()) } else { None })
     })
 }
 
@@ -2860,6 +2894,8 @@ pub(super) async fn serve_app_file_inner(
     }
 
     if let Some(port) = state.app_registry.get_port(app_id).await {
+        let proxy_path_mode =
+            crate::actions::app::proxy_path_mode_for_app_dir(&app_dir, app_id).await;
         if is_ws_request {
             if method != Method::GET {
                 return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -2870,12 +2906,9 @@ pub(super) async fn serve_app_file_inner(
                     .into_response();
             };
 
-            let upstream_path = path.trim_start_matches('/');
-            let mut upstream_url = if upstream_path.is_empty() {
-                format!("ws://127.0.0.1:{}/", port)
-            } else {
-                format!("ws://127.0.0.1:{}/{}", port, upstream_path)
-            };
+            let upstream_path =
+                crate::actions::app::dynamic_app_upstream_path(app_id, path, proxy_path_mode);
+            let mut upstream_url = format!("ws://127.0.0.1:{}{}", port, upstream_path);
             if let Some(q) = clean_query.as_deref().filter(|q| !q.is_empty()) {
                 upstream_url.push('?');
                 upstream_url.push_str(q);
@@ -2938,12 +2971,9 @@ pub(super) async fn serve_app_file_inner(
                 .into_response();
         }
 
-        let upstream_path = path.trim_start_matches('/');
-        let mut target_url = if upstream_path.is_empty() {
-            format!("http://127.0.0.1:{}/", port)
-        } else {
-            format!("http://127.0.0.1:{}/{}", port, upstream_path)
-        };
+        let upstream_path =
+            crate::actions::app::dynamic_app_upstream_path(app_id, path, proxy_path_mode);
+        let mut target_url = format!("http://127.0.0.1:{}{}", port, upstream_path);
         if let Some(q) = clean_query.as_deref().filter(|q| !q.is_empty()) {
             target_url.push('?');
             target_url.push_str(q);
@@ -3061,7 +3091,7 @@ pub(super) async fn serve_app_file_inner(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("index.html");
-                let content_type = guess_content_type(filename);
+                let content_type = guess_app_content_type(filename);
                 let mut response_bytes = bytes;
                 if should_upgrade_insecure_links(&content_type) {
                     let mut rewritten = String::from_utf8_lossy(&response_bytes).into_owned();
@@ -3447,6 +3477,139 @@ pub(super) async fn update_app_access_guard(
             };
             (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct AppPublishRequest {
+    #[serde(default)]
+    deploy_target: Option<String>,
+    #[serde(default)]
+    production: Option<bool>,
+    #[serde(default)]
+    vercel_project_mode: Option<String>,
+    #[serde(default)]
+    vercel_project_id: Option<String>,
+    #[serde(default)]
+    vercel_team_id: Option<String>,
+    #[serde(default)]
+    build_command: Option<String>,
+    #[serde(default)]
+    output_dir: Option<String>,
+}
+
+struct AppPublishLockGuard {
+    key: String,
+    locks: Arc<parking_lot::Mutex<HashSet<String>>>,
+}
+
+impl AppPublishLockGuard {
+    fn acquire(key: String, locks: Arc<parking_lot::Mutex<HashSet<String>>>) -> Option<Self> {
+        if !locks.lock().insert(key.clone()) {
+            return None;
+        }
+        Some(Self { key, locks })
+    }
+}
+
+impl Drop for AppPublishLockGuard {
+    fn drop(&mut self) {
+        self.locks.lock().remove(&self.key);
+    }
+}
+
+pub(super) async fn publish_app(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+    Json(request): Json<AppPublishRequest>,
+) -> Response {
+    if !is_valid_app_id(&app_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid app_id" })),
+        )
+            .into_response();
+    }
+
+    let Some(app_dir) = state.app_registry.get_dir(&app_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "App not found" })),
+        )
+            .into_response();
+    };
+
+    let publish_lock_key = app_id.clone();
+    let publish_locks = state.app_publish_locks.clone();
+    let Some(_publish_lock) = AppPublishLockGuard::acquire(publish_lock_key, publish_locks) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "A publish operation is already in progress for this app."
+            })),
+        )
+            .into_response();
+    };
+
+    let mut arguments = serde_json::to_value(&request).unwrap_or_else(|_| serde_json::json!({}));
+    if arguments
+        .get("deploy_target")
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        arguments["deploy_target"] = serde_json::json!("vercel_direct");
+    }
+    let options = crate::actions::vercel::ExternalDeployOptions::from_arguments(&arguments);
+    let meta = crate::actions::vercel::load_app_meta(&app_dir).await;
+    let title = meta
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&app_id)
+        .to_string();
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir().to_path_buf())
+    };
+
+    match crate::actions::vercel::publish_app_to_external_target(
+        &config_dir,
+        &data_dir,
+        &app_id,
+        &app_dir,
+        &meta,
+        &title,
+        &options,
+    )
+    .await
+    {
+        Ok(Some(result)) => {
+            if result
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status == "deployed")
+            {
+                trigger_arkpulse_after_app_change(&state, "app_external_publish").await;
+            }
+            Json(serde_json::json!({
+                "status": result.get("status").cloned().unwrap_or_else(|| serde_json::json!("ok")),
+                "app_id": app_id,
+                "title": title,
+                "external_deployment": result,
+            }))
+            .into_response()
+        }
+        Ok(None) => Json(serde_json::json!({
+            "status": "skipped",
+            "app_id": app_id,
+            "title": title,
+            "message": "No external deployment target was selected."
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -3895,7 +4058,12 @@ pub(super) async fn restart_app(
     }
 }
 
-/// Stop and delete an app from disk
+/// Stop and delete an app from disk.
+///
+/// Best-effort, idempotent cleanup: each step is attempted independently and
+/// failures are collected into a per-step warning list rather than aborting the
+/// whole operation. Deleting an app that no longer exists returns success
+/// quietly.
 pub(super) async fn delete_app(
     State(state): State<AppState>,
     Path(app_id): Path<String>,
@@ -3907,6 +4075,8 @@ pub(super) async fn delete_app(
         )
             .into_response();
     }
+
+    tracing::info!("delete_app: starting cleanup for app '{}'", app_id);
 
     let app_title: Option<String> = {
         let apps = state.app_registry.list().await;
@@ -3926,7 +4096,16 @@ pub(super) async fn delete_app(
         data_dir.join("apps").join(&app_id)
     };
 
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Step 1: ask the executor (or our local registry) to stop the running
+    // container/process. This must happen before files are removed so that
+    // filesystem mounts let go of the workspace dir.
     if let Some(executor) = state.executor_client.as_ref() {
+        tracing::info!(
+            "delete_app: requesting executor stop+delete for '{}'",
+            app_id
+        );
         match executor
             .request(
                 reqwest::Method::DELETE,
@@ -3935,64 +4114,138 @@ pub(super) async fn delete_app(
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+            Ok(response)
+                if response.status().is_success()
+                    || response.status() == reqwest::StatusCode::NOT_FOUND => {}
             Ok(response) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let status = response.status();
                 let payload = response
                     .json::<serde_json::Value>()
                     .await
                     .unwrap_or_else(|_| serde_json::json!({}));
-                return (
+                let msg = payload
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("executor returned non-success status")
+                    .to_string();
+                tracing::warn!(
+                    "delete_app: executor delete failed for '{}' ({}): {}",
+                    app_id,
                     status,
-                    Json(serde_json::json!({
-                        "error": payload.get("message").and_then(|value| value.as_str()).unwrap_or("Failed to stop app before delete"),
-                        "details": payload
-                    })),
-                )
-                    .into_response();
+                    msg
+                );
+                warnings.push(format!("executor_delete: {} ({})", msg, status));
             }
             Err(error) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("Failed to contact executor before delete: {}", error)
-                    })),
-                )
-                    .into_response();
+                tracing::warn!(
+                    "delete_app: failed to contact executor for '{}': {}",
+                    app_id,
+                    error
+                );
+                warnings.push(format!("executor_unreachable: {}", error));
             }
         }
-    } else if let Err(e) = state.app_registry.stop(&app_id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({ "error": format!("Failed to stop app before delete: {}", e) }),
-            ),
-        )
-            .into_response();
+    } else if let Err(error) = state.app_registry.stop(&app_id).await {
+        tracing::warn!(
+            "delete_app: registry.stop failed for '{}': {}",
+            app_id,
+            error
+        );
+        warnings.push(format!("stop_runtime: {}", error));
     }
+
+    // Step 2: belt-and-suspenders container removal in case the registry never
+    // tracked it (e.g. we crashed before recording container_id) but the
+    // container is still around.
+    let container_name = crate::actions::app::app_container_name(&app_id);
+    tracing::info!(
+        "delete_app: ensuring container '{}' is removed for '{}'",
+        container_name,
+        app_id
+    );
+    crate::actions::app::cleanup_existing_container(&container_name).await;
+
+    // Step 3: remove the app workspace directory (covers source files,
+    // node_modules, .agentark/venv, captured stdout/stderr logs, dockerfiles,
+    // and anything else generated during deploy/run).
+    tracing::info!("delete_app: removing workspace dir {}", app_dir.display());
     match tokio::fs::remove_dir_all(&app_dir).await {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to delete app files: {}", error) })),
-            )
-                .into_response();
+            tracing::warn!(
+                "delete_app: failed to remove workspace {} for '{}': {}",
+                app_dir.display(),
+                app_id,
+                error
+            );
+            warnings.push(format!("remove_workspace: {}", error));
         }
     }
 
+    // Step 4: prune in-memory/persisted registry rows, free the reserved port,
+    // delete app-scoped notifications and ArkPulse events. `purge_deleted_app_state`
+    // (invoked inside `cleanup_deleted_app_references`) handles port release and
+    // access-token cleanup; failures inside it are already logged as warnings.
+    tracing::info!(
+        "delete_app: pruning registry/notification state for '{}'",
+        app_id
+    );
     let cleanup = cleanup_deleted_app_references(&state, &app_id, app_title.as_deref()).await;
     trigger_arkpulse_after_app_change(&state, "app_delete").await;
+
+    tracing::info!(
+        "delete_app: completed for '{}' (warnings={})",
+        app_id,
+        warnings.len()
+    );
+
     Json(serde_json::json!({
         "status": "deleted",
         "app_id": app_id,
         "deleted_notifications": cleanup.deleted_notifications,
-        "deleted_pulse_events": cleanup.deleted_pulse_events
+        "deleted_pulse_events": cleanup.deleted_pulse_events,
+        "deleted_reflect_units": cleanup.deleted_reflect_units,
+        "warnings": warnings,
     }))
     .into_response()
+}
+
+fn path_has_source_checkout_markers(path: &FsPath) -> bool {
+    path.join("Cargo.toml").is_file() && path.join("src").is_dir()
+}
+
+fn data_dir_looks_like_source_checkout(data_dir: &FsPath) -> bool {
+    if path_has_source_checkout_markers(data_dir) {
+        return true;
+    }
+
+    let Ok(current_dir) = std::env::current_dir() else {
+        return false;
+    };
+    if !path_has_source_checkout_markers(&current_dir) {
+        return false;
+    }
+
+    let canonical_data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_current =
+        std::fs::canonicalize(&current_dir).unwrap_or_else(|_| current_dir.clone());
+    canonical_data == canonical_current
+}
+
+fn managed_uploads_dir(data_dir: &FsPath) -> PathBuf {
+    if !data_dir_looks_like_source_checkout(data_dir) {
+        return data_dir.join("uploads");
+    }
+
+    if let Some(dirs) = crate::branding::project_dirs() {
+        let fallback_data_dir = dirs.data_dir().to_path_buf();
+        if !data_dir_looks_like_source_checkout(&fallback_data_dir) {
+            return fallback_data_dir.join("uploads");
+        }
+    }
+
+    std::env::temp_dir().join("agentark").join("uploads")
 }
 
 /// Upload a file for use in chat (attachments for code execution, analysis, etc.)
@@ -4004,7 +4257,14 @@ pub(super) async fn upload_chat_file(
         let agent = state.agent.read().await;
         (agent.data_dir().to_path_buf(), agent.storage.clone())
     };
-    let uploads_dir = data_dir.join("uploads");
+    let uploads_dir = managed_uploads_dir(&data_dir);
+    if uploads_dir != data_dir.join("uploads") {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            upload_dir = %uploads_dir.display(),
+            "Upload storage was redirected away from a source checkout data directory"
+        );
+    }
 
     let mut uploaded_files = Vec::new();
 
@@ -4063,18 +4323,6 @@ pub(super) async fn upload_chat_file(
                     tracing::error!("Failed to persist upload manifest: {}", error);
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
-                if let Some(workspace) = state.workspace_client.as_ref() {
-                    if let Err(error) = workspace
-                        .put_blob(&format!("uploads/{}", manifest.stored_name), &data)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to mirror upload {} to workspace service: {}",
-                            manifest.id,
-                            error
-                        );
-                    }
-                }
 
                 tracing::info!("File uploaded: {} ({} bytes)", safe_name, data.len());
                 uploaded_files.push(serde_json::json!({
@@ -4125,7 +4373,7 @@ pub(super) async fn serve_upload_file(
         }
     };
 
-    let uploads_dir = data_dir.join("uploads");
+    let uploads_dir = managed_uploads_dir(&data_dir);
     let mut bytes = if let Ok(uploads_root) = tokio::fs::canonicalize(&uploads_dir).await {
         match tokio::fs::canonicalize(uploads_root.join(&manifest.stored_name)).await {
             Ok(file_path) if file_path.starts_with(&uploads_root) => {

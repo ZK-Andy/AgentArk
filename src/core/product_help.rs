@@ -1,5 +1,5 @@
 use crate::actions::ActionDef;
-use crate::docs::product_help::{BUNDLED_HELP_DOCS, render_bundled_help_doc};
+use crate::docs::product_help::{render_bundled_help_doc, BUNDLED_HELP_DOCS};
 use std::collections::BTreeSet;
 
 pub const CURATED_SOURCE: &str = "agentark_help";
@@ -451,50 +451,32 @@ mod tests {
         ]);
         assert!(items.iter().any(|item| item.source == CURATED_SOURCE));
         assert!(items.iter().any(|item| item.source == RUNTIME_SOURCE));
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title.contains("Main navigation"))
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Models and provider setup")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Embeddings and retrieval")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Input needed and unattended runs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Environment, deployment, and investigation")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Chat shortcuts and safe actions")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Custom integrations and extension packs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Plugins, webhooks, and custom APIs")
-        );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.title == "Runtime environment and investigation")
-        );
+        assert!(items
+            .iter()
+            .any(|item| item.title.contains("Main navigation")));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Models and provider setup"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Embeddings and retrieval"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Input needed and unattended runs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Environment, deployment, and investigation"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Chat shortcuts and safe actions"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Custom integrations and extension packs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Plugins, webhooks, and custom APIs"));
+        assert!(items
+            .iter()
+            .any(|item| item.title == "Runtime environment and investigation"));
     }
 }

@@ -3,11 +3,21 @@ import MoreVertIcon from "@mui/icons-material/MoreVert";
 import {
   Alert,
   Box,
+  Button,
   Chip,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  FormControlLabel,
   IconButton,
   Link,
   Menu,
   MenuItem,
+  Switch,
+  TextField,
   Stack,
   Table,
   TableBody,
@@ -44,6 +54,21 @@ type RowMenuAction = {
 type AppsPageProps = {
   autoRefresh: boolean;
 };
+
+type QualityDialogTarget = {
+  id: string;
+  title: string;
+  appItem: JsonRecord;
+};
+
+type VercelPublishTarget = {
+  id: string;
+  title: string;
+  appItem: JsonRecord;
+  mode: "vercel_direct" | "vercel_git";
+};
+
+type VercelProjectMode = "auto" | "existing" | "create";
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -85,6 +110,24 @@ function toBool(value: unknown): boolean {
     return normalized === "true" || normalized === "1" || normalized === "yes";
   }
   return false;
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => str(item, "").trim())
+    .filter((item) => item.length > 0);
+}
+
+function normalizeVercelProjectMode(value: unknown): VercelProjectMode {
+  const normalized = str(value, "").trim().toLowerCase();
+  if (normalized === "existing") {
+    return "existing";
+  }
+  if (normalized === "create") {
+    return "create";
+  }
+  return "auto";
 }
 
 function errMessage(error: unknown): string {
@@ -168,6 +211,92 @@ function getAppAccessPasswordValue(
     str(appItem.access_key, "").trim() ||
     extractAccessPasswordFromUrl(accessUrl, baseOrigin)
   );
+}
+
+type AppQualityChip = {
+  label: string;
+  color: "default" | "success" | "warning" | "info" | "error";
+  title: string;
+};
+
+function appQualityChip(appItem: JsonRecord): AppQualityChip | null {
+  const report = asRecord(appItem.quality_report);
+  const status = str(report.status, str(appItem.quality_report_status, ""))
+    .trim()
+    .toLowerCase();
+  if (!status || status === "unavailable") return null;
+  const coverage = asRecord(report.coverage);
+  const total = num(coverage.total, 0);
+  const covered = num(coverage.covered, 0);
+  const missing = num(coverage.missing, Math.max(0, total - covered));
+  const concerns = Array.isArray(report.judge_concerns)
+    ? report.judge_concerns.length
+    : 0;
+  if (status === "pending") {
+    return {
+      label: "Review pending",
+      color: "info",
+      title: "Automated app review is queued.",
+    };
+  }
+  if (status === "error") {
+    return {
+      label: "Review unavailable",
+      color: "error",
+      title: str(report.detail, "Automated app review did not complete."),
+    };
+  }
+  if (total > 0) {
+    const passed = missing === 0 && concerns === 0;
+    return {
+      label: passed ? "Review OK" : "Review needs attention",
+      color: passed ? "success" : "warning",
+      title: passed
+        ? `Automated review found all ${total} requested item${total === 1 ? "" : "s"}.`
+        : `Automated review found ${covered} of ${total} requested item${total === 1 ? "" : "s"}.`,
+    };
+  }
+  if (status === "passed") {
+    return {
+      label: "Review OK",
+      color: "success",
+      title: "Automated app review found no advisory concerns.",
+    };
+  }
+  if (status === "concerns") {
+    return {
+      label: "Review notes",
+      color: "warning",
+      title:
+        concerns > 0
+          ? `Automated app review has ${concerns} note${concerns === 1 ? "" : "s"}.`
+          : "Automated app review has advisory notes.",
+    };
+  }
+  return null;
+}
+
+function qualityDialogDetails(appItem: JsonRecord) {
+  const report = asRecord(appItem.quality_report);
+  const coverage = asRecord(report.coverage);
+  const items = Array.isArray(coverage.items)
+    ? coverage.items.filter(isRecord)
+    : [];
+  return {
+    report,
+    coverage,
+    total: num(coverage.total, 0),
+    covered: num(coverage.covered, 0),
+    missing: num(
+      coverage.missing,
+      Math.max(0, num(coverage.total, 0) - num(coverage.covered, 0)),
+    ),
+    concerns: stringList(report.judge_concerns),
+    items,
+    status: str(report.status, str(appItem.quality_report_status, ""))
+      .trim()
+      .toLowerCase(),
+  };
 }
 
 function dedupeLinkTargets(
@@ -254,6 +383,11 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
     queryFn: () => api.rawGet("/tunnel/status"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
+  const integrationsQ = useQuery({
+    queryKey: ["apps-manager-integrations"],
+    queryFn: api.getIntegrations,
+    refetchInterval: autoRefresh ? REFRESH_MS : false,
+  });
   const [tunnelActionError, setTunnelActionError] = useState<string | null>(
     null,
   );
@@ -269,6 +403,25 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
     null,
   );
   const [appsActionBusy, setAppsActionBusy] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [qualityTarget, setQualityTarget] =
+    useState<QualityDialogTarget | null>(null);
+  const [vercelTarget, setVercelTarget] = useState<VercelPublishTarget | null>(
+    null,
+  );
+  const [vercelToken, setVercelToken] = useState("");
+  const [vercelTeamId, setVercelTeamId] = useState("");
+  const [vercelProjectMode, setVercelProjectMode] =
+    useState<VercelProjectMode>("auto");
+  const [vercelProjectId, setVercelProjectId] = useState("");
+  const [vercelProduction, setVercelProduction] = useState(false);
+  const [vercelBusy, setVercelBusy] = useState(false);
+  const [vercelError, setVercelError] = useState<string | null>(null);
 
   const opMutation = useMutation({
     mutationFn: ({
@@ -301,7 +454,8 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
   });
 
   const tunnelStopMutation = useMutation({
-    mutationFn: () => api.rawPost("/tunnel/stop", {}),
+    mutationFn: (payload: { app_id?: string }) =>
+      api.rawPost("/tunnel/stop", payload),
     onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: ["apps-manager-tunnel-status"],
@@ -312,6 +466,15 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
 
   const appsPayload = asRecord(appsQ.data);
   const apps = pickRecords(appsPayload, "apps");
+  const integrations = Array.isArray(integrationsQ.data?.integrations)
+    ? integrationsQ.data.integrations
+    : [];
+  const vercelIntegration = integrations.find(
+    (item) => str((item as JsonRecord).id, "") === "vercel",
+  ) as JsonRecord | undefined;
+  const vercelConfigValues = asRecord(vercelIntegration?.config_values);
+  const vercelConnected =
+    str(vercelIntegration?.status, "").trim().toLowerCase() === "connected";
   const restoreInfo = asRecord(appsPayload.restore);
   const restoreActive = toBool(restoreInfo.active);
   const restoreTotal = Math.max(0, num(restoreInfo.total, apps.length));
@@ -329,14 +492,25 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
   const tunnelActive = toBool(tunnel.active);
   const tunnelAvailable = toBool(tunnel.available);
   const tunnelErrorText = str(tunnel.error, "").trim();
+  const isCloudflareQuickTunnel =
+    !tunnelMeta.isPrivate &&
+    str(tunnel.provider, "").trim().toLowerCase() === "cloudflare";
   const selectedPublicAppId = str(tunnel.selected_app_id, "").trim();
+  const exposedPublicAppIds = new Set(stringList(tunnel.exposed_app_ids));
+  if (selectedPublicAppId) exposedPublicAppIds.add(selectedPublicAppId);
+  const exposedPublicAppIdsKey = Array.from(exposedPublicAppIds)
+    .sort()
+    .join("|");
   const tunnelControlPlaneEnabled = toBool(tunnel.control_plane_enabled);
   const tunnelExposureActive =
-    tunnelActive && (!!selectedPublicAppId || tunnelControlPlaneEnabled);
+    tunnelActive &&
+    (exposedPublicAppIds.size > 0 || tunnelControlPlaneEnabled);
   const tunnelStarting =
     tunnelActionState === "starting" || tunnelStartMutation.isPending;
   const tunnelStopping =
     tunnelActionState === "stopping" || tunnelStopMutation.isPending;
+  const showQuickTunnelWarning =
+    isCloudflareQuickTunnel && tunnelActive && !!tunnelBaseUrl;
 
   useEffect(() => {
     if (tunnelActionState === "starting") {
@@ -345,13 +519,21 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       }
       return;
     }
-    if (tunnelActionState === "stopping" && !tunnelExposureActive) {
-      setTunnelActionState("idle");
+    if (tunnelActionState === "stopping") {
+      if (tunnelActionAppId) {
+        if (!exposedPublicAppIds.has(tunnelActionAppId)) {
+          setTunnelActionState("idle");
+        }
+      } else if (!tunnelExposureActive) {
+        setTunnelActionState("idle");
+      }
     }
   }, [
     tunnelActionState,
+    tunnelActionAppId,
     tunnelBaseUrl,
     tunnelErrorText,
+    exposedPublicAppIdsKey,
     tunnelExposureActive,
   ]);
 
@@ -407,6 +589,9 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       queryClient.invalidateQueries({
         queryKey: ["apps-manager-tunnel-status"],
       }),
+      queryClient.invalidateQueries({
+        queryKey: ["apps-manager-integrations"],
+      }),
     ]);
   };
 
@@ -443,6 +628,136 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       return false;
     } finally {
       setAppsActionBusy(null);
+    }
+  };
+
+  const confirmDeleteApp = async () => {
+    if (!deleteTarget || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await opMutation.mutateAsync({
+        path: `/api/apps/${encodeURIComponent(deleteTarget.id)}`,
+        method: "DELETE",
+      });
+      await refreshAppState();
+      setAppsActionSuccess(`Delete App completed.`);
+      setDeleteTarget(null);
+    } catch (error) {
+      setDeleteError(errMessage(error));
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  const openVercelDialog = (
+    appItem: JsonRecord,
+    mode: "vercel_direct" | "vercel_git",
+  ) => {
+    const external = asRecord(appItem.external_deployments);
+    const vercel = asRecord(external.vercel || appItem.vercel_deployment);
+    setVercelTarget({
+      id: str(appItem.id, ""),
+      title: str(appItem.title, str(appItem.id, "")),
+      appItem,
+      mode,
+    });
+    setVercelProjectMode(
+      mode === "vercel_git"
+        ? "existing"
+        : normalizeVercelProjectMode(vercel.project_mode),
+    );
+    setVercelProjectId(
+      str(vercel.project_id, str(vercelConfigValues.project_id, "")).trim(),
+    );
+    setVercelTeamId(
+      str(vercel.team_id, str(vercelConfigValues.team_id, "")).trim(),
+    );
+    setVercelProduction(str(vercel.target, "").trim() === "production");
+    setVercelToken("");
+    setVercelError(null);
+  };
+
+  const publishVercelTarget = async () => {
+    if (!vercelTarget || vercelBusy) return;
+    setVercelBusy(true);
+    setVercelError(null);
+    setAppsActionError(null);
+    setAppsActionSuccess(null);
+    try {
+      if (!vercelConnected) {
+        if (!vercelToken.trim()) {
+          setVercelError("Vercel access token is required.");
+          return;
+        }
+        await api.configureIntegration("vercel", {
+          token: vercelToken.trim(),
+          team_id: vercelTeamId.trim() || undefined,
+          project_id: vercelProjectId.trim() || undefined,
+        });
+        setVercelToken("");
+        await queryClient.invalidateQueries({
+          queryKey: ["apps-manager-integrations"],
+        });
+      }
+      const payload = await api.rawPost(
+        `/api/apps/${encodeURIComponent(vercelTarget.id)}/publish`,
+        {
+          deploy_target: vercelTarget.mode,
+          production: vercelProduction,
+          vercel_project_mode: vercelProjectMode,
+          vercel_team_id: vercelTeamId.trim() || undefined,
+          vercel_project_id: vercelProjectId.trim() || undefined,
+        },
+      );
+      const deployment = asRecord(asRecord(payload).external_deployment);
+      const status = str(deployment.status, str(asRecord(payload).status, ""));
+      if (status === "needs_auth") {
+        setVercelError("Connect Vercel before publishing this app.");
+        return;
+      }
+      if (status === "needs_project") {
+        setVercelError(str(deployment.message, "Select a Vercel project."));
+        return;
+      }
+      if (
+        status === "needs_git" ||
+        status === "needs_git_push" ||
+        status === "vercel_project_linked"
+      ) {
+        setAppsActionSuccess(str(deployment.message, "Vercel Git setup is needed."));
+        setVercelTarget(null);
+        await refreshAppState();
+        return;
+      }
+      if (status === "error") {
+        setVercelError(str(deployment.message, "Vercel deployment failed."));
+        await refreshAppState();
+        return;
+      }
+      if (status === "building") {
+        setAppsActionSuccess(
+          str(
+            deployment.message,
+            "Vercel accepted the deployment and it is still building.",
+          ),
+        );
+        setVercelToken("");
+        setVercelTarget(null);
+        await refreshAppState();
+        return;
+      }
+      const url = str(deployment.url, "");
+      setAppsActionSuccess(
+        url ? `Published to Vercel: ${url}` : "Published to Vercel.",
+      );
+      setVercelToken("");
+      setVercelTarget(null);
+      await refreshAppState();
+    } catch (error) {
+      setVercelError(errMessage(error));
+    } finally {
+      setVercelBusy(false);
     }
   };
 
@@ -522,11 +837,12 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
     }
   };
 
-  const stopTunnel = async () => {
+  const stopTunnel = async (appId?: string) => {
     setTunnelActionError(null);
     setTunnelActionState("stopping");
+    setTunnelActionAppId(appId || "");
     try {
-      await tunnelStopMutation.mutateAsync();
+      await tunnelStopMutation.mutateAsync(appId ? { app_id: appId } : {});
       await refreshLinks();
     } catch (error) {
       setTunnelActionState("idle");
@@ -549,6 +865,14 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
       {appsActionError ? <Alert severity="error">{appsActionError}</Alert> : null}
       {appsActionSuccess ? (
         <Alert severity="success">{appsActionSuccess}</Alert>
+      ) : null}
+      {showQuickTunnelWarning ? (
+        <Alert severity="info" variant="outlined">
+          Public links from Cloudflare Quick Tunnel are temporary. They are good
+          for sharing or testing now, but the address can change or stop after a
+          session restart. For a permanent address, choose a production tunnel in
+          Settings.
+        </Alert>
       ) : null}
       {appsRestartNotice ? (
         <Box className="settings-inline-card tone-info">
@@ -627,7 +951,7 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                     accessUrl || url,
                     origin,
                   );
-                  const isSelectedPublicApp = selectedPublicAppId === id;
+                  const isPublicAppExposed = exposedPublicAppIds.has(id);
                   const runtimeMode = str(appItem.runtime_mode, "")
                     .trim()
                     .toLowerCase();
@@ -641,11 +965,12 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                   const isEnabled =
                     appItem.enabled === undefined ? true : toBool(appItem.enabled);
                   const isRunning = toBool(appItem.running);
+                  const qualityChip = appQualityChip(appItem);
                   const canStopApp = isEnabled && !isRestoring;
                   const canRestartApp =
                     !isRestoring && (!isEnabled || !isStaticApp || isRunning);
                   const appTunnelActive =
-                    tunnelActive && !!tunnelBaseUrl && isSelectedPublicApp;
+                    tunnelActive && !!tunnelBaseUrl && isPublicAppExposed;
                   const publicUrl = appTunnelActive
                     ? toAbsoluteAppUrl(url, tunnelBaseUrl)
                     : "";
@@ -654,16 +979,22 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                   const controlPlaneTunnelOnly =
                     tunnelActive &&
                     !!tunnelBaseUrl &&
-                    !selectedPublicAppId &&
+                    exposedPublicAppIds.size === 0 &&
                     tunnelControlPlaneEnabled;
                   const publicTunnelReadyOnly =
                     tunnelActive &&
                     !!tunnelBaseUrl &&
-                    !selectedPublicAppId &&
+                    exposedPublicAppIds.size === 0 &&
                     !tunnelControlPlaneEnabled;
                   const publicShareUrl = publicUrl;
                   const localShareUrl = localUrl;
                   const shareUrl = publicShareUrl || localShareUrl;
+                  const externalDeployments = asRecord(appItem.external_deployments);
+                  const vercelDeployment = asRecord(
+                    externalDeployments.vercel || appItem.vercel_deployment,
+                  );
+                  const vercelUrl = str(vercelDeployment.url, "").trim();
+                  const vercelStatus = str(vercelDeployment.status, "").trim();
                   const shareCaptionLabel =
                     getAppSharePublicCaption(tunnelMeta);
                   const shareOpenLabel = getAppShareOpenLabel(tunnelMeta);
@@ -766,40 +1097,55 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                     },
                     {
                       label: tunnelStarting
-                        ? tunnelMeta.isPrivate
-                          ? "Starting Private Access..."
-                          : "Starting Public Tunnel..."
-                        : tunnelActive && selectedPublicAppId === id
+                        ? tunnelActionAppId === id
+                          ? tunnelMeta.isPrivate
+                            ? "Starting Private Access..."
+                            : "Starting Public Access..."
+                          : tunnelMeta.isPrivate
+                            ? "Start Private Access"
+                            : "Start Public Access"
+                        : isPublicAppExposed
                           ? tunnelMeta.isPrivate
                             ? "Refresh Private Exposure"
                             : "Refresh Public Exposure"
-                          : tunnelActive &&
-                              selectedPublicAppId &&
-                              selectedPublicAppId !== id
-                            ? tunnelMeta.isPrivate
-                              ? "Set as Private Landing App"
-                              : "Set as Public Landing App"
-                            : tunnelMeta.isPrivate
-                              ? "Start Private Access"
-                              : "Start Public Tunnel",
+                          : tunnelMeta.isPrivate
+                            ? "Start Private Access"
+                            : "Start Public Access",
                       divider: true,
                       disabled: tunnelStarting || !tunnelAvailable,
                       onClick: () => startTunnel(id),
                     },
                     {
                       label: tunnelStopping
-                        ? "Stopping Exposure..."
+                        ? tunnelActionAppId === id
+                          ? "Stopping Exposure..."
+                          : tunnelMeta.isPrivate
+                            ? "Stop Private Exposure"
+                            : "Stop Public Exposure"
                         : tunnelMeta.isPrivate
                           ? "Stop Private Exposure"
                           : "Stop Public Exposure",
-                      disabled: tunnelStopping || !tunnelExposureActive,
-                      onClick: stopTunnel,
+                      disabled: tunnelStopping || !isPublicAppExposed,
+                      onClick: () => stopTunnel(id),
                     },
                     {
                       label: tunnelMeta.isPrivate
                         ? "Refresh Private URL"
                         : "Refresh Public Link",
                       onClick: refreshLinks,
+                    },
+                    {
+                      label: vercelConnected
+                        ? "Publish to Vercel"
+                        : "Connect Vercel + Publish",
+                      divider: true,
+                      disabled: appsActionBusy != null || isRestoring,
+                      onClick: () => openVercelDialog(appItem, "vercel_direct"),
+                    },
+                    {
+                      label: "Vercel via Git",
+                      disabled: appsActionBusy != null || isRestoring,
+                      onClick: () => openVercelDialog(appItem, "vercel_git"),
                     },
                     {
                       label: !canStopApp ? "Stop Unavailable" : "Stop",
@@ -839,12 +1185,13 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                       tone: "error",
                       divider: true,
                       disabled: appsActionBusy != null,
-                      onClick: () =>
-                        void runAppOp({
-                          label: "Delete App",
-                          path: `/api/apps/${encodeURIComponent(id)}`,
-                          method: "DELETE",
-                        }),
+                      onClick: () => {
+                        setDeleteError(null);
+                        setDeleteTarget({
+                          id,
+                          title: str(appItem.title, id) || id,
+                        });
+                      },
                     },
                   ];
 
@@ -886,6 +1233,27 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                               label="Stopped"
                             />
                           )}
+                          {qualityChip ? (
+                            <Chip
+                              size="small"
+                              color={qualityChip.color}
+                              variant={
+                                qualityChip.color === "success"
+                                  ? "filled"
+                                  : "outlined"
+                              }
+                              label={qualityChip.label}
+                              title={qualityChip.title}
+                              onClick={() => {
+                                if (!id) return;
+                                setQualityTarget({
+                                  id,
+                                  title: str(appItem.title, id) || id,
+                                  appItem,
+                                });
+                              }}
+                            />
+                          ) : null}
                         </Stack>
                       </TableCell>
                       <TableCell sx={{ maxWidth: 420 }}>
@@ -967,23 +1335,25 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                             </Typography>
                           ) : null}
                           {publicShareUrl ? (
-                            <Typography
-                              variant="caption"
-                              component="div"
-                              noWrap
-                              title={publicShareUrl}
-                              sx={{ color: "info.main" }}
-                            >
-                              {shareCaptionLabel}{" "}
-                              <Link
-                                href={publicShareUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                underline="hover"
+                            <>
+                              <Typography
+                                variant="caption"
+                                component="div"
+                                noWrap
+                                title={publicShareUrl}
+                                sx={{ color: "info.main" }}
                               >
-                                {publicShareUrl}
-                              </Link>
-                            </Typography>
+                                {shareCaptionLabel}{" "}
+                                <Link
+                                  href={publicShareUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  underline="hover"
+                                >
+                                  {publicShareUrl}
+                                </Link>
+                              </Typography>
+                            </>
                           ) : tunnelStarting && tunnelActionAppId === id ? (
                             <Typography
                               variant="caption"
@@ -992,7 +1362,7 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                             >
                               {shareCaptionLabel} starting tunnel...
                             </Typography>
-                          ) : tunnelStopping && isSelectedPublicApp ? (
+                          ) : tunnelStopping && tunnelActionAppId === id ? (
                             <Typography
                               variant="caption"
                               component="div"
@@ -1019,6 +1389,34 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
                               this app to get a working app link.
                             </Typography>
                           ) : null}
+                          {vercelUrl ? (
+                            <Typography
+                              variant="caption"
+                              component="div"
+                              noWrap
+                              title={vercelUrl}
+                              sx={{ color: "success.main" }}
+                            >
+                              Vercel:{" "}
+                              <Link
+                                href={vercelUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                underline="hover"
+                              >
+                                {vercelUrl}
+                              </Link>
+                            </Typography>
+                          ) : vercelStatus ? (
+                            <Typography
+                              variant="caption"
+                              component="div"
+                              noWrap
+                              sx={{ color: "text.secondary" }}
+                            >
+                              Vercel: {vercelStatus}
+                            </Typography>
+                          ) : null}
                           {toBool(appItem.access_guard_enabled) &&
                           (publicShareUrl || localShareUrl) ? (
                             <Typography
@@ -1043,6 +1441,304 @@ export default function AppsPage({ autoRefresh }: AppsPageProps) {
           </Table>
         </TableContainer>
       </Box>
+      {qualityTarget
+        ? (() => {
+            const details = qualityDialogDetails(qualityTarget.appItem);
+            const hasChecklist = details.total > 0 || details.items.length > 0;
+            const hasConcerns = details.concerns.length > 0;
+            return (
+              <Dialog
+                open
+                onClose={() => setQualityTarget(null)}
+                aria-labelledby="app-quality-dialog-title"
+                maxWidth="sm"
+                fullWidth
+              >
+                <DialogTitle id="app-quality-dialog-title">
+                  Automated review
+                </DialogTitle>
+                <DialogContent>
+                  <DialogContentText>
+                    {`AgentArk checked '${qualityTarget.title}' after it was created. This helps spot missing requested pieces, but it is advisory and does not prove the app is perfect.`}
+                  </DialogContentText>
+                  <DialogContentText sx={{ mt: 1.25 }}>
+                    Found means the live page appeared to include that requested
+                    item when AgentArk opened it in a browser.
+                  </DialogContentText>
+                  {hasChecklist ? (
+                    <Box sx={{ mt: 2 }}>
+                      <Stack
+                        direction="row"
+                        spacing={1}
+                        sx={{ alignItems: "center", flexWrap: "wrap" }}
+                      >
+                        <Chip
+                          size="small"
+                          color={details.missing > 0 ? "warning" : "success"}
+                          label={`Found ${details.covered} of ${details.total}`}
+                        />
+                        {details.missing > 0 ? (
+                          <Typography
+                            variant="body2"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            Review the items marked Needs review.
+                          </Typography>
+                        ) : null}
+                      </Stack>
+                      {details.items.length > 0 ? (
+                        <Stack spacing={1} sx={{ mt: 1.5 }}>
+                          {details.items.map((item, index) => {
+                            const covered = item.covered;
+                            const label =
+                              covered === true
+                                ? "Found"
+                                : covered === false
+                                  ? "Needs review"
+                                  : "Not checked";
+                            const color =
+                              covered === true
+                                ? "success"
+                                : covered === false
+                                  ? "warning"
+                                  : "default";
+                            return (
+                              <Box
+                                key={`${str(item.id, "item")}-${index}`}
+                                sx={{
+                                  display: "flex",
+                                  gap: 1,
+                                  alignItems: "flex-start",
+                                }}
+                              >
+                                <Chip
+                                  size="small"
+                                  color={color}
+                                  variant={
+                                    covered === true ? "filled" : "outlined"
+                                  }
+                                  label={label}
+                                  sx={{ flexShrink: 0 }}
+                                />
+                                <Typography variant="body2">
+                                  {str(item.summary, "Requested item")}
+                                </Typography>
+                              </Box>
+                            );
+                          })}
+                        </Stack>
+                      ) : null}
+                    </Box>
+                  ) : null}
+                  {hasConcerns ? (
+                    <Box sx={{ mt: 2 }}>
+                      <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
+                        Notes
+                      </Typography>
+                      <Stack spacing={0.75}>
+                        {details.concerns.map((concern, index) => (
+                          <Typography
+                            key={`${concern}-${index}`}
+                            variant="body2"
+                            sx={{ color: "text.secondary" }}
+                          >
+                            {concern}
+                          </Typography>
+                        ))}
+                      </Stack>
+                    </Box>
+                  ) : null}
+                  {!hasChecklist && !hasConcerns ? (
+                    <DialogContentText sx={{ mt: 2 }}>
+                      No detailed review notes are available yet.
+                    </DialogContentText>
+                  ) : null}
+                </DialogContent>
+                <DialogActions>
+                  <Button onClick={() => setQualityTarget(null)}>Close</Button>
+                </DialogActions>
+              </Dialog>
+            );
+          })()
+        : null}
+      <Dialog
+        open={vercelTarget != null}
+        onClose={() => {
+          if (vercelBusy) return;
+          setVercelTarget(null);
+          setVercelToken("");
+          setVercelError(null);
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          {vercelTarget?.mode === "vercel_git"
+            ? "Publish with Vercel Git"
+            : "Publish to Vercel"}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} sx={{ mt: 1 }}>
+            <DialogContentText>
+              {vercelTarget?.mode === "vercel_git"
+                ? "Use the app's Git repository and connected Vercel project for deployment. If Git or project setup is missing, AgentArk will return a setup nudge."
+                : "Deploy the current app bundle to Vercel through the REST API. The token is stored encrypted and is never written into app files or metadata."}
+            </DialogContentText>
+            {vercelError ? <Alert severity="error">{vercelError}</Alert> : null}
+            {!vercelConnected ? (
+              <TextField
+                label="Vercel Access Token"
+                type="password"
+                size="small"
+                value={vercelToken}
+                onChange={(event) => setVercelToken(event.target.value)}
+                autoComplete="off"
+                fullWidth
+              />
+            ) : (
+              <Alert severity="success" variant="outlined">
+                Vercel is connected.
+              </Alert>
+            )}
+            <TextField
+              label="Team ID"
+              size="small"
+              value={vercelTeamId}
+              onChange={(event) => setVercelTeamId(event.target.value)}
+              placeholder="team_..."
+              fullWidth
+            />
+            <TextField
+              select
+              label="Project Handling"
+              size="small"
+              value={vercelProjectMode}
+              onChange={(event) =>
+                setVercelProjectMode(event.target.value as VercelProjectMode)
+              }
+              disabled={vercelTarget?.mode === "vercel_git"}
+              fullWidth
+            >
+              <MenuItem value="auto">Auto</MenuItem>
+              <MenuItem value="existing">Existing project</MenuItem>
+              <MenuItem value="create">Create project</MenuItem>
+            </TextField>
+            <TextField
+              label={
+                vercelProjectMode === "create"
+                  ? "Project Name"
+                  : "Project ID or Name"
+              }
+              size="small"
+              value={vercelProjectId}
+              onChange={(event) => setVercelProjectId(event.target.value)}
+              placeholder={
+                vercelProjectMode === "create"
+                  ? "agentark-app"
+                  : "my-vercel-project"
+              }
+              helperText={
+                vercelProjectMode === "auto"
+                  ? "Leave empty to let AgentArk derive a Vercel project name from the app."
+                  : vercelProjectMode === "create"
+                    ? "Leave empty to create a project from the app name."
+                    : "Required unless a default project is saved in Vercel integration settings."
+              }
+              fullWidth
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={vercelProduction}
+                  onChange={(event) => setVercelProduction(event.target.checked)}
+                />
+              }
+              label="Production deployment"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            disabled={vercelBusy}
+            onClick={() => {
+              setVercelTarget(null);
+              setVercelToken("");
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            disabled={vercelBusy || !vercelTarget}
+            onClick={publishVercelTarget}
+          >
+            {vercelBusy ? (
+              <CircularProgress size={18} color="inherit" />
+            ) : vercelTarget?.mode === "vercel_git" ? (
+              "Check Git Deploy"
+            ) : (
+              "Publish"
+            )}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={deleteTarget != null}
+        onClose={() => {
+          if (deleteBusy) return;
+          setDeleteTarget(null);
+          setDeleteError(null);
+        }}
+        aria-labelledby="app-delete-confirm-title"
+        className="app-delete-confirm-dialog"
+      >
+        <DialogTitle id="app-delete-confirm-title">Delete app?</DialogTitle>
+        <DialogContent className="app-delete-confirm-content">
+          <DialogContentText>
+            {`Delete '${deleteTarget?.title ?? ""}'?`}
+          </DialogContentText>
+          <DialogContentText sx={{ mt: 1 }}>
+            All files, virtual environments, install caches, and run logs for
+            this app will be permanently deleted. This cannot be undone.
+          </DialogContentText>
+          {deleteError ? (
+            <Alert
+              severity="error"
+              sx={{ mt: 2 }}
+              className="app-delete-confirm-error"
+            >
+              {deleteError}
+            </Alert>
+          ) : null}
+        </DialogContent>
+        <DialogActions className="app-delete-confirm-actions">
+          <Button
+            color="inherit"
+            disabled={deleteBusy}
+            onClick={() => {
+              setDeleteTarget(null);
+              setDeleteError(null);
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            disabled={deleteBusy}
+            onClick={() => {
+              void confirmDeleteApp();
+            }}
+            startIcon={
+              deleteBusy ? (
+                <CircularProgress size={16} color="inherit" />
+              ) : undefined
+            }
+          >
+            Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
     </WorkspacePageShell>
   );
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 const INTENT_PLAN_TIMEOUT_MS: u64 = 90_000;
-const INTENT_PLAN_MAX_ACTIONS: usize = 80;
+const INTENT_PLAN_MAX_ACTIONS: usize = 20;
 const INTENT_PLAN_MAX_HISTORY: usize = 6;
 const INTENT_PLAN_MAX_ENTITIES: usize = 36;
 const INTENT_KIND_ANSWER: &str = "answer";
@@ -137,18 +137,32 @@ impl AdvisoryIntentPlan {
                 }
             }
             lines.extend(intent.likely_actions.iter().cloned());
-            lines.extend(intent.depends_on.iter().map(|value| format!("depends_on {value}")));
+            lines.extend(
+                intent
+                    .depends_on
+                    .iter()
+                    .map(|value| format!("depends_on {value}")),
+            );
             if let Some(channel) = intent.qualifier_delivery_channel() {
                 lines.push(format!("delivery channel {channel}"));
             }
             if let Some(target) = intent.qualifier_target_entity() {
-                lines.push(format!("target entity {}", safe_truncate(&target.to_string(), 260)));
+                lines.push(format!(
+                    "target entity {}",
+                    safe_truncate(&target.to_string(), 260)
+                ));
             }
             if let Some(time) = intent.qualifier_time() {
-                lines.push(format!("time qualifier {}", safe_truncate(&time.to_string(), 260)));
+                lines.push(format!(
+                    "time qualifier {}",
+                    safe_truncate(&time.to_string(), 260)
+                ));
             }
             if let Some(source) = intent.qualifier_source() {
-                lines.push(format!("source {}", safe_truncate(&source.to_string(), 260)));
+                lines.push(format!(
+                    "source {}",
+                    safe_truncate(&source.to_string(), 260)
+                ));
             }
             if let Some(inspect_target) = intent.qualifier_inspect_target() {
                 lines.push(format!("inspect target {inspect_target}"));
@@ -234,17 +248,19 @@ fn normalize_chain_relationship(raw: &str, intent_count: usize) -> String {
     }
 }
 
-fn normalize_intent_durability(raw: &str, has_likely_actions: bool) -> String {
+fn normalize_intent_durability(raw: &str, _has_likely_actions: bool) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "ephemeral" | "none" => "ephemeral".to_string(),
         "session" => "session".to_string(),
         "persistent" => "persistent".to_string(),
-        _ if has_likely_actions => "persistent".to_string(),
         _ => "ephemeral".to_string(),
     }
 }
 
-fn normalize_plan(mut plan: AdvisoryIntentPlan, authorized_actions: &HashSet<String>) -> AdvisoryIntentPlan {
+fn normalize_plan(
+    mut plan: AdvisoryIntentPlan,
+    authorized_actions: &HashSet<String>,
+) -> AdvisoryIntentPlan {
     plan.intents.retain(|intent| {
         !intent.summary.trim().is_empty()
             || !intent.kind.trim().is_empty()
@@ -295,7 +311,8 @@ fn normalize_plan(mut plan: AdvisoryIntentPlan, authorized_actions: &HashSet<Str
             .filter(|value| !value.is_empty())
             .map(|value| safe_truncate(value, 80));
     }
-    plan.chain_relationship = normalize_chain_relationship(&plan.chain_relationship, plan.intents.len());
+    plan.chain_relationship =
+        normalize_chain_relationship(&plan.chain_relationship, plan.intents.len());
     plan.rationale = safe_truncate(plan.rationale.trim(), 300);
     if plan.intents.is_empty() {
         plan.is_conversational_only = true;
@@ -327,7 +344,9 @@ fn pending_action_entity(action: &PendingConversationAction) -> serde_json::Valu
     })
 }
 
-fn background_session_entity(session: &crate::core::background_session::BackgroundSession) -> serde_json::Value {
+fn background_session_entity(
+    session: &crate::core::background_session::BackgroundSession,
+) -> serde_json::Value {
     serde_json::json!({
         "kind": "background_session",
         "id": session.id,
@@ -364,7 +383,7 @@ fn app_entity(app: &serde_json::Value) -> serde_json::Value {
 }
 
 fn intent_plan_system_prompt() -> &'static str {
-    "You are AgentArk's advisory intent planner. Produce a compact JSON plan that decomposes the user's underlying requested outcomes into broad kinds: answer, act, delegate, or interactive. Put specific details in qualifiers and likely_actions, not in new intent kinds. This plan is advisory only: the execution loop will choose tools. Do not block, refuse, or answer the user. Do not depend on keywords or phrasing; infer meaning from the whole request, conversation context, action catalog, and recent entities. Prefer action names only from the provided catalog when likely_actions are useful. Return strict JSON only."
+    "You are AgentArk's advisory intent planner. Produce a compact JSON plan that decomposes the user's underlying requested outcomes into broad kinds: answer, act, delegate, or interactive. Put specific details in qualifiers and likely_actions, not in new intent kinds. This plan is advisory only: the execution loop will choose tools. Do not block, refuse, or answer the user. Do not depend on keywords or phrasing; infer meaning from the whole request, conversation context, action catalog, and recent entities. Preserve ownership of timing/cadence: app or dashboard refresh belongs to the app intent, while AgentArk-owned later execution, independent monitoring, and outside-UI notification belong to schedule/watch intents. Prefer action names only from the provided catalog when likely_actions are useful. Return strict JSON only."
 }
 
 fn intent_plan_prompt(
@@ -397,7 +416,12 @@ fn intent_plan_prompt(
         .collect::<Vec<_>>();
     let mut recent_entities = Vec::new();
     recent_entities.extend(pending_actions.iter().take(8).map(pending_action_entity));
-    recent_entities.extend(background_sessions.iter().take(10).map(background_session_entity));
+    recent_entities.extend(
+        background_sessions
+            .iter()
+            .take(10)
+            .map(background_session_entity),
+    );
     recent_entities.extend(watchers.iter().take(10).map(watcher_entity));
     recent_entities.extend(apps.iter().take(8).map(app_entity));
     recent_entities.truncate(INTENT_PLAN_MAX_ENTITIES);
@@ -441,10 +465,16 @@ fn intent_plan_prompt(
         },
         "rules": [
             "The plan never blocks execution.",
+            "The current user_message is authoritative for this turn. Use conversation history and recent entities only to resolve references, dependencies, or explicit continuations; when the current message shifts topic, outcome, or work type, do not continue the prior frame.",
             "For live/current product state, prefer live inspection/search actions over documentation actions.",
             "For product how-to or capability explanation, product documentation actions may be likely.",
-            "For generated runnable apps/sites/dashboards/tools, include the app-hosting/deployment action.",
+            crate::core::inline_artifacts::app_delivery_boundary_guidance(),
+            crate::core::inline_artifacts::inline_visualization_guidance(),
+            "Attach timing and cadence qualifiers to the artifact or workflow they modify. If the cadence describes how a generated app, dashboard, page, or tool should refresh, poll, animate, backfill, or update its own displayed data, keep that cadence inside the app/deploy intent instead of creating a watcher or scheduled-task intent.",
+            "Create schedule/watch intents only when AgentArk itself must run later, monitor independently of the generated artifact, or notify/report outside the artifact's own UI.",
             "For monitoring/recurrence/reminders/watch-until-condition work, preserve timing and delivery qualifiers.",
+            "When the requested outcome is ongoing or conditional monitoring, recurring checks, future reminders, or notification-on-change behavior, the durable orchestration action is the likely action; data-source, research, browser, or search actions are later poll inputs, not substitutes for creating the durable work object.",
+            "For multiple independent scheduled outcomes or watchers, preserve each distinct target, condition, timing/cadence, timeout, and delivery route. Represent them as separate intents or as one likely action that will use that action's batch `items` schema; never collapse item-specific details into one generic outcome.",
             "Use kind=act for concrete actions including deploy, schedule, watch, modify, install, query live state, research, and integration work.",
             "Use kind=answer for textual responses, even when a read-only retrieval action may help.",
             "Use kind=delegate only when work should be split across sub-agents.",
@@ -465,6 +495,7 @@ impl Agent {
         background_sessions: &[crate::core::background_session::BackgroundSession],
         watchers: &[crate::core::watcher::Watcher],
         authorized_actions: &[crate::actions::ActionDef],
+        stream_tx: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
     ) -> Option<AdvisoryIntentPlan> {
         if message.trim().is_empty() {
             return None;
@@ -479,21 +510,40 @@ impl Agent {
             &apps,
             authorized_actions,
         );
+        let proxy_stream_tx = stream_tx.as_ref().map(|parent| {
+            super::reasoning_stream::spawn_reasoning_proxy(parent.clone(), "planner")
+        });
+        if let Some(parent_tx) = stream_tx.as_ref() {
+            super::reasoning_stream::stream_reasoning_progress(
+                parent_tx,
+                "planner",
+                "Preparing the intent and action plan...\n",
+                false,
+            )
+            .await;
+        }
         let response = self
-            .supervised_internal_chat(
+            .supervised_internal_chat_detailed_with_stream(
                 "automation",
                 "intent_plan",
                 "advisory_intent_plan",
-                &ModelRole::Primary,
-                self.llm_candidates_for_role(&ModelRole::Primary),
+                &ModelRole::Fast,
+                self.llm_candidates_for_role(&ModelRole::Fast),
                 intent_plan_system_prompt(),
                 &prompt,
                 &[],
                 &[],
                 INTENT_PLAN_TIMEOUT_MS,
                 2,
+                proxy_stream_tx,
             )
-            .await?;
+            .await
+            .ok();
+        if let Some(parent_tx) = stream_tx.as_ref() {
+            super::reasoning_stream::stream_reasoning_progress(parent_tx, "planner", "", true)
+                .await;
+        }
+        let response = response?;
         let value = extract_json_object(&response.content)?;
         let authorized_names = authorized_actions
             .iter()
@@ -565,5 +615,70 @@ mod tests {
             normalized.intents[0].qualifiers.extras["checkpoint"],
             serde_json::json!("user_login")
         );
+    }
+
+    #[test]
+    fn normalize_plan_does_not_make_missing_durability_persistent_from_action_presence() {
+        let authorized = HashSet::from(["app_deploy".to_string()]);
+        let plan = AdvisoryIntentPlan {
+            intents: vec![AdvisoryIntent {
+                id: "apps".to_string(),
+                kind: "act".to_string(),
+                summary: "Inspect existing app inventory".to_string(),
+                likely_actions: vec!["app_deploy".to_string()],
+                durability: String::new(),
+                ..AdvisoryIntent::default()
+            }],
+            ..AdvisoryIntentPlan::default()
+        };
+
+        let normalized = normalize_plan(plan, &authorized);
+
+        assert_eq!(normalized.intents[0].durability, "ephemeral");
+    }
+
+    #[test]
+    fn planner_contract_keeps_app_owned_cadence_inside_app_intent() {
+        let packed_context =
+            super::super::conversation_context::PackedConversationContext::default();
+        let actions = vec![
+            crate::actions::ActionDef {
+                name: "app_deploy".to_string(),
+                description: "Deploy a generated app.".to_string(),
+                capabilities: vec!["app_deploy".to_string()],
+                ..crate::actions::ActionDef::default()
+            },
+            crate::actions::ActionDef {
+                name: "watch".to_string(),
+                description: "Create durable background monitoring.".to_string(),
+                capabilities: vec!["watcher".to_string()],
+                ..crate::actions::ActionDef::default()
+            },
+        ];
+
+        let prompt = intent_plan_prompt(
+            "Build a dashboard that updates its data on a cadence.",
+            &packed_context,
+            &[],
+            &[],
+            &[],
+            &[],
+            &actions,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&prompt).expect("intent prompt should be JSON");
+        let rules = value
+            .get("rules")
+            .and_then(|value| value.as_array())
+            .expect("rules should be present")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rules.contains("generated app, dashboard, page, or tool"));
+        assert!(rules.contains("inside the app/deploy intent"));
+        assert!(rules.contains("notify/report outside the artifact"));
+        assert!(rules.contains("current user_message is authoritative"));
     }
 }

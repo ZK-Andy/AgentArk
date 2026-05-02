@@ -2080,12 +2080,13 @@ pub fn protocol_document() -> CompanionProtocolDocument {
     CompanionProtocolDocument {
         protocol_version: "agentark-companion-v1".to_string(),
         websocket_path: "/companion/ws".to_string(),
-        auth: "After pairing, reconnect with Authorization: Bearer acd_... and X-AgentArk-Companion-Device: device-.... Do not send device tokens inside JSON WebSocket messages.".to_string(),
+        auth: "Native companions reconnect with Authorization: Bearer acd_... and X-AgentArk-Companion-Device: device-.... Browser companions that cannot set WebSocket headers send {\"type\":\"browser_auth\",\"device_id\":\"device-...\",\"token\":\"acd_...\"} over the already-open companion WebSocket.".to_string(),
         pairing: "Create a pairing session in Settings > Companion Devices, then the device sends {\"type\":\"pairing_claim\",\"session_id\":\"...\",\"code\":\"...\",\"device_public_key\":\"stable-device-key\",\"attestation\":{\"provider\":\"app_attest|play_integrity|custom\",\"evidence\":\"...\"}}. Approval is bound to that device identity; after UI approval the approved claim returns the one-time scoped device token on the same WebSocket.".to_string(),
         messages: vec![
             "hello".to_string(),
             "pairing_claim".to_string(),
             "pairing_claim_result".to_string(),
+            "browser_auth".to_string(),
             "auth".to_string(),
             "auth_ok".to_string(),
             "auth_error".to_string(),

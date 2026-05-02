@@ -1,5 +1,13 @@
 use super::*;
 
+static GEPA_AUTO_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+const GEPA_AUTO_INITIAL_DELAY_SECS: u64 = 90;
+const GEPA_AUTO_POLL_SECS: u64 = 30 * 60;
+const GEPA_AUTO_QUIET_WINDOW_SECS: i64 = 5 * 60;
+const GEPA_AUTO_COOLDOWN_HOURS: i64 = 18;
+const GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS: usize = 6;
+const GEPA_AUTO_EVIDENCE_SCAN_LIMIT: u64 = 160;
+
 pub(super) fn resolve_project_root() -> PathBuf {
     let app_path = FsPath::new("/app");
     if app_path.join("Cargo.toml").exists() {
@@ -240,11 +248,7 @@ pub(super) async fn load_learning_queue_cap(storage: &crate::storage::Storage) -
 }
 
 pub(super) fn bool_setting_bytes(enabled: bool) -> &'static [u8] {
-    if enabled {
-        b"true"
-    } else {
-        b"false"
-    }
+    if enabled { b"true" } else { b"false" }
 }
 
 pub(super) async fn store_bool_setting(
@@ -288,7 +292,6 @@ pub(super) async fn disable_all_evolution_canaries(
         crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
         crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
         crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
-        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
     ] {
         disable_canary_state_if_present(storage, key).await?;
@@ -710,7 +713,9 @@ pub(super) fn build_skill_evolution_entry(
         } else {
             let assessment = SkillImpactAssessment {
                 status: "pending".to_string(),
-                summary: vec!["Approved, but waiting for the first post-approval runs.".to_string()],
+                summary: vec![
+                    "Approved, but waiting for the first post-approval runs.".to_string(),
+                ],
                 ..SkillImpactAssessment::default()
             };
             (
@@ -788,7 +793,6 @@ pub(super) fn build_experience_item_summary(
         "support_count": item.support_count,
         "contradiction_count": item.contradiction_count,
         "status": item.status,
-        "project_id": serde_json::Value::Null,
         "conversation_id": serde_json::Value::Null,
         "updated_at": item.updated_at,
         "suggested_steps": suggested_steps,
@@ -858,7 +862,6 @@ pub(super) fn build_procedural_pattern_summary(
         "correction_count": pattern.correction_count,
         "success_rate": pattern.success_rate,
         "status": pattern.status,
-        "project_id": serde_json::Value::Null,
         "conversation_id": serde_json::Value::Null,
         "updated_at": pattern.updated_at,
         "last_validated_at": pattern.last_validated_at,
@@ -882,6 +885,7 @@ pub(super) fn experience_run_decision_event_payload<'a>(
 pub(super) fn experience_run_decision_summary(
     run: &crate::storage::experience_run::Model,
 ) -> serde_json::Value {
+    let turn_decision = run.metadata.get("turn_decision");
     let request_shape = experience_run_decision_event_payload(run, "request_shape");
     let action_selection = experience_run_decision_event_payload(run, "action_selection");
     let routing = experience_run_decision_event_payload(run, "routing");
@@ -957,6 +961,16 @@ pub(super) fn experience_run_decision_summary(
             .and_then(|payload| payload.get("status"))
             .and_then(|value| value.as_str())
             .unwrap_or(run.success_state.as_str()),
+        "turn_decision_path": turn_decision
+            .and_then(|value| value.get("path"))
+            .and_then(|value| value.as_str()),
+        "turn_decision_task_type": turn_decision
+            .and_then(|value| value.get("task_type"))
+            .and_then(|value| value.as_str()),
+        "turn_decision_total_tokens": turn_decision
+            .and_then(|value| value.get("usage_delta"))
+            .and_then(|value| value.get("total_tokens"))
+            .and_then(|value| value.as_i64()),
     })
 }
 
@@ -988,12 +1002,10 @@ pub(super) fn build_experience_run_summary(
         "correction_state": run.correction_state,
         "outcome_summary": run.outcome_summary,
         "failure_reason": run.failure_reason,
-        "project_id": serde_json::Value::Null,
         "conversation_id": serde_json::Value::Null,
         "strategy_version": run.strategy_version,
         "policy_version": run.policy_version,
         "prompt_version": run.prompt_version,
-        "classifier_prompt_version": crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(run, "classifier_prompt_version"),
         "specialist_prompt_version": crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(run, "specialist_prompt_version"),
         "model_slot": run.model_slot,
         "consolidated": run.consolidated,
@@ -1006,6 +1018,11 @@ pub(super) fn build_experience_run_summary(
         "decision_episode": run
             .metadata
             .get("decision_episode")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "turn_decision": run
+            .metadata
+            .get("turn_decision")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
         "prompt_telemetry": run
@@ -1378,10 +1395,6 @@ pub(super) fn prompt_canary_state_key_for_surface(
             crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
             "Prompt bundle",
         )),
-        "classifier_prompt" => Some((
-            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
-            "Classifier prompt bundle",
-        )),
         "specialist_prompt" => Some((
             crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
             "Specialist prompt bundle",
@@ -1749,6 +1762,9 @@ pub(super) fn normalize_evolution_dev_limit(limit: Option<u64>) -> u64 {
 
 pub(super) async fn build_evolution_settings_response(
     storage: &crate::storage::Storage,
+    agent_config: &crate::core::config::AgentConfig,
+    primary_model_id: &str,
+    project_root: &FsPath,
 ) -> EvolutionSettingsResponse {
     let canary_state = load_evolution_canary_state(storage).await;
     let strategy_canary_state = load_canary_state_by_key(
@@ -1758,11 +1774,6 @@ pub(super) async fn build_evolution_settings_response(
     .await;
     let last_result = load_last_self_evolve_result(storage).await;
     let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
-    let classifier_prompt_canary_state = load_canary_state_by_key(
-        storage,
-        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
-    )
-    .await;
     let specialist_prompt_canary_state = load_canary_state_by_key(
         storage,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
@@ -1771,11 +1782,6 @@ pub(super) async fn build_evolution_settings_response(
     let prompt_last_result = load_json_value_by_key(
         storage,
         crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
-    )
-    .await;
-    let classifier_prompt_last_result = load_json_value_by_key(
-        storage,
-        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
     )
     .await;
     let specialist_prompt_last_result = load_json_value_by_key(
@@ -1837,24 +1843,6 @@ pub(super) async fn build_evolution_settings_response(
             candidate_version: "-".to_string(),
         }
     };
-    let classifier_prompt_canary = if let Some(state) = classifier_prompt_canary_state.as_ref() {
-        EvolutionCanarySummary {
-            enabled: state.enabled,
-            rollout_percent: state.rollout_percent,
-            baseline_version: state.baseline_version.clone(),
-            candidate_version: state.candidate_version.clone(),
-        }
-    } else {
-        EvolutionCanarySummary {
-            enabled: false,
-            rollout_percent: 0,
-            baseline_version:
-                crate::core::self_evolve::classifier_prompt_evolution::compose_classifier_prompt_version(
-                    "retired-classifier-prompt-bundle-v1",
-                ),
-            candidate_version: "-".to_string(),
-        }
-    };
     let specialist_prompt_canary = if let Some(state) = specialist_prompt_canary_state.as_ref() {
         EvolutionCanarySummary {
             enabled: state.enabled,
@@ -1882,12 +1870,6 @@ pub(super) async fn build_evolution_settings_response(
     };
     let mut prompt_replay_gate_result: Option<String> = None;
     let mut prompt_promotion_mode = if prompt_canary.enabled {
-        "canary".to_string()
-    } else {
-        "none".to_string()
-    };
-    let mut classifier_prompt_replay_gate_result: Option<String> = None;
-    let mut classifier_prompt_promotion_mode = if classifier_prompt_canary.enabled {
         "canary".to_string()
     } else {
         "none".to_string()
@@ -1974,48 +1956,6 @@ pub(super) async fn build_evolution_settings_response(
         } else {
             "No prompt evolution runs yet".to_string()
         };
-    let classifier_prompt_last_promotion_result = if let Some(obj) = classifier_prompt_last_result
-        .as_ref()
-        .and_then(|v| v.as_object())
-    {
-        if let Some(mode) = obj.get("promotion_mode").and_then(|v| v.as_str()) {
-            if !mode.trim().is_empty() {
-                classifier_prompt_promotion_mode = mode.to_string();
-            }
-        }
-        if let Some(replay) = obj.get("replay_evaluation").and_then(|v| v.as_object()) {
-            if replay
-                .get("promote")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                classifier_prompt_replay_gate_result = Some("passed".to_string());
-            } else if let Some(reason) = replay.get("reason").and_then(|v| v.as_str()) {
-                classifier_prompt_replay_gate_result = Some(reason.to_string());
-            }
-        }
-        let promoted = obj
-            .get("promoted")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let gate = obj
-            .get("promotion_gate")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if classifier_prompt_promotion_mode == "baseline" {
-            "Promoted candidate classifier prompt bundle".to_string()
-        } else if classifier_prompt_promotion_mode == "canary" {
-            "Activated candidate classifier prompt bundle in canary".to_string()
-        } else if promoted {
-            "Candidate classifier prompt bundle passed offline benchmark gate".to_string()
-        } else if !gate.trim().is_empty() {
-            format!("Not promoted ({})", gate)
-        } else {
-            "Classifier prompt evolution completed".to_string()
-        }
-    } else {
-        "No classifier prompt evolution runs yet".to_string()
-    };
     let specialist_prompt_last_promotion_result = if let Some(obj) = specialist_prompt_last_result
         .as_ref()
         .and_then(|v| v.as_object())
@@ -2069,19 +2009,6 @@ pub(super) async fn build_evolution_settings_response(
     }
     if let Some(replay_eval) = load_live_metadata_prompt_replay_evaluation(
         storage,
-        classifier_prompt_canary_state.as_ref(),
-        "classifier_prompt_version",
-    )
-    .await
-    {
-        classifier_prompt_replay_gate_result = Some(if replay_eval.promote {
-            "passed".to_string()
-        } else {
-            replay_eval.reason
-        });
-    }
-    if let Some(replay_eval) = load_live_metadata_prompt_replay_evaluation(
-        storage,
         specialist_prompt_canary_state.as_ref(),
         "specialist_prompt_version",
     )
@@ -2106,6 +2033,39 @@ pub(super) async fn build_evolution_settings_response(
         && learning_enabled;
     let learning_queue = storage.learning_queue_counts().await.unwrap_or_default();
     let readiness_policy = crate::core::readiness::load_readiness_policy(storage).await;
+    let routing_rollback_available = storage
+        .get(
+            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let gepa_config =
+        crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(storage).await;
+    let gepa_auto_state =
+        crate::core::self_evolve::gepa_bridge::load_gepa_auto_run_state(storage).await;
+    let gepa_last_result =
+        crate::core::self_evolve::gepa_bridge::load_gepa_last_result(storage).await;
+    let gepa_readiness = crate::core::self_evolve::gepa_bridge::check_gepa_readiness(
+        storage,
+        project_root,
+        agent_config,
+        primary_model_id,
+    )
+    .await;
+    let gepa_queue = match crate::core::self_evolve::gepa_bridge::queue_status_snapshot(
+        project_root,
+        12,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "status": "unavailable",
+            "error": error.to_string(),
+        }),
+    };
 
     EvolutionSettingsResponse {
         self_evolve_enabled,
@@ -2116,7 +2076,6 @@ pub(super) async fn build_evolution_settings_response(
         canary,
         strategy_canary,
         prompt_canary,
-        classifier_prompt_canary,
         specialist_prompt_canary,
         last_promotion_result,
         replay_gate_result,
@@ -2124,14 +2083,17 @@ pub(super) async fn build_evolution_settings_response(
         prompt_last_promotion_result,
         prompt_replay_gate_result,
         prompt_promotion_mode,
-        classifier_prompt_last_promotion_result,
-        classifier_prompt_replay_gate_result,
-        classifier_prompt_promotion_mode,
         specialist_prompt_last_promotion_result,
         specialist_prompt_replay_gate_result,
         specialist_prompt_promotion_mode,
+        routing_rollback_available,
         deploy_guard_default: load_deploy_guard_default(storage).await,
         readiness_policy,
+        gepa_config,
+        gepa_readiness,
+        gepa_auto_state,
+        gepa_last_result,
+        gepa_queue,
     }
 }
 
@@ -2209,10 +2171,6 @@ pub(super) async fn read_recent_lineage(limit: usize) -> Vec<serde_json::Value> 
 
 pub(super) async fn read_recent_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
     read_recent_jsonl(PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
-}
-
-pub(super) async fn read_recent_classifier_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
-    read_recent_jsonl(CLASSIFIER_PROMPT_BUNDLE_LINEAGE_REL_PATH, limit).await
 }
 
 pub(super) async fn read_recent_specialist_prompt_lineage(limit: usize) -> Vec<serde_json::Value> {
@@ -2813,29 +2771,6 @@ pub(super) async fn build_evolution_dev_response(
     );
     let prompt_canary_state = load_prompt_evolution_canary_state(storage).await;
     let prompt_insights = build_prompt_insights(&prompt_metrics, prompt_canary_state.as_ref());
-    let classifier_prompt_canary_state = load_canary_state_by_key(
-        storage,
-        crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_CANARY_STATE_KEY,
-    )
-    .await;
-    let classifier_prompt_metrics = aggregate_bundle_metrics_by_selectors(
-        &recent_experience_run_rows,
-        &prompt_tool_logs,
-        &prompt_routing_logs,
-        &prompt_llm_logs,
-        |run| {
-            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
-                run,
-                "classifier_prompt_version",
-            )
-            .map(str::to_string)
-        },
-        |row| operational_payload_string(row, "classifier_prompt_version"),
-    );
-    let classifier_prompt_insights = build_prompt_insights(
-        &classifier_prompt_metrics,
-        classifier_prompt_canary_state.as_ref(),
-    );
     let specialist_prompt_canary_state = load_canary_state_by_key(
         storage,
         crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
@@ -2867,18 +2802,6 @@ pub(super) async fn build_evolution_dev_response(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some()
-        })
-        .take(24)
-        .map(build_experience_run_summary)
-        .collect::<Vec<_>>();
-    let recent_classifier_prompt_runs = recent_experience_run_rows
-        .iter()
-        .filter(|run| {
-            crate::core::self_evolve::strategy_runtime::experience_run_metadata_version(
-                run,
-                "classifier_prompt_version",
-            )
-            .is_some()
         })
         .take(24)
         .map(build_experience_run_summary)
@@ -2916,15 +2839,6 @@ pub(super) async fn build_evolution_dev_response(
         prompt_lineage_recent: read_recent_prompt_lineage(40).await,
         prompt_metrics,
         prompt_insights,
-        classifier_prompt_canary_state,
-        classifier_prompt_last_result: load_json_value_by_key(
-            storage,
-            crate::core::self_evolve::CLASSIFIER_PROMPT_BUNDLE_LAST_RESULT_KEY,
-        )
-        .await,
-        classifier_prompt_lineage_recent: read_recent_classifier_prompt_lineage(40).await,
-        classifier_prompt_metrics,
-        classifier_prompt_insights,
         specialist_prompt_canary_state,
         specialist_prompt_last_result: load_json_value_by_key(
             storage,
@@ -2941,7 +2855,6 @@ pub(super) async fn build_evolution_dev_response(
         learning_patterns,
         experience_graph,
         recent_prompt_runs,
-        recent_classifier_prompt_runs,
         recent_specialist_prompt_runs,
         recent_experience_runs,
         prompt_canary_safety_events,
@@ -2951,21 +2864,40 @@ pub(super) async fn build_evolution_dev_response(
 }
 
 pub(super) async fn get_evolution_settings(State(state): State<AppState>) -> Response {
-    let storage = {
+    let (storage, agent_config, primary_model_id) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (
+            agent.storage.clone(),
+            agent.config.clone(),
+            agent.primary_model_id.clone(),
+        )
     };
-    Json(build_evolution_settings_response(&storage).await).into_response()
+    let project_root = resolve_project_root();
+    Json(
+        build_evolution_settings_response(
+            &storage,
+            &agent_config,
+            &primary_model_id,
+            &project_root,
+        )
+        .await,
+    )
+    .into_response()
 }
 
 pub(super) async fn update_evolution_settings(
     State(state): State<AppState>,
     Json(request): Json<EvolutionSettingsUpdateRequest>,
 ) -> Response {
-    let storage = {
+    let (storage, agent_config, primary_model_id) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (
+            agent.storage.clone(),
+            agent.config.clone(),
+            agent.primary_model_id.clone(),
+        )
     };
+    let project_root = resolve_project_root();
     if let Some(enabled) = request.self_evolve_enabled.or(request.learning_enabled) {
         if let Err(e) = store_bool_setting(
             &storage,
@@ -3072,7 +3004,55 @@ pub(super) async fn update_evolution_settings(
                 .into_response();
         }
     }
-    Json(build_evolution_settings_response(&storage).await).into_response()
+    let mut gepa_config =
+        crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(&storage).await;
+    let mut gepa_config_changed = false;
+    if let Some(mode) = request.gepa_auto_mode.as_deref() {
+        gepa_config.auto_mode = mode.trim().to_string();
+        gepa_config_changed = true;
+    }
+    if let Some(value) = request.gepa_daily_budget_usd {
+        gepa_config.daily_budget_usd = value;
+        gepa_config_changed = true;
+    }
+    if let Some(value) = request.gepa_per_run_budget_usd {
+        gepa_config.per_run_budget_usd = value;
+        gepa_config_changed = true;
+    }
+    if let Some(value) = request.gepa_max_runs_per_day {
+        gepa_config.max_runs_per_day = value;
+        gepa_config_changed = true;
+    }
+    if let Some(value) = request.gepa_max_metric_calls {
+        gepa_config.max_metric_calls = value;
+        gepa_config_changed = true;
+    }
+    if gepa_config_changed {
+        if let Err(e) = crate::core::self_evolve::gepa_bridge::save_gepa_optimizer_config(
+            &storage,
+            &gepa_config,
+        )
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to update GEPA optimizer settings: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    }
+    Json(
+        build_evolution_settings_response(
+            &storage,
+            &agent_config,
+            &primary_model_id,
+            &project_root,
+        )
+        .await,
+    )
+    .into_response()
 }
 
 pub(super) async fn get_evolution_dev(
@@ -3419,17 +3399,514 @@ pub(super) async fn persist_autonomy_action_trace(
     Some(trace_id)
 }
 
+fn gepa_auto_latest_activity_at(
+    state: &crate::core::self_evolve::gepa_bridge::GepaAutoRunState,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    [
+        state.last_queued_at.as_deref(),
+        state.last_completed_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(parse_rfc3339_utc)
+    .max()
+}
+
+async fn save_gepa_auto_skip(
+    storage: &crate::storage::Storage,
+    mut state: crate::core::self_evolve::gepa_bridge::GepaAutoRunState,
+    now: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+    evidence_samples: usize,
+    next_check_after: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    state.last_checked_at = Some(now.to_rfc3339());
+    state.last_status = Some("waiting".to_string());
+    state.last_reason = Some(reason.to_string());
+    state.last_evidence_samples = evidence_samples;
+    state.next_check_after = next_check_after
+        .map(|value| value.to_rfc3339())
+        .or_else(|| {
+            Some((now + chrono::Duration::seconds(GEPA_AUTO_POLL_SECS as i64)).to_rfc3339())
+        });
+    if let Err(error) =
+        crate::core::self_evolve::gepa_bridge::save_gepa_auto_run_state(storage, &state).await
+    {
+        tracing::warn!("Failed to save GEPA auto-run state: {}", error);
+    }
+}
+
+async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
+    let agent = {
+        let agent = state.agent.read().await;
+        agent.clone()
+    };
+    let storage = agent.storage.clone();
+    let project_root = resolve_project_root();
+    let now = chrono::Utc::now();
+    let auto_state =
+        crate::core::self_evolve::gepa_bridge::load_gepa_auto_run_state(&storage).await;
+
+    let learning_enabled = load_learning_enabled(&storage).await;
+    let self_evolve_enabled = storage
+        .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|value| !value.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+        && learning_enabled;
+    if !self_evolve_enabled {
+        save_gepa_auto_skip(&storage, auto_state, now, "learning_paused", 0, None).await;
+        return Ok(());
+    }
+
+    let readiness = crate::core::self_evolve::gepa_bridge::check_gepa_readiness(
+        &storage,
+        &project_root,
+        &agent.config,
+        &agent.primary_model_id,
+    )
+    .await;
+    if !readiness.ready {
+        save_gepa_auto_skip(
+            &storage,
+            auto_state,
+            now,
+            "model_or_runtime_not_ready",
+            0,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+    if !readiness.budget.allowed {
+        save_gepa_auto_skip(&storage, auto_state, now, "budget_paused", 0, None).await;
+        return Ok(());
+    }
+
+    let (pending_jobs, running_jobs) =
+        crate::core::self_evolve::gepa_bridge::active_job_counts(&project_root).await?;
+    if pending_jobs > 0 || running_jobs > 0 {
+        agent.spawn_gepa_idle_worker();
+        save_gepa_auto_skip(&storage, auto_state, now, "work_already_scheduled", 0, None).await;
+        return Ok(());
+    }
+
+    let idle = agent
+        .gepa_background_idle_check(GEPA_AUTO_QUIET_WINDOW_SECS)
+        .await;
+    if !idle.idle {
+        save_gepa_auto_skip(&storage, auto_state, now, "waiting_for_quiet_time", 0, None).await;
+        return Ok(());
+    }
+
+    if let Some(last_activity_at) = gepa_auto_latest_activity_at(&auto_state) {
+        let cooldown_until = last_activity_at + chrono::Duration::hours(GEPA_AUTO_COOLDOWN_HOURS);
+        if now < cooldown_until {
+            save_gepa_auto_skip(
+                &storage,
+                auto_state,
+                now,
+                "cooling_down",
+                0,
+                Some(cooldown_until),
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    let recent_runs = storage
+        .list_recent_experience_runs_any_scope(GEPA_AUTO_EVIDENCE_SCAN_LIMIT)
+        .await?;
+    let since = gepa_auto_latest_activity_at(&auto_state);
+    let usable_runs = recent_runs
+        .iter()
+        .filter(|run| !run.success_state.trim().eq_ignore_ascii_case("provisional"));
+    let fresh_evidence = usable_runs
+        .filter(|run| {
+            since
+                .map(|cutoff| {
+                    parse_rfc3339_utc(&run.updated_at)
+                        .map(|updated_at| updated_at > cutoff)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true)
+        })
+        .count();
+    if fresh_evidence < GEPA_AUTO_MIN_FRESH_EXPERIENCE_RUNS {
+        save_gepa_auto_skip(
+            &storage,
+            auto_state,
+            now,
+            "waiting_for_more_evidence",
+            fresh_evidence,
+            None,
+        )
+        .await;
+        return Ok(());
+    }
+
+    let pending_path = agent
+        .queue_gepa_seed_run(
+            "Generate safer prompt candidates from recent private ArkEvolve evidence.",
+            GEPA_AUTO_QUIET_WINDOW_SECS,
+        )
+        .await?;
+    let mut next_state =
+        crate::core::self_evolve::gepa_bridge::load_gepa_auto_run_state(&storage).await;
+    next_state.last_checked_at = Some(now.to_rfc3339());
+    next_state.last_queued_at = Some(now.to_rfc3339());
+    next_state.last_status = Some("queued".to_string());
+    next_state.last_reason = Some("queued_for_quiet_time".to_string());
+    next_state.last_evidence_samples = fresh_evidence;
+    next_state.next_check_after =
+        Some((now + chrono::Duration::hours(GEPA_AUTO_COOLDOWN_HOURS)).to_rfc3339());
+    crate::core::self_evolve::gepa_bridge::save_gepa_auto_run_state(&storage, &next_state).await?;
+    record_background_learning_job_result(
+        &storage,
+        &BackgroundLearningJobUpdate {
+            key: "gepa_optimizer".to_string(),
+            status: "queued".to_string(),
+            started_at: Some(now.to_rfc3339()),
+            completed_at: None,
+            summary: "Background prompt improvement queued for quiet time.".to_string(),
+            changed: false,
+            stats: serde_json::json!({
+                "pending_job_path": pending_path,
+                "fresh_evidence_samples": fresh_evidence,
+                "quiet_window_seconds": GEPA_AUTO_QUIET_WINDOW_SECS,
+            }),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn gepa_auto_loop(state: AppState) {
+    tokio::time::sleep(std::time::Duration::from_secs(GEPA_AUTO_INITIAL_DELAY_SECS)).await;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(GEPA_AUTO_POLL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if let Err(error) = run_gepa_auto_tick(&state).await {
+            tracing::warn!("GEPA auto-run scheduler tick failed: {}", error);
+        }
+    }
+}
+
+pub(super) fn spawn_gepa_auto_loop(state: AppState) {
+    if GEPA_AUTO_LOOP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    crate::spawn_logged!(
+        "src/channels/http/evolution_control.rs:gepa_auto_loop",
+        async move {
+            gepa_auto_loop(state).await;
+        }
+    );
+}
+
+async fn run_guided_routing_optimization(
+    state: &AppState,
+    storage: &crate::storage::Storage,
+) -> std::result::Result<String, String> {
+    let enabled = storage
+        .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map(|s| !s.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+        && crate::core::learning::load_learning_enabled(storage).await;
+    if !enabled {
+        return Err(
+            "ArkEvolve is off. Turn on Self-evolve before running optimization.".to_string(),
+        );
+    }
+
+    let llm = {
+        let agent = state.agent.read().await;
+        agent.llm.clone()
+    };
+    let current_policy_raw = storage
+        .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
+        .await
+        .map_err(|error| format!("Failed to load current routing policy: {}", error))?;
+    let config = crate::core::self_evolve::PolicyEvolutionConfig {
+        project_root: resolve_project_root(),
+        ..Default::default()
+    };
+    let engine = crate::core::self_evolve::PolicyEvolutionEngine::new(config, llm);
+    let result = engine
+        .evolve_routing_policy(
+            "Improve AgentArk turn-routing accuracy from recent typed turn evidence. Keep accuracy and safety ahead of token, latency, and cost savings.",
+            current_policy_raw.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("Optimization failed: {}", error))?;
+
+    let mut promotion_mode = "none";
+    let mut canary_state: Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> =
+        None;
+    let mut replay_result: Option<
+        crate::core::self_evolve::strategy_runtime::ReplayEvaluationResult,
+    > = None;
+
+    if result.promoted {
+        if let Some(policy_json) = result.promoted_policy.as_ref() {
+            let candidate_serialized = serde_json::to_vec(policy_json)
+                .map_err(|error| format!("Failed to encode candidate policy: {}", error))?;
+            if let Some(existing_baseline) = current_policy_raw.as_ref() {
+                storage
+                    .set(
+                        crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_BASELINE_SNAPSHOT_KEY,
+                        existing_baseline,
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("Failed to snapshot current routing policy: {}", error)
+                    })?;
+            }
+
+            let baseline_version = storage
+                .get(
+                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| {
+                    serde_json::from_slice::<
+                        crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                    >(&raw)
+                    .ok()
+                    .map(|state| state.baseline_version)
+                })
+                .unwrap_or_else(|| "routing-policy-default-v1".to_string());
+            let candidate_version = format!("routing-candidate-{}", result.lineage_entry_id);
+
+            storage
+                .set(
+                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_POLICY_CANARY_KEY,
+                    &candidate_serialized,
+                )
+                .await
+                .map_err(|error| format!("Failed to save candidate routing policy: {}", error))?;
+            let state = crate::core::self_evolve::strategy_runtime::CanaryRolloutState {
+                enabled: true,
+                baseline_version,
+                candidate_version,
+                rollout_percent: 20,
+                min_samples_per_version: 25,
+                min_success_gain: 0.03,
+                max_sign_test_p_value: 0.10,
+                activated_at: Some(chrono::Utc::now().to_rfc3339()),
+            };
+            let state_bytes = serde_json::to_vec(&state)
+                .map_err(|error| format!("Failed to encode canary state: {}", error))?;
+            storage
+                .set(
+                    crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                    &state_bytes,
+                )
+                .await
+                .map_err(|error| format!("Failed to activate routing canary: {}", error))?;
+            canary_state = Some(state.clone());
+            promotion_mode = "canary";
+
+            if let Ok(logs) = storage
+                .list_operational_logs_by_event("tool_call", 4_000)
+                .await
+            {
+                let replay_eval =
+                    crate::core::self_evolve::strategy_runtime::evaluate_canary_by_policy_version(
+                        &logs,
+                        &state.baseline_version,
+                        &state.candidate_version,
+                        state.min_samples_per_version,
+                        state.min_success_gain,
+                        state.max_sign_test_p_value,
+                    );
+                if replay_eval.promote {
+                    storage
+                        .set(
+                            crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
+                            &candidate_serialized,
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!("Failed to promote routing policy immediately: {}", error)
+                        })?;
+                    let mut disabled_state = state.clone();
+                    disabled_state.enabled = false;
+                    let disabled_bytes = serde_json::to_vec(&disabled_state)
+                        .map_err(|error| format!("Failed to encode canary state: {}", error))?;
+                    storage
+                        .set(
+                            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+                            &disabled_bytes,
+                        )
+                        .await
+                        .map_err(|error| format!("Failed to close promoted canary: {}", error))?;
+                    canary_state = Some(disabled_state);
+                    promotion_mode = "baseline";
+                }
+                replay_result = Some(replay_eval);
+            }
+        }
+    }
+
+    let mut value = serde_json::to_value(&result)
+        .map_err(|error| format!("Failed to serialize optimization result: {}", error))?;
+    if let serde_json::Value::Object(obj) = &mut value {
+        obj.insert("mode".to_string(), serde_json::json!("policy"));
+        obj.insert(
+            "promotion_applied".to_string(),
+            serde_json::json!(promotion_mode != "none"),
+        );
+        obj.insert(
+            "apply_promotion_requested".to_string(),
+            serde_json::json!(true),
+        );
+        obj.insert(
+            "promotion_mode".to_string(),
+            serde_json::json!(promotion_mode),
+        );
+        obj.insert(
+            "canary_state".to_string(),
+            serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "replay_evaluation".to_string(),
+            serde_json::to_value(&replay_result).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    if let Ok(bytes) = serde_json::to_vec(&value) {
+        let _ = storage
+            .set(
+                crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_LAST_RESULT_KEY,
+                &bytes,
+            )
+            .await;
+    }
+
+    if !result.success {
+        return Ok(format!(
+            "Optimization ran but could not finish: {}",
+            result.error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+    if promotion_mode == "baseline" {
+        return Ok(format!(
+            "Optimization found a routing improvement and promoted it after replay passed. Accuracy changed from {:.0}% to {:.0}%.",
+            result.baseline_accuracy * 100.0,
+            result.best_candidate_accuracy * 100.0,
+        ));
+    }
+    if promotion_mode == "canary" {
+        return Ok(format!(
+            "Optimization found a routing improvement and started a 20% canary. Accuracy changed from {:.0}% to {:.0}%.",
+            result.baseline_accuracy * 100.0,
+            result.best_candidate_accuracy * 100.0,
+        ));
+    }
+    Ok(format!(
+        "Optimization checked {} routing candidates. No candidate beat the current behavior, so nothing changed.",
+        result.evaluated_candidates
+    ))
+}
+
 pub(super) async fn run_evolution_dev_action(
     State(state): State<AppState>,
     Json(request): Json<EvolutionDevActionRequest>,
 ) -> Response {
-    let storage = {
+    let (storage, agent_config, primary_model_id) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (
+            agent.storage.clone(),
+            agent.config.clone(),
+            agent.primary_model_id.clone(),
+        )
     };
+    let project_root = resolve_project_root();
     let action = request.action.trim().to_ascii_lowercase();
 
     let message = match action.as_str() {
+        "run_gepa_seed" => {
+            let agent = {
+                let agent = state.agent.read().await;
+                agent.clone()
+            };
+            let trace_ref = Arc::new(RwLock::new(ExecutionTrace::default()));
+            let call = crate::core::ToolCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "self_evolve".to_string(),
+                arguments: serde_json::json!({
+                    "mode": "gepa_run",
+                    "request": "Use recent ArkEvolve evidence to generate GEPA prompt candidates.",
+                    "gepa_quiet_window_seconds": 60,
+                    "apply_promotion": true,
+                    "import_after_run": true,
+                }),
+            };
+            let raw = match agent
+                .handle_self_evolve_tool_call(&call, &trace_ref, None)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("GEPA run failed: {}", error),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            let result = serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+            let status = result
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("completed");
+            match status {
+                "queued" => "GEPA run queued and will start when AgentArk is idle.".to_string(),
+                "blocked" => result
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(|error| format!("GEPA run blocked: {}", error))
+                    .unwrap_or_else(|| {
+                        "GEPA run was blocked by readiness or budget gates.".to_string()
+                    }),
+                "completed" => {
+                    "GEPA run completed and candidates were handed to ArkEvolve gates.".to_string()
+                }
+                "timed_out" => "GEPA run timed out; it was recorded for review.".to_string(),
+                "failed" => result
+                    .get("stderr_tail")
+                    .and_then(|value| value.as_str())
+                    .map(|error| format!("GEPA run failed: {}", error))
+                    .unwrap_or_else(|| "GEPA run failed; check ArkEvolve status.".to_string()),
+                _ => "GEPA run finished; check ArkEvolve status for details.".to_string(),
+            }
+        }
+        "run_guided_optimization" => {
+            match run_guided_routing_optimization(&state, &storage).await {
+                Ok(message) => message,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+            }
+        }
         "disable_canary" => {
             if let Some(candidate_id) = request
                 .candidate_id
@@ -4656,7 +5133,7 @@ pub(super) async fn run_evolution_dev_action(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Unsupported action. Use disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
+                    error: "Unsupported action. Use run_guided_optimization, disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
                         .to_string(),
                 }),
             )
@@ -4664,7 +5141,13 @@ pub(super) async fn run_evolution_dev_action(
         }
     };
 
-    let evolution = build_evolution_settings_response(&storage).await;
+    let evolution = build_evolution_settings_response(
+        &storage,
+        &agent_config,
+        &primary_model_id,
+        &project_root,
+    )
+    .await;
     let dev = build_evolution_dev_response(&storage, EVOLUTION_DEV_DEFAULT_LIMIT, false).await;
     let trace_id = persist_evolution_action_trace(
         &state,

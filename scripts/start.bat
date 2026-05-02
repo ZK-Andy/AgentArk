@@ -14,8 +14,6 @@ REM   scripts\start.bat status       - Show running containers
 
 setlocal enabledelayedexpansion
 
-set "AGENTARK_LOCAL_ENV=.agentark\local.env"
-
 if "%1"=="" goto start
 if "%1"=="start" goto start
 if "%1"=="tunnel" goto tunnel
@@ -27,14 +25,14 @@ if "%1"=="build" goto build
 if "%1"=="status" goto status
 if "%1"=="lowmem" goto lowmem
 if "%1"=="verify-lightpanda" goto verify_lightpanda
+if "%1"=="verify-gepa" goto verify_gepa
 goto usage
 
 :start
-call :ensure_local_env
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo Starting AgentArk...
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
+docker compose up -d
 call :verify_lightpanda_async
+call :verify_gepa_async
 echo.
 echo AgentArk is running!
 echo   Web UI:  http://localhost:8990
@@ -48,12 +46,11 @@ goto end
 :tunnel
 if "%2"=="setup" goto tunnel_setup
 
-call :ensure_local_env
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo Starting AgentArk with remote access...
 set AGENTARK_TUNNEL=true
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
+docker compose up -d
 call :verify_lightpanda_async
+call :verify_gepa_async
 echo.
 echo AgentArk is starting with secure tunnel!
 echo.
@@ -88,15 +85,12 @@ if "!TOKEN!"=="" (
     echo Cancelled. You can run this again anytime.
     goto end
 )
-call :upsert_managed_env TUNNEL_TOKEN "!TOKEN!"
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-echo Token saved to %AGENTARK_LOCAL_ENV%
+echo Permanent tunnel tokens are stored inside AgentArk settings.
+echo Open Web UI ^> Settings ^> Remote Access and paste the token there.
 echo.
-call :ensure_local_env
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo Starting AgentArk with permanent tunnel...
 set AGENTARK_TUNNEL=true
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
+docker compose up -d
 echo.
 echo AgentArk is running with your custom domain!
 echo Check your Cloudflare dashboard for the URL.
@@ -104,49 +98,42 @@ goto end
 
 :stop
 echo Stopping AgentArk...
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" down
+docker compose down
 echo AgentArk stopped. Your data is preserved.
 goto end
 
 :restart
 echo Restarting AgentArk...
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" restart agentark-control agentark-workspace agentark-executor agentark-embeddings
+docker compose restart agentark-control agentark-workspace agentark-executor agentark-embeddings
 call :verify_lightpanda_async
+call :verify_gepa_async
 goto end
 
 :logs
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" logs -f
+docker compose logs -f
 goto end
 
 :update
-call :ensure_local_env
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo Updating AgentArk (your data will be preserved)...
-findstr /R /C:"^AGENTARK_INSTALL_SOURCE=source$" "%AGENTARK_LOCAL_ENV%" >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
-    docker compose --env-file "%AGENTARK_LOCAL_ENV%" -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
-) else (
-    docker compose --env-file "%AGENTARK_LOCAL_ENV%" pull
-    docker compose --env-file "%AGENTARK_LOCAL_ENV%" up -d
-)
+docker compose pull
+docker compose up -d
 call :verify_lightpanda_async
+call :verify_gepa_async
 echo Update complete! Your data is intact.
 goto end
 
 :build
-call :ensure_local_env
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 echo Building AgentArk from this checkout and force-recreating containers (your data will be preserved)...
 if "%AGENTARK_IMAGE%"=="" set AGENTARK_IMAGE=agentark:dev
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build --force-recreate
 call :verify_lightpanda_async
+call :verify_gepa_async
 echo Local build complete! Your data is intact.
 goto end
 
 :status
 echo AgentArk Status:
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" ps
+docker compose ps
 goto end
 
 :lowmem
@@ -180,7 +167,7 @@ goto end
 echo Verifying bundled Lightpanda runtime...
 set "LIGHTPANDA_RETRIES=20"
 :verify_lightpanda_loop
-docker compose --env-file "%AGENTARK_LOCAL_ENV%" exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
+docker compose exec -T agentark-control sh -lc "command -v lightpanda >/dev/null 2>&1" >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo Lightpanda is available inside the AgentArk runtime.
     exit /b 0
@@ -198,17 +185,27 @@ if not exist ".agentark" mkdir ".agentark" >nul 2>&1
 start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-lightpanda ^> ".agentark\lightpanda-check.log" 2^>^&1
 exit /b 0
 
-:ensure_local_env
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$envPath='.agentark\local.env'; New-Item -ItemType Directory -Force -Path (Split-Path $envPath) | Out-Null; $lines=@(); if(Test-Path $envPath){ $lines=Get-Content $envPath | Where-Object { $_ -notmatch '^AGENTARK_POSTGRES_PASSWORD=' } }; Set-Content -Path $envPath -Value $lines"
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
-echo Local Postgres password is managed inside the Docker volume agentark-secrets.
-exit /b 0
+:verify_gepa
+echo Verifying bundled GEPA optimizer runtime...
+set "GEPA_RETRIES=20"
+:verify_gepa_loop
+docker compose exec -T agentark-control sh -lc "/opt/agentark-gepa/bin/python -c 'import dspy' >/dev/null 2>&1" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo GEPA optimizer is available inside the AgentArk runtime.
+    exit /b 0
+)
+set /a GEPA_RETRIES-=1
+if %GEPA_RETRIES% LEQ 0 (
+    echo GEPA optimizer is missing from the bundled AgentArk runtime. Update or rebuild before running ArkEvolve GEPA.
+    exit /b 1
+)
+ping -n 2 127.0.0.1 >nul
+goto verify_gepa_loop
 
-:upsert_managed_env
-set "AA_ENV_KEY=%~1"
-set "AA_ENV_VALUE=%~2"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$envPath='.agentark\local.env'; New-Item -ItemType Directory -Force -Path (Split-Path $envPath) | Out-Null; $key=$env:AA_ENV_KEY; $value=$env:AA_ENV_VALUE; $lines=@(); if(Test-Path $envPath){ $lines=Get-Content $envPath | Where-Object { $_ -notmatch ('^' + [regex]::Escape($key) + '=') } }; $lines += ($key + '=' + $value); Set-Content -Path $envPath -Value $lines"
-exit /b %ERRORLEVEL%
+:verify_gepa_async
+if not exist ".agentark" mkdir ".agentark" >nul 2>&1
+start "" /b /d "%CD%" "%ComSpec%" /c call "%~f0" verify-gepa ^> ".agentark\gepa-check.log" 2^>^&1
+exit /b 0
 
 :usage
 echo Usage: scripts\start.bat [start^|tunnel^|stop^|restart^|logs^|update^|build^|status^|lowmem]

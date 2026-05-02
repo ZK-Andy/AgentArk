@@ -42,6 +42,7 @@ impl Agent {
             related_actions: vec![
                 "schedule_task".to_string(),
                 "watch".to_string(),
+                "background_session_manage".to_string(),
                 "notify_user".to_string(),
                 "list_tasks".to_string(),
                 "list_watchers".to_string(),
@@ -408,7 +409,9 @@ impl Agent {
                         safe_truncate(objective, 400),
                         conversation_id
                     )),
-                    preferred_delivery_channel: self.resolve_single_notification_channel(None).await,
+                    // Keep `preferred` automations dynamic: a channel connected
+                    // after creation should be eligible when the task/watch fires.
+                    preferred_delivery_channel: None,
                     channel: Some(channel.to_string()),
                     conversation_id: Some(conversation_id.to_string()),
                     project_id: project_id.map(|value| value.to_string()),
@@ -422,6 +425,632 @@ impl Agent {
         self.sync_background_session_artifact_context(conversation_id, &session)
             .await;
         Some(session)
+    }
+
+    async fn resolve_background_session_for_manage(
+        &self,
+        background_session_id: Option<&str>,
+        reference_text: Option<&str>,
+        conversation_id: Option<&str>,
+        include_closed: bool,
+    ) -> Result<background_session::BackgroundSession, String> {
+        if let Some(id) = background_session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self
+                .background_sessions
+                .get(id)
+                .await
+                .ok_or_else(|| format!("Background session `{}` was not found.", id));
+        }
+
+        let reference_text = reference_text
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
+
+        if let Some(conversation_id) = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let local_sessions = self
+                .background_sessions_for_conversation(conversation_id, include_closed)
+                .await;
+            if !reference_text.is_empty() {
+                let recent_artifacts = self.load_recent_artifact_contexts(conversation_id).await;
+                let resolved = Self::resolve_background_session_reference_from_candidates(
+                    reference_text,
+                    &recent_artifacts,
+                    &local_sessions,
+                );
+                if let Some(session) = resolved.session {
+                    return Ok(session);
+                }
+                if resolved.ambiguous {
+                    return Err(format!(
+                        "Multiple background sessions match. Use one of these ids: {}",
+                        resolved
+                            .candidates
+                            .iter()
+                            .map(|session| format!("{} ({})", session.id, session.title))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+
+            let open_local = local_sessions
+                .iter()
+                .filter(|session| include_closed || !session.status.is_closed())
+                .cloned()
+                .collect::<Vec<_>>();
+            if open_local.len() == 1 {
+                return Ok(open_local[0].clone());
+            }
+            if open_local.len() > 1 {
+                return Err(format!(
+                    "This conversation has multiple background sessions. Use one of these ids: {}",
+                    open_local
+                        .iter()
+                        .map(|session| format!("{} ({})", session.id, session.title))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+
+        let all_open = self
+            .background_sessions
+            .list()
+            .await
+            .into_iter()
+            .filter(|session| include_closed || !session.status.is_closed())
+            .collect::<Vec<_>>();
+        if !reference_text.is_empty() {
+            let resolved = Self::resolve_background_session_reference_from_candidates(
+                reference_text,
+                &[],
+                &all_open,
+            );
+            if let Some(session) = resolved.session {
+                return Ok(session);
+            }
+            if resolved.ambiguous {
+                return Err(format!(
+                    "Multiple background sessions match. Use one of these ids: {}",
+                    resolved
+                        .candidates
+                        .iter()
+                        .map(|session| format!("{} ({})", session.id, session.title))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        if all_open.len() == 1 {
+            return Ok(all_open[0].clone());
+        }
+        if all_open.is_empty() {
+            Err("No active background sessions were found.".to_string())
+        } else {
+            Err(format!(
+                "Multiple background sessions are active. Use one of these ids: {}",
+                all_open
+                    .iter()
+                    .map(|session| format!("{} ({})", session.id, session.title))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+
+    fn background_session_status_line(
+        session: &background_session::BackgroundSession,
+        tasks: &[task::Task],
+        watchers: &[watcher::Watcher],
+    ) -> String {
+        let linked_tasks = session
+            .linked_task_ids
+            .iter()
+            .filter_map(|id| {
+                tasks
+                    .iter()
+                    .find(|task| task.id.to_string() == id.as_str())
+                    .map(|task| {
+                        format!(
+                            "{} [{}]",
+                            task.description,
+                            Self::task_status_debug_label(&task.status)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let linked_watchers = session
+            .linked_watcher_ids
+            .iter()
+            .filter_map(|id| {
+                watchers
+                    .iter()
+                    .find(|watcher| watcher.id.to_string() == id.as_str())
+                    .map(|watcher| {
+                        format!(
+                            "{} [{}]",
+                            watcher.description,
+                            Self::watcher_supervisor_status_label(&watcher.status)
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let delivery = session
+            .preferred_delivery_channel
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("preferred");
+        format!(
+            "{}\n- id: {}\n- status: {}\n- delivery: {}\n- objective: {}\n- linked tasks: {}\n- linked watchers: {}",
+            session.title,
+            session.id,
+            session.status.label(),
+            watcher_delivery_label(delivery),
+            safe_truncate(&session.objective, 300),
+            if linked_tasks.is_empty() {
+                "none".to_string()
+            } else {
+                linked_tasks.join("; ")
+            },
+            if linked_watchers.is_empty() {
+                "none".to_string()
+            } else {
+                linked_watchers.join("; ")
+            }
+        )
+    }
+
+    async fn pause_linked_background_tasks(&self, task_ids: &[String]) -> usize {
+        let updated = {
+            let mut tasks = self.tasks.write().await;
+            let mut updated = Vec::new();
+            for task_id in task_ids {
+                let Ok(id) = uuid::Uuid::parse_str(task_id) else {
+                    continue;
+                };
+                let Some(task) = tasks.get_mut(id) else {
+                    continue;
+                };
+                if matches!(
+                    task.status,
+                    task::TaskStatus::Pending
+                        | task::TaskStatus::AwaitingApproval
+                        | task::TaskStatus::ExpiredNeedsReapproval
+                        | task::TaskStatus::InProgress
+                ) {
+                    task.status = task::TaskStatus::Paused;
+                    updated.push(task.clone());
+                }
+            }
+            updated
+        };
+        for task in &updated {
+            if let Ok(status_json) = serde_json::to_string(&task.status) {
+                let _ = self
+                    .storage
+                    .update_task_status(&task.id.to_string(), &status_json)
+                    .await;
+            }
+        }
+        updated.len()
+    }
+
+    async fn resume_linked_background_tasks(&self, task_ids: &[String]) -> usize {
+        let updated = {
+            let mut tasks = self.tasks.write().await;
+            let mut updated = Vec::new();
+            for task_id in task_ids {
+                let Ok(id) = uuid::Uuid::parse_str(task_id) else {
+                    continue;
+                };
+                let Some(task) = tasks.get_mut(id) else {
+                    continue;
+                };
+                if matches!(task.status, task::TaskStatus::Paused) {
+                    task.status = task::TaskStatus::Pending;
+                    updated.push(task.clone());
+                }
+            }
+            updated
+        };
+        for task in &updated {
+            if let Ok(status_json) = serde_json::to_string(&task.status) {
+                let _ = self
+                    .storage
+                    .update_task_status(&task.id.to_string(), &status_json)
+                    .await;
+            }
+        }
+        updated.len()
+    }
+
+    async fn cancel_linked_background_tasks(&self, task_ids: &[String]) -> usize {
+        let updated = {
+            let mut tasks = self.tasks.write().await;
+            let mut updated = Vec::new();
+            for task_id in task_ids {
+                let Ok(id) = uuid::Uuid::parse_str(task_id) else {
+                    continue;
+                };
+                let Some(task) = tasks.get_mut(id) else {
+                    continue;
+                };
+                if !matches!(
+                    task.status,
+                    task::TaskStatus::Completed | task::TaskStatus::Cancelled
+                ) {
+                    task.status = task::TaskStatus::Cancelled;
+                    task.result = Some("Cancelled with its background session.".to_string());
+                    updated.push(task.clone());
+                }
+            }
+            updated
+        };
+        for task in &updated {
+            if let Ok(status_json) = serde_json::to_string(&task.status) {
+                let _ = self
+                    .storage
+                    .update_task_status_and_result(
+                        &task.id.to_string(),
+                        &status_json,
+                        task.result.as_deref(),
+                    )
+                    .await;
+            }
+        }
+        updated.len()
+    }
+
+    async fn delete_linked_background_tasks(&self, task_ids: &[String]) -> usize {
+        let mut deleted = 0usize;
+        for task_id in task_ids {
+            let Ok(id) = uuid::Uuid::parse_str(task_id) else {
+                continue;
+            };
+            if self.tasks.write().await.remove(id) {
+                deleted += 1;
+            }
+            let _ = self.storage.delete_task(task_id).await;
+        }
+        deleted
+    }
+
+    async fn update_linked_background_task_delivery(
+        &self,
+        task_ids: &[String],
+        delivery_channel: &str,
+    ) -> usize {
+        let updated = {
+            let mut tasks = self.tasks.write().await;
+            let mut updated = Vec::new();
+            for task_id in task_ids {
+                let Ok(id) = uuid::Uuid::parse_str(task_id) else {
+                    continue;
+                };
+                let Some(task) = tasks.get_mut(id) else {
+                    continue;
+                };
+                let mut arguments = task.arguments.clone();
+                if let Some(obj) = arguments.as_object_mut() {
+                    obj.insert(
+                        "report_to".to_string(),
+                        serde_json::Value::String(delivery_channel.to_string()),
+                    );
+                } else {
+                    arguments = serde_json::json!({ "report_to": delivery_channel });
+                }
+                if arguments != task.arguments {
+                    task.arguments = arguments;
+                    updated.push(task.clone());
+                }
+            }
+            updated
+        };
+        for task in &updated {
+            if let Ok(arguments_json) = serde_json::to_string(&task.arguments) {
+                let _ = self
+                    .storage
+                    .update_task(&task.id.to_string(), None, Some(arguments_json), None, None)
+                    .await;
+            }
+        }
+        updated.len()
+    }
+
+    pub(super) async fn handle_background_session_manage(
+        &self,
+        arguments: &serde_json::Value,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        let operation = arguments
+            .get("operation")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("status")
+            .to_ascii_lowercase();
+        let include_closed = arguments
+            .get("include_closed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(matches!(operation.as_str(), "list"));
+        let background_session_id = arguments
+            .get("background_session_id")
+            .and_then(|value| value.as_str());
+        let reference_text = arguments
+            .get("reference_text")
+            .and_then(|value| value.as_str());
+
+        if operation == "list" {
+            let mut sessions = if let Some(conversation_id) = conversation_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                self.background_sessions_for_conversation(conversation_id, include_closed)
+                    .await
+            } else {
+                self.background_sessions
+                    .list()
+                    .await
+                    .into_iter()
+                    .filter(|session| include_closed || !session.status.is_closed())
+                    .collect::<Vec<_>>()
+            };
+            sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            let tasks = self.tasks.read().await.all().to_vec();
+            let watchers = self.watcher_manager.list().await;
+            let lines = sessions
+                .iter()
+                .map(|session| Self::background_session_status_line(session, &tasks, &watchers))
+                .collect::<Vec<_>>();
+            let detail = if lines.is_empty() {
+                "No matching background sessions found.".to_string()
+            } else {
+                format!("Found {} background session(s).", lines.len())
+            };
+            return Some(format!(
+                "{}\n{}",
+                render_tool_completion_marker_with_data(
+                    "background_session_manage",
+                    "completed",
+                    &detail,
+                    serde_json::json!({
+                        "operation": operation,
+                        "session_count": sessions.len(),
+                        "object_refs": sessions.iter().map(|session| {
+                            serde_json::json!({ "kind": "background_session", "id": session.id.clone() })
+                        }).collect::<Vec<_>>(),
+                    }),
+                ),
+                if lines.is_empty() {
+                    detail
+                } else {
+                    lines.join("\n\n")
+                }
+            ));
+        }
+
+        let mut session = match self
+            .resolve_background_session_for_manage(
+                background_session_id,
+                reference_text,
+                conversation_id,
+                include_closed || background_session_id.is_some(),
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(message) => return Some(message),
+        };
+
+        let mut task_changes = 0usize;
+        let mut watcher_changes = 0usize;
+        let status_detail;
+        match operation.as_str() {
+            "status" => {
+                status_detail = "Background session status loaded.".to_string();
+            }
+            "pause" => {
+                task_changes = self
+                    .pause_linked_background_tasks(&session.linked_task_ids)
+                    .await;
+                for watcher_id in &session.linked_watcher_ids {
+                    if let Ok(id) = uuid::Uuid::parse_str(watcher_id) {
+                        if self.watcher_manager.pause(id).await {
+                            watcher_changes += 1;
+                        }
+                    }
+                }
+                if let Some(updated) = self
+                    .background_sessions
+                    .set_status(
+                        &session.id,
+                        background_session::BackgroundSessionStatus::Paused,
+                        "Background session paused by user.",
+                        Some("agent"),
+                    )
+                    .await
+                {
+                    session = updated;
+                }
+                status_detail = format!(
+                    "Paused background session. Updated {} task(s) and {} watcher(s).",
+                    task_changes, watcher_changes
+                );
+            }
+            "resume" => {
+                task_changes = self
+                    .resume_linked_background_tasks(&session.linked_task_ids)
+                    .await;
+                for watcher_id in &session.linked_watcher_ids {
+                    if let Ok(id) = uuid::Uuid::parse_str(watcher_id) {
+                        if self.watcher_manager.resume(id).await {
+                            watcher_changes += 1;
+                        }
+                    }
+                }
+                if let Some(updated) = self
+                    .background_sessions
+                    .set_status(
+                        &session.id,
+                        background_session::BackgroundSessionStatus::Active,
+                        "Background session resumed by user.",
+                        Some("agent"),
+                    )
+                    .await
+                {
+                    session = updated;
+                }
+                status_detail = format!(
+                    "Resumed background session. Updated {} task(s) and {} watcher(s).",
+                    task_changes, watcher_changes
+                );
+            }
+            "stop" | "cancel" => {
+                task_changes = self
+                    .cancel_linked_background_tasks(&session.linked_task_ids)
+                    .await;
+                for watcher_id in &session.linked_watcher_ids {
+                    if let Ok(id) = uuid::Uuid::parse_str(watcher_id) {
+                        if self.watcher_manager.cancel(id).await {
+                            watcher_changes += 1;
+                        }
+                    }
+                }
+                if let Some(updated) = self
+                    .background_sessions
+                    .set_status(
+                        &session.id,
+                        background_session::BackgroundSessionStatus::Cancelled,
+                        "Background session cancelled by user.",
+                        Some("agent"),
+                    )
+                    .await
+                {
+                    session = updated;
+                }
+                status_detail = format!(
+                    "Stopped background session. Cancelled {} task(s) and {} watcher(s).",
+                    task_changes, watcher_changes
+                );
+            }
+            "delete" => {
+                task_changes = self
+                    .delete_linked_background_tasks(&session.linked_task_ids)
+                    .await;
+                for watcher_id in &session.linked_watcher_ids {
+                    if let Ok(id) = uuid::Uuid::parse_str(watcher_id) {
+                        if self.watcher_manager.delete(id).await {
+                            watcher_changes += 1;
+                        }
+                    }
+                }
+                let deleted_session = self.background_sessions.delete(&session.id).await;
+                status_detail = format!(
+                    "Deleted background session{} and removed {} linked task(s) and {} linked watcher(s).",
+                    if deleted_session.is_some() {
+                        ""
+                    } else {
+                        " record was already missing"
+                    },
+                    task_changes,
+                    watcher_changes
+                );
+            }
+            "update_delivery" => {
+                let delivery_channel = normalize_automation_notification_channel(
+                    arguments
+                        .get("delivery_channel")
+                        .and_then(|value| value.as_str()),
+                );
+                task_changes = self
+                    .update_linked_background_task_delivery(
+                        &session.linked_task_ids,
+                        &delivery_channel,
+                    )
+                    .await;
+                for watcher_id in &session.linked_watcher_ids {
+                    if let Ok(id) = uuid::Uuid::parse_str(watcher_id) {
+                        if self
+                            .watcher_manager
+                            .set_notify_channel(id, &delivery_channel)
+                            .await
+                        {
+                            watcher_changes += 1;
+                        }
+                    }
+                }
+                if let Some(updated) = self
+                    .background_sessions
+                    .update(
+                        &session.id,
+                        background_session::BackgroundSessionUpdate {
+                            preferred_delivery_channel: Some(delivery_channel.clone()),
+                            ..Default::default()
+                        },
+                        Some("agent"),
+                    )
+                    .await
+                {
+                    session = updated;
+                }
+                status_detail = format!(
+                    "Updated background session delivery to {}. Updated {} task(s) and {} watcher(s).",
+                    watcher_delivery_label(&delivery_channel),
+                    task_changes,
+                    watcher_changes
+                );
+            }
+            _ => {
+                return Some(format!(
+                    "Unsupported background session operation `{}`.",
+                    operation
+                ));
+            }
+        }
+
+        if operation != "delete" {
+            if let Some(conversation_id) = conversation_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                self.sync_background_session_artifact_context(conversation_id, &session)
+                    .await;
+            }
+        }
+        let tasks = self.tasks.read().await.all().to_vec();
+        let watchers = self.watcher_manager.list().await;
+        let status_line = if operation == "delete" {
+            format!("{} ({})", session.title, session.id)
+        } else {
+            Self::background_session_status_line(&session, &tasks, &watchers)
+        };
+        Some(format!(
+            "{}\n{}\n\n{}",
+            render_tool_completion_marker_with_data(
+                "background_session_manage",
+                "completed",
+                &status_detail,
+                serde_json::json!({
+                    "operation": operation,
+                    "background_session_id": session.id.clone(),
+                    "task_changes": task_changes,
+                    "watcher_changes": watcher_changes,
+                    "object_refs": [{
+                        "kind": "background_session",
+                        "id": session.id.clone()
+                    }],
+                }),
+            ),
+            status_detail,
+            status_line
+        ))
     }
 
     pub(super) async fn attach_items_to_background_session(
@@ -487,7 +1116,7 @@ impl Agent {
         }
     }
 
-    pub(super) async fn maybe_consolidate_idle_background_sessions(&self) {
+    pub(crate) async fn maybe_consolidate_idle_background_sessions(&self) {
         let sessions = self.background_sessions.list().await;
         if sessions.is_empty() {
             return;

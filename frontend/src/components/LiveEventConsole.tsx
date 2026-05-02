@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Box, Button, Card, CardContent, Chip, Stack, Typography } from "@mui/material";
 import type { TraceOperationalEvent, TraceSummary } from "../types";
+import { formatChannelSource } from "./channelLabels";
 
 type Props = {
   history: TraceSummary[];
@@ -244,7 +245,7 @@ function buildEventEntry(event: TraceOperationalEvent): ConsoleEntry {
     : formatLabel(event.event_type);
   const detail = event.outcome ? formatLabel(event.outcome) : "Live operational signal";
   const meta = [
-    event.channel ? `${formatLabel(event.channel)} channel` : "",
+    event.channel ? `${formatChannelSource(event.channel)} channel` : "",
     event.latency_ms != null ? formatDuration(event.latency_ms) : "",
   ].filter(Boolean);
 
@@ -262,7 +263,7 @@ function buildEventEntry(event: TraceOperationalEvent): ConsoleEntry {
 function buildTraceEntry(trace: TraceSummary): ConsoleEntry {
   const tone = traceTone(trace);
   const meta = [
-    trace.channel ? `${formatLabel(trace.channel)} channel` : "",
+    trace.channel ? `${formatChannelSource(trace.channel)} channel` : "",
     Number.isFinite(trace.step_count) ? `${trace.step_count} steps` : "",
     trace.duration_ms != null ? formatDuration(trace.duration_ms) : "",
   ].filter(Boolean);
@@ -287,7 +288,7 @@ export function LiveEventConsole({ history, events = [], compact = false, onHide
   const latestTrace = pickLatestByTime(history, (item) => item.started_at);
   const stage = latestEvent ? stageFromEvent(latestEvent) : stageFromTrace(latestTrace);
   const sourceLabel = latestEvent?.channel || latestTrace?.channel
-    ? formatLabel(latestEvent?.channel || latestTrace?.channel)
+    ? formatChannelSource(latestEvent?.channel || latestTrace?.channel)
     : "Standby";
   const updatedLabel = latestEvent?.created_at || latestTrace?.started_at
     ? shortTimestamp(latestEvent?.created_at || latestTrace?.started_at)

@@ -12,7 +12,7 @@ pub(super) fn normalize_origin(value: &str) -> Option<String> {
 }
 
 pub(super) fn generate_ephemeral_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     base64::engine::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)

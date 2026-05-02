@@ -293,7 +293,6 @@ pub(super) struct AutomationRunInfo {
     pub error: Option<String>,
     pub next_retry_at: Option<String>,
     pub conversation_id: Option<String>,
-    pub project_id: Option<String>,
     pub view: String,
 }
 
@@ -355,8 +354,6 @@ pub(super) struct CreateBackgroundSessionRequest {
     pub channel: Option<String>,
     #[serde(default)]
     pub conversation_id: Option<String>,
-    #[serde(default)]
-    pub project_id: Option<String>,
     #[serde(default)]
     pub task_ids: Vec<String>,
     #[serde(default)]
@@ -1116,8 +1113,6 @@ pub(super) struct GoalLoopRequest {
     pub(super) preview_only: bool,
     #[serde(default)]
     pub(super) plan_override: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(super) project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1145,8 +1140,6 @@ pub(super) struct KnowledgeQueryRequest {
     pub(super) query: String,
     #[serde(default)]
     pub(super) limit: Option<usize>,
-    #[serde(default)]
-    pub(super) project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1205,7 +1198,6 @@ pub(super) struct EvolutionSettingsResponse {
     pub(super) canary: EvolutionCanarySummary,
     pub(super) strategy_canary: EvolutionCanarySummary,
     pub(super) prompt_canary: EvolutionCanarySummary,
-    pub(super) classifier_prompt_canary: EvolutionCanarySummary,
     pub(super) specialist_prompt_canary: EvolutionCanarySummary,
     pub(super) last_promotion_result: String,
     pub(super) replay_gate_result: Option<String>,
@@ -1213,14 +1205,17 @@ pub(super) struct EvolutionSettingsResponse {
     pub(super) prompt_last_promotion_result: String,
     pub(super) prompt_replay_gate_result: Option<String>,
     pub(super) prompt_promotion_mode: String,
-    pub(super) classifier_prompt_last_promotion_result: String,
-    pub(super) classifier_prompt_replay_gate_result: Option<String>,
-    pub(super) classifier_prompt_promotion_mode: String,
     pub(super) specialist_prompt_last_promotion_result: String,
     pub(super) specialist_prompt_replay_gate_result: Option<String>,
     pub(super) specialist_prompt_promotion_mode: String,
+    pub(super) routing_rollback_available: bool,
     pub(super) deploy_guard_default: bool,
     pub(super) readiness_policy: crate::core::ReadinessPolicy,
+    pub(super) gepa_config: crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig,
+    pub(super) gepa_readiness: crate::core::self_evolve::gepa_bridge::GepaReadiness,
+    pub(super) gepa_auto_state: crate::core::self_evolve::gepa_bridge::GepaAutoRunState,
+    pub(super) gepa_last_result: Option<serde_json::Value>,
+    pub(super) gepa_queue: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1231,6 +1226,11 @@ pub(super) struct EvolutionSettingsUpdateRequest {
     pub(super) learning_model_slot: Option<String>,
     pub(super) learning_queue_cap: Option<u64>,
     pub(super) readiness_policy: Option<crate::core::ReadinessPolicy>,
+    pub(super) gepa_auto_mode: Option<String>,
+    pub(super) gepa_daily_budget_usd: Option<f64>,
+    pub(super) gepa_per_run_budget_usd: Option<f64>,
+    pub(super) gepa_max_runs_per_day: Option<u32>,
+    pub(super) gepa_max_metric_calls: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1349,12 +1349,6 @@ pub(super) struct EvolutionDevResponse {
     pub(super) prompt_lineage_recent: Vec<serde_json::Value>,
     pub(super) prompt_metrics: Vec<PromptEvolutionMetric>,
     pub(super) prompt_insights: PromptEvolutionInsights,
-    pub(super) classifier_prompt_canary_state:
-        Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
-    pub(super) classifier_prompt_last_result: Option<serde_json::Value>,
-    pub(super) classifier_prompt_lineage_recent: Vec<serde_json::Value>,
-    pub(super) classifier_prompt_metrics: Vec<PromptEvolutionMetric>,
-    pub(super) classifier_prompt_insights: PromptEvolutionInsights,
     pub(super) specialist_prompt_canary_state:
         Option<crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
     pub(super) specialist_prompt_last_result: Option<serde_json::Value>,
@@ -1368,7 +1362,6 @@ pub(super) struct EvolutionDevResponse {
     pub(super) learning_patterns: Vec<serde_json::Value>,
     pub(super) experience_graph: serde_json::Value,
     pub(super) recent_prompt_runs: Vec<serde_json::Value>,
-    pub(super) recent_classifier_prompt_runs: Vec<serde_json::Value>,
     pub(super) recent_specialist_prompt_runs: Vec<serde_json::Value>,
     pub(super) recent_experience_runs: Vec<serde_json::Value>,
     pub(super) prompt_canary_safety_events:

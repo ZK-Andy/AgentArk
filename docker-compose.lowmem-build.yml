@@ -1,0 +1,16 @@
+# =============================================================================
+# AgentArk - low-memory local source build override
+# =============================================================================
+#
+# Use with docker-compose.dev.yml when the normal Rust release link runs out of
+# memory. This selects Dockerfile.lowmem; no user build env flags are required.
+#
+#   AGENTARK_IMAGE=agentark:dev docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.lowmem-build.yml up -d --build
+#
+# Runtime memory limits remain in docker-compose.lowmem.yml.
+# =============================================================================
+
+services:
+  agentark-control:
+    build:
+      dockerfile: Dockerfile.lowmem

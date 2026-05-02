@@ -61,7 +61,6 @@ export type BackgroundSessionSummary = {
   preferred_delivery_channel?: string | null;
   channel?: string | null;
   conversation_id?: string | null;
-  project_id?: string | null;
   linked_task_ids: string[];
   linked_watcher_ids: string[];
   created_at: string;
@@ -131,7 +130,6 @@ export type BackgroundSessionDetail = {
     working_memory?: string | null;
     channel?: string | null;
     conversation_id?: string | null;
-    project_id?: string | null;
     events: BackgroundSessionEvent[];
   };
   linked_tasks: BackgroundSessionLinkedTask[];
@@ -190,6 +188,14 @@ export type ArkPulseRemediationSpec =
   | { kind: "tunnel_restart_verify" }
   | { kind: "app_restart"; app_id: string }
   | { kind: "readonly_investigation"; topic: "memory_capture_health" }
+  | {
+      kind: "managed_app_operation";
+      app_id: string;
+      operation:
+        | "compile_python_requirements"
+        | "generate_cargo_lockfile"
+        | "remove_npm_install_hooks";
+    }
   | { kind: "shell_command"; command: string };
 
 export type ArkPulseDoctorFinding = {
@@ -444,8 +450,14 @@ export type LlmAnalyticsBreakdownRow = {
 };
 
 export type LlmAnalyticsResponse = {
-  range: { since: string; until: string; bucket: "hour" | "day" | "week" | string };
+  range: {
+    since: string;
+    until: string;
+    bucket: "hour" | "day" | "week" | string;
+    truncated?: boolean;
+  };
   totals: LlmAnalyticsTotals;
+  truncated?: boolean;
   series: LlmAnalyticsPoint[];
   by_model: LlmAnalyticsBreakdownRow[];
   by_channel: LlmAnalyticsBreakdownRow[];

@@ -560,7 +560,7 @@ impl BackgroundSessionManager {
             ),
             channel: normalize_text_field(request.channel, 80),
             conversation_id: normalize_text_field(request.conversation_id, 120),
-            project_id: normalize_text_field(request.project_id, 120),
+            project_id: None,
             linked_task_ids: normalize_id_list(&request.task_ids),
             linked_watcher_ids: normalize_id_list(&request.watcher_ids),
             policy: request.policy.normalized(),
@@ -740,7 +740,7 @@ impl BackgroundSessionManager {
         id: &str,
         channel: Option<&str>,
         conversation_id: Option<&str>,
-        project_id: Option<&str>,
+        _project_id: Option<&str>,
         actor: Option<&str>,
     ) -> Option<BackgroundSession> {
         let updated = {
@@ -761,13 +761,6 @@ impl BackgroundSessionManager {
                 && session.conversation_id != normalized_conversation
             {
                 session.conversation_id = normalized_conversation;
-                changed = true;
-            }
-
-            let normalized_project =
-                normalize_text_field(project_id.map(|value| value.to_string()), 120);
-            if normalized_project.is_some() && session.project_id != normalized_project {
-                session.project_id = normalized_project;
                 changed = true;
             }
 
@@ -1038,12 +1031,7 @@ impl BackgroundSessionManager {
                     session.last_activity_at = now;
                     push_event(
                         &mut session.events,
-                        build_event(
-                            "rebound",
-                            "Linked work was reassigned to another background session.",
-                            None,
-                            actor,
-                        ),
+                        build_event("rebound", "Linked work was moved or removed.", None, actor),
                     );
                     if session.linked_task_ids.is_empty()
                         && session.linked_watcher_ids.is_empty()

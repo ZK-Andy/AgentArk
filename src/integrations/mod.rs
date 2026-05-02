@@ -21,6 +21,7 @@ pub mod places;
 pub mod social_analytics;
 pub mod twilio;
 pub mod twitter;
+pub mod vercel;
 pub mod whatsapp;
 pub mod whoop;
 
@@ -167,6 +168,19 @@ fn external_integration_is_connected(
     manager: &crate::core::config::SecureConfigManager,
     integration_id: &str,
 ) -> Option<bool> {
+    if integration_id == "vercel" {
+        return Some(
+            std::env::var("VERCEL_TOKEN")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+                || manager
+                    .get_custom_secret(crate::actions::vercel::VERCEL_TOKEN_SECRET_KEY)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|value| !value.trim().is_empty()),
+        );
+    }
+
     if integration_id == "media_gen" {
         let config = manager.load().ok()?;
         return Some(
@@ -344,6 +358,21 @@ impl IntegrationManager {
         // Register Twitter/X
         self.register(twitter::TwitterConnector::new_with_config_dir(
             config_dir.clone(),
+        ));
+
+        // Register Vercel app publishing integration status.
+        let vercel_data_dir = std::env::var("AGENTARK_DATA_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                config_dir
+                    .parent()
+                    .map(|path| path.join("data"))
+                    .unwrap_or_else(|| config_dir.clone())
+            });
+        self.register(vercel::VercelConnector::new_with_paths(
+            config_dir.clone(),
+            vercel_data_dir,
         ));
 
         // Register 1Password

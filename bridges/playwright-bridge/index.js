@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 const { chromium } = require('playwright');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -14,7 +14,7 @@ const LIVE_VIEW_PORT = Number.parseInt(process.env.PLAYWRIGHT_LIVE_VIEW_PORT || 
 const LIVE_VIEW_PATH = process.env.PLAYWRIGHT_LIVE_VIEW_PATH || '/vnc.html?autoconnect=1&resize=remote&path=websockify';
 const LIVE_VIEW_ENABLED = !HEADLESS && Boolean(process.env.DISPLAY);
 
-// Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer }
+// Active browser sessions: id -> { context, page, mode, claimed, claimedAt, lastActivity, cleanupTimer, diagnostics }
 const sessions = new Map();
 
 let browser = null;
@@ -69,6 +69,23 @@ function touchSession(session) {
   session.cleanupTimer = setTimeout(() => destroySession(session.id), SESSION_TIMEOUT_MS);
 }
 
+function recordDiagnostic(session, entry) {
+  if (!session || !Array.isArray(session.diagnostics)) return;
+  const normalized = {
+    time: new Date().toISOString(),
+    kind: String(entry.kind || 'browser'),
+    severity: String(entry.severity || 'info'),
+    message: String(entry.message || '').slice(0, 600),
+    url: String(entry.url || '').slice(0, 600),
+    resource_type: String(entry.resource_type || ''),
+  };
+  if (!normalized.message && !normalized.url) return;
+  session.diagnostics.push(normalized);
+  if (session.diagnostics.length > 80) {
+    session.diagnostics.splice(0, session.diagnostics.length - 80);
+  }
+}
+
 async function destroySession(id) {
   const session = sessions.get(id);
   if (!session) return;
@@ -93,7 +110,7 @@ app.post('/session', async (req, res) => {
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     });
     const page = await context.newPage();
-    const id = uuidv4();
+    const id = randomUUID();
     const session = {
       id,
       context,
@@ -103,7 +120,46 @@ app.post('/session', async (req, res) => {
       claimedAt: null,
       lastActivity: Date.now(),
       cleanupTimer: null,
+      diagnostics: [],
     };
+    page.on('console', (msg) => {
+      const type = msg.type();
+      recordDiagnostic(session, {
+        kind: 'console',
+        severity: type === 'error' ? 'error' : type === 'warning' ? 'warning' : 'info',
+        message: msg.text(),
+        url: page.url(),
+      });
+    });
+    page.on('pageerror', (err) => {
+      recordDiagnostic(session, {
+        kind: 'pageerror',
+        severity: 'error',
+        message: err && err.message ? err.message : String(err || ''),
+        url: page.url(),
+      });
+    });
+    page.on('requestfailed', (request) => {
+      const failure = request.failure();
+      recordDiagnostic(session, {
+        kind: 'requestfailed',
+        severity: 'warning',
+        message: failure && failure.errorText ? failure.errorText : 'request failed',
+        url: request.url(),
+        resource_type: request.resourceType(),
+      });
+    });
+    page.on('response', (response) => {
+      const status = response.status();
+      if (status >= 400) {
+        recordDiagnostic(session, {
+          kind: 'response',
+          severity: status >= 500 ? 'error' : 'warning',
+          message: `HTTP ${status}`,
+          url: response.url(),
+        });
+      }
+    });
     sessions.set(id, session);
     touchSession(session);
     console.log(`Session ${id} created (${sessions.size} total)`);
@@ -313,7 +369,7 @@ app.get('/session/:id/content', async (req, res) => {
       return results;
     });
 
-    res.json({ title, url, body_text: bodyText, elements });
+    res.json({ title, url, body_text: bodyText, elements, diagnostics: session.diagnostics || [] });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

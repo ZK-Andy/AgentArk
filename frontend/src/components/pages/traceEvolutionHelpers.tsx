@@ -724,10 +724,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.result" ||
-      traceKind === "self_evolve.specialist_prompt.result"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.result") {
       const evaluatedCandidates = num(data.evaluated_candidates, 0);
       const baselineScore = percentageLabel(data.baseline_score, 0);
       const candidateScore = percentageLabel(data.best_candidate_score, 0);
@@ -773,10 +770,7 @@ export function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewC
       if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
       const lineageId = str(data.lineage_entry_id, "").trim();
       if (lineageId) evidence.push(`Lineage: ${lineageId}`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.promotion" ||
-      traceKind === "self_evolve.specialist_prompt.promotion"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.promotion") {
       const promotionMode = str(data.promotion_mode, "none").trim();
       const canaryState = asRecord(data.canary_state);
       const replay = asRecord(data.replay_evaluation);
@@ -1293,7 +1287,6 @@ export function evolutionExperimentStatusText(item: {
 export function promptProposalScopeLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "prompt_profile") return "Main replies";
-  if (normalized === "classifier_prompt_profile") return "Request understanding";
   if (normalized === "specialist_prompt_profile") return "Specialist helpers";
   return humanizeStatusLabel(value || "prompt profile");
 }
@@ -1712,10 +1705,10 @@ export function learningCandidateReviewEvidence(
 export type EvolutionPageTab = "what" | "helped" | "tests" | "review";
 
 export const EVOLUTION_PAGE_TABS: Array<{ value: EvolutionPageTab; label: string }> = [
-  { value: "what", label: "Recent changes" },
-  { value: "helped", label: "What improved" },
-  { value: "tests", label: "Experiments" },
-  { value: "review", label: "Needs approval" },
+  { value: "what", label: "Overview" },
+  { value: "helped", label: "Results" },
+  { value: "tests", label: "Live tests" },
+  { value: "review", label: "Review queue" },
 ];
 
 export function clampPercent(value: unknown): number {

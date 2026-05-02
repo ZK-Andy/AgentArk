@@ -21,32 +21,18 @@ pub(super) enum ArkPulseFixPlan {
     TunnelStartVerify,
     TunnelRestartVerify,
     AppRestart(String),
+    ManagedAppOperation {
+        app_id: String,
+        operation: crate::sentinel::DoctorManagedAppOperation,
+    },
     ReadonlyInvestigation {
         topic: crate::sentinel::DoctorReadonlyInvestigationTopic,
     },
-    ShellOperations {
-        app_dir: String,
-        operations: Vec<ArkPulseShellOperation>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ArkPulseShellOperation {
-    PipCompileRequirements,
-    Ripgrep {
-        pattern: String,
-        path: Option<String>,
-    },
-    CargoGenerateLockfile,
-    NpmPkgDelete {
-        keys: Vec<String>,
-    },
-    MoveEnvBackup,
 }
 
 pub(super) fn arkpulse_fix_plan_from_remediation(
     remediation: &crate::sentinel::DoctorRemediationSpec,
-    allow_shell_command: bool,
+    _allow_shell_command: bool,
 ) -> Option<ArkPulseFixPlan> {
     match remediation {
         crate::sentinel::DoctorRemediationSpec::TunnelStartVerify => {
@@ -67,130 +53,18 @@ pub(super) fn arkpulse_fix_plan_from_remediation(
                 topic: topic.clone(),
             })
         }
-        crate::sentinel::DoctorRemediationSpec::ShellCommand { command } if allow_shell_command => {
-            parse_supported_arkpulse_shell_command(command.trim())
+        crate::sentinel::DoctorRemediationSpec::ManagedAppOperation { app_id, operation } => {
+            if is_valid_app_id(app_id) {
+                Some(ArkPulseFixPlan::ManagedAppOperation {
+                    app_id: app_id.clone(),
+                    operation: operation.clone(),
+                })
+            } else {
+                None
+            }
         }
         crate::sentinel::DoctorRemediationSpec::ShellCommand { .. } => None,
     }
-}
-
-pub(super) fn parse_arkpulse_app_restart(command: &str) -> Option<String> {
-    let normalized = command.trim();
-    let path = normalized
-        .strip_prefix("POST ")
-        .or_else(|| normalized.strip_prefix("post "))?
-        .trim();
-    let app_id = path.strip_prefix("/api/apps/")?.strip_suffix("/restart")?;
-    if is_valid_app_id(app_id) {
-        Some(app_id.to_string())
-    } else {
-        None
-    }
-}
-
-pub(super) fn parse_supported_arkpulse_shell_segment(
-    segment: &str,
-) -> Option<ArkPulseShellOperation> {
-    let trimmed = segment.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower == "pip-compile requirements.txt" {
-        return Some(ArkPulseShellOperation::PipCompileRequirements);
-    }
-    if lower == "cargo generate-lockfile" {
-        return Some(ArkPulseShellOperation::CargoGenerateLockfile);
-    }
-    if lower == "npm pkg delete scripts.preinstall scripts.install scripts.postinstall" {
-        return Some(ArkPulseShellOperation::NpmPkgDelete {
-            keys: vec![
-                "scripts.preinstall".to_string(),
-                "scripts.install".to_string(),
-                "scripts.postinstall".to_string(),
-            ],
-        });
-    }
-    if lower == "mv .env ../.env.backup" || lower == "mv .env .env.backup" {
-        return Some(ArkPulseShellOperation::MoveEnvBackup);
-    }
-    if let Some(rest) = trimmed.strip_prefix("rg -n ") {
-        let quoted = rest.strip_prefix('"')?;
-        let end = quoted.find('"')?;
-        let pattern = quoted[..end].to_string();
-        let remaining = quoted[end + 1..].trim();
-        if remaining.contains('&')
-            || remaining.contains(';')
-            || remaining.contains('`')
-            || remaining.contains("$(")
-            || remaining.contains('|')
-        {
-            return None;
-        }
-        let path = (!remaining.is_empty()).then(|| remaining.to_string());
-        return Some(ArkPulseShellOperation::Ripgrep { pattern, path });
-    }
-    None
-}
-
-pub(super) fn parse_supported_arkpulse_shell_command(command: &str) -> Option<ArkPulseFixPlan> {
-    let normalized = command.trim();
-    if normalized.is_empty() {
-        return None;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    if lower.contains('\n')
-        || lower.contains('\r')
-        || lower.contains("||")
-        || lower.contains(';')
-        || lower.contains('`')
-        || lower.contains("$(")
-    {
-        return None;
-    }
-
-    let segments: Vec<&str> = normalized
-        .split("&&")
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.len() < 2 {
-        return None;
-    }
-
-    let cd_segment = segments[0];
-    let cd_prefix = cd_segment
-        .strip_prefix("cd ")
-        .or_else(|| cd_segment.strip_prefix("cd\t"))?;
-    let cd_target = cd_prefix.trim();
-    if cd_target.is_empty() {
-        return None;
-    }
-
-    let mut operations = Vec::new();
-    for segment in segments.iter().skip(1) {
-        operations.push(parse_supported_arkpulse_shell_segment(segment)?);
-    }
-
-    Some(ArkPulseFixPlan::ShellOperations {
-        app_dir: cd_target.to_string(),
-        operations,
-    })
-}
-
-pub(super) fn classify_arkpulse_fix_plan(command: &str) -> Option<ArkPulseFixPlan> {
-    let normalized = command.trim();
-    if normalized.is_empty() {
-        return None;
-    }
-    let lower = normalized.to_ascii_lowercase();
-    if lower.contains("start tunnel") && lower.contains("/tunnel/status") {
-        return Some(ArkPulseFixPlan::TunnelStartVerify);
-    }
-    if lower.contains("restart") && lower.contains("tunnel") {
-        return Some(ArkPulseFixPlan::TunnelRestartVerify);
-    }
-    if let Some(app_id) = parse_arkpulse_app_restart(normalized) {
-        return Some(ArkPulseFixPlan::AppRestart(app_id));
-    }
-    parse_supported_arkpulse_shell_command(normalized)
 }
 
 pub(super) fn truncate_for_response(input: &str, max_chars: usize) -> String {
@@ -221,6 +95,9 @@ pub(super) fn describe_arkpulse_remediation(
         Some(crate::sentinel::DoctorRemediationSpec::ReadonlyInvestigation { topic }) => {
             describe_arkpulse_readonly_investigation(topic)
         }
+        Some(crate::sentinel::DoctorRemediationSpec::ManagedAppOperation { app_id, operation }) => {
+            describe_arkpulse_managed_app_operation(app_id, operation)
+        }
         Some(crate::sentinel::DoctorRemediationSpec::ShellCommand { command }) => {
             command.trim().to_string()
         }
@@ -238,35 +115,21 @@ pub(super) fn describe_arkpulse_readonly_investigation(
     }
 }
 
-pub(super) fn describe_arkpulse_shell_operation(operation: &ArkPulseShellOperation) -> String {
+pub(super) fn describe_arkpulse_managed_app_operation(
+    app_id: &str,
+    operation: &crate::sentinel::DoctorManagedAppOperation,
+) -> String {
     match operation {
-        ArkPulseShellOperation::PipCompileRequirements => {
-            "pip-compile requirements.txt".to_string()
+        crate::sentinel::DoctorManagedAppOperation::CompilePythonRequirements => {
+            format!("Compile pinned Python requirements for app {}", app_id)
         }
-        ArkPulseShellOperation::Ripgrep { pattern, path } => match path {
-            Some(path) => format!("rg -n \"{}\" {}", pattern, path),
-            None => format!("rg -n \"{}\"", pattern),
-        },
-        ArkPulseShellOperation::CargoGenerateLockfile => "cargo generate-lockfile".to_string(),
-        ArkPulseShellOperation::NpmPkgDelete { keys } => {
-            format!("npm pkg delete {}", keys.join(" "))
+        crate::sentinel::DoctorManagedAppOperation::GenerateCargoLockfile => {
+            format!("Generate Cargo.lock for app {}", app_id)
         }
-        ArkPulseShellOperation::MoveEnvBackup => "mv .env .env.backup".to_string(),
-    }
-}
-
-pub(super) fn arkpulse_shell_operation_auto_run_error(
-    operations: &[ArkPulseShellOperation],
-) -> Option<String> {
-    for operation in operations {
-        if matches!(operation, ArkPulseShellOperation::Ripgrep { .. }) {
-            return Some(
-                "ArkPulse grep fixes are no longer auto-run because they can expose file contents. Review the finding and run the search manually if needed."
-                    .to_string(),
-            );
+        crate::sentinel::DoctorManagedAppOperation::RemoveNpmInstallHooks => {
+            format!("Remove npm install lifecycle hooks from app {}", app_id)
         }
     }
-    None
 }
 
 pub(super) fn apply_arkpulse_sanitized_env(command: &mut tokio::process::Command) {
@@ -323,6 +186,7 @@ pub(super) enum HealViability {
 pub(super) struct DeletedAppCleanupSummary {
     pub(super) deleted_notifications: u64,
     pub(super) deleted_pulse_events: u64,
+    pub(super) deleted_reflect_units: u64,
 }
 
 pub(super) fn arkpulse_error_result(
@@ -337,28 +201,6 @@ pub(super) fn arkpulse_error_result(
             "error": error,
         }),
     )
-}
-
-pub(super) fn validate_arkpulse_relative_path(raw: &str) -> Result<PathBuf, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("ArkPulse file target cannot be empty".to_string());
-    }
-    let path = PathBuf::from(trimmed);
-    if path.is_absolute() {
-        return Err("ArkPulse file targets must stay relative to the app directory".to_string());
-    }
-    for component in path.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        ) {
-            return Err("ArkPulse file targets cannot escape the app directory".to_string());
-        }
-    }
-    Ok(path)
 }
 
 pub(super) async fn resolve_arkpulse_app_dir(
@@ -383,6 +225,23 @@ pub(super) async fn resolve_arkpulse_app_dir(
         return Err("ArkPulse fixes may only run inside the managed apps directory".to_string());
     }
     Ok(requested)
+}
+
+pub(super) async fn resolve_arkpulse_app_dir_by_id(
+    state: &AppState,
+    app_id: &str,
+) -> Result<PathBuf, String> {
+    let trimmed = app_id.trim();
+    if !is_valid_app_id(trimmed) {
+        return Err("App id is required for ArkPulse app remediation".to_string());
+    }
+    let registry_dir = state.app_registry.get_dir(trimmed).await;
+    let fallback_dir = {
+        let agent = state.agent.read().await;
+        agent.data_dir().join("apps").join(trimmed)
+    };
+    let app_dir = registry_dir.unwrap_or(fallback_dir);
+    resolve_arkpulse_app_dir(state, &app_dir.display().to_string()).await
 }
 
 pub(super) async fn run_arkpulse_process(
@@ -422,81 +281,49 @@ pub(super) async fn run_arkpulse_process(
     }))
 }
 
-pub(super) async fn run_arkpulse_shell_operations_fix(
+pub(super) async fn run_arkpulse_managed_app_operation_fix(
     state: &AppState,
-    raw_app_dir: &str,
-    operations: &[ArkPulseShellOperation],
+    app_id: &str,
+    operation: &crate::sentinel::DoctorManagedAppOperation,
 ) -> ArkPulseFixHttpResult {
-    let app_dir = match resolve_arkpulse_app_dir(state, raw_app_dir).await {
+    let app_dir = match resolve_arkpulse_app_dir_by_id(state, app_id).await {
         Ok(path) => path,
         Err(error) => return arkpulse_error_result(StatusCode::BAD_REQUEST, error),
     };
 
-    let mut results = Vec::new();
-    for operation in operations {
-        let detail = match operation {
-            ArkPulseShellOperation::PipCompileRequirements => {
-                let args = vec!["requirements.txt".to_string()];
-                run_arkpulse_process(&app_dir, "pip-compile", &args).await
-            }
-            ArkPulseShellOperation::Ripgrep { pattern, path } => {
-                let mut args = vec!["-n".to_string(), pattern.clone()];
-                if let Some(path) = path {
-                    let safe_path = match validate_arkpulse_relative_path(path) {
-                        Ok(value) => value,
-                        Err(error) => return arkpulse_error_result(StatusCode::BAD_REQUEST, error),
-                    };
-                    args.push(safe_path.to_string_lossy().to_string());
-                }
-                run_arkpulse_process(&app_dir, "rg", &args).await
-            }
-            ArkPulseShellOperation::CargoGenerateLockfile => {
-                let args = vec!["generate-lockfile".to_string()];
-                run_arkpulse_process(&app_dir, "cargo", &args).await
-            }
-            ArkPulseShellOperation::NpmPkgDelete { keys } => {
-                let mut args = vec!["pkg".to_string(), "delete".to_string()];
-                args.extend(keys.clone());
-                run_arkpulse_process(&app_dir, "npm", &args).await
-            }
-            ArkPulseShellOperation::MoveEnvBackup => {
-                let source = app_dir.join(".env");
-                if !source.exists() {
-                    return arkpulse_error_result(
-                        StatusCode::BAD_REQUEST,
-                        "No .env file exists in this app directory",
-                    );
-                };
-                let target = app_dir.join(".env.backup");
-                match tokio::fs::rename(&source, &target).await {
-                    Ok(()) => Ok(serde_json::json!({
-                        "action": "rename",
-                        "from": source.display().to_string(),
-                        "to": target.display().to_string(),
-                    })),
-                    Err(error) => Err(format!("failed to move .env to backup: {}", error)),
-                }
-            }
-        };
-
-        match detail {
-            Ok(detail) => results.push(serde_json::json!({
-                "operation": describe_arkpulse_shell_operation(operation),
-                "detail": detail,
-            })),
-            Err(error) => return arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error),
+    let (program, args): (&str, Vec<String>) = match operation {
+        crate::sentinel::DoctorManagedAppOperation::CompilePythonRequirements => {
+            ("pip-compile", vec!["requirements.txt".to_string()])
         }
-    }
+        crate::sentinel::DoctorManagedAppOperation::GenerateCargoLockfile => {
+            ("cargo", vec!["generate-lockfile".to_string()])
+        }
+        crate::sentinel::DoctorManagedAppOperation::RemoveNpmInstallHooks => (
+            "npm",
+            vec![
+                "pkg".to_string(),
+                "delete".to_string(),
+                "scripts.preinstall".to_string(),
+                "scripts.install".to_string(),
+                "scripts.postinstall".to_string(),
+            ],
+        ),
+    };
 
-    (
-        StatusCode::OK,
-        serde_json::json!({
-            "status": "ok",
-            "mode": "shell_operations",
-            "app_dir": app_dir.display().to_string(),
-            "operations": results,
-        }),
-    )
+    match run_arkpulse_process(&app_dir, program, &args).await {
+        Ok(detail) => (
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "ok",
+                "mode": "managed_app_operation",
+                "app_id": app_id,
+                "operation": operation,
+                "message": describe_arkpulse_managed_app_operation(app_id, operation),
+                "detail": detail,
+            }),
+        ),
+        Err(error) => arkpulse_error_result(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 pub(super) async fn lookup_app_title_for_cleanup(state: &AppState, app_id: &str) -> Option<String> {
@@ -540,9 +367,24 @@ pub(super) async fn cleanup_deleted_app_references(
                 0
             }
         };
+    let deleted_reflect_units = match storage
+        .delete_semantic_work_units_for_source("app", app_id)
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                "Failed to prune ArkReflect rows while cleaning '{}': {}",
+                app_id,
+                error
+            );
+            0
+        }
+    };
     DeletedAppCleanupSummary {
         deleted_notifications,
         deleted_pulse_events,
+        deleted_reflect_units,
     }
 }
 
@@ -701,7 +543,7 @@ pub(super) async fn run_arkpulse_app_restart_fix(
             "status": "ok",
             "mode": "app_restart",
             "app_id": app_id,
-            "message": format!("Restarted app {} and queued a fresh ArkPulse run.", title),
+            "message": format!("Restarted app {}.", title),
             "url": url,
             "details": payload,
         }),
@@ -737,7 +579,6 @@ pub(super) async fn run_arkpulse_readonly_investigation_fix(
                     "status".to_string(),
                     "capture_kind".to_string(),
                     "conversation_id".to_string(),
-                    "project_id".to_string(),
                     "created_at".to_string(),
                     "updated_at".to_string(),
                     "next_retry_at".to_string(),
@@ -827,15 +668,7 @@ pub(super) async fn run_arkpulse_readonly_investigation_fix(
                         .and_then(|value| value.as_str())
                         .map(|value| format!("conversation={}", value))
                         .unwrap_or_else(|| "conversation=global".to_string());
-                    let project_id = row
-                        .get("project_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| format!("project={}", value))
-                        .unwrap_or_else(|| "project=global".to_string());
-                    format!(
-                        "- {} | {} | {} | {}",
-                        updated_at, capture_kind, conversation_id, project_id
-                    )
+                    format!("- {} | {} | {}", updated_at, capture_kind, conversation_id)
                 })
                 .collect::<Vec<_>>();
             let mut output_lines = vec![format!(
@@ -892,8 +725,8 @@ pub(super) fn arkpulse_fix_plan_label(plan: &ArkPulseFixPlan) -> &'static str {
         ArkPulseFixPlan::TunnelStartVerify => "tunnel_start_verify",
         ArkPulseFixPlan::TunnelRestartVerify => "tunnel_restart_verify",
         ArkPulseFixPlan::AppRestart(_) => "app_restart",
+        ArkPulseFixPlan::ManagedAppOperation { .. } => "managed_app_operation",
         ArkPulseFixPlan::ReadonlyInvestigation { .. } => "readonly_investigation",
-        ArkPulseFixPlan::ShellOperations { .. } => "shell_operations",
     }
 }
 
@@ -999,11 +832,15 @@ pub(super) async fn run_arkpulse_fix(
     let started_at = std::time::Instant::now();
 
     let request_fix_command = fix_command.trim().to_string();
-    if request_fix_command.is_empty() && remediation.is_none() {
+    let request_has_event_context = event_timestamp
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || finding_index.is_some();
+    if request_fix_command.is_empty() && remediation.is_none() && !request_has_event_context {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "remediation or fix_command is required".to_string(),
+                error: "structured remediation or ArkPulse finding context is required".to_string(),
             }),
         )
             .into_response();
@@ -1011,10 +848,6 @@ pub(super) async fn run_arkpulse_fix(
 
     let mut effective_fix_command = request_fix_command.clone();
     let mut effective_remediation = remediation.clone();
-    let request_has_event_context = event_timestamp
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || finding_index.is_some();
     let mut selected_event_timestamp: Option<String> = None;
     let mut selected_finding_index: Option<usize> = None;
 
@@ -1075,29 +908,6 @@ pub(super) async fn run_arkpulse_fix(
             )
                 .into_response();
         }
-        if !request_fix_command.is_empty() && finding.fix_command.trim() != request_fix_command {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "fix_command does not match the selected ArkPulse finding".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        if let (Some(requested_remediation), Some(stored_remediation)) =
-            (remediation.as_ref(), finding.remediation.as_ref())
-        {
-            if stored_remediation != requested_remediation {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "remediation does not match the selected ArkPulse finding"
-                            .to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
         selected_event_timestamp = Some(event_timestamp.to_string());
         selected_finding_index = Some(finding_index);
         effective_fix_command = finding.fix_command.trim().to_string();
@@ -1105,40 +915,31 @@ pub(super) async fn run_arkpulse_fix(
         effective_remediation
             .as_ref()
             .and_then(|value| arkpulse_fix_plan_from_remediation(value, true))
-            .or_else(|| classify_arkpulse_fix_plan(&effective_fix_command))
     } else {
         effective_remediation
             .as_ref()
             .and_then(|value| arkpulse_fix_plan_from_remediation(value, false))
-            .or_else(|| classify_arkpulse_fix_plan(&request_fix_command))
     };
 
     let Some(plan) = plan else {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error:
-                    "This fix cannot be auto-run directly. Copy the remediation and run it manually."
-                        .to_string(),
+                error: "This finding has no executable ArkPulse auto-fix.".to_string(),
             }),
         )
             .into_response();
     };
 
-    if let ArkPulseFixPlan::ShellOperations { operations, .. } = &plan {
-        if !request_has_event_context {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Shell-style ArkPulse fixes must come from a stored ArkPulse finding. Open the finding in ArkPulse and run it from there."
-                        .to_string(),
-                }),
-            )
-                .into_response();
-        }
-        if let Some(error) = arkpulse_shell_operation_auto_run_error(operations) {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
-        }
+    if matches!(plan, ArkPulseFixPlan::ManagedAppOperation { .. }) && !request_has_event_context {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Managed app ArkPulse fixes must come from a stored ArkPulse finding."
+                    .to_string(),
+            }),
+        )
+            .into_response();
     }
 
     let issue_title = issue_title.unwrap_or_default();
@@ -1207,7 +1008,6 @@ pub(super) async fn run_arkpulse_fix(
                 let app_title = lookup_app_title_for_cleanup(&state, app_id).await;
                 let cleanup =
                     cleanup_deleted_app_references(&state, app_id, app_title.as_deref()).await;
-                trigger_arkpulse_after_app_change(&state, "app_delete").await;
                 let result = (
                     StatusCode::OK,
                     serde_json::json!({
@@ -1325,13 +1125,12 @@ pub(super) async fn run_arkpulse_fix(
                 }
             }
             ArkPulseFixPlan::AppRestart(_) => unreachable!("app_restart handled above"),
+            ArkPulseFixPlan::ManagedAppOperation { app_id, operation } => {
+                run_arkpulse_managed_app_operation_fix(&state, app_id, operation).await
+            }
             ArkPulseFixPlan::ReadonlyInvestigation { topic } => {
                 run_arkpulse_readonly_investigation_fix(&state, topic).await
             }
-            ArkPulseFixPlan::ShellOperations {
-                app_dir,
-                operations,
-            } => run_arkpulse_shell_operations_fix(&state, app_dir, operations).await,
         }
     };
     let result = match tokio::time::timeout(Duration::from_secs(60), execution).await {

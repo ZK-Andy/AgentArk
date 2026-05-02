@@ -1,0 +1,5 @@
+{
+  "name": "iframe-html",
+  "description": "Compatibility widget for self-contained HTML snippets.",
+  "entry": "index.js"
+}

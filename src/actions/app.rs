@@ -1,9 +1,9 @@
-//! App deployment — write files, optionally start a server, return a live URL.
+//! App deployment: write files, optionally start a server, return a live URL.
 //!
 //! Supports any kind of app:
-//! - Static HTML/JS/CSS → served directly at /apps/{id}/
-//! - Python server (FastAPI, Flask, etc.) → started as subprocess, reverse-proxied
-//! - Node.js server (Express, etc.) → started as subprocess, reverse-proxied
+//! - Static HTML/JS/CSS -> served directly at /apps/{id}/
+//! - Python server (FastAPI, Flask, etc.) -> started as subprocess, reverse-proxied
+//! - Node.js server (Express, etc.) -> started as subprocess, reverse-proxied
 //!
 //! Dynamic apps get an auto-assigned port on localhost. The main HTTP server
 //! reverse-proxies /apps/{id}/* to that port.
@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::RwLock;
 
-use crate::core::StreamEvent;
 use crate::core::runtime_image;
+use crate::core::StreamEvent;
 
 /// Port range for dynamic apps (localhost only)
 const PORT_RANGE_START: u16 = 9100;
@@ -29,6 +29,8 @@ const APP_CONTAINER_PREFIX: &str = "agentark-app-";
 const MAX_APP_COMMAND_LEN: usize = 1024;
 const LOCAL_RUNTIME_STDOUT_LOG_FILE: &str = ".agentark_runtime_stdout.log";
 const LOCAL_RUNTIME_STDERR_LOG_FILE: &str = ".agentark_runtime_stderr.log";
+pub(crate) const APP_QUALITY_REPORT_FILE: &str = "quality_report.json";
+pub(crate) const APP_SUB_GOALS_FILE: &str = "sub_goals.json";
 const LOCAL_RUNTIME_LOG_TAIL_BYTES: usize = 4096;
 const DYNAMIC_RUNTIME_READY_TIMEOUT_SECS: u64 = 30;
 const DYNAMIC_RUNTIME_READY_POLL_MS: u64 = 500;
@@ -62,12 +64,6 @@ fn control_plane_catalog_mode() -> bool {
             let role = value.trim();
             role.eq_ignore_ascii_case("control-plane") || role.eq_ignore_ascii_case("control")
         })
-}
-
-fn executor_service_mode() -> bool {
-    std::env::var("AGENTARK_STACK_ROLE")
-        .ok()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("executor"))
 }
 
 fn control_plane_executor_client() -> Option<crate::clients::ExecutorClient> {
@@ -195,7 +191,7 @@ fn html_raw_text_element_needs_close(tag_name: &str) -> bool {
     matches!(tag_name, "script" | "style" | "textarea" | "title")
 }
 
-fn find_unclosed_html_raw_text_element(content: &str) -> Option<&'static str> {
+pub(crate) fn detect_unclosed_html_raw_text_element(content: &str) -> Option<&'static str> {
     let lower = content.to_ascii_lowercase();
     let mut cursor = 0usize;
 
@@ -288,7 +284,7 @@ fn validate_static_app_html_structure(
         let Some(content) = content.as_str() else {
             continue;
         };
-        if let Some(tag_name) = find_unclosed_html_raw_text_element(content) {
+        if let Some(tag_name) = detect_unclosed_html_raw_text_element(content) {
             malformed.push(format!(
                 "{} has an unclosed <{}> block",
                 owner_file, tag_name
@@ -753,6 +749,7 @@ fn should_skip_repo_dir(entry: &walkdir::DirEntry) -> bool {
             | "coverage"
             | ".venv"
             | "venv"
+            | ".agentark"
             | "__pycache__"
             | "target"
             | ".idea"
@@ -1086,6 +1083,28 @@ fn build_python_commands(
     None
 }
 
+fn build_rust_commands(
+    dir: &Path,
+    relative_dir: &str,
+) -> Option<(RepoServiceKind, Option<String>, String)> {
+    if !dir.join("Cargo.toml").exists() {
+        return None;
+    }
+    let entry_command = if relative_dir.trim().is_empty() {
+        "cargo run".to_string()
+    } else {
+        format!(
+            "cargo run --manifest-path {}",
+            shell_quote_arg(&build_relative_file_arg(relative_dir, "Cargo.toml"))
+        )
+    };
+    Some((
+        repo_dir_name_hint(relative_dir).unwrap_or(RepoServiceKind::Backend),
+        None,
+        entry_command,
+    ))
+}
+
 fn classify_node_service_kind(manifest: &RepoNodeManifest, relative_dir: &str) -> RepoServiceKind {
     let deps = &manifest.dependencies;
     let has_frontend_framework = deps.iter().any(|dep| {
@@ -1282,6 +1301,7 @@ fn discover_repo_candidate_dirs(root: &Path) -> Vec<PathBuf> {
             || dir.join("requirements.txt").exists()
             || dir.join("pyproject.toml").exists()
             || dir.join("manage.py").exists()
+            || dir.join("Cargo.toml").exists()
             || dir.join("index.html").exists();
         if is_candidate {
             candidates.push(dir.to_path_buf());
@@ -1376,6 +1396,25 @@ fn plan_repo_services(
                 entry_command: Some(entry_command),
                 required_inputs,
                 detection_reason: "python app manifest".to_string(),
+            });
+            continue;
+        }
+
+        if let Some((kind, install_command, entry_command)) =
+            build_rust_commands(&dir, &relative_dir)
+        {
+            if !kind.matches_mode(service_mode) {
+                continue;
+            }
+            plans.push(RepoServicePlan {
+                title: build_repo_service_title(repo_title, &relative_dir, kind),
+                relative_dir,
+                kind,
+                copy_scope: RepoCopyScope::RepositoryRoot,
+                install_command,
+                entry_command: Some(entry_command),
+                required_inputs,
+                detection_reason: "cargo manifest".to_string(),
             });
             continue;
         }
@@ -1479,6 +1518,21 @@ fn collect_repo_files(root: &Path) -> Result<serde_json::Map<String, serde_json:
     Ok(files)
 }
 
+async fn emit_repo_clone_progress(
+    stream_tx: &Option<Sender<StreamEvent>>,
+    message: impl Into<String>,
+) {
+    if let Some(tx) = stream_tx {
+        let _ = tx
+            .send(StreamEvent::ToolProgress {
+                name: "app_deploy".to_string(),
+                content: message.into(),
+                payload: None,
+            })
+            .await;
+    }
+}
+
 async fn clone_repo(
     repo_url: &str,
     repo_ref: Option<&str>,
@@ -1493,7 +1547,7 @@ async fn clone_repo(
     clone_args.push(repo_url.to_string());
     clone_args.push(target_dir.to_string_lossy().to_string());
 
-    emit_progress(stream_tx, &format!("Cloning repository {}", repo_url)).await;
+    emit_repo_clone_progress(stream_tx, format!("Cloning repository {}", repo_url)).await;
     let output = run_local_command_with_progress(
         &join_shell_command(&clone_args),
         "git clone",
@@ -1516,7 +1570,7 @@ async fn clone_repo(
     }
 
     if let Some(reference) = repo_ref.filter(|value| !value.trim().is_empty()) {
-        emit_progress(stream_tx, &format!("Checking out repo ref {}", reference)).await;
+        emit_repo_clone_progress(stream_tx, format!("Checking out repo ref {}", reference)).await;
         let output = run_local_command_with_progress(
             &format!("git checkout {}", shell_quote_arg(reference)),
             "git checkout",
@@ -1825,7 +1879,7 @@ async fn deploy_repo_bundle(
                 .and_then(|value| value.as_str()),
         )
     } else {
-        RuntimePreference::Container
+        runtime_preference_from_opt(None)
     };
     let expose_public = arguments
         .get("expose_public")
@@ -1873,7 +1927,12 @@ async fn deploy_repo_bundle(
         match RepoDeployInFlightGuard::acquire(data_dir, &fingerprint, &lock_metadata).await {
             Ok(guard) => guard,
             Err(error) => {
-                emit_progress(&stream_tx, &error.to_string()).await;
+                emit_phase_progress(
+                    &stream_tx,
+                    AppDeployProgressPhase::Planning,
+                    error.to_string(),
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -1907,7 +1966,12 @@ async fn deploy_repo_bundle(
         .map(|(file, hints)| (Some(file), hints.mentions_compose))
         .unwrap_or((None, false));
 
-    emit_progress(&stream_tx, "Reading repo README and local manifests").await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::Planning,
+        "Reading repo README and local manifests",
+    )
+    .await;
     let service_plans = {
         let repo_root = repo_root.clone();
         let repo_title = repo_title.clone();
@@ -1922,9 +1986,10 @@ async fn deploy_repo_bundle(
             "I cloned the repo, but I could not detect a runnable frontend/backend service from the README or local manifests."
         );
     }
-    emit_progress(
+    emit_phase_progress(
         &stream_tx,
-        &format!(
+        AppDeployProgressPhase::Planning,
+        format!(
             "Detected {} repo service(s): {}",
             service_plans.len(),
             service_plans
@@ -1950,9 +2015,10 @@ async fn deploy_repo_bundle(
     let mut failure_count = 0usize;
 
     for (idx, plan) in service_plans.iter().enumerate() {
-        emit_progress(
+        emit_phase_progress(
             &stream_tx,
-            &format!(
+            AppDeployProgressPhase::Deploying,
+            format!(
                 "Deploying repo service {}/{}: {}",
                 idx + 1,
                 service_plans.len(),
@@ -2214,7 +2280,7 @@ async fn deploy_repo_bundle(
     })
     .to_string())
 }
-fn app_container_name(app_id: &str) -> String {
+pub fn app_container_name(app_id: &str) -> String {
     format!("{}{}", APP_CONTAINER_PREFIX, app_id)
 }
 
@@ -2544,7 +2610,18 @@ fn prepend_path_entry(prefix: &Path, existing_path: Option<&str>) -> Option<Stri
 }
 
 async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> {
-    let venv_dir = app_dir.join(".venv");
+    // Per-app venv lives under `<app_dir>/.agentark/venv` so it stays
+    // isolated from any user-managed `.venv` and we own the path layout.
+    let agentark_dir = app_dir.join(".agentark");
+    if !agentark_dir.exists() {
+        std::fs::create_dir_all(&agentark_dir).with_context(|| {
+            format!(
+                "failed to create per-app state directory {}",
+                agentark_dir.display()
+            )
+        })?;
+    }
+    let venv_dir = agentark_dir.join("venv");
     let bin_dir = if cfg!(windows) {
         venv_dir.join("Scripts")
     } else {
@@ -2560,15 +2637,18 @@ async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> 
         return Ok((venv_dir, bin_dir));
     }
 
+    // Pass the venv as an absolute path so this works regardless of cwd
+    // resolution quirks on Windows / macOS sandboxes.
+    let venv_arg = venv_dir.to_string_lossy().to_string();
     let creators: Vec<(&str, Vec<&str>)> = if cfg!(windows) {
         vec![
-            ("python", vec!["-m", "venv", ".venv"]),
-            ("py", vec!["-3", "-m", "venv", ".venv"]),
+            ("python", vec!["-m", "venv", venv_arg.as_str()]),
+            ("py", vec!["-3", "-m", "venv", venv_arg.as_str()]),
         ]
     } else {
         vec![
-            ("python3", vec!["-m", "venv", ".venv"]),
-            ("python", vec!["-m", "venv", ".venv"]),
+            ("python3", vec!["-m", "venv", venv_arg.as_str()]),
+            ("python", vec!["-m", "venv", venv_arg.as_str()]),
         ]
     };
 
@@ -2585,8 +2665,9 @@ async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> 
                 if python_candidates.iter().any(|p| p.exists()) {
                     return Ok((venv_dir, bin_dir));
                 }
-                last_error = "venv command succeeded but Python executable was not found in .venv"
-                    .to_string();
+                last_error =
+                    "venv command succeeded but Python executable was not found in .agentark/venv"
+                        .to_string();
             }
             Ok(Ok(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2609,7 +2690,7 @@ async fn ensure_local_python_venv(app_dir: &Path) -> Result<(PathBuf, PathBuf)> 
     }
 
     if last_error.is_empty() {
-        last_error = "unknown error creating .venv".to_string();
+        last_error = "unknown error creating .agentark/venv".to_string();
     }
     anyhow::bail!(
         "failed to prepare local Python virtual environment: {}",
@@ -2754,7 +2835,11 @@ async fn discover_current_agent_image() -> Option<String> {
         return None;
     }
     let image = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if image.is_empty() { None } else { Some(image) }
+    if image.is_empty() {
+        None
+    } else {
+        Some(image)
+    }
 }
 
 async fn resolve_runtime_image(runtime_image: Option<&str>) -> String {
@@ -2789,6 +2874,202 @@ fn localize_app_entry_command(command: &str, app_dir: &Path) -> String {
         }
     }
     parts.join(" ")
+}
+
+fn command_program_name(raw: &str) -> String {
+    let file = raw
+        .trim()
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    file.strip_suffix(".cmd")
+        .or_else(|| file.strip_suffix(".exe"))
+        .unwrap_or(file.as_str())
+        .to_string()
+}
+
+fn package_manager_script_name(args: &[String]) -> Option<&str> {
+    let program = command_program_name(args.first()?.as_str());
+    match program.as_str() {
+        "npm" => (args.get(1).map(String::as_str) == Some("run"))
+            .then(|| args.get(2).map(String::as_str))
+            .flatten(),
+        "pnpm" | "yarn" | "bun" => {
+            if args.get(1).map(String::as_str) == Some("run") {
+                args.get(2).map(String::as_str)
+            } else {
+                args.get(1).map(String::as_str)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_package_manager_run(args: &[String]) -> bool {
+    package_manager_script_name(args).is_some()
+}
+
+fn app_manifest_uses_vite(app_dir: &Path) -> bool {
+    load_node_manifest(app_dir)
+        .map(|manifest| manifest.dependencies.contains("vite"))
+        .unwrap_or(false)
+}
+
+fn command_is_vite_runtime(args: &[String], app_dir: &Path) -> bool {
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let program = command_program_name(first);
+    if program == "vite" {
+        return true;
+    }
+    if matches!(program.as_str(), "npx" | "pnpm" | "yarn" | "bun")
+        && args
+            .iter()
+            .skip(1)
+            .any(|arg| command_program_name(arg) == "vite")
+    {
+        return true;
+    }
+    let Some(script) = package_manager_script_name(args) else {
+        return false;
+    };
+    app_manifest_uses_vite(app_dir) && matches!(script, "dev" | "start" | "preview")
+}
+
+fn command_vite_base_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--base" {
+            return iter.next().map(String::as_str);
+        }
+        if let Some(value) = arg.strip_prefix("--base=") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn command_has_vite_base_arg(args: &[String]) -> bool {
+    command_vite_base_arg(args).is_some()
+}
+
+fn app_mount_base(app_id: &str) -> String {
+    format!("/apps/{}/", app_id.trim_matches('/'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppProxyPathMode {
+    StripAppPrefix,
+    PreserveAppPrefix,
+}
+
+impl AppProxyPathMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StripAppPrefix => "strip_app_prefix",
+            Self::PreserveAppPrefix => "preserve_app_prefix",
+        }
+    }
+
+    fn from_meta(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "strip_app_prefix" | "stripped" | "strip" => Some(Self::StripAppPrefix),
+            "preserve_app_prefix" | "app_scoped" | "preserve" => Some(Self::PreserveAppPrefix),
+            _ => None,
+        }
+    }
+}
+
+pub fn dynamic_app_upstream_path(app_id: &str, path: &str, mode: AppProxyPathMode) -> String {
+    let normalized_path = path.trim_start_matches('/');
+    match mode {
+        AppProxyPathMode::StripAppPrefix => {
+            if normalized_path.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", normalized_path)
+            }
+        }
+        AppProxyPathMode::PreserveAppPrefix => {
+            if normalized_path.is_empty() {
+                app_mount_base(app_id)
+            } else {
+                format!(
+                    "{}{}",
+                    app_mount_base(app_id),
+                    normalized_path.trim_start_matches('/')
+                )
+            }
+        }
+    }
+}
+
+pub fn proxy_path_mode_for_entry_command(
+    entry_command: Option<&str>,
+    app_dir: &Path,
+    app_id: &str,
+) -> AppProxyPathMode {
+    let Some(command) = entry_command
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return AppProxyPathMode::StripAppPrefix;
+    };
+    let Ok(args) = split_command_args(command, "entry_command") else {
+        return AppProxyPathMode::StripAppPrefix;
+    };
+    if !command_is_vite_runtime(&args, app_dir) {
+        return AppProxyPathMode::StripAppPrefix;
+    }
+    match command_vite_base_arg(&args) {
+        Some(base)
+            if base.trim_end_matches('/') == app_mount_base(app_id).trim_end_matches('/') =>
+        {
+            AppProxyPathMode::PreserveAppPrefix
+        }
+        Some(_) => AppProxyPathMode::StripAppPrefix,
+        None => AppProxyPathMode::PreserveAppPrefix,
+    }
+}
+
+pub async fn proxy_path_mode_for_app_dir(app_dir: &Path, app_id: &str) -> AppProxyPathMode {
+    let meta = load_app_meta_json(app_dir).await;
+    if let Some(mode) = meta
+        .get("proxy_path_mode")
+        .and_then(|value| value.as_str())
+        .and_then(AppProxyPathMode::from_meta)
+    {
+        return mode;
+    }
+    let entry_command = app_meta_lifecycle_command(&meta, "entry_command");
+    proxy_path_mode_for_entry_command(entry_command.as_deref(), app_dir, app_id)
+}
+
+async fn persist_app_proxy_path_mode_meta(app_dir: &Path, mode: AppProxyPathMode) -> Result<()> {
+    let mut meta = load_app_meta_json(app_dir).await;
+    meta["proxy_path_mode"] = serde_json::Value::String(mode.as_str().to_string());
+    write_app_meta_json(app_dir, &meta).await?;
+    Ok(())
+}
+
+fn apply_app_mount_base_to_vite_entry_command(
+    command: &str,
+    app_dir: &Path,
+    app_id: &str,
+) -> Result<String> {
+    let mut args = split_command_args(command, "entry_command")?;
+    if !command_is_vite_runtime(&args, app_dir) || command_has_vite_base_arg(&args) {
+        return Ok(command.to_string());
+    }
+    if is_package_manager_run(&args) && !args.iter().any(|arg| arg == "--") {
+        args.push("--".to_string());
+    }
+    args.push("--base".to_string());
+    args.push(app_mount_base(app_id));
+    Ok(join_shell_command(&args))
 }
 
 fn split_command_args(command: &str, label: &str) -> Result<Vec<String>> {
@@ -3027,6 +3308,13 @@ async fn spawn_local_process_with_fallback(
         let stdout_log = open_local_runtime_log_for_append(stdout_log_path, "stdout")?;
         let stderr_log = open_local_runtime_log_for_append(stderr_log_path, "stderr")?;
         let mut cmd = tokio::process::Command::new(&program);
+        // Strip orchestrator secrets / namespaced env from the inherited
+        // environment (LLM API keys, internal auth, integration creds), then
+        // layer the curated runtime env on top. See
+        // `is_orchestrator_secret_var` for the pattern the scrub uses -
+        // intent-based, not enumerative, so legitimate dev tooling vars
+        // (JAVA_HOME, NODE_PATH, RUSTUP_HOME, etc.) still flow through.
+        scrub_inherited_env_for_local_app(&mut cmd);
         cmd.args(candidate.iter().skip(1))
             .stdout(Stdio::from(stdout_log))
             .stderr(Stdio::from(stderr_log))
@@ -3046,14 +3334,221 @@ async fn spawn_local_process_with_fallback(
     )
 }
 
-fn docker_required() -> bool {
-    if executor_service_mode() {
+/// Decide whether a specific app must use Docker, using intrinsic app signals
+/// rather than a user/operator env knob. This stays deliberately narrow:
+/// missing Docker must not poison ordinary Node/Python/Rust apps that can run
+/// as executor-local processes.
+fn docker_required_for_app(app_dir: &Path, runtime_image: Option<&str>) -> bool {
+    if runtime_image
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
         return true;
     }
-    std::env::var("AGENTARK_APP_REQUIRE_DOCKER")
-        .map(|v| {
-            let normalized = v.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+    app_has_compose_manifest(app_dir)
+}
+
+/// Build a one-line "why" for the Docker-required decision so the user-facing
+/// error tells the operator exactly which signal triggered the requirement.
+fn describe_docker_signals(app_dir: &Path, runtime_image: Option<&str>) -> String {
+    let mut signals: Vec<String> = Vec::new();
+    if let Some(image) = runtime_image {
+        signals.push(format!("runtime_image={}", image));
+    }
+    if app_has_compose_manifest(app_dir) {
+        signals.push("compose manifest detected".to_string());
+    }
+    if signals.is_empty() {
+        "no specific signal".to_string()
+    } else {
+        signals.join(", ")
+    }
+}
+
+fn app_has_compose_manifest(app_dir: &Path) -> bool {
+    const MANIFESTS: &[&str] = &[
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ];
+    MANIFESTS.iter().any(|name| app_dir.join(name).is_file())
+}
+
+/// Namespaces of environment variables owned by the orchestrator. Anything
+/// starting with one of these prefixes is considered orchestrator-internal
+/// and never inherited by user-deployed apps, regardless of name shape.
+const LOCAL_RUNTIME_ENV_BLOCKED_PREFIXES: &[&str] = &[
+    "AGENTARK_",
+    "ANTHROPIC_",
+    "OPENAI_",
+    "GOOGLE_API",
+    "GROQ_",
+    "DEEPSEEK_",
+    "MISTRAL_",
+    "AZURE_OPENAI_",
+    "INTERNAL_",
+    "POSTGRES_",
+    "DATABASE_",
+    "DOCKER_HOST_",
+    "EMBEDDINGS_",
+    "TELEGRAM_",
+    "WHATSAPP_",
+    "SLACK_",
+    "DISCORD_",
+    "MATRIX_",
+    "TEAMS_",
+    "GMAIL_",
+    "GOOGLE_CHAT_",
+    "RUNNER_",
+    "GITHUB_TOKEN",
+];
+
+/// Variable names that always pass through (well-known dev tooling roots and
+/// system essentials), even if their text would otherwise look secret-shaped
+/// to the secret-name heuristic below. Empty for now; left for future surgical
+/// exemptions.
+const LOCAL_RUNTIME_ENV_FORCE_ALLOW: &[&str] = &[];
+
+fn env_name_tokens(name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+
+    for ch in name.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(current.to_ascii_uppercase());
+                current.clear();
+            }
+            previous = None;
+            continue;
+        }
+
+        let camel_boundary = previous
+            .map(|prev| prev.is_ascii_lowercase() && ch.is_ascii_uppercase())
+            .unwrap_or(false);
+        if camel_boundary && !current.is_empty() {
+            tokens.push(current.to_ascii_uppercase());
+            current.clear();
+        }
+        current.push(ch);
+        previous = Some(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current.to_ascii_uppercase());
+    }
+    tokens
+}
+
+fn env_name_has_token_pair(tokens: &[String], first: &str, second: &str) -> bool {
+    tokens
+        .windows(2)
+        .any(|window| window[0] == first && window[1] == second)
+}
+
+fn env_name_looks_secret(name: &str) -> bool {
+    let tokens = env_name_tokens(name);
+    if tokens.is_empty() {
+        return false;
+    }
+    let sensitive_single_tokens = [
+        "APIKEY",
+        "KEY",
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "PRIVATE",
+        "BEARER",
+        "SESSION",
+        "AUTH",
+        "OAUTH",
+    ];
+    if tokens
+        .iter()
+        .any(|token| sensitive_single_tokens.contains(&token.as_str()))
+    {
+        return true;
+    }
+    if env_name_has_token_pair(&tokens, "API", "KEY")
+        || env_name_has_token_pair(&tokens, "ACCESS", "TOKEN")
+        || env_name_has_token_pair(&tokens, "REFRESH", "TOKEN")
+        || env_name_has_token_pair(&tokens, "DATABASE", "URL")
+        || env_name_has_token_pair(&tokens, "POSTGRES", "URL")
+        || env_name_has_token_pair(&tokens, "MONGO", "URI")
+        || env_name_has_token_pair(&tokens, "MONGODB", "URI")
+        || env_name_has_token_pair(&tokens, "MYSQL", "URL")
+        || env_name_has_token_pair(&tokens, "REDIS", "URL")
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns true if a given env var should be scrubbed before launching a
+/// user app. The rule is intent-based, not phrasing-list-based:
+/// 1. Anything in an orchestrator namespace is dropped.
+/// 2. Anything whose tokenized name looks like a secret is dropped.
+/// 3. Everything else (PATH, HOME, JAVA_HOME, NODE_PATH, RUSTUP_HOME,
+///    GOPATH, locale, proxy, Windows essentials, custom dev vars) passes.
+fn is_orchestrator_secret_var(name: &str) -> bool {
+    if LOCAL_RUNTIME_ENV_FORCE_ALLOW
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+    let upper = name.to_ascii_uppercase();
+    for prefix in LOCAL_RUNTIME_ENV_BLOCKED_PREFIXES {
+        if upper.starts_with(prefix) {
+            return true;
+        }
+    }
+    env_name_looks_secret(name)
+}
+
+/// Apply the env-scrub policy to a `tokio::process::Command`. We don't
+/// `env_clear()` (that would drop dev tooling roots like JAVA_HOME and
+/// NODE_PATH that vary across hosts and aren't easy to enumerate). Instead
+/// we walk the parent env, remove anything `is_orchestrator_secret_var`
+/// flags, and let the caller layer on the curated `extra_env` afterwards.
+fn scrub_inherited_env_for_local_app(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        let key_str = key.to_string_lossy();
+        if is_orchestrator_secret_var(&key_str) {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+fn docker_cli_available() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                if cfg!(windows) {
+                    let exts = std::env::var_os("PATHEXT")
+                        .map(|raw| {
+                            raw.to_string_lossy()
+                                .split(';')
+                                .map(|ext| ext.trim().trim_start_matches('.').to_ascii_lowercase())
+                                .filter(|ext| !ext.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|exts| !exts.is_empty())
+                        .unwrap_or_else(|| {
+                            vec!["exe".to_string(), "cmd".to_string(), "bat".to_string()]
+                        });
+                    exts.iter()
+                        .any(|ext| dir.join(format!("docker.{ext}")).is_file())
+                } else {
+                    dir.join("docker").is_file()
+                }
+            })
         })
         .unwrap_or(false)
 }
@@ -3063,6 +3558,10 @@ fn container_runtime_configured() -> bool {
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
         || Path::new("/var/run/docker.sock").exists()
+}
+
+fn container_runtime_available() -> bool {
+    docker_cli_available() && container_runtime_configured()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3090,7 +3589,7 @@ fn default_runtime_preference() -> RuntimePreference {
         "container" | "docker" => RuntimePreference::Container,
         "local" | "native" | "process" => RuntimePreference::Local,
         _ => {
-            if container_runtime_configured() {
+            if container_runtime_available() {
                 RuntimePreference::Container
             } else {
                 RuntimePreference::Local
@@ -3137,6 +3636,156 @@ fn with_node_bin_path(app_dir: &Path) -> Option<String> {
     std::env::join_paths(entries)
         .ok()
         .and_then(|os| os.into_string().ok())
+}
+
+/// True if the app declares Python dependencies. Used to decide whether to
+/// bootstrap a per-app venv when the entry/install commands don't obviously
+/// look like Python (e.g. a Makefile target that wraps `pytest`).
+fn app_declares_python_deps(app_dir: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile",
+        "Pipfile.lock",
+        "setup.py",
+        "setup.cfg",
+    ];
+    MARKERS.iter().any(|name| app_dir.join(name).is_file())
+}
+
+/// Pick the right Node package manager based on the lockfile present.
+/// Returns `None` when the app has no `package.json`, or when `node_modules`
+/// already contains installed packages so we don't double-install.
+fn detect_node_install_command(app_dir: &Path) -> Option<&'static str> {
+    if !app_dir.join("package.json").is_file() {
+        return None;
+    }
+    let modules = app_dir.join("node_modules");
+    if modules.is_dir() {
+        let populated = std::fs::read_dir(&modules)
+            .map(|iter| iter.take(2).count() > 0)
+            .unwrap_or(false);
+        if populated {
+            return None;
+        }
+    }
+    if app_dir.join("pnpm-lock.yaml").is_file() {
+        Some("pnpm install")
+    } else if app_dir.join("yarn.lock").is_file() {
+        Some("yarn install")
+    } else {
+        Some("npm install")
+    }
+}
+
+/// Walk PATH and return true if any candidate program resolves to an existing
+/// executable. Honours the explicit `PATH` we hand the child process so the
+/// check matches what the spawn will see.
+fn program_resolvable_on_path(program: &str, path_value: Option<&str>) -> bool {
+    if program.contains('/') || program.contains('\\') {
+        return Path::new(program).is_file();
+    }
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .ok()
+            .map(|raw| {
+                raw.split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()])
+    } else {
+        vec![String::new()]
+    };
+    let raw_path = match path_value {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => std::env::var("PATH").unwrap_or_default(),
+    };
+    for entry in std::env::split_paths(&raw_path) {
+        if entry.as_os_str().is_empty() {
+            continue;
+        }
+        for ext in exts.iter() {
+            let candidate = if ext.is_empty() {
+                entry.join(program)
+            } else {
+                entry.join(format!("{}{}", program, ext))
+            };
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Names of language runtimes the entry command needs on PATH. Returned as
+/// `(canonical_name, accepted_aliases)` so a missing `python3` can also be
+/// satisfied by `python` / `py`.
+fn required_runtimes_for_command(args: &[String]) -> Vec<(&'static str, Vec<&'static str>)> {
+    let Some(program) = args.first().map(|s| s.to_ascii_lowercase()) else {
+        return Vec::new();
+    };
+    let py_aliases: Vec<&'static str> = if cfg!(windows) {
+        vec!["python3", "python", "py"]
+    } else {
+        vec!["python3", "python"]
+    };
+    match program.as_str() {
+        "python" | "python3" | "py" | "pip" | "pip3" | "uvicorn" | "gunicorn" | "streamlit"
+        | "flask" | "fastapi" | "celery" => vec![("python3", py_aliases)],
+        "node" | "nodejs" | "npm" | "npx" => vec![("node", vec!["node", "nodejs"])],
+        "pnpm" => vec![("pnpm", vec!["pnpm"]), ("node", vec!["node", "nodejs"])],
+        "yarn" => vec![("yarn", vec!["yarn"]), ("node", vec!["node", "nodejs"])],
+        "bun" | "bunx" => vec![("bun", vec!["bun"])],
+        "deno" => vec![("deno", vec!["deno"])],
+        "cargo" | "rustc" => vec![("cargo", vec!["cargo"])],
+        "go" => vec![("go", vec!["go"])],
+        "ruby" | "bundle" | "bundler" | "rails" => vec![("ruby", vec!["ruby"])],
+        "java" => vec![("java", vec!["java"])],
+        _ => Vec::new(),
+    }
+}
+
+fn runtime_install_hint(canonical: &str) -> &'static str {
+    match canonical {
+        "python3" => "install Python 3 (e.g. `apt-get install -y python3 python3-venv` on Debian/Ubuntu, `brew install python` on macOS)",
+        "node" => "install Node.js 20+ (e.g. `apt-get install -y nodejs npm`, or via nvm/fnm)",
+        "bun" => "install Bun (https://bun.sh) - `curl -fsSL https://bun.sh/install | bash`",
+        "deno" => "install Deno (https://deno.land) - `curl -fsSL https://deno.land/install.sh | sh`",
+        "cargo" => "install Rust + cargo (https://rustup.rs)",
+        "go" => "install Go 1.21+ (https://go.dev/dl)",
+        "ruby" => "install Ruby 3+ (e.g. `apt-get install -y ruby` or via rbenv)",
+        "java" => "install a JDK 17+ (e.g. `apt-get install -y default-jdk`)",
+        "pnpm" => "enable pnpm via corepack (`corepack enable pnpm`) or `npm i -g pnpm`",
+        "yarn" => "enable yarn via corepack (`corepack enable`) or `npm i -g yarn`",
+        _ => "install the missing runtime on this host",
+    }
+}
+
+fn ensure_required_runtimes_available(
+    app_id: &str,
+    label: &str,
+    args: &[String],
+    runtime_path: Option<&str>,
+) -> Result<()> {
+    for (canonical, aliases) in required_runtimes_for_command(args) {
+        if aliases
+            .iter()
+            .any(|alias| program_resolvable_on_path(alias, runtime_path))
+        {
+            continue;
+        }
+        anyhow::bail!(
+            "app {} {} needs '{}' which isn't installed on this orchestrator host. {}, or rebuild the agentark image to include it.",
+            app_id,
+            label,
+            canonical,
+            runtime_install_hint(canonical)
+        );
+    }
+    Ok(())
 }
 
 fn compact_progress_line(line: &str, max_chars: usize) -> String {
@@ -3252,6 +3901,9 @@ async fn run_local_command_with_progress(
         let program = candidate[0].clone();
         attempted.push(candidate.join(" "));
         let mut cmd = tokio::process::Command::new(&program);
+        // Same secret-scrub policy as the spawn path. See
+        // `is_orchestrator_secret_var` for the rule.
+        scrub_inherited_env_for_local_app(&mut cmd);
         cmd.args(candidate.iter().skip(1))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3317,7 +3969,7 @@ async fn run_local_command_with_progress(
     );
 }
 
-async fn cleanup_existing_container(name: &str) {
+pub async fn cleanup_existing_container(name: &str) {
     let args = vec!["rm".to_string(), "-f".to_string(), name.to_string()];
     let _ = run_docker(&args, None, 20).await;
 }
@@ -3386,13 +4038,25 @@ fn build_local_lifecycle_env(app_dir: &Path) -> HashMap<String, String> {
     if let Some(path) = with_node_bin_path(app_dir) {
         env.insert("PATH".to_string(), path);
     }
-    let venv_dir = app_dir.join(".venv");
-    let venv_bin = if cfg!(windows) {
-        venv_dir.join("Scripts")
-    } else {
-        venv_dir.join("bin")
-    };
-    if venv_bin.exists() {
+    // Check the per-app venv first (.agentark/venv), then fall back to the
+    // legacy .venv layout so already-bootstrapped apps keep working.
+    let venv_candidates: [PathBuf; 2] = [
+        app_dir.join(".agentark").join("venv"),
+        app_dir.join(".venv"),
+    ];
+    let mut resolved_venv: Option<(PathBuf, PathBuf)> = None;
+    for venv_dir in venv_candidates.iter() {
+        let venv_bin = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        if venv_bin.exists() {
+            resolved_venv = Some((venv_dir.clone(), venv_bin));
+            break;
+        }
+    }
+    if let Some((venv_dir, venv_bin)) = resolved_venv {
         if let Some(path) = prepend_path_entry(&venv_bin, env.get("PATH").map(|v| v.as_str())) {
             env.insert("PATH".to_string(), path);
         }
@@ -3478,10 +4142,15 @@ pub async fn launch_dynamic_container(
     extra_env: &HashMap<String, String>,
     runtime_image: Option<&str>,
 ) -> Result<String> {
+    if !docker_cli_available() {
+        anyhow::bail!("container runtime unavailable: docker executable was not found on PATH");
+    }
+
     let container_name = app_container_name(app_id);
     cleanup_existing_container(&container_name).await;
 
     let mut entry_cmd = validate_app_command(entry_command, "entry_command")?;
+    entry_cmd = apply_app_mount_base_to_vite_entry_command(&entry_cmd, app_dir, app_id)?;
     let install_cmd = if let Some(cmd) = install_command {
         Some(validate_app_command(cmd, "install_command")?)
     } else {
@@ -3565,11 +4234,13 @@ pub async fn launch_dynamic_process(
     extra_env: &HashMap<String, String>,
     stream_tx: Option<Sender<StreamEvent>>,
 ) -> Result<tokio::process::Child> {
-    // Normalize absolute /app/ paths to relative — entry commands are often authored
+    // Normalize absolute /app/ paths to relative: entry commands are often authored
     // for container context where the app lives at /app/, but for local process runtime
     // the cwd is already app_dir so these should be relative.
+    let localized_entry =
+        localize_app_entry_command(entry_command, app_dir).replace("{PORT}", &port.to_string());
     let entry_command = validate_app_command(
-        &localize_app_entry_command(entry_command, app_dir).replace("{PORT}", &port.to_string()),
+        &apply_app_mount_base_to_vite_entry_command(&localized_entry, app_dir, app_id)?,
         "entry_command",
     )?;
 
@@ -3587,20 +4258,6 @@ pub async fn launch_dynamic_process(
     runtime_env.insert("HOST".to_string(), "0.0.0.0".to_string());
     runtime_env.extend(extra_env.clone());
 
-    // If a per-app venv exists, prepend its bin to PATH so the entry command
-    // picks up the venv's Python and installed packages automatically.
-    let venv_dir = app_dir.join(".venv");
-    if venv_dir.join("bin").exists() {
-        let venv_bin = venv_dir.join("bin").to_string_lossy().to_string();
-        let merged = std::env::var("PATH")
-            .map(|existing| format!("{}:{}", venv_bin, existing))
-            .unwrap_or(venv_bin.clone());
-        runtime_env.insert("PATH".to_string(), merged);
-        runtime_env.insert(
-            "VIRTUAL_ENV".to_string(),
-            venv_dir.to_string_lossy().to_string(),
-        );
-    }
     // Legacy: support old --target _deps installs for backward compat.
     let deps_dir = app_dir.join("_deps");
     if deps_dir.exists() {
@@ -3623,11 +4280,15 @@ pub async fn launch_dynamic_process(
         runtime_env.insert("PATH".to_string(), path);
     }
 
+    // Bootstrap a venv when the entry/install command obviously calls Python,
+    // OR when the app declares Python deps even if the entry is something
+    // opaque like `make serve`. Pure Node/Bun/Go apps skip this entirely.
     let uses_python_runtime = command_looks_python_related(&entry_command)
         || install_command
             .as_deref()
             .map(command_looks_python_related)
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || app_declares_python_deps(app_dir);
     if uses_python_runtime {
         match ensure_local_python_venv(app_dir).await {
             Ok((venv_dir, venv_bin_dir)) => {
@@ -3654,6 +4315,13 @@ pub async fn launch_dynamic_process(
     }
 
     if let Some(ref cmd) = install_command {
+        let install_args = split_command_args(cmd, "install_command")?;
+        ensure_required_runtimes_available(
+            app_id,
+            "install_command",
+            &install_args,
+            runtime_env.get("PATH").map(|v| v.as_str()),
+        )?;
         let output = run_local_command_with_progress(
             cmd,
             "install_command",
@@ -3676,8 +4344,66 @@ pub async fn launch_dynamic_process(
         }
     }
 
+    // If the app ships a package.json but no install_command (or one that
+    // didn't populate node_modules), auto-install with the right manager.
+    // Per-app `node_modules` keeps installs isolated; we never touch a global
+    // prefix.
+    if let Some(node_install) = detect_node_install_command(app_dir) {
+        let node_install_args = split_command_args(node_install, "node_install")?;
+        ensure_required_runtimes_available(
+            app_id,
+            "node_install",
+            &node_install_args,
+            runtime_env.get("PATH").map(|v| v.as_str()),
+        )?;
+        tracing::info!(
+            "auto-installing node deps for app {} via `{}`",
+            app_id,
+            node_install
+        );
+        let output = run_local_command_with_progress(
+            node_install,
+            "node_install",
+            app_dir,
+            &runtime_env,
+            600,
+            &stream_tx,
+            "install",
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            anyhow::bail!(
+                "auto `{}` failed for app {}: {}",
+                node_install,
+                app_id,
+                detail
+            );
+        }
+        // Refresh PATH so the freshly populated `node_modules/.bin` is on it
+        // for the entry-command spawn that follows.
+        if let Some(path) = with_node_bin_path(app_dir) {
+            runtime_env.insert("PATH".to_string(), path);
+        }
+    }
+
     let (stdout_log_path, stderr_log_path) = prepare_local_runtime_log_files(app_dir)?;
     let args = split_command_args(&entry_command, "entry_command")?;
+
+    // Pre-spawn runtime detection. If the binary the entry command needs is
+    // not on PATH (with the venv/node_modules already merged in), bail with a
+    // concrete remediation hint instead of letting the spawn produce ENOENT.
+    // We never auto-install OS packages - that requires root and is a
+    // security risk on a shared orchestrator.
+    let runtime_path = runtime_env.get("PATH").map(|v| v.as_str());
+    ensure_required_runtimes_available(app_id, "entry_command", &args, runtime_path)?;
+
     let (mut child, _resolved_program) = spawn_local_process_with_fallback(
         &args,
         "entry_command",
@@ -3740,7 +4466,26 @@ pub async fn launch_dynamic_runtime(
         stream_tx,
     } = request;
 
-    if matches!(runtime_preference, RuntimePreference::Local) && !docker_required() {
+    // Decide once, per-app, whether Docker is genuinely required. This is
+    // intent-driven - not a user-set env knob - so non-technical operators
+    // don't have to reason about it: a custom `runtime_image` or compose
+    // manifest requires containers; ordinary app dependencies still get a
+    // local-process fallback when Docker is unavailable.
+    let needs_docker = docker_required_for_app(app_dir, runtime_image);
+    if needs_docker && !container_runtime_available() {
+        anyhow::bail!(
+            "app {} needs Docker (signals: {}). Start the Docker daemon to deploy this app, or remove the runtime_image/compose requirement to enable the host-process fallback.",
+            app_id,
+            describe_docker_signals(app_dir, runtime_image)
+        );
+    }
+    let runtime_preference = if needs_docker {
+        RuntimePreference::Container
+    } else {
+        runtime_preference
+    };
+
+    if matches!(runtime_preference, RuntimePreference::Local) && !needs_docker {
         match launch_dynamic_process(
             app_id,
             app_dir,
@@ -3772,10 +4517,17 @@ pub async fn launch_dynamic_runtime(
                 {
                     Ok(container_id) => return Ok(DynamicRuntimeHandle::Container(container_id)),
                     Err(container_err) => {
+                        let docker_hint = if !container_runtime_available() {
+                            " (No Docker daemon reachable from this orchestrator; install/start Docker to enable container fallback.)"
+                        } else {
+                            ""
+                        };
                         return Err(anyhow::anyhow!(
-                            "local runtime failed: {} | container fallback failed: {}",
+                            "could not start app {}. Local runtime: {}. Container fallback: {}.{}",
+                            app_id,
                             local_err,
-                            container_err
+                            container_err,
+                            docker_hint
                         ));
                     }
                 }
@@ -3796,10 +4548,7 @@ pub async fn launch_dynamic_runtime(
     {
         Ok(container_id) => Ok(DynamicRuntimeHandle::Container(container_id)),
         Err(container_err) => {
-            if matches!(runtime_preference, RuntimePreference::Container)
-                || docker_required()
-                || container_runtime_configured()
-            {
+            if needs_docker {
                 return Err(container_err);
             }
             tracing::warn!(
@@ -3819,79 +4568,100 @@ pub async fn launch_dynamic_runtime(
             .await
             {
                 Ok(child) => Ok(DynamicRuntimeHandle::Process(Box::new(child))),
-                Err(local_err) => Err(anyhow::anyhow!(
-                    "container runtime failed: {} | local runtime fallback failed: {}",
-                    container_err,
-                    local_err
-                )),
+                Err(local_err) => {
+                    let docker_hint = if !container_runtime_available() {
+                        " (No Docker daemon reachable from this orchestrator; install/start Docker to make the container path available.)"
+                    } else {
+                        ""
+                    };
+                    Err(anyhow::anyhow!(
+                        "could not start app {}. Container runtime: {}. Local fallback: {}.{}",
+                        app_id,
+                        container_err,
+                        local_err,
+                        docker_hint
+                    ))
+                }
             }
         }
     }
 }
 
-async fn emit_progress(stream_tx: &Option<Sender<StreamEvent>>, message: &str) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppDeployProgressPhase {
+    Planning,
+    Deploying,
+    GeneratingFiles,
+    PreparingRuntime,
+    Installing,
+    StartingRuntime,
+    WaitingForInputs,
+    Completed,
+}
+
+impl AppDeployProgressPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            AppDeployProgressPhase::Planning => "planning",
+            AppDeployProgressPhase::Deploying => "deploying",
+            AppDeployProgressPhase::GeneratingFiles => "generating_files",
+            AppDeployProgressPhase::PreparingRuntime => "preparing_runtime",
+            AppDeployProgressPhase::Installing => "installing",
+            AppDeployProgressPhase::StartingRuntime => "starting_runtime",
+            AppDeployProgressPhase::WaitingForInputs => "waiting_for_inputs",
+            AppDeployProgressPhase::Completed => "completed",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AppDeployProgressPhase::Planning => "Planning",
+            AppDeployProgressPhase::Deploying => "Deploying",
+            AppDeployProgressPhase::GeneratingFiles => "Generating files",
+            AppDeployProgressPhase::PreparingRuntime => "Preparing runtime",
+            AppDeployProgressPhase::Installing => "Installing",
+            AppDeployProgressPhase::StartingRuntime => "Starting runtime",
+            AppDeployProgressPhase::WaitingForInputs => "Waiting for inputs",
+            AppDeployProgressPhase::Completed => "App ready",
+        }
+    }
+}
+
+fn app_deploy_phase_status_payload(
+    phase: AppDeployProgressPhase,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "phase_status",
+        "phase": phase.as_str(),
+        "label": phase.label(),
+        "detail": detail,
+        "elapsed_secs": 0,
+        "stream_key": format!("phase-status:app_deploy:{}", phase.as_str()),
+    })
+}
+
+async fn emit_phase_progress(
+    stream_tx: &Option<Sender<StreamEvent>>,
+    phase: AppDeployProgressPhase,
+    message: impl Into<String>,
+) {
     if let Some(tx) = stream_tx {
-        let payload = app_deploy_phase_status_payload(message);
+        let message = message.into();
         let _ = tx
             .send(StreamEvent::ToolProgress {
                 name: "app_deploy".to_string(),
-                content: message.to_string(),
-                payload,
+                content: message.clone(),
+                payload: Some(app_deploy_phase_status_payload(phase, &message)),
             })
             .await;
     }
 }
 
-fn app_deploy_phase_status_payload(message: &str) -> Option<serde_json::Value> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let (phase, label) =
-        if lower.starts_with("deploying '") || lower.starts_with("deploying repo service ") {
-            ("deploying", "Deploying")
-        } else if lower.starts_with("cloning repository ")
-            || lower.starts_with("checking out repo ref ")
-        {
-            ("planning", "Preparing source")
-        } else if lower == "reading repo readme and local manifests"
-            || (lower.starts_with("detected ") && lower.contains("repo service"))
-        {
-            ("planning", "Planning")
-        } else if lower.starts_with("wrote ") || lower.contains(" files ready") {
-            ("generating_files", "Generating files")
-        } else if lower == "saved app metadata" || lower.starts_with("assigned port ") {
-            ("preparing_runtime", "Preparing runtime")
-        } else if lower == "installing dependencies..." || lower == "no dependencies to install" {
-            ("installing", "Installing")
-        } else if lower.starts_with("starting server on port ")
-            || lower == "server container started"
-            || lower == "docker unavailable; started local app process"
-            || lower == "waiting for server readiness"
-        {
-            ("starting_runtime", "Starting runtime")
-        } else if lower.starts_with("static app ready at ")
-            || lower.starts_with("dynamic app ready at ")
-        {
-            ("validating", "Validating")
-        } else {
-            return None;
-        };
-
-    Some(serde_json::json!({
-        "kind": "phase_status",
-        "phase": phase,
-        "label": label,
-        "detail": trimmed,
-        "elapsed_secs": 0,
-        "stream_key": format!("phase-status:app_deploy:{}", phase),
-    }))
-}
-
 async fn emit_file_write_progress(
     stream_tx: &Option<Sender<StreamEvent>>,
     filename: &str,
+    target_path: &Path,
     line: usize,
     total_lines: usize,
     text: &str,
@@ -3906,6 +4676,7 @@ async fn emit_file_write_progress(
         let payload = serde_json::json!({
             "kind": "file_write",
             "file": filename,
+            "target_path": target_path.to_string_lossy(),
             "line": line,
             "total_lines": total_lines,
             "text": compact_progress_line(text, 240),
@@ -3927,10 +4698,27 @@ async fn write_file_with_progress(
     content: &str,
     stream_tx: &Option<Sender<StreamEvent>>,
 ) -> Result<()> {
-    let mut file = tokio::fs::File::create(file_path).await?;
+    if let Some(parent) = file_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Target file has no parent directory"))?;
+    let final_name = file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("app-file");
+    let temp_path = parent.join(format!(
+        ".{}.agentark-tmp-{}",
+        final_name,
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = tokio::fs::File::create(&temp_path).await?;
     if content.is_empty() {
-        emit_file_write_progress(stream_tx, filename, 0, 0, "", true).await;
+        emit_file_write_progress(stream_tx, filename, file_path, 0, 0, "", true).await;
         file.flush().await?;
+        drop(file);
+        replace_app_file(&temp_path, file_path).await?;
         return Ok(());
     }
 
@@ -3949,6 +4737,7 @@ async fn write_file_with_progress(
             emit_file_write_progress(
                 stream_tx,
                 filename,
+                file_path,
                 line_no,
                 total_lines,
                 line_text,
@@ -3958,6 +4747,881 @@ async fn write_file_with_progress(
         }
     }
     file.flush().await?;
+    drop(file);
+    replace_app_file(&temp_path, file_path).await?;
+    Ok(())
+}
+
+async fn replace_app_file(temp_path: &Path, file_path: &Path) -> Result<()> {
+    match tokio::fs::rename(temp_path, file_path).await {
+        Ok(_) => Ok(()),
+        Err(first_error) => {
+            if tokio::fs::try_exists(file_path).await.unwrap_or(false) {
+                tokio::fs::remove_file(file_path)
+                    .await
+                    .with_context(|| format!("Failed to replace {}", file_path.display()))?;
+                tokio::fs::rename(temp_path, file_path)
+                    .await
+                    .with_context(|| format!("Failed to install {}", file_path.display()))?;
+                Ok(())
+            } else {
+                let _ = tokio::fs::remove_file(temp_path).await;
+                Err(first_error).with_context(|| {
+                    format!("Failed to move temporary file into {}", file_path.display())
+                })
+            }
+        }
+    }
+}
+
+fn app_source_workspace_root(data_dir: &Path) -> PathBuf {
+    let fallback = std::env::current_dir()
+        .ok()
+        .unwrap_or_else(|| data_dir.to_path_buf());
+    match std::env::var("AGENTARK_WORKSPACE_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => fallback.join(path),
+        None => fallback,
+    }
+}
+
+fn remap_app_source_alias_path(data_dir: &Path, raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    const PREFIXES: &[&str] = &["/workspace", "/repo", "/project"];
+    let matched = PREFIXES.iter().find(|prefix| {
+        trimmed == **prefix
+            || trimmed
+                .strip_prefix(**prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })?;
+    let suffix = trimmed.strip_prefix(matched).unwrap_or("");
+    let relative = suffix.trim_start_matches('/');
+    let root = app_source_workspace_root(data_dir);
+    if relative.is_empty() {
+        Some(root)
+    } else {
+        Some(root.join(relative))
+    }
+}
+
+fn canonical_allowed_app_source_roots(data_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![data_dir.to_path_buf(), app_source_workspace_root(data_dir)];
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    let mut deduped = Vec::new();
+    for root in roots {
+        let candidate = root.canonicalize().unwrap_or(root);
+        if !deduped
+            .iter()
+            .any(|existing: &PathBuf| existing == &candidate)
+        {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn resolve_staged_app_source_dir(data_dir: &Path, raw: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("source_dir cannot be empty");
+    }
+    let candidate = remap_app_source_alias_path(data_dir, trimmed).unwrap_or_else(|| {
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .ok()
+                .unwrap_or_else(|| data_dir.to_path_buf())
+                .join(path)
+        }
+    });
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("source_dir '{}' does not exist", trimmed))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("source_dir '{}' is not a directory", trimmed);
+    }
+    let allowed_roots = canonical_allowed_app_source_roots(data_dir);
+    if allowed_roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(resolved)
+    } else {
+        anyhow::bail!(
+            "source_dir '{}' is outside the allowed workspace/data roots",
+            trimmed
+        );
+    }
+}
+
+fn staged_app_source_path_looks_sensitive(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let lower = name.trim().to_ascii_lowercase();
+    lower == ".agentark_runtime_env"
+        || lower == ".env"
+        || lower.starts_with(".env.")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.ends_with(".p12")
+        || lower.ends_with(".pfx")
+        || lower == "secrets.json"
+        || lower == "credentials.json"
+}
+
+fn normalize_app_bundle_relative_path(raw: &str, field: &str) -> Result<String> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        anyhow::bail!("{} entries cannot be empty", field);
+    }
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        anyhow::bail!("{} entries must be app-relative paths", field);
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => anyhow::bail!("{} path '{}' is not app-relative", field, raw),
+        }
+    }
+    if normalized
+        .split('/')
+        .any(|part| part.is_empty() || part == ".")
+    {
+        anyhow::bail!("{} path '{}' contains an empty path segment", field, raw);
+    }
+    if is_app_internal_bundle_path(&normalized) {
+        anyhow::bail!("{} path '{}' targets AgentArk app metadata", field, raw);
+    }
+    Ok(normalized)
+}
+
+fn normalize_staged_app_relative_path(raw: &str) -> Result<String> {
+    normalize_app_bundle_relative_path(raw, "source_paths")
+}
+
+fn is_app_internal_bundle_path(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/");
+    let mut parts = normalized.split('/').filter(|part| !part.is_empty());
+    let first = parts.next().unwrap_or("");
+    normalized == ".app_meta.json"
+        || normalized == ".agentark_runtime_env"
+        || normalized == LOCAL_RUNTIME_STDOUT_LOG_FILE
+        || normalized == LOCAL_RUNTIME_STDERR_LOG_FILE
+        || first == ".agentark"
+        || first == ".git"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppDeployMode {
+    Replace,
+    Patch,
+}
+
+impl AppDeployMode {
+    fn from_arguments(arguments: &serde_json::Value) -> Result<Self> {
+        let Some(raw) = arguments
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(Self::Replace);
+        };
+        match raw {
+            "replace" => Ok(Self::Replace),
+            "patch" => Ok(Self::Patch),
+            _ => anyhow::bail!("mode must be either 'replace' or 'patch'"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Patch => "patch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDeployFileWrite {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDeployFilePatch {
+    pub path: String,
+    pub patch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDeployApplyPlan {
+    pub mode: AppDeployMode,
+    pub file_writes: Vec<AppDeployFileWrite>,
+    pub file_patches: Vec<AppDeployFilePatch>,
+    pub delete_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppDeployApplyOutcome {
+    written_names: Vec<String>,
+    deleted_names: Vec<String>,
+}
+
+fn parse_app_deploy_delete_paths(arguments: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = arguments.get("delete_paths") else {
+        return Ok(Vec::new());
+    };
+    let Some(paths) = value.as_array() else {
+        anyhow::bail!("delete_paths must be an array of app-relative paths");
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in paths {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("delete_paths entries must be strings"))?;
+        let path = normalize_app_bundle_relative_path(raw, "delete_paths")?;
+        if !seen.insert(path.clone()) {
+            anyhow::bail!("delete_paths contains duplicate path '{}'", path);
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
+fn parse_app_deploy_file_patches(arguments: &serde_json::Value) -> Result<Vec<AppDeployFilePatch>> {
+    let Some(value) = arguments.get("file_patches") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        anyhow::bail!("file_patches must be an array of objects with path and patch");
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("file_patches entries must be objects"))?;
+        let raw_path = obj
+            .get("path")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("file_patches entries require path"))?;
+        let path = normalize_app_bundle_relative_path(raw_path, "file_patches")?;
+        if !seen.insert(path.clone()) {
+            anyhow::bail!("file_patches contains duplicate path '{}'", path);
+        }
+        let patch = obj
+            .get("patch")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("file_patches entries require patch"))?;
+        if patch.trim().is_empty() {
+            anyhow::bail!("file_patches entry for '{}' has an empty patch", path);
+        }
+        out.push(AppDeployFilePatch {
+            path,
+            patch: patch.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+async fn read_staged_app_source_files(
+    data_dir: &Path,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let source_dir = arguments
+        .get("source_dir")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing 'files': provide a files object or source_dir with source_paths"
+            )
+        })?;
+    let source_paths = arguments
+        .get("source_paths")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Missing 'files': source_dir deployments also require source_paths")
+        })?;
+    if source_paths.is_empty() {
+        anyhow::bail!("source_paths must contain at least one app-relative file path");
+    }
+
+    let root = resolve_staged_app_source_dir(data_dir, source_dir)?;
+    let mut files = serde_json::Map::new();
+    for raw_path in source_paths {
+        let raw_path = raw_path
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("source_paths entries must be strings"))?;
+        let relative_path = normalize_staged_app_relative_path(raw_path)?;
+        let candidate = root.join(&relative_path);
+        let resolved = candidate.canonicalize().with_context(|| {
+            format!(
+                "Staged app source file '{}' was not found under source_dir",
+                relative_path
+            )
+        })?;
+        if !resolved.starts_with(&root) {
+            anyhow::bail!("source path '{}' escapes source_dir", relative_path);
+        }
+        if !resolved.is_file() {
+            anyhow::bail!("source path '{}' is not a file", relative_path);
+        }
+        if staged_app_source_path_looks_sensitive(&resolved) {
+            anyhow::bail!(
+                "Refusing to deploy sensitive staged file '{}'",
+                relative_path
+            );
+        }
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .with_context(|| format!("Failed to read staged app file '{}'", relative_path))?;
+        files.insert(relative_path, serde_json::Value::String(content));
+    }
+    Ok(files)
+}
+
+async fn app_deploy_apply_plan_from_arguments(
+    data_dir: &Path,
+    arguments: &serde_json::Value,
+) -> Result<AppDeployApplyPlan> {
+    let mode = AppDeployMode::from_arguments(arguments)?;
+    let staged_files: serde_json::Map<String, serde_json::Value>;
+    let files = if let Some(files) = arguments.get("files").and_then(|v| v.as_object()) {
+        Some(files)
+    } else if arguments
+        .get("source_dir")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        staged_files = read_staged_app_source_files(data_dir, arguments).await?;
+        Some(&staged_files)
+    } else {
+        None
+    };
+
+    let mut file_writes = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(files) = files {
+        for (filename, content) in files {
+            let path = normalize_app_bundle_relative_path(filename, "files")?;
+            if !seen.insert(path.clone()) {
+                anyhow::bail!("files contains duplicate path '{}'", path);
+            }
+            let content = content.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "File '{}' must have string content; app_deploy does not accept nested file objects",
+                    filename
+                )
+            })?;
+            file_writes.push(AppDeployFileWrite {
+                path,
+                content: content.to_string(),
+            });
+        }
+    }
+
+    let file_patches = parse_app_deploy_file_patches(arguments)?;
+    if !file_patches.is_empty() && mode != AppDeployMode::Patch {
+        anyhow::bail!("file_patches require mode='patch'");
+    }
+
+    let delete_paths = parse_app_deploy_delete_paths(arguments)?;
+    let delete_set = delete_paths.iter().collect::<HashSet<_>>();
+    for write in &file_writes {
+        if delete_set.contains(&write.path) {
+            anyhow::bail!(
+                "Path '{}' cannot be both written and deleted in one app_deploy call",
+                write.path
+            );
+        }
+    }
+    for patch in &file_patches {
+        if !seen.insert(patch.path.clone()) {
+            anyhow::bail!("Path '{}' cannot be both written and patched", patch.path);
+        }
+        if delete_set.contains(&patch.path) {
+            anyhow::bail!(
+                "Path '{}' cannot be both patched and deleted in one app_deploy call",
+                patch.path
+            );
+        }
+    }
+
+    Ok(AppDeployApplyPlan {
+        mode,
+        file_writes,
+        file_patches,
+        delete_paths,
+    })
+}
+
+fn parse_unified_hunk_header(header: &str) -> Result<(usize, usize)> {
+    let mut body = header.trim();
+    if let Some(rest) = body.strip_prefix("@@") {
+        body = rest;
+    }
+    if let Some((range_part, _)) = body.split_once("@@") {
+        body = range_part;
+    }
+    let body = body.trim();
+    let old_range = body
+        .split_whitespace()
+        .find(|part| part.starts_with('-'))
+        .ok_or_else(|| anyhow::anyhow!("Unified diff hunk is missing original range"))?;
+    let range = old_range.trim_start_matches('-');
+    let mut parts = range.splitn(2, ',');
+    let start = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| anyhow::anyhow!("Unified diff original range has invalid start"))?;
+    let count = parts
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    Ok((start, count))
+}
+
+fn split_text_lines_for_patch(text: &str) -> (Vec<String>, bool) {
+    let had_trailing_newline = text.ends_with('\n');
+    let lines = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect::<Vec<_>>();
+    if had_trailing_newline {
+        (lines[..lines.len().saturating_sub(1)].to_vec(), true)
+    } else {
+        (lines, false)
+    }
+}
+
+fn join_text_lines_after_patch(lines: &[String], trailing_newline: bool) -> String {
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
+fn apply_unified_diff_to_text(original: &str, patch: &str) -> Result<String> {
+    let (original_lines, had_trailing_newline) = split_text_lines_for_patch(original);
+    let patch_lines = patch.lines().collect::<Vec<_>>();
+    let mut out = Vec::<String>::new();
+    let mut original_idx = 0usize;
+    let mut patch_idx = 0usize;
+    let mut saw_hunk = false;
+
+    while patch_idx < patch_lines.len() {
+        let line = patch_lines[patch_idx];
+        if line.starts_with("--- ") || line.starts_with("+++ ") || line.trim().is_empty() {
+            patch_idx += 1;
+            continue;
+        }
+        if !line.starts_with("@@") {
+            anyhow::bail!("Unified diff contains content outside a hunk: {}", line);
+        }
+        saw_hunk = true;
+        let (old_start, _old_count) = parse_unified_hunk_header(line)?;
+        let target_idx = old_start.saturating_sub(1);
+        if target_idx < original_idx || target_idx > original_lines.len() {
+            anyhow::bail!("Unified diff hunk range does not match current file");
+        }
+        out.extend(original_lines[original_idx..target_idx].iter().cloned());
+        original_idx = target_idx;
+        patch_idx += 1;
+
+        while patch_idx < patch_lines.len() {
+            let hunk_line = patch_lines[patch_idx];
+            if hunk_line.starts_with("@@") {
+                break;
+            }
+            if hunk_line == r"\ No newline at end of file" {
+                patch_idx += 1;
+                continue;
+            }
+            let Some(marker) = hunk_line.chars().next() else {
+                anyhow::bail!("Unified diff hunk line is empty");
+            };
+            let content = &hunk_line[marker.len_utf8()..];
+            match marker {
+                ' ' => {
+                    let Some(original_line) = original_lines.get(original_idx) else {
+                        anyhow::bail!("Unified diff context extends beyond the file");
+                    };
+                    if original_line != content {
+                        anyhow::bail!("Unified diff context did not match current file");
+                    }
+                    out.push(content.to_string());
+                    original_idx += 1;
+                }
+                '-' => {
+                    let Some(original_line) = original_lines.get(original_idx) else {
+                        anyhow::bail!("Unified diff deletion extends beyond the file");
+                    };
+                    if original_line != content {
+                        anyhow::bail!("Unified diff deletion did not match current file");
+                    }
+                    original_idx += 1;
+                }
+                '+' => out.push(content.to_string()),
+                _ => anyhow::bail!("Unified diff hunk line must start with space, '+', or '-'"),
+            }
+            patch_idx += 1;
+        }
+    }
+
+    if !saw_hunk {
+        anyhow::bail!("Unified diff must contain at least one hunk");
+    }
+    out.extend(original_lines[original_idx..].iter().cloned());
+    Ok(join_text_lines_after_patch(&out, had_trailing_newline))
+}
+
+fn app_meta_managed_files(meta: &Option<serde_json::Value>) -> Vec<String> {
+    meta.as_ref()
+        .and_then(|value| value.get("managed_files").and_then(|item| item.as_array()))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .filter_map(|item| normalize_app_bundle_relative_path(item, "managed_files").ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_existing_app_bundle_paths_sync(app_dir: &Path) -> Result<Vec<String>> {
+    fn visit(root: &Path, current: &Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(current)
+            .with_context(|| format!("Failed to read app directory '{}'", current.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(root, &path, out)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|value| value.to_str())
+                .map(|value| value.replace('\\', "/"))
+                .unwrap_or_default();
+            let Ok(relative) = normalize_app_bundle_relative_path(&relative, "existing app files")
+            else {
+                continue;
+            };
+            out.push(relative);
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    if app_dir.exists() {
+        visit(app_dir, app_dir, &mut out)?;
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+fn collect_existing_app_text_files_sync(
+    app_dir: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut out = serde_json::Map::new();
+    for relative in collect_existing_app_bundle_paths_sync(app_dir)? {
+        let path = app_dir.join(&relative);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        out.insert(relative, serde_json::Value::String(content));
+    }
+    Ok(out)
+}
+
+async fn load_existing_managed_app_text_files(
+    app_dir: &Path,
+    meta: &Option<serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let managed = app_meta_managed_files(meta);
+    if managed.is_empty() {
+        return collect_existing_app_text_files_sync(app_dir);
+    }
+    let mut out = serde_json::Map::new();
+    for relative in managed {
+        let path = app_dir.join(&relative);
+        let Ok(content) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        out.insert(relative, serde_json::Value::String(content));
+    }
+    Ok(out)
+}
+
+async fn effective_app_files_for_validation(
+    app_dir: Option<&Path>,
+    meta: &Option<serde_json::Value>,
+    plan: &AppDeployApplyPlan,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut files = if plan.mode == AppDeployMode::Patch {
+        if let Some(app_dir) = app_dir {
+            load_existing_managed_app_text_files(app_dir, meta).await?
+        } else {
+            serde_json::Map::new()
+        }
+    } else {
+        serde_json::Map::new()
+    };
+    for path in &plan.delete_paths {
+        files.remove(path);
+    }
+    for patch in &plan.file_patches {
+        let current = files
+            .get(&patch.path)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot patch '{}': file is not present in the current app bundle",
+                    patch.path
+                )
+            })?;
+        let patched = apply_unified_diff_to_text(current, &patch.patch)
+            .with_context(|| format!("Failed to apply patch for {}", patch.path))?;
+        files.insert(patch.path.clone(), serde_json::Value::String(patched));
+    }
+    for write in &plan.file_writes {
+        files.insert(
+            write.path.clone(),
+            serde_json::Value::String(write.content.clone()),
+        );
+    }
+    Ok(files)
+}
+
+async fn delete_empty_parent_dirs(app_dir: &Path, path: &str) {
+    let Some(mut parent) = app_dir.join(path).parent().map(Path::to_path_buf) else {
+        return;
+    };
+    while parent.starts_with(app_dir) && parent != app_dir {
+        match tokio::fs::remove_dir(&parent).await {
+            Ok(_) => {
+                let Some(next) = parent.parent().map(Path::to_path_buf) else {
+                    break;
+                };
+                parent = next;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn app_deploy_apply(
+    app_dir: &Path,
+    plan: &AppDeployApplyPlan,
+    previous_meta: &Option<serde_json::Value>,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Result<AppDeployApplyOutcome> {
+    tokio::fs::create_dir_all(app_dir).await?;
+    let previous_managed = app_meta_managed_files(previous_meta);
+    let declared_paths = plan
+        .file_writes
+        .iter()
+        .map(|write| write.path.clone())
+        .chain(plan.file_patches.iter().map(|patch| patch.path.clone()))
+        .collect::<HashSet<_>>();
+    let mut removed = HashSet::new();
+    let mut written_names = Vec::new();
+    let mut deleted_names = Vec::new();
+
+    for path in &plan.delete_paths {
+        let target = app_dir.join(path);
+        match tokio::fs::remove_file(&target).await {
+            Ok(_) => {
+                removed.insert(path.clone());
+                deleted_names.push(path.clone());
+                emit_phase_progress(
+                    stream_tx,
+                    AppDeployProgressPhase::GeneratingFiles,
+                    format!("Deleted {}", path),
+                )
+                .await;
+                delete_empty_parent_dirs(app_dir, path).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("Failed to delete {}", path)),
+        }
+    }
+
+    if plan.mode == AppDeployMode::Replace {
+        let orphan_candidates = if previous_managed.is_empty() {
+            collect_existing_app_bundle_paths_sync(app_dir)?
+        } else {
+            previous_managed
+        };
+        for path in orphan_candidates {
+            if declared_paths.contains(&path) || removed.contains(&path) {
+                continue;
+            }
+            let target = app_dir.join(&path);
+            match tokio::fs::remove_file(&target).await {
+                Ok(_) => {
+                    removed.insert(path.clone());
+                    deleted_names.push(path.clone());
+                    emit_phase_progress(
+                        stream_tx,
+                        AppDeployProgressPhase::GeneratingFiles,
+                        format!("Deleted stale {}", path),
+                    )
+                    .await;
+                    delete_empty_parent_dirs(app_dir, &path).await;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Failed to delete stale {}", path));
+                }
+            }
+        }
+    }
+
+    for patch in &plan.file_patches {
+        let file_path = app_dir.join(&patch.path);
+        let current = tokio::fs::read_to_string(&file_path)
+            .await
+            .with_context(|| format!("Cannot patch '{}': file is not readable", patch.path))?;
+        let patched = apply_unified_diff_to_text(&current, &patch.patch)
+            .with_context(|| format!("Failed to apply patch for {}", patch.path))?;
+        write_file_with_progress(&file_path, &patch.path, &patched, stream_tx)
+            .await
+            .with_context(|| format!("Failed to write patched {}", patch.path))?;
+        emit_phase_progress(
+            stream_tx,
+            AppDeployProgressPhase::GeneratingFiles,
+            format!("Patched {}", patch.path),
+        )
+        .await;
+        written_names.push(patch.path.clone());
+    }
+
+    for write in &plan.file_writes {
+        let file_path = app_dir.join(&write.path);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let byte_len = write.content.len();
+        write_file_with_progress(&file_path, &write.path, &write.content, stream_tx)
+            .await
+            .with_context(|| format!("Failed to write {}", write.path))?;
+        written_names.push(write.path.clone());
+        emit_phase_progress(
+            stream_tx,
+            AppDeployProgressPhase::GeneratingFiles,
+            format!("Wrote {} ({}B)", write.path, byte_len),
+        )
+        .await;
+    }
+    Ok(AppDeployApplyOutcome {
+        written_names,
+        deleted_names,
+    })
+}
+
+pub async fn app_deploy_preflight(
+    data_dir: &Path,
+    arguments: &serde_json::Value,
+    registry: &AppRegistry,
+) -> Result<()> {
+    if should_deploy_repo_bundle(arguments) {
+        let repo_url = arguments
+            .get("repo_url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("repo_url is required for repo deployments"))?;
+        reqwest::Url::parse(repo_url)
+            .with_context(|| format!("repo_url '{}' is not a valid URL", repo_url))?;
+        return Ok(());
+    }
+
+    let plan = app_deploy_apply_plan_from_arguments(data_dir, arguments).await?;
+
+    let mut existing_meta: Option<serde_json::Value> = None;
+    let mut existing_app_dir: Option<PathBuf> = None;
+    if let Some(app_id) = arguments
+        .get("app_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let existing_app = registry
+            .list()
+            .await
+            .into_iter()
+            .any(|app| app.get("id").and_then(|value| value.as_str()) == Some(app_id));
+        let app_dir = registry
+            .get_dir(app_id)
+            .await
+            .unwrap_or_else(|| data_dir.join("apps").join(app_id));
+        if !existing_app && !app_dir.exists() {
+            anyhow::bail!("No deployed app found for app_id '{}'", app_id);
+        }
+        existing_app_dir = Some(app_dir.clone());
+        existing_meta = tokio::fs::read(app_dir.join(".app_meta.json"))
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|value| value.is_object());
+    }
+    if plan.mode == AppDeployMode::Patch && existing_app_dir.is_none() {
+        anyhow::bail!("mode='patch' requires app_id for an existing deployed app");
+    }
+    if plan.file_writes.is_empty() && plan.file_patches.is_empty() && plan.delete_paths.is_empty() {
+        anyhow::bail!(
+            "app_deploy requires at least one file write, file patch, or delete_paths entry"
+        );
+    }
+
+    let has_entry_command = arguments
+        .get("entry_command")
+        .or_else(|| arguments.get("start_command"))
+        .or_else(|| {
+            arguments
+                .get("commands")
+                .and_then(|value| value.get("start").or_else(|| value.get("entry")))
+        })
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || existing_meta
+            .as_ref()
+            .and_then(|value| app_meta_lifecycle_command(value, "entry_command"))
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if !has_entry_command {
+        let effective_files =
+            effective_app_files_for_validation(existing_app_dir.as_deref(), &existing_meta, &plan)
+                .await?;
+        if effective_files.is_empty() {
+            anyhow::bail!("Static app bundle would be empty after applying this deploy");
+        }
+        validate_static_app_asset_references(&effective_files)?;
+    }
     Ok(())
 }
 
@@ -4098,6 +5762,11 @@ fn load_persisted_access_key_sync(
     manager.get_custom_secret(&app_access_secret_name(app_id))
 }
 
+async fn read_optional_app_json(path: &Path) -> Option<serde_json::Value> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+}
+
 fn persist_access_key_sync(
     config_dir: &Path,
     data_dir: &Path,
@@ -4178,7 +5847,7 @@ pub struct AppHealthSnapshot {
     pub last_accessed: chrono::DateTime<chrono::Utc>,
 }
 
-/// Global app registry — tracks deployed apps and their processes
+/// Global app registry: tracks deployed apps and their processes
 #[derive(Clone)]
 pub struct AppRegistry {
     apps: Arc<RwLock<HashMap<String, Arc<RwLock<RunningApp>>>>>,
@@ -4604,6 +6273,25 @@ impl AppRegistry {
                 .issue_access_url(&id)
                 .await
                 .unwrap_or_else(|| relative_app_root_url(&id));
+            let quality_report =
+                read_optional_app_json(&app_dir.join(APP_QUALITY_REPORT_FILE)).await;
+            let sub_goals = read_optional_app_json(&app_dir.join(APP_SUB_GOALS_FILE)).await;
+            let app_meta = load_app_meta_json(&app_dir).await;
+            let external_deployments = app_meta
+                .get("external_deployments")
+                .cloned()
+                .filter(|value| value.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let vercel_deployment = external_deployments
+                .get("vercel")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let quality_status = quality_report
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unavailable")
+                .to_string();
             result.push(serde_json::json!({
                 "id": id,
                 "title": title,
@@ -4628,6 +6316,11 @@ impl AppRegistry {
                 "enabled": enabled,
                 "restoring": restoring,
                 "restore_error": restore_error,
+                "external_deployments": external_deployments,
+                "vercel_deployment": vercel_deployment,
+                "quality_report_status": quality_status,
+                "quality_report": quality_report,
+                "sub_goals": sub_goals,
                 "restore_status": if restoring {
                     "restoring"
                 } else if !enabled {
@@ -5717,9 +7410,10 @@ async fn wait_for_dynamic_runtime_ready(
         if last_progress_at.elapsed()
             >= std::time::Duration::from_secs(DYNAMIC_RUNTIME_PROGRESS_INTERVAL_SECS)
         {
-            emit_progress(
+            emit_phase_progress(
                 stream_tx,
-                &format!("Waiting for server readiness on port {}", port),
+                AppDeployProgressPhase::StartingRuntime,
+                format!("Waiting for server readiness on port {}", port),
             )
             .await;
             last_progress_at = tokio::time::Instant::now();
@@ -5732,13 +7426,81 @@ async fn wait_for_dynamic_runtime_ready(
     }
 }
 
+async fn maybe_publish_external_deployment(
+    config_dir: &Path,
+    data_dir: &Path,
+    arguments: &serde_json::Value,
+    app_id: &str,
+    app_dir: &Path,
+    title: &str,
+    stream_tx: &Option<Sender<StreamEvent>>,
+) -> Option<serde_json::Value> {
+    let options = crate::actions::vercel::ExternalDeployOptions::from_arguments(arguments);
+    if options.target == crate::actions::vercel::ExternalDeployTarget::Local {
+        return None;
+    }
+    emit_phase_progress(
+        stream_tx,
+        AppDeployProgressPhase::Deploying,
+        format!("Publishing '{}' to {}", title, options.target.as_str()),
+    )
+    .await;
+    let meta = crate::actions::vercel::load_app_meta(app_dir).await;
+    match crate::actions::vercel::publish_app_to_external_target(
+        config_dir, data_dir, app_id, app_dir, &meta, title, &options,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => Some(serde_json::json!({
+            "provider": "vercel",
+            "deploy_target": options.target.as_str(),
+            "status": "error",
+            "app_id": app_id,
+            "title": title,
+            "message": error.to_string(),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        })),
+    }
+}
+
+fn attach_external_deployment_result(
+    response: &mut serde_json::Value,
+    external: Option<serde_json::Value>,
+) {
+    let Some(external) = external else {
+        return;
+    };
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("external_deployment".to_string(), external.clone());
+        let deployments = obj
+            .entry("external_deployments")
+            .or_insert_with(|| serde_json::json!({}));
+        if !deployments.is_object() {
+            *deployments = serde_json::json!({});
+        }
+        if let Some(map) = deployments.as_object_mut() {
+            map.insert("vercel".to_string(), external.clone());
+        }
+        if let Some(url) = external.get("url").and_then(|value| value.as_str()) {
+            if !url.trim().is_empty() {
+                obj.insert(
+                    "vercel_url".to_string(),
+                    serde_json::Value::String(url.to_string()),
+                );
+            }
+        }
+    }
+}
+
 /// Deploy an app from agent-generated files.
 ///
 /// Arguments (JSON):
-/// - `files`: object mapping filename → content (required)
+/// - `files`: object mapping filename -> content, or `source_dir` +
+///   `source_paths` pointing at files previously staged with file_write
 /// - `title`: app name (optional, default: "App")
-/// - `entry_command`: command to start the server (optional — if omitted, static)
-/// - `port`: port the server listens on (optional — auto-assigned if dynamic)
+/// - `entry_command`: command to start the server (optional; if omitted, static)
+/// - `port`: port the server listens on (optional; auto-assigned if dynamic)
 /// - `install_command`: command to install deps (optional, e.g. "pip install -r requirements.txt")
 ///
 /// Returns JSON with the app URL.
@@ -5757,31 +7519,17 @@ pub async fn app_deploy(
         .await;
     }
 
-    let files = arguments
-        .get("files")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing 'files' — provide an object mapping filename to content")
-        })?;
-
-    if files.is_empty() {
-        anyhow::bail!("'files' must contain at least one file");
+    let plan = app_deploy_apply_plan_from_arguments(data_dir, arguments).await?;
+    let file_count = plan
+        .file_writes
+        .len()
+        .saturating_add(plan.file_patches.len())
+        .saturating_add(plan.delete_paths.len());
+    if file_count == 0 {
+        anyhow::bail!(
+            "app_deploy requires at least one file write, file patch, or delete_paths entry"
+        );
     }
-    for (filename, content) in files {
-        if filename.contains("..") || filename.starts_with('/') || filename.starts_with('\\') {
-            anyhow::bail!(
-                "File '{}' is not a safe app-relative path; use paths inside the app bundle",
-                filename
-            );
-        }
-        if !content.is_string() {
-            anyhow::bail!(
-                "File '{}' must have string content; app_deploy does not accept nested file objects",
-                filename
-            );
-        }
-    }
-    let file_count = files.len();
 
     let requested_app_id = arguments
         .get("app_id")
@@ -5851,6 +7599,9 @@ pub async fn app_deploy(
     } else {
         None
     };
+    if plan.mode == AppDeployMode::Patch && existing_target.is_none() {
+        anyhow::bail!("mode='patch' requires app_id for an existing deployed app");
+    }
     let title = arguments
         .get("title")
         .and_then(|v| v.as_str())
@@ -6024,16 +7775,18 @@ pub async fn app_deploy(
     if entry_command.is_none() {
         runtime_required = false;
     } else if !runtime_required {
-        emit_progress(
+        emit_phase_progress(
             &stream_tx,
+            AppDeployProgressPhase::PreparingRuntime,
             "runtime_required=false was provided; treating this generated bundle as a static/local deploy",
         )
         .await;
         install_command = None;
         entry_command = None;
     } else if runtime_required_was_inferred {
-        emit_progress(
+        emit_phase_progress(
             &stream_tx,
+            AppDeployProgressPhase::PreparingRuntime,
             "Runtime command provided; deploying this bundle as a persistent dynamic app",
         )
         .await;
@@ -6042,9 +7795,6 @@ pub async fn app_deploy(
         validate_app_command(command, "stop_command")?;
     }
     let is_static = entry_command.is_none();
-    if is_static {
-        validate_static_app_asset_references(files)?;
-    }
 
     let updating_existing = existing_target.is_some();
     let app_id = existing_target
@@ -6060,11 +7810,27 @@ pub async fn app_deploy(
         .as_ref()
         .map(|target| target.app_dir.clone())
         .unwrap_or_else(|| data_dir.join("apps").join(&app_id));
+    let previous_meta = existing_target
+        .as_ref()
+        .and_then(|target| target.meta.clone());
+    let effective_files = effective_app_files_for_validation(
+        if updating_existing {
+            Some(app_dir.as_path())
+        } else {
+            None
+        },
+        &previous_meta,
+        &plan,
+    )
+    .await?;
+    if effective_files.is_empty() {
+        anyhow::bail!("App bundle would be empty after applying this deploy");
+    }
+    if is_static {
+        validate_static_app_asset_references(&effective_files)?;
+    }
     if updating_existing {
         registry.stop_runtime(&app_id).await?;
-        if tokio::fs::metadata(&app_dir).await.is_ok() {
-            tokio::fs::remove_dir_all(&app_dir).await?;
-        }
     }
     tokio::fs::create_dir_all(&app_dir).await?;
 
@@ -6079,9 +7845,10 @@ pub async fn app_deploy(
         app_id,
         is_static
     );
-    emit_progress(
+    emit_phase_progress(
         &stream_tx,
-        &format!(
+        AppDeployProgressPhase::Deploying,
+        format!(
             "{} '{}' ({})",
             if updating_existing {
                 "Updating"
@@ -6093,35 +7860,29 @@ pub async fn app_deploy(
         ),
     )
     .await;
-    // Write all files
-    let mut written_files = 0usize;
-    let mut written_names: Vec<String> = Vec::new();
-    for (filename, content) in files {
-        let content_str = content.as_str().unwrap_or_default();
-        let file_path = app_dir.join(filename);
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let byte_len = content_str.len();
-        write_file_with_progress(&file_path, filename, content_str, &stream_tx)
-            .await
-            .with_context(|| format!("Failed to write {}", filename))?;
-        written_files += 1;
-        written_names.push(filename.to_string());
-        emit_progress(&stream_tx, &format!("wrote {} ({}B)", filename, byte_len)).await;
+    let apply_outcome = app_deploy_apply(&app_dir, &plan, &previous_meta, &stream_tx).await?;
+    let changed_files = apply_outcome.written_names.len();
+    let completed_ops = changed_files.saturating_add(apply_outcome.deleted_names.len());
+    if completed_ops == 0 {
+        anyhow::bail!("No app file changes were applied. Check paths and try again.");
     }
-    if written_files == 0 {
-        anyhow::bail!("No valid files were written. Check filenames and try again.");
-    }
-    let skipped_files = file_count.saturating_sub(written_files);
-    emit_progress(
+    let skipped_files = file_count.saturating_sub(completed_ops);
+    let mut changed_names = apply_outcome.written_names.clone();
+    changed_names.extend(
+        apply_outcome
+            .deleted_names
+            .iter()
+            .map(|path| format!("deleted {}", path)),
+    );
+    emit_phase_progress(
         &stream_tx,
-        &format!(
-            "{} / {} files ready (skipped {}): {}",
-            written_files,
+        AppDeployProgressPhase::GeneratingFiles,
+        format!(
+            "{} / {} file operations applied (skipped {}): {}",
+            completed_ops,
             file_count,
             skipped_files,
-            written_names.join(", ")
+            changed_names.join(", ")
         ),
     )
     .await;
@@ -6194,8 +7955,12 @@ pub async fn app_deploy(
                     .map(|value| value.to_string())
             })
         });
+    let mut managed_files = effective_files.keys().cloned().collect::<Vec<_>>();
+    managed_files.sort_unstable();
     let meta = serde_json::json!({
         "title": title,
+        "deploy_mode": plan.mode.as_str(),
+        "managed_files": managed_files,
         "entry_command": entry_command.clone(),
         "start_command": entry_command.clone(),
         "install_command": effective_install_cmd.clone(),
@@ -6233,10 +7998,16 @@ pub async fn app_deploy(
         serde_json::to_string_pretty(&meta)?,
     )
     .await?;
-    emit_progress(&stream_tx, "Saved app metadata").await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::PreparingRuntime,
+        "Saved app metadata",
+    )
+    .await;
 
     if is_static {
-        // Static app — just register, served directly by HTTP server
+        // Static app: just register, served directly by HTTP server
+        let app_dir_for_external = app_dir.clone();
         registry
             .register_stored(
                 app_id.clone(),
@@ -6258,8 +8029,23 @@ pub async fn app_deploy(
             .await
             .unwrap_or_else(|| url.clone());
         tracing::info!("Static app deployed at {}", url);
-        emit_progress(&stream_tx, &format!("Static app ready at {}", url)).await;
-        return Ok(serde_json::json!({
+        emit_phase_progress(
+            &stream_tx,
+            AppDeployProgressPhase::Completed,
+            format!("Static app ready at {}", url),
+        )
+        .await;
+        let external_deployment = maybe_publish_external_deployment(
+            config_dir,
+            data_dir,
+            arguments,
+            &app_id,
+            &app_dir_for_external,
+            title,
+            &stream_tx,
+        )
+        .await;
+        let mut response = serde_json::json!({
             "status": "deployed",
             "type": "static",
             "app_id": app_id,
@@ -6272,8 +8058,9 @@ pub async fn app_deploy(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
-        })
-        .to_string());
+        });
+        attach_external_deployment_result(&mut response, external_deployment);
+        return Ok(response.to_string());
     }
 
     if !missing_sensitive.is_empty() || !missing_config.is_empty() {
@@ -6283,11 +8070,6 @@ pub async fn app_deploy(
                 missing_all.push(m.clone());
             }
         }
-        let llm_reuse_candidates: Vec<String> = missing_sensitive
-            .iter()
-            .filter(|k| llm_env.get(*k).is_some_and(|v| !v.trim().is_empty()))
-            .cloned()
-            .collect();
         registry
             .register_stored(
                 app_id.clone(),
@@ -6303,9 +8085,10 @@ pub async fn app_deploy(
                 },
             )
             .await;
-        emit_progress(
+        emit_phase_progress(
             &stream_tx,
-            &format!(
+            AppDeployProgressPhase::WaitingForInputs,
+            format!(
                 "App created but waiting for required inputs: {}",
                 missing_all.join(", ")
             ),
@@ -6329,13 +8112,13 @@ pub async fn app_deploy(
             "required_config": required_config_keys,
             "missing_env": missing_sensitive,
             "missing_config": missing_config,
-            "llm_reuse_candidates": llm_reuse_candidates,
-            "message": "Missing required inputs. For sensitive keys, use the secure credential form in chat or Settings. For non-sensitive values pass config.{KEY} when deploying/restarting."
+            "message": "Missing required inputs. Sensitive keys must be provided through the secure credential form or Settings for this app; AgentArk model/provider credentials are not inherited by generated apps. For non-sensitive values pass config.{KEY} when deploying/restarting."
         })
         .to_string());
     }
 
     if control_plane_catalog_mode() {
+        let app_dir_for_external = app_dir.clone();
         registry
             .register_stored(
                 app_id.clone(),
@@ -6351,12 +8134,23 @@ pub async fn app_deploy(
                 },
             )
             .await;
-        emit_progress(
+        emit_phase_progress(
             &stream_tx,
+            AppDeployProgressPhase::StartingRuntime,
             "Dynamic app files are ready on the control plane; runtime start will be delegated to the executor",
         )
         .await;
-        return Ok(serde_json::json!({
+        let external_deployment = maybe_publish_external_deployment(
+            config_dir,
+            data_dir,
+            arguments,
+            &app_id,
+            &app_dir_for_external,
+            title,
+            &stream_tx,
+        )
+        .await;
+        let mut response = serde_json::json!({
             "status": "deployed",
             "type": "dynamic",
             "runtime": "delegated",
@@ -6370,11 +8164,12 @@ pub async fn app_deploy(
             "access_key": access_key,
             "access_password": access_key,
             "access_guard_enabled": access_guard_enabled,
-        })
-        .to_string());
+        });
+        attach_external_deployment_result(&mut response, external_deployment);
+        return Ok(response.to_string());
     }
 
-    // Dynamic app — start server in isolated container runtime
+    // Dynamic app: start server in isolated container runtime
     let port = arguments
         .get("port")
         .and_then(|v| v.as_u64())
@@ -6390,12 +8185,27 @@ pub async fn app_deploy(
             )
         })?,
     };
-    emit_progress(&stream_tx, &format!("Assigned port {}", port)).await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::PreparingRuntime,
+        format!("Assigned port {}", port),
+    )
+    .await;
 
     if effective_install_cmd.is_some() {
-        emit_progress(&stream_tx, "Installing dependencies...").await;
+        emit_phase_progress(
+            &stream_tx,
+            AppDeployProgressPhase::Installing,
+            "Installing dependencies...",
+        )
+        .await;
     } else {
-        emit_progress(&stream_tx, "No dependencies to install").await;
+        emit_phase_progress(
+            &stream_tx,
+            AppDeployProgressPhase::Installing,
+            "No dependencies to install",
+        )
+        .await;
     }
 
     // Start the server process in isolated container
@@ -6405,7 +8215,12 @@ pub async fn app_deploy(
         app_id,
         port
     );
-    emit_progress(&stream_tx, &format!("Starting server on port {}", port)).await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::StartingRuntime,
+        format!("Starting server on port {}", port),
+    )
+    .await;
 
     let runtime_handle = launch_dynamic_runtime(DynamicRuntimeLaunch {
         app_id: &app_id,
@@ -6421,15 +8236,34 @@ pub async fn app_deploy(
     .await?;
     let (container_id, child, runtime_label) = match runtime_handle {
         DynamicRuntimeHandle::Container(container_id) => {
-            emit_progress(&stream_tx, "Server container started").await;
+            emit_phase_progress(
+                &stream_tx,
+                AppDeployProgressPhase::StartingRuntime,
+                "Server container started",
+            )
+            .await;
             (Some(container_id), None, "container")
         }
         DynamicRuntimeHandle::Process(child) => {
-            emit_progress(&stream_tx, "Docker unavailable; started local app process").await;
+            emit_phase_progress(
+                &stream_tx,
+                AppDeployProgressPhase::StartingRuntime,
+                "Docker unavailable; started local app process",
+            )
+            .await;
             (None, Some(*child), "local_process")
         }
     };
     let app_dir_for_diagnostics = app_dir.clone();
+    let app_dir_for_external = app_dir.clone();
+    let proxy_path_mode = proxy_path_mode_for_entry_command(Some(entry), &app_dir, &app_id);
+    if let Err(error) = persist_app_proxy_path_mode_meta(&app_dir, proxy_path_mode).await {
+        tracing::warn!(
+            "Failed to persist app proxy path mode for '{}': {}",
+            app_id,
+            error
+        );
+    }
 
     registry
         .register_dynamic(
@@ -6449,7 +8283,12 @@ pub async fn app_deploy(
         )
         .await;
 
-    emit_progress(&stream_tx, "Waiting for server readiness").await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::StartingRuntime,
+        "Waiting for server readiness",
+    )
+    .await;
     if let Err(wait_err) = wait_for_dynamic_runtime_ready(registry, &app_id, port, &stream_tx).await
     {
         if updating_existing {
@@ -6472,9 +8311,24 @@ pub async fn app_deploy(
         .await
         .unwrap_or_else(|| url.clone());
     tracing::info!("Dynamic app deployed at {} (port {})", url, port);
-    emit_progress(&stream_tx, &format!("Dynamic app ready at {}", url)).await;
+    emit_phase_progress(
+        &stream_tx,
+        AppDeployProgressPhase::Completed,
+        format!("Dynamic app ready at {}", url),
+    )
+    .await;
 
-    Ok(serde_json::json!({
+    let external_deployment = maybe_publish_external_deployment(
+        config_dir,
+        data_dir,
+        arguments,
+        &app_id,
+        &app_dir_for_external,
+        title,
+        &stream_tx,
+    )
+    .await;
+    let mut response = serde_json::json!({
         "status": "deployed",
         "type": "dynamic",
         "runtime": runtime_label,
@@ -6489,13 +8343,184 @@ pub async fn app_deploy(
         "access_key": access_key,
         "access_password": access_key,
         "access_guard_enabled": access_guard_enabled,
-    })
-    .to_string())
+    });
+    attach_external_deployment_result(&mut response, external_deployment);
+    Ok(response.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn app_deploy_phase_status_payload_uses_explicit_phase_metadata() {
+        let payload = app_deploy_phase_status_payload(
+            AppDeployProgressPhase::GeneratingFiles,
+            "Wrote index.html",
+        );
+
+        assert_eq!(
+            payload.get("kind").and_then(|value| value.as_str()),
+            Some("phase_status")
+        );
+        assert_eq!(
+            payload.get("phase").and_then(|value| value.as_str()),
+            Some("generating_files")
+        );
+        assert_eq!(
+            payload.get("label").and_then(|value| value.as_str()),
+            Some("Generating files")
+        );
+        assert_eq!(
+            payload.get("detail").and_then(|value| value.as_str()),
+            Some("Wrote index.html")
+        );
+    }
+
+    fn write_package_json(dir: &Path, body: &str) {
+        std::fs::write(dir.join("package.json"), body).expect("write package.json");
+    }
+
+    #[test]
+    fn vite_direct_entry_command_gets_app_mount_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"vite":"^6.0.0"}}"#,
+        );
+
+        let command = apply_app_mount_base_to_vite_entry_command(
+            "npx vite --host 0.0.0.0 --port {PORT}",
+            temp.path(),
+            "demo1234",
+        )
+        .expect("rewrite command");
+
+        assert_eq!(
+            command,
+            "npx vite --host 0.0.0.0 --port {PORT} --base /apps/demo1234/"
+        );
+    }
+
+    #[test]
+    fn vite_npm_run_entry_command_passes_base_to_script() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"vite":"^6.0.0"}}"#,
+        );
+
+        let command =
+            apply_app_mount_base_to_vite_entry_command("npm run dev", temp.path(), "abc12345")
+                .expect("rewrite command");
+
+        assert_eq!(command, "npm run dev -- --base /apps/abc12345/");
+    }
+
+    #[test]
+    fn vite_entry_command_keeps_existing_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"preview":"vite preview"},"dependencies":{"vite":"^6.0.0"}}"#,
+        );
+
+        let command = apply_app_mount_base_to_vite_entry_command(
+            "npm run preview -- --host 0.0.0.0 --base /custom/",
+            temp.path(),
+            "demo1234",
+        )
+        .expect("rewrite command");
+
+        assert_eq!(command, "npm run preview -- --host 0.0.0.0 --base /custom/");
+    }
+
+    #[test]
+    fn non_vite_entry_command_is_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"^4.0.0"}}"#,
+        );
+
+        let command =
+            apply_app_mount_base_to_vite_entry_command("npm run start", temp.path(), "demo1234")
+                .expect("rewrite command");
+
+        assert_eq!(command, "npm run start");
+    }
+
+    #[test]
+    fn vite_runtime_uses_app_scoped_proxy_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"vite":"^6.0.0"}}"#,
+        );
+
+        let mode = proxy_path_mode_for_entry_command(Some("npm run dev"), temp.path(), "abc12345");
+
+        assert_eq!(mode, AppProxyPathMode::PreserveAppPrefix);
+        assert_eq!(
+            dynamic_app_upstream_path("abc12345", "", mode),
+            "/apps/abc12345/"
+        );
+        assert_eq!(
+            dynamic_app_upstream_path("abc12345", "src/main.tsx", mode),
+            "/apps/abc12345/src/main.tsx"
+        );
+    }
+
+    #[test]
+    fn non_vite_runtime_keeps_stripped_proxy_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(
+            temp.path(),
+            r#"{"scripts":{"start":"node server.js"},"dependencies":{"express":"^4.0.0"}}"#,
+        );
+
+        let mode =
+            proxy_path_mode_for_entry_command(Some("npm run start"), temp.path(), "demo1234");
+
+        assert_eq!(mode, AppProxyPathMode::StripAppPrefix);
+        assert_eq!(dynamic_app_upstream_path("demo1234", "", mode), "/");
+        assert_eq!(
+            dynamic_app_upstream_path("demo1234", "api/health", mode),
+            "/api/health"
+        );
+    }
+
+    #[test]
+    fn default_runtime_preference_requires_usable_container_runtime() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let original_path = std::env::var_os("PATH");
+        let original_docker_host = std::env::var_os("DOCKER_HOST");
+        let original_default = std::env::var_os("AGENTARK_APP_RUNTIME_DEFAULT");
+        let temp_path = tempfile::tempdir().expect("temp path");
+
+        std::env::set_var("PATH", temp_path.path());
+        std::env::set_var("DOCKER_HOST", "unix:///tmp/agentark-missing-docker.sock");
+        std::env::remove_var("AGENTARK_APP_RUNTIME_DEFAULT");
+
+        assert!(!docker_cli_available());
+        assert!(!container_runtime_available());
+        assert_eq!(default_runtime_preference(), RuntimePreference::Local);
+
+        match original_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match original_docker_host {
+            Some(value) => std::env::set_var("DOCKER_HOST", value),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        match original_default {
+            Some(value) => std::env::set_var("AGENTARK_APP_RUNTIME_DEFAULT", value),
+            None => std::env::remove_var("AGENTARK_APP_RUNTIME_DEFAULT"),
+        }
+    }
 
     #[test]
     fn resolve_secret_value_requires_explicit_secret_mapping() {
@@ -6506,6 +8531,78 @@ mod tests {
             resolve_secret_value(&custom, &llm_env, "OPENAI_API_KEY"),
             None
         );
+    }
+
+    #[test]
+    fn inherited_env_scrub_uses_secret_shape_not_dev_tool_allowlist() {
+        assert!(is_orchestrator_secret_var("OPENAI_API_KEY"));
+        assert!(is_orchestrator_secret_var("mySecretKey"));
+        assert!(is_orchestrator_secret_var("DATABASE_URL"));
+        assert!(is_orchestrator_secret_var("service-access-token"));
+
+        assert!(!is_orchestrator_secret_var("JAVA_HOME"));
+        assert!(!is_orchestrator_secret_var("NODE_PATH"));
+        assert!(!is_orchestrator_secret_var("RUSTUP_HOME"));
+        assert!(!is_orchestrator_secret_var("CUSTOM_CA_BUNDLE"));
+        assert!(!is_orchestrator_secret_var("PUBLIC_API_BASE_URL"));
+    }
+
+    #[tokio::test]
+    async fn app_scoped_required_api_secret_can_be_injected_explicitly() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let manager = crate::core::config::SecureConfigManager::new_with_data_dir(
+            config_dir.path(),
+            Some(data_dir.path()),
+        )
+        .expect("secure config");
+        manager
+            .set_custom_secret("env:OPENAI_API_KEY", Some("sk-user-app".to_string()))
+            .expect("stored app secret");
+
+        let required = vec![AppRequiredInput {
+            key: "OPENAI_API_KEY".to_string(),
+            sensitive: true,
+        }];
+        let llm_env = HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "sk-agentark-internal".to_string(),
+        )]);
+        let (resolved, missing_sensitive, missing_config) = resolve_required_env_values(
+            config_dir.path(),
+            data_dir.path(),
+            &required,
+            &llm_env,
+            &HashMap::new(),
+        )
+        .await
+        .expect("resolve env");
+
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-user-app")
+        );
+        assert!(missing_sensitive.is_empty());
+        assert!(missing_config.is_empty());
+    }
+
+    #[test]
+    fn docker_requirement_stays_narrow_for_local_fallback() {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        std::fs::write(
+            app_dir.path().join("package.json"),
+            r#"{"dependencies":{"redis":"latest","pg":"latest"}}"#,
+        )
+        .expect("package json");
+
+        assert!(!docker_required_for_app(app_dir.path(), None));
+        assert!(docker_required_for_app(
+            app_dir.path(),
+            Some("agentark/custom-runner:latest")
+        ));
+
+        std::fs::write(app_dir.path().join("compose.yml"), "services: {}\n").expect("compose file");
+        assert!(docker_required_for_app(app_dir.path(), None));
     }
 
     #[test]
@@ -6639,6 +8736,30 @@ $ npm run dev
                     .as_deref()
                     .is_some_and(|command| command.contains("uvicorn"))
         }));
+    }
+
+    #[test]
+    fn plan_repo_services_detects_cargo_manifest_repo() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            r#"[package]
+name = "demo-server"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .expect("cargo manifest");
+        std::fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        std::fs::write(repo.path().join("src").join("main.rs"), "fn main() {}\n").expect("main");
+
+        let plans = plan_repo_services(repo.path(), "Rust Demo", RepoServiceMode::Auto)
+            .expect("repo services");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, RepoServiceKind::Backend);
+        assert_eq!(plans[0].entry_command.as_deref(), Some("cargo run"));
+        assert_eq!(plans[0].detection_reason, "cargo manifest");
     }
 
     #[tokio::test]
@@ -7080,6 +9201,124 @@ $ npm run dev
                 .and_then(|value| value.as_str())
                 .is_some(),
             "updated deployments should stamp updated_at"
+        );
+    }
+
+    #[test]
+    fn unified_diff_patch_updates_only_target_lines() {
+        let original = "one\ntwo\nthree\n";
+        let patch = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let patched = apply_unified_diff_to_text(original, patch).expect("patch should apply");
+        assert_eq!(patched, "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn unified_diff_patch_rejects_context_mismatch() {
+        let original = "one\ntwo\nthree\n";
+        let patch = "@@ -1,3 +1,3 @@\n one\n-not-two\n+TWO\n three\n";
+        let error = apply_unified_diff_to_text(original, patch).expect_err("patch should fail");
+        assert!(
+            error.to_string().contains("did not match"),
+            "expected context mismatch, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_patch_mode_applies_diff_and_preserves_other_files() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let initial_result = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "title": "Patchable app",
+                "files": {
+                    "index.html": "<!doctype html><html><head><link rel=\"stylesheet\" href=\"style.css\"></head><body><script src=\"app.js\"></script></body></html>",
+                    "style.css": "body { color: black; }\n",
+                    "app.js": "const label = 'old';\nconsole.log(label);\n",
+                    "old.txt": "remove me\n"
+                }
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("initial deploy should succeed");
+        let initial_json: serde_json::Value =
+            serde_json::from_str(&initial_result).expect("initial deploy json");
+        let app_id = initial_json
+            .get("app_id")
+            .and_then(|value| value.as_str())
+            .expect("app id")
+            .to_string();
+
+        app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "app_id": app_id,
+                "mode": "patch",
+                "file_patches": [{
+                    "path": "app.js",
+                    "patch": "@@ -1,2 +1,2 @@\n-const label = 'old';\n+const label = 'new';\n console.log(label);\n"
+                }],
+                "delete_paths": ["old.txt"]
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect("patch deploy should succeed");
+
+        let app_dir = data_dir.path().join("apps").join(&app_id);
+        let app_js = tokio::fs::read_to_string(app_dir.join("app.js"))
+            .await
+            .expect("patched js should be readable");
+        let style_css = tokio::fs::read_to_string(app_dir.join("style.css"))
+            .await
+            .expect("unchanged css should remain readable");
+        assert!(app_js.contains("'new'"));
+        assert_eq!(style_css, "body { color: black; }\n");
+        assert!(
+            tokio::fs::metadata(app_dir.join("old.txt")).await.is_err(),
+            "explicit delete_paths should remove the old file"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_deploy_patch_mode_requires_existing_app_id() {
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let registry = AppRegistry::new();
+        let llm_env = HashMap::new();
+
+        let error = app_deploy(
+            config_dir.path(),
+            data_dir.path(),
+            &serde_json::json!({
+                "mode": "patch",
+                "file_patches": [{
+                    "path": "index.html",
+                    "patch": "@@ -1 +1 @@\n-old\n+new\n"
+                }]
+            }),
+            &registry,
+            &llm_env,
+            None,
+        )
+        .await
+        .expect_err("patch mode without app_id must fail");
+
+        assert!(
+            error.to_string().contains("requires app_id"),
+            "unexpected error: {}",
+            error
         );
     }
 

@@ -1,11 +1,11 @@
 use axum::{
-    extract::{
-        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
-    },
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::{
+        Path, Query, State,
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -102,6 +102,648 @@ pub(super) async fn get_presets() -> Response {
 
 pub(super) async fn get_protocol() -> Response {
     Json(crate::core::companion_protocol_document()).into_response()
+}
+
+const COMPANION_WEB_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgentArk Web Companion</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090a0d;
+      --panel: #121419;
+      --panel-2: #171a20;
+      --line: rgba(255,255,255,.12);
+      --text: #f6f3ec;
+      --muted: #aaa39a;
+      --accent: #d5a85e;
+      --ok: #47c47a;
+      --warn: #e2b85d;
+      --bad: #ec6f6f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      background: radial-gradient(circle at 50% -10%, rgba(213,168,94,.12), transparent 34%), var(--bg);
+      color: var(--text);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(760px, 100%);
+      margin: 0 auto;
+      padding: max(18px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 0 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.15;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 34px;
+      padding: 0 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.04);
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: 13px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 3px rgba(226,184,93,.13);
+    }
+    .status[data-state="connected"] .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(71,196,122,.15); }
+    .status[data-state="error"] .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(236,111,111,.15); }
+    section {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.025)), var(--panel);
+      padding: 14px;
+      margin: 0 0 12px;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin: 10px 0 5px;
+    }
+    input {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #0c0e12;
+      color: var(--text);
+      padding: 10px 11px;
+      font: inherit;
+      outline: none;
+    }
+    input:focus {
+      border-color: rgba(213,168,94,.75);
+      box-shadow: 0 0 0 3px rgba(213,168,94,.13);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 13px;
+      font: inherit;
+      font-weight: 650;
+      touch-action: manipulation;
+    }
+    button.primary {
+      border-color: rgba(213,168,94,.65);
+      background: linear-gradient(180deg, rgba(213,168,94,.24), rgba(213,168,94,.12));
+    }
+    button.danger {
+      border-color: rgba(236,111,111,.42);
+      color: #ffd2d2;
+    }
+    button:disabled {
+      opacity: .52;
+    }
+    .note {
+      margin: 9px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .device {
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(0,0,0,.18);
+      overflow-wrap: anywhere;
+    }
+    .device strong {
+      font-size: 13px;
+    }
+    .device span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .command {
+      padding: 11px;
+      border: 1px solid rgba(213,168,94,.28);
+      border-radius: 10px;
+      background: rgba(213,168,94,.08);
+      margin-top: 8px;
+    }
+    .command-title {
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .command-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      max-height: 250px;
+      overflow: auto;
+      margin: 0;
+      padding: 10px;
+      border-radius: 9px;
+      background: #080a0d;
+      border: 1px solid var(--line);
+      color: #c8d8ff;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 560px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .grid { grid-template-columns: 1fr; }
+      button { width: 100%; }
+      .actions { display: grid; grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>AgentArk Web Companion</h1>
+        <p class="subtitle">No Xcode install. Keep this page open while testing commands.</p>
+      </div>
+      <div id="status" class="status" data-state="idle"><span class="dot"></span><span id="statusText">Not connected</span></div>
+    </header>
+
+    <section>
+      <h2>Connection</h2>
+      <label for="wsUrl">WebSocket URL</label>
+      <input id="wsUrl" autocomplete="off" spellcheck="false" />
+      <div class="grid">
+        <div>
+          <label for="sessionId">Pairing session id</label>
+          <input id="sessionId" autocomplete="off" spellcheck="false" />
+        </div>
+        <div>
+          <label for="pairingCode">Pairing code</label>
+          <input id="pairingCode" autocomplete="off" spellcheck="false" />
+        </div>
+      </div>
+      <div class="actions">
+        <button id="claimButton" class="primary">Claim pairing</button>
+        <button id="connectButton">Connect saved device</button>
+        <button id="notifyButton">Allow notifications</button>
+        <button id="clearButton" class="danger">Forget device</button>
+      </div>
+      <p class="note">After you tap Claim pairing, approve the claimed device in AgentArk. This page retries finalization until approval completes.</p>
+    </section>
+
+    <section>
+      <h2>Saved Device</h2>
+      <div id="deviceBox" class="device">
+        <strong>No saved device</strong>
+        <span>Pair once to store a scoped browser companion token on this phone.</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>Commands</h2>
+      <div id="commands"></div>
+      <p id="emptyCommands" class="note">No commands received yet.</p>
+    </section>
+
+    <section>
+      <h2>Event Log</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script>
+    const storageKey = "agentark.webCompanion.v1";
+    const publicKeyKey = "agentark.webCompanion.publicKey.v1";
+    let socket = null;
+    let retryTimer = null;
+    let saved = loadSaved();
+
+    const wsUrlInput = document.getElementById("wsUrl");
+    const sessionInput = document.getElementById("sessionId");
+    const codeInput = document.getElementById("pairingCode");
+    const statusEl = document.getElementById("status");
+    const statusText = document.getElementById("statusText");
+    const logEl = document.getElementById("log");
+    const deviceBox = document.getElementById("deviceBox");
+    const commandsEl = document.getElementById("commands");
+    const emptyCommands = document.getElementById("emptyCommands");
+
+    function params() {
+      return new URLSearchParams(window.location.search);
+    }
+
+    function defaultWsUrl() {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      return `${protocol}//${window.location.host}/companion/ws`;
+    }
+
+    function randomId(prefix) {
+      const bytes = new Uint8Array(18);
+      crypto.getRandomValues(bytes);
+      const encoded = Array.from(bytes).map((value) => value.toString(16).padStart(2, "0")).join("");
+      return `${prefix}${encoded}`;
+    }
+
+    function devicePublicKey() {
+      let value = localStorage.getItem(publicKeyKey);
+      if (!value) {
+        value = randomId("webpk_");
+        localStorage.setItem(publicKeyKey, value);
+      }
+      return value;
+    }
+
+    function loadSaved() {
+      try {
+        return JSON.parse(localStorage.getItem(storageKey) || "null");
+      } catch {
+        return null;
+      }
+    }
+
+    function saveDevice(device, token) {
+      saved = {
+        device_id: device.id,
+        display_name: device.display_name || "Web Companion",
+        token,
+        saved_at: new Date().toISOString()
+      };
+      localStorage.setItem(storageKey, JSON.stringify(saved));
+      renderSaved();
+    }
+
+    function setStatus(state, text) {
+      statusEl.dataset.state = state;
+      statusText.textContent = text;
+    }
+
+    function log(message, payload) {
+      const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+      const detail = payload ? `\n${JSON.stringify(payload, null, 2)}` : "";
+      logEl.textContent = `${line}${detail}\n\n${logEl.textContent}`.slice(0, 9000);
+    }
+
+    function renderSaved() {
+      if (!saved || !saved.device_id || !saved.token) {
+        deviceBox.innerHTML = "<strong>No saved device</strong><span>Pair once to store a scoped browser companion token on this phone.</span>";
+        return;
+      }
+      deviceBox.innerHTML = `<strong>${escapeHtml(saved.display_name || "Web Companion")}</strong><span>${escapeHtml(saved.device_id)}</span><span>Saved ${escapeHtml(new Date(saved.saved_at || Date.now()).toLocaleString())}</span>`;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+
+    function send(payload) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        log("Socket is not open");
+        return false;
+      }
+      socket.send(JSON.stringify(payload));
+      return true;
+    }
+
+    function openSocket(onOpen) {
+      if (socket) {
+        socket.close();
+      }
+      setStatus("idle", "Connecting");
+      socket = new WebSocket(wsUrlInput.value.trim() || defaultWsUrl());
+      socket.onopen = () => {
+        setStatus("connected", "Connected");
+        log("WebSocket connected");
+        onOpen && onOpen();
+      };
+      socket.onclose = () => {
+        setStatus("idle", "Disconnected");
+        log("WebSocket closed");
+      };
+      socket.onerror = () => {
+        setStatus("error", "Connection error");
+        log("WebSocket error");
+      };
+      socket.onmessage = (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          log("Invalid JSON from server", event.data);
+          return;
+        }
+        handleMessage(message);
+      };
+    }
+
+    function pairingPayload() {
+      return {
+        type: "pairing_claim",
+        session_id: sessionInput.value.trim(),
+        code: codeInput.value.trim(),
+        device_public_key: devicePublicKey(),
+        metadata: {
+          client: "agentark-web-companion",
+          model: navigator.userAgent.slice(0, 140),
+          page_origin: window.location.origin
+        }
+      };
+    }
+
+    function claimPairing() {
+      if (!sessionInput.value.trim() || !codeInput.value.trim()) {
+        setStatus("error", "Missing pairing details");
+        log("Enter the session id and pairing code first");
+        return;
+      }
+      clearInterval(retryTimer);
+      openSocket(() => {
+        send(pairingPayload());
+        retryTimer = setInterval(() => send(pairingPayload()), 3500);
+      });
+    }
+
+    function connectSaved() {
+      if (!saved || !saved.device_id || !saved.token) {
+        setStatus("error", "No saved device");
+        log("No saved device token on this phone");
+        return;
+      }
+      openSocket(() => {
+        send({
+          type: "browser_auth",
+          device_id: saved.device_id,
+          token: saved.token
+        });
+      });
+    }
+
+    function sendPulse() {
+      if (!saved || !saved.device_id) return;
+      send({
+        type: "pulse",
+        device_id: saved.device_id,
+        state: "online",
+        capabilities: ["approval_prompt", "notifications"],
+        metadata: {
+          client: "agentark-web-companion",
+          notification_permission: "Notification" in window ? Notification.permission : "unavailable"
+        }
+      });
+    }
+
+    function handleMessage(message) {
+      if (message.type !== "hello" && message.type !== "pulse_ok") {
+        log(`Received ${message.type || "message"}`, message);
+      }
+      if (message.type === "pairing_claim_result") {
+        const result = message.result || {};
+        if (result.status === "claimed") {
+          setStatus("idle", "Approve in AgentArk");
+        }
+        if (result.status === "completed" && result.device && result.device_token) {
+          clearInterval(retryTimer);
+          saveDevice(result.device, result.device_token);
+          setStatus("connected", "Paired");
+          sendPulse();
+        }
+        return;
+      }
+      if (message.type === "auth_ok") {
+        if (message.device && saved) {
+          saved.display_name = message.device.display_name || saved.display_name;
+          localStorage.setItem(storageKey, JSON.stringify(saved));
+          renderSaved();
+        }
+        setStatus("connected", "Online");
+        sendPulse();
+        return;
+      }
+      if (message.type === "auth_error" || message.type === "error") {
+        setStatus("error", message.error || "Error");
+        return;
+      }
+      if (message.type === "command_dispatch" && message.command) {
+        handleCommand(message.command);
+      }
+    }
+
+    function handleCommand(command) {
+      emptyCommands.hidden = true;
+      const card = document.createElement("div");
+      card.className = "command";
+      card.innerHTML = `<div class="command-title">${escapeHtml(command.action || "Command")}</div><div class="command-meta">${escapeHtml(command.capability || "unknown")} - ${escapeHtml(command.id || "")}</div>`;
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const approve = document.createElement("button");
+      approve.className = "primary";
+      approve.textContent = command.capability === "notifications" ? "Mark received" : "Approve result";
+      const reject = document.createElement("button");
+      reject.textContent = "Reject";
+      actions.appendChild(approve);
+      actions.appendChild(reject);
+      card.appendChild(actions);
+      commandsEl.prepend(card);
+
+      if (command.capability === "notifications") {
+        showNotification(command);
+      }
+
+      approve.onclick = () => {
+        sendCommandResult(command, true, command.capability === "notifications" ? "Notification received in web companion." : "Approved in web companion.");
+        card.remove();
+        emptyCommands.hidden = commandsEl.children.length > 0;
+      };
+      reject.onclick = () => {
+        sendCommandResult(command, false, null, "Rejected in web companion.");
+        card.remove();
+        emptyCommands.hidden = commandsEl.children.length > 0;
+      };
+    }
+
+    function sendCommandResult(command, success, preview, error) {
+      send({
+        type: "command_result",
+        device_id: saved && saved.device_id,
+        command_id: command.id,
+        success,
+        result_preview: preview || undefined,
+        error: error || undefined
+      });
+    }
+
+    function showNotification(command) {
+      if (!("Notification" in window) || Notification.permission !== "granted") {
+        return;
+      }
+      const args = command.arguments || {};
+      const title = typeof args.title === "string" ? args.title : "AgentArk";
+      const body = typeof args.body === "string" ? args.body : (command.action || "Notification received.");
+      try {
+        new Notification(title, { body });
+      } catch {
+        log("Browser notification failed");
+      }
+    }
+
+    async function allowNotifications() {
+      if (!("Notification" in window)) {
+        log("Notifications are not available in this browser");
+        return;
+      }
+      const result = await Notification.requestPermission();
+      log(`Notification permission: ${result}`);
+      sendPulse();
+    }
+
+    function clearSaved() {
+      localStorage.removeItem(storageKey);
+      saved = null;
+      renderSaved();
+      setStatus("idle", "Device forgotten");
+      log("Saved browser companion token removed");
+    }
+
+    function init() {
+      const query = params();
+      wsUrlInput.value = query.get("ws") || defaultWsUrl();
+      sessionInput.value = query.get("session_id") || query.get("session") || "";
+      codeInput.value = query.get("code") || "";
+      document.getElementById("claimButton").onclick = claimPairing;
+      document.getElementById("connectButton").onclick = connectSaved;
+      document.getElementById("notifyButton").onclick = allowNotifications;
+      document.getElementById("clearButton").onclick = clearSaved;
+      renderSaved();
+      if (sessionInput.value && codeInput.value) {
+        setStatus("idle", "Ready to claim");
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
+"##;
+
+pub(super) async fn companion_web() -> Response {
+    let mut response = Html(COMPANION_WEB_HTML).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn companion_ws_url_from_base(base: &str) -> Option<String> {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        return Some(format!("wss://{}/companion/ws", rest));
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return Some(format!("ws://{}/companion/ws", rest));
+    }
+    None
+}
+
+async fn companion_connectivity_payload(state: &AppState) -> serde_json::Value {
+    let tunnel = state.tunnel.read().await;
+    let websocket_url = tunnel.url.as_deref().and_then(companion_ws_url_from_base);
+    serde_json::json!({
+        "status": "ok",
+        "protocol_version": "agentark-companion-v1",
+        "websocket_path": "/companion/ws",
+        "tunnel_active": tunnel.active,
+        "tunnel_url": tunnel.url.clone(),
+        "tunnel_provider": tunnel.provider.as_str(),
+        "tunnel_companion_enabled": tunnel.companion_enabled,
+        "websocket_url": websocket_url,
+        "error": tunnel.error.clone(),
+        "xcode_source": "clients/companion/ios",
+    })
+}
+
+pub(super) async fn get_connectivity(State(state): State<AppState>) -> Response {
+    Json(companion_connectivity_payload(&state).await).into_response()
+}
+
+pub(super) async fn start_companion_tunnel(State(state): State<AppState>) -> Response {
+    let should_spawn = {
+        let tunnel = state.tunnel.read().await;
+        !tunnel.active
+    };
+    if should_spawn {
+        if let Err(error) = super::tunnel::spawn_tunnel(&state, None).await {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+    }
+    {
+        let mut tunnel = state.tunnel.write().await;
+        tunnel.companion_enabled = true;
+    }
+    let discovered = super::tunnel::wait_for_tunnel_url(state.tunnel.clone(), 12).await;
+    if let Some(url) = discovered.as_deref() {
+        super::tunnel::persist_public_tunnel_state(&state, Some(url), None).await;
+    }
+    Json(companion_connectivity_payload(&state).await).into_response()
+}
+
+pub(super) async fn stop_companion_tunnel(State(state): State<AppState>) -> Response {
+    let should_stop = {
+        let mut tunnel = state.tunnel.write().await;
+        tunnel.companion_enabled = false;
+        tunnel.active && !tunnel.control_plane_enabled && tunnel.exposed_app_ids.is_empty()
+    };
+    if should_stop {
+        super::tunnel::stop_tunnel_internal(&state).await;
+    }
+    Json(companion_connectivity_payload(&state).await).into_response()
 }
 
 pub(super) async fn list_devices(State(state): State<AppState>) -> Response {
@@ -407,6 +1049,7 @@ async fn handle_companion_socket(
             "protocol_version": "agentark-companion-v1",
             "pairing_required": true,
             "auth_transport": "authorization_header",
+            "browser_auth_message": "browser_auth",
         }),
     )
     .await;
@@ -509,6 +1152,50 @@ async fn handle_companion_socket(
                             &mut sender,
                             serde_json::json!({
                                 "type": "error",
+                                "error": error.to_string(),
+                            }),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            "browser_auth" => {
+                let device_id = parsed.device_id.unwrap_or_default();
+                let token = parsed.token.unwrap_or_default();
+                match plane.verify_device_token(&device_id, &token).await {
+                    Ok(device) => {
+                        authed_device_id = Some(device.id.clone());
+                        let _ = plane
+                            .pulse_device(
+                                &device.id,
+                                Some(crate::core::CompanionDeviceState::Online),
+                                Vec::new(),
+                                BTreeMap::new(),
+                            )
+                            .await;
+                        if !send_ws_json(
+                            &mut sender,
+                            serde_json::json!({
+                                "type": "auth_ok",
+                                "device": device,
+                            }),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        if !send_next_command(&plane, &mut sender, &device_id).await {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        if !send_ws_json(
+                            &mut sender,
+                            serde_json::json!({
+                                "type": "auth_error",
                                 "error": error.to_string(),
                             }),
                         )

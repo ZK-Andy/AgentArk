@@ -452,7 +452,6 @@ pub(super) fn background_session_list_item_json(
         "preferred_delivery_channel": session.preferred_delivery_channel.clone(),
         "channel": session.channel.clone(),
         "conversation_id": session.conversation_id.clone(),
-        "project_id": session.project_id.clone(),
         "linked_task_ids": session.linked_task_ids.clone(),
         "linked_watcher_ids": session.linked_watcher_ids.clone(),
         "created_at": session.created_at.to_rfc3339(),
@@ -536,6 +535,22 @@ pub(super) async fn rebind_watcher_background_session(
         .watcher_manager
         .set_background_session_id(uuid, session_id)
         .await)
+}
+
+async fn delete_watcher_entity(state: &AppState, watcher_id: &str) -> Result<bool, String> {
+    let trimmed = watcher_id.trim();
+    let uuid =
+        uuid::Uuid::parse_str(trimmed).map_err(|_| format!("Invalid watcher id: {}", trimmed))?;
+    let agent = state.agent.read().await;
+    let deleted_live = agent.watcher_manager.delete(uuid).await;
+    let deleted_history = agent.clear_watcher_supervisor_state(trimmed).await;
+    let task_ids: Vec<String> = Vec::new();
+    let watcher_ids = vec![trimmed.to_string()];
+    agent
+        .background_sessions
+        .remove_child_references(&task_ids, &watcher_ids, Some("api"))
+        .await;
+    Ok(deleted_live || deleted_history)
 }
 
 pub(super) async fn pause_linked_background_session_work(
@@ -734,6 +749,101 @@ pub(super) async fn cancel_linked_background_session_work(
     Ok((cancelled_tasks.len(), cancelled_watchers))
 }
 
+pub(super) async fn update_linked_background_session_delivery(
+    state: &AppState,
+    session: &crate::core::BackgroundSession,
+    channel: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let channel = channel.trim();
+    if channel.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let linked_task_ids: HashSet<String> = session.linked_task_ids.iter().cloned().collect();
+    let mut task_updates = Vec::new();
+    {
+        let snapshot = state.tasks.read().await.all().to_vec();
+        let mut tasks = state.tasks.write().await;
+        for task in snapshot {
+            let task_id = task.id.to_string();
+            if !(linked_task_ids.contains(&task_id)
+                || task_background_session_id(&task).as_deref() == Some(session.id.as_str()))
+            {
+                continue;
+            }
+            let Some(inner) = tasks.get_mut(task.id) else {
+                continue;
+            };
+            let Some(arguments) = inner.arguments.as_object_mut() else {
+                continue;
+            };
+            if arguments
+                .get("report_to")
+                .and_then(|value| value.as_str())
+                .map(|value| value == channel)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            arguments.insert(
+                "report_to".to_string(),
+                serde_json::Value::String(channel.to_string()),
+            );
+            let serialized = serde_json::to_string(&inner.arguments)?;
+            task_updates.push((task_id, serialized));
+        }
+    }
+
+    if !task_updates.is_empty() {
+        let agent = state.agent.read().await;
+        for (task_id, serialized_arguments) in &task_updates {
+            agent
+                .storage
+                .update_task(
+                    task_id,
+                    None,
+                    Some(serialized_arguments.clone()),
+                    None,
+                    None,
+                )
+                .await?;
+        }
+    }
+
+    let mut watcher_ids: HashSet<String> = session.linked_watcher_ids.iter().cloned().collect();
+    {
+        let agent = state.agent.read().await;
+        for watcher in agent.watcher_manager.list().await {
+            if watcher_background_session_id(&watcher).as_deref() == Some(session.id.as_str()) {
+                watcher_ids.insert(watcher.id.to_string());
+            }
+        }
+    }
+
+    let mut watcher_updates = 0usize;
+    {
+        let agent = state.agent.read().await;
+        for watcher_id in watcher_ids {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&watcher_id) {
+                if agent
+                    .watcher_manager
+                    .set_notify_channel(uuid, channel)
+                    .await
+                {
+                    watcher_updates += 1;
+                    if let Some(watcher) = agent.watcher_manager.get(uuid).await {
+                        agent
+                            .sync_watcher_supervisor_state(&watcher, None, None)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((task_updates.len(), watcher_updates))
+}
+
 pub(super) async fn list_background_sessions(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
@@ -791,7 +901,7 @@ pub(super) async fn create_background_session(
                     preferred_delivery_channel: request.preferred_delivery_channel.clone(),
                     channel: request.channel.clone(),
                     conversation_id: request.conversation_id.clone(),
-                    project_id: request.project_id.clone(),
+                    project_id: None,
                     task_ids: Vec::new(),
                     watcher_ids: Vec::new(),
                     policy: Default::default(),
@@ -969,7 +1079,6 @@ pub(super) async fn get_background_session(
                 "working_memory": session.working_memory.clone(),
                 "channel": session.channel.clone(),
                 "conversation_id": session.conversation_id.clone(),
-                "project_id": session.project_id.clone(),
                 "events": session.events.iter().map(|event| serde_json::json!({
                     "id": event.id.clone(),
                     "at": event.at.to_rfc3339(),
@@ -996,6 +1105,12 @@ pub(super) async fn update_background_session(
     Path(id): Path<String>,
     Json(request): Json<UpdateBackgroundSessionRequest>,
 ) -> Response {
+    let requested_delivery_channel = request
+        .preferred_delivery_channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let status = match parse_background_session_status(request.status.as_deref()) {
         Ok(status) => status,
         Err(error) => {
@@ -1027,7 +1142,7 @@ pub(super) async fn update_background_session(
             .await
     };
 
-    if updated.is_none() {
+    let Some(updated_session) = updated else {
         return (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -1035,10 +1150,38 @@ pub(super) async fn update_background_session(
             }),
         )
             .into_response();
+    };
+
+    let mut delivery_task_updates = 0usize;
+    let mut delivery_watcher_updates = 0usize;
+    if let Some(channel) = requested_delivery_channel.as_deref() {
+        match update_linked_background_session_delivery(&state, &updated_session, channel).await {
+            Ok((task_count, watcher_count)) => {
+                delivery_task_updates = task_count;
+                delivery_watcher_updates = watcher_count;
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to update linked notification delivery: {error}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
     }
 
     spawn_autonomy_analysis_tick(state.agent.clone(), "background_session_updated");
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "delivery_task_updates": delivery_task_updates,
+            "delivery_watcher_updates": delivery_watcher_updates,
+        })),
+    )
+        .into_response()
 }
 
 pub(super) async fn attach_background_session_work(
@@ -1148,9 +1291,8 @@ pub(super) async fn detach_background_session_work(
         }
     }
     for watcher_id in &request.watcher_ids {
-        match rebind_watcher_background_session(&state, watcher_id, None).await {
-            Ok(true) => detached_watcher_ids.push(watcher_id.trim().to_string()),
-            Ok(false) => {}
+        match delete_watcher_entity(&state, watcher_id).await {
+            Ok(_) => detached_watcher_ids.push(watcher_id.trim().to_string()),
             Err(error) => {
                 return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
             }
@@ -1182,6 +1324,7 @@ pub(super) async fn detach_background_session_work(
             "status": "ok",
             "detached_task_ids": detached_task_ids,
             "detached_watcher_ids": detached_watcher_ids,
+            "deleted_watcher_ids": detached_watcher_ids,
         })),
     )
         .into_response()
@@ -1387,13 +1530,23 @@ pub(super) async fn delete_background_session(
         }
     }
     for watcher_id in &session.linked_watcher_ids {
-        if let Err(error) = rebind_watcher_background_session(&state, watcher_id, None).await {
-            tracing::warn!(
-                "Failed to unlink watcher {} from deleted background session {}: {}",
-                watcher_id,
-                id,
-                error
-            );
+        match delete_watcher_entity(&state, watcher_id).await {
+            Ok(false) => {
+                tracing::debug!(
+                    "Deleted background session {} referenced missing watcher {}",
+                    id,
+                    watcher_id
+                );
+            }
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to delete watcher {} from deleted background session {}: {}",
+                    watcher_id,
+                    id,
+                    error
+                );
+            }
         }
     }
 
@@ -1732,7 +1885,6 @@ pub(super) async fn list_automation_runs_endpoint(
                 error: run.error,
                 next_retry_at: run.next_retry_at,
                 conversation_id: run.origin.conversation_id,
-                project_id: run.origin.project_id,
                 view: match run.automation_kind.as_str() {
                     "task" => "tasks".to_string(),
                     "watcher" => "watchers".to_string(),
@@ -2073,12 +2225,37 @@ pub(super) async fn delete_goal_endpoint(
         0
     };
 
+    let deleted_reflect_units = {
+        let agent = state.agent.read().await;
+        let mut total = 0u64;
+        if let Some(gid) = goal_id.as_deref() {
+            total = total.saturating_add(
+                agent
+                    .storage
+                    .delete_semantic_work_units_for_source("goal", gid)
+                    .await
+                    .unwrap_or(0),
+            );
+        }
+        if let Some(task_id) = goal_task_id.as_deref() {
+            total = total.saturating_add(
+                agent
+                    .storage
+                    .delete_semantic_work_units_for_source("goal", task_id)
+                    .await
+                    .unwrap_or(0),
+            );
+        }
+        total
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
             "deleted_task_ids": ids_to_delete,
             "deleted_notifications": deleted_notifications,
+            "deleted_reflect_units": deleted_reflect_units,
         })),
     )
         .into_response()
@@ -2089,7 +2266,7 @@ pub(super) async fn create_task(
     State(state): State<AppState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Response {
-    use crate::core::{status_for_task_approval, Task, TaskApproval};
+    use crate::core::{Task, TaskApproval, status_for_task_approval};
 
     // Convert and validate cron expression if provided
     // Standard 5-field cron is converted to 6-field (with seconds) for Rust cron crate
@@ -2672,7 +2849,7 @@ pub(super) async fn resume_chat_task_stream(
     };
     let resume_request_body = request.map(|Json(body)| body).unwrap_or_default();
 
-    let (resume_request, resumed_task, previous_task, status_json, arguments_json) = {
+    let (resume_request, resumed_task, previous_task, status_json, arguments_json, plan_override) = {
         let mut tasks = state.tasks.write().await;
         let Some(task) = tasks.get_mut(uuid) else {
             return (
@@ -2729,6 +2906,7 @@ pub(super) async fn resume_chat_task_stream(
             } else {
                 None
             },
+            effective_plan_override,
         )
     };
 
@@ -2766,8 +2944,9 @@ pub(super) async fn resume_chat_task_stream(
             message: resume_request.message,
             channel: resume_request.channel,
             conversation_id: Some(resume_request.conversation_id),
-            project_id: resume_request.project_id,
             deep_research: resume_request.deep_research,
+            plan_confirmation_mode: None,
+            arkorbit_context: None,
             attachments: Vec::new(),
             caller_principal: maybe_caller.as_ref().map(|Extension(value)| value.clone()),
             task_mode: ChatStreamTaskMode::Existing(Box::new(StreamedChatTask {
@@ -2775,6 +2954,7 @@ pub(super) async fn resume_chat_task_stream(
                 description: resumed_task.description.clone(),
                 work_type: resume_request.work_type,
                 user_message_already_recorded: true,
+                plan_override,
             })),
         },
     )
@@ -3270,13 +3450,12 @@ pub(super) async fn run_chat_suggestion_scan(state: &AppState, trigger: &str) ->
 
     let agent_snapshot = Agent::snapshot(&state.agent).await;
     let mut suggestions = load_chat_suggestions(&storage).await;
-    let mut removed_duplicate_suggestions =
-        collapse_semantically_equivalent_chat_suggestions(
-            &agent_snapshot.llm,
-            &mut suggestions,
-            &now_rfc3339,
-        )
-        .await;
+    let mut removed_duplicate_suggestions = collapse_semantically_equivalent_chat_suggestions(
+        &agent_snapshot.llm,
+        &mut suggestions,
+        &now_rfc3339,
+    )
+    .await;
     if removed_duplicate_suggestions > 0 {
         save_chat_suggestions(&storage, &suggestions).await;
     }

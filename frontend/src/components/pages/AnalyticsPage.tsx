@@ -297,6 +297,8 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
     str(asRecord(resp?.range).until, ""),
     "-",
   );
+  const analyticsTruncated =
+    Boolean(resp?.truncated) || Boolean(asRecord(resp?.range).truncated);
   const totalPolicySamples = policyMetricsRows.reduce(
     (sum, row) => sum + num(row.samples, 0),
     0,
@@ -734,6 +736,12 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
           </TextField>
         }
       />
+      {analyticsTruncated ? (
+        <Alert severity="warning" variant="outlined">
+          The selected range reached the server analytics row cap. Charts and
+          totals show the available slice, not the complete range.
+        </Alert>
+      ) : null}
       <Dialog
         open={customDialogOpen}
         onClose={() => setCustomDialogOpen(false)}
@@ -884,10 +892,10 @@ export default function AnalyticsPage({ autoRefresh }: AnalyticsPageProps) {
                   aria-label="Analytics spend estimate details"
                   sx={{ p: 0.2, color: "text.secondary" }}
                 >
-                  <InfoOutlinedIcon sx={{ fontSize: 14 }} />
+                  <InfoOutlinedIcon sx={{ fontSize: 16 }} />
                 </IconButton>
               </Tooltip>
-              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
                 Spend is approximate.
               </Typography>
             </Stack>

@@ -256,11 +256,7 @@ pub(super) async fn build_runtime_health_payload(
         && blocking_startup_issue_count == 0;
     let overall_ok = if readiness_mode { ready } else { true };
     let status_text = if readiness_mode {
-        if ready {
-            "ok"
-        } else {
-            "not_ready"
-        }
+        if ready { "ok" } else { "not_ready" }
     } else if healthy {
         "ok"
     } else {
@@ -2006,7 +2002,20 @@ pub(super) async fn delete_watcher(
         let deleted_live = agent.watcher_manager.delete(uuid).await;
         let deleted_history = agent.clear_watcher_supervisor_state(&id).await;
         let deleted = deleted_live || deleted_history;
-        Json(serde_json::json!({ "deleted": deleted }))
+        let task_ids: Vec<String> = Vec::new();
+        let watcher_ids = vec![id.clone()];
+        agent
+            .background_sessions
+            .remove_child_references(&task_ids, &watcher_ids, Some("api"))
+            .await;
+        let deleted_reflect_units = agent
+            .storage
+            .delete_semantic_work_units_for_source("watcher", &id)
+            .await
+            .unwrap_or(0);
+        Json(
+            serde_json::json!({ "deleted": deleted, "deleted_reflect_units": deleted_reflect_units }),
+        )
     } else {
         Json(serde_json::json!({ "error": "Invalid watcher ID" }))
     }

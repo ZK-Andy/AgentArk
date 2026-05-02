@@ -36,6 +36,7 @@ pub mod recall_event;
 pub mod recall_test;
 pub mod run_checkpoint;
 pub mod security_log;
+pub mod semantic_work_unit;
 pub mod swarm_agent;
 pub mod swarm_delegation;
 pub mod task;

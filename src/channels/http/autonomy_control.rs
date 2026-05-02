@@ -490,7 +490,6 @@ pub(super) async fn start_goal_loop(
         serde_json::json!({
             "goal_id": goal_id,
             "goal": goal,
-            "project_id": request.project_id,
         }),
     );
     goal_task.scheduled_for = due_date;
@@ -723,7 +722,7 @@ pub(super) async fn run_goal_report_now(
     let agent = state.agent.read().await;
 
     // Find goal text from an existing goal task.
-    let (goal_text, project_id) = {
+    let goal_text = {
         let tasks = agent.tasks.read().await;
         let goal_task = tasks.all().iter().find(|t| {
             t.action == "goal"
@@ -740,12 +739,7 @@ pub(super) async fn run_goal_report_now(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or(t.description.trim_start_matches("Goal: ").to_string());
-            let pid = t
-                .arguments
-                .get("project_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            (goal, pid)
+            goal
         } else {
             return (
                 StatusCode::NOT_FOUND,
@@ -763,7 +757,6 @@ pub(super) async fn run_goal_report_now(
         serde_json::json!({
             "goal_id": goal_id,
             "goal": goal_text,
-            "project_id": project_id,
         }),
     );
     report_task.scheduled_for = Some(chrono::Utc::now());
@@ -1248,35 +1241,17 @@ pub(super) async fn query_knowledge_brain(
     let limit = request.limit.unwrap_or(8).clamp(1, 20);
     let agent = state.agent.read().await;
     let docs = agent
-        .search_documents(&request.query, limit, request.project_id.as_deref())
+        .search_documents(&request.query, limit, None)
         .await
         .unwrap_or_default();
-    let facts = if let Some(project_id) = request.project_id.as_deref() {
-        let mut merged = agent
-            .encrypted_storage
-            .get_facts_by_project_decrypted(limit as u64, 0, Some(project_id))
-            .await
-            .unwrap_or_default();
-        if merged.len() < limit {
-            let remaining = (limit - merged.len()) as u64;
-            let global = agent
-                .encrypted_storage
-                .get_global_facts_decrypted(remaining, 0)
-                .await
-                .unwrap_or_default();
-            merged.extend(global);
-        }
-        merged
-    } else {
-        agent
-            .encrypted_storage
-            .get_facts_decrypted()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .take(limit)
-            .collect()
-    };
+    let facts = agent
+        .encrypted_storage
+        .get_facts_decrypted()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .take(limit)
+        .collect::<Vec<_>>();
 
     let evidence_docs: Vec<serde_json::Value> = docs
         .iter()
@@ -1285,7 +1260,6 @@ pub(super) async fn query_knowledge_brain(
                 "document_id": &hit.document_id,
                 "filename": &hit.filename,
                 "content_type": &hit.content_type,
-                "project_id": &hit.project_id,
                 "chunk_index": hit.chunk_index,
                 "score": hit.score,
                 "match_reason": &hit.match_reason,

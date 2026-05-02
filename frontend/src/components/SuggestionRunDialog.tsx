@@ -76,11 +76,10 @@ function suggestionOutcomeStatusColor(status: string): ChipColor {
 
 function workspaceLabel(view: string): string {
   const normalized = view.toLowerCase();
-  if (normalized === "watcher" || normalized === "watchers" || normalized === "status") return "Open Watchers";
+  if (normalized === "watcher" || normalized === "watchers" || normalized === "status") return "Open Background Work";
   if (normalized === "task" || normalized === "tasks") return "Open Tasks";
   if (normalized === "app" || normalized === "apps") return "Open Apps";
-  if (normalized === "session" || normalized === "sessions") return "Open Sessions";
-  if (normalized === "project" || normalized === "projects") return "Open Projects";
+  if (normalized === "session" || normalized === "sessions") return "Open Browser Sessions";
   if (normalized === "document" || normalized === "documents" || normalized === "file" || normalized === "files") {
     return "Open Documents";
   }

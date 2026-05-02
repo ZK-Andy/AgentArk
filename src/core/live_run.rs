@@ -50,6 +50,42 @@ pub struct LiveRunRegistry {
     entries: Arc<Mutex<HashMap<String, LiveRunEntry>>>,
 }
 
+fn should_persist_run_event(event: &RunEvent) -> bool {
+    if event.kind == "token" {
+        return false;
+    }
+    if event.kind == "thinking" {
+        let stream_key = event
+            .payload
+            .get("__streamKey")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let step_type = event
+            .payload
+            .get("step_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if stream_key == "public-thinking" || step_type == "heartbeat" {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_event_checkpoint(event: &RunEvent) -> Option<crate::core::ExecutionCheckpoint> {
+    if !should_persist_run_event(event) {
+        return None;
+    }
+    let payload = serde_json::to_string(event).ok()?;
+    Some(crate::core::ExecutionCheckpoint {
+        run_id: event.run_id.clone(),
+        sequence_no: event.seq.min(u32::MAX as u64) as u32,
+        stage: event.kind.clone(),
+        payload,
+        created_at: event.ts.clone(),
+    })
+}
+
 impl LiveRunRegistry {
     pub fn new(storage: Option<Storage>) -> Self {
         Self {
@@ -102,40 +138,58 @@ impl LiveRunRegistry {
             return None;
         }
 
-        let mut entries = self.entries.lock().await;
-        Self::cleanup_locked(&mut entries);
-        let entry = entries.entry(run_id.to_string()).or_insert_with(|| {
-            let (tx, _) = broadcast::channel(LIVE_RUN_CHANNEL_CAPACITY);
-            LiveRunEntry {
-                tx,
-                replay: VecDeque::new(),
-                next_seq: 1,
-                completed: false,
-                updated_at: Instant::now(),
-            }
-        });
+        let event = {
+            let mut entries = self.entries.lock().await;
+            Self::cleanup_locked(&mut entries);
+            let entry = entries.entry(run_id.to_string()).or_insert_with(|| {
+                let (tx, _) = broadcast::channel(LIVE_RUN_CHANNEL_CAPACITY);
+                LiveRunEntry {
+                    tx,
+                    replay: VecDeque::new(),
+                    next_seq: 1,
+                    completed: false,
+                    updated_at: Instant::now(),
+                }
+            });
 
-        let event = RunEvent {
-            run_id: run_id.to_string(),
-            seq: entry.next_seq,
-            ts: chrono::Utc::now().to_rfc3339(),
-            flow_kind: flow_kind.to_string(),
-            origin: origin.to_string(),
-            kind: kind.to_string(),
-            priority,
-            stage,
-            payload,
+            let event = RunEvent {
+                run_id: run_id.to_string(),
+                seq: entry.next_seq,
+                ts: chrono::Utc::now().to_rfc3339(),
+                flow_kind: flow_kind.to_string(),
+                origin: origin.to_string(),
+                kind: kind.to_string(),
+                priority,
+                stage,
+                payload,
+            };
+            entry.next_seq = entry.next_seq.saturating_add(1);
+            if entry.replay.len() >= LIVE_RUN_REPLAY_LIMIT {
+                entry.replay.pop_front();
+            }
+            entry.replay.push_back(event.clone());
+            entry.updated_at = Instant::now();
+            if event.kind == "done" {
+                entry.completed = true;
+            }
+            let _ = entry.tx.send(event.clone());
+            event
         };
-        entry.next_seq = entry.next_seq.saturating_add(1);
-        if entry.replay.len() >= LIVE_RUN_REPLAY_LIMIT {
-            entry.replay.pop_front();
+
+        if let (Some(storage), Some(checkpoint)) =
+            (self.storage.clone(), run_event_checkpoint(&event))
+        {
+            crate::spawn_logged!("src/core/live_run.rs:persist-run-event", async move {
+                if let Err(error) = storage.append_execution_checkpoint(&checkpoint).await {
+                    tracing::warn!(
+                        "Failed to persist live run event {}#{}: {}",
+                        checkpoint.run_id,
+                        checkpoint.sequence_no,
+                        error
+                    );
+                }
+            });
         }
-        entry.replay.push_back(event.clone());
-        entry.updated_at = Instant::now();
-        if event.kind == "done" {
-            entry.completed = true;
-        }
-        let _ = entry.tx.send(event.clone());
         Some(event)
     }
 

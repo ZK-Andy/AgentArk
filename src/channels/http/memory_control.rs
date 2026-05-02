@@ -59,9 +59,9 @@ pub(super) async fn list_available_channels(State(state): State<AppState>) -> Re
 
 pub(super) async fn memory_stats(
     State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(_params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let project_id = params.get("project_id").map(|s| s.as_str());
+    let project_id: Option<&str> = None;
     let agent = state.agent.read().await;
     let fact_count = agent.storage.count_facts(project_id).await.unwrap_or(0);
     let doc_count = agent.storage.count_documents(project_id).await.unwrap_or(0);
@@ -98,7 +98,7 @@ pub(super) async fn list_facts(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let project_id = params.get("project_id").map(|s| s.as_str());
+    let project_id: Option<&str> = None;
     let limit = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -155,7 +155,6 @@ pub(super) struct UpsertUserPreferenceRequest {
     sensitivity: Option<String>,
     confidence: Option<f32>,
     source: Option<String>,
-    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,7 +165,6 @@ pub(super) struct CreateUserDataItemRequest {
     url: Option<String>,
     source_channel: Option<String>,
     conversation_id: Option<String>,
-    project_id: Option<String>,
     pinned: Option<bool>,
 }
 
@@ -177,7 +175,6 @@ pub(super) struct CreateKnowledgeItemRequest {
     source: Option<String>,
     url: Option<String>,
     tags: Option<String>,
-    project_id: Option<String>,
 }
 
 pub(super) async fn list_user_preferences(
@@ -192,7 +189,7 @@ pub(super) async fn list_user_preferences(
         .get("offset")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    let project_id = params.get("project_id").map(|s| s.as_str());
+    let project_id: Option<&str> = None;
 
     let agent = state.agent.read().await;
     match agent
@@ -249,11 +246,7 @@ pub(super) async fn upsert_user_preference(
             payload.value.trim(),
             payload.confidence.unwrap_or(0.85),
             payload.source.as_deref(),
-            payload
-                .project_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty()),
+            None,
             payload.sensitivity.as_deref(),
         )
         .await
@@ -297,13 +290,9 @@ pub(super) async fn upsert_user_preference(
 pub(super) async fn delete_user_preference(
     State(state): State<AppState>,
     Path(key): Path<String>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Query(_params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let project_id = params
-        .get("project_id")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let project_id: Option<&str> = None;
     let agent = state.agent.read().await;
     match agent.storage.delete_user_preference(&key, project_id).await {
         Ok(deleted) => (
@@ -333,11 +322,7 @@ pub(super) async fn list_user_data_items(
         .get("offset")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    let project_id = params
-        .get("project_id")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let project_id: Option<&str> = None;
     let kind = params
         .get("kind")
         .map(String::as_str)
@@ -400,11 +385,7 @@ pub(super) async fn create_user_data_item(
             url: payload.url.as_deref(),
             source_channel: payload.source_channel.as_deref(),
             conversation_id: payload.conversation_id.as_deref(),
-            project_id: payload
-                .project_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty()),
+            project_id: None,
             pinned: payload.pinned.unwrap_or(false),
         })
         .await
@@ -453,11 +434,7 @@ pub(super) async fn list_knowledge_items(
         .get("offset")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    let project_id = params
-        .get("project_id")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let project_id: Option<&str> = None;
 
     let agent = state.agent.read().await;
     match agent
@@ -515,11 +492,7 @@ pub(super) async fn create_knowledge_item(
             payload.source.as_deref(),
             payload.url.as_deref(),
             payload.tags.as_deref(),
-            payload
-                .project_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty()),
+            None,
         )
         .await
     {
@@ -567,11 +540,8 @@ pub(super) const ARKMEMORY_MEMORY_CANDIDATE_TYPES: &[&str] = &[
 pub(super) const ARKMEMORY_APPLYING_LEASE_TIMEOUT_SECS: i64 = 10 * 60;
 
 pub(super) fn arkmemory_project_param(params: &HashMap<String, String>) -> Option<&str> {
-    params
-        .get("project_id")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let _ = params;
+    None
 }
 
 pub(super) fn arkmemory_limit(params: &HashMap<String, String>, default_limit: u64) -> u64 {
@@ -599,12 +569,10 @@ pub(super) fn arkmemory_item_is_memory(item: &crate::storage::experience_item::M
 
 pub(super) fn arkmemory_item_visible_for_project(
     item: &crate::storage::experience_item::Model,
-    project_id: Option<&str>,
+    _project_id: Option<&str>,
 ) -> bool {
-    match project_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(pid) => item.project_id.as_deref() == Some(pid) || item.project_id.is_none(),
-        None => item.project_id.is_none(),
-    }
+    let _ = item;
+    true
 }
 
 #[derive(Default)]
@@ -619,7 +587,7 @@ impl ArkMemoryEventContext {
     fn from_memory(item: &crate::storage::experience_item::Model) -> Self {
         Self {
             scope: Some(item.scope.clone()),
-            project_id: item.project_id.clone(),
+            project_id: None,
             conversation_id: item.conversation_id.clone(),
             source_ref: Some(item.id.clone()),
         }
@@ -628,7 +596,7 @@ impl ArkMemoryEventContext {
     fn from_candidate(candidate: &crate::storage::learning_candidate::Model) -> Self {
         Self {
             scope: None,
-            project_id: candidate.project_id.clone(),
+            project_id: None,
             conversation_id: candidate.conversation_id.clone(),
             source_ref: Some(candidate.id.clone()),
         }
@@ -699,7 +667,7 @@ pub(super) async fn arkmemory_latest_open_candidate_for_subject(
         .list_learning_candidates_for_subject_key(
             &candidate.subject_key,
             ARKMEMORY_MEMORY_CANDIDATE_TYPES,
-            candidate.project_id.as_deref(),
+            None,
             32,
         )
         .await?;
@@ -794,7 +762,6 @@ pub(super) fn arkmemory_candidate_payload(
         "subject_key": candidate.subject_key,
         "title": candidate.title,
         "summary": candidate.summary,
-        "project_id": candidate.project_id,
         "conversation_id": candidate.conversation_id,
         "evidence_refs": candidate.evidence_refs,
         "proposed_content": candidate.proposed_content,
@@ -1050,18 +1017,7 @@ pub(super) async fn arkmemory_apply_memory_candidate(
     if !arkmemory_candidate_is_memory(&candidate.candidate_type) {
         anyhow::bail!("Memory queue item is not a memory operation.");
     }
-    match project_id.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(pid) => {
-            if candidate.project_id.as_deref() != Some(pid) && candidate.project_id.is_some() {
-                anyhow::bail!("Memory queue item is outside the active project scope.");
-            }
-        }
-        None => {
-            if candidate.project_id.is_some() {
-                anyhow::bail!("Memory queue item is outside the global scope.");
-            }
-        }
-    }
+    let _ = project_id;
     candidate = arkmemory_ensure_latest_open_candidate(storage, &candidate).await?;
     if candidate.approval_status == "applying" {
         anyhow::bail!("Memory queue item is already being applied.");
@@ -1182,9 +1138,6 @@ pub(super) async fn arkmemory_apply_claimed_memory_candidate(
             if !arkmemory_item_is_memory(&item) {
                 anyhow::bail!("Memory queue item points at a non-memory experience item.");
             }
-            if !arkmemory_item_visible_for_project(&item, candidate.project_id.as_deref()) {
-                anyhow::bail!("Memory queue item is outside its project scope.");
-            }
             let next_status = candidate
                 .proposed_content
                 .get("next_status")
@@ -1235,14 +1188,6 @@ pub(super) async fn arkmemory_apply_claimed_memory_candidate(
                 .ok_or_else(|| anyhow::anyhow!("Memory merge source item not found."))?;
             if !arkmemory_item_is_memory(&target_item) || !arkmemory_item_is_memory(&source_item) {
                 anyhow::bail!("Memory merge can only apply to memory experience items.");
-            }
-            if !arkmemory_item_visible_for_project(&target_item, candidate.project_id.as_deref())
-                || !arkmemory_item_visible_for_project(
-                    &source_item,
-                    candidate.project_id.as_deref(),
-                )
-            {
-                anyhow::bail!("Memory merge is outside its project scope.");
             }
             storage
                 .update_experience_item_status(source_item_id, "deprecated")
@@ -1404,7 +1349,7 @@ pub(super) async fn arkmemory_reject_queue_item(
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let project_id = arkmemory_project_param(&params);
+    let _project_id = arkmemory_project_param(&params);
     let agent = state.agent.read().await;
     let storage = &agent.storage;
     let result = async {
@@ -1414,18 +1359,6 @@ pub(super) async fn arkmemory_reject_queue_item(
             .ok_or_else(|| anyhow::anyhow!("Memory queue item not found."))?;
         if !arkmemory_candidate_is_memory(&candidate.candidate_type) {
             anyhow::bail!("Memory queue item is not a memory operation.");
-        }
-        match project_id.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(pid) => {
-                if candidate.project_id.as_deref() != Some(pid) && candidate.project_id.is_some() {
-                    anyhow::bail!("Memory queue item is outside the active project scope.");
-                }
-            }
-            None => {
-                if candidate.project_id.is_some() {
-                    anyhow::bail!("Memory queue item is outside the global scope.");
-                }
-            }
         }
         candidate = arkmemory_ensure_latest_open_candidate(storage, &candidate).await?;
         if candidate.approval_status == "applying" {
@@ -1545,18 +1478,6 @@ pub(super) async fn arkmemory_rollback_ledger_event(
             .ok_or_else(|| anyhow::anyhow!("Memory ledger event not found."))?;
         if !event.reversible || event.reverted_at.is_some() {
             anyhow::bail!("Memory ledger event is not reversible.");
-        }
-        match project_id.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(pid) => {
-                if event.project_id.as_deref() != Some(pid) && event.project_id.is_some() {
-                    anyhow::bail!("Memory ledger event is outside the active project scope.");
-                }
-            }
-            None => {
-                if event.project_id.is_some() {
-                    anyhow::bail!("Memory ledger event is outside the global scope.");
-                }
-            }
         }
         let previous: crate::storage::experience_item::Model =
             serde_json::from_value(event.old_snapshot.clone()).map_err(|_| {
@@ -1827,7 +1748,7 @@ pub(super) async fn arkmemory_run_tests(
                 id: test_id.clone(),
                 memory_id: Some(memory.id.clone()),
                 scope: memory.scope.clone(),
-                project_id: memory.project_id.clone(),
+                project_id: None,
                 conversation_id: memory.conversation_id.clone(),
                 prompt: "Return the current value of this stored memory.".to_string(),
                 expected_answer: memory.content.clone(),
@@ -1849,7 +1770,7 @@ pub(super) async fn arkmemory_run_tests(
             format!("Refreshed {} memory checks", generated),
             serde_json::json!({ "generated_or_refreshed": generated }),
             ArkMemoryEventContext {
-                project_id: project_id.map(|value| value.to_string()),
+                project_id: None,
                 ..ArkMemoryEventContext::default()
             },
         )
@@ -1935,7 +1856,7 @@ pub(super) async fn arkmemory_apply_cleanup(
         "Acknowledged ArkMemory cleanup review",
         serde_json::json!({ "cleanup": "retention_managed" }),
         ArkMemoryEventContext {
-            project_id: project_id.map(|value| value.to_string()),
+            project_id: None,
             ..ArkMemoryEventContext::default()
         },
     )

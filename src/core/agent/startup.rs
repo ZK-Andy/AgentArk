@@ -274,6 +274,9 @@ impl Agent {
         // Wire storage into runtime for expense + entity operations
         runtime.set_storage(storage.clone());
 
+        // Wire active user identity (DID) for per-user features such as ArkOrbit.
+        runtime.set_current_user_id(identity.did());
+
         // Initialize MCP registry and wire into runtime
         let mcp_registry = Arc::new(RwLock::new(crate::mcp::registry::McpRegistry::new(
             storage.clone(),
@@ -674,6 +677,7 @@ impl Agent {
                 storage.clone(),
             ))
             .await,
+            arkorbit: super::arkorbit::ArkOrbitService::with_filesystem(storage.clone(), data_dir),
             config,
             config_dir: config_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
@@ -716,6 +720,8 @@ impl Agent {
             app_registry,
         };
 
+        agent.spawn_gepa_idle_worker();
+
         {
             let agent_for_approval_repair = agent.clone();
             crate::spawn_logged!("src/core/agent/startup.rs:approval_repair", async move {
@@ -733,22 +739,30 @@ impl Agent {
 
         {
             let agent_for_catalog = agent.clone();
-            crate::spawn_logged!("src/core/agent/startup.rs:action_catalog_warmup", async move {
-                match agent_for_catalog.load_action_catalog_actions().await {
-                    Ok(actions) => agent_for_catalog.spawn_action_catalog_index_sync(actions, "startup"),
-                    Err(error) => {
-                        tracing::warn!("Failed to load actions for catalog index sync: {}", error);
-                        agent_for_catalog
-                            .push_startup_issue(StartupIssue::new(
-                                "action_catalog_index",
-                                "warning",
-                                "Action catalog semantic index sync could not start",
-                                error.to_string(),
-                            ))
-                            .await;
+            crate::spawn_logged!(
+                "src/core/agent/startup.rs:action_catalog_warmup",
+                async move {
+                    match agent_for_catalog.load_action_catalog_actions().await {
+                        Ok(actions) => {
+                            agent_for_catalog.spawn_action_catalog_index_sync(actions, "startup")
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "Failed to load actions for catalog index sync: {}",
+                                error
+                            );
+                            agent_for_catalog
+                                .push_startup_issue(StartupIssue::new(
+                                    "action_catalog_index",
+                                    "warning",
+                                    "Action catalog semantic index sync could not start",
+                                    error.to_string(),
+                                ))
+                                .await;
+                        }
                     }
                 }
-            });
+            );
         }
 
         {
@@ -769,6 +783,18 @@ impl Agent {
                             ))
                             .await;
                     }
+                }
+            });
+        }
+
+        {
+            // ArkOrbit slice 3: walk <data_dir>/arkorbit/ vs the orbits
+            // table at boot, logging any drift. Read-only — never deletes
+            // anything behind the user's back.
+            let arkorbit_for_reconcile = agent.arkorbit.clone();
+            crate::spawn_logged!("src/core/agent/startup.rs:arkorbit_reconcile", async move {
+                if let Err(error) = arkorbit_for_reconcile.reconcile_filesystem().await {
+                    tracing::warn!("ArkOrbit filesystem reconcile failed at startup: {}", error);
                 }
             });
         }

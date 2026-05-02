@@ -1,6 +1,7 @@
 use super::*;
 
 const ROUTER_CALL_TIMEOUT_MS: u64 = 12_000;
+const ROUTER_CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 512;
 
 fn router_call_timeout_ms() -> u64 {
     std::env::var("AGENTARK_ROUTER_TIMEOUT_MS")
@@ -76,59 +77,56 @@ fn parse_routing_decision_from_text(
     })
 }
 
-fn structural_complexity_score(message: &str) -> f32 {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return 0.0;
-    }
-
-    let word_count = trimmed.split_whitespace().count() as f32;
-    let line_count = trimmed.lines().count() as f32;
-    let question_count = trimmed.matches('?').count() as f32;
-    let has_code_block = trimmed.contains("```");
-    let has_list_shape = trimmed
-        .lines()
-        .map(str::trim_start)
-        .any(|line| line.starts_with("- ") || line.starts_with("* ") || line.starts_with("1."));
-
-    let mut score = 0.0_f32;
-    if word_count >= 30.0 {
-        score += ((word_count - 30.0) / 60.0).clamp(0.1, 0.4);
-    }
-    if line_count >= 4.0 {
-        score += (line_count / 10.0).clamp(0.08, 0.2);
-    }
-    if question_count >= 2.0 {
-        score += 0.08;
-    }
-    if has_code_block {
-        score += 0.12;
-    }
-    if has_list_shape {
-        score += 0.12;
-    }
-    score.clamp(0.0, 1.0)
-}
-
 impl Agent {
+    async fn routing_complexity_policy(
+        &self,
+    ) -> crate::core::self_evolve::policy_evolution::RoutingComplexityPolicy {
+        match self
+            .storage
+            .get(crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY)
+            .await
+        {
+            Ok(Some(raw)) => {
+                match crate::core::self_evolve::policy_evolution::routing_complexity_policy_from_slice(&raw) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Stored routing complexity policy is invalid; using default structural policy"
+                        );
+                        Default::default()
+                    }
+                }
+            }
+            Ok(None) => Default::default(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Failed to load routing complexity policy; using default structural policy"
+                );
+                Default::default()
+            }
+        }
+    }
+
     async fn classify_complexity_fallback(
         &self,
         message: &str,
     ) -> crate::core::task_router::RoutingDecision {
-        let score = structural_complexity_score(message);
-        let complexity = if score >= 0.72 {
-            QueryComplexity::Complex
-        } else if score >= 0.38 {
-            QueryComplexity::Medium
-        } else {
-            QueryComplexity::Simple
-        };
+        let policy = self.routing_complexity_policy().await;
+        let complexity = crate::core::self_evolve::policy_evolution::classify_message_complexity(
+            &policy, message,
+        );
         crate::core::task_router::RoutingDecision {
             needs_delegation: false,
             complexity,
             sub_agents: vec![],
             reasoning: "Structural fallback classification".to_string(),
-            confidence: score,
+            confidence: match complexity {
+                QueryComplexity::Complex => policy.complex_score_threshold,
+                QueryComplexity::Medium => policy.medium_score_threshold,
+                QueryComplexity::Simple => 1.0 - policy.medium_score_threshold,
+            },
             should_clarify: false,
             clarification_question: None,
         }
@@ -201,15 +199,15 @@ impl Agent {
         let router_system_prompt =
             crate::core::self_evolve::prompt_evolution::render_router_system_prompt(prompt_bundle);
 
-        let empty_actions: Vec<crate::actions::ActionDef> = Vec::new();
         let mut router_response: Option<crate::core::llm::LlmResponse> = None;
         let timeout_ms = router_call_timeout_ms();
 
         for candidate in router_candidates {
-            let route_call =
-                candidate
-                    .client
-                    .chat(&router_system_prompt, &routing_prompt, &[], &empty_actions);
+            let route_call = candidate.client.chat_classifier_bounded(
+                &router_system_prompt,
+                &routing_prompt,
+                ROUTER_CLASSIFIER_MAX_OUTPUT_TOKENS,
+            );
             match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), route_call)
                 .await
             {

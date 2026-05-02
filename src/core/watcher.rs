@@ -547,9 +547,9 @@ impl WatcherManager {
 
     /// Persist active watchers to the database.
     async fn persist(&self) {
-        let watchers = self.watchers.read().await;
-        if let Some(storage) = self.storage.as_ref() {
-            let active = watchers
+        let active = {
+            let watchers = self.watchers.read().await;
+            watchers
                 .values()
                 .filter(|watcher| {
                     matches!(
@@ -558,18 +558,47 @@ impl WatcherManager {
                     )
                 })
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
+        if let Some(storage) = self.storage.as_ref() {
             if let Err(e) = storage.replace_active_watchers(&active).await {
                 tracing::warn!("Failed to persist watchers to DB: {}", e);
             }
         }
     }
 
+    async fn persist_one(&self, id: Uuid) {
+        let watcher = self.watchers.read().await.get(&id).cloned();
+        self.persist_watcher_snapshot(id, watcher).await;
+    }
+
+    async fn persist_watcher_snapshot(&self, id: Uuid, watcher: Option<Watcher>) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        match watcher {
+            Some(watcher) if matches!(watcher.status, WatcherStatus::Active | WatcherStatus::Paused) => {
+                if let Err(error) = storage.upsert_watcher(&watcher).await {
+                    tracing::warn!("Failed to persist watcher '{}' to DB: {}", id, error);
+                }
+            }
+            _ => {
+                if let Err(error) = storage.delete_watcher(&id.to_string()).await {
+                    tracing::warn!("Failed to delete watcher '{}' from DB: {}", id, error);
+                }
+            }
+        }
+    }
+
+    async fn delete_persisted(&self, id: Uuid) {
+        self.persist_watcher_snapshot(id, None).await;
+    }
+
     /// Add a new watcher and return its ID
     pub async fn add(&self, watcher: Watcher) -> Uuid {
         let id = watcher.id;
         self.watchers.write().await.insert(id, watcher);
-        self.persist().await;
+        self.persist_one(id).await;
         self.notify_changed();
         id
     }
@@ -628,7 +657,7 @@ impl WatcherManager {
             })?;
             Self::replace_watcher(existing, watcher);
             drop(watchers);
-            self.persist().await;
+            self.persist_one(target_id).await;
             self.notify_changed();
             return Ok((target_id, true, 0));
         }
@@ -652,7 +681,10 @@ impl WatcherManager {
                 watchers.remove(duplicate_id);
             }
             drop(watchers);
-            self.persist().await;
+            self.persist_one(keeper_id).await;
+            for duplicate_id in matching_ids.iter().skip(1) {
+                self.delete_persisted(*duplicate_id).await;
+            }
             self.notify_changed();
             return Ok((keeper_id, true, matching_ids.len().saturating_sub(1)));
         }
@@ -660,7 +692,7 @@ impl WatcherManager {
         let id = watcher.id;
         watchers.insert(id, watcher);
         drop(watchers);
-        self.persist().await;
+        self.persist_one(id).await;
         self.notify_changed();
         Ok((id, false, 0))
     }
@@ -720,6 +752,25 @@ impl WatcherManager {
         self.change_notify.notified().await;
     }
 
+    /// Mark a watcher poll as started before external work so cancellation or
+    /// process restart does not leave it immediately due again.
+    pub async fn begin_poll(&self, id: Uuid) -> Option<Watcher> {
+        let started = {
+            let mut watchers = self.watchers.write().await;
+            let watcher = watchers.get_mut(&id)?;
+            if watcher.status != WatcherStatus::Active {
+                return None;
+            }
+            let now = Utc::now();
+            watcher.last_poll_at = Some(now);
+            watcher.poll_count = watcher.poll_count.saturating_add(1);
+            watcher.last_poll_outcome = None;
+            watcher.clone()
+        };
+        self.persist_one(id).await;
+        Some(started)
+    }
+
     /// Update a watcher after a successful poll.
     pub async fn record_poll_success(
         &self,
@@ -741,7 +792,7 @@ impl WatcherManager {
                 WatcherPollOutcome::NoMatch
             });
         }
-        self.persist().await;
+        self.persist_one(id).await;
     }
 
     /// Update a watcher after a failed poll attempt.
@@ -780,7 +831,7 @@ impl WatcherManager {
             w.last_error = Some(error_text);
             w.last_poll_outcome = Some(WatcherPollOutcome::Error);
         }
-        self.persist().await;
+        self.persist_one(id).await;
     }
 
     /// Mark a watcher as triggered
@@ -789,7 +840,7 @@ impl WatcherManager {
             w.status = WatcherStatus::Triggered;
             w.trigger_result = Some(truncate_for_storage(&result, MAX_STORED_RESULT_CHARS));
         }
-        self.persist().await;
+        self.persist_one(id).await;
     }
 
     /// Record a watcher notification delivery attempt.
@@ -811,7 +862,7 @@ impl WatcherManager {
                 w.notification_attempts.drain(0..overflow);
             }
         }
-        self.persist().await;
+        self.persist_one(id).await;
     }
 
     /// Mark timed-out watchers
@@ -830,7 +881,9 @@ impl WatcherManager {
         }
         drop(watchers);
         if !expired.is_empty() {
-            self.persist().await;
+            for watcher in &expired {
+                self.delete_persisted(watcher.id).await;
+            }
         }
         expired
     }
@@ -848,7 +901,7 @@ impl WatcherManager {
             false
         };
         if cancelled {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         cancelled
@@ -868,7 +921,7 @@ impl WatcherManager {
             false
         };
         if paused {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         paused
@@ -889,7 +942,7 @@ impl WatcherManager {
             false
         };
         if resumed {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         resumed
@@ -946,7 +999,7 @@ impl WatcherManager {
             false
         };
         if ran {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         ran
@@ -971,7 +1024,7 @@ impl WatcherManager {
             None
         };
         if updated.is_some() {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         updated
@@ -990,7 +1043,7 @@ impl WatcherManager {
             None
         };
         if updated.is_some() {
-            self.persist().await;
+            self.persist_one(id).await;
             self.notify_changed();
         }
         updated
@@ -1008,7 +1061,30 @@ impl WatcherManager {
             false
         };
         if updated {
-            self.persist().await;
+            self.persist_one(id).await;
+            self.notify_changed();
+        }
+        updated
+    }
+
+    /// Rebind a watcher's notification route without changing its poll target.
+    pub async fn set_notify_channel(&self, id: Uuid, notify_channel: &str) -> bool {
+        let normalized = notify_channel.trim();
+        if normalized.is_empty() {
+            return false;
+        }
+        let updated = if let Some(w) = self.watchers.write().await.get_mut(&id) {
+            if w.notify_channel == normalized {
+                false
+            } else {
+                w.notify_channel = normalized.to_string();
+                true
+            }
+        } else {
+            false
+        };
+        if updated {
+            self.persist_one(id).await;
             self.notify_changed();
         }
         updated
@@ -1018,7 +1094,7 @@ impl WatcherManager {
     pub async fn delete(&self, id: Uuid) -> bool {
         let deleted = self.watchers.write().await.remove(&id).is_some();
         if deleted {
-            self.persist().await;
+            self.delete_persisted(id).await;
             self.notify_changed();
         }
         deleted
@@ -1027,16 +1103,23 @@ impl WatcherManager {
     /// Clean up completed/failed/timed-out watchers (older than 1 hour)
     pub async fn cleanup(&self) {
         let cutoff = Utc::now() - chrono::Duration::hours(1);
-        let mut watchers = self.watchers.write().await;
-        let before = watchers.len();
-        watchers.retain(|_, w| {
-            matches!(w.status, WatcherStatus::Active | WatcherStatus::Paused)
-                || w.created_at > cutoff
-        });
-        let removed = before - watchers.len();
-        drop(watchers);
-        if removed > 0 {
-            self.persist().await;
+        let removed_ids = {
+            let mut watchers = self.watchers.write().await;
+            let removed_ids = watchers
+                .iter()
+                .filter_map(|(id, watcher)| {
+                    (!matches!(watcher.status, WatcherStatus::Active | WatcherStatus::Paused)
+                        && watcher.created_at <= cutoff)
+                        .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in &removed_ids {
+                watchers.remove(id);
+            }
+            removed_ids
+        };
+        for id in removed_ids {
+            self.delete_persisted(id).await;
         }
     }
 }

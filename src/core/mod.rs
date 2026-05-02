@@ -3,6 +3,7 @@
 
 pub(crate) mod action_catalog;
 mod agent;
+pub mod arkorbit;
 pub mod auth_profiles;
 pub mod automation;
 pub mod autonomy;
@@ -25,6 +26,7 @@ pub mod gateway_ops;
 pub mod integration_auth;
 pub mod integration_sync;
 pub mod intent;
+pub mod inline_artifacts;
 pub mod learning;
 pub mod live_run;
 mod llm;
@@ -55,12 +57,15 @@ pub mod watcher;
 
 pub(crate) use agent::chat_model_is_configured;
 pub(crate) use agent::queue_stream_event;
+pub(crate) use agent::reasoning_stream;
 pub(crate) use agent::AUTONOMY_SETTINGS_STORAGE_KEY;
 pub(crate) use agent::USER_SELECTED_MODEL_SLOT_KEY;
 pub use agent::{
-    Agent, ChatAttachmentHint, ClarificationChoice, ConversationMessage, ExecutionStep, ExecutionTrace,
-    RequestExecutionHints, SecurityEvents, SecuritySnapshot, StreamEvent, UserProfile,
+    Agent, ChatAttachmentHint, ClarificationChoice, ConversationMessage, ExecutionStep,
+    ExecutionTrace, RequestExecutionHints, SecurityEvents, SecuritySnapshot, StreamEvent,
+    UserProfile,
 };
+pub use arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitFileEntry, OrbitManifest};
 pub use automation::{
     list_runs as list_automation_runs, list_supervisor_states as list_automation_supervisor_states,
     AutomationRunStatus, AutomationSupervisorState,

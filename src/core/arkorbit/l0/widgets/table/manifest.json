@@ -1,0 +1,5 @@
+{
+  "name": "table",
+  "description": "Accessible table primitive for orbit modules.",
+  "entry": "index.js"
+}

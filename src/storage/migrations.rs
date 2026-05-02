@@ -243,6 +243,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
             memory_evidence_link::Entity,
             recall_event::Entity,
             recall_test::Entity,
+            semantic_work_unit::Entity,
             abuse_tracker_state::Entity
         ]
     );
@@ -883,6 +884,56 @@ pub async fn run(db: &DatabaseConnection) -> Result<()> {
            AND status = 'active' \
            AND kind IN ('personal_fact', 'constraint')",
         "experience_items personal-fact pgvector HNSW partial index",
+    )
+    .await?;
+    ensure_pgvector_hnsw_index(
+        db,
+        backend,
+        "semantic_work_units",
+        "embedding",
+        // ArkReflect's selected-range clustering is computed from cached rows,
+        // but this index is used for cross-period related-history lookups over
+        // derived work units. Raw chat messages are not embedded into this table.
+        "CREATE INDEX IF NOT EXISTS idx_semantic_work_units_embedding_hnsw \
+         ON semantic_work_units USING hnsw (embedding vector_cosine_ops) \
+         WHERE embedding IS NOT NULL",
+        "semantic work unit pgvector HNSW index",
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_semantic_work_units_source")
+            .table(semantic_work_unit::Entity)
+            .col(semantic_work_unit::Column::SourceKind)
+            .col(semantic_work_unit::Column::SourceId)
+            .unique()
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_semantic_work_units_occurred")
+            .table(semantic_work_unit::Entity)
+            .col(semantic_work_unit::Column::OccurredAt)
+            .if_not_exists()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        db,
+        backend,
+        Index::create()
+            .name("idx_semantic_work_units_channel")
+            .table(semantic_work_unit::Entity)
+            .col(semantic_work_unit::Column::Channel)
+            .col(semantic_work_unit::Column::OccurredAt)
+            .if_not_exists()
+            .to_owned(),
     )
     .await?;
     ensure_index(

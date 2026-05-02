@@ -346,6 +346,7 @@ pub async fn web_search(query: &str) -> Result<String> {
         query: query.to_string(),
         num_results: 5,
         backend: None,
+        time_scope: None,
     };
     let config = crate::actions::search::SearchConfig::default();
     crate::actions::search::execute_search(&args, &config).await

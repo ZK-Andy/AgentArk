@@ -35,6 +35,7 @@ import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
 import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import AutoGraphRoundedIcon from "@mui/icons-material/AutoGraphRounded";
 import AnalyticsRoundedIcon from "@mui/icons-material/AnalyticsRounded";
+import BubbleChartRoundedIcon from "@mui/icons-material/BubbleChartRounded";
 import MemoryRoundedIcon from "@mui/icons-material/MemoryRounded";
 import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
 import MenuRoundedIcon from "@mui/icons-material/MenuRounded";
@@ -59,7 +60,7 @@ import { PersonalizeAgentArkDialog } from "./components/PersonalizeAgentArkDialo
 import { AmberCascadesBackground } from "./components/AmberCascadesBackground";
 import {
   NativeWorkspace,
-  preloadCommonSettingsPanels,
+  preloadSettingsTab,
   preloadWorkspaceSurface,
   type WorkspaceView,
 } from "./components/NativeWorkspace";
@@ -67,7 +68,7 @@ import SettingsPage from "./components/pages/SettingsPage";
 import {
   CORE_SETTINGS_STALE_TIME_MS,
   fetchSettings,
-  prefetchSettingsPageData,
+  prefetchSettingsTabData,
   SETTINGS_QUERY_KEYS,
 } from "./components/pages/settingsData";
 import { OverviewPane } from "./components/OverviewPane";
@@ -162,7 +163,9 @@ type ViewKey =
   | "sessions"
   | "apps"
   | "arkpulse"
+  | "arkorbit"
   | "arkmemory"
+  | "arkreflect"
   | "goals"
   | "autonomy"
   | "evolution"
@@ -170,7 +173,6 @@ type ViewKey =
   | "trace"
   | "status"
   | "swarm"
-  | "projects"
   | "documents"
   | "analytics"
   | "search"
@@ -257,6 +259,8 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   tasks: "tasks",
   session: "sessions",
   sessions: "sessions",
+  "browser-session": "sessions",
+  "browser-sessions": "sessions",
   app: "apps",
   apps: "apps",
   skill: "skills",
@@ -269,8 +273,6 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   agent: "swarm",
   agents: "swarm",
   swarm: "swarm",
-  project: "projects",
-  projects: "projects",
   document: "documents",
   documents: "documents",
   file: "documents",
@@ -286,12 +288,19 @@ const VIEW_ALIASES: Record<string, ViewKey> = {
   failover: "settings",
   watchers: "status",
   watcher: "status",
+  "background-work": "status",
+  background: "status",
   status: "status",
   integration: "settings",
   integrations: "settings",
   search: "search",
   ambient: "sentinel",
+  arkorbit: "arkorbit",
+  orbit: "arkorbit",
+  orbits: "arkorbit",
   arkmemory: "arkmemory",
+  arkreflect: "arkreflect",
+  reflect: "arkreflect",
   arkrecall: "arkmemory",
   memory: "arkmemory",
   setting: "settings",
@@ -314,7 +323,9 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "sessions",
   "apps",
   "arkpulse",
+  "arkorbit",
   "arkmemory",
+  "arkreflect",
   "goals",
   "autonomy",
   "evolution",
@@ -322,7 +333,6 @@ const VIEW_KEYS: ReadonlySet<ViewKey> = new Set<ViewKey>([
   "trace",
   "status",
   "swarm",
-  "projects",
   "documents",
   "analytics",
   "search",
@@ -343,6 +353,11 @@ const NAV_GROUPS: NavGroup[] = [
         key: "chat",
         label: "Chat",
         icon: <ChatRoundedIcon fontSize="small" />,
+      },
+      {
+        key: "arkorbit",
+        label: "Orbit",
+        icon: <HubRoundedIcon fontSize="small" />,
       },
     ],
   },
@@ -373,34 +388,8 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    id: "operations",
-    label: "Operations",
-    items: [
-      {
-        key: "tasks",
-        label: "Tasks",
-        icon: <TaskRoundedIcon fontSize="small" />,
-      },
-      {
-        key: "sessions",
-        label: "Sessions",
-        icon: <HistoryRoundedIcon fontSize="small" />,
-      },
-      {
-        key: "status",
-        label: "Watchers",
-        icon: <VisibilityRoundedIcon fontSize="small" />,
-      },
-      {
-        key: "trace",
-        label: "Trace",
-        icon: <TimelineRoundedIcon fontSize="small" />,
-      },
-    ],
-  },
-  {
     id: "ark_core",
-    label: "Ark Autonomy",
+    label: "Ark Core",
     items: [
       {
         key: "sentinel",
@@ -418,9 +407,40 @@ const NAV_GROUPS: NavGroup[] = [
         icon: <MemoryRoundedIcon fontSize="small" />,
       },
       {
+        key: "arkreflect",
+        label: "ArkReflect",
+        icon: <BubbleChartRoundedIcon fontSize="small" />,
+      },
+      {
         key: "arkpulse",
         label: "ArkPulse",
         icon: <MonitorHeartRoundedIcon fontSize="small" />,
+      },
+    ],
+  },
+  {
+    id: "operations",
+    label: "Operations",
+    items: [
+      {
+        key: "tasks",
+        label: "Tasks",
+        icon: <TaskRoundedIcon fontSize="small" />,
+      },
+      {
+        key: "sessions",
+        label: "Browser Sessions",
+        icon: <HistoryRoundedIcon fontSize="small" />,
+      },
+      {
+        key: "status",
+        label: "Background Work",
+        icon: <VisibilityRoundedIcon fontSize="small" />,
+      },
+      {
+        key: "trace",
+        label: "Trace",
+        icon: <TimelineRoundedIcon fontSize="small" />,
       },
     ],
   },
@@ -458,15 +478,16 @@ const VIEW_PATH_SEGMENTS: Record<ViewKey, string> = {
   sessions: "sessions",
   apps: "apps",
   arkpulse: "arkpulse",
+  arkorbit: "arkorbit",
   arkmemory: "arkmemory",
+  arkreflect: "arkreflect",
   goals: "goals",
   autonomy: "autonomy",
   evolution: "evolution",
   sentinel: "sentinel",
   trace: "trace",
-  status: "watchers",
+  status: "background-work",
   swarm: "swarm",
-  projects: "projects",
   documents: "documents",
   analytics: "analytics",
   search: "search",
@@ -949,8 +970,8 @@ export default function App() {
       );
       preloadWorkspaceSurface(nextView as WorkspaceView, settingsTab);
       if (nextView === "settings" || settingsTab != null) {
-        preloadCommonSettingsPanels();
-        prefetchSettingsPageData(queryClient);
+        preloadSettingsTab(settingsTab);
+        prefetchSettingsTabData(queryClient, settingsTab);
       }
     },
     [queryClient],
@@ -996,7 +1017,7 @@ export default function App() {
     }, 900);
     const cancelSettingsWarmup = scheduleWarmup(() => {
       preloadAppView("settings");
-      prefetchSettingsPageData(queryClient);
+      prefetchSettingsTabData(queryClient, 0);
       void loadGuidedTourModule();
     }, 1800);
     return () => {

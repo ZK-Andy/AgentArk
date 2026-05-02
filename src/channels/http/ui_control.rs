@@ -245,12 +245,26 @@ pub(super) fn redirect_to_selected_tunnel_app(app_id: &str) -> Response {
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-pub(super) fn is_public_app_tunnel_path(path: &str) -> bool {
-    path == "/public/proxy/raw"
-        || path == "/public/proxy/raw/"
-        || path == "/apps"
-        || path == "/apps/"
-        || path.starts_with("/apps/")
+pub(super) fn public_app_id_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/apps/")?;
+    let app_id = rest.split('/').next().unwrap_or_default().trim();
+    if is_valid_app_id(app_id) {
+        Some(app_id.to_string())
+    } else {
+        None
+    }
+}
+
+pub(super) fn is_public_app_tunnel_path(path: &str, exposed_app_ids: &HashSet<String>) -> bool {
+    if path == "/public/proxy/raw" || path == "/public/proxy/raw/" {
+        return !exposed_app_ids.is_empty();
+    }
+    if path == "/apps" || path == "/apps/" {
+        return exposed_app_ids.len() == 1;
+    }
+    public_app_id_from_path(path)
+        .as_deref()
+        .is_some_and(|app_id| exposed_app_ids.contains(app_id))
 }
 
 pub(super) async fn tunnel_exposure_middleware(
@@ -263,12 +277,22 @@ pub(super) async fn tunnel_exposure_middleware(
         return next.run(request).await;
     }
 
-    let (tunnel_url, selected_app_id, control_plane_enabled) = {
+    let (tunnel_url, selected_app_id, exposed_app_ids, control_plane_enabled, companion_enabled) = {
         let tunnel = state.tunnel.read().await;
+        let mut exposed_app_ids = tunnel.exposed_app_ids.clone();
+        if let Some(app_id) = tunnel
+            .selected_app_id
+            .as_deref()
+            .filter(|id| is_valid_app_id(id))
+        {
+            exposed_app_ids.insert(app_id.to_string());
+        }
         (
             tunnel.url.clone(),
             tunnel.selected_app_id.clone(),
+            exposed_app_ids,
             tunnel.control_plane_enabled,
+            tunnel.companion_enabled,
         )
     };
 
@@ -276,15 +300,33 @@ pub(super) async fn tunnel_exposure_middleware(
         return next.run(request).await;
     }
 
-    if let Some(selected_app_id) = selected_app_id
-        .as_deref()
-        .filter(|id| is_valid_app_id(id))
-        .map(ToString::to_string)
-    {
-        if path == "/" || path == "/ui" || path == "/ui/" || path == "/ui/v2" {
-            return redirect_to_selected_tunnel_app(&selected_app_id);
+    if companion_enabled && (path == "/companion/ws" || path == "/companion/web") {
+        return next.run(request).await;
+    }
+
+    if !exposed_app_ids.is_empty() {
+        let selected_app_id = selected_app_id
+            .as_deref()
+            .filter(|id| exposed_app_ids.contains(*id))
+            .map(ToString::to_string)
+            .or_else(|| {
+                let mut ids: Vec<String> = exposed_app_ids.iter().cloned().collect();
+                ids.sort();
+                ids.into_iter().next()
+            });
+        if path == "/"
+            || path == "/ui"
+            || path == "/ui/"
+            || path == "/ui/v2"
+            || path == "/apps"
+            || path == "/apps/"
+        {
+            if let Some(app_id) = selected_app_id.as_deref() {
+                return redirect_to_selected_tunnel_app(app_id);
+            }
+            return StatusCode::NOT_FOUND.into_response();
         }
-        if is_public_app_tunnel_path(path) {
+        if is_public_app_tunnel_path(path, &exposed_app_ids) {
             return next.run(request).await;
         }
 
@@ -292,6 +334,9 @@ pub(super) async fn tunnel_exposure_middleware(
     }
 
     if !control_plane_enabled {
+        if companion_enabled && (path == "/companion/ws" || path == "/companion/web") {
+            return next.run(request).await;
+        }
         return StatusCode::NOT_FOUND.into_response();
     }
 

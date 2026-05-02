@@ -1,0 +1,73 @@
+// Terminal-style live output for shell / code_execute / build / deploy steps.
+
+import Box from "@mui/material/Box";
+import Typography from "@mui/material/Typography";
+
+import type { ChatStepCard } from "../types";
+import { extractCommand } from "../dispatch";
+
+export interface TerminalViewProps {
+  card: ChatStepCard;
+  live?: boolean;
+}
+
+type TerminalTone = "idle" | "run" | "ok" | "fail";
+
+function pickTone(card: ChatStepCard, live: boolean): TerminalTone {
+  const k = (card.kind || "").toLowerCase();
+  if (k.includes("issue") || k.includes("error") || k.includes("fail")) return "fail";
+  if (k.includes("done") || k.includes("complete") || k.includes("success")) return "ok";
+  if (live || k.includes("running") || k.includes("planning")) return "run";
+  return "idle";
+}
+
+function pickBody(card: ChatStepCard): string {
+  return (
+    card.payloadView?.body ||
+    card.rawDetailFull ||
+    card.detailFull ||
+    card.detail ||
+    card.summary ||
+    ""
+  );
+}
+
+const TONE_LABEL: Record<TerminalTone, string> = {
+  run: "running",
+  ok: "done",
+  fail: "failed",
+  idle: "idle",
+};
+
+export function TerminalView({ card, live = false }: TerminalViewProps) {
+  const command = extractCommand(card);
+  const body = pickBody(card);
+  const tone = pickTone(card, live);
+  return (
+    <Box className="cview cview-terminal">
+      <Box className={`cview-terminal-head tone-${tone}`}>
+        <span className="cview-terminal-prompt" aria-hidden="true">$</span>
+        <span
+          className="cview-terminal-cmd"
+          title={command || card.label}
+        >
+          {command || card.label}
+        </span>
+        <span className={`cview-terminal-pill tone-${tone}`}>
+          {TONE_LABEL[tone]}
+        </span>
+      </Box>
+      <pre className="cview-terminal-body">
+        {body || (live ? "..." : "(no output captured)")}
+        {live ? <span className="cview-terminal-caret" aria-hidden="true">|</span> : null}
+      </pre>
+      {card.detail && card.detail !== body ? (
+        <Typography variant="caption" className="cview-terminal-detail">
+          {card.detail}
+        </Typography>
+      ) : null}
+    </Box>
+  );
+}
+
+export default TerminalView;

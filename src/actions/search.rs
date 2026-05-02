@@ -5,7 +5,7 @@
 //! - Brave Search API
 //! - DuckDuckGo (scraping, no API key needed)
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -288,6 +288,17 @@ impl SearchClient {
 
     /// Perform a web search
     pub async fn search(&self, query: &str, num_results: usize) -> Result<SearchResponse> {
+        self.search_with_scope(query, num_results, None).await
+    }
+
+    /// Perform a web search with an optional semantic temporal scope supplied by the planner.
+    pub async fn search_with_scope(
+        &self,
+        query: &str,
+        num_results: usize,
+        time_scope: Option<SearchTimeScope>,
+    ) -> Result<SearchResponse> {
+        let fresh_results = scope_requests_fresh_results(time_scope);
         match &self.backend {
             SearchBackend::Serper { api_key } => {
                 self.search_serper(api_key, query, num_results).await
@@ -297,13 +308,16 @@ impl SearchClient {
             }
             SearchBackend::Exa { api_key } => self.search_exa(api_key, query, num_results).await,
             SearchBackend::Tavily { api_key } => {
-                self.search_tavily(api_key, query, num_results).await
+                self.search_tavily(api_key, query, num_results, fresh_results)
+                    .await
             }
             SearchBackend::Perplexity { api_key } => {
-                self.search_perplexity(api_key, query, num_results).await
+                self.search_perplexity(api_key, query, num_results, fresh_results)
+                    .await
             }
             SearchBackend::Firecrawl { api_key } => {
-                self.search_firecrawl(api_key, query, num_results).await
+                self.search_firecrawl(api_key, query, num_results, fresh_results)
+                    .await
             }
             SearchBackend::Searxng { base_url } => {
                 self.search_searxng(base_url, query, num_results).await
@@ -601,6 +615,7 @@ impl SearchClient {
         api_key: &str,
         query: &str,
         num_results: usize,
+        fresh_results: bool,
     ) -> Result<SearchResponse> {
         #[derive(Serialize)]
         struct TavilyRequest {
@@ -631,7 +646,7 @@ impl SearchClient {
 
         let request = TavilyRequest {
             query: query.to_string(),
-            topic: if query_looks_freshness_sensitive(query) {
+            topic: if fresh_results {
                 "news".to_string()
             } else {
                 "general".to_string()
@@ -684,6 +699,7 @@ impl SearchClient {
         api_key: &str,
         query: &str,
         num_results: usize,
+        fresh_results: bool,
     ) -> Result<SearchResponse> {
         #[derive(Serialize)]
         struct PerplexityRequest {
@@ -717,8 +733,7 @@ impl SearchClient {
             max_results: num_results.min(20),
             max_tokens: 10_000,
             max_tokens_per_page: 2048,
-            search_recency_filter: query_looks_freshness_sensitive(query)
-                .then_some("month".to_string()),
+            search_recency_filter: fresh_results.then_some("month".to_string()),
         };
 
         let response: PerplexityResponse = self
@@ -762,6 +777,7 @@ impl SearchClient {
         api_key: &str,
         query: &str,
         num_results: usize,
+        fresh_results: bool,
     ) -> Result<SearchResponse> {
         #[derive(Serialize)]
         struct FirecrawlRequest {
@@ -805,7 +821,7 @@ impl SearchClient {
         }
 
         let mut sources = vec!["web".to_string()];
-        if query_looks_freshness_sensitive(query) {
+        if fresh_results {
             sources.push("news".to_string());
         }
         let request = FirecrawlRequest {
@@ -1579,6 +1595,22 @@ fn extract_xml_tag(xml: &str, tag: &str) -> String {
 }
 
 /// Search action arguments
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTimeScope {
+    Current,
+    Recent,
+    Historical,
+    Timeless,
+}
+
+fn scope_requests_fresh_results(time_scope: Option<SearchTimeScope>) -> bool {
+    matches!(
+        time_scope,
+        Some(SearchTimeScope::Current | SearchTimeScope::Recent)
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SearchArgs {
     pub query: String,
@@ -1586,33 +1618,17 @@ pub struct SearchArgs {
     pub num_results: usize,
     #[serde(default)]
     pub backend: Option<String>,
+    #[serde(default)]
+    pub time_scope: Option<SearchTimeScope>,
 }
 
 fn default_num_results() -> usize {
     5
 }
 
-fn query_looks_freshness_sensitive(query: &str) -> bool {
-    let lower = query.to_ascii_lowercase();
-    [
-        "latest",
-        "current",
-        "today",
-        "news",
-        "headline",
-        "breaking",
-        "recent",
-        "updates",
-        "developments",
-        "what changed",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn normalize_freshness_query(raw_query: &str) -> String {
+fn normalize_freshness_query(raw_query: &str, time_scope: Option<SearchTimeScope>) -> String {
     let compact = raw_query.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() || !query_looks_freshness_sensitive(&compact) {
+    if compact.is_empty() || !scope_requests_fresh_results(time_scope) {
         return compact;
     }
 
@@ -1622,17 +1638,11 @@ fn normalize_freshness_query(raw_query: &str) -> String {
         .filter_map(|m| m.as_str().parse::<i32>().ok())
         .collect::<std::collections::BTreeSet<_>>();
 
-    if distinct_years.len() < 2 || distinct_years.iter().any(|year| *year >= current_year) {
+    if !distinct_years.is_empty() {
         return compact;
     }
 
-    let stripped = QUERY_YEAR_RE.replace_all(&compact, " ").to_string();
-    let stripped = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-    if stripped.is_empty() {
-        compact
-    } else {
-        format!("{} {}", stripped, current_year)
-    }
+    format!("{} {}", compact, current_year)
 }
 
 const DEFAULT_CONFIGURED_PROVIDER_ORDER: &[&str] = &[
@@ -1663,6 +1673,7 @@ pub async fn execute_search_response(
         args.num_results.max(1),
         args.backend.as_deref(),
         config,
+        args.time_scope,
     )
     .await?;
     Ok(response)
@@ -1878,8 +1889,9 @@ pub async fn search_with_config(
     num_results: usize,
     explicit_backend: Option<&str>,
     config: &SearchConfig,
+    time_scope: Option<SearchTimeScope>,
 ) -> Result<SearchResponse> {
-    let normalized_query = normalize_freshness_query(raw_query);
+    let normalized_query = normalize_freshness_query(raw_query, time_scope);
     if normalized_query != raw_query {
         tracing::warn!(
             "Normalized freshness search query from '{}' to '{}'",
@@ -1930,7 +1942,14 @@ pub async fn search_with_config(
         };
 
         let client = SearchClient::new(backend);
-        match client.search(&normalized_query, num_results).await {
+        let search_result = if time_scope.is_some() {
+            client
+                .search_with_scope(&normalized_query, num_results, time_scope)
+                .await
+        } else {
+            client.search(&normalized_query, num_results).await
+        };
+        match search_result {
             Ok(response) if !response.results.is_empty() => {
                 if config.is_builtin_cooldown_backend(name) {
                     let _ = config.health.clear(name).await;
@@ -2087,11 +2106,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "India AI policy outlook 2026");
         assert_eq!(results[0].url, "https://example.com/policy/india-ai");
-        assert!(
-            results[0]
-                .snippet
-                .contains("Government strategy, compute constraints")
-        );
+        assert!(results[0]
+            .snippet
+            .contains("Government strategy, compute constraints"));
     }
 
     #[test]
@@ -2134,6 +2151,39 @@ mod tests {
         let xml = r#"<content:encoded>Encoded body</content:encoded>"#;
 
         assert_eq!(extract_xml_tag(xml, "content:encoded"), "Encoded body");
+    }
+
+    #[test]
+    fn freshness_query_adds_current_year_when_user_did_not_scope_a_year() {
+        let current_year = chrono::Utc::now().year();
+
+        assert_eq!(
+            normalize_freshness_query("search iran news", Some(SearchTimeScope::Current)),
+            format!("search iran news {}", current_year)
+        );
+    }
+
+    #[test]
+    fn freshness_query_does_not_guess_scope_from_query_words() {
+        assert_eq!(
+            normalize_freshness_query("search iran news", None),
+            "search iran news"
+        );
+    }
+
+    #[test]
+    fn freshness_query_preserves_explicit_historical_year_scope() {
+        assert_eq!(
+            normalize_freshness_query(
+                "events on corona from march 2020",
+                Some(SearchTimeScope::Historical)
+            ),
+            "events on corona from march 2020"
+        );
+        assert_eq!(
+            normalize_freshness_query("iran news may 2025", Some(SearchTimeScope::Current)),
+            "iran news may 2025"
+        );
     }
 
     #[test]

@@ -8,6 +8,9 @@ pub(super) fn parse_range_param(input: Option<&String>) -> chrono::Duration {
     if raw.is_empty() {
         return chrono::Duration::hours(24);
     }
+    if raw == "all" {
+        return chrono::Duration::days(365 * 100);
+    }
     let (num, unit) = raw.split_at(raw.len().saturating_sub(1));
     let n = num.parse::<i64>().unwrap_or(24);
     match unit {
@@ -522,10 +525,15 @@ pub(super) async fn llm_analytics_endpoint(
         std::mem::swap(&mut since, &mut until);
     }
     let since_rfc3339 = since.to_rfc3339();
+    let until_rfc3339 = until.to_rfc3339();
 
     let agent = state.agent.read().await;
-    let rows = match agent.storage.list_llm_usage_since(&since_rfc3339).await {
-        Ok(r) => r,
+    let (rows, truncated) = match agent
+        .storage
+        .list_llm_usage_window_complete(&since_rfc3339, &until_rfc3339)
+        .await
+    {
+        Ok(result) => result,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -718,8 +726,14 @@ pub(super) async fn llm_analytics_endpoint(
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "range": { "since": since.to_rfc3339(), "until": until.to_rfc3339(), "bucket": bucket },
+            "range": {
+                "since": since_rfc3339,
+                "until": until_rfc3339,
+                "bucket": bucket,
+                "truncated": truncated,
+            },
             "totals": totals,
+            "truncated": truncated,
             "series": series.into_values().collect::<Vec<_>>(),
             "by_model": by_model_list,
             "by_channel": by_channel_list,

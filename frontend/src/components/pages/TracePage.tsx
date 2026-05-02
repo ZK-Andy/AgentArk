@@ -32,6 +32,7 @@ import Grid2 from "@mui/material/Grid";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
+import { formatChannelSource } from "../channelLabels";
 import { LiveEventConsole } from "../LiveEventConsole";
 import { MetricBarCard } from "../analytics/MetricBarCard";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
@@ -809,10 +810,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.result" ||
-      traceKind === "self_evolve.specialist_prompt.result"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.result") {
       const evaluatedCandidates = num(data.evaluated_candidates, 0);
       const baselineScore = percentageLabel(data.baseline_score, 0);
       const candidateScore = percentageLabel(data.best_candidate_score, 0);
@@ -858,10 +856,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
       const lineageId = str(data.lineage_entry_id, "").trim();
       if (lineageId) evidence.push(`Lineage: ${lineageId}`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.promotion" ||
-      traceKind === "self_evolve.specialist_prompt.promotion"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.promotion") {
       const promotionMode = str(data.promotion_mode, "none").trim();
       const canaryState = asRecord(data.canary_state);
       const replay = asRecord(data.replay_evaluation);
@@ -1071,6 +1066,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
   );
   const selectedTraceProofId = str(selectedTrace.proof_id, "");
   const selectedTraceChannel = str(selectedTrace.channel, "chat");
+  const selectedTraceSource = formatChannelSource(selectedTraceChannel, "Chat");
   const selectedTraceResponse = str(selectedTrace.response, "").trim();
   const selectedTraceStarted = humanTs(str(selectedTrace.started_at, ""));
   const selectedTraceCompleted = humanTs(str(selectedTrace.completed_at, ""));
@@ -1358,6 +1354,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                                   `trace-${historyPage * historyPageSize + idx}`,
                                 );
                                 const status = str(item.status, "running");
+                                const source = formatChannelSource(item.channel);
                                 return (
                                   <TableRow
                                     key={id}
@@ -1382,7 +1379,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
                                         noWrap
                                         title={str(item.channel)}
                                       >
-                                        {str(item.channel)}
+                                        {source}
                                       </Typography>
                                     </TableCell>
                                     <TableCell>
@@ -1730,7 +1727,7 @@ export default function TracePage({ autoRefresh }: TracePageProps) {
               <span title={selectedTraceStarted.tip}>
                 {selectedTraceStarted.label}
               </span>{" "}
-              | {selectedTraceChannel}
+              | {selectedTraceSource}
             </Typography>
           </Box>
           <IconButton

@@ -488,9 +488,11 @@ fn memory_overlap_bonus(task_lower: &str, content_lower: &str) -> f32 {
 /// callers no longer have to coordinate on exact wording with the error
 /// emission sites.
 fn classify_agent_failure(error: &anyhow::Error) -> (DelegationStatus, FailureKind, String) {
-    let is_timeout = error
-        .chain()
-        .any(|cause| cause.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+    let is_timeout = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    });
     if is_timeout {
         return (
             DelegationStatus::TimedOut,
@@ -2683,8 +2685,7 @@ impl TaskRouter {
                     Ok(Err(e)) => {
                         let _ = heartbeat_handle.await;
                         tracing::warn!("Agent {} failed: {}", idx, e);
-                        let (status, failure_kind, next_action_hint) =
-                            classify_agent_failure(&e);
+                        let (status, failure_kind, next_action_hint) = classify_agent_failure(&e);
                         // Create a failure result so we can continue
                         results[idx] = Some(AgentExecResult {
                             agent_id: assignments[idx].agent_id.clone(),

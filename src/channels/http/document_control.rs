@@ -6,7 +6,7 @@ pub(super) async fn list_documents_endpoint(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let project_id = params.get("project_id").map(|s| s.as_str());
+    let scope_filter: Option<&str> = None;
     let limit = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -16,10 +16,14 @@ pub(super) async fn list_documents_endpoint(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
     let agent = state.agent.read().await;
-    let total = agent.storage.count_documents(project_id).await.unwrap_or(0);
+    let total = agent
+        .storage
+        .count_documents(scope_filter)
+        .await
+        .unwrap_or(0);
     match agent
         .storage
-        .list_documents(limit, offset, project_id)
+        .list_documents(limit, offset, scope_filter)
         .await
     {
         Ok(docs) => {
@@ -28,7 +32,7 @@ pub(super) async fn list_documents_endpoint(
                 .map(|d| {
                     serde_json::json!({
                         "id": d.id, "filename": d.filename, "content_type": d.content_type,
-                        "project_id": d.project_id, "chunk_count": d.chunk_count,
+                        "chunk_count": d.chunk_count,
                         "file_size": d.file_size, "created_at": d.created_at,
                     })
                 })
@@ -170,7 +174,6 @@ pub(super) async fn insert_document_from_text(
     agent: &Agent,
     filename: String,
     content_type: String,
-    project_id: Option<String>,
     content: String,
 ) -> Result<(String, usize), String> {
     // Chunk the content (simple fixed-size chunking)
@@ -187,7 +190,7 @@ pub(super) async fn insert_document_from_text(
         id: doc_id.clone(),
         filename: filename.clone(),
         content_type,
-        project_id,
+        project_id: None,
         chunk_count: chunks.len() as i32,
         file_size: content.len().min(i64::MAX as usize) as i64,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -210,7 +213,7 @@ pub(super) async fn insert_document_from_text(
         agent.embedding_client.as_deref(),
         &filename,
         &doc.content_type,
-        doc.project_id.as_deref(),
+        None,
         &mut chunk_rows,
     )
     .await
@@ -275,10 +278,6 @@ pub(super) async fn upload_document_endpoint(
         )
             .into_response();
     }
-    let project_id = request
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
     let content_type = request
         .get("content_type")
         .and_then(|v| v.as_str())
@@ -286,9 +285,7 @@ pub(super) async fn upload_document_endpoint(
         .to_string();
 
     let agent = state.agent.read().await;
-    match insert_document_from_text(&agent, filename.clone(), content_type, project_id, content)
-        .await
-    {
+    match insert_document_from_text(&agent, filename.clone(), content_type, content).await {
         Ok((doc_id, chunks)) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -310,7 +307,6 @@ pub(super) async fn upload_document_endpoint(
 /// Upload a binary/text document using multipart form-data and extract text server-side.
 /// Expected fields:
 /// - file (required)
-/// - project_id (optional)
 /// - filename (optional override)
 /// - content_type (optional override)
 pub(super) async fn upload_document_file_endpoint(
@@ -319,7 +315,6 @@ pub(super) async fn upload_document_file_endpoint(
 ) -> Response {
     let mut filename_override: Option<String> = None;
     let mut content_type_override: Option<String> = None;
-    let mut project_id: Option<String> = None;
     let mut uploaded_filename: Option<String> = None;
     let mut uploaded_content_type = "application/octet-stream".to_string();
     let mut uploaded_bytes: Option<Vec<u8>> = None;
@@ -327,23 +322,6 @@ pub(super) async fn upload_document_file_endpoint(
     while let Ok(Some(field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
-            "project_id" => match field.text().await {
-                Ok(v) => {
-                    let trimmed = v.trim();
-                    if !trimmed.is_empty() {
-                        project_id = Some(trimmed.to_string());
-                    }
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: format!("Invalid project_id field: {}", e),
-                        }),
-                    )
-                        .into_response();
-                }
-            },
             "filename" => match field.text().await {
                 Ok(v) => {
                     let trimmed = v.trim();
@@ -386,6 +364,12 @@ pub(super) async fn upload_document_file_endpoint(
                 uploaded_filename = field.file_name().map(|s| s.to_string());
                 if let Some(ct) = field.content_type() {
                     uploaded_content_type = ct.to_string();
+                }
+                if uploaded_filename.is_none()
+                    && uploaded_content_type == "application/octet-stream"
+                {
+                    let _ = field.text().await;
+                    continue;
                 }
                 match field.bytes().await {
                     Ok(bytes) => {
@@ -449,14 +433,7 @@ pub(super) async fn upload_document_file_endpoint(
     };
 
     let agent = state.agent.read().await;
-    match insert_document_from_text(
-        &agent,
-        filename.clone(),
-        content_type.clone(),
-        project_id,
-        extracted,
-    )
-    .await
+    match insert_document_from_text(&agent, filename.clone(), content_type.clone(), extracted).await
     {
         Ok((doc_id, chunks)) => (
             StatusCode::OK,

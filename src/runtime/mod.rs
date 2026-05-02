@@ -6,6 +6,7 @@
 //! - Docker sandbox for heavier/untrusted operations
 //! - Transactional filesystem with rollback capability
 
+mod ark_inspect;
 mod sandbox;
 mod transaction;
 
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::actions::ActionCallerPrincipal;
 use crate::actions::{
     ActionAuthorization, ActionAuthorizationContext, ActionAuthorizationDecision, ActionDef,
-    ActionExecutionSurface, ActionRiskLevel, ActionSource,
+    ActionErrorDomain, ActionErrorReason, ActionExecutionSurface, ActionRiskLevel, ActionSource,
 };
 use crate::clients::{CodeExecuteFilePayload, ExecutorClient, ExecutorClientConfig};
 use crate::core::config::{AgentConfig, SecureConfigManager};
@@ -227,6 +228,10 @@ pub struct ActionRuntime {
         std::sync::RwLock<crate::security::tool_args_guard::ToolArgsGuardConfig>,
     /// Shared storage for expense + entity operations
     storage: Option<crate::storage::Storage>,
+    /// Stable identifier for the active user (DID), set by `Agent::init`. Used
+    /// by per-user features such as ArkOrbit when no explicit user scope is
+    /// supplied in tool arguments.
+    current_user_id: Option<String>,
     /// MCP registry for external tools/resources
     mcp_registry: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp::registry::McpRegistry>>>,
     /// Plugin registry for third-party HTTP extensions
@@ -282,6 +287,43 @@ struct SandboxUploadFile {
     filename: String,
     content_type: Option<String>,
     bytes: Vec<u8>,
+}
+
+fn path_has_source_checkout_markers(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file() && path.join("src").is_dir()
+}
+
+fn data_dir_looks_like_source_checkout(data_dir: &Path) -> bool {
+    if path_has_source_checkout_markers(data_dir) {
+        return true;
+    }
+
+    let Ok(current_dir) = std::env::current_dir() else {
+        return false;
+    };
+    if !path_has_source_checkout_markers(&current_dir) {
+        return false;
+    }
+
+    let canonical_data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical_current =
+        std::fs::canonicalize(&current_dir).unwrap_or_else(|_| current_dir.clone());
+    canonical_data == canonical_current
+}
+
+fn managed_uploads_dir(data_dir: &Path) -> PathBuf {
+    if !data_dir_looks_like_source_checkout(data_dir) {
+        return data_dir.join("uploads");
+    }
+
+    if let Some(dirs) = crate::branding::project_dirs() {
+        let fallback_data_dir = dirs.data_dir().to_path_buf();
+        if !data_dir_looks_like_source_checkout(&fallback_data_dir) {
+            return fallback_data_dir.join("uploads");
+        }
+    }
+
+    std::env::temp_dir().join("agentark").join("uploads")
 }
 
 /// A loaded action ready for execution
@@ -1226,10 +1268,32 @@ print(json.dumps({
         .into())
     }
 
+    fn tool_path_looks_sensitive_file(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        let lower = name.trim().to_ascii_lowercase();
+        lower == ".agentark_runtime_env"
+            || lower == ".env"
+            || lower.starts_with(".env.")
+            || lower.ends_with(".pem")
+            || lower.ends_with(".key")
+            || lower.ends_with(".p12")
+            || lower.ends_with(".pfx")
+            || lower == "secrets.json"
+            || lower == "credentials.json"
+    }
+
     fn resolve_tool_read_path(&self, raw: &str) -> Result<PathBuf> {
         let candidate = self.absolutize_tool_path(raw)?;
         let resolved = candidate.canonicalize()?;
         self.ensure_tool_path_allowed(&resolved)?;
+        if Self::tool_path_looks_sensitive_file(&resolved) {
+            anyhow::bail!(
+                "Refusing to read sensitive credential file '{}'. Use the secure credential store or app required_inputs flow instead.",
+                resolved.display()
+            );
+        }
         Ok(resolved)
     }
 
@@ -1493,7 +1557,7 @@ print(json.dumps({
             .load_upload_manifest(&normalized_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Upload '{}' was not found", normalized_id))?;
-        let uploads_dir = self.data_dir().join("uploads");
+        let uploads_dir = managed_uploads_dir(self.data_dir());
         let uploads_root = tokio::fs::canonicalize(&uploads_dir)
             .await
             .with_context(|| {
@@ -3487,6 +3551,7 @@ print(json.dumps({
             auto_approved_actions: std::sync::RwLock::new(HashSet::new()),
             tool_args_guard_config: std::sync::RwLock::new(Default::default()),
             storage: None,
+            current_user_id: None,
             mcp_registry: None,
             plugin_registry: None,
             extension_pack_registry: None,
@@ -3545,6 +3610,35 @@ print(json.dumps({
 
     pub fn storage(&self) -> Option<crate::storage::Storage> {
         self.storage.clone()
+    }
+
+    /// Set the active user identifier (DID). Called from `Agent::init` after
+    /// the identity is loaded so per-user actions (e.g. ArkOrbit) can resolve
+    /// scope without it being threaded through every tool argument.
+    pub fn set_current_user_id(&mut self, user_id: impl Into<String>) {
+        let value = user_id.into();
+        self.current_user_id = if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        };
+    }
+
+    fn current_user_id(&self) -> Result<&str> {
+        self.current_user_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Active user identity is not configured for the runtime")
+        })
+    }
+
+    fn arkorbit_service(&self) -> Result<crate::core::arkorbit::ArkOrbitService> {
+        let storage = self
+            .storage
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("ArkOrbit requires storage to be configured"))?;
+        Ok(crate::core::arkorbit::ArkOrbitService::with_filesystem(
+            storage,
+            self.data_dir(),
+        ))
     }
 
     /// Set MCP registry (called from Agent::init)
@@ -3699,7 +3793,7 @@ print(json.dumps({
         // File operations
         self.register_builtin_action(ActionDef {
             name: "file_read".to_string(),
-            description: "Read the full text contents of a single file from the workspace and return them. Use when an action depends on what is already inside a file the user has authored, downloaded, or generated previously — source code, notes, JSON state, generated artifacts. The path must resolve inside the configured workspace and data directories; absolute paths outside those roots are rejected. Returns the file's UTF-8 text body.".to_string(),
+            description: "Read the full text contents of a single file from the workspace and return them. Use when an action depends on what is already inside a file the user has authored, downloaded, or generated previously: source code, notes, JSON state, generated artifacts. The path must resolve inside the configured workspace and data directories; absolute paths outside those roots are rejected. Credential-looking files such as runtime env files, .env files, private keys, and credential JSON files are refused; use the secure credential store instead. Returns the file's UTF-8 text body.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3718,7 +3812,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "file_write".to_string(),
-            description: "Author or overwrite a single file in the workspace with the provided text content. Suitable for tangible authored artifacts that the user wants persisted on disk — HTML pages, JSON or YAML configuration, Markdown notes, source code modules, generated reports. The path must resolve inside the configured workspace and data directories; both the path and the full content body are required for any useful write. Parent directories are created if they do not already exist. For multi-file deliverables that should run as a hosted application, use the dedicated app-deployment action instead.".to_string(),
+            description: "Author or overwrite a single file in the workspace with the provided text content. Suitable for tangible authored artifacts that the user wants persisted on disk: HTML pages, JSON or YAML configuration, Markdown notes, source code modules, generated reports. The path must resolve inside the configured workspace and data directories; both the path and the full content body are required for any useful write. Parent directories are created if they do not already exist. For generated multi-file apps, write each app file individually under one workspace directory, then call app_deploy with source_dir and source_paths so the hosted app is assembled from those staged files.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -3940,7 +4034,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "app_restart".to_string(),
-            description: "Restart an existing deployed app from its saved metadata. Use after file_write edits to /app/data/apps/<id>/..., when a deployed app needs reload, or when the user asks to restart or re-run an existing app. Prefer app_id from app_inspect when available; otherwise use query to match an app.".to_string(),
+            description: "Restart an existing deployed app from its saved metadata. Use after file_write edits to /app/data/apps/<id>/..., when a deployed app needs reload, or when the user asks to restart or re-run an existing app. Prefer app_id from ark_inspect app-registry results when available; otherwise use query to match an app.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4037,7 +4131,7 @@ print(json.dumps({
         // Shell commands (requires approval by default)
         self.register_builtin_action(ActionDef {
             name: "shell".to_string(),
-            description: "Run a single shell command on the host machine and return its combined stdout/stderr and exit status. Suitable for read-only diagnostics — listing files, inspecting process state, querying versions — and for small scripted manipulations that do not have a dedicated action. The command is forwarded verbatim to the configured shell; quoting and escaping are the caller's responsibility. By default this action requires approval, since arbitrary shell access can mutate host state.".to_string(),
+            description: "Run a single shell command on the host machine and return its combined stdout/stderr and exit status. Suitable for read-only diagnostics such as listing files, inspecting process state, querying versions, and for small scripted manipulations that do not have a dedicated action. The command is forwarded verbatim to the configured shell; quoting and escaping are the caller's responsibility. By default this action requires approval, since arbitrary shell access can mutate host state.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4058,7 +4152,7 @@ print(json.dumps({
         // Clipboard
         self.register_builtin_action(ActionDef {
             name: "clipboard_read".to_string(),
-            description: "Read the current text on the host system clipboard and return it as a UTF-8 string. Useful when the user has just copied something — a snippet, a URL, a structured payload — and wants the assistant to operate on that exact content without retyping it. Returns the clipboard's text contents, or an empty string when the clipboard does not currently hold text.".to_string(),
+            description: "Read the current text on the host system clipboard and return it as a UTF-8 string. Useful when the user has just copied something such as a snippet, a URL, or a structured payload, and wants the assistant to operate on that exact content without retyping it. Returns the clipboard's text contents, or an empty string when the clipboard does not currently hold text.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4129,6 +4223,10 @@ print(json.dumps({
                     "title": {
                         "type": "string",
                         "description": "Optional title for the reminder"
+                    },
+                    "delivery_channel": {
+                        "type": "string",
+                        "description": "Optional delivery route for direct chat/API notification requests. Use preferred for the runtime fallback chain, in_app for local-only delivery, or a requested channel such as telegram or whatsapp. Scheduled tasks should use schedule_task.report_to instead."
                     }
                 },
                 "required": ["message"]
@@ -4144,17 +4242,45 @@ print(json.dumps({
         // Scheduler
         self.register_builtin_action(ActionDef {
             name: "schedule_task".to_string(),
-            description: "Schedule or update a durable recurring/one-time AgentArk task whose execution is intentionally deferred until a specified time or recurrence. The result is an asynchronous task record that runs later and reports through the selected delivery route; it is not a substitute for an immediate action that returns the requested result during the current turn. Create the task directly from the task body, cadence, selected action, validation policy, and reporting route. Use `task_id` when changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use cron for recurring schedules with minute granularity or at for one-time ISO timestamps. Use `watch` instead when notification should happen only after a condition, material change, or trigger match.".to_string(),
+            description: "Schedule or update durable recurring/one-time AgentArk task records whose execution is intentionally deferred until specified times or recurrences. The result is asynchronous task record(s) that run later and report through the selected delivery route; it is not a substitute for an immediate action that returns the requested result during the current turn. Do not use this for cadence that belongs inside a generated app, dashboard, page, or tool, such as its own refresh, polling, auto-update, or live-data display behavior; keep that behavior in the app/deploy artifact unless the user wants AgentArk to run or notify independently outside the artifact. Create the task directly from the task body, cadence, selected action, validation policy, and reporting route. When the user asks for multiple independent future notifications, reminders, appointments, or scheduled outcomes in one request, use `items` with one item per outcome instead of collapsing them into one task. Use `task_id` when changing an existing task from `list_tasks`; otherwise matching tasks are updated/reused unless allow_duplicate=true. Use cron for recurring schedules with minute granularity or at for one-time ISO timestamps. The cron/at value is the run or notification time; for reminders before an event, schedule the notification at the lead-time offset before the event and keep the event details in task/action_arguments. A recurring cron has no expiry unless the user gives an end policy. If the exact schedule needed to honor the user's requested reminder cannot be inferred, ask for the missing timing detail instead of creating a guess. Use `watch` instead when notification should happen only after a condition, material change, or trigger match.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "description": "Task description - what to do" },
-                    "task_id": { "type": "string", "description": "Optional existing task ID to update. Use this after `list_tasks` or when the user explicitly references an existing routine/task." },
-                    "cron": { "type": "string", "description": "Cron expression for recurring tasks. Minute granularity only for schedule_task. Format: 'minute hour day month weekday'. Examples: '0 9 * * *' = daily at 9am, '0 9 * * 1' = every Monday 9am, '*/30 * * * *' = every 30 minutes" },
-                    "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. Example: '2026-02-06T09:00:00+05:30'" },
-                    "action": { "type": "string", "description": "Optional explicit action name to run for each task occurrence" },
-                    "action_arguments": { "type": "object", "description": "Optional explicit arguments for the selected action" },
+                      "task": { "type": "string", "description": "Task description - what to do" },
+                      "task_id": { "type": "string", "description": "Optional existing task ID to update. Use this after `list_tasks` or when the user explicitly references an existing routine/task." },
+                      "cron": { "type": "string", "description": "Cron expression for recurring tasks. Minute granularity only for schedule_task. Format: 'minute hour day month weekday'. This is the time AgentArk runs or notifies, not necessarily the event start time. For advance reminders, schedule the reminder at the offset time before the event. Recurring cron schedules continue until the user cancels or changes them unless the task itself encodes a different policy. Examples: '0 9 * * *' = daily at 9am, '45 8 * * 1' = every Monday at 8:45am, '*/30 * * * *' = every 30 minutes" },
+                      "at": { "type": "string", "description": "ISO 8601 timestamp for one-time task. This is the time AgentArk runs or notifies. For advance reminders, use the offset timestamp before the event. Example: '2026-02-06T09:00:00+05:30'" },
+                      "items": {
+                          "type": "array",
+                          "description": "Batch of independent scheduled outcomes. Use one item for each distinct future task/reminder/appointment requested in the same turn. Top-level report_to, action, action_arguments, validation, automation_policy, max_attempts, stall_timeout_secs, retry_backoff_secs, and allow_duplicate are inherited by items unless overridden.",
+                          "items": {
+                              "type": "object",
+                              "properties": {
+                                  "task": { "type": "string", "description": "Task description for this scheduled outcome" },
+                                  "task_id": { "type": "string", "description": "Optional existing task ID to update for this item" },
+                                  "cron": { "type": "string", "description": "Cron expression for this recurring task, at the run/notification time" },
+                                  "at": { "type": "string", "description": "ISO 8601 timestamp for this one-time task, at the run/notification time" },
+                                  "action": { "type": "string", "description": "Optional explicit action name for this item" },
+                                  "action_arguments": { "type": "object", "description": "Optional explicit arguments for this item's action" },
+                                  "report_to": { "type": "string", "description": "Optional notification route override for this item" },
+                                  "allow_duplicate": { "type": "boolean", "description": "Create this item separately even if a matching task already exists" },
+                                  "validation": { "type": "object" },
+                                  "max_attempts": { "type": "integer" },
+                                  "stall_timeout_secs": { "type": "integer" },
+                                  "retry_backoff_secs": { "type": "integer" },
+                                  "automation_policy": { "type": "object" }
+                              },
+                              "oneOf": [
+                                  { "required": ["task", "cron"] },
+                                  { "required": ["task", "at"] },
+                                  { "required": ["task_id", "cron"] },
+                                  { "required": ["task_id", "at"] }
+                              ]
+                          }
+                      },
+                      "action": { "type": "string", "description": "Optional explicit action name to run for each task occurrence" },
+                      "action_arguments": { "type": "object", "description": "Optional explicit arguments for the selected action" },
                     "report_to": { "type": "string", "description": "Notification route for results. Use 'preferred' unless the user explicitly requests a connected delivery channel; do not guess Telegram, WhatsApp, or another messenger." },
                     "allow_duplicate": { "type": "boolean", "description": "Create a separate task even if a matching one already exists. Default false: matching tasks are updated/reused." },
                     "validation": {
@@ -4182,13 +4308,14 @@ print(json.dumps({
                         }
                     }
                 },
-                "oneOf": [
-                    { "required": ["task", "cron"] },
-                    { "required": ["task", "at"] },
-                    { "required": ["task_id", "cron"] },
-                    { "required": ["task_id", "at"] }
-                ]
-            }),
+                  "oneOf": [
+                      { "required": ["task", "cron"] },
+                      { "required": ["task", "at"] },
+                      { "required": ["task_id", "cron"] },
+                      { "required": ["task_id", "at"] },
+                      { "required": ["items"] }
+                  ]
+              }),
             capabilities: vec!["scheduler".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
@@ -4222,16 +4349,47 @@ print(json.dumps({
         }).await;
         self.register_builtin_action(ActionDef {
             name: "watch".to_string(),
-            description: "Spawn or update a durable background watcher that polls an action at regular intervals until a structured condition is met, then executes follow-up instructions. Use this when the requested outcome is conditional monitoring, trigger-on-change detection, sub-minute polling, or a long-running watch that should notify later. Create the watcher directly from the target, poll action, condition, cadence, and notification policy; do not run read/data-source actions first just to establish a baseline unless a required watcher argument cannot be inferred. Use `watcher_id` when changing an existing watcher from `list_watchers`; otherwise matching watchers are updated/reused unless allow_duplicate=true. The watcher runs autonomously and notifies the user when triggered or timed out. Default duration is 24 hours; users can extend it with timeout_hours, timeout_days, timeout_secs, or until_stopped=true.".to_string(),
+            description: "Spawn or update durable background watcher(s) that poll an action at regular intervals until structured conditions are met, then execute follow-up instructions. Use this when the requested outcome is conditional monitoring, trigger-on-change detection, sub-minute polling, or a long-running watch that should notify later. Do not use this for polling or refresh cadence that belongs inside a generated app, dashboard, page, or tool's own UI/data flow; implement that in the artifact unless the user wants AgentArk to monitor or notify independently outside the artifact. Use schedule_task instead when the trigger is purely a known date/time or recurrence and no external condition needs polling. Create watcher records directly from the target, poll action, condition, cadence, timeout, and notification policy; do not run read/data-source actions first just to establish a baseline unless a required watcher argument cannot be inferred. When the user asks for multiple independent watches in one request, use `items` with one item per watcher so item-specific targets, conditions, timeouts, cadences, and notification routes are preserved. Use `watcher_id` when changing an existing watcher from `list_watchers`; otherwise matching watchers are updated/reused unless allow_duplicate=true. The watcher runs autonomously and notifies the user when triggered or timed out. Default duration is 24 hours; use until_stopped=true for watches with no expiry or when the user says to keep watching until told otherwise. If the poll target, condition, cadence, or required delivery route is too vague to infer, ask for that missing item-specific detail instead of creating a guess.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "description": { "type": "string", "description": "What this watcher does (shown in UI)" },
-                    "watcher_id": { "type": "string", "description": "Optional existing watcher ID to update. Use this after `list_watchers` or when the user explicitly references an existing watcher." },
-                    "poll_action": { "type": "string", "description": "Action to poll (e.g. 'gmail_scan', 'web_search', 'http_get')" },
-                    "poll_arguments": { "type": "object", "description": "Arguments for the poll action" },
-                    "condition": {
+                      "description": { "type": "string", "description": "What this watcher does (shown in UI)" },
+                      "watcher_id": { "type": "string", "description": "Optional existing watcher ID to update. Use this after `list_watchers` or when the user explicitly references an existing watcher." },
+                      "poll_action": { "type": "string", "description": "Action to poll (e.g. 'gmail_scan', 'web_search', 'http_get')" },
+                      "poll_arguments": { "type": "object", "description": "Arguments for the poll action" },
+                      "items": {
+                          "type": "array",
+                          "description": "Batch of independent watcher outcomes. Use one item for each distinct watch requested in the same turn. Top-level poll_action, poll_arguments, condition, interval_secs, timeout fields, notify_channel, on_trigger, validation, automation_policy, max_attempts, stall_timeout_secs, retry_backoff_secs, and allow_duplicate are inherited by items unless overridden.",
+                          "items": {
+                              "type": "object",
+                              "properties": {
+                                  "description": { "type": "string" },
+                                  "watcher_id": { "type": "string" },
+                                  "poll_action": { "type": "string" },
+                                  "poll_arguments": { "type": "object" },
+                                  "condition": { "type": "object" },
+                                  "on_trigger": { "type": "string" },
+                                  "interval_secs": { "type": "integer" },
+                                  "timeout_secs": { "type": "integer" },
+                                  "timeout_hours": { "type": "integer" },
+                                  "timeout_days": { "type": "integer" },
+                                  "until_stopped": { "type": "boolean" },
+                                  "notify_channel": { "type": "string" },
+                                  "allow_duplicate": { "type": "boolean" },
+                                  "validation": { "type": "object" },
+                                  "max_attempts": { "type": "integer" },
+                                  "stall_timeout_secs": { "type": "integer" },
+                                  "retry_backoff_secs": { "type": "integer" },
+                                  "automation_policy": { "type": "object" }
+                              },
+                              "oneOf": [
+                                  { "required": ["description", "poll_action", "condition", "on_trigger"] },
+                                  { "required": ["watcher_id"] }
+                              ]
+                          }
+                      },
+                      "condition": {
                         "type": "object",
                         "description": "Structured trigger condition authored by the model. Include a human-readable `description` and an explicit matcher. Prefer `json_predicate` or `json_logic` for structured poll outputs; use `llm` only when the trigger cannot be expressed safely as a deterministic contract.",
                         "properties": {
@@ -4293,11 +4451,12 @@ print(json.dumps({
                         }
                     }
                 },
-                "oneOf": [
-                    { "required": ["description", "poll_action", "condition", "on_trigger"] },
-                    { "required": ["watcher_id"] }
-                ]
-            }),
+                  "oneOf": [
+                      { "required": ["description", "poll_action", "condition", "on_trigger"] },
+                      { "required": ["watcher_id"] },
+                      { "required": ["items"] }
+                  ]
+              }),
             capabilities: vec!["watcher".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
@@ -4597,14 +4756,15 @@ print(json.dumps({
         // Web search
         self.register_builtin_action(ActionDef {
             name: "web_search".to_string(),
-            description: "Search the web for current information needed in the current answer or as a required input to another action. Do not use this as a prerequisite baseline for durable scheduled work or watchers when the durable object can perform its own later poll. Keep the query topic-focused and do not invent specific year filters unless the user explicitly asked for them.".to_string(),
+            description: "Search the web for external information needed in the current answer or as a required input to another action. Use the semantic temporal scope to distinguish current/recent information from historical or timeless lookup. Do not use this as a prerequisite baseline for durable scheduled work or watchers when the durable object can perform its own later poll.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search query. Preserve the user's topic, but do not inject arbitrary years or date ranges unless the user explicitly requested them." },
+                    "query": { "type": "string", "description": "Search query. Preserve the user's topic and any explicit date or range. For current/recent scope, include the runtime date or year when it improves freshness; for historical scope, preserve the historical period." },
                     "num_results": { "type": "integer", "description": "Number of results (default 5)" },
-                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper" }
+                    "backend": { "type": "string", "description": "Search backend: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
+                    "time_scope": { "type": "string", "enum": ["current", "recent", "historical", "timeless"], "description": "Semantic temporal intent of the lookup. Use current/recent when the answer depends on now, latest state, news, or recent changes; historical when the user gives or implies a past period; timeless for stable background/reference lookup." }
                 },
                 "required": ["query"]
             }),
@@ -4623,7 +4783,7 @@ print(json.dumps({
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Research topic or question" },
+                    "query": { "type": "string", "description": "Research topic or question. For current or recent questions, anchor the query to the runtime date/current year. For explicit historical periods, preserve the user's date or range instead of making it current." },
                     "max_sources": { "type": "integer", "description": "Maximum sources to examine (default 5, or 12 when depth='deep')" },
                     "backend": { "type": "string", "description": "Optional search backend override: lightpanda, duckduckgo, playwright, brave, brave_api, serper" },
                     "depth": { "type": "string", "description": "Research depth: quick, standard, deep" },
@@ -4723,37 +4883,58 @@ print(json.dumps({
         }).await;
 
         self.register_builtin_action(ActionDef {
-            name: "agentark_inspect".to_string(),
-            description: "Inspect live AgentArk internal surfaces such as overview, gateway_ops, arkpulse, sentinel, evolution, trace, and moltbook. Use when the user asks about current AgentArk state, recent internal runs, anomalies, learning status, Moltbook activity, or what changed.".to_string(),
+            name: "background_session_manage".to_string(),
+            description: "Inspect or modify a durable AgentArk background session and its linked tasks/watchers. Use when the user refers to an existing background work/session and wants status, pause, resume, stop/cancel, deletion, or a delivery-channel change for that session as a whole. Resolve by background_session_id when available; otherwise provide the user's reference in reference_text so AgentArk can resolve against recent session context. This action is for AgentArk-owned background work, not app-internal refresh/poll cadence.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "surface": {
+                    "operation": {
                         "type": "string",
-                        "enum": ["overview", "gateway_ops", "arkpulse", "sentinel", "evolution", "trace", "moltbook"],
-                        "description": "Internal AgentArk surface to inspect. Default: overview."
+                        "enum": ["status", "list", "pause", "resume", "stop", "cancel", "delete", "update_delivery"],
+                        "description": "Session-level operation. stop and cancel close the session and cancel linked pending work; delete removes the session and linked work records."
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum recent records to include per section (default: 6)."
-                    },
-                    "trace_id": {
+                    "background_session_id": {
                         "type": "string",
-                        "description": "Optional execution trace id when surface=trace."
+                        "description": "Optional exact background session id. Omit only when the current conversation context clearly identifies one session."
                     },
-                    "inspect_target": {
+                    "reference_text": {
                         "type": "string",
-                        "description": "Optional planner qualifier equivalent to surface. The model may pass this when following an intent plan."
+                        "description": "User's semantic reference to the target background work when no id is supplied."
+                    },
+                    "delivery_channel": {
+                        "type": "string",
+                        "description": "Required for update_delivery. Use preferred, in_app, telegram, whatsapp, or another configured channel only when requested."
+                    },
+                    "include_closed": {
+                        "type": "boolean",
+                        "description": "Include completed/cancelled/failed sessions when listing or resolving. Default false except status by exact id."
                     }
-                }
+                },
+                "required": ["operation"]
             }),
-            capabilities: vec!["platform_observability".to_string()],
+            capabilities: vec![
+                "background_session".to_string(),
+                "scheduler".to_string(),
+                "watcher".to_string(),
+                "notification".to_string(),
+            ],
             sandbox_mode: Some(SandboxMode::Native),
             source: ActionSource::System,
             file_path: None,
-        authorization: Default::default(),
+            authorization: authorization_with_access(crate::actions::ActionAccessMetadata {
+                permission_ids: vec![
+                    "background_session".to_string(),
+                    "watcher".to_string(),
+                    "scheduler".to_string(),
+                ],
+                channel_targets: vec![channel_target("delivery_channel", "preferred")],
+                ..crate::actions::ActionAccessMetadata::default()
+            }),
         }).await;
+
+        self.register_builtin_action(ark_inspect::action_def())
+            .await;
 
         self.register_builtin_action(ActionDef {
             name: "goal_manage".to_string(),
@@ -6149,50 +6330,16 @@ print(json.dumps({
             }).await;
         }
 
-        self.register_builtin_action(ActionDef {
-            name: "app_inspect".to_string(),
-            description: "Inspect existing deployed apps. Use when the user asks which apps are deployed, refers to a deployed app by name/ID, wants to inspect a repo deployment bundle, or wants to debug, diagnose, fix, or update an existing app. Returns matched app metadata, its /app/data/apps/<id> directory, repo bundle metadata when present, runtime state, and recent logs so you can use file_read/file_write/app_restart/app_stop/app_delete/http_get on the live app.".to_string(),
-            version: "1.0.0".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Optional app title or app ID to match. Leave empty to list deployed apps."
-                    },
-                    "bundle_id": {
-                        "type": "string",
-                        "description": "Optional repo deployment bundle ID to inspect all services from a repo-based deployment together."
-                    },
-                    "include_files": {
-                        "type": "boolean",
-                        "description": "Include a file inventory for the matched app. Default: true."
-                    },
-                    "include_logs": {
-                        "type": "boolean",
-                        "description": "Include recent runtime log tail for the matched app when available. Default: true."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of apps to list in the summary. Default: 10."
-                    }
-                }
-            }),
-            capabilities: vec!["app_hosting".to_string(), "file_read".to_string()],
-            sandbox_mode: Some(SandboxMode::Native),
-            source: ActionSource::System,
-            file_path: None,
-        authorization: Default::default(),
-        }).await;
-
         // App deployment - write files, start servers, return live URL
         self.register_builtin_action(ActionDef {
             name: "app_deploy".to_string(),
             description: format!(
-                "Deploy a web app or server and return a live URL. Supports either generated files OR a repository source. Use when asked to build a dashboard, create a tool, make a website, build an app, or deploy/run a repo locally for the user. For file-based apps, provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. For substantial generated pages, prefer a multi-file static bundle with a complete `index.html` that links app-relative `style.css` and `app.js` files included in `files`; this keeps HTML structure complete and makes validation/repair reliable. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services; arXiv search is available at `__agentark/arxiv/search?categories=cs.LG,cs.AI,stat.ML&keywords=reinforcement%20learning,time%20series&max_results=20` and returns normalized JSON from server-side arXiv fetches. Redeploys in an existing conversation update the active app in place unless `allow_duplicate=true`; when an exact app is known, provide its stable `app_id` with the new `files`. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
+                "Deploy a web app or server and return a live URL. Supports generated files, files staged in the workspace, line-level patches to an existing app, explicit file deletes, OR a repository source. Use when the intended outcome is a managed browser-usable or hosted artifact, such as building a dashboard, creating a tool, making a website, building an app, or deploying/running a repo locally for the user. External publishing is explicit: deploy_target defaults to local; set deploy_target=\"vercel_direct\" only when the selected app deployment layer is Vercel direct API publishing, or deploy_target=\"vercel_git\" only when the selected layer is Git-backed Vercel. If the requested timing/cadence describes how the generated artifact refreshes, polls, auto-updates, backfills, or presents live data, implement that behavior inside the artifact rather than creating an AgentArk schedule or watcher. {inline_report_boundary} For generated multi-file apps, prefer staging each file with `file_write` under one workspace directory, then call app_deploy with `source_dir` and `source_paths`; this gives the user per-file progress and avoids one giant deploy payload. For edits to a known existing app, prefer `mode=\"patch\"` with `app_id` and `file_patches` unified diffs for small line changes, plus `delete_paths` for removed files; use full `files` only for files that must be replaced completely. For small file-based apps, you may instead provide a `files` object containing every local file needed by the page: if HTML/CSS references a local stylesheet, script, image, font, manifest, or media asset, include that file too. The delivered app must implement the requested workflow and controls; do not substitute a placeholder, mock-only screen, or decorative shell when the user asked for working behavior. For substantial generated pages, prefer a multi-file static bundle with a complete `index.html` that links app-relative `style.css` and `app.js` files included in `files` or `source_paths`; this keeps HTML structure complete and makes validation/repair reliable. Local asset paths must be app-relative, not root-relative. For generated static apps that read public APIs, prefer app-relative {} helpers over third-party CORS proxy services; arXiv search is available at `__agentark/arxiv/search?categories=cs.LG,cs.AI,stat.ML&keywords=reinforcement%20learning,time%20series&max_results=20` and returns normalized JSON from server-side arXiv fetches. Authenticated API apps are supported, but do not embed credentials in browser JavaScript or static files. Build a dynamic backend/proxy when an API needs secret headers/tokens, declare the needed keys in `required_inputs`/`required_secrets`, read them from process env at runtime, and use `config` only for non-sensitive values such as base URLs. AgentArk's own model/provider credentials are not inherited by generated apps; app credentials must be supplied intentionally through the secure credential store. When modifying a known deployed app, provide its stable `app_id`; otherwise a new deployment is created unless duplicate detection finds a matching app to reuse or replace. For repo-based apps, provide `repo_url` (and optionally `repo_ref`, `repo_subdir`, `service_mode`) so {} can clone the repo, inspect the README/manifests, stand up the detected frontend/backend services, and return managed endpoints. For generated file bundles, provide `entry_command` or `start_command` when the app needs a long-lived server/runtime; a start command makes the app dynamic unless `runtime_required=false` is explicitly supplied. Generated dynamic bundles may be Python, Node/TypeScript, Rust, or another direct-command stack when the files include complete project configuration plus appropriate lifecycle commands. Dynamic app runtimes persist their app directory and lifecycle commands, can install dependencies with network access before startup (`pip`, `npm`, `cargo`, etc.), can run an optional `stop_command` as a graceful stop hook, and restart from saved metadata. Repo-based deploys default to container runtime unless overridden. Dynamic app containers default to the installed {} image unless `runtime_image` or a runner-image env override is provided; use `runtime_image` for specialized toolchains not present in the default runner. Public exposure stays off unless explicitly requested (`expose_public=true`). Declare required inputs via required_inputs and mark each item sensitive=true/false. Access guard follows the current app-hosting default when omitted for local/private apps. Public exposure requires `access_password`, and providing `access_password` enables App Guard.",
                 crate::branding::PRODUCT_NAME,
                 crate::branding::PRODUCT_NAME,
-                crate::branding::PRODUCT_NAME
+                crate::branding::PRODUCT_NAME,
+                inline_report_boundary =
+                    crate::core::inline_artifacts::app_deploy_inline_report_boundary()
             ),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
@@ -6200,11 +6347,43 @@ print(json.dumps({
                 "properties": {
                     "app_id": {
                         "type": "string",
-                        "description": "Optional stable deployed app id to update in place. Use when modifying a known existing generated app; if omitted, AgentArk may update the active app associated with the current conversation unless allow_duplicate=true."
+                        "description": "Optional stable deployed app id to update in place. Use when modifying a known existing generated app; omit when creating a new app."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "patch"],
+                        "default": "replace",
+                        "description": "replace creates or replaces the declared app bundle and removes stale managed files. patch requires app_id and applies only file_patches, complete changed files in files/source_paths, and delete_paths while preserving all other managed files."
                     },
                     "files": {
                         "type": "object",
                         "description": "Object mapping filename to file content. Include every locally referenced asset; use relative paths such as \"style.css\", \"app.js\", or \"assets/logo.svg\", not \"/style.css\". For generated static pages, prefer {\"index.html\":\"<html>...<link rel=\\\"stylesheet\\\" href=\\\"style.css\\\">...\", \"style.css\":\"body{...}\", \"app.js\":\"...\"} over large inline style/script blocks. Each value must be the complete file body."
+                    },
+                    "file_patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "App-relative file path to patch." },
+                                "patch": { "type": "string", "description": "Unified diff hunks for this file. Include context lines so the patch can be verified against the current file." }
+                            },
+                            "required": ["path", "patch"]
+                        },
+                        "description": "Line-level unified diffs to apply when mode='patch'. This lets small edits avoid re-emitting whole files."
+                    },
+                    "delete_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "App-relative files to remove from the existing app bundle. Use with mode='patch' for deletions; replace mode also removes stale managed files not declared in files/source_paths."
+                    },
+                    "source_dir": {
+                        "type": "string",
+                        "description": "Optional workspace/data directory already populated with app files via file_write. When supplied with source_paths, app_deploy reads those staged files instead of receiving a large files object."
+                    },
+                    "source_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "App-relative file paths under source_dir to include in the bundle, such as [\"index.html\", \"style.css\", \"src/App.tsx\"]. Required when using source_dir without files."
                     },
                     "repo_url": {
                         "type": "string",
@@ -6226,10 +6405,42 @@ print(json.dumps({
                         "enum": ["auto", "frontend", "backend", "fullstack"],
                         "description": "For repo deploys, choose which service(s) to stand up. auto deploys the detected default services."
                     },
+                    "deploy_target": {
+                        "type": "string",
+                        "enum": ["local", "vercel_direct", "vercel_git"],
+                        "default": "local",
+                        "description": "Explicit app deployment layer. local creates the standard AgentArk /apps/{id} deployment. vercel_direct also publishes the resulting app bundle to Vercel through the REST API using the configured Vercel token. vercel_git records the Git-backed Vercel intent and returns a structured nudge when Git or Vercel project configuration is missing."
+                    },
+                    "production": {
+                        "type": "boolean",
+                        "description": "For external Vercel publishing, deploy to production when true; otherwise create a preview deployment. Production publishing should be explicit."
+                    },
+                    "vercel_project_mode": {
+                        "type": "string",
+                        "enum": ["auto", "existing", "create"],
+                        "default": "auto",
+                        "description": "Project handling for external Vercel publishing. auto uses the saved or generated project name with the deployment API. existing requires a saved or supplied project id/name. create calls the Vercel Projects API before deploying and then deploys into that project."
+                    },
+                    "vercel_project_id": {
+                        "type": "string",
+                        "description": "Optional Vercel project id/name for external Vercel publishing. If omitted, the saved Vercel project setting or a generated project name is used."
+                    },
+                    "vercel_team_id": {
+                        "type": "string",
+                        "description": "Optional Vercel team id used as the teamId API query parameter for external Vercel publishing."
+                    },
+                    "build_command": {
+                        "type": "string",
+                        "description": "Optional Vercel projectSettings.buildCommand for source-based deployments such as Next.js apps."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Optional Vercel projectSettings.outputDirectory for source-based deployments."
+                    },
                     "title": { "type": "string", "description": "App name/title (default: App)" },
                     "entry_command": {
                         "type": "string",
-                        "description": "Command to start the server process (omit for static HTML apps). Supplying this makes the app a persistent dynamic runtime unless runtime_required=false is explicitly set. Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'uvicorn app:app --host 0.0.0.0 --port {PORT}'"
+                        "description": "Command to start the server process (omit for static HTML apps). Supplying this makes the app a persistent dynamic runtime unless runtime_required=false is explicitly set. Use {PORT} placeholder or PORT env var for the port. Python apps auto-activate their venv. Examples: 'python3 app.py', 'node server.js', 'npm run start', 'uvicorn app:app --host 0.0.0.0 --port {PORT}', 'cargo run'"
                     },
                     "start_command": {
                         "type": "string",
@@ -6237,7 +6448,7 @@ print(json.dumps({
                     },
                     "install_command": {
                         "type": "string",
-                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt - a venv is auto-created. Each app runs in its own persistent isolated environment (Python venv or local node_modules), and dynamic runtime dependency installs may use network access. Examples: 'pip install -r requirements.txt', 'npm install'"
+                        "description": "Command to install dependencies before starting (optional). Omit for Python apps with requirements.txt - a venv is auto-created. Each app runs in its own persistent isolated environment (Python venv, local node_modules, or stack-specific build cache), and dynamic runtime dependency installs may use network access. Examples: 'pip install -r requirements.txt', 'npm install', 'cargo fetch'"
                     },
                     "stop_command": {
                         "type": "string",
@@ -6263,7 +6474,7 @@ print(json.dumps({
                                 }
                             ]
                         },
-                        "description": "Required runtime inputs. String entries default to sensitive=true. Use object entries for per-key sensitivity, e.g. [{\"key\":\"API_TOKEN\",\"sensitive\":true},{\"key\":\"BASE_URL\",\"sensitive\":false}]"
+                        "description": "Required runtime inputs. String entries default to sensitive=true. Use object entries for per-key sensitivity, e.g. [{\"key\":\"API_TOKEN\",\"sensitive\":true},{\"key\":\"BASE_URL\",\"sensitive\":false}]. For authenticated APIs, declare secret headers/tokens here and read them from process env in a dynamic backend rather than embedding them in static browser files."
                     },
                     "required_secrets": {
                         "type": "array",
@@ -6302,7 +6513,7 @@ print(json.dumps({
                     },
                     "runtime_required": {
                         "type": "boolean",
-                        "description": "Set true only when the generated bundle genuinely needs a long-lived server/runtime. Default: false."
+                        "description": "Whether the generated bundle needs a long-lived server/runtime. Omit to infer from entry_command/start_command; set false only when a bundle with lifecycle metadata should still be served as static files."
                     },
                     "runtime_reason": {
                         "type": "string",
@@ -6381,8 +6592,8 @@ print(json.dumps({
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["policy", "code"],
-                        "description": "Evolution mode. policy (default) evolves runtime strategy; code enables source mutation mode."
+                        "enum": ["policy", "strategy", "prompt", "specialist_prompt", "gepa_export", "gepa_run", "gepa_import", "gepa_status", "code"],
+                        "description": "Evolution mode. policy (default) evolves runtime strategy; prompt/specialist_prompt evolve prompt surfaces; GEPA modes run offline seed export/run/import/status; code enables source mutation mode."
                     },
                     "allow_code_writes": {
                         "type": "boolean",
@@ -6418,9 +6629,30 @@ print(json.dumps({
                         "type": "integer",
                         "minimum": 100,
                         "description": "Operational log window size used for replay evaluation. Default 4000."
+                    },
+                    "gepa_run_id": {
+                        "type": "string",
+                        "description": "Optional GEPA run id used to locate .agentark/self_evolve/gepa/runs/<run_id> artifacts."
+                    },
+                    "export_path": {
+                        "type": "string",
+                        "description": "Optional path to a GEPA export.json file for gepa_run."
+                    },
+                    "candidates_path": {
+                        "type": "string",
+                        "description": "Optional path to GEPA candidates.jsonl for gepa_import or gepa_run output."
+                    },
+                    "gepa_quiet_window_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Quiet window required before GEPA work starts. Default 60."
+                    },
+                    "gepa_optimizer_timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 30,
+                        "description": "Maximum wall-clock seconds for the offline GEPA optimizer process. Default 900."
                     }
-                },
-                "required": ["request"]
+                }
             }),
             capabilities: vec!["self_evolve".to_string()],
             sandbox_mode: Some(SandboxMode::Native),
@@ -6428,6 +6660,72 @@ print(json.dumps({
             file_path: None,
         authorization: Default::default(),
         }).await;
+
+        // ==================== ArkOrbit (per-user canvas) ====================
+
+        self.register_builtin_action(ActionDef {
+            name: "arkorbit_create_orbit".to_string(),
+            description: "Create a new ArkOrbit canvas backed by durable orbit files. Use when the user wants a fresh, separate space for a different topic, project, or purpose. The new canvas is owned by the active user and persisted to disk; it does not become the default unless the user has none yet.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short human-readable label shown in the orbit switcher."
+                    },
+                    "icon": {
+                        "type": "string",
+                        "description": "Optional emoji or short glyph rendered alongside the name in the switcher."
+                    },
+                    "color": {
+                        "type": "string",
+                        "description": "Optional CSS color string (e.g. '#7c3aed') used to tint the orbit chip."
+                    },
+                    "agent_instructions": {
+                        "type": "string",
+                        "description": "Optional free-form instructions scoped to this orbit. The agent receives them as structural context whenever the user chats inside this canvas."
+                    }
+                },
+                "required": ["name"]
+            }),
+            capabilities: vec!["arkorbit".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
+
+        self.register_builtin_action(ActionDef {
+            name: "arkorbit_file_write".to_string(),
+            description: "Fallback write primitive for ArkOrbit files. The fast orbit chat path normally applies structured orbit file operations directly; this action exists for non-streaming providers and other structured tool paths. The path must be index.html, orbit.json, or under mod/, data/, or assets/.".to_string(),
+            version: "1.0.0".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "orbit_id": {
+                        "type": "string",
+                        "description": "Selected orbit identifier."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative orbit file path. Allowed roots: mod/, data/, assets/, index.html, orbit.json."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file contents to write atomically."
+                    }
+                },
+                "required": ["orbit_id", "path", "content"]
+            }),
+            capabilities: vec!["arkorbit".to_string()],
+            sandbox_mode: Some(SandboxMode::Native),
+            source: ActionSource::System,
+            file_path: None,
+            authorization: Default::default(),
+        })
+        .await;
 
         Ok(())
     }
@@ -6478,10 +6776,12 @@ print(json.dumps({
 
     fn action_has_dangerous_capabilities(capabilities: &[String]) -> bool {
         capabilities.iter().any(|cap| {
-            matches!(
-                crate::security::action_guard::ActionGuard::permission_risk(
-                    &crate::security::action_guard::ActionGuard::parse_permission(cap)
-                ),
+            let permission = crate::security::action_guard::ActionGuard::parse_permission(cap);
+            !matches!(
+                permission,
+                crate::security::action_guard::Permission::Custom(_)
+            ) && matches!(
+                crate::security::action_guard::ActionGuard::permission_risk(&permission),
                 crate::security::action_guard::PermissionRisk::Dangerous
             )
         })
@@ -7718,14 +8018,24 @@ print(json.dumps({
             actions
                 .get(action_name)
                 .map(|action| action.info.clone())
-                .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_name))?
+                .ok_or_else(|| {
+                    crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::NotFound,
+                        format!("Unknown action: {}", action_name),
+                    )
+                })?
         };
 
         let authorization_decision = self
             .authorize_action_invocation(action_name, Some(&info), arguments, auth_context)
             .await?;
         if !authorization_decision.allowed {
-            anyhow::bail!("{}", authorization_decision.reason);
+            return Err(crate::actions::structured_action_error(
+                ActionErrorDomain::Auth,
+                ActionErrorReason::PermissionDenied,
+                authorization_decision.reason,
+            ));
         }
         let chat_override = Self::direct_trusted_chat_tool_override(auth_context);
 
@@ -7733,19 +8043,24 @@ print(json.dumps({
             match self.refresh_action_review_state(action_name).await? {
                 Some(review) => {
                     if !review.allow_execute {
-                        anyhow::bail!(
-                            "{}",
+                        return Err(crate::actions::structured_action_error(
+                            ActionErrorDomain::Action,
+                            ActionErrorReason::Unavailable,
                             review.blocked_reason.unwrap_or_else(|| {
                                 format!("Action '{}' is not ready to execute.", action_name)
-                            })
-                        );
+                            }),
+                        ));
                     }
                 }
                 None if info.source != ActionSource::System => {
-                    anyhow::bail!(
-                        "Action '{}' has no persisted security review and cannot execute.",
-                        action_name
-                    );
+                    return Err(crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::Unavailable,
+                        format!(
+                            "Action '{}' has no persisted security review and cannot execute.",
+                            action_name
+                        ),
+                    ));
                 }
                 None => {}
             }
@@ -7755,10 +8070,14 @@ print(json.dumps({
             if info.source != ActionSource::System {
                 let disabled = self.disabled_actions.read().await;
                 if disabled.contains(action_name) {
-                    anyhow::bail!(
-                        "Action '{}' is disabled. Re-enable it in the UI before running.",
-                        action_name
-                    );
+                    return Err(crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::Unavailable,
+                        format!(
+                            "Action '{}' is disabled. Re-enable it in the UI before running.",
+                            action_name
+                        ),
+                    ));
                 }
             } else if !self.is_action_integration_ready(&info).await {
                 let integration_id = info
@@ -7769,11 +8088,14 @@ print(json.dumps({
                     .or_else(|| info.authorization.access.extension_pack_ids.first())
                     .map(String::as_str)
                     .unwrap_or("required");
-                anyhow::bail!(
-                    "Action '{}' is unavailable because required integration '{}' is not ready.",
-                    action_name,
-                    integration_id
-                );
+                return Err(crate::actions::structured_action_error(
+                    ActionErrorDomain::Integration,
+                    ActionErrorReason::NotConnected,
+                    format!(
+                        "Action '{}' is unavailable because required integration '{}' is not ready.",
+                        action_name, integration_id
+                    ),
+                ));
             }
         }
 
@@ -7782,7 +8104,13 @@ print(json.dumps({
                 let url = arguments
                     .get("url")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing URL"))?;
+                    .ok_or_else(|| {
+                        crate::actions::structured_action_error(
+                            ActionErrorDomain::Action,
+                            ActionErrorReason::MissingInput,
+                            "Missing URL",
+                        )
+                    })?;
                 self.resolve_http_get_url_for_context(url, auth_context)
                     .await?;
             }
@@ -7809,9 +8137,13 @@ print(json.dumps({
             info,
         ) = {
             let actions = self.actions.read().await;
-            let action = actions
-                .get(action_name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown action: {}", action_name))?;
+            let action = actions.get(action_name).ok_or_else(|| {
+                crate::actions::structured_action_error(
+                    ActionErrorDomain::Action,
+                    ActionErrorReason::NotFound,
+                    format!("Unknown action: {}", action_name),
+                )
+            })?;
             (
                 action
                     .info
@@ -7832,7 +8164,11 @@ print(json.dumps({
             .authorize_action_invocation(action_name, Some(&info), arguments, auth_context)
             .await?;
         if !authorization_decision.allowed {
-            anyhow::bail!("{}", authorization_decision.reason);
+            return Err(crate::actions::structured_action_error(
+                ActionErrorDomain::Auth,
+                ActionErrorReason::PermissionDenied,
+                authorization_decision.reason,
+            ));
         }
         let chat_override = Self::direct_trusted_chat_tool_override(auth_context);
 
@@ -7840,19 +8176,24 @@ print(json.dumps({
             match self.refresh_action_review_state(action_name).await? {
                 Some(review) => {
                     if !review.allow_execute {
-                        anyhow::bail!(
-                            "{}",
+                        return Err(crate::actions::structured_action_error(
+                            ActionErrorDomain::Action,
+                            ActionErrorReason::Unavailable,
                             review.blocked_reason.unwrap_or_else(|| {
                                 format!("Action '{}' is not ready to execute.", action_name)
-                            })
-                        );
+                            }),
+                        ));
                     }
                 }
                 None if source != ActionSource::System => {
-                    anyhow::bail!(
-                        "Action '{}' has no persisted security review and cannot execute.",
-                        action_name
-                    );
+                    return Err(crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::Unavailable,
+                        format!(
+                            "Action '{}' has no persisted security review and cannot execute.",
+                            action_name
+                        ),
+                    ));
                 }
                 None => {}
             }
@@ -7862,9 +8203,13 @@ print(json.dumps({
             if source != ActionSource::System {
                 let disabled = self.disabled_actions.read().await;
                 if disabled.contains(action_name) {
-                    return Err(anyhow::anyhow!(
-                        "Action '{}' is disabled. Re-enable it in the UI before running.",
-                        action_name
+                    return Err(crate::actions::structured_action_error(
+                        ActionErrorDomain::Action,
+                        ActionErrorReason::Unavailable,
+                        format!(
+                            "Action '{}' is disabled. Re-enable it in the UI before running.",
+                            action_name
+                        ),
                     ));
                 }
             } else if !self.is_action_integration_ready(&info).await {
@@ -7876,10 +8221,13 @@ print(json.dumps({
                     .or_else(|| info.authorization.access.extension_pack_ids.first())
                     .map(String::as_str)
                     .unwrap_or("required");
-                return Err(anyhow::anyhow!(
-                    "Action '{}' is unavailable because required integration '{}' is not ready.",
-                    action_name,
-                    integration_id
+                return Err(crate::actions::structured_action_error(
+                    ActionErrorDomain::Integration,
+                    ActionErrorReason::NotConnected,
+                    format!(
+                        "Action '{}' is unavailable because required integration '{}' is not ready.",
+                        action_name, integration_id
+                    )
                 ));
             }
         }
@@ -8714,37 +9062,134 @@ print(json.dumps({
                 Ok(output)
             }
             "tunnel_control" => self.execute_tunnel_control(arguments).await,
+            "background_session_manage" => {
+                let operation = arguments
+                    .get("operation")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing background session operation"))?;
+                let valid = matches!(
+                    operation,
+                    "status"
+                        | "list"
+                        | "pause"
+                        | "resume"
+                        | "stop"
+                        | "cancel"
+                        | "delete"
+                        | "update_delivery"
+                );
+                if !valid {
+                    anyhow::bail!("Unsupported background session operation `{}`", operation);
+                }
+                if operation == "update_delivery"
+                    && arguments
+                        .get("delivery_channel")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                {
+                    anyhow::bail!("update_delivery requires delivery_channel");
+                }
+                Ok(format!(
+                    "{}{}",
+                    TOOL_COMPLETION_MARKER,
+                    serde_json::json!({
+                        "tool": "background_session_manage",
+                        "status": "completed",
+                        "detail": format!("Prepared background session operation: {}", operation),
+                    })
+                ))
+            }
             "schedule_task" => {
-                let task_desc = arguments["task"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing task description"))?;
+                let validate_schedule_item = |item: &serde_json::Value| -> Result<String> {
+                    let task_desc = item
+                        .get("task")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| {
+                            item.get("task_id")
+                                .and_then(|value| value.as_str())
+                                .map(|_| "existing task")
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("Missing task description"))?;
 
-                let schedule_info =
-                    if let Some(cron_expr) = arguments.get("cron").and_then(|v| v.as_str()) {
-                        // Auto-convert standard 5-field cron to 6-field (with seconds)
-                        // Standard: "minute hour day month weekday" -> "0 9 * * *"
-                        // Rust cron: "second minute hour day month weekday" -> "0 0 9 * * *"
-                        let cron_6field = if cron_expr.split_whitespace().count() == 5 {
-                            format!("0 {}", cron_expr) // Prepend "0 " for seconds
+                    let schedule_info =
+                        if let Some(cron_expr) = item.get("cron").and_then(|v| v.as_str()) {
+                            // Auto-convert standard 5-field cron to 6-field (with seconds)
+                            // Standard: "minute hour day month weekday" -> "0 9 * * *"
+                            // Rust cron: "second minute hour day month weekday" -> "0 0 9 * * *"
+                            let cron_6field = if cron_expr.split_whitespace().count() == 5 {
+                                format!("0 {}", cron_expr) // Prepend "0 " for seconds
+                            } else {
+                                cron_expr.to_string()
+                            };
+
+                            // Validate cron expression
+                            cron_6field.parse::<cron::Schedule>().map_err(|e| {
+                                anyhow::anyhow!("Invalid cron expression '{}': {}", cron_6field, e)
+                            })?;
+                            format!("cron:{}", cron_6field)
+                        } else if let Some(at_time) = item.get("at").and_then(|v| v.as_str()) {
+                            // Validate ISO timestamp
+                            chrono::DateTime::parse_from_rfc3339(at_time)
+                                .map_err(|e| anyhow::anyhow!("Invalid timestamp: {}", e))?;
+                            format!("at:{}", at_time)
                         } else {
-                            cron_expr.to_string()
+                            return Err(anyhow::anyhow!(
+                                "Must specify either 'cron' or 'at' for scheduling"
+                            ));
                         };
+                    Ok(format!("Task: {}; schedule: {}", task_desc, schedule_info))
+                };
 
-                        // Validate cron expression
-                        cron_6field.parse::<cron::Schedule>().map_err(|e| {
-                            anyhow::anyhow!("Invalid cron expression '{}': {}", cron_6field, e)
+                let detail = if let Some(items) = arguments.get("items") {
+                    let items = items
+                        .as_array()
+                        .filter(|items| !items.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("schedule_task.items must be a non-empty array")
                         })?;
-                        format!("cron:{}", cron_6field)
-                    } else if let Some(at_time) = arguments.get("at").and_then(|v| v.as_str()) {
-                        // Validate ISO timestamp
-                        chrono::DateTime::parse_from_rfc3339(at_time)
-                            .map_err(|e| anyhow::anyhow!("Invalid timestamp: {}", e))?;
-                        format!("at:{}", at_time)
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "Must specify either 'cron' or 'at' for scheduling"
-                        ));
-                    };
+                    let inheritable_keys = [
+                        "task",
+                        "report_to",
+                        "action",
+                        "action_arguments",
+                        "allow_duplicate",
+                        "validation",
+                        "max_attempts",
+                        "stall_timeout_secs",
+                        "retry_backoff_secs",
+                        "automation_policy",
+                    ];
+                    for (index, item) in items.iter().enumerate() {
+                        let Some(item_obj) = item.as_object() else {
+                            return Err(anyhow::anyhow!(
+                                "schedule_task.items[{}] must be an object",
+                                index
+                            ));
+                        };
+                        let mut merged = serde_json::Map::new();
+                        for key in inheritable_keys {
+                            if let Some(value) = arguments.get(key) {
+                                merged.insert(key.to_string(), value.clone());
+                            }
+                        }
+                        for (key, value) in item_obj {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                        merged.remove("items");
+                        validate_schedule_item(&serde_json::Value::Object(merged)).map_err(
+                            |error| {
+                                anyhow::anyhow!("Invalid schedule item {}: {}", index + 1, error)
+                            },
+                        )?;
+                    }
+                    format!("Prepared {} scheduled task item(s)", items.len())
+                } else {
+                    validate_schedule_item(arguments)?
+                };
 
                 // Return structured scheduling info - actual scheduling is handled by the agent's task queue
                 Ok(format!(
@@ -8753,16 +9198,83 @@ print(json.dumps({
                     serde_json::json!({
                         "tool": "schedule_task",
                         "status": "completed",
-                        "detail": format!("Task: {}; schedule: {}", task_desc, schedule_info),
+                        "detail": detail,
                     })
                 ))
             }
             "watch" => {
                 // Return structured watcher info - actual watcher creation is handled by Agent::handle_watch
-                let desc = arguments
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("watcher");
+                let validate_watch_item = |item: &serde_json::Value| -> Result<String> {
+                    if item
+                        .get("watcher_id")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .is_some_and(|value| !value.is_empty())
+                    {
+                        return Ok("existing watcher".to_string());
+                    }
+                    let desc = item
+                        .get("description")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("Missing watcher description"))?;
+                    for key in ["poll_action", "condition", "on_trigger"] {
+                        if item.get(key).is_none() {
+                            return Err(anyhow::anyhow!("Missing watcher `{}`", key));
+                        }
+                    }
+                    Ok(desc.to_string())
+                };
+                let desc = if let Some(items) = arguments.get("items") {
+                    let items = items
+                        .as_array()
+                        .filter(|items| !items.is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("watch.items must be a non-empty array"))?;
+                    let inheritable_keys = [
+                        "description",
+                        "poll_action",
+                        "poll_arguments",
+                        "condition",
+                        "on_trigger",
+                        "interval_secs",
+                        "timeout_secs",
+                        "timeout_hours",
+                        "timeout_days",
+                        "until_stopped",
+                        "notify_channel",
+                        "allow_duplicate",
+                        "validation",
+                        "max_attempts",
+                        "stall_timeout_secs",
+                        "retry_backoff_secs",
+                        "automation_policy",
+                    ];
+                    for (index, item) in items.iter().enumerate() {
+                        let Some(item_obj) = item.as_object() else {
+                            return Err(anyhow::anyhow!(
+                                "watch.items[{}] must be an object",
+                                index
+                            ));
+                        };
+                        let mut merged = serde_json::Map::new();
+                        for key in inheritable_keys {
+                            if let Some(value) = arguments.get(key) {
+                                merged.insert(key.to_string(), value.clone());
+                            }
+                        }
+                        for (key, value) in item_obj {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                        merged.remove("items");
+                        validate_watch_item(&serde_json::Value::Object(merged)).map_err(
+                            |error| anyhow::anyhow!("Invalid watch item {}: {}", index + 1, error),
+                        )?;
+                    }
+                    format!("Prepared {} watcher item(s)", items.len())
+                } else {
+                    validate_watch_item(arguments).unwrap_or_else(|_| "watcher".to_string())
+                };
                 Ok(format!(
                     "{}{}",
                     TOOL_COMPLETION_MARKER,
@@ -8791,7 +9303,7 @@ print(json.dumps({
                 ))
             }
             "manage_actions" => self.execute_manage_actions(arguments).await,
-            "agentark_inspect" => self.execute_agentark_inspect(arguments).await,
+            "ark_inspect" => self.execute_ark_inspect(arguments).await,
             "product_help_search" => self.execute_product_help_search(arguments).await,
             "list_integrations" => self.execute_list_integrations(arguments).await,
             "postgres_schema_inspect" => self.execute_postgres_schema_inspect(arguments).await,
@@ -9462,7 +9974,13 @@ print(result["text"])
                     .and_then(|value| value.as_str())
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("notify_user requires a non-empty `message`"))?;
+                    .ok_or_else(|| {
+                        crate::actions::structured_action_error(
+                            ActionErrorDomain::Channel,
+                            ActionErrorReason::MissingInput,
+                            "notify_user requires a non-empty `message`",
+                        )
+                    })?;
                 let title = arguments
                     .get("title")
                     .and_then(|value| value.as_str())
@@ -9473,6 +9991,16 @@ print(result["text"])
                 } else {
                     Ok(message.to_string())
                 }
+            }
+            // ArkOrbit (per-user limitless canvas)
+            "arkorbit_create_orbit" => {
+                let service = self.arkorbit_service()?;
+                let user_id = self.current_user_id()?.to_string();
+                crate::actions::arkorbit::create_orbit(&service, &user_id, arguments).await
+            }
+            "arkorbit_file_write" => {
+                let service = self.arkorbit_service()?;
+                crate::actions::arkorbit::orbit_file_write(&service, arguments).await
             }
             // Google Calendar actions
             "calendar_today" => {
@@ -9541,7 +10069,11 @@ print(result["text"])
                         ));
                     }
                 }
-                Err(anyhow::anyhow!("Unknown native action: {}", action_name))
+                Err(crate::actions::structured_action_error(
+                    ActionErrorDomain::Action,
+                    ActionErrorReason::NotFound,
+                    format!("Unknown native action: {}", action_name),
+                ))
             }
         }
     }
@@ -9784,7 +10316,6 @@ print(result["text"])
                             "id": conversation.id,
                             "title": conversation.title,
                             "channel": conversation.channel,
-                            "project_id": conversation.project_id,
                             "message_count": conversation.message_count,
                             "updated_at": conversation.updated_at,
                             "match_score": score,
@@ -9806,7 +10337,6 @@ print(result["text"])
                             "id": conversation.id,
                             "title": conversation.title,
                             "channel": conversation.channel,
-                            "project_id": conversation.project_id,
                             "message_count": conversation.message_count,
                             "updated_at": conversation.updated_at,
                             "match_score": score,
@@ -9956,21 +10486,22 @@ print(result["text"])
         config: &AgentConfig,
         provider: crate::integrations::media_gen::MediaProvider,
     ) -> String {
-        let explicit = config
-            .media_gen
-            .provider_base_urls
-            .iter()
-            .find_map(|(raw_provider, base_url)| {
-                let configured =
-                    crate::integrations::media_gen::MediaProvider::parse(raw_provider)?;
-                if configured == provider {
-                    let trimmed = base_url.trim().trim_end_matches('/');
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+        let explicit =
+            config
+                .media_gen
+                .provider_base_urls
+                .iter()
+                .find_map(|(raw_provider, base_url)| {
+                    let configured =
+                        crate::integrations::media_gen::MediaProvider::parse(raw_provider)?;
+                    if configured == provider {
+                        let trimmed = base_url.trim().trim_end_matches('/');
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
                     }
-                }
-                None
-            });
+                    None
+                });
         if let Some(base_url) = explicit {
             return base_url;
         }
@@ -9994,8 +10525,7 @@ print(result["text"])
                 return base_url;
             }
             if let crate::core::LlmProvider::OpenAI { base_url, .. } = &config.llm {
-                if crate::core::llm_provider::openai_provider_label(base_url.as_deref())
-                    == "openai"
+                if crate::core::llm_provider::openai_provider_label(base_url.as_deref()) == "openai"
                 {
                     if let Some(base_url) = base_url
                         .as_deref()
@@ -10892,46 +11422,8 @@ print(result["text"])
         }))?)
     }
 
-    async fn execute_agentark_inspect(&self, arguments: &serde_json::Value) -> Result<String> {
-        let storage = self.runtime_storage()?;
-        let surface = arguments
-            .get("surface")
-            .or_else(|| arguments.get("inspect_target"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("overview");
-        let limit = arguments
-            .get("limit")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(6)
-            .clamp(1, 24);
-        let trace_id = arguments.get("trace_id").and_then(|value| value.as_str());
-        let payload = match surface {
-            "overview" => serde_json::json!({
-                "surface": "overview",
-                "generated_at": chrono::Utc::now().to_rfc3339(),
-                "gateway_ops": self.inspect_gateway_ops_json(&storage, limit).await?,
-                "arkpulse": self.inspect_arkpulse_json(&storage, limit).await?,
-                "sentinel": self.inspect_sentinel_json(&storage, limit).await?,
-                "evolution": self.inspect_evolution_json(&storage, limit).await?,
-                "trace": self.inspect_trace_json(&storage, None, limit).await?,
-                "moltbook": self.inspect_moltbook_json(&storage, limit).await?,
-            }),
-            "gateway_ops" => self.inspect_gateway_ops_json(&storage, limit).await?,
-            "arkpulse" => self.inspect_arkpulse_json(&storage, limit).await?,
-            "sentinel" => self.inspect_sentinel_json(&storage, limit).await?,
-            "evolution" => self.inspect_evolution_json(&storage, limit).await?,
-            "trace" => self.inspect_trace_json(&storage, trace_id, limit).await?,
-            "moltbook" => self.inspect_moltbook_json(&storage, limit).await?,
-            other => {
-                anyhow::bail!(
-                    "Unknown AgentArk surface '{}'. Use overview, gateway_ops, arkpulse, sentinel, evolution, trace, or moltbook",
-                    other
-                )
-            }
-        };
-        Ok(serde_json::to_string_pretty(&payload)?)
+    async fn execute_ark_inspect(&self, arguments: &serde_json::Value) -> Result<String> {
+        ark_inspect::execute(self, arguments).await
     }
 
     async fn execute_postgres_schema_inspect(
@@ -12851,7 +13343,7 @@ print(result["text"])
         let sleep_ms = if jitter_ratio <= 0.0 {
             backoff_ms.max(25)
         } else {
-            use rand::Rng;
+            use rand::RngExt;
             let span = ((backoff_ms as f64) * jitter_ratio).round() as i64;
             if span <= 0 {
                 backoff_ms.max(25)
@@ -13432,7 +13924,7 @@ print(result["text"])
                     }
                 }
                 drop(actions); // Release lock before async call
-                // Fall back to native
+                               // Fall back to native
                 self.execute_native(action_name, arguments).await
             }
         }
@@ -16975,6 +17467,7 @@ required:{required_block}
                 query: query.clone(),
                 num_results: 5,
                 backend: None,
+                time_scope: None,
             };
             match crate::actions::search::execute_search(&args, &search_config).await {
                 Ok(results) => {
@@ -18281,12 +18774,10 @@ mod tests {
 
         assert_eq!(action.source, ActionSource::System);
         assert!(action.capabilities.iter().any(|cap| cap == "file_read"));
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "capability_inventory")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "capability_inventory"));
     }
 
     #[tokio::test]
@@ -18297,12 +18788,10 @@ mod tests {
         let action = action_def_by_name(&runtime, "manage_actions").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "skill_management")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "skill_management"));
     }
 
     #[tokio::test]
@@ -18335,11 +18824,9 @@ mod tests {
         let action = action_def_by_name(&runtime, "capability_acquire").await;
 
         assert_eq!(action.source, ActionSource::System);
-        assert!(
-            ActionRuntime::action_required_agent_permission_ids(&action)
-                .iter()
-                .any(|permission| permission == "capability_acquire")
-        );
+        assert!(ActionRuntime::action_required_agent_permission_ids(&action)
+            .iter()
+            .any(|permission| permission == "capability_acquire"));
     }
 
     #[tokio::test]
@@ -18408,16 +18895,12 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_command")
-        );
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_skills")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_skills"));
         assert_eq!(
             manager
                 .get_custom_secret(&integration_enabled_key("google_workspace"))
@@ -18435,41 +18918,27 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(!enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "calendar_create")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_workspace_gws_command")
-        );
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_workspace_gws_command"));
     }
 
     #[tokio::test]
@@ -18508,36 +18977,24 @@ mod tests {
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
         assert!(enabled.iter().any(|action| action.name == "gmail_reply"));
         assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "calendar_create")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "calendar_create"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
     }
 
     #[tokio::test]
@@ -18575,32 +19032,22 @@ mod tests {
         let enabled = runtime.list_enabled_actions().await.unwrap();
 
         assert!(enabled.iter().any(|action| action.name == "gmail_scan"));
-        assert!(
-            enabled
-                .iter()
-                .any(|action| action.name == "google_drive_search")
-        );
+        assert!(enabled
+            .iter()
+            .any(|action| action.name == "google_drive_search"));
         assert!(!enabled.iter().any(|action| action.name == "calendar_today"));
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_docs_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_sheets_read")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_chat_list_spaces")
-        );
-        assert!(
-            !enabled
-                .iter()
-                .any(|action| action.name == "google_admin_list_users")
-        );
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_docs_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_sheets_read"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_chat_list_spaces"));
+        assert!(!enabled
+            .iter()
+            .any(|action| action.name == "google_admin_list_users"));
     }
 
     #[tokio::test]
@@ -18715,6 +19162,7 @@ mod tests {
             task_queue: None,
             action_guard: None,
             storage: None,
+            current_user_id: None,
             mcp_registry: None,
             plugin_registry: None,
             extension_pack_registry: None,
@@ -18806,11 +19254,9 @@ version: "1.2.3"
         let reloaded = ActionRuntime::new(temp.path(), temp.path()).await.unwrap();
         reloaded.load_all_actions().await.unwrap();
         let reloaded_actions = reloaded.list_actions().await.unwrap();
-        assert!(
-            reloaded_actions
-                .iter()
-                .any(|action| action.name == "officecli")
-        );
+        assert!(reloaded_actions
+            .iter()
+            .any(|action| action.name == "officecli"));
     }
 
     #[tokio::test]
@@ -18894,6 +19340,32 @@ version: "1.2.3"
             .expect("action should exist")
     }
 
+    #[tokio::test]
+    async fn app_and_automation_action_contracts_separate_cadence_ownership() {
+        let runtime = runtime_for_authorization_tests().await;
+        let app_deploy = action_def_by_name(&runtime, "app_deploy").await;
+        let schedule_task = action_def_by_name(&runtime, "schedule_task").await;
+        let watch = action_def_by_name(&runtime, "watch").await;
+        let background_session_manage =
+            action_def_by_name(&runtime, "background_session_manage").await;
+
+        assert!(app_deploy
+            .description
+            .contains("implement that behavior inside the artifact"));
+        assert!(schedule_task
+            .description
+            .contains("cadence that belongs inside a generated app"));
+        assert!(watch
+            .description
+            .contains("inside a generated app, dashboard, page, or tool's own UI"));
+        assert!(background_session_manage
+            .description
+            .contains("durable AgentArk background session"));
+        assert!(background_session_manage
+            .description
+            .contains("not app-internal refresh/poll cadence"));
+    }
+
     fn trusted_chat_context(
         capability_context_id: &str,
         current_turn_is_explicit_approval: bool,
@@ -18938,12 +19410,10 @@ version: "1.2.3"
     async fn lan_discover_requires_explicit_approval_for_trusted_chat() {
         let runtime = runtime_for_authorization_tests().await;
         let action = action_def_by_name(&runtime, "lan_discover").await;
-        assert!(
-            action
-                .capabilities
-                .iter()
-                .any(|cap| cap == "local_network_discovery")
-        );
+        assert!(action
+            .capabilities
+            .iter()
+            .any(|cap| cap == "local_network_discovery"));
 
         let decision = runtime
             .authorize_action_invocation(
@@ -19198,11 +19668,9 @@ version: "1.2.3"
             .unapproved_permissions_for_action(&action, &ActionAuthorizationContext::default())
             .await;
 
-        assert!(
-            unapproved
-                .iter()
-                .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute))
-        );
+        assert!(unapproved
+            .iter()
+            .any(|perm| matches!(perm, crate::security::action_guard::Permission::CodeExecute)));
     }
 
     #[tokio::test]

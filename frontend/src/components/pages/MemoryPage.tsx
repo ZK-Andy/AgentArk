@@ -27,13 +27,6 @@ import { useMemo, useState } from "react";
 import { api } from "../../api/client";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import {
-  buildProjectNameById,
-  normalizeProjectId,
-  projectScopeLabel,
-  withProjectScope,
-  WorkspaceProjectScopeBar,
-} from "./projectScope";
-import {
   asRecord,
   errMessage,
   num,
@@ -162,8 +155,6 @@ function knowledgeDisplayTitle(item: JsonRecord | null | undefined): string {
 
 type MemoryPageProps = {
   autoRefresh: boolean;
-  projects: JsonRecord[];
-  activeProjectId: string;
   showHeader?: boolean;
   showScopeControls?: boolean;
   onNavigateToView?: (view: string, replace?: boolean) => void;
@@ -172,13 +163,12 @@ type MemoryPageProps = {
 
 export default function MemoryPage({
   autoRefresh,
-  projects,
-  activeProjectId,
   showHeader = true,
-  showScopeControls = true,
+  showScopeControls: _showScopeControls = true,
   onNavigateToView,
   onViewMemoryEvidence,
 }: MemoryPageProps) {
+  void onNavigateToView;
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [selectedFact, setSelectedFact] = useState<JsonRecord | null>(null);
@@ -199,12 +189,6 @@ export default function MemoryPage({
   const [knowledgeSource, setKnowledgeSource] = useState("");
   const [knowledgeUrl, setKnowledgeUrl] = useState("");
   const [knowledgeTags, setKnowledgeTags] = useState("");
-  const projectNameById = useMemo(
-    () => buildProjectNameById(projects),
-    [projects],
-  );
-  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
-
   const invalidateMemoryQueries = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["memory-stats"] }),
@@ -216,39 +200,28 @@ export default function MemoryPage({
   };
 
   const statsQ = useQuery({
-    queryKey: ["memory-stats", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/memory/stats", activeProjectId)),
+    queryKey: ["memory-stats"],
+    queryFn: () => api.rawGet("/memory/stats"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const factsQ = useQuery({
-    queryKey: ["memory-facts", activeProjectId],
-    queryFn: () =>
-      api.rawGet(withProjectScope("/memory/facts?limit=50", activeProjectId)),
+    queryKey: ["memory-facts"],
+    queryFn: () => api.rawGet("/memory/facts?limit=50"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const preferencesQ = useQuery({
-    queryKey: ["memory-preferences", activeProjectId],
-    queryFn: () =>
-      api.rawGet(
-        withProjectScope("/memory/preferences?limit=100", activeProjectId),
-      ),
+    queryKey: ["memory-preferences"],
+    queryFn: () => api.rawGet("/memory/preferences?limit=100"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const userDataQ = useQuery({
-    queryKey: ["memory-user-data", activeProjectId],
-    queryFn: () =>
-      api.rawGet(
-        withProjectScope("/memory/user-data?limit=100", activeProjectId),
-      ),
+    queryKey: ["memory-user-data"],
+    queryFn: () => api.rawGet("/memory/user-data?limit=100"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
   const knowledgeQ = useQuery({
-    queryKey: ["memory-knowledge", activeProjectId],
-    queryFn: () =>
-      api.rawGet(
-        withProjectScope("/memory/knowledge?limit=100", activeProjectId),
-      ),
+    queryKey: ["memory-knowledge"],
+    queryFn: () => api.rawGet("/memory/knowledge?limit=100"),
     refetchInterval: autoRefresh ? REFRESH_MS : false,
   });
 
@@ -343,25 +316,8 @@ export default function MemoryPage({
         <WorkspacePageHeader
           eyebrow="Data"
           title="Memory"
-          description={
-            showScopeControls
-              ? `Review remembered facts, preferences, user data, and knowledge for ${activeScopeLabel}.`
-              : "Review remembered facts, preferences, user data, and knowledge."
-          }
+          description="Review remembered facts, preferences, user data, and knowledge."
         />
-      ) : null}
-      {showScopeControls ? (
-        <>
-          <WorkspaceProjectScopeBar
-            activeProjectId={activeProjectId}
-            projects={projects}
-            onNavigateToView={onNavigateToView}
-          />
-          <Alert severity="info">
-            Showing memory for {activeScopeLabel}. New entries inherit this
-            scope automatically.
-          </Alert>
-        </>
       ) : null}
       {/* -- Compact stat row -- */}
       <Box
@@ -457,9 +413,7 @@ export default function MemoryPage({
                 color: "text.secondary",
               }}
             >
-              {activeProjectId
-                ? "No facts in this project yet."
-                : "No facts yet."}
+              No facts yet.
             </Typography>
           ) : (
             <TableContainer className="table-shell">
@@ -597,7 +551,6 @@ export default function MemoryPage({
                           ? parsedConfidence
                           : 0.85,
                         source: prefSource.trim() || undefined,
-                        project_id: activeProjectId || undefined,
                       });
                       setPrefKey("");
                       setPrefValue("");
@@ -632,9 +585,7 @@ export default function MemoryPage({
                   color: "text.secondary",
                 }}
               >
-                {activeProjectId
-                  ? "No preferences in this project yet."
-                  : "No preferences yet."}
+                No preferences yet.
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -645,7 +596,6 @@ export default function MemoryPage({
                       <TableCell>Value</TableCell>
                       <TableCell>Confidence</TableCell>
                       <TableCell>Source</TableCell>
-                      <TableCell>Scope</TableCell>
                       <TableCell>Updated</TableCell>
                       <TableCell align="right">Ops</TableCell>
                     </TableRow>
@@ -653,17 +603,9 @@ export default function MemoryPage({
                   <TableBody>
                     {preferences.map((pref, idx) => {
                       const key = str(pref.key, String(idx));
-                      const projectId =
-                        typeof pref.project_id === "string"
-                          ? pref.project_id
-                          : "";
-                      const endpoint = projectId
-                        ? `/memory/preferences/${encodeURIComponent(key)}?project_id=${encodeURIComponent(projectId)}`
-                        : `/memory/preferences/${encodeURIComponent(key)}`;
+                      const endpoint = `/memory/preferences/${encodeURIComponent(key)}`;
                       return (
-                        <TableRow
-                          key={`${projectId || "global"}-${key}-${idx}`}
-                        >
+                        <TableRow key={`${key}-${idx}`}>
                           <TableCell sx={{ whiteSpace: "nowrap" }}>
                             {key}
                           </TableCell>
@@ -680,11 +622,6 @@ export default function MemoryPage({
                             {num(pref.confidence, 0).toFixed(2)}
                           </TableCell>
                           <TableCell>{str(pref.source, "-")}</TableCell>
-                          <TableCell>
-                            {projectId
-                              ? projectScopeLabel(projectId, projectNameById)
-                              : "Global"}
-                          </TableCell>
                           <TableCell
                             sx={{ whiteSpace: "nowrap" }}
                             title={humanTs(str(pref.updated_at, "-")).tip}
@@ -796,7 +733,6 @@ export default function MemoryPage({
                         title: dataTitle.trim(),
                         content: dataContent.trim(),
                         url: dataUrl.trim() || undefined,
-                        project_id: activeProjectId || undefined,
                       });
                       setDataKind("note");
                       setDataTitle("");
@@ -832,9 +768,7 @@ export default function MemoryPage({
                   color: "text.secondary",
                 }}
               >
-                {activeProjectId
-                  ? "No user data items in this project yet."
-                  : "No user data items yet."}
+                No user data items yet.
               </Typography>
             ) : (
               <TableContainer className="table-shell">
@@ -845,7 +779,6 @@ export default function MemoryPage({
                       <TableCell>Title</TableCell>
                       <TableCell>Content</TableCell>
                       <TableCell>URL</TableCell>
-                      <TableCell>Scope</TableCell>
                       <TableCell>Updated</TableCell>
                       <TableCell align="right">Ops</TableCell>
                     </TableRow>
@@ -853,7 +786,6 @@ export default function MemoryPage({
                   <TableBody>
                     {userDataItems.map((item, idx) => {
                       const id = str(item.id, String(idx));
-                      const projectId = normalizeProjectId(item.project_id);
                       const url = str(item.url, "");
                       return (
                         <TableRow key={id}>
@@ -901,11 +833,6 @@ export default function MemoryPage({
                                 -
                               </Typography>
                             )}
-                          </TableCell>
-                          <TableCell>
-                            {projectId
-                              ? projectScopeLabel(projectId, projectNameById)
-                              : "Global"}
                           </TableCell>
                           <TableCell
                             sx={{ whiteSpace: "nowrap" }}
@@ -1034,7 +961,6 @@ export default function MemoryPage({
                         source: knowledgeSource.trim() || undefined,
                         url: knowledgeUrl.trim() || undefined,
                         tags: knowledgeTags.trim() || undefined,
-                        project_id: activeProjectId || undefined,
                       });
                       setKnowledgeTitle("");
                       setKnowledgeContent("");
@@ -1071,17 +997,14 @@ export default function MemoryPage({
                   color: "text.secondary",
                 }}
               >
-                {activeProjectId
-                  ? "No knowledge items in this project yet."
-                  : "No knowledge items yet."}
+                No knowledge items yet.
               </Typography>
             ) : (
               <TableContainer className="table-shell">
                 <Table size="small" sx={{ tableLayout: "fixed" }}>
                   <TableHead>
                     <TableRow>
-                      <TableCell sx={{ width: "56%" }}>Item</TableCell>
-                      <TableCell sx={{ width: 140 }}>Scope</TableCell>
+                      <TableCell sx={{ width: "68%" }}>Item</TableCell>
                       <TableCell sx={{ width: 140 }}>Updated</TableCell>
                       <TableCell align="right" sx={{ width: 64 }}>
                         Ops
@@ -1091,7 +1014,6 @@ export default function MemoryPage({
                   <TableBody>
                     {knowledgeItems.map((item, idx) => {
                       const id = str(item.id, String(idx));
-                      const projectId = normalizeProjectId(item.project_id);
                       const title = knowledgeDisplayTitle(item);
                       const content = str(item.content, "-");
                       const source = knowledgeSourceLabel(item);
@@ -1175,11 +1097,6 @@ export default function MemoryPage({
                                 </Typography>
                               ) : null}
                             </Stack>
-                          </TableCell>
-                          <TableCell>
-                            {projectId
-                              ? projectScopeLabel(projectId, projectNameById)
-                              : "Global"}
                           </TableCell>
                           <TableCell
                             sx={{ whiteSpace: "nowrap" }}
@@ -1324,17 +1241,6 @@ export default function MemoryPage({
               useFlexGap
               sx={{ flexWrap: "wrap" }}
             >
-              <Chip
-                size="small"
-                label={
-                  normalizeProjectId(selectedKnowledge?.project_id)
-                    ? projectScopeLabel(
-                        normalizeProjectId(selectedKnowledge?.project_id),
-                        projectNameById,
-                      )
-                    : "Global"
-                }
-              />
               {selectedKnowledgeSource ? (
                 <Chip size="small" variant="outlined" label={selectedKnowledgeSource} />
               ) : null}

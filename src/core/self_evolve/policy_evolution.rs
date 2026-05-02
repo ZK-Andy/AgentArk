@@ -16,64 +16,51 @@ const LINEAGE_ARCHIVE_REL_PATH: &str = ".agentark/self_evolve/routing_policy_lin
 const BENCHMARK_PROFILE_JSON: &str = include_str!("benchmarks/routing_benchmark_v1.json");
 const DEFAULT_RECENT_LINEAGE_LIMIT: usize = 12;
 const MAX_LINEAGE_ARCHIVE_ENTRIES: usize = 400;
-const MAX_INDICATORS: usize = 96;
-const MAX_INDICATOR_LEN: usize = 80;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingComplexityPolicy {
-    pub complex_indicators: Vec<String>,
-    pub medium_indicators: Vec<String>,
+    pub complex_score_threshold: f32,
+    pub medium_score_threshold: f32,
     pub long_question_word_threshold: usize,
     pub long_message_word_threshold: usize,
     pub multi_sentence_threshold: usize,
+    pub multi_line_threshold: usize,
+    pub code_block_weight: f32,
+    pub list_shape_weight: f32,
 }
 
 impl Default for RoutingComplexityPolicy {
     fn default() -> Self {
         Self {
-            complex_indicators: vec![
-                "research".to_string(),
-                "investigate".to_string(),
-                "analyze and".to_string(),
-                "compare and".to_string(),
-                "write a report".to_string(),
-                "write an article".to_string(),
-                "comprehensive".to_string(),
-                "step by step".to_string(),
-                "multiple".to_string(),
-                "all of".to_string(),
-                "each of".to_string(),
-            ],
-            medium_indicators: vec![
-                "explain".to_string(),
-                "why".to_string(),
-                "how does".to_string(),
-                "what is the difference".to_string(),
-                "should i".to_string(),
-                "which is better".to_string(),
-                "pros and cons".to_string(),
-                "analyze".to_string(),
-                "evaluate".to_string(),
-                "recommend".to_string(),
-                "suggest".to_string(),
-                "help me understand".to_string(),
-                "clarify".to_string(),
-                "create a".to_string(),
-                "build a".to_string(),
-                "develop".to_string(),
-                "implement".to_string(),
-                "design".to_string(),
-                "make a".to_string(),
-                "deploy".to_string(),
-                "generate".to_string(),
-                "send".to_string(),
-                "check".to_string(),
-                "fix".to_string(),
-            ],
+            complex_score_threshold: 0.68,
+            medium_score_threshold: 0.18,
             long_question_word_threshold: 50,
             long_message_word_threshold: 30,
             multi_sentence_threshold: 3,
+            multi_line_threshold: 4,
+            code_block_weight: 0.18,
+            list_shape_weight: 0.22,
         }
+    }
+}
+
+pub fn routing_complexity_policy_from_slice(raw: &[u8]) -> Result<RoutingComplexityPolicy> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).context("failed to parse routing complexity policy JSON")?;
+    let mut policy = RoutingComplexityPolicy::default();
+    apply_override(&mut policy, &value);
+    sanitize_policy(&mut policy);
+    Ok(policy)
+}
+
+pub fn classify_message_complexity(
+    policy: &RoutingComplexityPolicy,
+    message: &str,
+) -> crate::core::agent::QueryComplexity {
+    match classify_complexity(policy, message) {
+        ComplexityLabel::Simple => crate::core::agent::QueryComplexity::Simple,
+        ComplexityLabel::Medium => crate::core::agent::QueryComplexity::Medium,
+        ComplexityLabel::Complex => crate::core::agent::QueryComplexity::Complex,
     }
 }
 
@@ -141,7 +128,7 @@ impl PolicyEvolutionEngine {
 
         let recent_lineage = self.load_recent_lineage(DEFAULT_RECENT_LINEAGE_LIMIT).await;
         let mut candidates =
-            self.heuristic_candidates(user_request, &baseline_policy, &baseline_eval, &benchmark);
+            self.heuristic_candidates(&baseline_policy, &baseline_eval, &benchmark);
 
         if let Some(llm_candidate) = self
             .generate_llm_candidate(
@@ -304,9 +291,7 @@ impl PolicyEvolutionEngine {
     ) -> Result<RoutingComplexityPolicy> {
         let mut policy = RoutingComplexityPolicy::default();
         if let Some(raw) = current_policy_raw {
-            let value: serde_json::Value = serde_json::from_slice(raw)
-                .context("failed to parse stored routing complexity policy JSON")?;
-            apply_override(&mut policy, &value);
+            policy = routing_complexity_policy_from_slice(raw)?;
         }
         sanitize_policy(&mut policy);
         Ok(policy)
@@ -387,7 +372,6 @@ impl PolicyEvolutionEngine {
 
     fn heuristic_candidates(
         &self,
-        user_request: &str,
         baseline: &RoutingComplexityPolicy,
         baseline_eval: &PolicyEvaluation,
         benchmark: &[BenchmarkCase],
@@ -440,44 +424,19 @@ impl PolicyEvolutionEngine {
             });
         }
 
-        let mut keyword_candidate = baseline.clone();
-        let mut complex_tokens: Vec<String> = Vec::new();
-        let mut medium_tokens: Vec<String> = Vec::new();
-        for (case, expected, predicted) in misses {
-            if expected == ComplexityLabel::Complex && predicted != ComplexityLabel::Complex {
-                complex_tokens.extend(extract_keywords(&case.prompt, 5, 4));
-            } else if expected == ComplexityLabel::Medium && predicted == ComplexityLabel::Simple {
-                medium_tokens.extend(extract_keywords(&case.prompt, 5, 4));
-            }
+        for (delta, source) in [
+            (-0.08_f32, "heuristic-score-threshold-lower"),
+            (0.08_f32, "heuristic-score-threshold-raise"),
+        ] {
+            let mut score_candidate = baseline.clone();
+            score_candidate.complex_score_threshold += delta;
+            score_candidate.medium_score_threshold += delta / 2.0;
+            sanitize_policy(&mut score_candidate);
+            out.push(CandidatePolicy {
+                source: source.to_string(),
+                policy: score_candidate,
+            });
         }
-        append_unique_limited(
-            &mut keyword_candidate.complex_indicators,
-            &complex_tokens,
-            MAX_INDICATORS,
-        );
-        append_unique_limited(
-            &mut keyword_candidate.medium_indicators,
-            &medium_tokens,
-            MAX_INDICATORS,
-        );
-        sanitize_policy(&mut keyword_candidate);
-        out.push(CandidatePolicy {
-            source: "heuristic-failure-keywords".to_string(),
-            policy: keyword_candidate,
-        });
-
-        let mut request_candidate = baseline.clone();
-        let request_tokens = extract_keywords(user_request, 5, 8);
-        append_unique_limited(
-            &mut request_candidate.medium_indicators,
-            &request_tokens,
-            MAX_INDICATORS,
-        );
-        sanitize_policy(&mut request_candidate);
-        out.push(CandidatePolicy {
-            source: "heuristic-request-keywords".to_string(),
-            policy: request_candidate,
-        });
 
         out
     }
@@ -523,7 +482,7 @@ impl PolicyEvolutionEngine {
             .collect::<Vec<_>>()
             .join("; ");
         let user_prompt = format!(
-            "Target key: {}\nUser request: {}\nBaseline policy JSON:\n{}\n\nBaseline accuracy: {:.4}\nBaseline mismatches: {}\n\nRecent lineage:\n{}\n\nReturn ONLY one JSON object with optional keys: complex_indicators (array<string>), medium_indicators (array<string>), long_question_word_threshold (int), long_message_word_threshold (int), multi_sentence_threshold (int).\nConstraints: no empty strings, lowercase indicators, keep thresholds in safe ranges.",
+            "Target key: {}\nOperator request: {}\nBaseline policy JSON:\n{}\n\nBaseline accuracy: {:.4}\nBaseline mismatches: {}\n\nRecent lineage:\n{}\n\nReturn ONLY one JSON object with optional numeric keys: complex_score_threshold (0.1..1.0), medium_score_threshold (0.05..0.95), long_question_word_threshold (int), long_message_word_threshold (int), multi_sentence_threshold (int), multi_line_threshold (int), code_block_weight (0.0..0.5), list_shape_weight (0.0..0.5). Do not return phrase lists, keywords, or examples.",
             ROUTING_COMPLEXITY_POLICY_KEY,
             user_request,
             serde_json::to_string_pretty(baseline).ok()?,
@@ -663,29 +622,87 @@ fn evaluate_policy(policy: &RoutingComplexityPolicy, cases: &[BenchmarkCase]) ->
 }
 
 fn classify_complexity(policy: &RoutingComplexityPolicy, message: &str) -> ComplexityLabel {
-    let msg_lower = message.to_ascii_lowercase();
-    let word_count = message.split_whitespace().count();
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return ComplexityLabel::Simple;
+    }
 
-    for indicator in &policy.complex_indicators {
-        if !indicator.is_empty() && msg_lower.contains(indicator) {
-            return ComplexityLabel::Complex;
-        }
+    let word_count = trimmed.split_whitespace().count();
+    let line_count = trimmed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let question_count = trimmed.matches('?').count();
+    let sentence_count =
+        trimmed.matches('.').count() + trimmed.matches('?').count() + trimmed.matches('!').count();
+    let clause_count =
+        trimmed.matches(',').count() + trimmed.matches(';').count() + trimmed.matches(':').count();
+    let list_item_count = trimmed
+        .lines()
+        .filter(|line| line_has_list_shape(line))
+        .count();
+    let code_block_count = trimmed.matches("```").count() / 2;
+
+    let question_score = if question_count > 0 {
+        scaled_sqrt_score(word_count, policy.long_question_word_threshold)
+    } else {
+        0.0
+    };
+    let length_score = scaled_sqrt_score(word_count, policy.long_message_word_threshold);
+    let sentence_score = scaled_linear_score(sentence_count, policy.multi_sentence_threshold);
+    let line_score = scaled_linear_score(line_count, policy.multi_line_threshold);
+    let clause_score = scaled_linear_score(clause_count, 3) * 0.15;
+    let list_score = scaled_linear_score(list_item_count, policy.multi_line_threshold)
+        * policy.list_shape_weight;
+    let code_score = if code_block_count > 0 {
+        policy.code_block_weight
+    } else {
+        0.0
+    };
+    let score = (question_score
+        .max(length_score)
+        .max(sentence_score)
+        .max(line_score)
+        + clause_score
+        + list_score
+        + code_score)
+        .min(1.0);
+
+    if score >= policy.complex_score_threshold {
+        ComplexityLabel::Complex
+    } else if score >= policy.medium_score_threshold {
+        ComplexityLabel::Medium
+    } else {
+        ComplexityLabel::Simple
     }
-    if word_count > policy.long_question_word_threshold && msg_lower.contains('?') {
-        return ComplexityLabel::Complex;
+}
+
+fn scaled_sqrt_score(value: usize, threshold: usize) -> f32 {
+    if value == 0 {
+        return 0.0;
     }
-    for indicator in &policy.medium_indicators {
-        if !indicator.is_empty() && msg_lower.contains(indicator) {
-            return ComplexityLabel::Medium;
-        }
+    ((value as f32) / (threshold.max(1) as f32)).sqrt().min(1.0)
+}
+
+fn scaled_linear_score(value: usize, threshold: usize) -> f32 {
+    if value == 0 {
+        return 0.0;
     }
-    let sentence_count = message.matches('.').count() + message.matches('?').count();
-    if sentence_count >= policy.multi_sentence_threshold
-        || word_count > policy.long_message_word_threshold
-    {
-        return ComplexityLabel::Medium;
+    ((value as f32) / (threshold.max(1) as f32)).min(1.0)
+}
+
+fn line_has_list_shape(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
     }
-    ComplexityLabel::Simple
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 || digit_count + 1 >= trimmed.len() {
+        return false;
+    }
+    let rest = &trimmed[digit_count..];
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('.' | ')')) && chars.next().is_some_and(char::is_whitespace)
 }
 
 fn paired_stats(baseline: &PolicyEvaluation, candidate: &PolicyEvaluation) -> PairedStats {
@@ -799,21 +816,11 @@ fn apply_override(policy: &mut RoutingComplexityPolicy, raw: &serde_json::Value)
         return;
     };
 
-    if let Some(v) = obj.get("complex_indicators").and_then(|v| v.as_array()) {
-        policy.complex_indicators = v
-            .iter()
-            .filter_map(|item| item.as_str())
-            .map(normalize_indicator)
-            .filter(|s| !s.is_empty())
-            .collect();
+    if let Some(v) = obj.get("complex_score_threshold").and_then(|v| v.as_f64()) {
+        policy.complex_score_threshold = v.clamp(0.10, 1.0) as f32;
     }
-    if let Some(v) = obj.get("medium_indicators").and_then(|v| v.as_array()) {
-        policy.medium_indicators = v
-            .iter()
-            .filter_map(|item| item.as_str())
-            .map(normalize_indicator)
-            .filter(|s| !s.is_empty())
-            .collect();
+    if let Some(v) = obj.get("medium_score_threshold").and_then(|v| v.as_f64()) {
+        policy.medium_score_threshold = v.clamp(0.05, 0.95) as f32;
     }
     if let Some(v) = obj
         .get("long_question_word_threshold")
@@ -830,88 +837,28 @@ fn apply_override(policy: &mut RoutingComplexityPolicy, raw: &serde_json::Value)
     if let Some(v) = obj.get("multi_sentence_threshold").and_then(|v| v.as_u64()) {
         policy.multi_sentence_threshold = v.clamp(1, 50) as usize;
     }
+    if let Some(v) = obj.get("multi_line_threshold").and_then(|v| v.as_u64()) {
+        policy.multi_line_threshold = v.clamp(1, 80) as usize;
+    }
+    if let Some(v) = obj.get("code_block_weight").and_then(|v| v.as_f64()) {
+        policy.code_block_weight = v.clamp(0.0, 0.50) as f32;
+    }
+    if let Some(v) = obj.get("list_shape_weight").and_then(|v| v.as_f64()) {
+        policy.list_shape_weight = v.clamp(0.0, 0.50) as f32;
+    }
 }
 
 fn sanitize_policy(policy: &mut RoutingComplexityPolicy) {
-    policy.complex_indicators = policy
-        .complex_indicators
-        .iter()
-        .map(|s| normalize_indicator(s))
-        .filter(|s| !s.is_empty())
-        .take(MAX_INDICATORS)
-        .collect::<Vec<_>>();
-    dedup_stable(&mut policy.complex_indicators);
-
-    policy.medium_indicators = policy
-        .medium_indicators
-        .iter()
-        .map(|s| normalize_indicator(s))
-        .filter(|s| !s.is_empty())
-        .take(MAX_INDICATORS)
-        .collect::<Vec<_>>();
-    dedup_stable(&mut policy.medium_indicators);
-
+    policy.complex_score_threshold = policy.complex_score_threshold.clamp(0.10, 1.0);
+    policy.medium_score_threshold = policy
+        .medium_score_threshold
+        .clamp(0.05, policy.complex_score_threshold - 0.01);
     policy.long_question_word_threshold = policy.long_question_word_threshold.clamp(5, 1000);
     policy.long_message_word_threshold = policy.long_message_word_threshold.clamp(5, 1000);
     policy.multi_sentence_threshold = policy.multi_sentence_threshold.clamp(1, 50);
-}
-
-fn normalize_indicator(input: &str) -> String {
-    input
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .take(MAX_INDICATOR_LEN)
-        .collect()
-}
-
-fn dedup_stable(items: &mut Vec<String>) {
-    let mut seen = HashSet::new();
-    items.retain(|item| seen.insert(item.clone()));
-}
-
-fn append_unique_limited(target: &mut Vec<String>, additions: &[String], max_len: usize) {
-    let mut seen: HashSet<String> = target.iter().cloned().collect();
-    for item in additions {
-        let normalized = normalize_indicator(item);
-        if normalized.is_empty() {
-            continue;
-        }
-        if target.len() >= max_len {
-            break;
-        }
-        if seen.insert(normalized.clone()) {
-            target.push(normalized);
-        }
-    }
-}
-
-fn extract_keywords(text: &str, min_len: usize, max_items: usize) -> Vec<String> {
-    const STOPWORDS: &[&str] = &[
-        "about", "across", "after", "all", "also", "and", "any", "are", "because", "been",
-        "before", "between", "build", "could", "each", "from", "have", "into", "need", "next",
-        "only", "please", "should", "that", "their", "them", "then", "there", "these", "they",
-        "this", "those", "through", "under", "using", "with", "would", "your",
-    ];
-    let stop = STOPWORDS.iter().copied().collect::<HashSet<_>>();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for token in text
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| !t.is_empty())
-    {
-        let t = token.to_ascii_lowercase();
-        if t.len() < min_len || stop.contains(t.as_str()) || t.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        *counts.entry(t).or_insert(0) += 1;
-    }
-    let mut sorted = counts.into_iter().collect::<Vec<_>>();
-    sorted.sort_by(|(ak, av), (bk, bv)| bv.cmp(av).then_with(|| ak.cmp(bk)));
-    sorted
-        .into_iter()
-        .take(max_items)
-        .map(|(token, _)| token)
-        .collect()
+    policy.multi_line_threshold = policy.multi_line_threshold.clamp(1, 80);
+    policy.code_block_weight = policy.code_block_weight.clamp(0.0, 0.50);
+    policy.list_shape_weight = policy.list_shape_weight.clamp(0.0, 0.50);
 }
 
 fn parse_json_object(text: &str) -> Option<serde_json::Value> {

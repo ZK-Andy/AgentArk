@@ -419,13 +419,18 @@ impl Agent {
         &self,
         channel: &str,
         conversation_id: Option<&str>,
-        project_id: Option<&str>,
+        _project_id: Option<&str>,
         message_preview: &str,
     ) -> Result<(String, bool)> {
+        let project_id: Option<&str> = None;
+        let create_fresh_conversation_without_explicit_id = matches!(channel, "http" | "web");
+        if conversation_id.is_none() && create_fresh_conversation_without_explicit_id {
+            return Ok((uuid::Uuid::new_v4().to_string(), true));
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
         let scope = self.conversation_scope_mode().await;
         let conv_key = scope.conversation_key(channel, project_id);
-        let create_fresh_conversation_without_explicit_id = matches!(channel, "http" | "web");
 
         let create_conversation = |id: String| crate::storage::entities::conversation::Model {
             id: id.clone(),
@@ -438,15 +443,6 @@ impl Agent {
             archived: false,
             starred: false,
         };
-
-        let stored_id = self
-            .storage
-            .get(&conv_key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .filter(|id| !id.is_empty());
 
         if let Some(cid) = conversation_id {
             let is_new = match self.storage.get_conversation(cid).await {
@@ -467,6 +463,14 @@ impl Agent {
         }
 
         if !create_fresh_conversation_without_explicit_id {
+            let stored_id = self
+                .storage
+                .get(&conv_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|id| !id.is_empty());
             if let Some(id) = stored_id {
                 match self.storage.get_conversation(&id).await {
                     Ok(Some(existing)) => {
@@ -481,9 +485,11 @@ impl Agent {
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
-        let conv = create_conversation(new_id.clone());
-        let _ = self.storage.create_conversation(&conv).await;
-        if !create_fresh_conversation_without_explicit_id {
+        if create_fresh_conversation_without_explicit_id {
+            return Ok((new_id, true));
+        } else {
+            let conv = create_conversation(new_id.clone());
+            let _ = self.storage.create_conversation(&conv).await;
             let _ = self.storage.set(&conv_key, new_id.as_bytes()).await;
         }
         Ok((new_id, true))
@@ -493,12 +499,12 @@ impl Agent {
         &self,
         channel: &str,
         conversation_id: Option<&str>,
-        project_id: Option<&str>,
+        _project_id: Option<&str>,
         message_preview: &str,
     ) -> Result<String> {
         let preview = safe_truncate(message_preview, 80);
         let (conversation_id, _) = self
-            .resolve_conversation_id(channel, conversation_id, project_id, &preview)
+            .resolve_conversation_id(channel, conversation_id, None, &preview)
             .await?;
         Ok(conversation_id)
     }
@@ -645,7 +651,7 @@ impl Agent {
                                 summary: "Recently deployed app in this conversation".to_string(),
                                 url: legacy.url,
                                 related_actions: vec![
-                                    "app_inspect".to_string(),
+                                    "ark_inspect".to_string(),
                                     "file_read".to_string(),
                                     "file_write".to_string(),
                                     "app_restart".to_string(),
@@ -690,6 +696,27 @@ impl Agent {
         fresh
     }
 
+    pub(super) fn conversation_artifacts_for_prompt(
+        recent_artifacts: &[ConversationArtifactContext],
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        recent_artifacts
+            .iter()
+            .take(limit)
+            .map(|artifact| {
+                serde_json::json!({
+                    "artifact_type": artifact.artifact_type,
+                    "artifact_id": artifact.artifact_id,
+                    "title": artifact.title,
+                    "summary": artifact.summary,
+                    "url": artifact.url,
+                    "related_actions": artifact.related_actions,
+                    "updated_at": artifact.updated_at,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) async fn persist_last_deployed_app_context(
         &self,
         conversation_id: &str,
@@ -722,7 +749,7 @@ impl Agent {
                 title,
                 summary: "Recently deployed app in this conversation",
                 url: Some(url),
-                related_actions: &["app_inspect", "file_read", "file_write", "app_restart"],
+                related_actions: &["ark_inspect", "file_read", "file_write", "app_restart"],
             },
         )
         .await;

@@ -9,7 +9,6 @@ import {
   Button,
   ButtonBase,
   Checkbox,
-  Chip,
   CircularProgress,
   Collapse,
   Dialog,
@@ -74,13 +73,13 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type CSSProperties,
   type DragEvent,
   type JSX,
   type MouseEvent,
   type ReactNode,
 } from "react";
-import ReactECharts from "echarts-for-react";
 import { api, apiUrl } from "../../api/client";
 import AgentLogo from "../../assets/logo.svg";
 import { MetricBarCard } from "../analytics/MetricBarCard";
@@ -131,7 +130,17 @@ import type {
   TraceOperationalEvent,
   TraceSummary,
 } from "../../types";
-import { useUiStore } from "../../store/uiStore";
+import { ComputerPane } from "../chat";
+import {
+  InlineAgentArkChart,
+  isAgentArkChartFence,
+} from "../chat/InlineAgentArkChart";
+import { guessCodeLanguage, renderCodeBlockLines } from "../chat/codeHighlight";
+
+// Chat layout mode: "split" runs the prose+action-row chat with a focused
+// Computer pane on the right. "classic" keeps the original inline timeline
+// view. Flip to "classic" to instantly revert if the new layout regresses.
+const CHAT_LAYOUT_MODE: "split" | "classic" = "split";
 
 const REFRESH_MS = 8000;
 const EVOLUTION_DEV_QUERY_LIMIT = 250;
@@ -159,7 +168,7 @@ const CHAT_PENDING_STREAM_STEPS_MAX = 48;
 const CHAT_STREAMING_STEPS_UI_MAX = 240;
 const CHAT_STREAMING_STEP_FLUSH_MS = 180;
 const CHAT_PENDING_RUN_SNAPSHOT_FLUSH_MS = 1200;
-const CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS = 1800;
+const CHAT_WORKSPACE_SNAPSHOT_FLUSH_MS = 300;
 const CHAT_TRACE_STATE_CACHE_MAX = 24;
 const CHAT_PROGRESS_MEMORY_MAX_CONVERSATIONS = 12;
 const CHAT_PENDING_RUN_RECOVERY_GRACE_MS = 12_000;
@@ -217,7 +226,6 @@ type ChatTurnAttachment = {
 type ChatPendingRunSnapshot = {
   conversationId: string;
   message: string;
-  projectId: string;
   startedAt: number;
   initialMessageCount?: number;
   runId?: string;
@@ -245,7 +253,6 @@ type ChatWorkspaceSnapshot = {
 type ChatLaunchRunDetail = {
   message: string;
   conversationId?: string;
-  projectId?: string;
   taskId?: string;
   launchMode?: "message" | "resume_task";
   navigateToChat?: boolean;
@@ -259,7 +266,6 @@ type ChatPendingLaunch = {
   launchMode: "message" | "resume_task";
   message?: string;
   conversationId?: string;
-  projectId?: string;
   taskId?: string;
   source?: string;
 };
@@ -413,302 +419,6 @@ type StreamPhaseStatus = {
   planStepId: number | null;
   planStepTitle: string;
 };
-
-type CodeLanguage =
-  | "markup"
-  | "script"
-  | "css"
-  | "json"
-  | "python"
-  | "sql"
-  | "shell"
-  | "markdown"
-  | "config"
-  | "text";
-
-type CodeToken = {
-  text: string;
-  className?: string;
-};
-
-function guessCodeLanguage(fileName = "", content = ""): CodeLanguage {
-  const normalizedName = fileName.trim().toLowerCase();
-  if (/\.(html?|xml|svg)$/.test(normalizedName)) return "markup";
-  if (/\.(css|scss|less)$/.test(normalizedName)) return "css";
-  if (/\.(json)$/.test(normalizedName)) return "json";
-  if (/\.(py|pyw)$/.test(normalizedName)) return "python";
-  if (/\.(sql)$/.test(normalizedName)) return "sql";
-  if (/\.(sh|bash|zsh|fish|ps1)$/.test(normalizedName)) return "shell";
-  if (/\.(md|markdown)$/.test(normalizedName)) return "markdown";
-  if (/\.(ya?ml|toml|ini|env)$/.test(normalizedName)) return "config";
-  if (
-    /\.(js|jsx|ts|tsx|mjs|cjs|java|kt|go|rs|php|rb|c|cc|cpp|cs)$/.test(
-      normalizedName,
-    )
-  ) {
-    return "script";
-  }
-
-  const trimmed = content.trim();
-  if (!trimmed) return "text";
-  if (
-    trimmed.startsWith("<!DOCTYPE") ||
-    trimmed.startsWith("<html") ||
-    /^<[\w-]+/.test(trimmed)
-  )
-    return "markup";
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
-  if (/^\s*#\s/.test(trimmed) || /^\s*[-*+]\s/.test(trimmed)) return "markdown";
-  if (/^\s*(def |class |import |from )/.test(trimmed)) return "python";
-  if (
-    /^\s*SELECT\b|^\s*WITH\b|^\s*INSERT\b|^\s*UPDATE\b|^\s*CREATE\b/i.test(
-      trimmed,
-    )
-  )
-    return "sql";
-  if (/^\s*(const |let |var |function |import |export )/.test(trimmed))
-    return "script";
-  return "text";
-}
-
-function tokenizeByPattern(
-  line: string,
-  pattern: RegExp,
-  classify: (value: string) => string | undefined,
-): CodeToken[] {
-  const tokens: CodeToken[] = [];
-  let lastIndex = 0;
-  pattern.lastIndex = 0;
-  for (const match of line.matchAll(pattern)) {
-    const value = match[0];
-    const start = match.index ?? 0;
-    if (start > lastIndex) {
-      tokens.push({ text: line.slice(lastIndex, start) });
-    }
-    tokens.push({ text: value, className: classify(value) });
-    lastIndex = start + value.length;
-  }
-  if (lastIndex < line.length) {
-    tokens.push({ text: line.slice(lastIndex) });
-  }
-  return tokens.length > 0 ? tokens : [{ text: line }];
-}
-
-function highlightMarkupLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /<!--.*?-->|<\/?[A-Za-z][\w:-]*|\/?>|[A-Za-z_:][-A-Za-z0-9_:.]*(?==)|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g,
-    (value) => {
-      if (value.startsWith("<!--")) return "comment";
-      if (
-        value.startsWith("</") ||
-        value.startsWith("<") ||
-        value === "/>" ||
-        value === ">"
-      )
-        return "tag";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      return "attr";
-    },
-  );
-}
-
-function highlightCssLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /\/\*.*?\*\/|@[A-Za-z-]+|--?[\w-]+(?=\s*:)|#[0-9a-fA-F]{3,8}\b|\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%|s|ms|deg)?\b|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{}():;,.]/g,
-    (value) => {
-      if (value.startsWith("/*")) return "comment";
-      if (value.startsWith("@")) return "keyword";
-      if (value.startsWith("--") || /^[A-Za-z-]+$/.test(value)) return "attr";
-      if (value.startsWith("#")) return "number";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      if (/^\d/.test(value)) return "number";
-      return "punctuation";
-    },
-  );
-}
-
-function highlightJsonLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b|[{}\[\],:]/g,
-    (value) => {
-      if (value.startsWith('"')) return value.endsWith(":") ? "attr" : "string";
-      if (/^(true|false|null)$/.test(value)) return "keyword";
-      if (/^-?\d/.test(value)) return "number";
-      return "punctuation";
-    },
-  );
-}
-
-function highlightPythonLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:def|class|import|from|return|if|elif|else|for|while|try|except|finally|with|as|pass|break|continue|lambda|yield|async|await|True|False|None|in|is|and|or|not)\b|\b(?:print|len|range|dict|list|set|tuple|str|int|float|bool)\b|-?\b\d+(?:\.\d+)?\b/g,
-    (value) => {
-      if (value.startsWith("#")) return "comment";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      if (/^-?\d/.test(value)) return "number";
-      if (
-        /^(print|len|range|dict|list|set|tuple|str|int|float|bool)$/.test(value)
-      )
-        return "builtin";
-      return "keyword";
-    },
-  );
-}
-
-function highlightSqlLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /--.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:SELECT|FROM|WHERE|GROUP BY|ORDER BY|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|NULL|AS|LIMIT|OFFSET|WITH|UNION|DISTINCT)\b|-?\b\d+(?:\.\d+)?\b/gi,
-    (value) => {
-      if (value.startsWith("--")) return "comment";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      if (/^-?\d/.test(value)) return "number";
-      return "keyword";
-    },
-  );
-}
-
-function highlightShellLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\$(?:\w+|{[^}]+})|\b(?:if|then|else|fi|for|do|done|case|esac|export|sudo|echo|cd|ls|cat|grep|find|curl|npm|node|python|pip|cargo|git|docker)\b|-?\b\d+(?:\.\d+)?\b/g,
-    (value) => {
-      if (value.startsWith("#")) return "comment";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      if (value.startsWith("$")) return "builtin";
-      if (/^-?\d/.test(value)) return "number";
-      return "keyword";
-    },
-  );
-}
-
-function highlightMarkdownLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /^#{1,6}\s.*$|^\s*[-*+]\s.*$|`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)/g,
-    (value) => {
-      if (value.startsWith("#")) return "keyword";
-      if (/^\s*[-*+]\s/.test(value)) return "punctuation";
-      if (value.startsWith("`")) return "string";
-      if (
-        value.startsWith("[") ||
-        value.startsWith("**") ||
-        value.startsWith("__")
-      )
-        return "builtin";
-      return undefined;
-    },
-  );
-}
-
-function highlightConfigLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /#.*$|;.*$|[A-Za-z_][\w.-]*(?=\s*[:=])|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?\b/g,
-    (value) => {
-      if (value.startsWith("#") || value.startsWith(";")) return "comment";
-      if (value.startsWith('"') || value.startsWith("'")) return "string";
-      if (/^(true|false|null)$/i.test(value)) return "keyword";
-      if (/^-?\d/.test(value)) return "number";
-      return "attr";
-    },
-  );
-}
-
-function highlightScriptLine(line: string): CodeToken[] {
-  return tokenizeByPattern(
-    line,
-    /\/\/.*$|\/\*.*?\*\/|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|async|await|class|new|import|export|from|try|catch|finally|throw|extends|implements|interface|type|public|private|protected|static|readonly|true|false|null|undefined)\b|\b(?:document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)\b|=>|-?\b\d+(?:\.\d+)?\b/g,
-    (value) => {
-      if (value.startsWith("//") || value.startsWith("/*")) return "comment";
-      if (
-        value.startsWith('"') ||
-        value.startsWith("'") ||
-        value.startsWith("`")
-      )
-        return "string";
-      if (value === "=>") return "operator";
-      if (/^-?\d/.test(value)) return "number";
-      if (
-        /^(document|window|fetch|console|Math|Date|Promise|JSON|Array|Object|String|Number|Boolean|DOMParser|setTimeout|setInterval|clearTimeout|clearInterval)$/.test(
-          value,
-        )
-      ) {
-        return "builtin";
-      }
-      return "keyword";
-    },
-  );
-}
-
-function highlightCodeLine(line: string, language: CodeLanguage): CodeToken[] {
-  switch (language) {
-    case "markup":
-      return highlightMarkupLine(line);
-    case "css":
-      return highlightCssLine(line);
-    case "json":
-      return highlightJsonLine(line);
-    case "python":
-      return highlightPythonLine(line);
-    case "sql":
-      return highlightSqlLine(line);
-    case "shell":
-      return highlightShellLine(line);
-    case "markdown":
-      return highlightMarkdownLine(line);
-    case "config":
-      return highlightConfigLine(line);
-    case "script":
-      return highlightScriptLine(line);
-    default:
-      return [{ text: line }];
-  }
-}
-
-function renderCodeBlockLines(
-  content: string,
-  options?: {
-    fileName?: string;
-    startLine?: number;
-    activeLine?: number | null;
-  },
-): ReactNode[] {
-  const language = guessCodeLanguage(options?.fileName, content);
-  const startLine = options?.startLine ?? 1;
-  const activeLine = options?.activeLine ?? null;
-  return content.split(/\r?\n/).map((line, index) => {
-    const lineNumber = startLine + index;
-    const tokens = highlightCodeLine(line, language);
-    return (
-      <span
-        key={`${options?.fileName || "code"}-${lineNumber}`}
-        className={`code-line${activeLine === lineNumber ? " code-line-active" : ""}`}
-      >
-        <span className="code-line-number">{lineNumber}</span>
-        <span className="code-line-content">
-          {tokens.map((token, tokenIndex) => (
-            <span
-              key={`${lineNumber}-${tokenIndex}`}
-              className={
-                token.className
-                  ? `code-token code-token-${token.className}`
-                  : undefined
-              }
-            >
-              {token.text}
-            </span>
-          ))}
-        </span>
-        {"\n"}
-      </span>
-    );
-  });
-}
 
 const CODE_PREVIEW_LANGUAGE_LABELS: Record<string, string> = {
   bash: "Bash",
@@ -1021,6 +731,62 @@ type ExecutionPlanState = {
   summary: string;
   steps: ExecutionPlanItem[];
 };
+
+type TaskProgressState = {
+  done: number;
+  total: number;
+};
+
+function isTerminalPlanStatus(status: unknown): boolean {
+  return ["completed", "failed", "skipped"].includes(
+    str(status, "").trim().toLowerCase(),
+  );
+}
+
+function taskProgressFromExecutionPlan(
+  plan: ExecutionPlanState | null | undefined,
+): TaskProgressState | null {
+  const steps = plan?.steps || [];
+  if (steps.length === 0) return null;
+  return {
+    done: steps.filter((step) => isTerminalPlanStatus(step.status)).length,
+    total: steps.length,
+  };
+}
+
+function taskProgressFromActivityStep(step: JsonRecord): TaskProgressState | null {
+  const data = asRecord(step.data);
+  const progress = asRecord(data.progress);
+  const total = Math.max(
+    0,
+    num(progress.total, num(data.goal_count, num(data.total, 0))),
+  );
+  if (total <= 0) return null;
+  const done = Math.max(
+    0,
+    num(
+      progress.settled,
+      num(
+        data.settled_goal_count,
+        num(progress.completed, num(data.completed_goal_count, 0)),
+      ),
+    ),
+  );
+  return {
+    done: Math.min(done, total),
+    total,
+  };
+}
+
+function latestTaskProgressFromSteps(
+  steps: JsonRecord[],
+): TaskProgressState | null {
+  for (let idx = steps.length - 1; idx >= 0; idx -= 1) {
+    const progress = taskProgressFromActivityStep(steps[idx]);
+    if (progress) return progress;
+  }
+  return null;
+}
 
 type PlanConfirmationStage =
   | "planning"
@@ -1685,12 +1451,12 @@ export type WorkspaceView =
   | "arkmemory"
   | "sentinel"
   | "documents"
-  | "projects"
   | "swarm"
   | "trace"
   | "status"
   | "analytics"
   | "arkpulse"
+  | "arkorbit"
   | "search"
   | "settings";
 
@@ -1802,37 +1568,116 @@ function num(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function normalizeProjectId(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function withProjectScope(path: string, projectId: string): string {
-  const normalizedProjectId = normalizeProjectId(projectId);
-  if (!normalizedProjectId) return path;
-  const [pathname, rawSearch = ""] = path.split("?");
-  const params = new URLSearchParams(rawSearch);
-  params.set("project_id", normalizedProjectId);
-  const search = params.toString();
-  return search ? `${pathname}?${search}` : pathname;
-}
-
-function buildProjectNameById(projects: JsonRecord[]): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const project of projects) {
-    const id = normalizeProjectId(project.id);
-    if (!id) continue;
-    map.set(id, str(project.name, id));
+function luhnValidDigits(digits: string): boolean {
+  if (digits.length < 8 || !/^\d+$/.test(digits)) return false;
+  let sum = 0;
+  let double = false;
+  for (let idx = digits.length - 1; idx >= 0; idx -= 1) {
+    let value = Number(digits[idx]);
+    if (double) {
+      value *= 2;
+      if (value > 9) value -= 9;
+    }
+    sum += value;
+    double = !double;
   }
-  return map;
+  return sum % 10 === 0;
 }
 
-function projectScopeLabel(
-  projectId: string,
-  projectNameById: Map<string, string>,
+function hasNearbyShortNumericCode(
+  text: string,
+  start: number,
+  end: number,
+): boolean {
+  const proximity = 96;
+  const searchStart = Math.max(0, start - proximity);
+  const searchEnd = Math.min(text.length, end + proximity);
+  const nearby = text.slice(searchStart, searchEnd);
+  const shortCodePattern = /\b\d{3,4}\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = shortCodePattern.exec(nearby)) !== null) {
+    const codeStart = searchStart + match.index;
+    const codeEnd = codeStart + match[0].length;
+    if (codeEnd <= start || codeStart >= end) return true;
+  }
+  return false;
+}
+
+function maskRanges(
+  text: string,
+  ranges: Array<{ start: number; end: number }>,
+  replacement: string,
 ): string {
-  const normalizedProjectId = normalizeProjectId(projectId);
-  if (!normalizedProjectId) return "Global workspace";
-  return projectNameById.get(normalizedProjectId) || normalizedProjectId;
+  if (ranges.length === 0) return text;
+  const sorted = ranges
+    .filter((range) => range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const range of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && range.start <= last.end) {
+      last.end = Math.max(last.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  let cursor = 0;
+  let result = "";
+  for (const range of merged) {
+    result += text.slice(cursor, range.start);
+    result += replacement;
+    cursor = range.end;
+  }
+  return result + text.slice(cursor);
+}
+
+function maskPaymentLikeSequences(text: string): string {
+  const paymentNumberPattern = /\b\d(?:[\s.-]?\d){11,18}\b/g;
+  const shortCodePattern = /\b\d{3,4}\b/g;
+  const paymentRanges: Array<{ start: number; end: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = paymentNumberPattern.exec(text)) !== null) {
+    const value = match[0];
+    const digits = value.replace(/\D/g, "");
+    if (digits.length < 12 || digits.length > 19) continue;
+    const start = match.index;
+    const end = start + value.length;
+    if (luhnValidDigits(digits) || hasNearbyShortNumericCode(text, start, end)) {
+      paymentRanges.push({ start, end });
+    }
+  }
+  if (paymentRanges.length === 0) return text;
+  const ranges = [...paymentRanges];
+  while ((match = shortCodePattern.exec(text)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (
+      paymentRanges.some(
+        (range) => end >= range.start - 96 && start <= range.end + 96,
+      )
+    ) {
+      ranges.push({ start, end });
+    }
+  }
+  return maskRanges(text, ranges, "[PAYMENT_DATA]");
+}
+
+function maskSensitiveChatPreview(text: string): string {
+  let result = maskPaymentLikeSequences(text);
+  result = result.replace(
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
+    "[EMAIL]",
+  );
+  result = result.replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]");
+  result = result.replace(
+    /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g,
+    "[IP]",
+  );
+  result = result.replace(
+    /(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{4}/g,
+    "[PHONE]",
+  );
+  return result;
 }
 
 function boolText(value: unknown): string {
@@ -1876,7 +1721,6 @@ const WORKSPACE_METADATA_FIELD_NAMES = new Set([
   "conversation_id",
   "description",
   "entry_command",
-  "project_id",
   "runtime_mode",
   "session_id",
   "slug",
@@ -1964,6 +1808,29 @@ function normalizeWorkspaceFileName(pathOrName: unknown, appDir = ""): string {
   return normalized || raw;
 }
 
+function progressFileTargetPath(
+  payload: JsonRecord,
+  appDir: string,
+  fileName: string,
+): string {
+  const direct = str(
+    payload.target_path,
+    str(payload.absolute_path, str(payload.full_path, "")),
+  ).trim();
+  if (direct) return direct;
+  const appRoot = (appDir || "").trim().replace(/[\\/]+$/, "");
+  if (appRoot && fileName) return `${appRoot}/${fileName}`.replace(/\\/g, "/");
+  return fileName;
+}
+
+function progressLineLabel(lineNo: number, totalLines: number): string {
+  if (totalLines > 0) {
+    return `Line ${Math.min(lineNo, totalLines)}/${totalLines}`;
+  }
+  if (lineNo > 0) return `Line ${lineNo}`;
+  return "";
+}
+
 function mergeWorkspaceFiles(
   current: WorkspaceFileEntry[],
   incoming: WorkspaceFileEntry[],
@@ -2038,9 +1905,16 @@ function extractWorkspaceFilesFromStreamPayload(
     return filesValue
       .map((row) => {
         const entry = asRecord(row);
+        const content = choosePreferredWorkspaceFileContent(
+          str(
+            entry.content,
+            str(entry.text, str(entry.body, str(entry.file_content, ""))),
+          ),
+          str(entry.raw_content, ""),
+        );
         return {
           name: normalizeWorkspaceFileName(entry.path, appDir),
-          content: "",
+          content,
         };
       })
       .filter((file) => !!file.name);
@@ -2100,6 +1974,192 @@ function extractWorkspaceFilesFromStreamPayload(
       content: "",
     }))
     .filter((file) => !!file.name);
+}
+
+type WorkspaceStateFromActivitySteps = {
+  deployedFiles: WorkspaceFileEntry[];
+  liveFileWrites: Record<string, LiveFileWriteState>;
+  app: JsonRecord | null;
+};
+
+function mergeLiveFileWriteStates(
+  current: Record<string, LiveFileWriteState>,
+  incoming: Record<string, LiveFileWriteState>,
+  appDir = "",
+): Record<string, LiveFileWriteState> {
+  const next: Record<string, LiveFileWriteState> = { ...current };
+  for (const [rawName, state] of Object.entries(incoming)) {
+    const name = normalizeWorkspaceFileName(rawName, appDir);
+    if (!name || !isLikelyWorkspaceFileName(name)) continue;
+    const existing = next[name];
+    if (!existing) {
+      next[name] = {
+        content: choosePreferredWorkspaceFileContent("", state.content),
+        line: Math.max(0, state.line),
+        totalLines: Math.max(0, state.totalLines),
+        done: Boolean(state.done),
+      };
+      continue;
+    }
+    const content = choosePreferredWorkspaceFileContent(
+      existing.content,
+      state.content,
+    );
+    next[name] = {
+      content,
+      line: Math.max(existing.line, state.line),
+      totalLines: Math.max(existing.totalLines, state.totalLines),
+      done: existing.done || state.done,
+    };
+  }
+  return canonicalizeLiveFileWrites(next, appDir);
+}
+
+function liveFileWriteStateFromPayload(
+  payload: JsonRecord,
+  appDir: string,
+  existing: LiveFileWriteState | undefined,
+): { name: string; state: LiveFileWriteState } | null {
+  const kind = str(payload.kind, "").trim().toLowerCase();
+  const fileName = normalizeWorkspaceFileName(
+    payload.file ?? payload.path,
+    appDir,
+  );
+  if (!fileName || !isLikelyWorkspaceFileName(fileName)) return null;
+  if (
+    kind !== "draft_file" &&
+    kind !== "file_write" &&
+    !str(payload.content_snapshot, "") &&
+    !str(payload.content_delta, "") &&
+    !str(payload.text, "")
+  ) {
+    return null;
+  }
+
+  const snapshot = choosePreferredWorkspaceFileContent(
+    str(payload.content_snapshot, ""),
+    str(payload.file_content, str(payload.raw_content, "")),
+  );
+  const directContent = choosePreferredWorkspaceFileContent(
+    snapshot,
+    str(payload.content, ""),
+  );
+  const delta = str(payload.content_delta, "");
+  const text = str(payload.text, "");
+  const lineNo = Math.max(0, num(payload.line, 0));
+  const totalLines = Math.max(0, num(payload.total_lines, 0));
+  let content = existing?.content || "";
+  if (directContent) {
+    content = choosePreferredWorkspaceFileContent(content, directContent);
+  } else if (delta) {
+    content = `${content}${delta}`;
+  } else if (text) {
+    const currentLine = existing?.line ?? 0;
+    if (!existing || lineNo >= currentLine) {
+      content = `${content}${text}${text.endsWith("\n") ? "" : "\n"}`;
+    }
+  }
+  const contentLines = content ? content.split(/\r?\n/).length : 0;
+  const nextTotalLines = Math.max(existing?.totalLines ?? 0, totalLines, contentLines);
+  const nextLine = Math.max(existing?.line ?? 0, lineNo, contentLines);
+  return {
+    name: fileName,
+    state: {
+      content,
+      line: nextLine,
+      totalLines: nextTotalLines,
+      done: toBool(payload.done) || (nextTotalLines > 0 && nextLine >= nextTotalLines),
+    },
+  };
+}
+
+function workspacePayloadCandidates(root: JsonRecord): JsonRecord[] {
+  const out: JsonRecord[] = [];
+  const push = (value: JsonRecord) => {
+    if (Object.keys(value).length === 0) return;
+    if (out.includes(value)) return;
+    out.push(value);
+  };
+  push(root);
+  push(asRecord(root.payload));
+  push(asRecord(root.arguments));
+  push(asRecord(root.args));
+  push(asRecord(root.matched_app));
+  return out;
+}
+
+function payloadToolName(root: JsonRecord, candidate: JsonRecord): string {
+  return str(
+    candidate.tool_name,
+    str(
+      candidate.name,
+      str(
+        candidate.action_name,
+        str(root.tool_name, str(root.name, str(root.action_name, ""))),
+      ),
+    ),
+  ).trim();
+}
+
+function workspaceStateFromActivitySteps(
+  steps: JsonRecord[],
+): WorkspaceStateFromActivitySteps {
+  let deployedFiles: WorkspaceFileEntry[] = [];
+  let liveFileWrites: Record<string, LiveFileWriteState> = {};
+  let app: JsonRecord | null = null;
+  let appDir = "";
+
+  for (const step of steps) {
+    const root = activityDataRecord(step.data);
+    if (Object.keys(root).length === 0) continue;
+    for (const candidate of workspacePayloadCandidates(root)) {
+      const toolName = payloadToolName(root, candidate);
+      const capturedApp = extractWorkspaceAppFromStreamPayload(
+        toolName,
+        candidate,
+      );
+      if (capturedApp) {
+        app = { ...(app || {}), ...capturedApp };
+        appDir = str(capturedApp.app_dir, appDir);
+      }
+      const effectiveAppDir = appDir || str(app?.app_dir, "");
+      const capturedFiles = extractWorkspaceFilesFromStreamPayload(
+        toolName,
+        candidate,
+      );
+      if (capturedFiles.length > 0) {
+        deployedFiles = mergeWorkspaceFiles(
+          deployedFiles,
+          capturedFiles,
+          effectiveAppDir,
+        );
+      }
+      const liveWrite = liveFileWriteStateFromPayload(
+        candidate,
+        effectiveAppDir,
+        liveFileWrites[
+          normalizeWorkspaceFileName(candidate.file ?? candidate.path, effectiveAppDir)
+        ],
+      );
+      if (liveWrite) {
+        liveFileWrites = mergeLiveFileWriteStates(
+          liveFileWrites,
+          { [liveWrite.name]: liveWrite.state },
+          effectiveAppDir,
+        );
+      }
+    }
+  }
+
+  const finalAppDir = str(app?.app_dir, appDir);
+  const liveFiles = Object.entries(liveFileWrites)
+    .map(([name, state]) => ({ name, content: state.content }))
+    .filter((file) => !!file.name);
+  return {
+    deployedFiles: mergeWorkspaceFiles(deployedFiles, liveFiles, finalAppDir),
+    liveFileWrites: canonicalizeLiveFileWrites(liveFileWrites, finalAppDir),
+    app,
+  };
 }
 
 function tunnelCheckAlertSeverity(
@@ -2171,6 +2231,41 @@ type ActivityTimelineCard = {
   isHeartbeat: boolean;
   time: string;
 };
+
+type ChatTranscriptActionStatus = "running" | "done" | "issue";
+
+type ChatTranscriptActionDetail = {
+  id: string;
+  label: string;
+  detail: string;
+  status: ChatTranscriptActionStatus;
+  card: ActivityTimelineCard;
+};
+
+type ChatTranscriptItem =
+  | {
+      kind: "prose";
+      id: string;
+      text: string;
+    }
+  | {
+      kind: "reasoning";
+      id: string;
+      title: string;
+      detail: string;
+      status: ChatTranscriptActionStatus;
+      details: ChatTranscriptActionDetail[];
+    }
+  | {
+      kind: "action";
+      id: string;
+      card: ActivityTimelineCard;
+      toolName: string;
+      title: string;
+      detail: string;
+      status: ChatTranscriptActionStatus;
+      details: ChatTranscriptActionDetail[];
+    };
 
 const ACTIVITY_PAYLOAD_PREVIEW_PRIORITY = [
   "kind",
@@ -2468,6 +2563,10 @@ function summarizeJsonActivityPayload(value: unknown): string {
   const summary = str(obj.summary, "").trim();
   const error = str(obj.error, "").trim();
   const toolName = str(obj.tool_name, str(obj.name, "")).trim();
+  const flowKind = str(obj.flow_kind, "").trim();
+  if (flowKind && toolName && (obj.args != null || obj.arguments != null)) {
+    return `Prepared ${formatActivityToolName(toolName)} input.`;
+  }
   if (kind === "tool_dispatch") {
     const toolLabel = formatActivityToolName(toolName);
     const preview = summarizeActivityPayloadPreview(obj);
@@ -2486,11 +2585,7 @@ function summarizeJsonActivityPayload(value: unknown): string {
     return `${stage ? `${stage} ` : ""}${stream} output received.`;
   }
   if (kind === "argument_stream") {
-    const stage = str(obj.stage, "").trim();
-    const toolLabel = formatActivityToolName(toolName);
-    const stageLabel = stage.replace(/[_-]+/g, " ").trim();
-    if (stageLabel) return `Preparing ${toolLabel} input (${stageLabel}).`;
-    return `Preparing ${toolLabel} input.`;
+    return "";
   }
   if (kind.startsWith("delegation_")) {
     const agentName = str(obj.agent_name, "Agent").trim() || "Agent";
@@ -2614,6 +2709,33 @@ function activityDataRecord(value: unknown): JsonRecord {
   }
 }
 
+function normalizeToolStartIntentText(value: string): string {
+  return (value || "")
+    .toLowerCase()
+    .replace(/[`"'.,:;!?()[\]{}<>/_\\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function toolStartIntentText(payload: JsonRecord): string {
+  const summary = str(payload.intent_summary, "").trim();
+  const why = str(payload.why, str(payload.expected_outcome, "")).trim();
+  if (!summary) return why;
+  if (!why) return summary;
+  const normalizedSummary = normalizeToolStartIntentText(summary);
+  const normalizedWhy = normalizeToolStartIntentText(why);
+  if (
+    normalizedSummary &&
+    normalizedWhy &&
+    (normalizedSummary === normalizedWhy ||
+      normalizedSummary.includes(normalizedWhy) ||
+      normalizedWhy.includes(normalizedSummary))
+  ) {
+    return summary;
+  }
+  return `${summary} ${why}`;
+}
+
 function agentLoopProgressPresentation(
   payload: JsonRecord,
   fallbackDetail = "",
@@ -2630,12 +2752,221 @@ function agentLoopProgressPresentation(
     tool_execution: "Running actions",
     tool_result: "Processing action output",
   };
-  const title = titleByPhase[phase] || titleFromPayload || "Working";
+  const detail =
+    toolStartIntentText(payload) || fallbackDetail || str(payload.content, "").trim();
+  let title = titleByPhase[phase] || titleFromPayload || "Working";
+  if (phase === "model_call") {
+    const focus = str(payload.focus, "").trim();
+    if (focus === "app_delivery") {
+      title = "Preparing app build";
+    } else if (focus === "app_inspection") {
+      title = "Preparing app inspection";
+    } else if (focus === "file_changes") {
+      title = "Drafting file changes";
+    }
+  }
   return {
     title,
-    detail: fallbackDetail || str(payload.content, "").trim(),
+    detail,
     streamKey: phase ? `agent-loop:${phase}` : "agent-loop",
   };
+}
+
+function normalizeAgentProseKey(value: string): string {
+  return (value || "")
+    .toLowerCase()
+    .replace(/[`"'.,:;!?()[\]{}<>/_\\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanAgentProseText(value: string): string {
+  const text = stripAgentControlArtifacts(value || "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!text) return "";
+  if (text.startsWith("{") || text.startsWith("[")) return "";
+  if (/<\/?(function_calls|invoke|parameter)\b/i.test(text)) return "";
+  if (/<<<AGENT_?SCOPE_?EXPAND>>>/i.test(text)) return "";
+  return text.length > 900 ? `${text.slice(0, 897).trimEnd()}...` : text;
+}
+
+function stripAgentInternalReasoningLeaks(value: string): string {
+  return stripAgentControlArtifacts(value || "").replace(/\r\n/g, "\n").trim();
+}
+
+function modelInternalReasoningTextFromActivityStep(step: JsonRecord): string {
+  void step;
+  return "";
+}
+
+function modelProseTextFromActivityStep(step: JsonRecord): string {
+  const data = activityDataRecord(step.data);
+  const kind = str(data.kind, "").trim().toLowerCase();
+
+  if (kind === "model_prose") {
+    return cleanAgentProseText(
+      str(
+        data.content,
+        str(data.content_snapshot, str(step.detail, "")),
+      ),
+    );
+  }
+  return "";
+}
+
+function agentProseTextFromActivityStep(step: JsonRecord): string {
+  const modelProse = modelProseTextFromActivityStep(step);
+  if (modelProse) return modelProse;
+
+  const data = activityDataRecord(step.data);
+  const stepType = str(step.step_type, str(step.type, ""))
+    .trim()
+    .toLowerCase();
+
+  if (stepType === "tool_start") {
+    return cleanAgentProseText(toolStartIntentText(data));
+  }
+
+  return "";
+}
+
+function agentProseMessagesFromActivitySteps(
+  steps: JsonRecord[],
+  maxItems = 4,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const step of steps) {
+    const text = agentProseTextFromActivityStep(step);
+    if (!text) continue;
+    const key = normalizeAgentProseKey(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(text);
+  }
+  return out.slice(-Math.max(1, maxItems));
+}
+
+function activityStepType(step: JsonRecord): string {
+  return str(step.step_type, str(step.type, "")).trim().toLowerCase();
+}
+
+function activityToolNameFromStep(step: JsonRecord): string {
+  const data = activityDataRecord(step.data);
+  return str(data.tool_name, str(data.name, str(step.tool_name, ""))).trim();
+}
+
+function transcriptStatusFromCard(
+  card: ActivityTimelineCard,
+): ChatTranscriptActionStatus {
+  const combined = `${card.kind} ${card.tone} ${card.stepType}`.toLowerCase();
+  if (/issue|error|fail|blocked/.test(combined)) return "issue";
+  if (/done|complete|success|result/.test(combined)) return "done";
+  return "running";
+}
+
+function compactTranscriptDetail(value: string): string {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > 120 ? `${text.slice(0, 117).trimEnd()}...` : text;
+}
+
+function agentLoopProgressPhaseFromStep(step: JsonRecord): string {
+  const data = activityDataRecord(step.data);
+  if (str(data.kind, "").trim() !== "agent_loop_progress") return "";
+  return str(data.phase, "").trim().toLowerCase();
+}
+
+function agentLoopProgressActionNamesFromStep(step: JsonRecord): string[] {
+  const data = activityDataRecord(step.data);
+  const out: string[] = [];
+  const add = (value: unknown) => {
+    const normalized = str(value, "")
+      .trim()
+      .replace(/[.。]+$/g, "")
+      .replace(/^["'`]+|["'`]+$/g, "");
+    if (!normalized || out.includes(normalized)) return;
+    out.push(normalized);
+  };
+  for (const key of [
+    "action_name",
+    "tool_name",
+    "name",
+    "selected_action",
+    "authorized_action",
+  ]) {
+    add(data[key]);
+  }
+  for (const key of ["actions", "action_names", "tool_names"]) {
+    const values = data[key];
+    if (Array.isArray(values)) values.forEach(add);
+  }
+  const text = [
+    str(data.intent_summary, ""),
+    str(data.expected_outcome, ""),
+    str(data.content, ""),
+    str(step.detail, ""),
+    str(step.title, ""),
+  ].join(" ");
+  const callsMatch =
+    text.match(/action call\(s\):\s*([a-zA-Z0-9_,\s.-]+)/i) ||
+    text.match(/authorized action\(s\):\s*([a-zA-Z0-9_,\s.-]+)/i);
+  if (callsMatch?.[1]) {
+    callsMatch[1]
+      .split(/[.;\n]/)[0]
+      .split(/,|\band\b/i)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .forEach(add);
+  }
+  return out;
+}
+
+function isMainChatReasoningStep(step: JsonRecord): boolean {
+  const data = activityDataRecord(step.data);
+  const stepType = activityStepType(step);
+  const kind = str(data.kind, "").trim().toLowerCase();
+  if (kind === "reasoning_delta" || stepType === "reasoning_delta") {
+    return true;
+  }
+  const phase = agentLoopProgressPhaseFromStep(step);
+  if (!phase) return false;
+  return phase !== "tool_execution" && phase !== "tool_result";
+}
+
+function normalizeReasoningPhase(raw: unknown): string {
+  const phase = str(raw, "reasoning")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return phase || "reasoning";
+}
+
+function reasoningStatusCopy(
+  rawPhase: unknown,
+  emittedProgress: string,
+  payload?: JsonRecord,
+): ToolProgressPresentation {
+  const phase = normalizeReasoningPhase(rawPhase);
+  const detail = emittedProgress.trim();
+  const title =
+    str(payload?.title, "").trim() ||
+    str(payload?.label, "").trim() ||
+    formatActivityToolName(phase);
+  return {
+    title,
+    detail,
+    streamKey: str(payload?.stream_key, `reasoning:${phase}`),
+  };
+}
+
+function isReasoningProgressPayload(name: string, payloadObj: JsonRecord): boolean {
+  return (
+    str(payloadObj.kind, "").trim() === "reasoning_delta" ||
+    str(name, "").trim().toLowerCase() === "reasoning"
+  );
 }
 
 function buildToolProgressPresentation(
@@ -2651,16 +2982,36 @@ function buildToolProgressPresentation(
   const isFileWriteProgress =
     (name === "app_deploy" && str(payloadObj.kind, "") === "file_write") ||
     name === "file_write";
-  const isArgumentStream = str(payloadObj.kind, "") === "argument_stream";
+  const isToolEnvelope =
+    !!str(payloadObj.flow_kind, "").trim() &&
+    !!str(payloadObj.name, "").trim() &&
+    (payloadObj.args != null || payloadObj.arguments != null);
   const isDraftFile = str(payloadObj.kind, "") === "draft_file";
   const isPhaseStatus = str(payloadObj.kind, "") === "phase_status";
   const isConsoleChunk = str(payloadObj.kind, "") === "console_chunk";
+
+  if (isReasoningProgressPayload(name, payloadObj)) {
+    return reasoningStatusCopy(
+      payloadObj.phase,
+      str(payloadObj.content, str(payloadObj.content_delta, content)),
+      payloadObj,
+    );
+  }
 
   const agentLoopPresentation = agentLoopProgressPresentation(
     payloadObj,
     detail || preview,
   );
   if (agentLoopPresentation) return agentLoopPresentation;
+
+  if (isToolEnvelope) {
+    const toolLabel = formatActivityToolName(str(payloadObj.name, name || "tool"));
+    return {
+      title: `Running ${toolLabel}`,
+      detail: "Preparing action input.",
+      streamKey: str(payloadObj.run_id, `tool-envelope:${toolLabel}`),
+    };
+  }
 
   if (str(payloadObj.kind, "") === "provider_stream_error") {
     const error = str(payloadObj.error, "").trim();
@@ -2750,29 +3101,6 @@ function buildToolProgressPresentation(
     }
   }
 
-  if (isArgumentStream) {
-    const stage = str(payloadObj.stage, "");
-    const chars = Math.max(0, num(payloadObj.chars, 0));
-    const streamKey = str(
-      payloadObj.stream_key,
-      `argument-stream:${name || "tool"}`,
-    );
-    const toolLabel = formatActivityToolName(name || "tool");
-    let title = `Preparing ${toolLabel} input`;
-    if (stage === "payload_build" && name === "app_deploy") {
-      title = "Generating deploy payload";
-    } else if (stage === "payload_repair" && name === "app_deploy") {
-      title = "Repairing deploy payload";
-    }
-    const detailParts: string[] = [];
-    if (chars > 0) detailParts.push(`${chars.toLocaleString()} chars`);
-    return {
-      title,
-      detail: detailParts.join(" - ") || detail || preview || "Working...",
-      streamKey,
-    };
-  }
-
   if (isPhaseStatus) {
     const label = str(payloadObj.label, "").trim() || "Working";
     const phaseDetail = str(payloadObj.detail, preview).trim();
@@ -2807,11 +3135,17 @@ function buildToolProgressPresentation(
         : lineNo > 0
           ? `${lineNo} line${lineNo === 1 ? "" : "s"}`
           : "Draft ready";
+    const targetPath = progressFileTargetPath(payloadObj, appDir, fileName);
+    const currentLine = snapshot
+      ? snapshot.split(/\r?\n/).slice(-1)[0]
+      : "";
+    const detailParts = [
+      targetPath ? `Bundle file: ${targetPath}` : "",
+      currentLine ? `${lineLabel}: ${currentLine}` : lineLabel,
+    ].filter(Boolean);
     return {
       title: `Drafting ${fileName || "file"}`,
-      detail: snapshot
-        ? `${lineLabel}: ${snapshot.split(/\r?\n/).slice(-1)[0]}`
-        : lineLabel,
+      detail: detailParts.join(" - "),
       streamKey: str(
         payloadObj.stream_key,
         fileName ? `draft-file:${fileName}` : "draft-file",
@@ -2827,15 +3161,20 @@ function buildToolProgressPresentation(
     const lineNo = Math.max(0, num(payloadObj.line, 0));
     const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
     const text = str(payloadObj.text, "").trim();
-    const lineLabel =
-      totalLines > 0
-        ? `Line ${Math.min(lineNo, totalLines)}/${totalLines}`
-        : lineNo > 0
-          ? `Line ${lineNo}`
-          : "Preparing file";
+    const lineLabel = progressLineLabel(lineNo, totalLines);
+    const targetPath = progressFileTargetPath(payloadObj, appDir, fileName);
+    const done = toBool(payloadObj.done);
+    const detailParts = [
+      targetPath ? `Target: ${targetPath}` : "",
+      done && targetPath
+        ? `Wrote ${targetPath}`
+        : text && lineLabel
+          ? `${lineLabel}: ${text}`
+          : lineLabel || (done ? "Write complete" : "Preparing file"),
+    ].filter(Boolean);
     return {
       title: `Writing ${fileName || "file"}`,
-      detail: text ? `${lineLabel}: ${text}` : lineLabel,
+      detail: detailParts.join(" - "),
       streamKey: fileName ? `file-write:${fileName}` : "file-write",
     };
   }
@@ -3199,7 +3538,10 @@ function countPublicActivityCards(cards: ActivityTimelineCard[]): number {
 
 function publicActivityKicker(cards: ActivityTimelineCard[], live: boolean): string {
   const count = countPublicActivityCards(cards);
-  if (live) return count > 1 ? "Current step" : "Starting";
+  const latestMeaningful = [...cards].reverse().find((card) => !card.isHeartbeat);
+  if (live || (latestMeaningful && activityCardIsRunning(latestMeaningful))) {
+    return count > 1 ? "Current step" : "Starting";
+  }
   return count > 1 ? "Run summary" : "Activity";
 }
 
@@ -3207,31 +3549,19 @@ function withInitialThinkingActivityCard(
   cards: ActivityTimelineCard[],
   keyPrefix: string,
 ): ActivityTimelineCard[] {
-  const meaningful = cards.filter((card) => !card.isHeartbeat);
-  const firstMeaningful = meaningful[0];
-  if (firstMeaningful && activityCardIsPlanning(firstMeaningful)) {
-    return cards;
-  }
-  return [buildInitialThinkingActivityCard(keyPrefix), ...cards];
+  return cards.length > 0 ? cards : [buildInitialThinkingActivityCard(keyPrefix)];
 }
 
 function pickPublicActivityCard(
   cards: ActivityTimelineCard[],
-  live: boolean,
+  _live: boolean,
 ): ActivityTimelineCard {
   const meaningful = cards.filter((card) => !card.isHeartbeat);
   if (meaningful.length === 0) return buildInitialThinkingActivityCard("empty");
-  if (live) {
-    return (
-      [...meaningful]
-        .reverse()
-        .find(
-          (card) =>
-            activityCardIsRunning(card) || activityCardIsPlanning(card),
-        ) || meaningful[meaningful.length - 1]
-    );
-  }
-  return meaningful[0];
+  return (
+    [...meaningful].reverse().find((card) => activityCardIsRunning(card)) ||
+    meaningful[meaningful.length - 1]
+  );
 }
 
 function InlineActivityFeed({
@@ -3253,14 +3583,7 @@ function InlineActivityFeed({
   const displayCards = withInitialThinkingActivityCard(cards, keyPrefix);
   const activeId = live ? displayCards[displayCards.length - 1]?.id : "";
   const latestCards = displayCards.slice(-7);
-  const firstCard = displayCards[0];
-  const visibleCards =
-    displayCards.length > 8
-      ? [
-          firstCard,
-          ...latestCards.filter((card) => card.id !== firstCard.id),
-        ]
-      : displayCards;
+  const visibleCards = displayCards.length > 8 ? latestCards : displayCards;
   const hiddenCount = Math.max(0, displayCards.length - visibleCards.length);
   const publicCard = pickPublicActivityCard(displayCards, live);
   const publicSummary =
@@ -3273,15 +3596,22 @@ function InlineActivityFeed({
     <Box
       className={`chat-inline-activity${live ? " is-live" : ""}${expanded ? " is-expanded" : " is-collapsed"}`}
     >
-      <Box
-        className={`chat-public-progress${live ? " is-live" : ""}`}
+      <Button
+        size="small"
+        className={`chat-inline-activity-toggle chat-inline-run-card${live ? " is-live" : ""}`}
         role={live ? "status" : undefined}
         aria-live={live ? "polite" : undefined}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        endIcon={<ExpandMoreIcon className="chat-inline-activity-toggle-icon" />}
       >
         <Box className="chat-public-progress-dot" aria-hidden="true" />
-        <Box className="chat-public-progress-copy">
+        <Box className="chat-inline-run-copy">
+          <span className="chat-inline-run-kicker">
+            {progressKicker}
+          </span>
           <Typography
-            component="div"
+            component="span"
             className="chat-public-progress-title"
             title={publicCard.label}
           >
@@ -3289,7 +3619,7 @@ function InlineActivityFeed({
           </Typography>
           {publicSummary ? (
             <Typography
-              component="div"
+              component="span"
               className="chat-public-progress-detail"
               title={publicSummary}
             >
@@ -3297,33 +3627,17 @@ function InlineActivityFeed({
             </Typography>
           ) : null}
         </Box>
-      </Box>
-      <Button
-        size="small"
-        className="chat-inline-activity-toggle chat-inline-task-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-        endIcon={<ExpandMoreIcon className="chat-inline-activity-toggle-icon" />}
-      >
-        <Box className="chat-inline-task-toggle-main">
-          <span className="chat-inline-task-toggle-kicker">
-            {progressKicker}
-          </span>
-          <span className="chat-inline-task-toggle-title">
-            {publicCard.kind} | {publicCard.label}
-          </span>
-        </Box>
         <span className="chat-inline-task-toggle-action">
           {expanded ? "Hide" : "Expand"}
         </span>
       </Button>
       <Collapse in={expanded} mountOnEnter unmountOnExit>
         <Stack spacing={0.7} className="chat-inline-activity-list">
-          {hiddenCount > 0 ? (
-            <Typography variant="caption" className="chat-inline-activity-meta-note">
-              Showing first step and latest {visibleCards.length - 1} of {displayCards.length}. Full details are in AgentArk Console.
-            </Typography>
-          ) : null}
+            {hiddenCount > 0 ? (
+              <Typography variant="caption" className="chat-inline-activity-meta-note">
+                Showing latest {visibleCards.length} of {displayCards.length}. Full details are in AgentArk Console.
+              </Typography>
+            ) : null}
           {visibleCards.map((row) => {
             const payloadKey = `${keyPrefix}:${row.id}`;
             return (
@@ -3680,17 +3994,12 @@ function SwarmActivityPanel({
               flexWrap: "wrap",
             }}
           >
-            <Chip
-              size="small"
-              color={interrupted ? "warning" : "info"}
-              variant={interrupted ? "filled" : "outlined"}
-              label={`${runs.length} run${runs.length === 1 ? "" : "s"}`}
-            />
-            <Chip
-              size="small"
-              variant="outlined"
-              label={`${totalAgents} agent${totalAgents === 1 ? "" : "s"}`}
-            />
+            <span className={`chat-value-pill ${interrupted ? "tone-warning" : "tone-info"}`}>
+              {runs.length} run{runs.length === 1 ? "" : "s"}
+            </span>
+            <span className="chat-value-pill">
+              {totalAgents} agent{totalAgents === 1 ? "" : "s"}
+            </span>
           </Stack>
         </Stack>
 
@@ -3747,16 +4056,15 @@ function SwarmActivityPanel({
                       flexWrap: "wrap",
                     }}
                   >
-                    <Chip
-                      size="small"
-                      color={swarmStatusChipColor(run.status)}
-                      label={swarmStatusLabel(run.status)}
-                    />
-                    <Chip
-                      size="small"
-                      variant="outlined"
-                      label={`${Math.max(run.agentCount, run.agents.length)} agent${Math.max(run.agentCount, run.agents.length) === 1 ? "" : "s"}`}
-                    />
+                    <span className={`chat-value-pill tone-${swarmStatusChipColor(run.status)}`}>
+                      {swarmStatusLabel(run.status)}
+                    </span>
+                    <span className="chat-value-pill">
+                      {Math.max(run.agentCount, run.agents.length)} agent
+                      {Math.max(run.agentCount, run.agents.length) === 1
+                        ? ""
+                        : "s"}
+                    </span>
                   </Stack>
                 </Stack>
 
@@ -3827,21 +4135,13 @@ function SwarmActivityPanel({
                                   flexWrap: "wrap",
                                 }}
                               >
-                                <Chip
-                                  size="small"
-                                  color={swarmStatusChipColor(agent.status)}
-                                  label={swarmStatusLabel(agent.status)}
-                                  sx={{ height: 22 }}
-                                />
+                                <span className={`chat-value-pill tone-${swarmStatusChipColor(agent.status)}`}>
+                                  {swarmStatusLabel(agent.status)}
+                                </span>
                                 {agent.elapsedMs ? (
-                                  <Chip
-                                    size="small"
-                                    variant="outlined"
-                                    label={formatSwarmElapsedMs(
-                                      agent.elapsedMs,
-                                    )}
-                                    sx={{ height: 22 }}
-                                  />
+                                  <span className="chat-value-pill">
+                                    {formatSwarmElapsedMs(agent.elapsedMs)}
+                                  </span>
                                 ) : null}
                               </Stack>
                             </Stack>
@@ -4056,14 +4356,39 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
       continue;
     }
 
+    if (kind === "reasoning_delta") {
+      const phase = normalizeReasoningPhase(payload.phase);
+      const detail = str(
+        payload.content_snapshot,
+        str(payload.content, str(payload.content_delta, "")),
+      );
+      if (detail.trim()) {
+        const presentation = reasoningStatusCopy(phase, detail);
+        steps.push({
+          step_type: "reasoning_delta",
+          title: presentation.title,
+          detail,
+          data: payload,
+          __streamKey: presentation.streamKey || str(payload.stream_key, ""),
+          timestamp,
+        });
+      }
+      continue;
+    }
+
     if (kind === "tool_start") {
       const name = str(payload.name, "");
       const inner = asRecord(payload.payload);
+      const intentText = toolStartIntentText(inner);
       steps.push({
         step_type: "tool_start",
         title: `Tool started: ${name || "tool"}`,
-        detail: compactUnknown(inner, 240) || `Starting ${name || "tool"}.`,
-        data: Object.keys(inner).length > 0 ? inner : payload,
+        detail:
+          intentText || compactUnknown(inner, 240) || `Starting ${name || "tool"}.`,
+        data:
+          Object.keys(inner).length > 0
+            ? { ...inner, tool_name: name }
+            : { ...payload, tool_name: name },
         timestamp,
       });
       continue;
@@ -4083,7 +4408,10 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
         step_type: "tool_progress",
         title: presentation.title,
         detail: presentation.detail,
-        data: Object.keys(inner).length > 0 ? inner : payload,
+        data:
+          Object.keys(inner).length > 0
+            ? { ...inner, tool_name: name }
+            : { ...payload, tool_name: name },
         ...(presentation.streamKey
           ? { __streamKey: presentation.streamKey }
           : {}),
@@ -4099,7 +4427,7 @@ function buildPersistedRunSteps(events: JsonRecord[]): JsonRecord[] {
         step_type: "tool_result",
         title: `Tool finished: ${name || "tool"}`,
         detail: summarizeActivityDetail(content),
-        data: payload,
+        data: { ...payload, tool_name: name },
         timestamp,
       });
       continue;
@@ -4274,9 +4602,9 @@ function loadStoredChatWorkspaceSnapshots(): Record<
 > {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.sessionStorage.getItem(
-      CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY,
-    );
+    const raw =
+      window.localStorage.getItem(CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY) ??
+      window.sessionStorage.getItem(CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY);
     if (!raw) return {};
     const parsed = asRecord(JSON.parse(raw));
     const now = Date.now();
@@ -4338,10 +4666,11 @@ function saveStoredChatWorkspaceSnapshots(
 ): void {
   if (typeof window === "undefined") return;
   try {
-    window.sessionStorage.setItem(
+    window.localStorage.setItem(
       CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY,
       JSON.stringify(snapshots),
     );
+    window.sessionStorage.removeItem(CHAT_WORKSPACE_SNAPSHOTS_STORAGE_KEY);
   } catch {
     // Ignore storage quota failures.
   }
@@ -4472,7 +4801,6 @@ function normalizeChatPendingRunSnapshot(
   return {
     conversationId,
     message: typeof parsed.message === "string" ? parsed.message : "",
-    projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
     startedAt,
     ...(initialMessageCount !== undefined ? { initialMessageCount } : {}),
     runId,
@@ -4540,7 +4868,6 @@ function loadChatPendingLaunch(): ChatPendingLaunch | null {
       message,
       conversationId:
         typeof parsed.conversationId === "string" ? parsed.conversationId : "",
-      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
       taskId,
       source: typeof parsed.source === "string" ? parsed.source : "",
     };
@@ -4744,6 +5071,45 @@ function stripAttachmentContextMarker(text: string): string {
       "",
     )
     .trimEnd();
+}
+
+// Defensive strip for assistant-message rendering. The agent loop uses an
+// out-of-band scope-expansion sentinel and a legacy JSON envelope; if either
+// slips into a streamed response (e.g. the iteration that produced it was
+// shown briefly before the loop continued), we don't want them rendered as
+// prose. This is belt-and-suspenders; the canonical fix is the prompt
+// hygiene rule that tells the model not to emit these in user-visible text.
+function stripAgentControlArtifacts(text: string): string {
+  if (!text) return text;
+  let out = text;
+  // 1. Scope-expansion sentinels. Drop malformed historical spellings too,
+  // because old turns may stream them before the loop continues.
+  out = out.replace(/[ \t]*<<<AGENT_?SCOPE_?EXPAND>>>[^\n]*/gim, "");
+  // 2. Non-native XML tool-call dialects. AgentArk parses native tool calls
+  // or the JSON fallback protocol; these blocks are control artifacts, not
+  // assistant prose.
+  out = out.replace(
+    /<function_calls\b[^>]*>[\s\S]*?<\/function_?calls>/gi,
+    "",
+  );
+  out = out.replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, "");
+  out = out.replace(/<parameter\b[^>]*>[\s\S]*?<\/parameter>/gi, "");
+  out = out.replace(/<function_calls\b[\s\S]*$/gi, "");
+  out = out.replace(/<invoke\b[\s\S]*$/gi, "");
+  out = out.replace(/<parameter\b[\s\S]*$/gi, "");
+  // 2. Legacy JSON envelope: `{"agent_action_scope":"expand", ...}`. Strip
+  // wherever it appears so it can't render as prose. Tight pattern; only
+  // matches the specific control-protocol shape, never legitimate JSON.
+  out = out.replace(
+    /\{\s*"agent_action_scope"\s*:\s*"expand"[\s\S]*?\}/g,
+    "",
+  );
+  out = out.replace(/\{\s*"agent_tool_calls"\s*:\s*\[[\s\S]*?\]\s*\}/g, "");
+  out = out.replace(/\{\s*"agent_action_scope"\s*:\s*"expand"[\s\S]*$/g, "");
+  out = out.replace(/\{\s*"agent_tool_calls"\s*:\s*\[[\s\S]*$/g, "");
+  // Collapse blank-line gaps left behind by removals.
+  out = out.replace(/\n{3,}/g, "\n\n").trimEnd();
+  return out;
 }
 
 type ChatMarkdownBlock =
@@ -5122,6 +5488,9 @@ function MarkdownBody({
                 </pre>
               );
             }
+            if (isAgentArkChartFence(extracted.className)) {
+              return <InlineAgentArkChart code={extracted.code} />;
+            }
             const snippetIndex = blockIndex++;
             const fileName = inferCodePreviewFileName(
               extracted.className,
@@ -5218,6 +5587,244 @@ function MarkdownBody({
   );
 }
 
+type ChatSearchBriefItem = {
+  title: string;
+  body: string;
+};
+
+type ChatSearchBriefSection = {
+  title: string;
+  items: ChatSearchBriefItem[];
+};
+
+type ChatSearchBrief = {
+  intro: string;
+  sections: ChatSearchBriefSection[];
+  bottomLine: string;
+  followUp: string;
+};
+
+function cleanSearchBriefText(value: string): string {
+  return (value || "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s*#{1,6}\s+/, "")
+    .replace(/^[_*]{1,3}|[_*]{1,3}$/g, "")
+    .replace(/[_*]{2}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isSearchBriefDivider(line: string): boolean {
+  return /^-{3,}$/.test(line.trim());
+}
+
+function isSearchBriefBullet(line: string): boolean {
+  return /^\s*(?:[-*+]|\d+[.)])\s+/.test(line);
+}
+
+function parseSearchBriefHeading(line: string): string {
+  const cleaned = cleanSearchBriefText(line).replace(/:$/, "").trim();
+  if (!cleaned) return "";
+  if (cleaned.length > 72) return "";
+  if (/[.!?]$/.test(cleaned)) return "";
+  if (/^(bottom line|would you like|do you want|should i|want me to)\b/i.test(cleaned)) {
+    return "";
+  }
+  if (/^(here(?:'|’)s|here is|from the|based on|i found)\b/i.test(cleaned)) {
+    return "";
+  }
+  return /[a-z]/i.test(cleaned) ? cleaned : "";
+}
+
+function parseSearchBriefItem(line: string): ChatSearchBriefItem {
+  const content = line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
+  const boldLead = content.match(/^(\*\*|__)(.+?)\1\s*[:.-]?\s*(.*)$/);
+  if (boldLead) {
+    return {
+      title: cleanSearchBriefText(boldLead[2]).replace(/[.]$/, ""),
+      body: cleanSearchBriefText(boldLead[3] || ""),
+    };
+  }
+
+  const colonLead = content.match(/^([^:]{8,120}):\s+(.+)$/);
+  if (colonLead) {
+    return {
+      title: cleanSearchBriefText(colonLead[1]),
+      body: cleanSearchBriefText(colonLead[2]),
+    };
+  }
+
+  const sentenceLead = content.match(/^(.{16,150}?[.!?])\s+(.+)$/);
+  if (sentenceLead) {
+    return {
+      title: cleanSearchBriefText(sentenceLead[1]).replace(/[.]$/, ""),
+      body: cleanSearchBriefText(sentenceLead[2]),
+    };
+  }
+
+  return {
+    title: "",
+    body: cleanSearchBriefText(content),
+  };
+}
+
+function parseSearchBriefBottomLine(line: string): string {
+  const normalized = line.trim();
+  const match = normalized.match(/^\*{0,2}Bottom line:?\*{0,2}\s*(.*)$/i);
+  if (!match) return "";
+  return cleanSearchBriefText(match[1] || "");
+}
+
+function parseChatSearchBrief(text: string): ChatSearchBrief | null {
+  const source = (text || "").replace(/\r\n/g, "\n").trim();
+  if (!source || source.includes("```")) return null;
+
+  const bulletCount = source
+    .split("\n")
+    .filter((line) => isSearchBriefBullet(line)).length;
+  if (bulletCount < 2) return null;
+
+  const hasSearchSignature =
+    /\b(latest|news|search|results?|summary|developments?|top stories|bottom line)\b/i.test(
+      source,
+    );
+  if (!hasSearchSignature) return null;
+
+  const rawLines = source
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !isSearchBriefDivider(line));
+  const introLines: string[] = [];
+  const sections: ChatSearchBriefSection[] = [];
+  let currentSection: ChatSearchBriefSection | null = null;
+  let bottomLine = "";
+  let followUp = "";
+
+  const ensureSection = () => {
+    if (!currentSection) {
+      currentSection = { title: "Key results", items: [] };
+      sections.push(currentSection);
+    }
+    return currentSection;
+  };
+
+  for (const line of rawLines) {
+    const bottom = parseSearchBriefBottomLine(line);
+    if (bottom) {
+      bottomLine = bottom;
+      currentSection = null;
+      continue;
+    }
+
+    const plainLine = cleanSearchBriefText(line);
+    if (/^(would you like|do you want|want me to|should i)\b/i.test(plainLine)) {
+      followUp = plainLine;
+      currentSection = null;
+      continue;
+    }
+
+    if (isSearchBriefBullet(line)) {
+      ensureSection().items.push(parseSearchBriefItem(line));
+      continue;
+    }
+
+    const heading = parseSearchBriefHeading(line);
+    if (heading) {
+      currentSection = { title: heading, items: [] };
+      sections.push(currentSection);
+      continue;
+    }
+
+    if (currentSection && currentSection.items.length > 0) {
+      const last = currentSection.items[currentSection.items.length - 1];
+      last.body = [last.body, plainLine].filter(Boolean).join(" ");
+      continue;
+    }
+
+    if (sections.length === 0 && !bottomLine) {
+      introLines.push(plainLine.replace(/:$/, ""));
+    }
+  }
+
+  const populatedSections = sections.filter((section) => section.items.length > 0);
+  if (populatedSections.length === 0) return null;
+
+  return {
+    intro: introLines.join(" ").trim(),
+    sections: populatedSections,
+    bottomLine,
+    followUp,
+  };
+}
+
+function renderChatSearchBrief(brief: ChatSearchBrief): ReactNode {
+  return (
+    <Box className="chat-search-brief">
+      {brief.intro ? (
+        <Typography component="div" className="chat-search-brief-kicker">
+          {renderInlineMarkdown(brief.intro)}
+        </Typography>
+      ) : null}
+
+      {brief.sections.map((section, sectionIndex) => (
+        <Box
+          component="section"
+          className="chat-search-brief-section"
+          key={`${section.title}-${sectionIndex}`}
+        >
+          <Typography component="div" className="chat-search-brief-section-title">
+            {section.title}
+          </Typography>
+          <Box component="ol" className="chat-search-brief-list">
+            {section.items.map((item, itemIndex) => (
+              <Box
+                component="li"
+                className="chat-search-brief-item"
+                key={`${section.title}-${itemIndex}`}
+              >
+                <Box className="chat-search-brief-item-body">
+                  {item.title ? (
+                    <Typography
+                      component="div"
+                      className="chat-search-brief-item-title"
+                    >
+                      {renderInlineMarkdown(item.title)}
+                    </Typography>
+                  ) : null}
+                  {item.body ? (
+                    <Typography
+                      component="div"
+                      className="chat-search-brief-item-text"
+                    >
+                      {renderInlineMarkdown(item.body)}
+                    </Typography>
+                  ) : null}
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      ))}
+
+      {brief.bottomLine ? (
+        <Box className="chat-search-brief-bottom">
+          <span className="chat-search-brief-label">Bottom line</span>
+          <Typography component="div" className="chat-search-brief-bottom-text">
+            {renderInlineMarkdown(brief.bottomLine)}
+          </Typography>
+        </Box>
+      ) : null}
+
+      {brief.followUp ? (
+        <Typography component="div" className="chat-search-brief-followup">
+          {renderInlineMarkdown(brief.followUp)}
+        </Typography>
+      ) : null}
+    </Box>
+  );
+}
+
 function extractCodeFences(
   text: string,
 ): Array<{ languageHint: string; code: string }> {
@@ -5229,8 +5836,10 @@ function extractCodeFences(
   while ((match = regex.exec(source)) !== null) {
     const code = str(match[2], "").replace(/\r\n/g, "\n").replace(/\n$/, "");
     if (!code.trim()) continue;
+    const languageHint = str(match[1], "").trim();
+    if (isAgentArkChartFence(languageHint)) continue;
     out.push({
-      languageHint: str(match[1], "").trim(),
+      languageHint,
       code,
     });
   }
@@ -5286,6 +5895,14 @@ function renderChatMarkdown(
   },
 ): ReactNode {
   if (!text?.trim()) return null;
+  const searchBrief = parseChatSearchBrief(text);
+  if (searchBrief) {
+    return (
+      <Box className="chat-markdown chat-markdown-search-brief">
+        {renderChatSearchBrief(searchBrief)}
+      </Box>
+    );
+  }
   return (
     <Box className="chat-markdown">
       <MarkdownBody
@@ -5298,11 +5915,12 @@ function renderChatMarkdown(
 }
 
 function renderStreamingChatMarkdown(text: string): ReactNode {
-  if (!text?.trim()) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
   return (
     <Box className="chat-markdown chat-markdown-streaming">
       <Typography component="div" variant="body2" className="chat-md-paragraph">
-        {renderMarkdownLineBreaks(text)}
+        {renderMarkdownLineBreaks(trimmed)}
       </Typography>
     </Box>
   );
@@ -5912,10 +6530,20 @@ function buildChatRunMetricItems(metrics: ChatRunMetrics): Array<{
   const timeToFirstTokenMs = positiveRunMetric(metrics.timeToFirstTokenMs);
 
   if (timeToFirstTokenMs != null) {
-    items.push({ label: "TTFT", value: formatTraceDuration(timeToFirstTokenMs) });
+    items.push({ label: "First token", value: formatTraceDuration(timeToFirstTokenMs) });
+  }
+  if (inputTokens != null && inputTokens > 0) {
+    items.push({ label: "Input tokens", value: Math.round(inputTokens).toLocaleString() });
+  }
+  if (outputTokens != null && outputTokens > 0) {
+    items.push({ label: "Output tokens", value: Math.round(outputTokens).toLocaleString() });
   }
   if (totalTokens != null && totalTokens > 0) {
     items.push({ label: "Total tokens", value: Math.round(totalTokens).toLocaleString() });
+  }
+  const durationMs = positiveRunMetric(metrics.durationMs);
+  if (durationMs != null && durationMs > 0) {
+    items.push({ label: "Duration", value: formatTraceDuration(durationMs) });
   }
   return items;
 }
@@ -6097,33 +6725,25 @@ function KeyValuePanel({
                       }
                     : formatTimestampForHumans(v);
                 return (
-                  <Chip
-                    size="small"
-                    variant="outlined"
-                    label={t.label}
-                    title={t.tooltip}
-                  />
+                  <span className="chat-value-pill" title={t.tooltip}>
+                    {t.label}
+                  </span>
                 );
               }
               if (typeof v === "boolean") {
                 const b = boolLabelForKey(k, v);
                 return (
-                  <Chip
-                    size="small"
-                    label={b.label}
-                    color={b.color}
-                    variant={v ? "filled" : "outlined"}
-                  />
+                  <span className={`chat-value-pill tone-${b.color}`}>
+                    {b.label}
+                  </span>
                 );
               }
               if (typeof v === "number" && Number.isFinite(v)) {
                 if (keyLower.includes("ms") || keyLower.includes("duration")) {
                   return (
-                    <Chip
-                      size="small"
-                      variant="outlined"
-                      label={`${Math.round(v)} ms`}
-                    />
+                    <span className="chat-value-pill">
+                      {Math.round(v)} ms
+                    </span>
                   );
                 }
                 if (
@@ -6131,9 +6751,7 @@ function KeyValuePanel({
                   keyLower.includes("total") ||
                   keyLower.includes("remaining")
                 ) {
-                  return (
-                    <Chip size="small" variant="outlined" label={String(v)} />
-                  );
+                  return <span className="chat-value-pill">{String(v)}</span>;
                 }
               }
               if (
@@ -6148,10 +6766,9 @@ function KeyValuePanel({
                     ? `${trimmed.slice(0, 8)}...${trimmed.slice(-6)}`
                     : trimmed;
                 return (
-                  <Chip
-                    size="small"
-                    variant="outlined"
-                    label={label}
+                  <button
+                    type="button"
+                    className="chat-value-pill is-clickable"
                     title={trimmed}
                     onClick={async () => {
                       try {
@@ -6160,8 +6777,9 @@ function KeyValuePanel({
                         // ignore
                       }
                     }}
-                    sx={{ cursor: "pointer" }}
-                  />
+                  >
+                    {label}
+                  </button>
                 );
               }
               return (
@@ -6220,78 +6838,6 @@ function KeyValuePanel({
         ) : null}
       </Stack>
     </Box>
-  );
-}
-
-function WorkspaceScopeMenuButton({
-  activeProjectId,
-  projects,
-  onNavigateToView,
-}: {
-  activeProjectId: string;
-  projects: JsonRecord[];
-  onNavigateToView?: (view: string, replace?: boolean) => void;
-}) {
-  const setActiveProjectId = useUiStore((s) => s.setActiveProjectId);
-  const projectNameById = useMemo(
-    () => buildProjectNameById(projects),
-    [projects],
-  );
-  const activeScopeLabel = projectScopeLabel(activeProjectId, projectNameById);
-  const hasProjects = projects.length > 0;
-  const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
-  const open = Boolean(anchorEl);
-
-  return (
-    <>
-      <Button
-        size="small"
-        variant="outlined"
-        className="workspace-scope-menu-trigger"
-        endIcon={<ArrowDropDownRoundedIcon sx={{ fontSize: 18 }} />}
-        onClick={(event) => setAnchorEl(event.currentTarget)}
-        title={`Scope: ${activeScopeLabel}`}
-        aria-label={`Change scope. Current scope: ${activeScopeLabel}`}
-      >
-        {activeScopeLabel}
-      </Button>
-      <Menu anchorEl={anchorEl} open={open} onClose={() => setAnchorEl(null)}>
-        <MenuItem
-          selected={!activeProjectId}
-          onClick={() => {
-            setActiveProjectId("");
-            setAnchorEl(null);
-          }}
-        >
-          Global workspace
-        </MenuItem>
-        {projects.map((project) => {
-          const id = normalizeProjectId(project.id);
-          if (!id) return null;
-          return (
-            <MenuItem
-              key={id}
-              selected={id === activeProjectId}
-              onClick={() => {
-                setActiveProjectId(id);
-                setAnchorEl(null);
-              }}
-            >
-              {projectScopeLabel(id, projectNameById)}
-            </MenuItem>
-          );
-        })}
-        <Divider />
-        <MenuItem
-          onClick={() => {
-            setAnchorEl(null);
-            onNavigateToView?.("projects");
-          }}
-        >
-          {hasProjects ? "Manage projects" : "New project"}
-        </MenuItem>
-      </Menu>
-    </>
   );
 }
 
@@ -6825,14 +7371,10 @@ const ChatComposerInput = memo(function ChatComposerInput({
 function ChatPageInner({
   autoRefresh,
   isActive,
-  projects,
-  activeProjectId,
   onNavigateToView,
 }: {
   autoRefresh: boolean;
   isActive: boolean;
-  projects: JsonRecord[];
-  activeProjectId: string;
   onNavigateToView?: (view: string, replace?: boolean) => void;
 }) {
   const queryClient = useQueryClient();
@@ -6887,12 +7429,20 @@ function ChatPageInner({
       : CHAT_INLINE_ACTIVITY_MIN_WIDTH,
   );
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [activeStepId, setActiveStepId] = useState<string | null>(null);
+  const handleActivateStep = useCallback((id: string | null) => {
+    setActiveStepId(id);
+    if (id) setWorkspaceOpen(true);
+  }, []);
   const [conversationSidebarOpen, setConversationSidebarOpen] = useState(false);
   const [starterLibraryExpanded, setStarterLibraryExpanded] = useState(false);
   const [starterAdvancedExpanded, setStarterAdvancedExpanded] = useState(false);
   const [conversationPage, setConversationPage] = useState(0);
   const [activityAutoFollow, setActivityAutoFollow] = useState(true);
   const [expandedActivityPayloads, setExpandedActivityPayloads] = useState<
+    Set<string>
+  >(new Set());
+  const [expandedTranscriptActions, setExpandedTranscriptActions] = useState<
     Set<string>
   >(new Set());
   const [secretHelperMode, setSecretHelperMode] = useState<"reuse" | "manual">(
@@ -6910,6 +7460,14 @@ function ChatPageInner({
   >({});
   const [streamPhaseStatus, setStreamPhaseStatus] =
     useState<StreamPhaseStatus | null>(null);
+  // Live reasoning preview. Aggregated from structural
+  // `reasoning_delta` events on the SSE step pipeline (see
+  // `handleStreamToolProgress`). Resets between phases and clears once the
+  // assistant content stream begins or the phase reports `done: true`.
+  const [reasoningStream, setReasoningStream] = useState<{
+    phase: string;
+    content: string;
+  } | null>(null);
   const [codeViewerOpen, setCodeViewerOpen] = useState(false);
   const [codeViewerFileIdx, setCodeViewerFileIdx] = useState(0);
   const [selectedSnippetId, setSelectedSnippetId] = useState<string | null>(
@@ -6918,9 +7476,6 @@ function ChatPageInner({
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
   const [researchReportDialog, setResearchReportDialog] =
     useState<ResearchReportDialogState | null>(null);
-  const [messageTraceOpen, setMessageTraceOpen] = useState<
-    Record<string, boolean>
-  >({});
   const [submittedClarificationChoices, setSubmittedClarificationChoices] =
     useState<Record<string, boolean>>({});
   const [traceStepsById, setTraceStepsById] = useState<
@@ -6991,10 +7546,13 @@ function ChatPageInner({
   const pendingFileWritePathRef = useRef("");
   const lastProgressBubbleCategoryRef = useRef("");
   const lastProgressBubbleAtRef = useRef(0);
+  const reasoningProgressByPhaseRef = useRef<Record<string, string>>({});
+  const reasoningActivityEmitRef = useRef<Record<string, number>>({});
   const streamedWorkspaceAppRef = useRef<JsonRecord | null>(null);
   const streamingTokenBufferRef = useRef("");
   const streamingTokenFlushTimerRef = useRef<number | null>(null);
   const lastWorkspaceRestoreSeedRef = useRef("");
+  const lastWorkspaceActivityRestoreSeedRef = useRef("");
   const reattachedRunIdRef = useRef("");
   const conversationOffset = conversationPage * CHAT_CONVERSATIONS_PAGE_SIZE;
   const queueComposerPrefill = (text: string) => {
@@ -7169,15 +7727,12 @@ function ChatPageInner({
     viewportWidth >= CHAT_INLINE_ACTIVITY_MIN_WIDTH;
   const scopedConversationPath = useMemo(
     () =>
-      withProjectScope(
-        `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`,
-        activeProjectId,
-      ),
-    [activeProjectId, conversationOffset],
+      `/conversations?sidebar=1&limit=${CHAT_CONVERSATIONS_PAGE_SIZE}&offset=${conversationOffset}`,
+    [conversationOffset],
   );
 
   const convQ = useQuery({
-    queryKey: ["chat-conversations", activeProjectId, conversationPage],
+    queryKey: ["chat-conversations", conversationPage],
     queryFn: () => api.rawGet(scopedConversationPath),
     refetchInterval:
       chatPassiveRefresh || chatBackgroundRefresh ? REFRESH_MS : false,
@@ -7387,25 +7942,11 @@ function ChatPageInner({
     [shouldPreparePersistedThread, messagesQ.data],
   );
   useEffect(() => {
-    const visibleMessageIds = new Set(
-      messages.map((message, idx) => str(message.id, String(idx)).trim()),
-    );
-    setMessageTraceOpen((prev) =>
-      pruneRecordToAllowedKeys(prev, visibleMessageIds),
-    );
-
     const visibleTraceIds = messages
       .map((message) => str(message.trace_id, "").trim())
       .filter(Boolean);
     const recentTraceIds = visibleTraceIds.slice(-CHAT_TRACE_STATE_CACHE_MAX);
-    const expandedTraceIds = messages
-      .filter((message, idx) => {
-        const messageId = str(message.id, String(idx)).trim();
-        return Boolean(messageTraceOpen[messageId]);
-      })
-      .map((message) => str(message.trace_id, "").trim())
-      .filter(Boolean);
-    const traceIdsToKeep = new Set([...recentTraceIds, ...expandedTraceIds]);
+    const traceIdsToKeep = new Set(recentTraceIds);
     setTraceStepsById((prev) =>
       pruneRecordToAllowedKeys(prev, traceIdsToKeep),
     );
@@ -7415,7 +7956,7 @@ function ChatPageInner({
     setTraceErrorById((prev) =>
       pruneRecordToAllowedKeys(prev, traceIdsToKeep),
     );
-  }, [messages, messageTraceOpen]);
+  }, [messages]);
   const previousUserPromptByIndex = useMemo(() => {
     const map = new Map<number, string>();
     let lastUserPrompt = "";
@@ -7496,14 +8037,6 @@ function ChatPageInner({
     }
     return "";
   }, [messages]);
-  const projectNameById = useMemo(
-    () => buildProjectNameById(projects),
-    [projects],
-  );
-  const selectedConversationProjectId = normalizeProjectId(
-    selectedConversation?.project_id,
-  );
-  const effectiveProjectId = selectedConversationProjectId || activeProjectId;
   const selectedConversationWorkspace = asRecord(
     selectedConversation?.workspace,
   );
@@ -7578,7 +8111,6 @@ function ChatPageInner({
     scheduleChatPendingRunSnapshotStore({
       ...pendingRunSnapshot,
       message: pendingUserMessage ?? pendingRunSnapshot.message,
-      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
       streamingResponse: streamingResponse.slice(
         0,
         CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
@@ -7596,7 +8128,6 @@ function ChatPageInner({
     failedUserMessage,
     streamingResponse,
     streamingSteps,
-    effectiveProjectId,
   ]);
 
   useEffect(() => {
@@ -7674,6 +8205,7 @@ function ChatPageInner({
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
+  // Keep stream choices scoped to active assistant text.
   useEffect(() => {
     if (!streamingResponse.trim()) {
       setStreamingResponseChoices([]);
@@ -7760,15 +8292,12 @@ function ChatPageInner({
 
   useEffect(() => {
     if (!conversationId) return;
-    const includeWorkspaceContent =
-      !hasPendingSnapshotForConversation ||
-      (pendingRunSnapshot?.phase ?? "running") !== "running";
     const compactedFiles = compactWorkspaceFilesForSnapshot(deployedFiles, {
-      includeContent: includeWorkspaceContent,
+      includeContent: true,
     });
     const compactedLiveWrites = compactLiveFileWritesForSnapshot(
       liveFileWrites,
-      { includeContent: includeWorkspaceContent },
+      { includeContent: true },
     );
     const compactedApp = sanitizeWorkspaceAppSnapshot(streamedWorkspaceApp);
     if (
@@ -7789,9 +8318,7 @@ function ChatPageInner({
   }, [
     conversationId,
     deployedFiles,
-    hasPendingSnapshotForConversation,
     liveFileWrites,
-    pendingRunSnapshot?.phase,
     streamedWorkspaceApp,
     codeViewerFileIdx,
   ]);
@@ -7802,10 +8329,6 @@ function ChatPageInner({
       setConversationPage(maxPage);
     }
   }, [conversationPage, conversationPageCount]);
-
-  useEffect(() => {
-    setConversationPage(0);
-  }, [activeProjectId]);
 
   useEffect(() => {
     const pending = pendingRunSnapshot ?? loadChatPendingRunSnapshot();
@@ -8083,6 +8606,31 @@ function ChatPageInner({
     traceErrorById,
   ]);
 
+  // Also load traces for prior assistant messages so their compact transcript
+  // rows remain populated after a new turn begins.
+  useEffect(() => {
+    if (isStreaming || hasPendingSnapshotForConversation) return;
+    for (const message of messages) {
+      if (str(message.role, "").toLowerCase() !== "assistant") continue;
+      const traceId = str(message.trace_id, "").trim();
+      if (!traceId) continue;
+      if (
+        traceStepsById[traceId] ||
+        traceLoadingById[traceId] ||
+        traceErrorById[traceId]
+      )
+        continue;
+      void loadTraceForId(traceId);
+    }
+  }, [
+    messages,
+    isStreaming,
+    hasPendingSnapshotForConversation,
+    traceStepsById,
+    traceLoadingById,
+    traceErrorById,
+  ]);
+
   useEffect(() => {
     if (!conversationId || isStreaming || hasPendingSnapshotForConversation)
       return;
@@ -8144,6 +8692,18 @@ function ChatPageInner({
     });
   };
 
+  const toggleExpandedTranscriptAction = (id: string) => {
+    setExpandedTranscriptActions((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
   const followActivityConsole = () => {
     setActivityAutoFollow(true);
   };
@@ -8157,73 +8717,11 @@ function ChatPageInner({
     setActivityAutoFollow(true);
   };
 
-  const toolStartCopy = (name: string): { label: string; detail: string } => {
-    const normalized = (name || "").trim().toLowerCase();
-    const byTool: Record<string, { label: string; detail: string }> = {
-      app_deploy: {
-        label: "Deploying access link",
-        detail: "Starting deployment and publishing access link.",
-      },
-      build_check: {
-        label: "Running checks",
-        detail: "Checking compile and build health.",
-      },
-      run_tests: {
-        label: "Running checks",
-        detail: "Running tests to validate behavior.",
-      },
-      lint_check: {
-        label: "Running checks",
-        detail: "Checking code quality and style.",
-      },
-      source_read: {
-        label: "Reading project files",
-        detail: "Reviewing existing code before changes.",
-      },
-      source_write: {
-        label: "Creating project files",
-        detail: "Creating or updating project files.",
-      },
-      source_edit: {
-        label: "Creating project files",
-        detail: "Applying code changes in project files.",
-      },
-      source_list: {
-        label: "Scanning project files",
-        detail: "Checking project structure.",
-      },
-      source_search: {
-        label: "Searching project files",
-        detail: "Looking for the right place to edit.",
-      },
-      web_search: {
-        label: "Searching sources",
-        detail: "Looking up relevant online sources.",
-      },
-      browse: {
-        label: "Opening source page",
-        detail: "Trying to open the requested web page.",
-      },
-      schedule_task: {
-        label: "Setting recurring monitor",
-        detail: "Creating the schedule for automatic runs.",
-      },
-      frontend_build: {
-        label: "Installing dependencies",
-        detail: "Preparing dependencies and building dashboard UI.",
-      },
-    };
-    return (
-      byTool[normalized] || {
-        label: `Running ${toHumanToolName(name).toLowerCase()}`,
-        detail: "Executing this action.",
-      }
-    );
-  };
-
   const resetStreamingProgressBubbleState = () => {
     lastProgressBubbleCategoryRef.current = "";
     lastProgressBubbleAtRef.current = 0;
+    reasoningProgressByPhaseRef.current = {};
+    reasoningActivityEmitRef.current = {};
   };
 
   const normalizeStreamingProgressBubbleText = (value: string): string =>
@@ -8299,13 +8797,11 @@ function ChatPageInner({
     });
   };
 
-  const maybeSurfaceToolStartProgressBubble = (name: string) => {
-    const copy = toolStartCopy(name);
-    const message = (
-      copy.detail ||
-      copy.label ||
-      `Starting ${toHumanToolName(name)}.`
-    ).trim();
+  const maybeSurfaceToolStartProgressBubble = (
+    name: string,
+    payloadObj: JsonRecord,
+  ) => {
+    const message = toolStartIntentText(payloadObj).trim();
     if (!message) return;
     pushStreamingProgressBubble(message, {
       category: `tool-start:${str(name, "").trim().toLowerCase() || "tool"}`,
@@ -8321,29 +8817,73 @@ function ChatPageInner({
     progressPresentation: ToolProgressPresentation,
   ) => {
     const kind = str(payloadObj.kind, "");
-    if (kind === "file_write" || name === "file_write") return;
+    const workspaceAppDir = str(streamedWorkspaceAppRef.current?.app_dir, "");
 
-    if (kind === "argument_stream") {
-      const stage = str(payloadObj.stage, "");
-      const toolLabel = toHumanToolName(name).toLowerCase();
-      let message = `I'm preparing ${toolLabel} inputs now.`;
-      if (stage === "payload_build" && name === "app_deploy") {
-        message = "I'm assembling the deploy payload now.";
-      } else if (stage === "payload_repair" && name === "app_deploy") {
-        message = "I'm repairing the deploy payload now.";
-      }
+    if (kind === "draft_file") {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir,
+      );
+      const lineNo = Math.max(0, num(payloadObj.line, 0));
+      const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+      const targetPath = progressFileTargetPath(
+        payloadObj,
+        workspaceAppDir,
+        fileName,
+      );
+      const lineLabel = progressLineLabel(lineNo, totalLines);
+      const message = [
+        fileName ? `Drafting ${fileName}` : "Drafting file",
+        targetPath ? `bundle path: ${targetPath}` : "",
+        lineLabel,
+      ]
+        .filter(Boolean)
+        .join(" - ");
       pushStreamingProgressBubble(message, {
         category: str(
           payloadObj.stream_key,
-          `argument-stream:${name || "tool"}`,
+          fileName ? `draft-file:${fileName}` : "draft-file",
         ),
         replace: true,
-        minIntervalMs: 6000,
+        minIntervalMs: 1200,
       });
       return;
     }
 
-    if (/^writing\s+/i.test(progressPresentation.title)) return;
+    if (kind === "file_write" || name === "file_write") {
+      const fileName = normalizeWorkspaceFileName(
+        payloadObj.file ?? payloadObj.path,
+        workspaceAppDir,
+      );
+      const lineNo = Math.max(0, num(payloadObj.line, 0));
+      const totalLines = Math.max(0, num(payloadObj.total_lines, 0));
+      const targetPath = progressFileTargetPath(
+        payloadObj,
+        workspaceAppDir,
+        fileName,
+      );
+      const lineLabel = progressLineLabel(lineNo, totalLines);
+      const done = toBool(payloadObj.done);
+      const message = [
+        done ? "Wrote file" : "Writing file",
+        fileName,
+        targetPath && targetPath !== fileName ? `to ${targetPath}` : "",
+        lineLabel,
+      ]
+        .filter(Boolean)
+        .join(" - ");
+      pushStreamingProgressBubble(message, {
+        category: fileName ? `file-write:${fileName}` : "file-write",
+        replace: true,
+        minIntervalMs: 1200,
+      });
+      return;
+    }
+
+    if (kind === "argument_stream") {
+      return;
+    }
+
     const message = (
       progressPresentation.detail ||
       simplifyConsoleDetail(
@@ -9074,6 +9614,99 @@ function ChatPageInner({
   const getStreamingStepStableKey = (value: JsonRecord): string =>
     str(value.__streamKey, str(value.id, ""));
 
+  const isCompleteModelProseStep = (value: JsonRecord): boolean => {
+    const data = asRecord(value.data);
+    return (
+      normalizeStatusText(str(data.kind, "")) === "model_prose" &&
+      !str(data.content_delta, "").trim() &&
+      !str(data.content_snapshot, "").trim()
+    );
+  };
+
+  const streamingStepStructuralStableKey = (value: JsonRecord): string => {
+    const explicitKey = getStreamingStepStableKey(value);
+    const data = asRecord(value.data);
+    const stepType = normalizeStatusText(
+      str(value.step_type, str(value.type, "")),
+    );
+    const dataKind = normalizeStatusText(str(data.kind, ""));
+    if ((
+      stepType === "reasoning_delta" ||
+      dataKind === "reasoning_delta" ||
+      dataKind === "model_prose"
+    ) && !isCompleteModelProseStep(value)) {
+      const eventStreamKey = str(data.stream_key, str(value.stream_key, "")).trim();
+      if (eventStreamKey) return eventStreamKey;
+      const phase = normalizeReasoningPhase(
+        str(data.phase, str(value.phase, "")),
+      );
+      const toolName =
+        normalizeStatusText(str(data.tool_name, str(value.tool_name, ""))) ||
+        "reasoning";
+      const runId = str(data.run_id, str(value.run_id, "")).trim();
+      return ["reasoning", runId, phase, toolName]
+        .filter((part) => part.trim())
+        .join(":");
+    }
+
+    if (stepType === "plan_step_update") {
+      const planId = str(value.plan_id, str(data.plan_id, "")).trim();
+      const revision = str(value.revision, str(data.revision, "")).trim();
+      const stepId = str(value.step_id, str(data.step_id, "")).trim();
+      if (planId || stepId) {
+        return ["plan_step_update", planId, revision, stepId]
+          .filter((part) => part.trim())
+          .join(":");
+      }
+    }
+
+    return explicitKey;
+  };
+
+  const isStreamedModelTextStep = (value: JsonRecord): boolean => {
+    const data = asRecord(value.data);
+    const stepType = normalizeStatusText(
+      str(value.step_type, str(value.type, "")),
+    );
+    const dataKind = normalizeStatusText(str(data.kind, ""));
+    return (
+      !isCompleteModelProseStep(value) &&
+      (stepType === "reasoning_delta" ||
+        dataKind === "reasoning_delta" ||
+        dataKind === "model_prose")
+    );
+  };
+
+  const streamedStepText = (value: JsonRecord): string => {
+    const data = asRecord(value.data);
+    return str(
+      data.content_snapshot,
+      str(data.content, str(data.content_delta, str(value.detail, ""))),
+    );
+  };
+
+  const mergeStreamedModelTextStep = (
+    previous: JsonRecord,
+    incoming: JsonRecord,
+  ): JsonRecord => {
+    const prevText = streamedStepText(previous);
+    const incomingText = streamedStepText(incoming);
+    const mergedText =
+      incomingText && prevText && !incomingText.startsWith(prevText)
+        ? `${prevText}${incomingText}`
+        : incomingText || prevText;
+    const incomingData = asRecord(incoming.data);
+    return {
+      ...incoming,
+      detail: stripAgentControlArtifacts(mergedText),
+      data: {
+        ...incomingData,
+        content: stripAgentControlArtifacts(mergedText),
+        content_snapshot: stripAgentControlArtifacts(mergedText),
+      },
+    };
+  };
+
   const attachStreamingStepStableKey = (
     value: JsonRecord,
     preferredKey?: string,
@@ -9193,8 +9826,8 @@ function ChatPageInner({
     const stableId = getStreamingStepStableKey(step);
     const rawDetailFull = humanDetailRaw ? fullDetail || rawDetail : "";
     const payloadView = buildActivityPayloadViewFromSources(
-      rawDetailFull,
       step.data,
+      rawDetailFull,
     );
     const summary = detailFull || detail;
     return {
@@ -9250,6 +9883,438 @@ function ChatPageInner({
         time: str(record.time, ""),
       };
     }
+  };
+
+  const buildChatTranscriptItemsFromSteps = (
+    sourceSteps: JsonRecord[],
+    keyPrefix: string,
+    maxItems = 28,
+    options?: { complete?: boolean },
+  ): ChatTranscriptItem[] => {
+    const steps = compressActivitySteps(
+      trimTrailingHeartbeatSteps(sourceSteps),
+    );
+    const items: ChatTranscriptItem[] = [];
+    const proseSeen = new Set<string>();
+    const actionIndicesByTool = new Map<string, number[]>();
+    let reasoningItemIndex = -1;
+    let latestAgentLoopActionKey = "";
+    let pendingProse: Extract<ChatTranscriptItem, { kind: "prose" }> | null =
+      null;
+
+    const toolKey = (toolName: string, card: ActivityTimelineCard) => {
+      const normalizedTool = toolName.trim().toLowerCase();
+      if (normalizedTool) return normalizedTool;
+      return (card.rawTitle || card.label || card.stepType).trim().toLowerCase();
+    };
+
+    const actionTitle = (toolName: string, card: ActivityTimelineCard) =>
+      toolName
+        ? formatActivityToolName(toolName)
+        : card.label || card.rawTitle || "Action";
+
+    const detailLabel = (type: string, card: ActivityTimelineCard) => {
+      if (type === "tool_start") return "Input";
+      if (type === "tool_result") return "Result";
+      if (type === "tool_progress") return card.label || "Step";
+      return card.kind || "Step";
+    };
+
+    const buildActionDetail = (
+      type: string,
+      card: ActivityTimelineCard,
+      fallbackDetail: string,
+    ): ChatTranscriptActionDetail | null => {
+      const detail = compactTranscriptDetail(
+        card.summary || card.detail || fallbackDetail,
+      );
+      if (!detail && type === "tool_progress") return null;
+      return {
+        id: `${card.id}:${type}`,
+        label: detailLabel(type, card),
+        detail: detail || card.label || "Updated.",
+        status:
+          type === "tool_result"
+            ? transcriptStatusFromCard(card) === "running"
+              ? "done"
+              : transcriptStatusFromCard(card)
+            : transcriptStatusFromCard(card),
+        card,
+      };
+    };
+
+    const appendActionDetail = (
+      action: Extract<ChatTranscriptItem, { kind: "action" }>,
+      detail: ChatTranscriptActionDetail | null,
+    ) => {
+      if (!detail) return;
+      const duplicate = action.details.some(
+        (entry) =>
+          entry.label === detail.label &&
+          entry.detail === detail.detail &&
+          entry.status === detail.status,
+      );
+      if (duplicate) return;
+      action.details = [...action.details.slice(-7), detail];
+    };
+
+    const buildReasoningDetail = (
+      type: string,
+      card: ActivityTimelineCard,
+      fallbackDetail: string,
+    ): ChatTranscriptActionDetail | null => {
+      const detail = compactTranscriptDetail(
+        card.summary || card.detail || fallbackDetail,
+      );
+      if (!detail) return null;
+      return {
+        id: `${card.id}:${type}:reasoning`,
+        label: card.label || detailLabel(type, card),
+        detail,
+        status: transcriptStatusFromCard(card),
+        card,
+      };
+    };
+
+    const appendReasoningDetail = (
+      detail: ChatTranscriptActionDetail | null,
+    ) => {
+      if (!detail) return;
+      let item =
+        reasoningItemIndex >= 0 ? items[reasoningItemIndex] : undefined;
+      if (!item || item.kind !== "reasoning") {
+        const nextItem: ChatTranscriptItem = {
+          kind: "reasoning",
+          id: `${keyPrefix}:reasoning`,
+          title: "Reasoning",
+          detail: detail.detail,
+          status: detail.status,
+          details: [detail],
+        };
+        reasoningItemIndex = items.length;
+        items.push(nextItem);
+        return;
+      }
+      const duplicate = item.details.some(
+        (entry) =>
+          entry.label === detail.label &&
+          entry.detail === detail.detail &&
+          entry.status === detail.status,
+      );
+      item = {
+        ...item,
+        detail: detail.detail || item.detail,
+        status:
+          detail.status === "issue"
+            ? "issue"
+            : item.status === "running"
+              ? detail.status
+              : item.status,
+        details: duplicate
+          ? item.details
+          : [...item.details.slice(-14), detail],
+      };
+      items[reasoningItemIndex] = item;
+    };
+
+    const pushPendingProse = () => {
+      if (!pendingProse) return;
+      const key = normalizeAgentProseKey(pendingProse.text);
+      if (key && !proseSeen.has(key)) {
+        proseSeen.add(key);
+        items.push(pendingProse);
+      }
+      pendingProse = null;
+    };
+
+    const rememberActionIndex = (key: string, index: number) => {
+      const existing = actionIndicesByTool.get(key) || [];
+      actionIndicesByTool.set(key, [...existing, index]);
+    };
+
+    const latestMatchingAction = (key: string) => {
+      const indices = actionIndicesByTool.get(key) || [];
+      for (let idx = indices.length - 1; idx >= 0; idx -= 1) {
+        const item = items[indices[idx]];
+        if (item?.kind === "action" && item.status === "running") {
+          return indices[idx];
+        }
+      }
+      return indices.length > 0 ? indices[indices.length - 1] : -1;
+    };
+
+    const runLooksComplete = () =>
+      Boolean(options?.complete) ||
+      steps.some((step) => {
+        const data = activityDataRecord(step.data);
+        const combined = [
+          activityStepType(step),
+          str(step.title, ""),
+          str(step.detail, ""),
+          str(data.status, str(data.run_status, "")),
+        ]
+          .join(" ")
+          .toLowerCase();
+        return /\b(completed|complete|succeeded|success|done)\b/.test(combined);
+      });
+
+    const completeTranscriptItems = (value: ChatTranscriptItem[]) =>
+      value.map((item) => {
+        if (item.kind !== "action" && item.kind !== "reasoning") return item;
+        if (item.status === "issue") return item;
+        return {
+          ...item,
+          status: "done" as ChatTranscriptActionStatus,
+          details: item.details.map((detail) =>
+            detail.status === "issue"
+              ? detail
+              : { ...detail, status: "done" as ChatTranscriptActionStatus },
+          ),
+        };
+      });
+
+    for (let idx = 0; idx < steps.length; idx += 1) {
+      const step = steps[idx];
+      if (isHeartbeatStreamingStep(step)) continue;
+      const stepType = activityStepType(step);
+      const card = safeBuildStepCard(step, idx);
+      const internalReasoningText = modelInternalReasoningTextFromActivityStep(step);
+      if (internalReasoningText) {
+        pushPendingProse();
+        appendReasoningDetail({
+          id: `${card.id}:model-reasoning`,
+          label: "Model reasoning",
+          detail: compactTranscriptDetail(internalReasoningText),
+          status: transcriptStatusFromCard(card),
+          card,
+        });
+        continue;
+      }
+      const proseText = modelProseTextFromActivityStep(step);
+      if (proseText) {
+        pendingProse = {
+          kind: "prose",
+          id: `${keyPrefix}:prose:${card.id}`,
+          text: proseText,
+        };
+        continue;
+      }
+      const agentLoopPhase = agentLoopProgressPhaseFromStep(step);
+      if (isMainChatReasoningStep(step)) {
+        pushPendingProse();
+        appendReasoningDetail(
+          buildReasoningDetail(stepType, card, str(step.detail, "")),
+        );
+        continue;
+      }
+      if (agentLoopPhase === "tool_execution") {
+        pushPendingProse();
+        const actionNames = agentLoopProgressActionNamesFromStep(step);
+        const toolName = actionNames[0] || activityToolNameFromStep(step);
+        const syntheticKey = toolName
+          ? toolName.trim().toLowerCase()
+          : "agent-loop-actions";
+        latestAgentLoopActionKey = syntheticKey;
+        const title =
+          actionNames.length > 1
+            ? `${actionNames.length} Actions`
+            : actionTitle(toolName, card);
+        const detail = compactTranscriptDetail(
+          card.summary || card.detail || str(step.detail, ""),
+        );
+        const childDetail = buildActionDetail(
+          "tool_start",
+          card,
+          str(step.detail, ""),
+        );
+        const action: ChatTranscriptItem = {
+          kind: "action",
+          id: `${keyPrefix}:action:${card.id}`,
+          card,
+          toolName,
+          title,
+          detail,
+          status: "running",
+          details: childDetail ? [childDetail] : [],
+        };
+        const actionIndex = items.length;
+        items.push(action);
+        rememberActionIndex(syntheticKey, actionIndex);
+        continue;
+      }
+      if (agentLoopPhase === "tool_result") {
+        const actionNames = agentLoopProgressActionNamesFromStep(step);
+        const toolName = actionNames[0] || activityToolNameFromStep(step);
+        const syntheticKey =
+          latestAgentLoopActionKey ||
+          (toolName ? toolName.trim().toLowerCase() : "agent-loop-actions");
+        const status = transcriptStatusFromCard(card);
+        const detail = compactTranscriptDetail(
+          card.summary || card.detail || str(step.detail, ""),
+        );
+        const matchIndex = latestMatchingAction(syntheticKey);
+        if (matchIndex >= 0) {
+          const item = items[matchIndex];
+          if (item.kind === "action") {
+            item.card = card;
+            item.status = status === "running" ? "done" : status;
+            item.detail = detail || item.detail;
+            appendActionDetail(
+              item,
+              buildActionDetail("tool_result", card, str(step.detail, "")),
+            );
+          }
+        } else {
+          pushPendingProse();
+          const childDetail = buildActionDetail(
+            "tool_result",
+            card,
+            str(step.detail, ""),
+          );
+          const action: ChatTranscriptItem = {
+            kind: "action",
+            id: `${keyPrefix}:action:${card.id}`,
+            card,
+            toolName,
+            title: actionTitle(toolName, card),
+            detail,
+            status: status === "running" ? "done" : status,
+            details: childDetail ? [childDetail] : [],
+          };
+          const actionIndex = items.length;
+          items.push(action);
+          rememberActionIndex(syntheticKey, actionIndex);
+        }
+        continue;
+      }
+      if (stepType === "tool_start") {
+        const data = activityDataRecord(step.data);
+        if (!pendingProse && items.length === 0) {
+          const fallbackProse = cleanAgentProseText(toolStartIntentText(data));
+          if (fallbackProse) {
+            pendingProse = {
+              kind: "prose",
+              id: `${keyPrefix}:prose:${card.id}:tool-intent`,
+              text: fallbackProse,
+            };
+          }
+        }
+        pushPendingProse();
+        const toolName = activityToolNameFromStep(step);
+        const title = actionTitle(toolName, card);
+        const detail = compactTranscriptDetail(
+          toolStartIntentText(data) ||
+            card.summary ||
+            card.detail ||
+            str(step.detail, ""),
+        );
+        const childDetail = buildActionDetail(
+          stepType,
+          card,
+          toolStartIntentText(data) || str(step.detail, ""),
+        );
+        const action: ChatTranscriptItem = {
+          kind: "action",
+          id: `${keyPrefix}:action:${card.id}`,
+          card,
+          toolName,
+          title,
+          detail,
+          status: "running",
+          details: childDetail ? [childDetail] : [],
+        };
+        const actionIndex = items.length;
+        items.push(action);
+        rememberActionIndex(toolKey(toolName, card), actionIndex);
+        continue;
+      }
+      if (stepType === "tool_progress") {
+        const toolName = activityToolNameFromStep(step);
+        const key = toolKey(toolName, card);
+        const detail = compactTranscriptDetail(
+          card.summary || card.detail || str(step.detail, ""),
+        );
+        const matchIndex = latestMatchingAction(key);
+        if (matchIndex >= 0) {
+          const item = items[matchIndex];
+          if (item.kind === "action") {
+            item.card = card;
+            item.status = transcriptStatusFromCard(card);
+            if (detail) item.detail = detail;
+            appendActionDetail(
+              item,
+              buildActionDetail(stepType, card, str(step.detail, "")),
+            );
+          }
+        } else {
+          pushPendingProse();
+          const childDetail = buildActionDetail(
+            stepType,
+            card,
+            str(step.detail, ""),
+          );
+          const action: ChatTranscriptItem = {
+            kind: "action",
+            id: `${keyPrefix}:action:${card.id}`,
+            card,
+            toolName,
+            title: actionTitle(toolName, card),
+            detail,
+            status: transcriptStatusFromCard(card),
+            details: childDetail ? [childDetail] : [],
+          };
+          const actionIndex = items.length;
+          items.push(action);
+          rememberActionIndex(key, actionIndex);
+        }
+        continue;
+      }
+      if (stepType === "tool_result") {
+        const toolName = activityToolNameFromStep(step);
+        const key = toolKey(toolName, card);
+        const status = transcriptStatusFromCard(card);
+        const detail = compactTranscriptDetail(
+          card.summary || card.detail || str(step.detail, ""),
+        );
+        const matchIndex = latestMatchingAction(key);
+        if (matchIndex >= 0) {
+          const item = items[matchIndex];
+          if (item.kind === "action") {
+            item.card = card;
+            item.status = status === "running" ? "done" : status;
+            item.detail = detail || item.detail;
+            appendActionDetail(
+              item,
+              buildActionDetail(stepType, card, str(step.detail, "")),
+            );
+          }
+        } else {
+          pushPendingProse();
+          const childDetail = buildActionDetail(
+            stepType,
+            card,
+            str(step.detail, ""),
+          );
+          const action: ChatTranscriptItem = {
+            kind: "action",
+            id: `${keyPrefix}:action:${card.id}`,
+            card,
+            toolName,
+            title: actionTitle(toolName, card),
+            detail,
+            status: status === "running" ? "done" : status,
+            details: childDetail ? [childDetail] : [],
+          };
+          const actionIndex = items.length;
+          items.push(action);
+          rememberActionIndex(key, actionIndex);
+        }
+        continue;
+      }
+    }
+
+    const finalItems = runLooksComplete() ? completeTranscriptItems(items) : items;
+    return finalItems.slice(-Math.max(1, maxItems));
   };
 
   const streamingTraceCards = useMemo(
@@ -9428,6 +10493,7 @@ function ChatPageInner({
     setStreamingProgressMessages([]);
     resetStreamingProgressBubbleState();
     setStreamPhaseStatus(null);
+    setReasoningStream(null);
     setLiveFileWrites({});
     setDeployedFiles([]);
     setIsStreaming(false);
@@ -9506,11 +10572,11 @@ function ChatPageInner({
     setDeployedFiles([]);
     setSelectedSnippetId(null);
     setStreamPhaseStatus(null);
+    setReasoningStream(null);
     setStreamedWorkspaceApp(null);
     streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
-    setMessageTraceOpen({});
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
     if (
@@ -9520,17 +10586,6 @@ function ChatPageInner({
       setConversationSidebarOpen(false);
     }
   };
-
-  useEffect(() => {
-    if (!conversationId || !activeProjectId || !selectedConversation) return;
-    if (selectedConversationProjectId === activeProjectId) return;
-    startNewConversation();
-  }, [
-    activeProjectId,
-    conversationId,
-    selectedConversation,
-    selectedConversationProjectId,
-  ]);
 
   const openConversationById = (id: string) => {
     if (!id) return;
@@ -9569,11 +10624,11 @@ function ChatPageInner({
     setDeployedFiles([]);
     setSelectedSnippetId(null);
     setStreamPhaseStatus(null);
+    setReasoningStream(null);
     setStreamedWorkspaceApp(null);
     streamedWorkspaceAppRef.current = null;
     setCodeViewerFileIdx(0);
     setStreamTraceOpen(false);
-    setMessageTraceOpen({});
     pendingFileReadPathRef.current = "";
     pendingFileWritePathRef.current = "";
     setConversationId(id);
@@ -9672,9 +10727,9 @@ function ChatPageInner({
     messages.length,
   ]);
 
-  const queueAttachedFiles = (files: FileList | null) => {
+  const queueAttachedFiles = (files: FileList | File[] | null) => {
     if (!files || files.length === 0) return;
-    const incoming = Array.from(files);
+    const incoming = Array.from(files as ArrayLike<File>);
     const { accepted, rejected } = splitSupportedChatAttachments(incoming);
     if (rejected.length > 0) {
       const preview = rejected.slice(0, 3).join(", ");
@@ -9728,6 +10783,28 @@ function ChatPageInner({
     queueAttachedFiles(event.dataTransfer?.files ?? null);
   };
 
+  // Capture pasted screenshots / files from anywhere inside the chat shell.
+  // Plain-text paste is left alone (no preventDefault) so typing still works
+  // normally; we only intercept when the clipboard actually carries file
+  // items. A pasted image from the OS shortcut (e.g. Win+Shift+S) arrives
+  // as a `kind === "file"` item with `type === "image/png"` and an empty or
+  // generic name, which `splitSupportedChatAttachments` already accepts.
+  const handleChatPaste = (event: ClipboardEvent<HTMLDivElement>) => {
+    if (isStreaming) return;
+    const clipboard = event.clipboardData;
+    if (!clipboard || clipboard.items.length === 0) return;
+    const files: File[] = [];
+    for (const item of Array.from(clipboard.items)) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+    if (files.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    queueAttachedFiles(files);
+  };
+
   const removeAttachedFile = (idx: number) => {
     setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
   };
@@ -9750,7 +10827,6 @@ function ChatPageInner({
         documents: [] as IndexedKnowledgeAttachment[],
         visuals: [] as UploadedVisualAttachment[],
       };
-    const projectId = effectiveProjectId.trim();
     const documents: IndexedKnowledgeAttachment[] = [];
     const visuals: UploadedVisualAttachment[] = [];
     for (const file of files) {
@@ -9774,7 +10850,6 @@ function ChatPageInner({
         continue;
       }
 
-      if (projectId) formData.append("project_id", projectId);
       const out = asRecord(
         await api.rawPostForm("/documents/upload-file", formData),
       );
@@ -10283,34 +11358,25 @@ function ChatPageInner({
           <Typography variant="body2" className="chat-research-report-summary">
             {summaryText}
           </Typography>
-          <Stack
-            direction="row"
-            spacing={0.75}
-            useFlexGap
-            className="chat-research-report-chips"
-            sx={{
-              flexWrap: "wrap",
-            }}
-          >
+          <Box className="chat-research-report-pills">
             {report.sourceCount > 0 ? (
-              <Chip
-                size="small"
-                label={`${report.sourceCount} source${report.sourceCount === 1 ? "" : "s"}`}
-              />
+              <span className="chat-research-report-pill">
+                {report.sourceCount} source{report.sourceCount === 1 ? "" : "s"}
+              </span>
             ) : null}
             {report.openQuestionCount > 0 ? (
-              <Chip
-                size="small"
-                label={`${report.openQuestionCount} open question${report.openQuestionCount === 1 ? "" : "s"}`}
-              />
+              <span className="chat-research-report-pill">
+                {report.openQuestionCount} open question
+                {report.openQuestionCount === 1 ? "" : "s"}
+              </span>
             ) : null}
             {report.contradictionCount > 0 ? (
-              <Chip
-                size="small"
-                label={`${report.contradictionCount} contradiction${report.contradictionCount === 1 ? "" : "s"}`}
-              />
+              <span className="chat-research-report-pill">
+                {report.contradictionCount} contradiction
+                {report.contradictionCount === 1 ? "" : "s"}
+              </span>
             ) : null}
-          </Stack>
+          </Box>
           {report.keyFindings.length > 0 ? (
             <Stack spacing={0.35} className="chat-research-report-findings">
               {report.keyFindings.map((finding, index) => (
@@ -10734,9 +11800,7 @@ function ChatPageInner({
                   >
                     {failureDetail}
                   </Typography>
-                  {/configure serper or brave search api for reliable research/i.test(
-                    failureDetail,
-                  ) ? (
+                  {isSearchBackendSetupIssue(failureDetail) ? (
                     <Box>
                       <Button
                         size="small"
@@ -11150,7 +12214,29 @@ function ChatPageInner({
       if (out.length > 0 && isHeartbeatStreamingStep(out[out.length - 1])) {
         out.pop();
       }
-      out.push(step);
+      const stableKey = streamingStepStructuralStableKey(step);
+      const stableStep = stableKey
+        ? attachStreamingStepStableKey(step, stableKey)
+        : step;
+      if (stableKey) {
+        const existingIndex = out.findIndex(
+          (row) => streamingStepStructuralStableKey(row) === stableKey,
+        );
+        if (existingIndex >= 0) {
+          const mergedStep =
+            isStreamedModelTextStep(stableStep) &&
+            isStreamedModelTextStep(out[existingIndex])
+              ? attachStreamingStepStableKey(
+                  mergeStreamedModelTextStep(out[existingIndex], stableStep),
+                  stableKey,
+                )
+              : stableStep;
+          out.splice(existingIndex, 1);
+          out.push(mergedStep);
+          continue;
+        }
+      }
+      out.push(stableStep);
     }
     return out;
   };
@@ -11193,9 +12279,11 @@ function ChatPageInner({
     name: string,
     payload: unknown,
   ): string => {
+    const root = asRecord(payload);
+    const intentText = toolStartIntentText(root);
+    if (intentText) return intentText;
     const normalizedName = (name || "").trim().toLowerCase();
     if (normalizedName === "app_deploy") {
-      const root = asRecord(payload);
       const nested = asRecord(root.payload);
       // The backend summary uses file_names (array) + file_count (number);
       // fall back to counting keys in a files object when present.
@@ -11226,7 +12314,6 @@ function ChatPageInner({
       return "Preparing deployment package.";
     }
     if (normalizedName === "file_write") {
-      const root = asRecord(payload);
       const fileName = normalizeWorkspaceFileName(
         root.path ?? root.file,
         str(streamedWorkspaceAppRef.current?.app_dir, ""),
@@ -11382,7 +12469,7 @@ function ChatPageInner({
       normalizeActivityStepForDisplay(normalizedIncomingStep),
     );
     const incomingHeartbeat = isHeartbeatStreamingStep(normalizedStep);
-    const incomingStableKey = getStreamingStepStableKey(normalizedStep);
+    const incomingStableKey = streamingStepStructuralStableKey(normalizedStep);
     let next: JsonRecord[];
     if (incomingHeartbeat) {
       const existingIndex = prevSteps.findIndex((row) =>
@@ -11416,9 +12503,14 @@ function ChatPageInner({
           (row) => getStreamingStepStableKey(row) === incomingStableKey,
         );
         if (existingIndex >= 0) {
+          const replacementStep =
+            isStreamedModelTextStep(normalizedStep) &&
+            isStreamedModelTextStep(next[existingIndex])
+              ? mergeStreamedModelTextStep(next[existingIndex], normalizedStep)
+              : normalizedStep;
           next.splice(existingIndex, 1);
           next.push(
-            attachStreamingStepStableKey(normalizedStep, incomingStableKey),
+            attachStreamingStepStableKey(replacementStep, incomingStableKey),
           );
           next = limitStreamingStepsForUi(next);
           streamingStepsRef.current = next;
@@ -11438,7 +12530,12 @@ function ChatPageInner({
           getStreamingStepStableKey(next[lastIdx]),
         );
       } else {
-        next.push(attachStreamingStepStableKey(normalizedStep));
+        next.push(
+          attachStreamingStepStableKey(
+            normalizedStep,
+            incomingStableKey || undefined,
+          ),
+        );
       }
     }
     next = limitStreamingStepsForUi(next);
@@ -11469,8 +12566,8 @@ function ChatPageInner({
     payload?: Record<string, unknown>,
   ) => {
     followActivityConsole();
-    maybeSurfaceToolStartProgressBubble(name);
     const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    maybeSurfaceToolStartProgressBubble(name, payloadObj);
     const payloadSummary = decorateActivityDetailWithPlanStep(
       summarizeToolStartPayload(name, payloadObj),
       payloadObj,
@@ -11479,7 +12576,10 @@ function ChatPageInner({
       step_type: "tool_start",
       title: `Tool started: ${name}`,
       detail: payloadSummary || `Starting ${toHumanToolName(name)}.`,
-      data: Object.keys(payloadObj).length > 0 ? payloadObj : name,
+      data:
+        Object.keys(payloadObj).length > 0
+          ? { ...payloadObj, tool_name: name }
+          : { tool_name: name },
     });
     if (name === "file_read") {
       pendingFileReadPathRef.current = normalizeWorkspaceFileName(
@@ -11652,8 +12752,61 @@ function ChatPageInner({
       step_type: "tool_result",
       title: `Tool finished: ${name || "tool"}`,
       detail: detail || preview,
-      data: payload || detail || preview,
+      data: Object.keys(payloadObj).length > 0
+        ? { ...payloadObj, tool_name: name }
+        : { tool_name: name, content: detail || preview },
     });
+  };
+
+  const handleStreamReasoningDeltaPayload = (
+    payload: Record<string, unknown>,
+    sourceName = "reasoning",
+    fallbackContent = "",
+  ) => {
+    const payloadObj = asRecord(payload);
+    const phase = normalizeReasoningPhase(payloadObj.phase);
+    const streamKey = str(payloadObj.stream_key, `reasoning:${phase || "active"}`);
+    const delta = str(
+      payloadObj.content_delta,
+      str(payloadObj.content, fallbackContent),
+    );
+    const done = toBool(payloadObj.done);
+    if (!phase) return;
+
+    const current = reasoningProgressByPhaseRef.current[phase] || "";
+    const nextContent = done ? current : `${current}${delta}`;
+    reasoningProgressByPhaseRef.current[phase] = nextContent;
+    setReasoningStream((prev) => {
+      if (done) {
+        if (!prev || prev.phase === phase) return { phase, content: nextContent };
+        return prev;
+      }
+      return { phase, content: nextContent };
+    });
+
+    const detail = nextContent.trim();
+    if (!detail) return;
+    const presentation = reasoningStatusCopy(phase, detail, payloadObj);
+    const now = Date.now();
+    const lastEmit = reasoningActivityEmitRef.current[streamKey] || 0;
+    const shouldEmit = done || now - lastEmit >= 750;
+    if (shouldEmit) {
+      reasoningActivityEmitRef.current[streamKey] = now;
+      pushStreamingStep({
+        step_type: "reasoning_delta",
+        title: presentation.title,
+        detail: decorateActivityDetailWithPlanStep(
+          presentation.detail,
+          payloadObj,
+        ),
+        data: {
+          ...payloadObj,
+          tool_name: sourceName,
+          content_snapshot: detail,
+        },
+        __streamKey: presentation.streamKey || streamKey,
+      });
+    }
   };
 
   const handleStreamToolProgress = (
@@ -11663,6 +12816,13 @@ function ChatPageInner({
   ) => {
     followActivityConsole();
     const payloadObj = attachCurrentPlanStepPayload(asRecord(payload));
+    // Backward compatibility for older streams that carried reasoning deltas
+    // as tool progress. Current streams use dedicated `reasoning_delta` events.
+    // Identification is by event kind only, never by phrasing.
+    if (isReasoningProgressPayload(name, payloadObj)) {
+      handleStreamReasoningDeltaPayload(payloadObj, name, content);
+      return;
+    }
     const workspaceAppDir = str(streamedWorkspaceAppRef.current?.app_dir, "");
     const progressPresentation = buildToolProgressPresentation(
       name,
@@ -11848,6 +13008,7 @@ function ChatPageInner({
     onToolStart: handleStreamToolStart,
     onToolResult: handleStreamToolResult,
     onToolProgress: handleStreamToolProgress,
+    onReasoningDelta: handleStreamReasoningDeltaPayload,
   });
 
   useEffect(() => {
@@ -11855,14 +13016,19 @@ function ChatPageInner({
       onToolStart: handleStreamToolStart,
       onToolResult: handleStreamToolResult,
       onToolProgress: handleStreamToolProgress,
+      onReasoningDelta: handleStreamReasoningDeltaPayload,
     };
-  }, [handleStreamToolStart, handleStreamToolResult, handleStreamToolProgress]);
+  }, [
+    handleStreamToolStart,
+    handleStreamToolResult,
+    handleStreamToolProgress,
+    handleStreamReasoningDeltaPayload,
+  ]);
 
   const buildArchivedPendingRunSnapshot = (): ChatPendingRunSnapshot | null => {
     if (!pendingRunSnapshot?.conversationId) return null;
     return {
       ...pendingRunSnapshot,
-      projectId: effectiveProjectId || pendingRunSnapshot.projectId || "",
       taskId: activeChatTaskIdRef.current || pendingRunSnapshot.taskId || "",
       streamingResponse: (
         streamingResponse ||
@@ -11896,7 +13062,6 @@ function ChatPageInner({
     opts?: {
       sensitive?: boolean;
       conversationIdOverride?: string;
-      projectIdOverride?: string;
       statusSource?: string;
       deepResearch?: boolean;
       resumeTaskId?: string;
@@ -11908,11 +13073,8 @@ function ChatPageInner({
     const requestedConversationOverride = (
       opts?.conversationIdOverride || ""
     ).trim();
-    const requestedProjectOverride = (opts?.projectIdOverride || "").trim();
     const targetConversationId =
       requestedConversationOverride || conversationId || "";
-    const targetProjectId =
-      requestedProjectOverride || effectiveProjectId || "";
     const preservedResumeSnapshot =
       isResumeMode && targetConversationId
         ? (() => {
@@ -11953,14 +13115,10 @@ function ChatPageInner({
           ),
         ).slice(-CHAT_PENDING_STREAM_STEPS_MAX)
       : [];
-    let activeMessage = isResumeMode
-      ? ""
-      : message.trim() ||
-        (files.length > 0
-          ? "Please analyze the attached documents and answer using them."
-          : "");
+    let activeMessage = isResumeMode ? "" : message.trim();
+    const activeMessagePreview = maskSensitiveChatPreview(activeMessage);
     if (
-      (!activeMessage && !isResumeMode) ||
+      (!activeMessage && files.length === 0 && !isResumeMode) ||
       isStreaming ||
       streamLockRef.current
     )
@@ -11975,12 +13133,15 @@ function ChatPageInner({
     const deepResearch = Boolean(opts?.deepResearch);
     const planOverride = opts?.planOverride ?? null;
     const executionMode: ChatExecutionMode = "auto";
+    const attachmentFingerprint = files
+      .map((file) => `${file.name}:${file.size}:${file.lastModified}`)
+      .join("|");
     const fingerprint = isResumeMode
       ? `resume::${resumeTaskId}::${targetConversationId || "__no_conversation__"}`
-      : `${targetConversationId || "__new__"}::${targetProjectId || "__no_project__"}::${activeMessage
+      : `${targetConversationId || "__new__"}::${activeMessagePreview
           .toLowerCase()
           .replace(/\s+/g, " ")
-          .trim()}::${deepResearch ? "research" : "chat"}::${executionMode}`;
+          .trim()}::${attachmentFingerprint}::${deepResearch ? "research" : "chat"}::${executionMode}`;
     const lastSend = recentSendRef.current;
     if (
       lastSend &&
@@ -12032,7 +13193,7 @@ function ChatPageInner({
     }
     const sensitiveMessage = !isResumeMode && Boolean(opts?.sensitive);
     setPendingUserMessage(
-      !isResumeMode && !sensitiveMessage ? activeMessage : null,
+      !isResumeMode && !sensitiveMessage ? activeMessagePreview : null,
     );
     setFailedUserMessage(null);
     setStreamingResponseNow(preservedResumeResponse);
@@ -12077,9 +13238,8 @@ function ChatPageInner({
       conversationId: targetConversationId,
       message:
         !isResumeMode && !sensitiveMessage
-          ? activeMessage
+          ? activeMessagePreview
           : str(preservedResumeSnapshot?.message, ""),
-      projectId: targetProjectId,
       startedAt: Date.now(),
       initialMessageCount: messages.length,
       runId: "",
@@ -12250,6 +13410,10 @@ function ChatPageInner({
                 absorbConversationId(step);
                 handleStreamThinking(step);
               },
+              onReasoningDelta: (payload) => {
+                absorbConversationId(payload);
+                handleStreamReasoningDeltaPayload(payload);
+              },
               onToolStart: handleStreamToolStart,
               onToolResult: handleStreamToolResult,
               onToolProgress: handleStreamToolProgress,
@@ -12346,7 +13510,6 @@ function ChatPageInner({
               message: payloadMessage,
               channel: "web",
               conversation_id: targetConversationId || undefined,
-              project_id: targetProjectId || undefined,
               deep_research: deepResearch,
               plan_confirmation_mode: deepResearch
                 ? "before_execution"
@@ -12367,6 +13530,10 @@ function ChatPageInner({
               onThinking: (step) => {
                 absorbConversationId(step);
                 handleStreamThinking(step);
+              },
+              onReasoningDelta: (payload) => {
+                absorbConversationId(payload);
+                handleStreamReasoningDeltaPayload(payload);
               },
               onToolStart: handleStreamToolStart,
               onToolResult: handleStreamToolResult,
@@ -12534,7 +13701,7 @@ function ChatPageInner({
           };
         });
         if (!sensitiveMessage && !isResumeMode) {
-          setFailedUserMessage(activeMessage);
+          setFailedUserMessage(activeMessagePreview);
         }
       } else if (terminalPlanningFailure) {
         setExecutionPlanFailure(terminalPlanningFailureDetail);
@@ -12573,7 +13740,7 @@ function ChatPageInner({
         if (!resolvedConversationId) {
           try {
             const latest = await api.rawGet(
-              withProjectScope("/conversations?limit=1", targetProjectId),
+              "/conversations?limit=1",
             );
             const newest = pickRecords(latest, "conversations")[0];
             const newestId = str(newest?.id, "");
@@ -12623,34 +13790,59 @@ function ChatPageInner({
         setFailedUserMessage(null);
       } else if (wasStopped) {
         setFailedUserMessage(null);
-        if (finalTaskId) {
-          const interruptedSteps = trimTrailingHeartbeatSteps(
-            streamingStepsRef.current,
-          ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+        const activeSnapshot = pendingRunSnapshotRef.current;
+        const interruptedSteps = trimTrailingHeartbeatSteps(
+          streamingStepsRef.current,
+        ).slice(-CHAT_PENDING_STREAM_STEPS_MAX);
+        const fallbackInterruptedSteps =
+          interruptedSteps.length > 0
+            ? interruptedSteps
+            : asRecords(activeSnapshot?.streamingSteps).slice(
+                -CHAT_PENDING_STREAM_STEPS_MAX,
+              );
+        const interruptedConversationId =
+          resolvedConversationId ||
+          targetConversationId ||
+          str(activeSnapshot?.conversationId, "");
+        const interruptedResponse = (
+          latestStreamingResponse ||
+          streamingResponseRef.current ||
+          str(activeSnapshot?.streamingResponse, "")
+        ).slice(0, CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS);
+        const interruptedMessage =
+          str(activeSnapshot?.message, "") ||
+          initialPendingSnapshot.message ||
+          activeMessagePreview;
+        const shouldPreserveInterruptedStop = Boolean(
+          interruptedConversationId &&
+            (finalTaskId ||
+              str(activeSnapshot?.runId, "").trim() ||
+              interruptedResponse.trim() ||
+              fallbackInterruptedSteps.length > 0 ||
+              interruptedMessage.trim()),
+        );
+        if (shouldPreserveInterruptedStop) {
           const interruptedSnapshot: ChatPendingRunSnapshot = {
             ...initialPendingSnapshot,
-            conversationId: resolvedConversationId || targetConversationId,
-            projectId:
-              targetProjectId || initialPendingSnapshot.projectId || "",
+            ...(activeSnapshot ?? {}),
+            conversationId: interruptedConversationId,
             runId: str(
-              pendingRunSnapshot?.runId,
+              activeSnapshot?.runId,
               initialPendingSnapshot.runId || "",
             ),
-            taskId: finalTaskId,
+            taskId: finalTaskId || str(activeSnapshot?.taskId, ""),
             mode: isResumeMode ? "resume" : "fresh",
             phase: "interrupted",
-            streamingResponse: latestStreamingResponse.slice(
-              0,
-              CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
-            ),
-            streamingSteps: interruptedSteps,
+            message: interruptedMessage,
+            streamingResponse: interruptedResponse,
+            streamingSteps: fallbackInterruptedSteps,
             failedUserMessage: "",
           };
           storeChatPendingRunSnapshotNow(interruptedSnapshot);
           setPendingRunSnapshot(interruptedSnapshot);
           setPendingUserMessage(null);
           setStreamingResponseNow(interruptedSnapshot.streamingResponse || "");
-          setStreamingStepsNow(interruptedSteps);
+          setStreamingStepsNow(fallbackInterruptedSteps);
         } else {
           storeChatPendingRunSnapshotNow(null);
           setPendingRunSnapshot(null);
@@ -12666,8 +13858,6 @@ function ChatPageInner({
           const restoredInterruptedSnapshot: ChatPendingRunSnapshot = {
             ...preservedResumeSnapshot,
             conversationId: resolvedConversationId || targetConversationId,
-            projectId:
-              targetProjectId || preservedResumeSnapshot.projectId || "",
             taskId: finalTaskId || preservedResumeSnapshot.taskId || "",
             phase: "interrupted",
             streamingResponse: preservedResumeResponse,
@@ -12693,11 +13883,6 @@ function ChatPageInner({
               targetConversationId ||
               activeSnapshot?.conversationId ||
               "",
-            projectId:
-              targetProjectId ||
-              activeSnapshot?.projectId ||
-              initialPendingSnapshot.projectId ||
-              "",
             runId: str(
               activeSnapshot?.runId,
               initialPendingSnapshot.runId || "",
@@ -12705,8 +13890,8 @@ function ChatPageInner({
             taskId: finalTaskId || activeSnapshot?.taskId || "",
             mode: "fresh",
             phase: "interrupted",
-            message: activeMessage,
-            failedUserMessage: activeMessage,
+            message: activeMessagePreview,
+            failedUserMessage: activeMessagePreview,
             streamingResponse: latestStreamingResponse.slice(
               0,
               CHAT_PENDING_STREAM_RESPONSE_MAX_CHARS,
@@ -12718,7 +13903,7 @@ function ChatPageInner({
           };
           storeChatPendingRunSnapshotNow(interruptedSnapshot);
           setPendingRunSnapshot(interruptedSnapshot);
-          setPendingUserMessage(activeMessage);
+          setPendingUserMessage(activeMessagePreview);
           setStreamingStepsNow(interruptedSteps);
           setExecutionPlan(null);
           setExecutionPlanFailure("");
@@ -12803,7 +13988,6 @@ function ChatPageInner({
           pendingRunSnapshotRef.current ?? {
             conversationId: cid,
             message: "",
-            projectId: effectiveProjectId || "",
             startedAt: Date.now(),
           };
         const next = {
@@ -12831,7 +14015,6 @@ function ChatPageInner({
           : {
               conversationId: pendingConversationId,
               message: "",
-              projectId: effectiveProjectId || "",
               startedAt: Date.now(),
               runId,
               phase: "running" as ChatPendingRunPhase,
@@ -12887,6 +14070,10 @@ function ChatPageInner({
         onThinking: (step) => {
           absorbRunPayload(step);
           handleStreamThinking(step);
+        },
+        onReasoningDelta: (payload) => {
+          absorbRunPayload(payload);
+          reattachToolHandlersRef.current.onReasoningDelta(payload);
         },
         onToolStart: (name, payload) =>
           reattachToolHandlersRef.current.onToolStart(name, payload),
@@ -13021,7 +14208,6 @@ function ChatPageInner({
     reattachTaskId,
     conversationId,
     isStreaming,
-    effectiveProjectId,
     queryClient,
   ]);
 
@@ -13158,7 +14344,6 @@ function ChatPageInner({
 
     const ok = await runStreamingChat("", [], {
       conversationIdOverride: conversationId || undefined,
-      projectIdOverride: effectiveProjectId || undefined,
       resumeTaskId: taskId,
       planOverride: overridePlan,
     });
@@ -13299,7 +14484,6 @@ function ChatPageInner({
       void runStreamingChat(launchMode === "resume_task" ? "" : message, [], {
         conversationIdOverride:
           str(detail?.conversationId, "").trim() || undefined,
-        projectIdOverride: str(detail?.projectId, "").trim() || undefined,
         statusSource: str(detail?.source, "").trim() || undefined,
         resumeTaskId: launchMode === "resume_task" ? resumeTaskId : undefined,
       }).catch((err) => {
@@ -13342,7 +14526,6 @@ function ChatPageInner({
       {
         conversationIdOverride:
           str(pendingLaunch.conversationId, "").trim() || undefined,
-        projectIdOverride: str(pendingLaunch.projectId, "").trim() || undefined,
         statusSource: str(pendingLaunch.source, "").trim() || undefined,
         resumeTaskId:
           pendingLaunch.launchMode === "resume_task"
@@ -13451,10 +14634,14 @@ function ChatPageInner({
   prevIsStreaming.current = isStreamingForCurrentConversation;
   // The final message has arrived if messages grew AND the latest is from assistant
   const lastMsg = messages[messages.length - 1];
+  const lastAssistantMessageHasRenderableContent =
+    str(lastMsg?.role, "").toLowerCase() === "assistant" &&
+    (!!str(lastMsg?.content, "").trim() ||
+      clarificationChoices(asRecord(lastMsg).choices).length > 0);
   const finalMessageLanded =
     !isStreamingForCurrentConversation &&
     messages.length > streamStartMsgCount.current &&
-    str(lastMsg?.role, "").toLowerCase() === "assistant";
+    lastAssistantMessageHasRenderableContent;
   // Show streaming bubble while streaming OR while waiting for final message to land
   const showStreamingAssistant =
     isStreamingForCurrentConversation ||
@@ -13514,16 +14701,28 @@ function ChatPageInner({
     streamingSteps,
     resetStreamingProgressBubbleState,
   ]);
-  const visiblePendingUserMessage =
-    hasLivePendingThread &&
-    pendingSnapshotMode === "fresh" &&
-    (pendingSnapshotPhase === "running" ||
-      pendingSnapshotPhase === "interrupted")
+    const visiblePendingUserMessage =
+      hasLivePendingThread &&
+      pendingSnapshotMode === "fresh" &&
+      (pendingSnapshotPhase === "running" ||
+        pendingSnapshotPhase === "interrupted")
       ? pendingUserMessage ||
         str(pendingRunSnapshot?.message, "").trim() ||
-        str(pendingRunSnapshot?.failedUserMessage, "").trim() ||
-        null
-      : null;
+          str(pendingRunSnapshot?.failedUserMessage, "").trim() ||
+          null
+        : null;
+    const interruptedTaskId = str(pendingRunSnapshot?.taskId, "").trim();
+    const interruptedRetryMessage = (
+      visiblePendingUserMessage ||
+      pendingUserMessage ||
+      str(pendingRunSnapshot?.message, "").trim() ||
+      str(pendingRunSnapshot?.failedUserMessage, "").trim() ||
+      failedUserMessage ||
+      ""
+    ).trim();
+    const canRecoverInterruptedRun = Boolean(
+      interruptedTaskId || interruptedRetryMessage,
+    );
   const pendingUserMessageAccepted =
     pendingSnapshotPhase === "interrupted" ||
     Boolean(str(pendingRunSnapshot?.runId, "").trim()) ||
@@ -13610,7 +14809,7 @@ function ChatPageInner({
     pendingUserMessageAlreadyPersisted,
   ]);
   const visibleStreamingResponse = hasLivePendingThread
-    ? streamingResponse
+    ? stripAgentInternalReasoningLeaks(streamingResponse)
     : "";
   const interruptedRunDetail = useMemo(
     () =>
@@ -13657,6 +14856,9 @@ function ChatPageInner({
     for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
       const candidate = asRecord(messages[idx]);
       if (str(candidate.role, "").toLowerCase() !== "assistant") continue;
+      const candidateContent = str(candidate.content, "").trim();
+      const candidateChoices = clarificationChoices(candidate.choices);
+      if (!candidateContent && candidateChoices.length === 0) continue;
       const tsMs = Date.parse(str(candidate.timestamp, ""));
       if (Number.isFinite(tsMs) && tsMs + 1000 < pendingSnapshotStartedAt) {
         continue;
@@ -13763,6 +14965,7 @@ function ChatPageInner({
   const openCodePreviewInWorkspace = useCallback(
     (request: CodePreviewOpenRequest) => {
       setWorkspaceOpen(true);
+      setActiveStepId(null);
       if (request.snippetId) {
         setSelectedSnippetId(request.snippetId);
         return;
@@ -13784,7 +14987,7 @@ function ChatPageInner({
       const content = str(message.content);
       const renderedContent = isUser
         ? stripAttachmentContextMarker(content)
-        : content;
+        : stripAgentInternalReasoningLeaks(content);
       const attachments = isUser ? extractChatTurnAttachments(content) : [];
       const rawMessageChoices = isAssistant
         ? clarificationChoices(message.choices)
@@ -14201,6 +15404,77 @@ function ChatPageInner({
     streamingSteps.length > 0
       ? trimTrailingHeartbeatSteps(streamingSteps)
       : completedWorkspaceSteps;
+  const workspaceActivityRestoreState = useMemo(
+    () => workspaceStateFromActivitySteps(workspaceStepsSource),
+    [workspaceStepsSource],
+  );
+  useEffect(() => {
+    if (!conversationId) {
+      lastWorkspaceActivityRestoreSeedRef.current = "";
+      return;
+    }
+    const restoredApp = sanitizeWorkspaceAppSnapshot(
+      workspaceActivityRestoreState.app,
+    );
+    const appDir = str(restoredApp?.app_dir, "");
+    const restoredFiles = workspaceActivityRestoreState.deployedFiles;
+    const restoredLiveWrites = workspaceActivityRestoreState.liveFileWrites;
+    if (
+      !restoredApp &&
+      restoredFiles.length === 0 &&
+      Object.keys(restoredLiveWrites).length === 0
+    ) {
+      return;
+    }
+    const restoreSeed = JSON.stringify({
+      conversationId,
+      appId: str(restoredApp?.id, str(restoredApp?.app_id, "")),
+      files: restoredFiles.map((file) => [file.name, file.content.length]),
+      liveWrites: Object.entries(restoredLiveWrites).map(([name, state]) => [
+        name,
+        state.content.length,
+        state.line,
+        state.totalLines,
+        state.done,
+      ]),
+    });
+    if (lastWorkspaceActivityRestoreSeedRef.current === restoreSeed) return;
+    lastWorkspaceActivityRestoreSeedRef.current = restoreSeed;
+    if (restoredApp) {
+      streamedWorkspaceAppRef.current = {
+        ...(streamedWorkspaceAppRef.current || {}),
+        ...restoredApp,
+      };
+      setStreamedWorkspaceApp(streamedWorkspaceAppRef.current);
+    }
+    if (restoredFiles.length > 0) {
+      setDeployedFiles((prev) =>
+        mergeWorkspaceFiles(prev, restoredFiles, appDir),
+      );
+      setCodeViewerFileIdx((prev) =>
+        Math.min(Math.max(0, prev), Math.max(0, restoredFiles.length - 1)),
+      );
+    }
+    if (Object.keys(restoredLiveWrites).length > 0) {
+      setLiveFileWrites((prev) =>
+        mergeLiveFileWriteStates(prev, restoredLiveWrites, appDir),
+      );
+    }
+  }, [conversationId, workspaceActivityRestoreState]);
+  const liveChatTranscriptItems = useMemo(() => {
+    if (!showStreamingAssistant && !hasPendingSnapshotForConversation) {
+      return [] as ChatTranscriptItem[];
+    }
+    const sourceSteps = trimTrailingHeartbeatSteps(
+      streamingSteps.length > 0 ? streamingSteps : workspaceStepsSource,
+    );
+    return buildChatTranscriptItemsFromSteps(sourceSteps, "live", 32);
+  }, [
+    hasPendingSnapshotForConversation,
+    showStreamingAssistant,
+    streamingSteps,
+    workspaceStepsSource,
+  ]);
   const livePlanPhaseStatuses = useMemo(() => {
     const plan =
       activePlanConfirmationState ??
@@ -14292,8 +15566,10 @@ function ChatPageInner({
     return compressed;
   }, [workspaceStepsSource, pendingSnapshotPhase, planConfirmation?.stage]);
   const workspaceConsoleSteps = useMemo(() => {
-    const raw = trimTrailingHeartbeatSteps(workspaceStepsSource).map((step) =>
-      normalizeActivityStepTime(normalizePlanStepUpdateStep(step)),
+    const raw = compressActivitySteps(
+      trimTrailingHeartbeatSteps(workspaceStepsSource).map((step) =>
+        normalizeActivityStepTime(normalizePlanStepUpdateStep(step)),
+      ),
     );
     if (
       pendingSnapshotPhase === "awaiting_confirmation" ||
@@ -14324,6 +15600,13 @@ function ChatPageInner({
   const workspaceConsoleCards = useMemo(() => {
     return workspaceConsoleSteps.map((step, idx) => safeBuildStepCard(step, idx));
   }, [workspaceConsoleSteps]);
+  const computerTaskProgress = useMemo(
+    () =>
+      latestTaskProgressFromSteps(workspaceConsoleSteps) ||
+      latestTaskProgressFromSteps(workspaceSteps) ||
+      taskProgressFromExecutionPlan(displayedExecutionPlanState),
+    [displayedExecutionPlanState, workspaceConsoleSteps, workspaceSteps],
+  );
   const inlineWorkspaceCards = useMemo(() => {
     if (!showStreamingAssistant && !hasPendingSnapshotForConversation) {
       return [];
@@ -14331,21 +15614,38 @@ function ChatPageInner({
     const meaningful = workspaceCards.filter((card) => !card.isHeartbeat);
     return meaningful.length > 0 ? meaningful : workspaceCards;
   }, [hasPendingSnapshotForConversation, showStreamingAssistant, workspaceCards]);
-  const expandedTraceCardsById = useMemo(() => {
-    const expanded = new Set<string>();
+  // Build compact per-assistant-message transcript rows from persisted traces.
+  // This keeps prior tool actions visible after a new turn begins, while the
+  // Computer pane remains the owner of full trace/output detail.
+  const perMessageTraceTranscriptById = useMemo(() => {
+    const out: Record<string, ChatTranscriptItem[]> = {};
     messages.forEach((message, idx) => {
-      const messageId = str(message.id, String(idx));
-      if (!messageTraceOpen[messageId]) return;
+      if (str(message.role, "").toLowerCase() !== "assistant") return;
       const traceId = str(message.trace_id, "").trim();
-      if (traceId) expanded.add(traceId);
-    });
-    const out: Record<string, ActivityTimelineCard[]> = {};
-    expanded.forEach((traceId) => {
+      if (!traceId) return;
+      const isLive =
+        traceId === latestAssistantTraceId && showStreamingAssistant;
+      if (isLive) return;
       const steps = traceStepsById[traceId] || [];
-      out[traceId] = steps.map((step, idx) => safeBuildStepCard(step, idx));
+      if (steps.length === 0) return;
+      const messageId = str(message.id, String(idx));
+      const items = buildChatTranscriptItemsFromSteps(
+        steps,
+        `message:${messageId}`,
+        24,
+        { complete: true },
+      );
+      if (items.length > 0) {
+        out[messageId] = items;
+      }
     });
     return out;
-  }, [messages, messageTraceOpen, traceStepsById]);
+  }, [
+    messages,
+    traceStepsById,
+    latestAssistantTraceId,
+    showStreamingAssistant,
+  ]);
   const latestWorkspaceCard = pickPrimaryActivityCard(workspaceCards);
   const progressRows = useMemo(() => {
     const seen = new Set<string>();
@@ -14421,6 +15721,14 @@ function ChatPageInner({
   const streamingRunMetricItems = streamingRunMetrics
     ? buildChatRunMetricItems(streamingRunMetrics)
     : [];
+  const hasVisibleStreamingReply = Boolean(visibleStreamingResponse.trim());
+  const hasLiveWorkActivity =
+    !isPlanningDeepResearch &&
+    (liveChatTranscriptItems.length > 0 ||
+      streamingRunMetricItems.length > 0);
+  const showLiveExecutionPanel =
+    showStreamingAssistant &&
+    hasLiveWorkActivity;
   const resolvedActiveFileContent = choosePreferredWorkspaceFileContent(
     activeCodeFile ? liveFileWrites[activeCodeFile.name]?.content || "" : "",
     activeCodeFile?.content || "",
@@ -14465,6 +15773,12 @@ function ChatPageInner({
     workspaceTunnel.selected_app_id,
     "",
   ).trim();
+  const workspaceExposedPublicAppIds = new Set(
+    stringList(workspaceTunnel.exposed_app_ids),
+  );
+  if (workspaceSelectedPublicAppId) {
+    workspaceExposedPublicAppIds.add(workspaceSelectedPublicAppId);
+  }
   const activeWorkspaceApp = useMemo(() => {
     const workspaceAppSeed =
       streamedWorkspaceApp || restoredConversationWorkspaceApp;
@@ -14511,9 +15825,8 @@ function ChatPageInner({
   const publicPreviewUrl =
     workspaceTunnelBaseUrl &&
     workspaceTunnelBaseUrl !== origin &&
-    workspaceSelectedPublicAppId &&
     activeWorkspaceAppId &&
-    workspaceSelectedPublicAppId === activeWorkspaceAppId &&
+    workspaceExposedPublicAppIds.has(activeWorkspaceAppId) &&
     publicAccessPath
       ? toAbsoluteAppUrl(publicAccessPath, workspaceTunnelBaseUrl)
       : "";
@@ -14671,6 +15984,21 @@ function ChatPageInner({
     }
     if (isStreamingForCurrentConversation) {
       const active = latestRunningCard || latestWorkspaceCard;
+      const liveWriteEntry =
+        Object.entries(liveFileWrites).find(([, state]) => !state.done) ||
+        null;
+      if (liveWriteEntry) {
+        const [fileName, state] = liveWriteEntry;
+        const line =
+          state.totalLines > 0
+            ? `line ${Math.min(state.line, state.totalLines)} of ${state.totalLines}`
+            : "capturing generated code";
+        return {
+          line1: `Status: Writing ${fileName}`,
+          line2: line,
+          tone: "info",
+        };
+      }
       return {
         line1: `Status: ${activePhaseStatus?.label || "Running"}`,
         line2:
@@ -14711,6 +16039,7 @@ function ChatPageInner({
     isStreamingForCurrentConversation,
     latestRunningCard,
     latestWorkspaceCard,
+    liveFileWrites,
     safetyPolicyBlocked,
   ]);
   const nowDoingLabel = useMemo(() => {
@@ -14718,6 +16047,12 @@ function ChatPageInner({
     if (safetyPolicyBlocked) return "Blocked by safety policy";
     if (isExecutionPlanFinalizing) return "Finalizing answer";
     if (isExecutionPlanTransitioning) return "Starting next branch";
+    if (isStreamingForCurrentConversation) {
+      const liveWriteEntry =
+        Object.entries(liveFileWrites).find(([, state]) => !state.done) ||
+        null;
+      if (liveWriteEntry?.[0]) return `Writing ${liveWriteEntry[0]}`;
+    }
     if (activePhaseStatus?.label) return activePhaseStatus.label;
     const active = latestRunningCard || latestWorkspaceCard;
     return active?.label || "Waiting for next step";
@@ -14726,8 +16061,10 @@ function ChatPageInner({
     credentialUiActive,
     isExecutionPlanFinalizing,
     isExecutionPlanTransitioning,
+    isStreamingForCurrentConversation,
     latestRunningCard,
     latestWorkspaceCard,
+    liveFileWrites,
     safetyPolicyBlocked,
   ]);
   const liveWriteEntries = useMemo(
@@ -14746,6 +16083,29 @@ function ChatPageInner({
       null,
     [liveWriteEntries],
   );
+  const computerWorkspaceFiles = useMemo(() => {
+    // Build the union of files the agent has fully deployed AND files it is
+    // currently streaming. The first deploy of a turn has empty deployedFiles
+    // until the action returns, so without folding live-writes in here the
+    // Computer pane would render "Files: 0" while the model is mid-draft —
+    // exactly the Lovable/Bolt hole the user flagged. Live-write content takes
+    // precedence over any captured snapshot for the same path.
+    const merged = new Map<string, { path: string; content: string }>();
+    for (const file of deployedFiles) {
+      merged.set(file.name, {
+        path: file.name,
+        content: choosePreferredWorkspaceFileContent(
+          liveFileWrites[file.name]?.content || "",
+          file.content || "",
+        ),
+      });
+    }
+    for (const [name, state] of Object.entries(liveFileWrites)) {
+      if (merged.has(name)) continue;
+      merged.set(name, { path: name, content: state.content || "" });
+    }
+    return Array.from(merged.values());
+  }, [deployedFiles, liveFileWrites]);
   const executionPlanStatusLabel = executionPlanNeedsAttention
     ? "Needs attention"
     : visibleExecutionPlanFailure
@@ -15107,6 +16467,43 @@ function ChatPageInner({
           Delete chat
         </MenuItem>
       </Menu>
+    </Box>
+  );
+
+  const renderComputerPaneContent = (_drawer = false) => (
+    <Box
+      className="computer-pane-shell"
+      sx={{
+        minHeight: 0,
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        alignSelf: "start",
+      }}
+    >
+      <ComputerPane
+        liveCards={inlineWorkspaceCards}
+        allCards={workspaceConsoleCards}
+        activeStepId={activeStepId}
+        onActivate={handleActivateStep}
+        onClose={() => setWorkspaceOpen(false)}
+        nowDoingLabel={nowDoingLabel || streamingActivity}
+        snippetPath={activeWorkspaceCodePath}
+        snippetContent={activeWorkspaceCodeContent}
+        isStreaming={isStreamingForCurrentConversation}
+        startedAt={pendingSnapshotStartedAt || null}
+        tokenPreview={visibleStreamingResponse}
+        reasoningPreview={reasoningStream?.content || ""}
+        reasoningPhase={reasoningStream?.phase || ""}
+        taskProgress={computerTaskProgress}
+        showSnippet={Boolean(selectedSnippetId) && !activeStepId}
+        workspaceFiles={computerWorkspaceFiles}
+        liveWritePath={activeLiveWriteEntry?.[0] || null}
+        liveWriteContent={activeLiveWriteEntry?.[1]?.content || ""}
+        liveWriteActive={
+          Boolean(activeLiveWriteEntry) && !activeLiveWriteEntry?.[1]?.done
+        }
+      />
     </Box>
   );
 
@@ -15601,30 +16998,30 @@ function ChatPageInner({
     return isStreaming ? chatTurnAttachmentsFromFiles(attachedFiles) : [];
   }, [attachedFiles, isStreaming, pendingRunSnapshot?.attachments]);
 
-  const renderAttachedFileChips = (className = "") =>
+  const renderAttachedFilePills = (className = "") =>
     !isStreaming && attachedFiles.length > 0 ? (
-      <Stack
-        className={className || undefined}
-        direction="row"
-        spacing={0.75}
-        useFlexGap
-        sx={{
-          flexWrap: "wrap",
-          mb: 0.5,
-        }}
-      >
+      <Box className={`chat-attached-file-pills ${className}`.trim()}>
         {attachedFiles.map((file, idx) => (
-          <Chip
+          <span
             key={`${file.name}-${file.size}-${file.lastModified}-${idx}`}
-            size="small"
-            label={file.name}
-            onDelete={isStreaming ? undefined : () => removeAttachedFile(idx)}
-          />
+            className="chat-attached-file-pill"
+          >
+            <AttachFileRoundedIcon fontSize="inherit" aria-hidden="true" />
+            <span className="chat-attached-file-pill-label">{file.name}</span>
+            <button
+              type="button"
+              className="chat-attached-file-pill-remove"
+              aria-label={`Remove ${file.name}`}
+              onClick={() => removeAttachedFile(idx)}
+            >
+              <CloseIcon fontSize="inherit" />
+            </button>
+          </span>
         ))}
-      </Stack>
+      </Box>
     ) : null;
 
-  const renderTurnAttachmentChips = (
+  const renderTurnAttachmentPills = (
     attachments: ChatTurnAttachment[],
     keyPrefix: string,
   ) =>
@@ -15642,14 +17039,205 @@ function ChatPageInner({
               key={`${keyPrefix}:${attachment.kind}:${attachment.id || attachment.name}:${idx}`}
               title={attachment.detail ? `${detail} - ${attachment.detail}` : detail}
             >
-              <Chip
-                className="chat-turn-attachment-chip"
-                icon={<AttachFileRoundedIcon />}
-                label={attachment.name}
-                size="small"
-                variant="outlined"
-              />
+              <span className="chat-turn-attachment-pill">
+                <AttachFileRoundedIcon fontSize="inherit" aria-hidden="true" />
+                <span className="chat-turn-attachment-pill-label">
+                  {attachment.name}
+                </span>
+              </span>
             </Tooltip>
+          );
+        })}
+      </Box>
+    ) : null;
+
+  const renderTranscriptStatusIcon = (
+    status: ChatTranscriptActionStatus,
+  ): ReactNode => {
+    if (status === "done") return <CheckCircleRoundedIcon fontSize="inherit" />;
+    if (status === "issue") return <ErrorOutlineRoundedIcon fontSize="inherit" />;
+    return <span className="chat-transcript-running-indicator" />;
+  };
+
+  const renderChatTranscriptItems = (
+    items: ChatTranscriptItem[],
+    keyPrefix: string,
+    isLiveTranscript = false,
+  ) =>
+    items.length > 0 ? (
+      <Box
+        className={`chat-agent-transcript${isLiveTranscript ? " is-live" : ""}`}
+        aria-label="Agent activity transcript"
+      >
+        {items.map((item, idx) => {
+          if (item.kind === "prose") {
+            return (
+              <Typography
+                key={`${keyPrefix}:${item.id}:${idx}`}
+                variant="body2"
+                className={`chat-transcript-prose-line${isLiveTranscript ? " is-live" : ""}`}
+              >
+                {item.text}
+              </Typography>
+            );
+          }
+          if (item.kind === "reasoning") {
+            const expanded = expandedTranscriptActions.has(item.id);
+            const stepCount = item.details.length;
+            return (
+              <Box
+                key={`${keyPrefix}:${item.id}:${idx}`}
+                className={`chat-transcript-action-shell chat-transcript-reasoning-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
+              >
+                <button
+                  type="button"
+                  className={`chat-transcript-action-row chat-transcript-reasoning-row status-${item.status}`}
+                  onClick={() => toggleExpandedTranscriptAction(item.id)}
+                  aria-expanded={expanded}
+                  aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}`}
+                >
+                  <span className="chat-transcript-action-icon" aria-hidden="true">
+                    {renderTranscriptStatusIcon(item.status)}
+                  </span>
+                  <span className="chat-transcript-action-main">
+                    <span className="chat-transcript-action-title">
+                      {item.title}
+                    </span>
+                    {item.detail ? (
+                      <>
+                        <span
+                          className="chat-transcript-action-separator"
+                          aria-hidden="true"
+                        >
+                          |
+                        </span>
+                        <span className="chat-transcript-action-detail">
+                          {item.detail}
+                        </span>
+                      </>
+                    ) : null}
+                  </span>
+                  {stepCount > 0 ? (
+                    <span className="chat-transcript-action-count">
+                      {stepCount}
+                    </span>
+                  ) : null}
+                  <ExpandMoreIcon
+                    className="chat-transcript-action-chevron"
+                    fontSize="inherit"
+                    aria-hidden="true"
+                  />
+                </button>
+                <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
+                  <Box className="chat-transcript-action-details chat-transcript-reasoning-details">
+                    {item.details.map((entry, entryIdx) => (
+                      <button
+                        key={`${item.id}:detail:${entry.id}:${entryIdx}`}
+                        type="button"
+                        className={`chat-transcript-action-detail-row status-${entry.status}`}
+                        onClick={() => handleActivateStep(entry.card.id)}
+                        aria-label={`${entry.label}${entry.detail ? `: ${entry.detail}` : ""}`}
+                      >
+                        <span
+                          className="chat-transcript-action-detail-dot"
+                          aria-hidden="true"
+                        />
+                        <span className="chat-transcript-action-detail-copy">
+                          <span className="chat-transcript-action-detail-label">
+                            {entry.label}
+                          </span>
+                          {entry.detail ? (
+                            <span className="chat-transcript-action-detail-text">
+                              {entry.detail}
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                    ))}
+                  </Box>
+                </Collapse>
+              </Box>
+            );
+          }
+          const statusIcon = renderTranscriptStatusIcon(item.status);
+          const expanded = expandedTranscriptActions.has(item.id);
+          const stepCount = item.details.length;
+          return (
+            <Box
+              key={`${keyPrefix}:${item.id}:${idx}`}
+              className={`chat-transcript-action-shell status-${item.status}${expanded ? " is-expanded" : ""}`}
+            >
+              <button
+                type="button"
+                className={`chat-transcript-action-row status-${item.status}`}
+                onClick={() => {
+                  handleActivateStep(item.card.id);
+                  toggleExpandedTranscriptAction(item.id);
+                }}
+                aria-expanded={expanded}
+                aria-label={`${expanded ? "Collapse" : "Expand"} ${item.title}${item.detail ? `: ${item.detail}` : ""}`}
+              >
+                <span className="chat-transcript-action-icon" aria-hidden="true">
+                  {statusIcon}
+                </span>
+                <span className="chat-transcript-action-main">
+                  <span className="chat-transcript-action-title">
+                    {item.title}
+                  </span>
+                  {item.detail ? (
+                    <>
+                      <span
+                        className="chat-transcript-action-separator"
+                        aria-hidden="true"
+                      >
+                        |
+                      </span>
+                      <span className="chat-transcript-action-detail">
+                        {item.detail}
+                      </span>
+                    </>
+                  ) : null}
+                </span>
+                {stepCount > 0 ? (
+                  <span className="chat-transcript-action-count">
+                    {stepCount}
+                  </span>
+                ) : null}
+                <ExpandMoreIcon
+                  className="chat-transcript-action-chevron"
+                  fontSize="inherit"
+                  aria-hidden="true"
+                />
+              </button>
+              <Collapse in={expanded && stepCount > 0} timeout="auto" unmountOnExit>
+                <Box className="chat-transcript-action-details">
+                  {item.details.map((entry, entryIdx) => (
+                    <button
+                      key={`${item.id}:detail:${entry.id}:${entryIdx}`}
+                      type="button"
+                      className={`chat-transcript-action-detail-row status-${entry.status}`}
+                      onClick={() => handleActivateStep(entry.card.id)}
+                      aria-label={`${entry.label}${entry.detail ? `: ${entry.detail}` : ""}`}
+                    >
+                      <span
+                        className="chat-transcript-action-detail-dot"
+                        aria-hidden="true"
+                      />
+                      <span className="chat-transcript-action-detail-copy">
+                        <span className="chat-transcript-action-detail-label">
+                          {entry.label}
+                        </span>
+                        {entry.detail ? (
+                          <span className="chat-transcript-action-detail-text">
+                            {entry.detail}
+                          </span>
+                        ) : null}
+                      </span>
+                    </button>
+                  ))}
+                </Box>
+              </Collapse>
+            </Box>
           );
         })}
       </Box>
@@ -15721,6 +17309,7 @@ function ChatPageInner({
         onDragOver={handleChatDragOver}
         onDragLeave={handleChatDragLeave}
         onDrop={handleChatDrop}
+        onPaste={handleChatPaste}
       >
         <Stack
           direction={{ xs: "column", sm: "row" }}
@@ -15794,21 +17383,19 @@ function ChatPageInner({
               justifyContent: { xs: "flex-start", sm: "flex-end" },
             }}
           >
-            <WorkspaceScopeMenuButton
-              activeProjectId={activeProjectId}
-              projects={projects}
-              onNavigateToView={onNavigateToView}
-            />
             {activeConversationSession ? (
-              <Chip
-                size="small"
-                variant="outlined"
-                color="info"
-                clickable={!!onNavigateToView}
+              <button
+                type="button"
+                className="chat-session-pill"
+                disabled={!onNavigateToView}
                 onClick={() => onNavigateToView?.("sessions")}
-                label={`Session: ${str(activeConversationSession.title, "Background session")}`}
-                sx={{ maxWidth: 280 }}
-              />
+                title={`Session: ${str(activeConversationSession.title, "Background session")}`}
+              >
+                <span className="chat-session-pill-dot" aria-hidden="true" />
+                <span className="chat-session-pill-label">
+                  Session: {str(activeConversationSession.title, "Background session")}
+                </span>
+              </button>
             ) : null}
             <Tooltip
               title={
@@ -15845,25 +17432,6 @@ function ChatPageInner({
           }}
         >
           <Box className="chat-reading-column">
-            {selectedConversationProjectId ? (
-              <Stack
-                direction="row"
-                spacing={0.9}
-                useFlexGap
-                sx={{
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  mb: 0.5,
-                }}
-              >
-                <Chip
-                  size="small"
-                  variant="outlined"
-                  label={`Project: ${projectNameById.get(selectedConversationProjectId) || selectedConversationProjectId}`}
-                />
-              </Stack>
-            ) : null}
-
             <Box
               ref={threadRef}
               sx={{ flex: 1, minHeight: 0, overflow: "auto" }}
@@ -15883,7 +17451,7 @@ function ChatPageInner({
                     </Typography>
                   </Box>
                   <Box className="chat-empty-composer-wrap">
-                    {renderAttachedFileChips("chat-empty-attachments")}
+                    {renderAttachedFilePills("chat-empty-attachments")}
                     <Box
                       className={`chat-composer-shell chat-composer-shell-centered${shouldShowExecutionPlanWarning ? " has-plan" : ""}`}
                     >
@@ -16126,16 +17694,13 @@ function ChatPageInner({
                           timeToFirstTokenMs: messageTimeToFirstTokenMs,
                         })
                       : [];
+                    const messageTranscriptItems = isAssistant
+                      ? perMessageTraceTranscriptById[messageId] || []
+                      : [];
                     const isPlanConfirmationMessage =
                       isAssistant &&
                       showPlanConfirmationCard &&
                       idx === planConfirmationMessageIndex;
-                    const traceLoading = hasTrace
-                      ? Boolean(traceLoadingById[traceId])
-                      : false;
-                    const traceError = hasTrace
-                      ? str(traceErrorById[traceId], "").trim()
-                      : "";
                     const rawTraceSteps = hasTrace
                       ? traceStepsById[traceId] || []
                       : [];
@@ -16144,21 +17709,6 @@ function ChatPageInner({
                       activityStepsRepresentAwaitingPlanConfirmation(
                         rawTraceSteps,
                       );
-                    const traceExpanded = Boolean(messageTraceOpen[messageId]);
-                    const traceCards =
-                      rawTraceSteps.length > 0
-                        ? rawTraceSteps.map((step, stepIdx) =>
-                            safeBuildStepCard(step, stepIdx),
-                          )
-                        : traceExpanded && hasTrace
-                          ? expandedTraceCardsById[traceId] || []
-                          : [];
-                    const inlineTraceCards = traceExpanded
-                      ? traceCards.filter((card) => !card.isHeartbeat).length >
-                        0
-                        ? traceCards.filter((card) => !card.isHeartbeat)
-                        : traceCards
-                      : [];
                     const shouldInsertCompletedProgressBeforeMessage =
                       shouldInlineCompletedProgressBeforeAssistant &&
                       messageId === completedProgressBeforeMessageId;
@@ -16262,18 +17812,7 @@ function ChatPageInner({
                                     </Tooltip>
                                   </Stack>
                                 </Stack>
-                                {/* Trace steps are rendered inline from normalized run events. */}
-                                {!isUser &&
-                                inlineTraceCards.length > 0 &&
-                                !traceShowsAwaitingPlanConfirmation ? (
-                                  <InlineActivityFeed
-                                    cards={inlineTraceCards}
-                                    expandedPayloads={expandedActivityPayloads}
-                                    onTogglePayload={toggleExpandedActivityPayload}
-                                    keyPrefix={`trace:${messageId}`}
-                                    onOpenConsole={openActivityConsole}
-                                  />
-                                ) : null}
+                                {/* Detailed tool/action outputs stay in Run Details; chat shows compact transcript rows. */}
                                 {isUser ? (
                                   <>
                                     <Typography
@@ -16282,21 +17821,29 @@ function ChatPageInner({
                                     >
                                       {renderedContent}
                                     </Typography>
-                                    {renderTurnAttachmentChips(
+                                    {renderTurnAttachmentPills(
                                       attachments,
                                       messageId,
                                     )}
                                   </>
-                                ) : researchReport ? (
-                                  renderResearchReportCard({
-                                    report: researchReport,
-                                    previousUserPrompt,
-                                    messageId,
-                                    timestamp: tsRaw,
-                                    traceId,
-                                  })
                                 ) : (
-                                  markdownNode
+                                  <>
+                                    {messageTranscriptItems.length > 0
+                                      ? renderChatTranscriptItems(
+                                          messageTranscriptItems,
+                                          `message-transcript:${messageId}`,
+                                        )
+                                      : null}
+                                    {researchReport
+                                      ? renderResearchReportCard({
+                                          report: researchReport,
+                                          previousUserPrompt,
+                                          messageId,
+                                          timestamp: tsRaw,
+                                          traceId,
+                                        })
+                                      : markdownNode}
+                                  </>
                                 )}
                                 {runMetricItems.length > 0 ? (
                                   <Box
@@ -16353,7 +17900,7 @@ function ChatPageInner({
                         >
                           {visiblePendingUserMessage}
                         </Typography>
-                        {renderTurnAttachmentChips(
+                        {renderTurnAttachmentPills(
                           pendingTurnAttachments,
                           "pending-user-message",
                         )}
@@ -16380,7 +17927,7 @@ function ChatPageInner({
                         >
                           {visibleFailedUserMessage}
                         </Typography>
-                        {renderTurnAttachmentChips(
+                        {renderTurnAttachmentPills(
                           pendingTurnAttachments,
                           "failed-user-message",
                         )}
@@ -16411,11 +17958,11 @@ function ChatPageInner({
                     </Box>
                   ) : null}
 
-                  {showInterruptedRunCard ? (
-                    <Box className="chat-row">
-                      {renderAgentAvatar()}
-                      <Box className="chat-bubble chat-bubble-assistant">
-                        <Stack spacing={1}>
+                    {showInterruptedRunCard ? (
+                      <Box className="chat-row chat-row-interrupted-work">
+                        {renderAgentAvatar()}
+                        <Box className="chat-bubble chat-bubble-assistant chat-bubble-interrupted-work">
+                          <Stack spacing={1}>
                           <Typography
                             variant="caption"
                             sx={{
@@ -16446,47 +17993,43 @@ function ChatPageInner({
                                 "This run was interrupted before a full reply was sent."}
                             </Typography>
                           )}
-                          {inlineWorkspaceCards.length > 0 ? (
-                            <InlineActivityFeed
-                              cards={inlineWorkspaceCards}
-                              expandedPayloads={expandedActivityPayloads}
-                              onTogglePayload={toggleExpandedActivityPayload}
-                              keyPrefix="interrupted-run"
-                              onOpenConsole={openActivityConsole}
-                            />
-                          ) : null}
-                          <SwarmActivityPanel
-                            runs={swarmActivityRuns}
-                            interrupted
-                            expandedPayloads={expandedActivityPayloads}
-                            onTogglePayload={toggleExpandedActivityPayload}
-                          />
+                          {renderChatTranscriptItems(
+                            liveChatTranscriptItems,
+                            "interrupted-transcript",
+                          )}
                           <Box>
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              disabled={
-                                !str(pendingRunSnapshot?.taskId, "").trim() ||
-                                isStreaming
-                              }
-                              onClick={() => {
-                                const taskId = str(
-                                  pendingRunSnapshot?.taskId,
-                                  "",
-                                ).trim();
-                                if (!taskId) return;
-                                void runStreamingChat("", [], {
-                                  conversationIdOverride:
-                                    conversationId || undefined,
-                                  projectIdOverride:
-                                    effectiveProjectId || undefined,
-                                  resumeTaskId: taskId,
-                                });
-                              }}
-                            >
-                              Resume
-                            </Button>
-                          </Box>
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                disabled={isStreaming || !canRecoverInterruptedRun}
+                                onClick={() => {
+                                  const taskId = str(
+                                    pendingRunSnapshot?.taskId,
+                                    "",
+                                  ).trim();
+                                  if (taskId) {
+                                    void runStreamingChat("", [], {
+                                      conversationIdOverride:
+                                        conversationId || undefined,
+                                      resumeTaskId: taskId,
+                                    });
+                                    return;
+                                  }
+                                  if (!interruptedRetryMessage) return;
+                                  void runStreamingChat(interruptedRetryMessage, [], {
+                                    conversationIdOverride:
+                                      conversationId ||
+                                      str(
+                                        pendingRunSnapshot?.conversationId,
+                                        "",
+                                      ).trim() ||
+                                      undefined,
+                                  });
+                                }}
+                              >
+                                {interruptedTaskId ? "Resume" : "Retry"}
+                              </Button>
+                            </Box>
                         </Stack>
                       </Box>
                     </Box>
@@ -16494,11 +18037,10 @@ function ChatPageInner({
 
                   {showStreamingAssistant &&
                   latestStreamingAssistantIndex === -1 ? (
-                    !visibleStreamingResponse.trim() &&
+                    !hasVisibleStreamingReply &&
                     !isPlanningDeepResearch &&
                     visibleStreamingProgressMessages.length === 0 &&
-                    inlineWorkspaceCards.length === 0 &&
-                    swarmActivityRuns.length === 0 ? (
+                    liveChatTranscriptItems.length === 0 ? (
                     <Box className="chat-row chat-thinking-inline">
                       {renderAgentAvatar("chat-avatar-working")}
                       <span className="chat-thinking-text">
@@ -16506,118 +18048,135 @@ function ChatPageInner({
                       </span>
                     </Box>
                   ) : (
-                    <Box className="chat-row">
-                      {renderAgentAvatar("chat-avatar-working")}
-                      <Box
-                        className={`chat-bubble chat-bubble-assistant${isPlanningDeepResearch && !visibleStreamingResponse.trim() ? " chat-bubble-plan-confirmation" : " chat-bubble-streaming"}`}
-                      >
-                        {isPlanningDeepResearch &&
-                        !visibleStreamingResponse.trim() ? (
-                          renderPlanConfirmationCard({ threadMode: true })
-                        ) : (
-                          <Stack className="chat-stream-section-stack" spacing={1}>
-                            <Typography
-                              variant="caption"
-                              className="chat-streaming-status"
-                              sx={{
-                                color: "text.secondary",
-                              }}
-                            >
-                              {streamingResearchReport
-                                ? "Deep research report is streaming..."
-                                : nowDoingLabel || streamingActivity}
-                            </Typography>
-                            {visibleStreamingResponse.trim() ? (
-                              <Box className="chat-stream-section chat-stream-section-reply">
+                    <>
+                      {isPlanningDeepResearch &&
+                      !hasVisibleStreamingReply ? (
+                        <Box className="chat-row chat-row-plan-confirmation">
+                          {renderAgentAvatar("chat-avatar-working")}
+                          <Box className="chat-bubble chat-bubble-assistant chat-bubble-plan-confirmation">
+                            {renderPlanConfirmationCard({ threadMode: true })}
+                          </Box>
+                        </Box>
+                      ) : (
+                        <>
+                          {hasVisibleStreamingReply ? (
+                            <Box className="chat-row">
+                              {renderAgentAvatar("chat-avatar-working")}
+                              <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming chat-bubble-streaming-reply">
                                 <Typography
                                   variant="caption"
-                                  className="chat-stream-section-kicker"
+                                  className="chat-streaming-status"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
                                 >
-                                  Reply
+                                  {streamingResearchReport
+                                    ? "Deep research report is streaming..."
+                                    : nowDoingLabel || streamingActivity}
                                 </Typography>
-                                {streamingResearchReport ? (
-                                  <Box sx={{ position: "relative" }}>
-                                    {renderResearchReportCard({
-                                      report: streamingResearchReport,
-                                      previousUserPrompt: streamingResearchPrompt,
-                                      messageId: "streaming-report",
-                                      isStreaming: true,
-                                    })}
-                                    <span className="stream-caret" />
-                                  </Box>
-                                ) : (
-                                  <Box sx={{ position: "relative" }}>
-                                    {renderStreamingChatMarkdown(visibleStreamingResponse)}
-                                    <span className="stream-caret" />
-                                  </Box>
-                                )}
-                              </Box>
-                            ) : null}
-                            {inlineWorkspaceCards.length > 0 &&
-                            !isPlanningDeepResearch ? (
-                              <Box className="chat-stream-section chat-stream-section-work">
-                                <Typography
-                                  variant="caption"
-                                  className="chat-stream-section-kicker"
-                                >
-                                  Work
-                                </Typography>
-                                <InlineActivityFeed
-                                  cards={inlineWorkspaceCards}
-                                  live={isStreamingForCurrentConversation}
-                                  expandedPayloads={expandedActivityPayloads}
-                                  onTogglePayload={toggleExpandedActivityPayload}
-                                  keyPrefix="live-run"
-                                  onOpenConsole={openActivityConsole}
-                                />
-                              </Box>
-                            ) : null}
-                            {!visibleStreamingResponse.trim() &&
-                            inlineWorkspaceCards.length === 0 ? (
-                              <div className="typing-dots" aria-label="typing">
-                                <span />
-                                <span />
-                                <span />
-                              </div>
-                            ) : null}
-                            {streamingRunMetricItems.length > 0 ? (
-                              <Box
-                                className="chat-run-metrics chat-run-metrics-live"
-                                aria-label="Live run metrics"
-                              >
-                                {streamingRunMetricItems.map((item) => (
-                                  <span
-                                    className="chat-run-metric"
-                                    key={`streaming:${item.label}`}
-                                  >
-                                    <span className="chat-run-metric-label">
-                                      {item.label}
-                                    </span>
-                                    <span className="chat-run-metric-value">
-                                      {item.value}
-                                    </span>
-                                  </span>
-                                ))}
-                              </Box>
-                            ) : null}
-                            {visibleStreamingResponse.trim()
-                              ? renderClarificationChoiceGroup(
+                                <Box className="chat-stream-section-reply">
+                                  {streamingResearchReport ? (
+                                    <Box sx={{ position: "relative" }}>
+                                      {renderResearchReportCard({
+                                        report: streamingResearchReport,
+                                        previousUserPrompt: streamingResearchPrompt,
+                                        messageId: "streaming-report",
+                                        isStreaming: true,
+                                      })}
+                                      <span className="stream-caret" />
+                                    </Box>
+                                  ) : (
+                                    <Box sx={{ position: "relative" }}>
+                                      {renderStreamingChatMarkdown(visibleStreamingResponse)}
+                                      <span className="stream-caret" />
+                                    </Box>
+                                  )}
+                                </Box>
+                                {renderClarificationChoiceGroup(
                                   `streaming-clarification:${str(
                                     pendingRunSnapshot?.runId,
                                     visibleStreamingResponse.slice(0, 80),
                                   )}`,
                                   streamingResponseChoices,
-                                )
-                              : null}
-                            <SwarmActivityPanel
-                              runs={swarmActivityRuns}
-                              expandedPayloads={expandedActivityPayloads}
-                              onTogglePayload={toggleExpandedActivityPayload}
-                            />
-                          </Stack>
-                        )}
-                      </Box>
-                    </Box>
+                                )}
+                              </Box>
+                            </Box>
+                          ) : null}
+                          {showLiveExecutionPanel ? (
+                            <Box className="chat-row chat-row-live-work">
+                              {hasVisibleStreamingReply ? (
+                                <Box className="chat-avatar-spacer" aria-hidden="true" />
+                              ) : (
+                                renderAgentAvatar("chat-avatar-working")
+                              )}
+                              <Box
+                                className={`chat-live-work-panel${
+                                  liveChatTranscriptItems.length > 0
+                                    ? " has-transcript"
+                                    : " has-status-copy"
+                                }${CHAT_LAYOUT_MODE === "split" ? " is-split" : ""}`}
+                              >
+                                {liveChatTranscriptItems.length > 0 ? (
+                                  renderChatTranscriptItems(
+                                    liveChatTranscriptItems,
+                                    "live-transcript",
+                                    true,
+                                  )
+                                ) : (
+                                  <Typography
+                                    variant="body2"
+                                    className="chat-live-ack-copy"
+                                  >
+                                    {nowDoingLabel || streamingActivity}
+                                  </Typography>
+                                )}
+                                {streamingRunMetricItems.length > 0 ? (
+                                  <Box
+                                    className="chat-run-metrics chat-run-metrics-live"
+                                    aria-label="Live run metrics"
+                                  >
+                                    {streamingRunMetricItems.map((item) => (
+                                      <span
+                                        className="chat-run-metric"
+                                        key={`streaming:${item.label}`}
+                                      >
+                                        <span className="chat-run-metric-label">
+                                          {item.label}
+                                        </span>
+                                        <span className="chat-run-metric-value">
+                                          {item.value}
+                                        </span>
+                                      </span>
+                                    ))}
+                                  </Box>
+                                ) : null}
+                              </Box>
+                            </Box>
+                          ) : null}
+                          {!hasVisibleStreamingReply && !showLiveExecutionPanel ? (
+                            <Box className="chat-row">
+                              {renderAgentAvatar("chat-avatar-working")}
+                              <Box className="chat-bubble chat-bubble-assistant chat-bubble-streaming">
+                                <Typography
+                                  variant="caption"
+                                  className="chat-streaming-status"
+                                  sx={{
+                                    color: "text.secondary",
+                                  }}
+                                >
+                                  {nowDoingLabel || streamingActivity}
+                                </Typography>
+                                <div className="typing-dots" aria-label="typing">
+                                  <span />
+                                  <span />
+                                  <span />
+                                </div>
+                              </Box>
+                            </Box>
+                          ) : null}
+                        </>
+                      )}
+                    </>
                   )
                   ) : null}
                 </Stack>
@@ -16925,7 +18484,7 @@ function ChatPageInner({
                 e.currentTarget.value = "";
               }}
             />
-            {!showEmptyHero ? renderAttachedFileChips() : null}
+            {!showEmptyHero ? renderAttachedFilePills() : null}
             {shouldShowCompactExecutionPlan ? (
               <Accordion
                 expanded={executionPlanExpanded}
@@ -17147,7 +18706,9 @@ function ChatPageInner({
       </Box>
       {showWorkspacePanelInline ? (
         <Box sx={{ minHeight: 0, display: { xs: "none", lg: "contents" } }}>
-          {renderActivityPanelContent()}
+          {CHAT_LAYOUT_MODE === "split"
+            ? renderComputerPaneContent()
+            : renderActivityPanelContent()}
         </Box>
       ) : null}
       <Drawer
@@ -17170,7 +18731,9 @@ function ChatPageInner({
           paper: { className: "chat-mobile-drawer chat-mobile-drawer-right" },
         }}
       >
-        {renderActivityPanelContent(true)}
+        {CHAT_LAYOUT_MODE === "split"
+          ? renderComputerPaneContent(true)
+          : renderActivityPanelContent(true)}
       </Drawer>
       {/* Code Viewer Dialog */}
       <Dialog
@@ -18126,10 +19689,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       const successGain = num(replay.success_gain, Number.NaN);
       if (Number.isFinite(successGain))
         evidence.push(`Experience gain: ${(successGain * 100).toFixed(1)} pts`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.result" ||
-      traceKind === "self_evolve.specialist_prompt.result"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.result") {
       const evaluatedCandidates = num(data.evaluated_candidates, 0);
       const baselineScore = percentageLabel(data.baseline_score, 0);
       const candidateScore = percentageLabel(data.best_candidate_score, 0);
@@ -18175,10 +19735,7 @@ function buildEvolutionReviewCards(steps: JsonRecord[]): EvolutionReviewCard[] {
       if (notes.length) evidence.push(`Why: ${notes.join(" | ")}`);
       const lineageId = str(data.lineage_entry_id, "").trim();
       if (lineageId) evidence.push(`Lineage: ${lineageId}`);
-    } else if (
-      traceKind === "self_evolve.classifier_prompt.promotion" ||
-      traceKind === "self_evolve.specialist_prompt.promotion"
-    ) {
+    } else if (traceKind === "self_evolve.specialist_prompt.promotion") {
       const promotionMode = str(data.promotion_mode, "none").trim();
       const canaryState = asRecord(data.canary_state);
       const replay = asRecord(data.replay_evaluation);
@@ -18695,7 +20252,6 @@ function evolutionExperimentStatusText(item: {
 function promptProposalScopeLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "prompt_profile") return "Main replies";
-  if (normalized === "classifier_prompt_profile") return "Request understanding";
   if (normalized === "specialist_prompt_profile") return "Specialist helpers";
   return humanizeStatusLabel(value || "prompt profile");
 }

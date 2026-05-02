@@ -217,7 +217,7 @@ pub(super) async fn gmail_status(State(state): State<AppState>) -> Response {
     };
     let parsed: serde_json::Value =
         serde_json::from_str(&payload).unwrap_or_else(|_| serde_json::json!({}));
-    // Check for refresh_token presence  - access tokens expire after ~1 hour
+    // Check for refresh_token presence - access tokens expire after ~1 hour
     // but as long as we have a refresh_token, we can auto-renew
     let has_refresh = parsed
         .get("refresh_token")
@@ -671,6 +671,7 @@ fn integration_uses_config_only_status(id: &str) -> bool {
             | "gsc"
             | "social_analytics"
             | "moltbook"
+            | "vercel"
     )
 }
 
@@ -876,6 +877,36 @@ pub(super) fn external_integration_config(
             }],
             Some("Create a GitHub personal access token and paste it here. It will be stored encrypted. This is for the GitHub API connector; local git operations in the workspace work separately and do not require this token.".to_string()),
             Some("Save Token".to_string()),
+        )),
+        "vercel" => Some((
+            vec![
+                IntegrationConfigField {
+                    key: "token".to_string(),
+                    label: "Vercel Access Token".to_string(),
+                    input_type: "password".to_string(),
+                    placeholder: Some("vercel token".to_string()),
+                    required: true,
+                    options: None,
+                },
+                IntegrationConfigField {
+                    key: "team_id".to_string(),
+                    label: "Team ID".to_string(),
+                    input_type: "text".to_string(),
+                    placeholder: Some("team_...".to_string()),
+                    required: false,
+                    options: None,
+                },
+                IntegrationConfigField {
+                    key: "project_id".to_string(),
+                    label: "Default Project ID or Name".to_string(),
+                    input_type: "text".to_string(),
+                    placeholder: Some("my-vercel-project".to_string()),
+                    required: false,
+                    options: None,
+                },
+            ],
+            Some("Paste a Vercel access token for app publishing. Team and project are optional defaults; individual deploys can override them.".to_string()),
+            Some("Save Vercel".to_string()),
         )),
         "notion" => Some((
             vec![IntegrationConfigField {
@@ -1613,8 +1644,56 @@ pub(super) async fn collect_integrations(agent: &crate::core::Agent) -> Vec<Inte
         });
     }
 
+    if let Some((config_fields, config_help, configure_button)) =
+        external_integration_config("vercel")
+    {
+        let status =
+            crate::actions::vercel::vercel_connection_status(&config_dir, &agent.data_dir).await;
+        let enabled = crate::integrations::effective_integration_enabled(&config_dir, "vercel");
+        let status_label = if status.connected {
+            "connected"
+        } else if status.token_configured {
+            "error"
+        } else {
+            "not_configured"
+        };
+        let status_detail = if let Some(error) = status.error.clone() {
+            Some(error)
+        } else if status.connected {
+            status
+                .username
+                .as_ref()
+                .or(status.email.as_ref())
+                .map(|identity| format!("Connected as {}.", identity))
+        } else {
+            Some("Add a Vercel access token to publish apps externally.".to_string())
+        };
+        integrations.push(IntegrationResponse {
+            id: "vercel".to_string(),
+            name: "Vercel".to_string(),
+            description: "Publish AgentArk apps to Vercel preview or production deployments."
+                .to_string(),
+            icon: "".to_string(),
+            status: status_label.to_string(),
+            enabled,
+            status_detail,
+            auth_url: None,
+            config_fields: Some(config_fields),
+            config_help,
+            configure_button,
+            config_values: Some(crate::actions::vercel::load_vercel_config_values(
+                &config_dir,
+                &agent.data_dir,
+            )),
+        });
+    }
+
     for info in agent.integrations.list().await {
-        if info.id == "moltbook" || info.id == "gmail" || info.id == "google_calendar" {
+        if info.id == "moltbook"
+            || info.id == "gmail"
+            || info.id == "google_calendar"
+            || info.id == "vercel"
+        {
             continue;
         }
 
@@ -1800,6 +1879,11 @@ pub(super) async fn disconnect_integration(
             "gmail" => &["gmail_tokens"],
             "google_calendar" => &["calendar_oauth_config", "calendar_tokens"],
             "github" => &["github_token"],
+            "vercel" => &[
+                crate::actions::vercel::VERCEL_TOKEN_SECRET_KEY,
+                crate::actions::vercel::VERCEL_TEAM_ID_SECRET_KEY,
+                crate::actions::vercel::VERCEL_PROJECT_ID_SECRET_KEY,
+            ],
             "notion" => &["notion_token"],
             "twitter" => &["twitter_bearer_token"],
             "onepassword" => &["onepassword_token", "onepassword_host"],
@@ -1832,6 +1916,9 @@ pub(super) async fn disconnect_integration(
         for key in keys {
             let _ = manager.set_custom_secret(key, None);
         }
+        if id == "vercel" {
+            let _ = crate::actions::vercel::clear_vercel_config(&config_dir, &data_dir);
+        }
         // Also disable the integration (do not auto-use it after disconnect).
         let _ = manager.set_custom_secret(&integration_enabled_key(&id), Some("false".to_string()));
         let _ = manager.set_custom_secret(
@@ -1842,6 +1929,55 @@ pub(super) async fn disconnect_integration(
         return (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "message": "Disconnected"})),
+        )
+            .into_response();
+    }
+
+    if id == "vercel" {
+        let (config_dir, data_dir) = {
+            let agent = state.agent.read().await;
+            (agent.config_dir.clone(), agent.data_dir.clone())
+        };
+        let status = crate::actions::vercel::vercel_connection_status(&config_dir, &data_dir).await;
+        let manager = match crate::core::config::SecureConfigManager::new_with_data_dir(
+            &config_dir,
+            Some(&data_dir),
+        ) {
+            Ok(manager) => manager,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Config error: {}", error),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        if status.connected {
+            let _ = manager
+                .set_custom_secret(&integration_enabled_key("vercel"), Some("true".to_string()));
+            let _ = manager.set_custom_secret(
+                &integration_user_disabled_key("vercel"),
+                Some("false".to_string()),
+            );
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"ok","enabled":true,"connected":true})),
+            )
+                .into_response();
+        }
+        let _ = manager.set_custom_secret(
+            &integration_enabled_key("vercel"),
+            Some("false".to_string()),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: status
+                    .error
+                    .unwrap_or_else(|| "Connect Vercel first.".to_string()),
+            }),
         )
             .into_response();
     }
@@ -1878,6 +2014,106 @@ pub(super) async fn disconnect_integration(
     }
 }
 
+async fn configure_vercel(
+    State(state): State<AppState>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let (config_dir, data_dir) = {
+        let agent = state.agent.read().await;
+        (agent.config_dir.clone(), agent.data_dir.clone())
+    };
+    let token = request
+        .get("token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let team_id = request
+        .get("team_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let project_id = request
+        .get("project_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let existing = crate::actions::vercel::load_vercel_config_values(&config_dir, &data_dir);
+    let has_existing_token = existing
+        .get("token_configured")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if token.is_none() && !has_existing_token {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Missing token".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(token) = token.as_deref() {
+        if let Err(error) = crate::actions::vercel::validate_vercel_token_value(token).await {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+    }
+
+    if let Err(error) = crate::actions::vercel::store_vercel_config(
+        &config_dir,
+        &data_dir,
+        token,
+        team_id,
+        project_id,
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to save Vercel config: {}", error),
+            }),
+        )
+            .into_response();
+    }
+
+    let status = crate::actions::vercel::vercel_connection_status(&config_dir, &data_dir).await;
+    if status.connected {
+        if let Ok(manager) = crate::core::config::SecureConfigManager::new_with_data_dir(
+            &config_dir,
+            Some(&data_dir),
+        ) {
+            let _ = manager
+                .set_custom_secret(&integration_enabled_key("vercel"), Some("true".to_string()));
+            let _ = manager.set_custom_secret(
+                &integration_user_disabled_key("vercel"),
+                Some("false".to_string()),
+            );
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "connected": true,
+                "enabled": true,
+                "details": status,
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: status
+                    .error
+                    .unwrap_or_else(|| "Vercel connection test failed".to_string()),
+            }),
+        )
+            .into_response()
+    }
+}
+
 /// Configure an external integration (store encrypted secrets)
 pub(super) async fn configure_integration(
     State(state): State<AppState>,
@@ -1902,6 +2138,9 @@ pub(super) async fn configure_integration(
     }
     if id == "google_workspace" {
         return configure_google_workspace(State(state), Json(request)).await;
+    }
+    if id == "vercel" {
+        return configure_vercel(State(state), Json(request)).await;
     }
     let (config_dir, data_dir) = {
         let agent = state.agent.read().await;
@@ -2589,6 +2828,29 @@ pub(super) async fn test_integration(
             Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
             Err(error) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response(),
         };
+    }
+    if id == "vercel" {
+        let (config_dir, data_dir) = {
+            let agent = state.agent.read().await;
+            (agent.config_dir.clone(), agent.data_dir.clone())
+        };
+        let status = crate::actions::vercel::vercel_connection_status(&config_dir, &data_dir).await;
+        if status.connected {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"ok","connected":true,"details": status})),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: status
+                    .error
+                    .unwrap_or_else(|| "Vercel is not connected.".to_string()),
+            }),
+        )
+            .into_response();
     }
 
     let agent = state.agent.read().await;

@@ -102,6 +102,32 @@ function shortValue(value?: string | null): string {
   return value.length > 18 ? `${value.slice(0, 18)}...` : value;
 }
 
+function recordString(record: Record<string, unknown> | null, key: string): string {
+  const value = record?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function recordBool(record: Record<string, unknown> | null, key: string): boolean {
+  return record?.[key] === true;
+}
+
+function companionWebUrl(sessionId: string, code: string, wsUrl: string): string {
+  const origin =
+    wsUrl.startsWith("wss://")
+      ? `https://${wsUrl.slice("wss://".length).split("/")[0]}`
+      : wsUrl.startsWith("ws://")
+        ? `http://${wsUrl.slice("ws://".length).split("/")[0]}`
+        : typeof window !== "undefined"
+          ? window.location.origin
+          : "";
+  if (!origin) return "";
+  const url = new URL("/companion/web", origin);
+  if (sessionId) url.searchParams.set("session_id", sessionId);
+  if (code) url.searchParams.set("code", code);
+  if (wsUrl) url.searchParams.set("ws", wsUrl);
+  return url.toString();
+}
+
 function defaultPresetCapabilities(
   preset: CompanionPreset | null,
   capabilities: CompanionCapabilityDescriptor[]
@@ -149,6 +175,11 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     queryKey: ["companion-protocol"],
     queryFn: api.getCompanionProtocol
   });
+  const connectivityQ = useQuery({
+    queryKey: ["companion-connectivity"],
+    queryFn: api.getCompanionConnectivity,
+    refetchInterval: autoRefresh ? 10000 : false
+  });
   const devicesQ = useQuery({
     queryKey: ["companion-devices"],
     queryFn: api.getCompanionDevices,
@@ -165,6 +196,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
   const devices = devicesQ.data?.devices ?? [];
   const sessions = devicesQ.data?.pairing_sessions ?? [];
   const pendingApprovals = devicesQ.data?.pending_approvals ?? [];
+  const connectivity = connectivityQ.data ?? null;
   const selectedPreset = presets.find((preset) => preset.id === selectedPresetId) ?? presets[0] ?? null;
   const selectedDevice = devices.find((device) => device.id === selectedDeviceId) ?? devices[0] ?? null;
   const capabilityMap = useMemo(
@@ -228,11 +260,30 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
 
   const refreshAll = async () => {
     await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["companion-connectivity"] }),
       queryClient.invalidateQueries({ queryKey: ["companion-devices"] }),
       queryClient.invalidateQueries({ queryKey: ["companion-audit"] }),
       queryClient.invalidateQueries({ queryKey: ["companion-commands"] })
     ]);
   };
+
+  const startCompanionTunnelMutation = useMutation({
+    mutationFn: api.startCompanionTunnel,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["companion-connectivity"] });
+      setNotice({ kind: "success", text: "Companion tunnel is ready. Use the generated WebSocket URL in the iPhone app." });
+    },
+    onError: (error) => setNotice({ kind: "error", text: errMessage(error) })
+  });
+
+  const stopCompanionTunnelMutation = useMutation({
+    mutationFn: api.stopCompanionTunnel,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["companion-connectivity"] });
+      setNotice({ kind: "info", text: "Companion tunnel disabled." });
+    },
+    onError: (error) => setNotice({ kind: "error", text: errMessage(error) })
+  });
 
   const createPairingMutation = useMutation({
     mutationFn: async () => {
@@ -362,9 +413,21 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
     { label: "Approvals", value: overview?.pending_approvals ?? pendingApprovals.length, tone: "warn" }
   ];
   const presetCapabilityIds = selectedPreset?.capability_ids ?? [];
+  const pairingSessionId = recordString(pairingPayload, "session_id");
+  const pairingCode = recordString(pairingPayload, "code");
+  const pairingWebSocketPath =
+    recordString(pairingPayload, "websocket_path") || protocol?.websocket_path || "/companion/ws";
+  const pairingExpiresAt = recordString(pairingPayload, "expires_at");
+  const companionTunnelWsUrl = recordString(connectivity, "websocket_url");
+  const companionTunnelActive = recordBool(connectivity, "tunnel_active");
+  const companionTunnelEnabled = recordBool(connectivity, "tunnel_companion_enabled");
+  const companionTunnelError = recordString(connectivity, "error");
+  const companionTunnelReady = companionTunnelActive && companionTunnelEnabled && Boolean(companionTunnelWsUrl);
+  const recommendedCompanionWsUrl = companionTunnelWsUrl;
+  const webCompanionUrl = companionWebUrl(pairingSessionId, pairingCode, recommendedCompanionWsUrl);
 
   return (
-    <Stack spacing={1.5} sx={{ width: "100%", minWidth: 0, overflowX: "clip" }}>
+    <Stack className="companion-devices-panel" spacing={1.25}>
       {notice ? <Alert severity={notice.kind}>{notice.text}</Alert> : null}
       {rotatedToken ? (
         <Alert severity="warning" onClose={() => setRotatedToken(null)}>
@@ -372,25 +435,99 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
         </Alert>
       ) : null}
 
-      <Box className="list-shell stat-strip" sx={{ minWidth: 0 }}>
+      <Box className="companion-metric-strip">
         {metricItems.map((item) => (
-          <Box key={item.label} className="stat-strip-item" data-tone={item.tone}>
-            <Typography className="stat-strip-label">{item.label}</Typography>
-            <Typography className="stat-strip-value">{item.value}</Typography>
+          <Box key={item.label} className="companion-metric-item" data-tone={item.tone}>
+            <Typography className="companion-metric-label">{item.label}</Typography>
+            <Typography className="companion-metric-value">{item.value}</Typography>
           </Box>
         ))}
       </Box>
 
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: { xs: "minmax(0, 1fr)", xl: "minmax(340px, 420px) minmax(0, 1fr)" },
-          gap: 1.5,
-          alignItems: "start",
-          minWidth: 0
-        }}
-      >
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+      <Box className="settings-inline-card companion-guide">
+        <Stack
+          direction={{ xs: "column", md: "row" }}
+          spacing={1}
+          sx={{ alignItems: { xs: "stretch", md: "flex-start" }, justifyContent: "space-between" }}
+        >
+          <Box sx={{ minWidth: 0 }}>
+            <Typography className="settings-inline-card-kicker">Connection flow</Typography>
+            <Typography className="settings-inline-card-title">
+              Pair a phone or helper device without giving it broad access
+            </Typography>
+            <Typography className="settings-inline-card-description">
+              Create a short-lived code, let the device claim it, approve the claimed identity, then send only typed commands that fit the granted scopes.
+            </Typography>
+          </Box>
+          <Chip size="small" variant="outlined" label={protocol?.protocol_version ?? "agentark-companion-v1"} />
+        </Stack>
+        <Box className="companion-guide-steps">
+          {[
+            ["1", "Create code", "Choose the device type and the grants it should receive."],
+            ["2", "Claim on device", "Open the companion app and enter the session id plus code."],
+            ["3", "Approve identity", "Approve only after the expected device appears as claimed."],
+            ["4", "Use safely", "Low-risk commands run; high-risk commands wait in Approvals."]
+          ].map(([step, title, body]) => (
+            <Box key={step} className="companion-guide-step">
+              <span className="companion-step-index">{step}</span>
+              <Box sx={{ minWidth: 0 }}>
+                <Typography className="companion-guide-step-title">{title}</Typography>
+                <Typography className="companion-guide-step-body">{body}</Typography>
+              </Box>
+            </Box>
+          ))}
+        </Box>
+        <Box className="companion-connect-card">
+          <Box sx={{ minWidth: 0 }}>
+            <Typography className="companion-guide-step-title">iPhone connection URL</Typography>
+            <Typography className="companion-guide-step-body">
+              Start a companion tunnel to connect from the same Wi-Fi, a VPS install, or anywhere else without editing Docker files.
+            </Typography>
+            <Typography className="companion-connect-url">
+              {companionTunnelReady ? companionTunnelWsUrl : "Start companion tunnel to generate a wss:// URL"}
+            </Typography>
+            {companionTunnelError ? (
+              <Typography variant="caption" sx={{ color: "error.main", overflowWrap: "anywhere" }}>
+                {companionTunnelError}
+              </Typography>
+            ) : null}
+          </Box>
+          <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", justifyContent: { xs: "flex-start", md: "flex-end" } }}>
+            <Button
+              size="small"
+              variant="contained"
+              onClick={() => startCompanionTunnelMutation.mutate()}
+              disabled={startCompanionTunnelMutation.isPending}
+            >
+              {startCompanionTunnelMutation.isPending ? "Starting..." : companionTunnelReady ? "Refresh tunnel" : "Start companion tunnel"}
+            </Button>
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={async () => {
+                await navigator.clipboard?.writeText(recommendedCompanionWsUrl);
+                setNotice({ kind: "success", text: "Companion WebSocket URL copied." });
+              }}
+              disabled={!recommendedCompanionWsUrl || !companionTunnelReady}
+            >
+              Copy URL
+            </Button>
+            {companionTunnelEnabled ? (
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() => stopCompanionTunnelMutation.mutate()}
+                disabled={stopCompanionTunnelMutation.isPending}
+              >
+                {stopCompanionTunnelMutation.isPending ? "Stopping..." : "Disable"}
+              </Button>
+            ) : null}
+          </Stack>
+        </Box>
+      </Box>
+
+      <Box className="companion-devices-grid">
+        <Box className="settings-inline-card companion-panel companion-panel-pair">
           <Stack spacing={1.35}>
             <Stack direction="row" spacing={1} sx={{ alignItems: "flex-start", minWidth: 0 }}>
               <Box
@@ -409,10 +546,10 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
               </Box>
               <Box sx={{ minWidth: 0 }}>
                 <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
-                  Pair Device
+                  Create pairing code
                 </Typography>
                 <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.45 }}>
-                  Short-lived code, device claim, then explicit approval.
+                  Select the companion type, grant only what it needs, then send the code to that device.
                 </Typography>
               </Box>
             </Stack>
@@ -464,7 +601,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     Grants
                   </Typography>
                   <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                    High-risk grants still need approval for sensitive actions.
+                    Low-risk grants are selected by default. Camera, photos, location, Shortcuts, and other sensitive grants require extra approval.
                   </Typography>
                 </Box>
                 <Chip size="small" variant="outlined" label={`${draftCapabilities.length} selected`} />
@@ -618,7 +755,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
               >
                 <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center", gap: 1 }}>
                   <Typography variant="subtitle2" sx={{ fontWeight: 650 }}>
-                    Pairing Payload
+                    Enter these in the companion app
                   </Typography>
                   <Tooltip title="Copy pairing payload">
                     <IconButton size="small" onClick={copyPairingPayload} aria-label="Copy pairing payload">
@@ -626,6 +763,55 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                     </IconButton>
                   </Tooltip>
                 </Stack>
+                <Box className="companion-pairing-fields">
+                  <Box className="companion-pairing-field">
+                    <Typography className="companion-pairing-label">WebSocket path</Typography>
+                    <Typography className="companion-pairing-value">{pairingWebSocketPath}</Typography>
+                  </Box>
+                  <Box className="companion-pairing-field">
+                    <Typography className="companion-pairing-label">Session id</Typography>
+                    <Typography className="companion-pairing-value">{pairingSessionId || "unknown"}</Typography>
+                  </Box>
+                  <Box className="companion-pairing-field">
+                    <Typography className="companion-pairing-label">Pairing code</Typography>
+                    <Typography className="companion-pairing-value">{pairingCode || "unknown"}</Typography>
+                  </Box>
+                  <Box className="companion-pairing-field">
+                    <Typography className="companion-pairing-label">Expires</Typography>
+                    <Typography className="companion-pairing-value">
+                      {formatUiDateTime(pairingExpiresAt, { fallback: "unknown" })}
+                    </Typography>
+                  </Box>
+                </Box>
+                <Typography variant="caption" sx={{ display: "block", color: "text.secondary", mt: 1 }}>
+                  No Xcode path: open the web companion link in iPhone Safari, tap Claim pairing, then approve the claimed device here.
+                </Typography>
+                <Stack direction="row" spacing={0.75} useFlexGap sx={{ flexWrap: "wrap", mt: 1 }}>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={async () => {
+                      await navigator.clipboard?.writeText(webCompanionUrl);
+                      setNotice({ kind: "success", text: "Web companion link copied. Open it on the iPhone." });
+                    }}
+                    disabled={!webCompanionUrl}
+                  >
+                    Copy Web Companion Link
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() => window.open(webCompanionUrl, "_blank", "noopener,noreferrer")}
+                    disabled={!webCompanionUrl}
+                  >
+                    Open Web Companion
+                  </Button>
+                </Stack>
+                {webCompanionUrl ? (
+                  <Typography className="companion-connect-url" sx={{ mt: 1 }}>
+                    {webCompanionUrl}
+                  </Typography>
+                ) : null}
                 <Typography
                   component="pre"
                   variant="caption"
@@ -640,7 +826,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                   {JSON.stringify(pairingPayload, null, 2)}
                 </Typography>
                 <Alert severity="warning" sx={{ mt: 1 }}>
-                  One-time pairing secret. Approve only after the expected device claims it.
+                  This is a one-time secret. Approve only after the expected device claims this exact session.
                 </Alert>
               </Box>
             ) : null}
@@ -687,7 +873,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
           </Stack>
         </Box>
 
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+        <Box className="settings-inline-card companion-panel companion-panel-devices">
           <Stack spacing={1.25}>
             <Stack
               direction={{ xs: "column", sm: "row" }}
@@ -706,7 +892,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             </Stack>
             {devicesQ.error ? <Alert severity="error">{errMessage(devicesQ.error)}</Alert> : null}
             {devices.length === 0 ? (
-              <Alert severity="info">No companion devices are paired yet.</Alert>
+              <Alert severity="info">
+                No companion devices are paired yet. Create a pairing code, enter it in the companion app, then approve the claimed device here.
+              </Alert>
             ) : (
               <Stack spacing={0.85}>
                 {devices.map((device) => {
@@ -766,18 +954,7 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             )}
           </Stack>
         </Box>
-      </Box>
-
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: { xs: "minmax(0, 1fr)", xl: "minmax(340px, 420px) minmax(0, 1fr)" },
-          gap: 1.5,
-          alignItems: "start",
-          minWidth: 0
-        }}
-      >
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+        <Box className="settings-inline-card companion-panel companion-panel-command">
           <Stack spacing={1.25}>
             <Stack
               direction={{ xs: "column", sm: "row" }}
@@ -859,12 +1036,14 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                 </Stack>
               </>
             ) : (
-              <Alert severity="info">Select a paired device to queue typed commands.</Alert>
+              <Alert severity="info">
+                Select a paired device first. Commands are structured JSON actions, not free-form remote control.
+              </Alert>
             )}
           </Stack>
         </Box>
 
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+        <Box className="settings-inline-card companion-panel companion-panel-approvals">
           <Stack spacing={1.25}>
             <Stack
               direction={{ xs: "column", sm: "row" }}
@@ -882,7 +1061,9 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
               <Chip size="small" variant="outlined" label={`${pendingApprovals.length} waiting`} />
             </Stack>
             {pendingApprovals.length === 0 ? (
-              <Alert severity="info">No high-risk companion commands are waiting.</Alert>
+              <Alert severity="info">
+                No high-risk companion commands are waiting. Sensitive commands will appear here before they can run.
+              </Alert>
             ) : (
               <Stack spacing={0.85}>
                 {pendingApprovals.map((command) => (
@@ -933,22 +1114,23 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
             )}
           </Stack>
         </Box>
-      </Box>
-
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: { xs: "minmax(0, 1fr)", xl: "repeat(2, minmax(0, 1fr))" },
-          gap: 1.5,
-          alignItems: "start",
-          minWidth: 0
-        }}
-      >
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+        <Box className="settings-inline-card companion-panel companion-panel-history">
           <Stack spacing={1.25}>
-            <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
-              Command History
-            </Typography>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{ alignItems: { xs: "stretch", sm: "center" }, justifyContent: "space-between" }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
+                  Command History
+                </Typography>
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  Recent queued actions and returned results.
+                </Typography>
+              </Box>
+              {selectedDevice ? <Chip size="small" variant="outlined" label={`${commandRows.length} command${commandRows.length === 1 ? "" : "s"}`} /> : null}
+            </Stack>
             {selectedDevice ? (
               commandRows.length ? (
                 <Stack spacing={0.75}>
@@ -981,21 +1163,35 @@ export function CompanionDevicesPanel({ autoRefresh }: { autoRefresh: boolean })
                   ))}
                 </Stack>
               ) : (
-                <Alert severity="info">No commands for the selected device.</Alert>
+                <Alert severity="info">No commands for the selected device yet. Queue a typed command to test dispatch.</Alert>
               )
             ) : (
-              <Alert severity="info">Select a device to see command history.</Alert>
+              <Alert severity="info">Select a device to see the commands AgentArk has sent to it.</Alert>
             )}
           </Stack>
         </Box>
 
-        <Box className="list-shell" sx={{ p: 1.5, minWidth: 0 }}>
+        <Box className="settings-inline-card companion-panel companion-panel-audit">
           <Stack spacing={1.25}>
-            <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
-              Audit
-            </Typography>
+            <Stack
+              direction={{ xs: "column", sm: "row" }}
+              spacing={1}
+              sx={{ alignItems: { xs: "stretch", sm: "center" }, justifyContent: "space-between" }}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="h6" sx={{ fontWeight: 650, lineHeight: 1.2 }}>
+                  Audit
+                </Typography>
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  Decisions, command approvals, and event hashes.
+                </Typography>
+              </Box>
+              <Chip size="small" variant="outlined" label={`${(auditQ.data?.events ?? []).length} event${(auditQ.data?.events ?? []).length === 1 ? "" : "s"}`} />
+            </Stack>
             {(auditQ.data?.events ?? []).length === 0 ? (
-              <Alert severity="info">No companion-device audit events yet.</Alert>
+              <Alert severity="info">
+                No companion-device audit events yet. Pairing, approvals, token changes, and command decisions will be recorded here.
+              </Alert>
             ) : (
               <Stack spacing={0.75}>
                 {(auditQ.data?.events ?? []).slice(0, 10).map((event) => (

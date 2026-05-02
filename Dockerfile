@@ -75,21 +75,19 @@ COPY .cargo ./.cargo
 # Create dummy main to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Balanced default: use 2 cargo jobs for better build speed without assuming
-# high-memory Docker Desktop setups. Pass AGENTARK_BUILD_JOBS=0 to let Cargo
-# choose its default parallelism, or a higher number on stronger machines.
-ENV CARGO_PROFILE_RELEASE_LTO=thin
-ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+# Default release builds use Cargo.toml's size-optimized profile.
+# Use 2 cargo jobs for better build speed without assuming high-memory Docker
+# Desktop setups. Pass AGENTARK_BUILD_JOBS=0 to let Cargo choose its default
+# parallelism, or a higher number on stronger machines.
 ARG AGENTARK_BUILD_JOBS=2
-ARG AGENTARK_DOCKER_FEATURES="telegram,docker,ssh"
 
 # Build dependencies with cache mount (survives across docker builds)
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}"; \
+        cargo build --release; \
     else \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --release -j "${AGENTARK_BUILD_JOBS}"; \
     fi && \
     rm -rf src
 
@@ -99,14 +97,24 @@ ARG CACHEBUST=0
 COPY src ./src
 COPY assets ./assets
 
-# Build for release with cache mount, then copy binary out of cache
+# Build for release with cache mount, then copy binary out of cache.
+# We rely on cargo's fingerprint system (target/release/.fingerprint) to detect
+# source changes via the mtimes preserved by `COPY src ./src` above. Do not
+# wipe target/release/agentark or target/release/deps/agentark-* before the
+# build: that forces a full re-link on every rebuild and discards incremental
+# work that the cache mount is specifically there to preserve. After the build,
+# we assert the produced binary is at least as new as any src/ file so a
+# silently-skipped rebuild can't ship stale code.
 RUN --mount=type=cache,id=agentark-cargo-target,target=/app/target \
     --mount=type=cache,id=agentark-cargo-registry,target=/usr/local/cargo/registry \
-    rm -f target/release/agentark target/release/deps/agentark-* && \
     if [ "${AGENTARK_BUILD_JOBS}" = "0" ]; then \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bins; \
+        cargo build --release --bins; \
     else \
-        cargo build --release --no-default-features --features "${AGENTARK_DOCKER_FEATURES}" --bins -j "${AGENTARK_BUILD_JOBS}"; \
+        cargo build --release --bins -j "${AGENTARK_BUILD_JOBS}"; \
+    fi && \
+    if find src -type f -newer target/release/agentark -print -quit | grep -q .; then \
+        echo "ERROR: src/ files newer than target/release/agentark after build; aborting" >&2; \
+        exit 1; \
     fi && \
     cp target/release/agentark /app/agentark-bin && \
     cp target/release/agentark_embed_server /app/agentark-embed-server-bin
@@ -181,12 +189,12 @@ ARG INSTALL_DOCKER_CLI=true
 ARG INSTALL_OLLAMA_CLI=false
 
 RUN set -eux; \
-    apt_packages="ca-certificates curl gosu git postgresql-client python3 python3-pip python3-venv tar"; \
+    apt_packages="ca-certificates curl gosu git postgresql-client python3 python3-pip python3-venv tar binutils"; \
     if [ "${INSTALL_PLAYWRIGHT_RUNTIME}" = "true" ]; then \
         apt_packages="${apt_packages} chromium xvfb x11vnc novnc websockify openbox"; \
     fi; \
     if [ "${INSTALL_DOCKER_CLI}" = "true" ]; then \
-        apt_packages="${apt_packages} docker.io"; \
+        apt_packages="${apt_packages} docker-cli"; \
     fi; \
     if [ "${INSTALL_OLLAMA_CLI}" = "true" ]; then \
         apt_packages="${apt_packages} zstd"; \
@@ -234,12 +242,22 @@ RUN if [ "${INSTALL_CLOUDFLARED}" = "true" ]; then \
 # Download Lightpanda for fast headless content extraction (~6MB vs ~1.5GB Chromium)
 # Used as fast-path for http_get, web search scraping, and research content fetching.
 # Playwright remains for screenshots and complex SPA interaction.
+#
+# Nightly builds ship with debug symbols (~120 MB on disk). Strip them so the
+# layer matches Lightpanda's advertised footprint (~6-20 MB). If stripping ever
+# breaks runtime (Zig binaries can have non-standard sections in future
+# releases), fall back to `strip --strip-debug` which preserves all symbol
+# tables and only removes DWARF info.
 ARG LIGHTPANDA_RELEASE=nightly
 RUN if [ "${INSTALL_LIGHTPANDA}" = "true" ]; then \
         curl -fsSL --retry 3 \
             "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_RELEASE}/lightpanda-x86_64-linux" \
             -o /usr/local/bin/lightpanda && \
-        chmod +x /usr/local/bin/lightpanda; \
+        chmod +x /usr/local/bin/lightpanda && \
+        strip /usr/local/bin/lightpanda && \
+        /usr/local/bin/lightpanda --version >/dev/null 2>&1 || \
+            /usr/local/bin/lightpanda --help >/dev/null 2>&1 || \
+            { echo "ERROR: stripped lightpanda failed to execute" >&2; exit 1; }; \
     fi
 
 # Install Google Workspace CLI so AgentArk can use gws as a Workspace execution backend.
@@ -280,8 +298,19 @@ COPY --from=builder --chown=agent:agent /app/agentark-bin /app/agentark
 COPY --from=builder --chown=agent:agent /app/agentark-embed-server-bin /app/agentark-embed-server
 COPY --from=builder --chown=agent:agent /app/prebuilt-embeddings-cache /app/prebuilt-embeddings-cache
 
+# Copy Python optimizers and preinstall DSPy for ArkEvolve GEPA runs.
+COPY --chown=agent:agent tools /app/tools
+RUN python3 -m venv /opt/agentark-gepa && \
+    /opt/agentark-gepa/bin/python -m pip install --upgrade pip && \
+    /opt/agentark-gepa/bin/python -m pip install -r /app/tools/gepa_optimizer/requirements.txt && \
+    /opt/agentark-gepa/bin/python -c "import dspy" && \
+    chown -R agent:agent /opt/agentark-gepa
+
+# Create the runtime config directory. In compose this path is normally
+# overlaid by the user-owned agentark-config volume.
+RUN mkdir -p /app/config && chown agent:agent /app/config
+
 # Copy assets directly from build context (not part of Rust compilation)
-COPY --chown=agent:agent config /app/config
 COPY --chown=agent:agent assets /app/assets
 # Copy frontend assets (built in Docker, not from host)
 COPY --from=frontend-builder --chown=agent:agent /app/frontend/dist /app/frontend/dist

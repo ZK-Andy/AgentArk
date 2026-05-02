@@ -55,86 +55,7 @@ function Get-AgentArkReleaseVersionFromTag {
     return $Tag.TrimStart("v", "V")
 }
 
-function Ensure-AgentArkScriptEnvFile {
-    # Script-managed Compose variables live here. Do not create a root .env.
-    $envPath = Join-Path $SourceDir ".agentark\local.env"
-    $envDir = Split-Path $envPath
-    if (-not (Test-Path $envDir)) {
-        New-Item -ItemType Directory -Path $envDir -Force | Out-Null
-    }
-    if (-not (Test-Path $envPath)) {
-        New-Item -ItemType File -Path $envPath -Force | Out-Null
-    }
-    return $envPath
-}
-
-function Set-AgentArkEnvValue {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Key,
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $envPath = Ensure-AgentArkScriptEnvFile
-    $lines = if (Test-Path $envPath) { [System.Collections.Generic.List[string]](Get-Content $envPath) } else { [System.Collections.Generic.List[string]]::new() }
-    $updated = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -like "$Key=*") {
-            $lines[$i] = "$Key=$Value"
-            $updated = $true
-        }
-    }
-    if (-not $updated) {
-        $lines.Add("$Key=$Value")
-    }
-    Set-Content -Path $envPath -Value $lines -Encoding ASCII
-}
-
-function Get-AgentArkEnvValue {
-    param([Parameter(Mandatory = $true)][string]$Key)
-
-    $envPath = Join-Path $SourceDir ".agentark\local.env"
-    if (-not (Test-Path $envPath)) {
-        return $null
-    }
-    foreach ($line in Get-Content $envPath) {
-        if ($line -match ('^' + [regex]::Escape($Key) + '=(.*)$')) {
-            return $matches[1].Trim()
-        }
-    }
-    return $null
-}
-
-function Set-AgentArkPinnedRelease {
-    param([Parameter(Mandatory = $true)][string]$Tag)
-
-    $version = Get-AgentArkReleaseVersionFromTag $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value "${ImageRepository}:$version"
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "image"
-}
-
-function Set-AgentArkSourceBuildRelease {
-    param([Parameter(Mandatory = $true)][string]$Tag)
-
-    Set-AgentArkEnvValue -Key "AGENTARK_IMAGE" -Value $LocalSourceImage
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_REPO" -Value $ReleaseRepo
-    Set-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG" -Value $Tag
-    Set-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE" -Value "source"
-}
-
-function Test-AgentArkSourceInstall {
-    return (Get-AgentArkEnvValue -Key "AGENTARK_INSTALL_SOURCE") -eq "source"
-}
-
 function Get-AgentArkCurrentReleaseTag {
-    $tag = Get-AgentArkEnvValue -Key "AGENTARK_RELEASE_TAG"
-    if (-not [string]::IsNullOrWhiteSpace($tag)) {
-        return $tag
-    }
-
     try {
         $tag = & docker run --rm -v "${InstallDir}:/work" -w /work alpine/git git -C /work/source describe --tags --exact-match 2>$null
         if ($LASTEXITCODE -eq 0) {
@@ -158,15 +79,9 @@ function Assert-AgentArkCleanCheckout {
 function Update-AgentArkCheckoutToTag {
     param([Parameter(Mandatory = $true)][string]$Tag)
 
-    $useSourceBuild = Test-AgentArkSourceInstall
     Assert-AgentArkCleanCheckout
     Invoke-AgentArkGitInInstall -Args @("git", "-C", "/work/source", "fetch", "--tags", "--force", "origin")
     Invoke-AgentArkGitInInstall -Args @("git", "-C", "/work/source", "checkout", "--force", $Tag)
-    if ($useSourceBuild) {
-        Set-AgentArkSourceBuildRelease -Tag $Tag
-    } else {
-        Set-AgentArkPinnedRelease -Tag $Tag
-    }
 }
 
 function Get-AgentArkCachedLatestReleaseTag {
@@ -207,11 +122,23 @@ function Show-AgentArkUpdateNotice {
 function Invoke-AgentArkStartScript {
     param([Parameter(Mandatory = $true)][string[]]$Args)
 
+    $releaseTag = if ([string]::IsNullOrWhiteSpace($env:AGENTARK_RELEASE_TAG)) { Get-AgentArkCurrentReleaseTag } else { $env:AGENTARK_RELEASE_TAG.Trim() }
+    $previousImage = $env:AGENTARK_IMAGE
+    $previousRepo = $env:AGENTARK_RELEASE_REPO
+    $previousTag = $env:AGENTARK_RELEASE_TAG
     Push-Location $SourceDir
     try {
+        if (-not [string]::IsNullOrWhiteSpace($releaseTag)) {
+            $env:AGENTARK_IMAGE = "${ImageRepository}:$(Get-AgentArkReleaseVersionFromTag $releaseTag)"
+            $env:AGENTARK_RELEASE_REPO = $ReleaseRepo
+            $env:AGENTARK_RELEASE_TAG = $releaseTag
+        }
         & "$SourceDir\scripts\start.bat" @Args
     } finally {
         Pop-Location
+        if ($null -eq $previousImage) { Remove-Item Env:\AGENTARK_IMAGE -ErrorAction SilentlyContinue } else { $env:AGENTARK_IMAGE = $previousImage }
+        if ($null -eq $previousRepo) { Remove-Item Env:\AGENTARK_RELEASE_REPO -ErrorAction SilentlyContinue } else { $env:AGENTARK_RELEASE_REPO = $previousRepo }
+        if ($null -eq $previousTag) { Remove-Item Env:\AGENTARK_RELEASE_TAG -ErrorAction SilentlyContinue } else { $env:AGENTARK_RELEASE_TAG = $previousTag }
     }
 }
 

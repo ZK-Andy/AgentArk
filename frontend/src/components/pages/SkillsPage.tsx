@@ -3456,8 +3456,8 @@ export default function SkillsPage({ autoRefresh }: { autoRefresh: boolean }) {
 
   return (
     <WorkspacePageShell spacing={1.5}>
-                <WorkspacePageHeader
-                  eyebrow="Ark Core"
+      <WorkspacePageHeader
+        eyebrow="Agent"
         title="Skills"
         description="Create, import, and manage reusable abilities available to the AgentArk OS."
         actions={

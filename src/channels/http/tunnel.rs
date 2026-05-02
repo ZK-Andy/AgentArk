@@ -15,10 +15,14 @@ pub(super) struct TunnelState {
     pub provider: TunnelProviderKind,
     /// Access URL assigned by the active provider
     pub url: Option<String>,
-    /// If set, only this deployed app is reachable through the active remote-access link.
+    /// Legacy/default app target for clients that still expect one selected app.
     pub selected_app_id: Option<String>,
+    /// App IDs currently exposed through the active app tunnel.
+    pub exposed_app_ids: HashSet<String>,
     /// Whether the active tunnel should serve the AgentArk control plane.
     pub control_plane_enabled: bool,
+    /// Whether the active tunnel should accept companion-device WebSocket traffic.
+    pub companion_enabled: bool,
     /// Whether the tunnel is actively running
     pub active: bool,
     /// Error message if tunnel failed
@@ -32,7 +36,9 @@ impl TunnelState {
             provider: TunnelProviderKind::Cloudflare,
             url: None,
             selected_app_id: None,
+            exposed_app_ids: HashSet::new(),
             control_plane_enabled: false,
+            companion_enabled: false,
             active: false,
             error: None,
         }
@@ -279,7 +285,9 @@ pub(super) struct TunnelProvidersResponse {
     link_label: String,
     url: Option<String>,
     selected_app_id: Option<String>,
+    exposed_app_ids: Vec<String>,
     control_plane_enabled: bool,
+    companion_enabled: bool,
     error: Option<String>,
     providers: Vec<TunnelProviderResponse>,
 }
@@ -452,6 +460,21 @@ fn tunnel_provider_configured(kind: TunnelProviderKind, config: &TunnelConfig) -
     }
 }
 
+fn sorted_exposed_app_ids(tunnel: &TunnelState) -> Vec<String> {
+    let mut ids: Vec<String> = tunnel.exposed_app_ids.iter().cloned().collect();
+    ids.sort();
+    ids
+}
+
+fn selected_or_first_exposed_app_id(tunnel: &TunnelState) -> Option<String> {
+    tunnel
+        .selected_app_id
+        .as_ref()
+        .filter(|id| tunnel.exposed_app_ids.contains(id.as_str()))
+        .cloned()
+        .or_else(|| sorted_exposed_app_ids(tunnel).into_iter().next())
+}
+
 fn tunnel_provider_config_values(
     kind: TunnelProviderKind,
     config: &TunnelConfig,
@@ -540,8 +563,10 @@ fn tunnel_providers_response(
         e2ee: tunnel_provider_is_e2ee(effective_provider),
         link_label: tunnel_provider_link_label(effective_provider).to_string(),
         url: runtime.url.clone(),
-        selected_app_id: runtime.selected_app_id.clone(),
+        selected_app_id: selected_or_first_exposed_app_id(runtime),
+        exposed_app_ids: sorted_exposed_app_ids(runtime),
         control_plane_enabled: runtime.control_plane_enabled,
+        companion_enabled: runtime.companion_enabled,
         error: runtime.error.clone(),
         providers: [
             TunnelProviderKind::Cloudflare,
@@ -570,9 +595,11 @@ pub(super) async fn handle_tunnel_control_command(
             {
                 let mut tunnel = state.tunnel.write().await;
                 tunnel.selected_app_id = None;
+                tunnel.exposed_app_ids.clear();
                 tunnel.control_plane_enabled = true;
             }
             persist_public_tunnel_state(state, None, None).await;
+            persist_public_exposed_app_ids(state, &HashSet::new()).await;
 
             let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
             let (provider, tunnel_url, tunnel_error) = {
@@ -1112,6 +1139,8 @@ async fn reset_tailscale_provider(provider: TunnelProviderKind, config: &TunnelC
     }
 }
 
+const PUBLIC_EXPOSED_APP_IDS_KEY: &str = "public_exposed_app_ids_v1";
+
 pub(super) async fn persist_public_tunnel_state(
     state: &AppState,
     url: Option<&str>,
@@ -1142,6 +1171,43 @@ pub(super) async fn persist_public_tunnel_state(
     }
 }
 
+pub(super) async fn persist_public_exposed_app_ids(state: &AppState, app_ids: &HashSet<String>) {
+    let mut values: Vec<String> = app_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort();
+    values.dedup();
+    let agent = state.agent.read().await;
+    if values.is_empty() {
+        let _ = agent.storage.delete(PUBLIC_EXPOSED_APP_IDS_KEY).await;
+        return;
+    }
+    if let Ok(payload) = serde_json::to_vec(&values) {
+        let _ = agent
+            .storage
+            .set(PUBLIC_EXPOSED_APP_IDS_KEY, &payload)
+            .await;
+    }
+}
+
+pub(super) async fn load_public_exposed_app_ids(state: &AppState) -> HashSet<String> {
+    let agent = state.agent.read().await;
+    agent
+        .storage
+        .get(PUBLIC_EXPOSED_APP_IDS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| is_valid_app_id(value))
+        .collect()
+}
+
 pub(super) async fn load_public_selected_app_id(state: &AppState) -> Option<String> {
     let agent = state.agent.read().await;
     agent
@@ -1157,14 +1223,14 @@ pub(super) async fn load_public_selected_app_id(state: &AppState) -> Option<Stri
 
 async fn selected_public_app_is_ready(state: &AppState, app_id: &str) -> Result<bool, String> {
     if !is_valid_app_id(app_id) {
-        return Err("Saved public app selection is not a valid app id.".to_string());
+        return Err("Saved public app exposure is not a valid app id.".to_string());
     }
     if state.app_registry.get_dir(app_id).await.is_none() {
         return Ok(false);
     }
     if !state.app_registry.access_guard_enabled(app_id).await {
         return Err(
-            "Saved public app selection no longer has App Guard enabled; not exposing it publicly."
+            "Saved public app exposure no longer has App Guard enabled; not exposing it publicly."
                 .to_string(),
         );
     }
@@ -1176,7 +1242,7 @@ async fn selected_public_app_is_ready(state: &AppState, app_id: &str) -> Result<
         .unwrap_or(true)
     {
         return Err(
-            "Saved public app selection has no access password; not exposing it publicly."
+            "Saved public app exposure has no access password; not exposing it publicly."
                 .to_string(),
         );
     }
@@ -1186,43 +1252,60 @@ async fn selected_public_app_is_ready(state: &AppState, app_id: &str) -> Result<
 pub(super) async fn auto_start_selected_app_tunnel(
     state: &AppState,
 ) -> Result<Option<String>, String> {
-    let Some(app_id) = load_public_selected_app_id(state).await else {
+    let mut exposed_app_ids = load_public_exposed_app_ids(state).await;
+    if let Some(app_id) = load_public_selected_app_id(state).await {
+        exposed_app_ids.insert(app_id);
+    }
+    if exposed_app_ids.is_empty() {
         return Ok(None);
-    };
+    }
 
-    persist_public_tunnel_state(state, None, Some(&app_id)).await;
+    let mut sorted_ids: Vec<String> = exposed_app_ids.iter().cloned().collect();
+    sorted_ids.sort();
+    let default_app_id = sorted_ids.first().cloned();
+
     for attempt in 0..30 {
-        match selected_public_app_is_ready(state, &app_id).await {
-            Ok(true) => break,
-            Ok(false) if attempt < 29 => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-            Ok(false) => {
-                return Err(format!(
-                    "Saved public app {} was not restored in time; tunnel auto-start skipped.",
-                    app_id
-                ));
-            }
-            Err(error) => {
-                persist_public_tunnel_state(state, None, None).await;
-                return Err(error);
+        let mut all_ready = true;
+        for app_id in &sorted_ids {
+            match selected_public_app_is_ready(state, app_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    all_ready = false;
+                    break;
+                }
+                Err(error) => {
+                    persist_public_tunnel_state(state, None, None).await;
+                    persist_public_exposed_app_ids(state, &HashSet::new()).await;
+                    return Err(error);
+                }
             }
         }
+        if all_ready {
+            break;
+        }
+        if attempt < 29 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        return Err(format!(
+            "Saved public app exposure for {} app{} was not restored in time; tunnel auto-start skipped.",
+            sorted_ids.len(),
+            if sorted_ids.len() == 1 { "" } else { "s" }
+        ));
     }
+
+    persist_public_tunnel_state(state, None, default_app_id.as_deref()).await;
+    persist_public_exposed_app_ids(state, &exposed_app_ids).await;
 
     spawn_tunnel(state, None).await?;
     {
         let mut tunnel = state.tunnel.write().await;
-        tunnel.selected_app_id = Some(app_id.clone());
+        tunnel.selected_app_id = default_app_id.clone();
+        tunnel.exposed_app_ids = exposed_app_ids.clone();
         tunnel.control_plane_enabled = false;
     }
     let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
-    if let Some(found) = url.as_deref() {
-        persist_public_tunnel_state(state, Some(found), Some(&app_id)).await;
-    } else {
-        persist_public_tunnel_state(state, None, Some(&app_id)).await;
-    }
+    persist_public_tunnel_state(state, url.as_deref(), default_app_id.as_deref()).await;
     Ok(url)
 }
 
@@ -1240,6 +1323,7 @@ pub(super) async fn auto_start_tunnel_infrastructure(
     {
         let mut tunnel = state.tunnel.write().await;
         tunnel.selected_app_id = None;
+        tunnel.exposed_app_ids.clear();
         tunnel.control_plane_enabled = false;
     }
     let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
@@ -1973,11 +2057,26 @@ pub(super) async fn get_tunnel_status(State(state): State<AppState>) -> Json<ser
     } else {
         config.provider
     };
+    let exposed_app_ids = sorted_exposed_app_ids(&tunnel);
+    let selected_app_id = selected_or_first_exposed_app_id(&tunnel);
+    let app_urls: BTreeMap<String, String> = tunnel
+        .url
+        .as_ref()
+        .map(|url| {
+            exposed_app_ids
+                .iter()
+                .map(|app_id| (app_id.clone(), url.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     Json(serde_json::json!({
         "active": tunnel.active,
         "url": tunnel.url,
-        "selected_app_id": tunnel.selected_app_id,
+        "selected_app_id": selected_app_id,
+        "exposed_app_ids": exposed_app_ids,
+        "app_urls": app_urls,
         "control_plane_enabled": tunnel.control_plane_enabled,
+        "companion_enabled": tunnel.companion_enabled,
         "error": tunnel.error,
         "provider": provider.as_str(),
         "provider_label": tunnel_provider_label(provider),
@@ -1997,8 +2096,14 @@ pub(super) struct StartTunnelRequest {
     provider: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct StopTunnelRequest {
+    #[serde(default)]
+    app_id: Option<String>,
+}
+
 /// POST /tunnel/start - start the selected public tunnel provider
-/// Core tunnel start logic  - used by both the API endpoint and auto-start
+/// Core tunnel start logic - used by both the API endpoint and auto-start
 async fn spawn_cloudflare_tunnel(
     tunnel_arc: Arc<RwLock<TunnelState>>,
     config: &TunnelCloudflareConfig,
@@ -2418,18 +2523,34 @@ pub(super) async fn start_tunnel(
 
     match spawn_tunnel(&state, requested_provider).await {
         Ok(()) => {
-            {
+            let exposed_app_ids = {
                 let mut tunnel = state.tunnel.write().await;
-                tunnel.selected_app_id = requested_app_id.clone();
-                tunnel.control_plane_enabled = requested_app_id.is_none();
-            }
+                if let Some(app_id) = requested_app_id.as_ref() {
+                    tunnel.exposed_app_ids.insert(app_id.clone());
+                    tunnel.selected_app_id = Some(app_id.clone());
+                    tunnel.control_plane_enabled = false;
+                } else {
+                    tunnel.selected_app_id = None;
+                    tunnel.exposed_app_ids.clear();
+                    tunnel.control_plane_enabled = true;
+                }
+                tunnel.exposed_app_ids.clone()
+            };
             persist_public_tunnel_state(&state, None, requested_app_id.as_deref()).await;
+            persist_public_exposed_app_ids(&state, &exposed_app_ids).await;
             let url = wait_for_tunnel_url(state.tunnel.clone(), 12).await;
             if let Some(found) = url.as_deref() {
                 persist_public_tunnel_state(&state, Some(found), requested_app_id.as_deref()).await;
             }
             let config = load_tunnel_config(&state).await;
-            let (provider, tunnel_active, tunnel_url, tunnel_error, selected_app_id) = {
+            let (
+                provider,
+                tunnel_active,
+                tunnel_url,
+                tunnel_error,
+                selected_app_id,
+                exposed_app_ids,
+            ) = {
                 let tunnel = state.tunnel.read().await;
                 (
                     if tunnel.active {
@@ -2440,9 +2561,19 @@ pub(super) async fn start_tunnel(
                     tunnel.active,
                     tunnel.url.clone(),
                     tunnel.error.clone(),
-                    tunnel.selected_app_id.clone(),
+                    selected_or_first_exposed_app_id(&tunnel),
+                    sorted_exposed_app_ids(&tunnel),
                 )
             };
+            let app_urls: BTreeMap<String, String> = tunnel_url
+                .as_ref()
+                .map(|url| {
+                    exposed_app_ids
+                        .iter()
+                        .map(|app_id| (app_id.clone(), url.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             if !tunnel_active {
                 if let Some(err) = tunnel_error {
                     return (
@@ -2460,6 +2591,8 @@ pub(super) async fn start_tunnel(
                 "ok": true,
                 "url": tunnel_url,
                 "selected_app_id": selected_app_id,
+                "exposed_app_ids": exposed_app_ids,
+                "app_urls": app_urls,
                 "provider": provider.as_str(),
                 "provider_label": tunnel_provider_label(provider),
                 "message": if tunnel_url.is_some() {
@@ -2491,7 +2624,9 @@ pub(super) async fn stop_tunnel_internal(state: &AppState) {
         tunnel.active = false;
         tunnel.url = None;
         tunnel.selected_app_id = None;
+        tunnel.exposed_app_ids.clear();
         tunnel.control_plane_enabled = false;
+        tunnel.companion_enabled = false;
         tunnel.error = None;
         tracing::info!("Tunnel stopped by user");
         provider
@@ -2504,6 +2639,7 @@ pub(super) async fn stop_tunnel_internal(state: &AppState) {
         reset_tailscale_provider(provider, &config).await;
     }
     persist_public_tunnel_state(state, None, None).await;
+    persist_public_exposed_app_ids(state, &HashSet::new()).await;
 }
 
 pub(super) async fn reset_tunnel_to_infrastructure(
@@ -2513,29 +2649,82 @@ pub(super) async fn reset_tunnel_to_infrastructure(
     auto_start_tunnel_infrastructure(state).await
 }
 
-/// POST /tunnel/stop - stop the active public tunnel
-pub(super) async fn stop_tunnel(State(state): State<AppState>) -> Response {
-    match reset_tunnel_to_infrastructure(&state).await {
-        Ok(url) => Json(serde_json::json!({
-            "ok": true,
-            "message": "Public exposure stopped; tunnel infrastructure remains ready.",
-            "active": true,
-            "url": url,
-            "selected_app_id": null,
-            "control_plane_enabled": false
-        }))
-        .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("Public exposure stopped, but tunnel infrastructure could not restart: {}", error),
-                "selected_app_id": null,
-                "control_plane_enabled": false
-            })),
-        )
-            .into_response(),
+/// POST /tunnel/stop - stop app public exposure without tearing down other apps.
+pub(super) async fn stop_tunnel(
+    State(state): State<AppState>,
+    payload: Option<Json<StopTunnelRequest>>,
+) -> Response {
+    let requested_app_id = payload
+        .map(|Json(request)| request.app_id)
+        .flatten()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    if let Some(app_id) = requested_app_id.as_deref() {
+        if !is_valid_app_id(app_id) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid app_id" })),
+            )
+                .into_response();
+        }
     }
+
+    let (active, url, selected_app_id, exposed_app_ids, companion_enabled) = {
+        let mut tunnel = state.tunnel.write().await;
+        if let Some(app_id) = requested_app_id.as_ref() {
+            tunnel.exposed_app_ids.remove(app_id);
+            if tunnel.selected_app_id.as_deref() == Some(app_id.as_str()) {
+                tunnel.selected_app_id = sorted_exposed_app_ids(&tunnel).into_iter().next();
+            }
+        } else {
+            tunnel.exposed_app_ids.clear();
+            tunnel.selected_app_id = None;
+        }
+        if tunnel.exposed_app_ids.is_empty() {
+            tunnel.selected_app_id = None;
+            tunnel.control_plane_enabled = false;
+        }
+        (
+            tunnel.active,
+            tunnel.url.clone(),
+            selected_or_first_exposed_app_id(&tunnel),
+            sorted_exposed_app_ids(&tunnel),
+            tunnel.companion_enabled,
+        )
+    };
+
+    let exposed_set: HashSet<String> = exposed_app_ids.iter().cloned().collect();
+    persist_public_exposed_app_ids(&state, &exposed_set).await;
+    persist_public_tunnel_state(&state, url.as_deref(), selected_app_id.as_deref()).await;
+
+    let app_urls: BTreeMap<String, String> = url
+        .as_ref()
+        .map(|base| {
+            exposed_app_ids
+                .iter()
+                .map(|app_id| (app_id.clone(), base.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": if requested_app_id.is_some() {
+            "App public exposure stopped; other app exposures remain unchanged."
+        } else {
+            "Public exposure stopped; tunnel infrastructure remains ready."
+        },
+        "active": active,
+        "url": url,
+        "selected_app_id": selected_app_id,
+        "exposed_app_ids": exposed_app_ids,
+        "app_urls": app_urls,
+        "control_plane_enabled": false,
+        "companion_enabled": companion_enabled
+    }))
+    .into_response()
 }
 
 pub(super) async fn wait_for_tunnel_url(

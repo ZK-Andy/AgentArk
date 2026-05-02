@@ -83,6 +83,8 @@ It is built to evolve with you. Accepted work, user corrections, repeated routin
 
 Your data stays with you. Your secrets are encrypted. You keep the final say on risky actions.
 
+> Note: AgentArk currently runs as one global workspace. Project-specific workspaces and project-scoped UI/API behavior are intentionally deferred to phase 2.
+
 | | |
 |:--|:--|
 | **Command layer** | Chat, plans, approvals, and direct work requests |
@@ -174,7 +176,7 @@ Open **http://localhost:8990**, pick your LLM provider in Settings, start chatti
 
 > **Use the Web UI.** AgentArk is designed to run through the Docker Compose stack and Mission Control at `http://localhost:8990`. Do not use the native `agentark` CLI as your normal entry point; it is an operator/developer escape hatch and may not initialize or expose the full runtime, approvals, integrations, browser/app tooling, and UI-backed settings.
 
-The supported install path uses `.agentark/local.env` for Docker Compose variables and preserves Docker volumes across updates. AgentArk does not create or require a root project `.env`. Generated apps may have framework-owned env files inside their own app directories when required, but secret keys stay in AgentArk's managed secret storage or runtime injection path.
+The supported install path uses Docker Compose defaults plus named Docker volumes for runtime state and preserves those volumes across updates. AgentArk does not create or require a root project `.env`. Generated apps may have framework-owned env files inside their own app directories when required, but secret keys stay in AgentArk's managed secret storage or runtime injection path.
 
 ### Managed backups
 
@@ -188,13 +190,13 @@ Backups are written under `/app/data/backups` as timestamped artifacts:
 
 AgentArk creates the backup directory itself. If backup creation fails, ArkPulse raises a critical data-safety finding and notifies the user; users should not be asked to create the backup folder manually.
 
-**Low-memory systems (2-4 GB RAM):** after the first script-managed start has created `.agentark/local.env`, add the low-memory override to reduce Postgres and service footprint:
+**Low-memory systems (2-4 GB RAM):** add the low-memory override to reduce Postgres and service footprint:
 
 ```bash
-docker compose --env-file .agentark/local.env -f docker-compose.yml -f docker-compose.lowmem.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d
 ```
 
-The bundled Docker runtime includes Lightpanda for fast free-content fetching, and the install/update scripts verify that it is present after startup.
+The bundled Docker runtime includes Lightpanda for fast free-content fetching and the ArkEvolve GEPA optimizer runtime with DSPy. GEPA uses the same active model configured in AgentArk's Models settings; there is no separate GEPA key, model, button, or `.env` setup. ArkEvolve runs this optimizer automatically only after AgentArk is quiet, enough completed work exists, and the daily cost guardrail allows it. The UI surfaces this as Background improvement status, queue, evidence, and latest result.
 
 ### Runtime footprint
 
@@ -203,6 +205,7 @@ These numbers are for the supported Docker Compose install. They were measured f
 | Item | Current expectation |
 |:--|:--|
 | Full AgentArk Docker image | `agentark:dev` measured at **3.07 GB**. Published full-runtime linux/amd64 images should be in the same range; run `docker image ls agentark:dev` or `docker image ls ghcr.io/agentark-ai/agentark` for the exact local size. |
+| Bundled ArkEvolve GEPA runtime | Adds the small `/app/tools` optimizer code plus a Python venv with DSPy and model-client dependencies. Expect roughly **120-250 MB** additional uncompressed image size, varying with Python dependency versions. |
 | AgentArk process startup | **5-10 ms measured** for the Rust binary command startup inside the rebuilt container. This excludes Docker Compose dependency ordering and Postgres health checks. |
 | Full local rebuild | About **12 minutes** on the measured Docker Desktop build with warm dependency caches. The Rust release binary compile dominated the build at **11m 38s**; frontend production build was about **11s**. Clean Docker/Cargo/npm caches can be longer. |
 | Docker stack ready after image exists | **47.3 seconds measured** from stopped containers to all services healthy with `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --wait` on Docker Desktop using the local `agentark:dev` image. This includes Postgres, workspace, executor, control, dependency ordering, and healthcheck intervals. Clean pulls/builds are not included. |
@@ -625,12 +628,13 @@ RUST_LOG=info,agentark=debug ./scripts/start.sh     # agent internals only
 
 ## Roadmap
 
-- Support multiple accounts per provider across integrations, channels, and reasoning, with project-scoped account management and selection.
+- Support multiple accounts per provider across integrations, channels, and reasoning, with workspace-level account management and selection. Project-specific selection can be revisited in phase 2.
 - Let users refine an active chat run with extra instructions while AgentArk is still working.
 - Add external database support through a dedicated Databases page with read-only schema inspection and conversational querying. Planned providers: Postgres, Supabase, MySQL, Snowflake, and Databricks SQL.
-- Optional GPU-accelerated learning for power users. Entirely opt-in and self-hosted — your data never leaves your machine, and any improvement is gated by AgentArk's existing rollout-and-promotion pipeline so your live agent only changes when a candidate clearly beats it.
+- ArkOrbit is in development for a future release as a dynamic app and widget deployment surface.
+- Optional GPU-accelerated learning for power users. Entirely opt-in and self-hosted - your data never leaves your machine, and any improvement is gated by AgentArk's existing rollout-and-promotion pipeline so your live agent only changes when a candidate clearly beats it.
   - Phase 1 (consumer GPU): lightweight on-device learning that makes routine decisions and evaluation faster and cheaper.
-  - Phase 2 (workstation GPU): personalization from your own usage — your local agent gradually adapts to your tasks and preferences.
+  - Phase 2 (workstation GPU): personalization from your own usage - your local agent gradually adapts to your tasks and preferences.
   - Phase 3 (multi-GPU / cluster): heavier on-device training and inference acceleration for teams running serious hardware.
 
 ---

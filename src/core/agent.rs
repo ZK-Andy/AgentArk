@@ -19,10 +19,10 @@ use regex::Regex;
 use sea_orm::{TransactionTrait, entity::prelude::PgVector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, broadcast};
 
 use super::{
@@ -32,6 +32,7 @@ use super::{
         ActionCatalogSyncStats, action_catalog_embedding_has_default_dim,
         action_catalog_entry_needs_embedding, build_action_catalog_descriptor,
     },
+    arkorbit,
     automation::{
         self, AutomationExecutionPolicy, AutomationOriginContext, AutomationRunRecord,
         AutomationRunStatus, AutomationSupervisorState, AutomationValidation,
@@ -87,6 +88,7 @@ mod notifications;
 mod operational;
 mod pending_flows;
 mod prompt_builder;
+pub(crate) mod reasoning_stream;
 mod request_context;
 mod resilience_followups;
 mod routing;
@@ -101,6 +103,7 @@ mod watcher_followup;
 use automation_helpers::*;
 use background_sessions::*;
 pub use conversation_context::ConversationMessage;
+pub(crate) use intent_planning::{AdvisoryIntent, AdvisoryIntentPlan};
 use memory::*;
 pub use notifications::{NotificationDispatchOutcome, NotificationEvent, NotificationStore};
 use notifications::{
@@ -114,7 +117,6 @@ pub use streaming::StreamEvent;
 pub(crate) use streaming::queue_stream_event;
 use tool_responses::*;
 pub(crate) use watcher_followup::{WatcherFollowupPreparation, WatcherFollowupWorker};
-pub(crate) use intent_planning::{AdvisoryIntent, AdvisoryIntentPlan};
 
 const MOLTBOOK_ACTIVITY_LOG_KEY: &str = "moltbook_activity_log_v1";
 const MOLTBOOK_ACTIVITY_LOG_LIMIT: usize = 500;
@@ -148,7 +150,6 @@ const USER_LEARNED_MEMORY_CAPTURE_SOURCE: &str = "user_lifecycle_memory_capture"
 const USER_LEARNED_MEMORY_RETRACTION_SOURCE: &str = "user_lifecycle_memory_retraction";
 const USER_FACT_MEMORY_CAPTURE_LOCAL_TIMEOUT_MS: u64 = 6_000;
 const USER_FACT_MEMORY_CAPTURE_REMOTE_TIMEOUT_MS: u64 = 45_000;
-const USER_FACT_MEMORY_CAPTURE_WORKER_TIMEOUT_SECS: u64 = 75;
 const USER_FACT_MEMORY_CAPTURE_MAX_CANDIDATES: usize = 2;
 const USER_FACT_MEMORY_CAPTURE_EMPTY_ESCALATION_MAX_CANDIDATES: usize = 2;
 const USER_FACT_MEMORY_CAPTURE_EMPTY_VERDICT_MIN_CONFIDENCE: f32 = 0.70;
@@ -165,8 +166,6 @@ const SAVED_USER_FACT_PROMPT_KINDS: &[&str] = &[
 ];
 const MEMORY_OPERATION_CANDIDATE_TYPES: &[&str] =
     &["memory_add", "memory_update", "memory_retract"];
-static USER_MEMORY_CAPTURE_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
-static USER_MEMORY_CAPTURE_QUEUE: OnceLock<Mutex<VecDeque<UserMemoryCaptureJob>>> = OnceLock::new();
 static ACTION_CATALOG_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub(crate) const AUTONOMY_SETTINGS_STORAGE_KEY: &str = "autonomy_settings_v1";
 
@@ -978,6 +977,21 @@ fn extract_model_failure_tool_name(error: &str) -> Option<String> {
     None
 }
 
+fn format_model_timeout_duration(ms: u64) -> String {
+    let seconds = (ms / 1_000).max(1);
+    if seconds >= 60 {
+        let minutes = seconds / 60;
+        let remainder = seconds % 60;
+        if remainder == 0 {
+            format!("{} minutes", minutes)
+        } else {
+            format!("{} minutes {} seconds", minutes, remainder)
+        }
+    } else {
+        format!("{} seconds", seconds)
+    }
+}
+
 fn summarize_model_failure_for_user(error: &str) -> String {
     let trimmed = error.trim();
     if trimmed.is_empty() {
@@ -1050,11 +1064,83 @@ fn summarize_model_failure_for_user(error: &str) -> String {
     format!("{}failed: {}.", prefix, safe_truncate(detail, 160))
 }
 
-fn summarize_model_failures_for_user(errors: &[String]) -> String {
+fn summarize_model_attempt_failure_for_user(attempt: &crate::core::ModelAttemptRecord) -> String {
+    let label = attempt.slot_label.trim();
+    let prefix = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", label)
+    };
+    match attempt.failure_kind.as_ref() {
+        Some(crate::core::FailureKind::Timeout) => {
+            if let Some(elapsed_ms) = attempt.elapsed_ms {
+                format!(
+                    "{}timed out before responding after {}.",
+                    prefix,
+                    format_model_timeout_duration(elapsed_ms)
+                )
+            } else {
+                format!("{}timed out before responding.", prefix)
+            }
+        }
+        Some(crate::core::FailureKind::TransientTransport) => {
+            format!("{}lost the provider transport connection.", prefix)
+        }
+        Some(crate::core::FailureKind::UpstreamProvider) => {
+            format!("{}returned an upstream provider error.", prefix)
+        }
+        Some(crate::core::FailureKind::RateLimited) => {
+            format!("{}was rate-limited by the provider.", prefix)
+        }
+        Some(crate::core::FailureKind::Authentication) => {
+            format!("{}was rejected by provider authentication.", prefix)
+        }
+        Some(crate::core::FailureKind::Configuration) => {
+            format!(
+                "{}has invalid or incomplete provider configuration.",
+                prefix
+            )
+        }
+        Some(crate::core::FailureKind::ContextWindowExceeded) => {
+            format!(
+                "{}rejected the request because the context was too large.",
+                prefix
+            )
+        }
+        Some(crate::core::FailureKind::SchemaMismatch) => {
+            format!("{}returned a response schema mismatch.", prefix)
+        }
+        Some(crate::core::FailureKind::ToolContractFailure) => {
+            format!("{}could not satisfy the tool-call contract.", prefix)
+        }
+        Some(crate::core::FailureKind::CapabilityBound) => {
+            format!("{}hit a model capability limit.", prefix)
+        }
+        Some(crate::core::FailureKind::MissingInput) => {
+            format!("{}needed missing input.", prefix)
+        }
+        Some(crate::core::FailureKind::InternalPostProcess) => {
+            format!("{}failed during internal post-processing.", prefix)
+        }
+        Some(crate::core::FailureKind::DelegationFailed) => {
+            format!("{}failed during delegated execution.", prefix)
+        }
+        Some(crate::core::FailureKind::Panic) => {
+            format!("{}failed unexpectedly.", prefix)
+        }
+        Some(crate::core::FailureKind::Unknown) | None => attempt
+            .error
+            .as_deref()
+            .map(summarize_model_failure_for_user)
+            .unwrap_or_else(|| format!("{}failed unexpectedly.", prefix)),
+    }
+}
+
+fn summarize_model_failures_for_user(attempts: &[crate::core::ModelAttemptRecord]) -> String {
     let mut summaries = Vec::new();
     let mut seen = HashSet::new();
-    for error in errors {
-        let summary = summarize_model_failure_for_user(error);
+    for attempt in attempts {
+        let summary = summarize_model_attempt_failure_for_user(attempt);
         if seen.insert(summary.clone()) {
             summaries.push(summary);
         }
@@ -1146,13 +1232,13 @@ pub(crate) fn chat_model_is_configured(config: &AgentConfig) -> bool {
 }
 
 fn enrich_supervisor_outcome_with_model_failures(outcome: &mut crate::core::UserFacingOutcome) {
-    let errors: Vec<String> = outcome
+    let failures: Vec<crate::core::ModelAttemptRecord> = outcome
         .attempted_models
         .iter()
         .filter(|attempt| !attempt.success)
-        .filter_map(|attempt| attempt.error.clone())
+        .cloned()
         .collect();
-    let summary = summarize_model_failures_for_user(&errors);
+    let summary = summarize_model_failures_for_user(&failures);
     if summary.is_empty() || outcome.message.contains(&summary) {
         return;
     }
@@ -1413,7 +1499,7 @@ pub(crate) enum AgentTurnOutcomeKind {
     Skipped,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ImmediateExchangeContext<'a> {
     channel: &'a str,
     conversation_key: &'a str,
@@ -1422,6 +1508,7 @@ struct ImmediateExchangeContext<'a> {
     model_used: &'a str,
     user_message_already_recorded: bool,
     memory_capture_allowed: bool,
+    memory_capture_source: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -1619,6 +1706,9 @@ pub struct Agent {
     /// Durable operator-facing container for ongoing work that spans tasks/watchers.
     pub background_sessions: super::background_session::BackgroundSessionManager,
 
+    /// ArkOrbit per-user canvas service.
+    pub arkorbit: super::arkorbit::ArkOrbitService,
+
     /// Configuration
     pub config: AgentConfig,
 
@@ -1787,16 +1877,25 @@ pub struct RequestExecutionHints {
     pub execution_surface: ActionExecutionSurface,
     pub direct_user_intent: bool,
     pub routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
+    pub routing_trusted: bool,
     pub intent_plan: Option<AdvisoryIntentPlan>,
+    pub force_agent_loop: bool,
     pub secret_offered: Option<SecretOfferedHint>,
     pub attachments: Vec<ChatAttachmentHint>,
     pub saved_user_facts_context: Option<String>,
+    /// Per-call structural context describing the ArkOrbit canvas the user
+    /// is on. Includes the active orbit id, widget summary, and the orbit's
+    /// optional `agent_instructions`. Forwarded as augmentation only — never
+    /// a model selection override and never a global system-prompt mutation.
+    pub arkorbit_context: Option<serde_json::Value>,
 }
 
 enum InboundSecurityPrecheck {
     Continue {
         memory_capture_allowed: bool,
         routing: Option<crate::security::intent_classifier::InboundRoutingSignal>,
+        routing_trusted: bool,
+        direct_response: Option<String>,
     },
     Respond(ProcessedMessage),
 }

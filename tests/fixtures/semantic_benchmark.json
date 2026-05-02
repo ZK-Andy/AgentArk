@@ -147,6 +147,36 @@
       "notes": "URL in prompt supplies source; app_deploy step resolver uses it as the git_ref arg. The router must not treat this as a browser navigation."
     },
     {
+      "id": "app_build_public_webcam_monitor",
+      "category": "app_build",
+      "prompts": {
+        "canonical": "Create a clean React TypeScript Tailwind dashboard titled Public Webcam Monitor with a 2x2 grid for four legal public webcam pages, iframe/fallback handling, status badges, live-view, refresh, fullscreen, and last-checked controls.",
+        "paraphrases": [
+          "build a react+ts tailwind public webcam monitor: four camera cards in a 2 by 2 layout, each with location, online/external/error badge, iframe when possible, fallback text, open/refresh/fullscreen buttons, checked time",
+          "i need a deployed webcam dashboard for the Rome and Venice public camera URLs, 4 cards, embed if allowed otherwise show external-only fallback, include live link, refresh and fullscreen",
+          "make a browser app called Public Webcam Monitor showing four public cameras in a square grid, with statuses, embedded viewers where legal, fallback message when blocked, and per-camera controls",
+          "create the frontend for monitoring these public webcam pages: 2x2 cards, name/location/status, iframe fallback, open live view, refresh, fullscreen, last checked"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Public webcam URLs are artifact inputs. The requested outcome is a frontend dashboard, not background surveillance, private camera access, browser automation, or public web research."
+    },
+    {
       "id": "watcher_iran_news_telegram",
       "category": "watcher",
       "prompts": {
@@ -244,6 +274,44 @@
       "notes": "Two distinct goals: one persistent watcher (5-min cadence is external), one deployed dashboard (refresh button is artifact runtime). Dashboard depends on watcher output (depends_on references the earlier goal by its emitted id; the test asserts the second goal declares a dependency on the first, regardless of the ids chosen)."
     },
     {
+      "id": "mixed_app_build_plus_arksystem_inspection",
+      "category": "mixed",
+      "prompts": {
+        "canonical": "Build and deploy a ping pong game that I can play in a browser and tell me what the recent ArkPulse failures are.",
+        "paraphrases": [
+          "make me a playable browser ping-pong app, then also inspect the latest arkpulse failures",
+          "two things: deploy a pong game and report recent AgentArk/ArkPulse failure details",
+          "create a live ping pong web game; separately, check the recent arkpulse errors for me",
+          "i want a browser game built plus a current platform diagnostic on arkpulse failures"
+        ]
+      },
+      "expected": {
+        "goal_count": 2,
+        "goals": [
+          {
+            "capability_target": "app_deploy",
+            "embedding_similarity_min": 0.50,
+            "object_ref": null,
+            "side_effect": "create_object",
+            "hints": {"workspace_modification_request": true},
+            "depends_on": []
+          },
+          {
+            "capability_target": "ark_inspect",
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"surface": "arkpulse"},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Mixed durable creation plus current-state inspection. The router must preserve both goals; it must not pick only the app build, and it must not force the read-only inspection into app delivery."
+    },
+    {
       "id": "background_session_create_pricing",
       "category": "background_session",
       "prompts": {
@@ -289,7 +357,7 @@
         "goal_count": 1,
         "goals": [
           {
-            "capability_target_any_of": ["background_session_status", "list_background_sessions", "agentark_inspect"],
+            "capability_target_any_of": ["background_session_status", "list_background_sessions", "ark_inspect"],
             "embedding_similarity_min": 0.40,
             "object_ref": {"kind": "background_session", "resolution_family": "most_recent_in_context"},
             "side_effect": "read",
@@ -640,7 +708,7 @@
         "goal_count": 1,
         "goals": [
           {
-            "capability_target": "agentark_inspect",
+            "capability_target": "ark_inspect",
             "embedding_similarity_min": 0.45,
             "object_ref": null,
             "side_effect": "read",
@@ -652,7 +720,97 @@
         "requires_secret_sidecar": false,
         "turn_confidence_min": 0.55
       },
-      "notes": "Internal-inspection query. Step resolver picks agentark_inspect with surface=arkpulse,limit=1 args. Post-success predicate OutputNonEmpty terminates the step; orchestrator must not wander to web_search/browser."
+      "notes": "Internal-inspection query. Step resolver picks ark_inspect with surface=arkpulse,limit=1 args. Post-success predicate OutputNonEmpty terminates the step; orchestrator must not wander to web_search/browser."
+    },
+    {
+      "id": "ark_apps_inventory_inspect",
+      "category": "arksystem_inspect",
+      "prompts": {
+        "canonical": "What current apps do I have?",
+        "paraphrases": [
+          "show my existing deployed apps",
+          "which apps are running in Ark right now?",
+          "list the apps I already have here",
+          "what browser apps have been created so far?"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "ark_inspect",
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"surface": "apps"},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.55
+      },
+      "notes": "Existing app inventory is read-only platform inspection. App/deploy neighbors may appear semantically close, but side-effecting app delivery must not be selected without a durable create/update/deploy goal."
+    },
+    {
+      "id": "public_news_search_current_answer",
+      "category": "external_info",
+      "prompts": {
+        "canonical": "Search India Iran news.",
+        "paraphrases": [
+          "look up current news involving India and Iran",
+          "find recent India-Iran headlines for me",
+          "what's the latest public news on India and Iran?",
+          "search the web for India Iran updates"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target_any_of": ["web_search", "research", "respond_without_tool"],
+            "embedding_similarity_min": 0.40,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"public_freshness_required": true},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "A current public-information lookup is read-only. It must not inherit an earlier app-build frame or create a new deployable app merely because the conversation previously involved app work."
+    },
+    {
+      "id": "personal_activity_reflection",
+      "category": "arksystem_inspect",
+      "prompts": {
+        "canonical": "What patterns do you see in my recent work and chats?",
+        "paraphrases": [
+          "what have I been circling around lately?",
+          "based on my recent AgentArk activity, what themes keep coming up?",
+          "what does my recent work suggest I keep avoiding or delaying?",
+          "look at my recent chats and work and tell me what stands out"
+        ]
+      },
+      "expected": {
+        "goal_count": 1,
+        "goals": [
+          {
+            "capability_target": "ark_inspect",
+            "embedding_similarity_min": 0.45,
+            "object_ref": null,
+            "side_effect": "read",
+            "hints": {"surface": "activity"},
+            "depends_on": []
+          }
+        ],
+        "clarification_needed": false,
+        "requires_secret_sidecar": false,
+        "turn_confidence_min": 0.50
+      },
+      "notes": "Reflective questions over the user's recent activity are read-only local inspection. The model should infer the requested pattern from evidence across recent chats, tasks, watchers, sessions, memory/evolution, and sentinel signals, not from phrase-specific routing."
     },
     {
       "id": "integration_install_linear_plus_list",
@@ -728,12 +886,12 @@
       "id": "mixed_memory_plus_question",
       "category": "mixed",
       "prompts": {
-        "canonical": "My name is Alex. Do you know what OpenClaw is?",
+        "canonical": "My name is Alex. Do you know what Glimmernode is?",
         "paraphrases": [
-          "i'm alex btw. also - what is openclaw?",
-          "hey, my name's alex. and... what's openclaw?",
-          "pls remember my name is alex. also, do u know what OpenClaw is?",
-          "name: alex. question: what is openclaw"
+          "i'm alex btw. also - what is glimmernode?",
+          "hey, my name's alex. and... what's glimmernode?",
+          "pls remember my name is alex. also, do u know what Glimmernode is?",
+          "name: alex. question: what is glimmernode"
         ]
       },
       "expected": {
@@ -816,7 +974,7 @@
         "goal_count": 1,
         "goals": [
           {
-            "capability_target_any_of": ["list_integrations", "capability_resolve", "product_help", "agentark_inspect"],
+            "capability_target_any_of": ["list_integrations", "capability_resolve", "product_help", "ark_inspect"],
             "embedding_similarity_min": 0.40,
             "object_ref": null,
             "side_effect": "read",

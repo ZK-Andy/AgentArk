@@ -1,6 +1,7 @@
 {
   "target_key": "routing_complexity_policy_v1",
-  "version": 1,
+  "version": 2,
+  "description": "Regression fixture for structural fallback routing complexity. These examples validate message shape only; production routing must use typed inbound signals, embeddings, action metadata, and context.",
   "cases": [
     {
       "prompt": "hi",
@@ -8,14 +9,6 @@
     },
     {
       "prompt": "thanks, that helps",
-      "expected": "simple"
-    },
-    {
-      "prompt": "what time is it?",
-      "expected": "simple"
-    },
-    {
-      "prompt": "open the settings page",
       "expected": "simple"
     },
     {
@@ -27,79 +20,39 @@
       "expected": "simple"
     },
     {
-      "prompt": "rename this title to Q2 Review",
+      "prompt": "open the settings page",
       "expected": "simple"
     },
     {
-      "prompt": "explain why the nightly job failed",
+      "prompt": "Can you explain the failure in plain English and tell me the next practical step? I do not need a full audit, just enough context to decide whether to retry.",
       "expected": "medium"
     },
     {
-      "prompt": "fix the broken login button",
+      "prompt": "Please create a concise summary from the attached rows.\n- call out totals\n- mention missing values\n- keep the answer short",
       "expected": "medium"
     },
     {
-      "prompt": "create a CSV summary from these rows",
+      "prompt": "I need a small implementation plan. Cover the affected file, the likely test, and the rollback concern. Keep it to one pass.",
       "expected": "medium"
     },
     {
-      "prompt": "send a reminder tomorrow morning",
+      "prompt": "This failed again. Compare the last result with the earlier one, identify the most likely cause, and suggest a focused fix without changing unrelated behavior.",
       "expected": "medium"
     },
     {
-      "prompt": "check the latest deployment logs",
-      "expected": "medium"
-    },
-    {
-      "prompt": "implement a small parser guard for empty email",
-      "expected": "medium"
-    },
-    {
-      "prompt": "design a settings modal for account preferences",
-      "expected": "medium"
-    },
-    {
-      "prompt": "help me understand this error message",
-      "expected": "medium"
-    },
-    {
-      "prompt": "deploy the updated frontend after tests pass",
-      "expected": "medium"
-    },
-    {
-      "prompt": "research and compare the top three Rust web frameworks, then recommend one for production",
+      "prompt": "Review this multi-part release risk before we proceed.\n\n1. Database writes may spike during import.\n2. The worker queue has no retry budget yet.\n3. The UI currently hides partial failures.\n4. Support needs an operator runbook.\n\nReturn the main risks, owner handoffs, and a minimal rollout plan.",
       "expected": "complex"
     },
     {
-      "prompt": "write a report on the security, performance, and operational risks in this deployment plan",
+      "prompt": "Investigate this end to end: inspect the recent trace, compare it with the last five related runs, identify which tool or routing stage is most often failing, propose a fix, and list the regression tests needed before release.",
       "expected": "complex"
     },
     {
-      "prompt": "investigate flaky tests, identify the root cause, patch the code, and add regression coverage",
+      "prompt": "Build an operator-ready plan that covers research, implementation, validation, rollout, monitoring, rollback, and user-facing communication. Include assumptions, risks, dependencies, success metrics, and a day-by-day sequence.",
       "expected": "complex"
     },
     {
-      "prompt": "analyze and compare the storage, concurrency, and rollback behavior across all services",
-      "expected": "complex"
-    },
-    {
-      "prompt": "Create a comprehensive migration plan for the database, API, frontend, and deployment pipeline.",
-      "expected": "complex"
-    },
-    {
-      "prompt": "Audit production readiness for database bloat, concurrency, query safety, security, performance, and operability.",
-      "expected": "complex"
-    },
-    {
-      "prompt": "Map end-to-end release risks for authentication, billing, migrations, monitoring, and rollback.",
-      "expected": "complex"
-    },
-    {
-      "prompt": "Prepare a production launch checklist covering database growth, concurrency limits, alerts, backups, and incident response.",
-      "expected": "complex"
-    },
-    {
-      "prompt": "Review the architecture for scaling risks in search indexing, worker queues, cache invalidation, and API rate limits.",
+      "prompt": "Analyze the following code path and produce a production-readiness review:\n```rust\nfn run(input: Request) -> Result<Response> {\n    let rows = db.fetch(input.id)?;\n    for row in rows { worker.enqueue(row)?; }\n    Ok(Response::ok())\n}\n```\nCover concurrency, data growth, retries, observability, and failure recovery.",
       "expected": "complex"
     }
   ]

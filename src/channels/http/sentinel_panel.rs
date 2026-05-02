@@ -17,11 +17,12 @@ const SENTINEL_RETENTION_DAYS: i64 = 30;
 const SENTINEL_PROPOSAL_RECREATE_HOURS: i64 = 24;
 const IN_APP_EXECUTION_SCAN_LIMIT: u64 = 48;
 const IN_APP_STALE_RUN_MINUTES: i64 = 15;
-const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 4] = [
+const BACKGROUND_LEARNING_JOB_KEYS: [(&str, &str); 5] = [
     ("reflection_pass", "Reflection pass"),
     ("experience_consolidation", "Experience consolidation"),
     ("pattern_induction", "Pattern induction"),
     ("candidate_generation", "Candidate generation"),
+    ("gepa_optimizer", "Prompt tuning"),
 ];
 static BACKGROUND_LEARNING_STORE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -180,7 +181,7 @@ pub(crate) struct BackgroundLearningFeed {
     pub jobs: std::collections::BTreeMap<String, BackgroundLearningJobRecord>,
 }
 
-async fn load_scan_state(storage: &crate::storage::Storage) -> SentinelScanState {
+pub(super) async fn load_scan_state(storage: &crate::storage::Storage) -> SentinelScanState {
     match storage.get(SENTINEL_SCAN_STATE_KEY).await {
         Ok(Some(raw)) => serde_json::from_slice::<SentinelScanState>(&raw).unwrap_or_default(),
         _ => SentinelScanState::default(),
@@ -193,7 +194,9 @@ async fn save_scan_state(storage: &crate::storage::Storage, state: &SentinelScan
     }
 }
 
-async fn load_observations(storage: &crate::storage::Storage) -> Vec<SentinelObservation> {
+pub(super) async fn load_observations(
+    storage: &crate::storage::Storage,
+) -> Vec<SentinelObservation> {
     match storage.get(SENTINEL_OBSERVATIONS_KEY).await {
         Ok(Some(raw)) => {
             serde_json::from_slice::<Vec<SentinelObservation>>(&raw).unwrap_or_default()
@@ -211,7 +214,7 @@ async fn save_observations(
     }
 }
 
-async fn load_proposals(storage: &crate::storage::Storage) -> Vec<SentinelProposal> {
+pub(super) async fn load_proposals(storage: &crate::storage::Storage) -> Vec<SentinelProposal> {
     match storage.get(SENTINEL_PROPOSALS_KEY).await {
         Ok(Some(raw)) => serde_json::from_slice::<Vec<SentinelProposal>>(&raw).unwrap_or_default(),
         _ => Vec::new(),
@@ -266,6 +269,7 @@ fn background_learning_label(key: &str) -> String {
         "experience_consolidation" => "Experience consolidation",
         "pattern_induction" => "Pattern induction",
         "candidate_generation" => "Candidate generation",
+        "gepa_optimizer" => "Prompt tuning",
         other => other,
     }
     .to_string()

@@ -70,18 +70,6 @@ impl WorkspaceClient {
         }
     }
 
-    pub async fn put_blob(&self, path: &str, bytes: &[u8]) -> Result<()> {
-        self.request(
-            reqwest::Method::PUT,
-            &format!("/internal/v1/blobs/{}", urlencoding::encode(path)),
-        )
-        .body(bytes.to_vec())
-        .send()
-        .await?
-        .error_for_status()?;
-        Ok(())
-    }
-
     pub async fn get_blob(&self, path: &str) -> Result<Vec<u8>> {
         Ok(self
             .request(

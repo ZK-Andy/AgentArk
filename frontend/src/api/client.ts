@@ -371,7 +371,6 @@ type ChatStreamPayload = {
   message: string;
   channel?: string;
   conversation_id?: string | null;
-  project_id?: string | null;
   deep_research?: boolean;
   plan_confirmation_mode?: string;
   execution_mode?: string;
@@ -390,6 +389,7 @@ type ChatStreamHandlers = {
   onEvent?: (event: string, payload: unknown) => void;
   onToken?: (token: string) => void;
   onThinking?: (step: Record<string, unknown>) => void;
+  onReasoningDelta?: (payload: Record<string, unknown>) => void;
   onToolStart?: (name: string, payload?: Record<string, unknown>) => void;
   onToolProgress?: (name: string, content: string, payload?: Record<string, unknown>) => void;
   onToolResult?: (name: string, content: string, payload?: Record<string, unknown>) => void;
@@ -498,6 +498,10 @@ async function streamSseJson(
     }
     if (eventName === "thinking") {
       handlers.onThinking?.(asObject(payloadValue));
+      return;
+    }
+    if (eventName === "reasoning_delta") {
+      handlers.onReasoningDelta?.(asObject(payloadValue));
       return;
     }
     if (eventName === "tool_start") {
@@ -632,6 +636,10 @@ async function streamRun(runId: string, sinceSeq = 0, handlers: ChatStreamHandle
     }
     if (eventName === "thinking") {
       handlers.onThinking?.(asObject(payloadValue));
+      return;
+    }
+    if (eventName === "reasoning_delta") {
+      handlers.onReasoningDelta?.(asObject(payloadValue));
       return;
     }
     if (eventName === "tool_start") {
@@ -1029,6 +1037,17 @@ export const api = {
   getNodes: () => request<NodesResponse>("/nodes"),
   getCompanionPresets: () => request<CompanionPresetsResponse>("/companion/presets"),
   getCompanionProtocol: () => request<CompanionProtocolDocument>("/companion/protocol"),
+  getCompanionConnectivity: () => request<Record<string, unknown>>("/companion/connectivity"),
+  startCompanionTunnel: () =>
+    request<Record<string, unknown>>("/companion/connectivity/tunnel/start", {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  stopCompanionTunnel: () =>
+    request<Record<string, unknown>>("/companion/connectivity/tunnel/stop", {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
   getCompanionDevices: () => request<CompanionDevicesResponse>("/companion/devices"),
   createCompanionPairingSession: (payload: Record<string, unknown>) =>
     request<{ status: string; session?: Record<string, unknown>; pairing_payload?: Record<string, unknown>; message?: string }>(
@@ -1312,7 +1331,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ action, dry_run: false })
       }),
-  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; project_id?: string | null; deep_research?: boolean; plan_confirmation_mode?: string; execution_mode?: string }) =>
+  chat: (payload: { message: string; channel?: string; conversation_id?: string | null; deep_research?: boolean; plan_confirmation_mode?: string; execution_mode?: string }) =>
     request<{ response: string; proof_id?: string; conversation_id?: string; conversation_title?: string }>(
       "/chat",
       {
@@ -1333,6 +1352,7 @@ export const api = {
         "onEvent" in payloadOrHandlers ||
         "onToken" in payloadOrHandlers ||
         "onThinking" in payloadOrHandlers ||
+        "onReasoningDelta" in payloadOrHandlers ||
         "onToolStart" in payloadOrHandlers ||
         "onToolProgress" in payloadOrHandlers ||
         "onToolResult" in payloadOrHandlers ||

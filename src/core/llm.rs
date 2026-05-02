@@ -1,5 +1,7 @@
 //! LLM client for agent reasoning
 
+pub(crate) mod stream_blocks;
+
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
@@ -10,13 +12,14 @@ use tokio::sync::mpsc::Sender;
 use crate::core::agent::{ConversationMessage, StreamEvent};
 use crate::core::llm_provider::{
     display_openai_base_url, force_refresh_codex_cli_api_key, is_codex_cli_base_url,
-    openai_provider_label, resolve_openai_request_config, ResolvedOpenAiRequestConfig,
+    openai_provider_label, resolve_openai_request_config, PromptCacheCapability,
+    ResolvedOpenAiRequestConfig,
 };
 
 // OpenRouter enforces request affordability against the declared output budget.
 // Cap only that provider by default so other OpenAI-compatible backends remain
 // free to use their own native limits.
-// No artificial output cap — let the model use its full native output limit.
+// No artificial output cap: let the model use its full native output limit.
 // Previously set to 1024, which truncated app_deploy payloads mid-JSON.
 
 /// Supported LLM providers
@@ -109,7 +112,7 @@ fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
         }
     }
 
-    // Nothing to close — original should have parsed fine.
+    // Nothing to close: original should have parsed fine.
     if stack.is_empty() && !in_string {
         return None;
     }
@@ -345,6 +348,7 @@ fn tool_argument_phase(tool_name: &str) -> (&'static str, &'static str) {
 #[derive(Clone, Copy)]
 enum ModelRequestMode {
     Helper,
+    Classifier,
 }
 
 fn sanitize_model_request_bundle(
@@ -358,10 +362,11 @@ fn sanitize_model_request_bundle(
     let _ = mode;
     let system_context = crate::security::ModelInputContext::InternalHelperPrompt;
     let user_context = crate::security::ModelInputContext::InternalHelperPrompt;
+    let system_prompt = append_runtime_temporal_context(system_prompt);
 
     (
         sanitize_model_request_text(
-            system_prompt,
+            &system_prompt,
             system_context,
             policy,
             allow_sensitive_context,
@@ -369,6 +374,30 @@ fn sanitize_model_request_bundle(
         sanitize_model_request_text(user_message, user_context, policy, allow_sensitive_context),
         sanitize_model_request_history(history, policy, allow_sensitive_context),
     )
+}
+
+fn append_runtime_temporal_context(system_prompt: &str) -> String {
+    if has_runtime_temporal_context(system_prompt) {
+        return system_prompt.to_string();
+    }
+    let now_utc = chrono::Utc::now();
+    let temporal_context = format!(
+        "\n\n## Runtime Temporal Context\n\
+- Current UTC date: {}.\n\
+- Current UTC time: {}.\n\
+- Current year: {}.\n\
+- Interpret relative date words such as today, tomorrow, yesterday, current, latest, recent, this week, this month, and this year against this runtime clock unless tool results give a more specific timestamp.\n\
+- Do not infer the current date or year from model training data. Preserve the caller's requested output format.\n",
+        now_utc.format("%Y-%m-%d"),
+        now_utc.format("%H:%M UTC"),
+        now_utc.format("%Y")
+    );
+    format!("{}{}", system_prompt.trim_end(), temporal_context)
+}
+
+fn has_runtime_temporal_context(system_prompt: &str) -> bool {
+    let lower = system_prompt.to_ascii_lowercase();
+    lower.contains("current utc date") && lower.contains("current year")
 }
 
 fn sanitize_model_request_text(
@@ -430,27 +459,18 @@ fn queue_stream_event(token_tx: &Sender<StreamEvent>, event: StreamEvent) {
     }
 }
 
-async fn emit_argument_phase_status(
-    token_tx: &Sender<StreamEvent>,
-    tool_name: &str,
-    detail: String,
-    elapsed_secs: u64,
-) {
-    let (phase, label) = tool_argument_phase(tool_name);
-    emit_stream_tool_progress(
+fn queue_reasoning_delta(token_tx: &Sender<StreamEvent>, phase: &str, content_delta: String) {
+    if content_delta.is_empty() {
+        return;
+    }
+    queue_stream_event(
         token_tx,
-        tool_name,
-        detail.clone(),
-        serde_json::json!({
-            "kind": "phase_status",
-            "phase": phase,
-            "label": label,
-            "detail": detail,
-            "elapsed_secs": elapsed_secs,
-            "stream_key": format!("phase-status:{}:{}", tool_name, phase),
-        }),
-    )
-    .await;
+        StreamEvent::ReasoningDelta {
+            phase: phase.to_string(),
+            content_delta,
+            done: false,
+        },
+    );
 }
 
 async fn emit_partial_draft_file_previews(
@@ -513,6 +533,120 @@ async fn emit_partial_draft_file_previews(
             serde_json::Value::Object(payload),
         )
         .await;
+    }
+}
+
+fn stream_file_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        0
+    } else {
+        content.lines().count().max(1)
+    }
+}
+
+async fn emit_stream_block_events(
+    token_tx: &Sender<StreamEvent>,
+    events: Vec<stream_blocks::StreamBlockEvent>,
+) {
+    for event in events {
+        match event {
+            stream_blocks::StreamBlockEvent::Text(text) => {
+                if !text.is_empty() {
+                    queue_stream_event(token_tx, StreamEvent::Token(text));
+                }
+            }
+            stream_blocks::StreamBlockEvent::FileStart { path } => {
+                let stream_key = format!("stream-file:{}", path);
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    format!("Drafting {}", path),
+                    serde_json::json!({
+                        "kind": "draft_file",
+                        "phase": "generating_files",
+                        "file": path,
+                        "line": 0,
+                        "done": false,
+                        "stream_key": stream_key,
+                    }),
+                )
+                .await;
+            }
+            stream_blocks::StreamBlockEvent::FileDelta {
+                path,
+                delta,
+                snapshot,
+            } => {
+                let stream_key = format!("stream-file:{}", path);
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    format!("Drafting {}", path),
+                    serde_json::json!({
+                        "kind": "draft_file",
+                        "phase": "generating_files",
+                        "file": path,
+                        "content_delta": delta,
+                        "line": stream_file_line_count(&snapshot),
+                        "done": false,
+                        "stream_key": stream_key,
+                    }),
+                )
+                .await;
+            }
+            stream_blocks::StreamBlockEvent::FileEnd { path, content } => {
+                let total_lines = stream_file_line_count(&content);
+                let stream_key = format!("stream-file:{}", path);
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    format!("Drafted {}", path),
+                    serde_json::json!({
+                        "kind": "draft_file",
+                        "phase": "generating_files",
+                        "file": path,
+                        "content_snapshot": content,
+                        "line": total_lines,
+                        "total_lines": total_lines,
+                        "done": true,
+                        "stream_key": stream_key,
+                    }),
+                )
+                .await;
+            }
+            stream_blocks::StreamBlockEvent::Delete { path } => {
+                let stream_key = format!("stream-delete:{}", path);
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    format!("Deleting {}", path),
+                    serde_json::json!({
+                        "kind": "delete_file",
+                        "phase": "generating_files",
+                        "file": path.clone(),
+                        "path": path,
+                        "done": true,
+                        "stream_key": stream_key,
+                    }),
+                )
+                .await;
+            }
+            stream_blocks::StreamBlockEvent::Checklist { items } => {
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    "Delivery checklist".to_string(),
+                    serde_json::json!({
+                        "kind": "delivery_checklist",
+                        "phase": "generating_files",
+                        "items": items,
+                        "done": true,
+                        "stream_key": "stream-checklist:app_deploy",
+                    }),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -669,6 +803,11 @@ fn extract_openai_delta_text(value: &serde_json::Value) -> Option<String> {
     extract_openai_text_from_value(value, false)
 }
 
+fn extract_openai_reasoning_delta(value: &serde_json::Value) -> Option<String> {
+    extract_openai_text_from_value(value, false)
+        .or_else(|| value.as_str().map(|text| text.to_string()))
+}
+
 fn openai_responses_endpoint(config: &ResolvedOpenAiRequestConfig) -> String {
     format!("{}/responses", config.base_url.trim_end_matches('/'))
 }
@@ -736,6 +875,8 @@ fn build_openai_responses_request(
     history: &[ConversationMessage],
     actions: &[crate::actions::ActionDef],
     stream: bool,
+    prompt_cache_key: Option<String>,
+    prompt_cache_retention: Option<String>,
 ) -> serde_json::Value {
     let tools = build_openai_responses_tools(actions);
     let mut request = serde_json::json!({
@@ -745,9 +886,16 @@ fn build_openai_responses_request(
         "stream": stream,
         "store": false,
     });
+    if let Some(prompt_cache_key) = prompt_cache_key {
+        request["prompt_cache_key"] = serde_json::Value::String(prompt_cache_key);
+    }
+    if let Some(prompt_cache_retention) = prompt_cache_retention {
+        request["prompt_cache_retention"] = serde_json::Value::String(prompt_cache_retention);
+    }
     if !tools.is_empty() {
         request["tools"] = serde_json::Value::Array(tools);
-        request["tool_choice"] = serde_json::Value::String("auto".to_string());
+        request["tool_choice"] = openai_responses_tool_choice_for_actions(actions)
+            .unwrap_or_else(|| serde_json::Value::String("auto".to_string()));
         request["parallel_tool_calls"] = serde_json::Value::Bool(true);
     }
     request
@@ -808,6 +956,14 @@ fn parse_json_f64(value: &serde_json::Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+fn safe_log_excerpt(value: &str, max_chars: usize) -> String {
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
 fn total_tokens_or_sum(total_tokens: u64, prompt_tokens: u64, completion_tokens: u64) -> u64 {
     if total_tokens > 0 {
         total_tokens
@@ -816,8 +972,160 @@ fn total_tokens_or_sum(total_tokens: u64, prompt_tokens: u64, completion_tokens:
     }
 }
 
-fn should_request_openai_stream_usage(provider_label: &str, is_openrouter: bool) -> bool {
-    is_openrouter || provider_label.eq_ignore_ascii_case("openai")
+fn should_request_openai_stream_usage(
+    is_openrouter: bool,
+    capability: PromptCacheCapability,
+) -> bool {
+    is_openrouter
+        || matches!(
+            capability,
+            PromptCacheCapability::OpenAiAutomatic | PromptCacheCapability::OpenAiExplicitKey
+        )
+}
+
+fn action_requires_native_tool_choice(action: &crate::actions::ActionDef) -> bool {
+    let metadata = action.planner_metadata();
+    matches!(
+        metadata.side_effect_level,
+        crate::actions::PlannerSideEffectLevel::Notify
+            | crate::actions::PlannerSideEffectLevel::Write
+    ) || matches!(
+        metadata.role,
+        crate::actions::PlannerActionRole::Delivery
+            | crate::actions::PlannerActionRole::Mutation
+            | crate::actions::PlannerActionRole::Orchestration
+    ) || matches!(
+        metadata.delivery_mode,
+        crate::actions::PlannerDeliveryMode::Async
+            | crate::actions::PlannerDeliveryMode::Conditional
+            | crate::actions::PlannerDeliveryMode::Either
+    )
+}
+
+fn forced_native_tool_name(actions: &[crate::actions::ActionDef]) -> Option<&str> {
+    let [action] = actions else {
+        return None;
+    };
+    action_requires_native_tool_choice(action).then_some(action.name.as_str())
+}
+
+fn openai_chat_tool_choice_for_actions(
+    actions: &[crate::actions::ActionDef],
+) -> Option<serde_json::Value> {
+    forced_native_tool_name(actions).map(|name| {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            },
+        })
+    })
+}
+
+fn openai_responses_tool_choice_for_actions(
+    actions: &[crate::actions::ActionDef],
+) -> Option<serde_json::Value> {
+    forced_native_tool_name(actions).map(|name| {
+        serde_json::json!({
+            "type": "function",
+            "name": name,
+        })
+    })
+}
+
+fn openai_prompt_cache_key(
+    scope: &str,
+    system_prompt: &str,
+    actions: &[crate::actions::ActionDef],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"agentark-llm-cache-v1");
+    hasher.update(scope.as_bytes());
+    hasher.update(system_prompt.as_bytes());
+    for action in actions {
+        hasher.update(action.name.as_bytes());
+        hasher.update(action.version.as_bytes());
+        hasher.update(action.description.as_bytes());
+        hasher.update(action.input_schema.to_string().as_bytes());
+    }
+    let digest = hasher.finalize().to_hex();
+    format!("agentark-{scope}-{}", &digest[..32])
+}
+
+fn prompt_cache_uses_openai_explicit_key(capability: PromptCacheCapability) -> bool {
+    matches!(capability, PromptCacheCapability::OpenAiExplicitKey)
+}
+
+fn openai_prompt_cache_retention(capability: PromptCacheCapability) -> Option<String> {
+    if !prompt_cache_uses_openai_explicit_key(capability) {
+        return None;
+    }
+    let configured = std::env::var("AGENTARK_OPENAI_PROMPT_CACHE_RETENTION")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| value == "in_memory" || value == "24h");
+    Some(configured.unwrap_or_else(|| "in_memory".to_string()))
+}
+
+fn openai_prompt_cache_key_for_config(
+    request_config: &ResolvedOpenAiRequestConfig,
+    scope: &str,
+    system_prompt: &str,
+    actions: &[crate::actions::ActionDef],
+) -> Option<String> {
+    prompt_cache_uses_openai_explicit_key(request_config.prompt_cache_capability)
+        .then(|| openai_prompt_cache_key(scope, system_prompt, actions))
+}
+
+#[derive(Clone, Serialize)]
+struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+fn anthropic_cache_control() -> AnthropicCacheControl {
+    AnthropicCacheControl {
+        cache_type: "ephemeral",
+    }
+}
+
+fn prompt_cache_uses_openrouter_cache_control(capability: PromptCacheCapability) -> bool {
+    matches!(
+        capability,
+        PromptCacheCapability::OpenRouterAnthropicCacheControl
+    )
+}
+
+fn openrouter_prompt_cache_control(capability: PromptCacheCapability) -> Option<serde_json::Value> {
+    prompt_cache_uses_openrouter_cache_control(capability)
+        .then(|| serde_json::json!({ "type": "ephemeral" }))
+}
+
+fn openrouter_message_content_with_cache_control(
+    text: String,
+    capability: PromptCacheCapability,
+) -> serde_json::Value {
+    if let Some(cache_control) = openrouter_prompt_cache_control(capability) {
+        serde_json::json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": cache_control,
+        }])
+    } else {
+        serde_json::Value::String(text)
+    }
+}
+
+fn openrouter_chat_tool_cache_control(
+    capability: PromptCacheCapability,
+) -> Option<serde_json::Value> {
+    openrouter_prompt_cache_control(capability).map(|cache_control| {
+        serde_json::json!([{
+            "type": "text",
+            "text": "Tool catalog",
+            "cache_control": cache_control,
+        }])
+    })
 }
 
 fn merge_usage_field(target: &mut Option<u64>, update: Option<u64>) {
@@ -1304,11 +1612,41 @@ fn normalize_openai_tool_schema_in_place(node: &mut serde_json::Value, is_root: 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_partial_draft_files, json_contains_tool_call_indicators, merge_usage_field,
-        normalize_openai_tool_schema, openai_stream_data_has_terminal_finish_reason,
-        parse_openai_responses_payload, parse_partial_tool_arguments,
+        append_runtime_temporal_context, emit_partial_draft_file_previews,
+        extract_openai_reasoning_delta, extract_partial_draft_files,
+        json_contains_tool_call_indicators, merge_usage_field, normalize_openai_tool_schema,
+        openai_prompt_cache_key_for_config, openai_prompt_cache_retention,
+        openai_stream_data_has_terminal_finish_reason, parse_openai_responses_payload,
+        parse_partial_tool_arguments, prompt_cache_uses_openai_explicit_key,
         should_request_openai_stream_usage, total_tokens_or_sum,
     };
+    use crate::core::llm_provider::{
+        PromptCacheCapability, ResolvedOpenAiRequestConfig, OPENAI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
+    };
+    use crate::core::StreamEvent;
+    use std::collections::HashMap;
+
+    #[test]
+    fn runtime_temporal_context_is_added_to_model_prompts() {
+        let prompt = append_runtime_temporal_context("Return only valid JSON.");
+        let current_year = chrono::Utc::now().format("%Y").to_string();
+
+        assert!(prompt.contains("## Runtime Temporal Context"));
+        assert!(prompt.contains("Current UTC date:"));
+        assert!(prompt.contains(&format!("Current year: {}.", current_year)));
+        assert!(prompt.contains("Preserve the caller's requested output format."));
+    }
+
+    #[test]
+    fn runtime_temporal_context_is_not_duplicated_when_prompt_already_has_date() {
+        let prompt = append_runtime_temporal_context(
+            "## Current Date Context\n- Current UTC date: 2026-05-01.\n- Current year: 2026.",
+        );
+
+        assert!(!prompt.contains("## Runtime Temporal Context"));
+        assert_eq!(prompt.matches("Current UTC date").count(), 1);
+    }
 
     #[test]
     fn normalize_openai_tool_schema_removes_top_level_anyof_requirements() {
@@ -1503,6 +1841,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn emit_partial_draft_file_previews_marks_final_snapshot_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut emitted = HashMap::new();
+
+        emit_partial_draft_file_previews(
+            &tx,
+            "app_deploy",
+            r#"{"files":{"index.html":"<main>Hel""#,
+            &mut emitted,
+        )
+        .await;
+        emit_partial_draft_file_previews(
+            &tx,
+            "app_deploy",
+            r#"{"files":{"index.html":"<main>Hello</main>"}}"#,
+            &mut emitted,
+        )
+        .await;
+
+        let _partial = rx.recv().await.expect("partial draft event");
+        let final_event = rx.recv().await.expect("final draft event");
+        let StreamEvent::ToolProgress { payload, .. } = final_event else {
+            panic!("expected tool progress");
+        };
+        let payload = payload.expect("draft payload");
+        assert_eq!(
+            payload.get("kind").and_then(|value| value.as_str()),
+            Some("draft_file")
+        );
+        assert_eq!(
+            payload.get("done").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            payload.get("total_lines").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+    }
+
     #[test]
     fn openai_stream_terminal_finish_reason_detected() {
         assert!(openai_stream_data_has_terminal_finish_reason(
@@ -1524,6 +1902,49 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_is_gated_by_typed_capability() {
+        let direct = ResolvedOpenAiRequestConfig {
+            api_key: String::new(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            provider_label: OPENAI_PROVIDER_ID,
+            is_openrouter: false,
+            uses_codex_cli_oauth: false,
+            prompt_cache_capability: PromptCacheCapability::OpenAiExplicitKey,
+        };
+        let routed = ResolvedOpenAiRequestConfig {
+            api_key: direct.api_key.clone(),
+            base_url: direct.base_url.clone(),
+            provider_label: OPENROUTER_PROVIDER_ID,
+            is_openrouter: true,
+            uses_codex_cli_oauth: direct.uses_codex_cli_oauth,
+            prompt_cache_capability: PromptCacheCapability::OpenRouterProviderSpecific,
+        };
+
+        assert!(prompt_cache_uses_openai_explicit_key(
+            direct.prompt_cache_capability
+        ));
+        assert!(openai_prompt_cache_key_for_config(&direct, "chat", "sys", &[]).is_some());
+        assert!(openai_prompt_cache_retention(direct.prompt_cache_capability).is_some());
+        assert!(openai_prompt_cache_key_for_config(&routed, "chat", "sys", &[]).is_none());
+        assert!(openai_prompt_cache_retention(routed.prompt_cache_capability).is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_delta_accepts_openrouter_normalized_shapes() {
+        assert_eq!(
+            extract_openai_reasoning_delta(&serde_json::json!("thinking...")),
+            Some("thinking...".to_string())
+        );
+        assert_eq!(
+            extract_openai_reasoning_delta(&serde_json::json!({
+                "type": "reasoning",
+                "text": "planning tool call"
+            })),
+            Some("planning tool call".to_string())
+        );
+    }
+
+    #[test]
     fn total_tokens_or_sum_recovers_missing_total_tokens() {
         assert_eq!(total_tokens_or_sum(0, 12, 5), 17);
         assert_eq!(total_tokens_or_sum(21, 12, 5), 21);
@@ -1531,11 +1952,17 @@ mod tests {
 
     #[test]
     fn should_request_openai_stream_usage_is_limited_to_supported_providers() {
-        assert!(should_request_openai_stream_usage("openai", false));
-        assert!(should_request_openai_stream_usage("openrouter", true));
+        assert!(should_request_openai_stream_usage(
+            false,
+            PromptCacheCapability::OpenAiExplicitKey
+        ));
+        assert!(should_request_openai_stream_usage(
+            true,
+            PromptCacheCapability::OpenRouterProviderSpecific
+        ));
         assert!(!should_request_openai_stream_usage(
-            "openai-compatible",
-            false
+            false,
+            PromptCacheCapability::None
         ));
     }
 
@@ -1728,7 +2155,7 @@ fn extract_text_from_any_json(value: &serde_json::Value) -> Option<String> {
             }
         }
     }
-    // Try choices[*].message.content (flexible — accept content as string or object with text)
+    // Try choices[*].message.content. Accept content as string or object with text.
     if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
         for choice in choices {
             // Standard: choice.message.content
@@ -1822,10 +2249,11 @@ fn is_retryable_error(err: &anyhow::Error) -> bool {
 const RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 3000];
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const DEFAULT_LLM_HTTP_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS: u64 = 180;
-const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 90;
-const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 60;
-const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 240;
+const DEFAULT_LLM_NON_STREAM_TOTAL_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_LLM_STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_LLM_STREAM_INTER_CHUNK_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_LLM_APP_DEPLOY_TOOL_START_TIMEOUT_SECS: u64 = 90;
 
 fn llm_http_timeout_secs() -> u64 {
     std::env::var("AGENTARK_LLM_HTTP_TIMEOUT_SECS")
@@ -1867,6 +2295,14 @@ fn llm_stream_total_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_LLM_STREAM_TOTAL_TIMEOUT_SECS)
 }
 
+fn llm_app_deploy_tool_start_timeout_secs() -> u64 {
+    std::env::var("AGENTARK_LLM_APP_DEPLOY_TOOL_START_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 30 && *secs <= 300)
+        .unwrap_or(DEFAULT_LLM_APP_DEPLOY_TOOL_START_TIMEOUT_SECS)
+}
+
 fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
     #[derive(Deserialize)]
     struct TerminalChunk {
@@ -1894,6 +2330,7 @@ fn openai_stream_data_has_terminal_finish_reason(data: &str) -> bool {
 fn model_request_mode_label(mode: ModelRequestMode) -> &'static str {
     match mode {
         ModelRequestMode::Helper => "helper",
+        ModelRequestMode::Classifier => "classifier",
     }
 }
 
@@ -1948,27 +2385,6 @@ impl LlmClient {
         .await
     }
 
-    pub async fn chat_with_output_limit(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-        memories: &[crate::core::PromptMemory],
-        actions: &[crate::actions::ActionDef],
-        max_output_tokens: Option<u32>,
-    ) -> Result<LlmResponse> {
-        self.chat_with_history_for_helper_limited(
-            system_prompt,
-            user_message,
-            &[],
-            memories,
-            actions,
-            &crate::security::ModelPrivacyConfig::default(),
-            false,
-            max_output_tokens,
-        )
-        .await
-    }
-
     /// Simple chat with just system prompt and user message (no tools/actions)
     /// Used by browser automation loop and other subsystems that don't need tool calling
     pub async fn chat_with_system(
@@ -1996,6 +2412,29 @@ impl LlmClient {
         self.chat_for_helper_request_limited(
             system_prompt,
             user_message,
+            &[],
+            &[],
+            &crate::security::ModelPrivacyConfig::default(),
+            false,
+            Some(max_output_tokens),
+        )
+        .await
+    }
+
+    /// Structured classifier/judge request. This path is intentionally bounded:
+    /// providers that support explicit reasoning controls get no-reasoning
+    /// request flags through the shared `max_output_tokens` transport path.
+    pub async fn chat_classifier_bounded(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_output_tokens: u32,
+    ) -> Result<LlmResponse> {
+        self.chat_with_history_in_mode(
+            ModelRequestMode::Classifier,
+            system_prompt,
+            user_message,
+            &[],
             &[],
             &[],
             &crate::security::ModelPrivacyConfig::default(),
@@ -2271,10 +2710,21 @@ impl LlmClient {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_tokens: Option<u32>,
-            system: String,
+            system: Vec<AnthropicTextBlock>,
             messages: Vec<AnthropicMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<AnthropicTool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<AnthropicToolChoice>,
+        }
+
+        #[derive(Serialize)]
+        struct AnthropicTextBlock {
+            #[serde(rename = "type")]
+            block_type: &'static str,
+            text: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<AnthropicCacheControl>,
         }
 
         #[derive(Serialize)]
@@ -2288,6 +2738,15 @@ impl LlmClient {
             name: String,
             description: String,
             input_schema: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<AnthropicCacheControl>,
+        }
+
+        #[derive(Serialize)]
+        struct AnthropicToolChoice {
+            #[serde(rename = "type")]
+            choice_type: String,
+            name: String,
         }
 
         #[derive(Deserialize)]
@@ -2318,14 +2777,18 @@ impl LlmClient {
             },
         }
 
-        let tools: Vec<AnthropicTool> = actions
+        let mut tools: Vec<AnthropicTool> = actions
             .iter()
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),
                 input_schema: s.input_schema.clone(),
+                cache_control: None,
             })
             .collect();
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool.cache_control = Some(anthropic_cache_control());
+        }
 
         // Build messages array with history (exclude the last user message as we add it separately)
         let mut messages: Vec<AnthropicMessage> = history
@@ -2346,9 +2809,17 @@ impl LlmClient {
         let request = AnthropicRequest {
             model: model.to_string(),
             max_tokens: max_output_tokens,
-            system: system_prompt.to_string(),
+            system: vec![AnthropicTextBlock {
+                block_type: "text",
+                text: system_prompt.to_string(),
+                cache_control: Some(anthropic_cache_control()),
+            }],
             messages,
             tools,
+            tool_choice: forced_native_tool_name(actions).map(|name| AnthropicToolChoice {
+                choice_type: "tool".to_string(),
+                name: name.to_string(),
+            }),
         };
 
         let response = self
@@ -2456,32 +2927,42 @@ impl LlmClient {
         let actions = params.actions;
         let max_output_tokens = params.max_output_tokens;
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_tokens: Option<u32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_key: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_retention: Option<String>,
             messages: Vec<OpenAIMessage>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<serde_json::Value>,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIMessage {
             role: String,
-            content: String,
+            content: serde_json::Value,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAITool {
             #[serde(rename = "type")]
             tool_type: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
             function: OpenAIFunction,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIFunction {
             name: String,
             description: String,
@@ -2549,43 +3030,8 @@ impl LlmClient {
             arguments: Option<OpenAIFunctionArguments>,
         }
 
-        let tools: Vec<OpenAITool> = actions
-            .iter()
-            .map(|s| OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIFunction {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    parameters: normalize_openai_tool_schema(&s.input_schema),
-                },
-            })
-            .collect();
-
-        // Build messages with system prompt first
-        let mut messages = vec![OpenAIMessage {
-            role: "system".to_string(),
-            content: system_prompt.to_string(),
-        }];
-
-        // Add conversation history (excluding the current message)
-        for msg in history
-            .iter()
-            .filter(|m| !(m.role == "user" && m.content == user_message))
-        {
-            messages.push(OpenAIMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-            });
-        }
-
-        // Add current user message
-        messages.push(OpenAIMessage {
-            role: "user".to_string(),
-            content: user_message.to_string(),
-        });
-
         let mut request_config =
-            resolve_openai_request_config(&self.client, api_key, base_url).await?;
+            resolve_openai_request_config(&self.client, api_key, base_url, model).await?;
         if request_config.uses_codex_cli_oauth {
             return self
                 .chat_openai_codex_responses(
@@ -2598,6 +3044,50 @@ impl LlmClient {
                 )
                 .await;
         }
+
+        let mut tools: Vec<OpenAITool> = actions
+            .iter()
+            .map(|s| OpenAITool {
+                tool_type: "function".to_string(),
+                cache_control: None,
+                function: OpenAIFunction {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    parameters: normalize_openai_tool_schema(&s.input_schema),
+                },
+            })
+            .collect();
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool.cache_control =
+                openrouter_chat_tool_cache_control(request_config.prompt_cache_capability);
+        }
+
+        // Build messages with system prompt first
+        let mut messages = vec![OpenAIMessage {
+            role: "system".to_string(),
+            content: openrouter_message_content_with_cache_control(
+                system_prompt.to_string(),
+                request_config.prompt_cache_capability,
+            ),
+        }];
+
+        // Add conversation history (excluding the current message)
+        for msg in history
+            .iter()
+            .filter(|m| !(m.role == "user" && m.content == user_message))
+        {
+            messages.push(OpenAIMessage {
+                role: msg.role.clone(),
+                content: serde_json::Value::String(msg.content.clone()),
+            });
+        }
+
+        // Add current user message
+        messages.push(OpenAIMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(user_message.to_string()),
+        });
+
         let endpoint = format!("{}/chat/completions", request_config.base_url);
         let request = OpenAIRequest {
             model: model.to_string(),
@@ -2609,8 +3099,19 @@ impl LlmClient {
             } else {
                 None
             },
+            prompt_cache_key: openai_prompt_cache_key_for_config(
+                &request_config,
+                "chat",
+                system_prompt,
+                actions,
+            ),
+            prompt_cache_retention: openai_prompt_cache_retention(
+                request_config.prompt_cache_capability,
+            ),
             messages,
+            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
             tools,
+            tool_choice: openai_chat_tool_choice_for_actions(actions),
         };
 
         let mut last_err: Option<anyhow::Error> = None;
@@ -2646,7 +3147,7 @@ impl LlmClient {
                     .header("X-Title", crate::branding::PRODUCT_NAME);
             }
 
-            let response = match req.json(&request).send().await {
+            let mut response = match req.json(&request).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let err = anyhow::Error::from(e);
@@ -2657,7 +3158,7 @@ impl LlmClient {
                     return Err(err);
                 }
             };
-            let status = response.status();
+            let mut status = response.status();
 
             if status == reqwest::StatusCode::UNAUTHORIZED
                 && request_config.uses_codex_cli_oauth
@@ -2692,6 +3193,44 @@ impl LlmClient {
                 tokio::time::sleep(std::time::Duration::from_secs(retry_after)).await;
                 last_err = Some(anyhow!("OpenAI API rate limited (429)"));
                 continue;
+            }
+
+            if !status.is_success()
+                && matches!(
+                    status,
+                    reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                )
+                && request.tool_choice.is_some()
+            {
+                let error =
+                    match read_response_bytes_limited(response, "OpenAI-compatible API").await {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+                        Err(read_err) => format!("<failed to read error body: {}>", read_err),
+                    };
+                tracing::warn!(
+                    "OpenAI-compatible provider rejected forced tool_choice (status={}): {}; retrying without forced tool_choice",
+                    status,
+                    safe_log_excerpt(&error, 320)
+                );
+                let mut compatibility_request = request.clone();
+                compatibility_request.tool_choice = None;
+                let mut fallback_req = self
+                    .client
+                    .post(&endpoint)
+                    .header("Content-Type", "application/json");
+                if !request_config.api_key.is_empty() {
+                    fallback_req = fallback_req.header(
+                        "Authorization",
+                        format!("Bearer {}", request_config.api_key),
+                    );
+                }
+                if request_config.is_openrouter {
+                    fallback_req = fallback_req
+                        .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                        .header("X-Title", crate::branding::PRODUCT_NAME);
+                }
+                response = fallback_req.json(&compatibility_request).send().await?;
+                status = response.status();
             }
 
             if !status.is_success() {
@@ -3098,6 +3637,8 @@ impl LlmClient {
             messages: Vec<OllamaMessage>,
             stream: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
+            think: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             options: Option<OllamaOptions>,
         }
 
@@ -3148,6 +3689,7 @@ impl LlmClient {
             model: model.to_string(),
             messages,
             stream: false,
+            think: max_output_tokens.map(|_| false),
             options: max_output_tokens.map(|tokens| OllamaOptions {
                 num_predict: tokens as i64,
             }),
@@ -3281,6 +3823,7 @@ impl LlmClient {
         }
 
         let mut content = String::new();
+        let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
         let mut buffer = String::new();
         let mut done = false;
         let mut prompt_eval_count: Option<u64> = None;
@@ -3307,7 +3850,8 @@ impl LlmClient {
                 if let Some(msg) = parsed.message {
                     if !msg.content.is_empty() {
                         content.push_str(&msg.content);
-                        queue_stream_event(&token_tx, StreamEvent::Token(msg.content));
+                        emit_stream_block_events(&token_tx, stream_block_parser.feed(&msg.content))
+                            .await;
                     }
                 }
                 if parsed.done {
@@ -3323,6 +3867,7 @@ impl LlmClient {
                 break;
             }
         }
+        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
 
         let prompt_chars = system_prompt.len()
             + user_message.len()
@@ -3376,6 +3921,13 @@ impl LlmClient {
             history,
             actions,
             true,
+            openai_prompt_cache_key_for_config(
+                &request_config,
+                "responses-stream",
+                system_prompt,
+                actions,
+            ),
+            openai_prompt_cache_retention(request_config.prompt_cache_capability),
         );
         let prompt_chars = system_prompt.len()
             + user_message.len()
@@ -3386,7 +3938,7 @@ impl LlmClient {
         let send_start = std::time::Instant::now();
         let mut forced_oauth_refresh = false;
 
-        let response = loop {
+        let mut response = loop {
             let response = self
                 .client
                 .post(&endpoint)
@@ -3413,7 +3965,39 @@ impl LlmClient {
             break response;
         };
 
-        let status = response.status();
+        let mut status = response.status();
+        if !status.is_success()
+            && matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            )
+            && request
+                .get("tool_choice")
+                .is_some_and(|value| !value.as_str().is_some_and(|raw| raw == "auto"))
+        {
+            let error = match read_response_bytes_limited(response, "OpenAI Subscription").await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+                Err(read_err) => format!("<failed to read error body: {}>", read_err),
+            };
+            tracing::warn!(
+                "OpenAI Responses provider rejected forced tool_choice (status={}): {}; retrying with automatic tool choice",
+                status,
+                safe_log_excerpt(&error, 320)
+            );
+            let mut compatibility_request = request.clone();
+            compatibility_request["tool_choice"] = serde_json::Value::String("auto".to_string());
+            response = self
+                .client
+                .post(&endpoint)
+                .timeout(std::time::Duration::from_secs(600))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .bearer_auth(&request_config.api_key)
+                .json(&compatibility_request)
+                .send()
+                .await?;
+            status = response.status();
+        }
         if !status.is_success() {
             let error = match read_response_bytes_limited(response, "OpenAI Subscription").await {
                 Ok(bytes) => {
@@ -3432,6 +4016,7 @@ impl LlmClient {
         let mut content = String::new();
         let mut reasoning: Option<String> = None;
         let mut completed_response: Option<serde_json::Value> = None;
+        let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
         let mut first_token = true;
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
@@ -3446,10 +4031,7 @@ impl LlmClient {
                 if hb_done_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                queue_stream_event(
-                    &hb_tx,
-                    StreamEvent::Thinking("Thinking.".to_string()),
-                );
+                queue_stream_event(&hb_tx, StreamEvent::Thinking("Thinking.".to_string()));
             }
         });
 
@@ -3504,12 +4086,14 @@ impl LlmClient {
                                 heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             content.push_str(delta);
-                            queue_stream_event(&token_tx, StreamEvent::Token(delta.to_string()));
+                            emit_stream_block_events(&token_tx, stream_block_parser.feed(delta))
+                                .await;
                         }
                     }
                     "response.reasoning_summary_text.delta" => {
                         if let Some(delta) = parsed.get("delta").and_then(|value| value.as_str()) {
                             reasoning.get_or_insert_with(String::new).push_str(delta);
+                            queue_reasoning_delta(&token_tx, "model", delta.to_string());
                         }
                     }
                     "response.completed" => {
@@ -3522,6 +4106,17 @@ impl LlmClient {
         }
         heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
         heartbeat_handle.abort();
+        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        if reasoning.is_some() {
+            queue_stream_event(
+                &token_tx,
+                StreamEvent::ReasoningDelta {
+                    phase: "model".to_string(),
+                    content_delta: String::new(),
+                    done: true,
+                },
+            );
+        }
 
         if let Some(response_json) = completed_response {
             let mut parsed = parse_openai_responses_payload(
@@ -3570,38 +4165,48 @@ impl LlmClient {
 
         use std::collections::HashMap;
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIStreamOptions {
             include_usage: bool,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIRequest {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_tokens: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_key: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_retention: Option<String>,
             messages: Vec<OpenAIMessage>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<OpenAITool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<serde_json::Value>,
             stream: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             stream_options: Option<OpenAIStreamOptions>,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIMessage {
             role: String,
-            content: String,
+            content: serde_json::Value,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAITool {
             #[serde(rename = "type")]
             tool_type: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<serde_json::Value>,
             function: OpenAIFunction,
         }
 
-        #[derive(Serialize)]
+        #[derive(Clone, Serialize)]
         struct OpenAIFunction {
             name: String,
             description: String,
@@ -3644,6 +4249,8 @@ impl LlmClient {
             tool_calls: Option<Vec<OpenAIStreamToolCallDelta>>,
             #[serde(default)]
             reasoning_content: Option<String>,
+            #[serde(default)]
+            reasoning: Option<serde_json::Value>,
         }
 
         #[derive(Deserialize)]
@@ -3680,43 +4287,8 @@ impl LlmClient {
             emitted_draft_snapshots: HashMap<String, (String, bool)>,
         }
 
-        let tools: Vec<OpenAITool> = actions
-            .iter()
-            .map(|s| OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIFunction {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                    parameters: normalize_openai_tool_schema(&s.input_schema),
-                },
-            })
-            .collect();
-
-        // Build messages with system prompt first
-        let mut messages = vec![OpenAIMessage {
-            role: "system".to_string(),
-            content: system_prompt.to_string(),
-        }];
-
-        // Add conversation history (excluding the current message)
-        for msg in history
-            .iter()
-            .filter(|m| !(m.role == "user" && m.content == user_message))
-        {
-            messages.push(OpenAIMessage {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-            });
-        }
-
-        // Add current user message
-        messages.push(OpenAIMessage {
-            role: "user".to_string(),
-            content: user_message.to_string(),
-        });
-
         let mut request_config =
-            resolve_openai_request_config(&self.client, api_key, base_url).await?;
+            resolve_openai_request_config(&self.client, api_key, base_url, model).await?;
         if request_config.uses_codex_cli_oauth {
             return self
                 .chat_openai_codex_responses_stream(
@@ -3730,6 +4302,50 @@ impl LlmClient {
                 )
                 .await;
         }
+
+        let mut tools: Vec<OpenAITool> = actions
+            .iter()
+            .map(|s| OpenAITool {
+                tool_type: "function".to_string(),
+                cache_control: None,
+                function: OpenAIFunction {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    parameters: normalize_openai_tool_schema(&s.input_schema),
+                },
+            })
+            .collect();
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool.cache_control =
+                openrouter_chat_tool_cache_control(request_config.prompt_cache_capability);
+        }
+
+        // Build messages with system prompt first
+        let mut messages = vec![OpenAIMessage {
+            role: "system".to_string(),
+            content: openrouter_message_content_with_cache_control(
+                system_prompt.to_string(),
+                request_config.prompt_cache_capability,
+            ),
+        }];
+
+        // Add conversation history (excluding the current message)
+        for msg in history
+            .iter()
+            .filter(|m| !(m.role == "user" && m.content == user_message))
+        {
+            messages.push(OpenAIMessage {
+                role: msg.role.clone(),
+                content: serde_json::Value::String(msg.content.clone()),
+            });
+        }
+
+        // Add current user message
+        messages.push(OpenAIMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(user_message.to_string()),
+        });
+
         let url = request_config.base_url.clone();
         tracing::info!(
             "LLM stream → {} model={} msgs={} tools={}",
@@ -3740,8 +4356,8 @@ impl LlmClient {
         );
 
         let stream_options = if should_request_openai_stream_usage(
-            request_config.provider_label,
             request_config.is_openrouter,
+            request_config.prompt_cache_capability,
         ) {
             Some(OpenAIStreamOptions {
                 include_usage: true,
@@ -3752,8 +4368,19 @@ impl LlmClient {
         let request = OpenAIRequest {
             model: model.to_string(),
             max_tokens: None,
+            prompt_cache_key: openai_prompt_cache_key_for_config(
+                &request_config,
+                "chat-stream",
+                system_prompt,
+                actions,
+            ),
+            prompt_cache_retention: openai_prompt_cache_retention(
+                request_config.prompt_cache_capability,
+            ),
             messages,
+            cache_control: openrouter_prompt_cache_control(request_config.prompt_cache_capability),
             tools,
+            tool_choice: openai_chat_tool_choice_for_actions(actions),
             stream: true,
             stream_options,
         };
@@ -3824,6 +4451,49 @@ impl LlmClient {
             send_start.elapsed().as_millis()
         );
 
+        if !status.is_success()
+            && matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            )
+            && request.tool_choice.is_some()
+        {
+            let error = match read_response_bytes_limited(response, "OpenAI API").await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+                Err(read_err) => format!("<failed to read error body: {}>", read_err),
+            };
+            tracing::warn!(
+                "OpenAI-compatible stream provider rejected forced tool_choice (status={}): {}; retrying without forced tool_choice",
+                status,
+                safe_log_excerpt(&error, 320)
+            );
+            let mut compatibility_request = request.clone();
+            compatibility_request.tool_choice = None;
+            let mut retry_req = self
+                .client
+                .post(format!("{}/chat/completions", request_config.base_url))
+                .timeout(std::time::Duration::from_secs(600))
+                .header("Content-Type", "application/json");
+            if !request_config.api_key.is_empty() {
+                retry_req = retry_req.header(
+                    "Authorization",
+                    format!("Bearer {}", request_config.api_key),
+                );
+            }
+            if request_config.is_openrouter {
+                retry_req = retry_req
+                    .header("HTTP-Referer", crate::branding::REPOSITORY_URL)
+                    .header("X-Title", crate::branding::PRODUCT_NAME);
+            }
+            response = retry_req.json(&compatibility_request).send().await?;
+            status = response.status();
+            tracing::info!(
+                "LLM stream fallback response status={} after {}ms",
+                status,
+                send_start.elapsed().as_millis()
+            );
+        }
+
         // Handle 429 Too Many Requests for streaming
         if status.as_u16() == 429 {
             let retry_after = response
@@ -3868,6 +4538,7 @@ impl LlmClient {
         let mut content = String::new();
         let mut reasoning: Option<String> = None;
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
+        let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
         let mut first_token = true;
         let provider_display = if request_config
             .provider_label
@@ -3880,6 +4551,12 @@ impl LlmClient {
         let inter_chunk_timeout_secs = llm_stream_inter_chunk_timeout_secs();
         let first_token_timeout_secs = llm_stream_first_token_timeout_secs();
         let total_timeout_secs = llm_stream_total_timeout_secs();
+        let app_deploy_tool_call_required = request.tools.len() == 1
+            && request
+                .tools
+                .first()
+                .is_some_and(|tool| tool.function.name == "app_deploy");
+        let app_deploy_tool_start_timeout_secs = llm_app_deploy_tool_start_timeout_secs();
         let mut last_meaningful_progress_at = std::time::Instant::now();
 
         // Spawn heartbeat: emit Thinking events every 5s while waiting for first token
@@ -4029,9 +4706,24 @@ impl LlmClient {
                 }
 
                 for choice in parsed.choices {
-                    if let Some(rc) = choice.delta.reasoning_content {
-                        let r = reasoning.get_or_insert_with(String::new);
-                        r.push_str(&rc);
+                    let reasoning_delta = choice.delta.reasoning_content.or_else(|| {
+                        choice
+                            .delta
+                            .reasoning
+                            .as_ref()
+                            .and_then(extract_openai_reasoning_delta)
+                    });
+                    if let Some(rc) = reasoning_delta {
+                        if first_token {
+                            tracing::info!(
+                                "LLM stream first reasoning delta after {}ms",
+                                send_start.elapsed().as_millis()
+                            );
+                            first_token = false;
+                            heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        reasoning.get_or_insert_with(String::new).push_str(&rc);
+                        queue_reasoning_delta(&token_tx, "model", rc);
                         chunk_had_meaningful_progress = true;
                     }
                     if let Some(content_delta) = choice.delta.content {
@@ -4046,7 +4738,8 @@ impl LlmClient {
                                 heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             content.push_str(&tok);
-                            queue_stream_event(&token_tx, StreamEvent::Token(tok));
+                            emit_stream_block_events(&token_tx, stream_block_parser.feed(&tok))
+                                .await;
                             chunk_had_meaningful_progress = true;
                         }
                     }
@@ -4136,36 +4829,11 @@ impl LlmClient {
                             if let Some((
                                 tool_name,
                                 raw_args,
-                                progress_msg,
-                                elapsed_secs,
-                                arg_chars,
+                                _progress_msg,
+                                _elapsed_secs,
+                                _arg_chars,
                             )) = progress_update
                             {
-                                let stage = if tool_name == "app_deploy" {
-                                    "payload_build"
-                                } else {
-                                    "argument_build"
-                                };
-                                emit_stream_tool_progress(
-                                    &token_tx,
-                                    &tool_name,
-                                    progress_msg.clone(),
-                                    serde_json::json!({
-                                        "kind": "argument_stream",
-                                        "stage": stage,
-                                        "chars": arg_chars,
-                                        "elapsed_secs": elapsed_secs,
-                                        "stream_key": format!("argument-stream:{}", tool_name),
-                                    }),
-                                )
-                                .await;
-                                emit_argument_phase_status(
-                                    &token_tx,
-                                    &tool_name,
-                                    progress_msg,
-                                    elapsed_secs,
-                                )
-                                .await;
                                 if let Some(entry) = tool_builders.get_mut(&tc.index) {
                                     emit_partial_draft_file_previews(
                                         &token_tx,
@@ -4198,6 +4866,24 @@ impl LlmClient {
             buffer = last.to_string();
             if chunk_had_meaningful_progress {
                 last_meaningful_progress_at = chunk_received_at;
+            }
+            if app_deploy_tool_call_required
+                && !tool_builders.values().any(|tb| !tb.name.trim().is_empty())
+                && send_start.elapsed().as_secs() >= app_deploy_tool_start_timeout_secs
+            {
+                let reason = format!(
+                    "{} stream for model {} did not begin the required app_deploy tool-call payload within {}s.",
+                    provider_display, model, app_deploy_tool_start_timeout_secs,
+                );
+                tracing::warn!("{}", reason);
+                stream_failure = Some(LlmStreamFailure::new(
+                    LlmStreamFailureKind::NoUsefulProgress,
+                    provider_display.clone(),
+                    model,
+                    reason,
+                ));
+                stream_broken = true;
+                break;
             }
             if done {
                 break;
@@ -4253,10 +4939,39 @@ impl LlmClient {
         // Ensure heartbeat is stopped after stream loop exits
         heartbeat_done.store(true, std::sync::atomic::Ordering::Relaxed);
         heartbeat_handle.abort();
+        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+        if reasoning.is_some() {
+            queue_stream_event(
+                &token_tx,
+                StreamEvent::ReasoningDelta {
+                    phase: "model".to_string(),
+                    content_delta: String::new(),
+                    done: true,
+                },
+            );
+        }
 
         let has_content = !content.trim().is_empty();
         let has_tools =
             !tool_builders.is_empty() && tool_builders.values().any(|tb| !tb.name.is_empty());
+
+        if app_deploy_tool_call_required && !has_tools {
+            return Err(stream_failure
+                .unwrap_or_else(|| {
+                    LlmStreamFailure::new(
+                        LlmStreamFailureKind::NoUsableContent,
+                        provider_display.clone(),
+                        model,
+                        format!(
+                            "{} stream for model {} ended without the required app_deploy tool call after {}ms.",
+                            provider_display,
+                            model,
+                            send_start.elapsed().as_millis()
+                        ),
+                    )
+                })
+                .into());
+        }
 
         if !done && !stream_broken && !has_content && !has_tools {
             return Err(LlmStreamFailure::new(
@@ -4306,6 +5021,21 @@ impl LlmClient {
             tool_builders.len(),
             done && !stream_broken,
         );
+
+        for entry in tool_builders.values_mut() {
+            if entry.name.trim().is_empty() || entry.args.trim().is_empty() {
+                continue;
+            }
+            let tool_name = entry.name.clone();
+            let raw_args = entry.args.clone();
+            emit_partial_draft_file_previews(
+                &token_tx,
+                &tool_name,
+                &raw_args,
+                &mut entry.emitted_draft_snapshots,
+            )
+            .await;
+        }
 
         let mut tool_calls: Vec<(usize, ToolCall)> = tool_builders
             .into_iter()
@@ -4372,11 +5102,22 @@ impl LlmClient {
             model: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             max_tokens: Option<u32>,
-            system: String,
+            system: Vec<AnthropicTextBlock>,
             messages: Vec<AnthropicMessage>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             tools: Vec<AnthropicTool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<AnthropicToolChoice>,
             stream: bool,
+        }
+
+        #[derive(Serialize)]
+        struct AnthropicTextBlock {
+            #[serde(rename = "type")]
+            block_type: &'static str,
+            text: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<AnthropicCacheControl>,
         }
 
         #[derive(Serialize)]
@@ -4390,6 +5131,15 @@ impl LlmClient {
             name: String,
             description: String,
             input_schema: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_control: Option<AnthropicCacheControl>,
+        }
+
+        #[derive(Serialize)]
+        struct AnthropicToolChoice {
+            #[serde(rename = "type")]
+            choice_type: String,
+            name: String,
         }
 
         #[derive(Deserialize)]
@@ -4462,14 +5212,18 @@ impl LlmClient {
             emitted_draft_snapshots: HashMap<String, (String, bool)>,
         }
 
-        let tools: Vec<AnthropicTool> = actions
+        let mut tools: Vec<AnthropicTool> = actions
             .iter()
             .map(|s| AnthropicTool {
                 name: s.name.clone(),
                 description: s.description.clone(),
                 input_schema: s.input_schema.clone(),
+                cache_control: None,
             })
             .collect();
+        if let Some(last_tool) = tools.last_mut() {
+            last_tool.cache_control = Some(anthropic_cache_control());
+        }
 
         // Build messages array with history (exclude the last user message as we add it separately)
         let mut messages: Vec<AnthropicMessage> = history
@@ -4490,9 +5244,17 @@ impl LlmClient {
         let request = AnthropicRequest {
             model: model.to_string(),
             max_tokens: None,
-            system: system_prompt.to_string(),
+            system: vec![AnthropicTextBlock {
+                block_type: "text",
+                text: system_prompt.to_string(),
+                cache_control: Some(anthropic_cache_control()),
+            }],
             messages,
             tools,
+            tool_choice: forced_native_tool_name(actions).map(|name| AnthropicToolChoice {
+                choice_type: "tool".to_string(),
+                name: name.to_string(),
+            }),
             stream: true,
         };
 
@@ -4514,6 +5276,7 @@ impl LlmClient {
 
         let mut content = String::new();
         let mut tool_builders: HashMap<usize, ToolBuilder> = HashMap::new();
+        let mut stream_block_parser = stream_blocks::StreamBlockParser::new();
         let stream_started = std::time::Instant::now();
 
         let mut buffer = String::new();
@@ -4565,7 +5328,11 @@ impl LlmClient {
                                     if let Some(text) = text {
                                         if !text.is_empty() {
                                             content.push_str(&text);
-                                            queue_stream_event(&token_tx, StreamEvent::Token(text));
+                                            emit_stream_block_events(
+                                                &token_tx,
+                                                stream_block_parser.feed(&text),
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -4584,7 +5351,11 @@ impl LlmClient {
                                 if let Some(text) = parsed.delta.text {
                                     if !text.is_empty() {
                                         content.push_str(&text);
-                                        queue_stream_event(&token_tx, StreamEvent::Token(text));
+                                        emit_stream_block_events(
+                                            &token_tx,
+                                            stream_block_parser.feed(&text),
+                                        )
+                                        .await;
                                     }
                                 }
                             } else if parsed.delta.delta_type == "input_json_delta" {
@@ -4638,36 +5409,11 @@ impl LlmClient {
                                     if let Some((
                                         tool_name,
                                         raw_input_json,
-                                        progress_msg,
-                                        elapsed_secs,
-                                        arg_chars,
+                                        _progress_msg,
+                                        _elapsed_secs,
+                                        _arg_chars,
                                     )) = progress_update
                                     {
-                                        let stage = if tool_name == "app_deploy" {
-                                            "payload_build"
-                                        } else {
-                                            "argument_build"
-                                        };
-                                        emit_stream_tool_progress(
-                                            &token_tx,
-                                            &tool_name,
-                                            progress_msg.clone(),
-                                            serde_json::json!({
-                                                "kind": "argument_stream",
-                                                "stage": stage,
-                                                "chars": arg_chars,
-                                                "elapsed_secs": elapsed_secs,
-                                                "stream_key": format!("argument-stream:{}", tool_name),
-                                            }),
-                                        )
-                                        .await;
-                                        emit_argument_phase_status(
-                                            &token_tx,
-                                            &tool_name,
-                                            progress_msg,
-                                            elapsed_secs,
-                                        )
-                                        .await;
                                         if let Some(entry) = tool_builders.get_mut(&parsed.index) {
                                             emit_partial_draft_file_previews(
                                                 &token_tx,
@@ -4694,6 +5440,31 @@ impl LlmClient {
             if done {
                 break;
             }
+        }
+        emit_stream_block_events(&token_tx, stream_block_parser.finish()).await;
+
+        for entry in tool_builders.values_mut() {
+            if entry.name.trim().is_empty() {
+                continue;
+            }
+            let raw_args = if !entry.input_json.trim().is_empty() {
+                entry.input_json.clone()
+            } else if let Some(value) = entry.input_value.as_ref() {
+                value.to_string()
+            } else {
+                String::new()
+            };
+            if raw_args.trim().is_empty() {
+                continue;
+            }
+            let tool_name = entry.name.clone();
+            emit_partial_draft_file_previews(
+                &token_tx,
+                &tool_name,
+                &raw_args,
+                &mut entry.emitted_draft_snapshots,
+            )
+            .await;
         }
 
         let tool_calls = tool_builders

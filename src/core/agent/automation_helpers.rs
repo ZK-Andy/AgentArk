@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) const AUTOMATION_IN_APP_NOTIFICATION_CHANNEL: &str = "in_app";
+
 pub(super) fn normalize_watcher_notification_text(text: &str, watcher_description: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -186,8 +188,7 @@ pub(super) fn watcher_notification_text_is_useful(text: &str) -> bool {
         }
         sampled += 1;
 
-        let starts_indented =
-            raw_line.starts_with(' ') || raw_line.starts_with('\t');
+        let starts_indented = raw_line.starts_with(' ') || raw_line.starts_with('\t');
         // Common source-file extension markers occurring with a colon-line
         // tail (file.ext:NN) — a structural feature of nearly every stack
         // trace format we're likely to receive.
@@ -302,7 +303,7 @@ pub(super) fn normalize_automation_notification_channel(value: Option<&str>) -> 
                 "app" | "app_notification" | "app_notifications" | "in_app"
             ) =>
         {
-            String::new()
+            AUTOMATION_IN_APP_NOTIFICATION_CHANNEL.to_string()
         }
         Some(channel) if matches!(channel.as_str(), "auto" | "default") => "preferred".to_string(),
         Some(channel) => channel,
@@ -312,7 +313,7 @@ pub(super) fn normalize_automation_notification_channel(value: Option<&str>) -> 
 
 pub(super) fn watcher_delivery_label(notify_channel: &str) -> String {
     let normalized = notify_channel.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
+    if normalized.is_empty() || normalized == AUTOMATION_IN_APP_NOTIFICATION_CHANNEL {
         "In-app notification only".to_string()
     } else if normalized == "preferred" {
         "Preferred notification channel when connected, otherwise in-app".to_string()
@@ -623,8 +624,7 @@ mod tests {
 
     #[test]
     fn accepts_human_readable_summary() {
-        let text =
-            "Watcher matched: the daily import has finished and produced 42 new rows in the staging table.";
+        let text = "Watcher matched: the daily import has finished and produced 42 new rows in the staging table.";
         assert!(watcher_notification_text_is_useful(text));
     }
 
@@ -647,8 +647,32 @@ mod tests {
         // "traceback". The new structural filter only rejects content that
         // *is shaped like* a traceback — a one-line summary with the word in
         // it is fine.
-        let text =
-            "The watcher captured a runtime error in the import job; full traceback is stored under run-2025-04-26-01.";
+        let text = "The watcher captured a runtime error in the import job; full traceback is stored under run-2025-04-26-01.";
         assert!(watcher_notification_text_is_useful(text));
+    }
+
+    #[test]
+    fn in_app_delivery_is_preserved_as_explicit_channel() {
+        let normalized = normalize_automation_notification_channel(Some("in_app"));
+        assert_eq!(normalized, AUTOMATION_IN_APP_NOTIFICATION_CHANNEL);
+        assert_eq!(
+            watcher_delivery_label(&normalized),
+            "In-app notification only"
+        );
+    }
+
+    #[test]
+    fn omitted_automation_delivery_defaults_to_dynamic_preferred() {
+        let normalized = normalize_automation_notification_channel(None);
+        assert_eq!(normalized, "preferred");
+        assert_eq!(
+            watcher_delivery_label(&normalized),
+            "Preferred notification channel when connected, otherwise in-app"
+        );
+    }
+
+    #[test]
+    fn missing_delivery_still_displays_as_in_app_only() {
+        assert_eq!(watcher_delivery_label(""), "In-app notification only");
     }
 }

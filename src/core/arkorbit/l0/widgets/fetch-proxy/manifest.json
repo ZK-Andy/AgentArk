@@ -1,0 +1,5 @@
+{
+  "name": "fetch-proxy",
+  "description": "Placeholder module for future orbit-scoped fetch proxy calls.",
+  "entry": "index.js"
+}

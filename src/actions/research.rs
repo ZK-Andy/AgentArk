@@ -172,6 +172,13 @@ pub struct ResearchProgressReporter {
 }
 
 impl ResearchProgressReporter {
+    pub fn new(tx: UnboundedSender<ResearchProgressUpdate>) -> Self {
+        Self {
+            tx,
+            started_at: Instant::now(),
+        }
+    }
+
     pub fn emit(
         &self,
         phase: &str,
@@ -392,7 +399,7 @@ impl ResearchClient {
                 }
             })
             .collect::<Vec<_>>();
-        !years.is_empty() && years.iter().all(|year| *year <= current_year - 2)
+        !years.is_empty() && years.iter().all(|year| *year < current_year)
     }
 
     fn build_source(&self, result: &SearchResult) -> Source {
@@ -448,6 +455,7 @@ impl ResearchClient {
                 &args.query,
                 max_sources,
                 &args.backend,
+                None,
                 progress,
                 "phase-status:research:searching",
             )
@@ -556,6 +564,7 @@ impl ResearchClient {
                 &args.query,
                 max_sources,
                 &args.backend,
+                None,
                 progress,
                 "phase-status:research:searching",
             )
@@ -963,6 +972,7 @@ impl ResearchClient {
         query: &str,
         num_results: usize,
         backend_preference: &Option<String>,
+        time_scope: Option<super::search::SearchTimeScope>,
         progress: Option<&ResearchProgressReporter>,
         stream_key: &str,
     ) -> Result<Vec<SearchResult>> {
@@ -988,6 +998,7 @@ impl ResearchClient {
             num_results,
             backend_preference.as_deref(),
             &self.search_config,
+            time_scope,
         )
         .await;
         match response {
@@ -1061,11 +1072,19 @@ impl ResearchClient {
                     stream_key,
                 );
             }
+            let time_scope = if self.query_targets_historical_period(query) {
+                Some(super::search::SearchTimeScope::Historical)
+            } else if search_query.category == ResearchQueryCategory::Recent {
+                Some(super::search::SearchTimeScope::Recent)
+            } else {
+                None
+            };
             match self
                 .search(
                     &search_query.text,
                     results_per_query,
                     backend_preference,
+                    time_scope,
                     progress,
                     stream_key,
                 )
@@ -2162,6 +2181,11 @@ impl ResearchClient {
         query: &str,
         prefer_primary_sources: bool,
     ) -> Vec<ResearchQuery> {
+        let temporal_coverage = if self.query_targets_historical_period(query) {
+            "period coverage"
+        } else {
+            "recent coverage"
+        };
         let mut queries = vec![
             ResearchQuery {
                 category: ResearchQueryCategory::General,
@@ -2173,7 +2197,7 @@ impl ResearchClient {
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Recent,
-                text: format!("{} recent coverage", query),
+                text: format!("{} {}", query, temporal_coverage),
             },
             ResearchQuery {
                 category: ResearchQueryCategory::Comparison,
@@ -2364,6 +2388,7 @@ pub async fn execute_research_with_progress(
     // Format output
     let mut output = format!("# Research: {}\n\n", result.query);
     output.push_str(&format!("{}\n\n", result.summary));
+    output.push_str(&research_inline_chart_blocks(args, &result));
 
     let primary_findings = if result.key_findings.is_empty() {
         &result.findings
@@ -2438,6 +2463,70 @@ pub async fn execute_research_with_progress(
     }
 
     Ok(output)
+}
+
+fn research_inline_chart_blocks(args: &ResearchArgs, result: &ResearchResult) -> String {
+    if matches!(args.depth, ResearchDepth::Quick) {
+        return String::new();
+    }
+
+    let primary_finding_count = if result.key_findings.is_empty() {
+        result.findings.len()
+    } else {
+        result.key_findings.len()
+    };
+    if result.sources.len() < 2 && primary_finding_count < 2 {
+        return String::new();
+    }
+
+    let mut blocks = Vec::new();
+    if result.sources.len() >= 2 {
+        let data = result
+            .sources
+            .iter()
+            .take(16)
+            .enumerate()
+            .map(|(idx, source)| {
+                serde_json::json!({
+                    "source": format!("{} {}", idx + 1, source_host_label(&source.url)),
+                    "reliability": (source.reliability * 100.0).round(),
+                })
+            })
+            .collect::<Vec<_>>();
+        blocks.push(crate::core::inline_artifacts::inline_chart_block(
+            &serde_json::json!({
+                "title": "Research Source Reliability",
+                "type": "bar",
+                "x": "source",
+                "series": [{"key": "reliability", "name": "Reliability %"}],
+                "data": data,
+                "height": 300,
+            }),
+        ));
+    }
+
+    let evidence_data = serde_json::json!([
+        {"category": "Sources", "count": result.sources.len()},
+        {"category": "Key findings", "count": primary_finding_count},
+        {"category": "Open questions", "count": result.open_questions.len()},
+        {"category": "Contradictions", "count": result.contradictions.len()},
+    ]);
+    blocks.push(crate::core::inline_artifacts::inline_chart_block(
+        &serde_json::json!({
+            "title": "Research Evidence Mix",
+            "type": "doughnut",
+            "x": "category",
+            "series": [{"key": "count", "name": "Count"}],
+            "data": evidence_data,
+            "height": 280,
+        }),
+    ));
+
+    if blocks.is_empty() {
+        String::new()
+    } else {
+        format!("## Visual Summary\n\n{}\n\n", blocks.join("\n\n"))
+    }
 }
 
 fn format_finding_citations(finding: &Finding) -> String {
@@ -2527,6 +2616,38 @@ mod tests {
         assert_eq!(
             client.effective_freshness_window_days(&args, &args.query),
             Some(365)
+        );
+    }
+
+    #[test]
+    fn deep_research_preserves_explicit_historical_periods() {
+        let client = test_client();
+        let args = ResearchArgs {
+            query: "coronavirus events from March 2020".to_string(),
+            max_sources: default_max_sources(),
+            _include_sources: true,
+            backend: None,
+            depth: ResearchDepth::Deep,
+            min_primary_sources: 0,
+            freshness_window_days: None,
+            followup_rounds: 0,
+        };
+        let queries = client.generate_research_queries(&args.query, true);
+
+        assert!(client.query_targets_historical_period(&args.query));
+        assert_eq!(
+            client.effective_freshness_window_days(&args, &args.query),
+            None
+        );
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.text.contains("period coverage"))
+        );
+        assert!(
+            !queries
+                .iter()
+                .any(|query| query.text.contains("recent coverage"))
         );
     }
 

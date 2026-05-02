@@ -1075,10 +1075,36 @@ async fn app_deploy(
         );
     }
     let mut arguments = serde_json::Map::new();
+    if let Some(value) = request
+        .app_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("app_id".to_string(), json!(value));
+    }
+    if let Some(value) = request
+        .mode
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        arguments.insert("mode".to_string(), json!(value));
+    }
     if !request.files.is_empty() {
         arguments.insert(
             "files".to_string(),
             serde_json::to_value(&request.files).unwrap_or_default(),
+        );
+    }
+    if !request.file_patches.is_empty() {
+        arguments.insert(
+            "file_patches".to_string(),
+            serde_json::to_value(&request.file_patches).unwrap_or_default(),
+        );
+    }
+    if !request.delete_paths.is_empty() {
+        arguments.insert(
+            "delete_paths".to_string(),
+            serde_json::to_value(&request.delete_paths).unwrap_or_default(),
         );
     }
     if let Some(value) = request
@@ -1411,44 +1437,76 @@ async fn app_delete(
         );
     }
 
-    let Some(dir) = app_dir(&state, &app_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(AppActionResponse {
-                status: "error".to_string(),
-                message: "App not found".to_string(),
-                raw: json!({ "app_id": app_id }),
-            }),
-        );
-    };
+    tracing::info!("executor app_delete: starting cleanup for '{}'", app_id);
 
+    // Resolve workspace dir but treat absence as "already gone" (idempotent).
+    let dir = app_dir(&state, &app_id)
+        .await
+        .unwrap_or_else(|| state.config.data_dir.join("apps").join(&app_id));
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Step 1: stop the runtime process/container before removing files so
+    // filesystem mounts release the workspace.
+    tracing::info!("executor app_delete: stopping runtime for '{}'", app_id);
     if let Err(error) = state.registry.stop_runtime(&app_id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AppActionResponse {
-                status: "error".to_string(),
-                message: format!("Failed to stop app before delete: {}", error),
-                raw: json!({ "app_id": app_id }),
-            }),
+        tracing::warn!(
+            "executor app_delete: stop_runtime failed for '{}': {}",
+            app_id,
+            error
         );
+        warnings.push(format!("stop_runtime: {}", error));
     }
-    if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AppActionResponse {
-                status: "error".to_string(),
-                message: format!("Failed to delete app files: {}", error),
-                raw: json!({ "app_id": app_id }),
-            }),
+
+    // Step 2: belt-and-suspenders container removal - covers cases where the
+    // registry never recorded a container_id but a stale container exists.
+    let container_name = crate::actions::app::app_container_name(&app_id);
+    tracing::info!(
+        "executor app_delete: ensuring container '{}' removed for '{}'",
+        container_name,
+        app_id
+    );
+    crate::actions::app::cleanup_existing_container(&container_name).await;
+
+    // Step 3: remove the workspace directory (source, node_modules,
+    // .agentark/venv, captured stdout/stderr logs, dockerfiles, etc.).
+    tracing::info!("executor app_delete: removing workspace {}", dir.display());
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                "executor app_delete: failed to remove workspace {} for '{}': {}",
+                dir.display(),
+                app_id,
+                error
+            );
+            warnings.push(format!("remove_workspace: {}", error));
+        }
+    }
+
+    // Step 4: drop the registry entry (frees reserved port via stop()).
+    if let Err(error) = state.registry.stop(&app_id).await {
+        tracing::warn!(
+            "executor app_delete: registry.stop failed for '{}': {}",
+            app_id,
+            error
         );
+        warnings.push(format!("registry_stop: {}", error));
     }
-    let _ = state.registry.stop(&app_id).await;
+
+    tracing::info!(
+        "executor app_delete: completed for '{}' (warnings={})",
+        app_id,
+        warnings.len()
+    );
+
     (
         StatusCode::OK,
         Json(AppActionResponse {
             status: "deleted".to_string(),
             message: format!("Deleted app {}", app_id),
-            raw: json!({ "app_id": app_id }),
+            raw: json!({ "app_id": app_id, "warnings": warnings }),
         }),
     )
 }
@@ -1754,11 +1812,13 @@ async fn proxy_app_request(
     };
     state.registry.touch(&app_id).await;
 
-    let mut target_url = if path.trim_start_matches('/').is_empty() {
-        format!("http://127.0.0.1:{}/", port)
-    } else {
-        format!("http://127.0.0.1:{}/{}", port, path.trim_start_matches('/'))
+    let proxy_path_mode = match app_dir(&state, &app_id).await {
+        Some(dir) => crate::actions::app::proxy_path_mode_for_app_dir(&dir, &app_id).await,
+        None => crate::actions::app::AppProxyPathMode::StripAppPrefix,
     };
+    let target_path =
+        crate::actions::app::dynamic_app_upstream_path(&app_id, &path, proxy_path_mode);
+    let mut target_url = format!("http://127.0.0.1:{}{}", port, target_path);
     if let Some(query) = uri.query().filter(|q| !q.is_empty()) {
         target_url.push('?');
         target_url.push_str(query);

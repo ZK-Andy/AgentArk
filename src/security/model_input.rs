@@ -56,8 +56,8 @@ pub enum ModelInputPrivacyMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CurrentChatPiiPolicy {
-    #[default]
     RawCurrentTurn,
+    #[default]
     MaskChatPii,
     BlockSensitiveChat,
 }
@@ -80,7 +80,7 @@ impl Default for ModelPrivacyConfig {
     fn default() -> Self {
         Self {
             default_model_input_mode: ModelInputPrivacyMode::DefaultRedact,
-            current_chat_pii_policy: CurrentChatPiiPolicy::RawCurrentTurn,
+            current_chat_pii_policy: CurrentChatPiiPolicy::MaskChatPii,
             request_scoped_sensitive_approval_enabled: true,
         }
     }
@@ -641,13 +641,32 @@ mod tests {
     }
 
     #[test]
-    fn raw_current_turn_keeps_pii_but_still_redacts_secrets() {
+    fn default_current_turn_masks_pii_and_redacts_secrets() {
         let result = sanitize_model_input_text(
             &format!(
                 "My email is jane@example.com and key is {}",
                 fake_openai_key()
             ),
             &ModelPrivacyConfig::default(),
+            ModelInputContext::CurrentUserMessage,
+            false,
+        );
+        assert_eq!(result.decision, ModelInputPrivacyDecision::RedactedAllow);
+        assert!(result.sanitized_text.contains("[EMAIL]"));
+        assert!(result.sanitized_text.contains("[REDACTED_API_KEY]"));
+    }
+
+    #[test]
+    fn explicit_raw_current_turn_keeps_pii_but_still_redacts_secrets() {
+        let result = sanitize_model_input_text(
+            &format!(
+                "My email is jane@example.com and key is {}",
+                fake_openai_key()
+            ),
+            &ModelPrivacyConfig {
+                current_chat_pii_policy: CurrentChatPiiPolicy::RawCurrentTurn,
+                ..ModelPrivacyConfig::default()
+            },
             ModelInputContext::CurrentUserMessage,
             false,
         );

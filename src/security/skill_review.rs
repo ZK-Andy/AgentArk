@@ -17,6 +17,7 @@ use crate::security::capabilities::{
 };
 
 const MAX_SKILL_REVIEW_CHARS: usize = 32_000;
+const SKILL_REVIEW_CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 1_600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillCapability {
@@ -520,7 +521,11 @@ pub async fn review_skill_import_with_configured_model(
 
     let classification_result = async {
         let response = llm
-            .chat(&system_prompt, &user_message, &[], &[])
+            .chat_classifier_bounded(
+                &system_prompt,
+                &user_message,
+                SKILL_REVIEW_CLASSIFIER_MAX_OUTPUT_TOKENS,
+            )
             .await
             .context("configured model request failed")?;
         let value = extract_json_object(&response.content)

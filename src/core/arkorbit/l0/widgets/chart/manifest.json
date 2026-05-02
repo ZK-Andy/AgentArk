@@ -1,0 +1,5 @@
+{
+  "name": "chart",
+  "description": "Tiny SVG chart primitive for orbit modules.",
+  "entry": "index.js"
+}
