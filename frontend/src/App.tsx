@@ -60,6 +60,7 @@ import {
   formatUiRelativeDateTimeMeta,
   setUiTimeZoneOverride,
 } from "./lib/dateFormat";
+import { recordRuntimeMetricSample } from "./lib/runtimeMetricHistory";
 import { AmberCascadesBackground } from "./components/AmberCascadesBackground";
 import {
   NativeWorkspace,
@@ -226,11 +227,14 @@ function settingsSearchForTab(tab?: number | null): string {
     case 6:
       tabName = "observability";
       break;
+    case 8:
+      tabName = "mcp";
+      break;
     case 14:
       tabName = "data-lifecycle";
       break;
     case 16:
-      tabName = "sender-verification";
+      tabName = "security";
       break;
     case 20:
       tabName = "integrations";
@@ -631,28 +635,6 @@ function resolveBrowserHandoffPath(pathname: string): string | null {
   return null;
 }
 
-function formatMetaValue(value: unknown): { text: string; href?: string } {
-  if (value == null) return { text: "-" };
-  if (typeof value === "string") {
-    const v = value.trim();
-    if (v.startsWith("http://") || v.startsWith("https://"))
-      return { text: v, href: v };
-    return { text: v };
-  }
-  if (typeof value === "number")
-    return { text: Number.isFinite(value) ? String(value) : "-" };
-  if (typeof value === "boolean") return { text: value ? "true" : "false" };
-  if (Array.isArray(value)) return { text: `List (${value.length})` };
-  if (typeof value === "object") {
-    const rec = value as Record<string, unknown>;
-    const keys = Object.keys(rec || {});
-    const keyHint = keys.slice(0, 4).join(", ");
-    const more = keys.length > 4 ? `, +${keys.length - 4}` : "";
-    return { text: keys.length ? `Object(${keyHint}${more})` : "Object" };
-  }
-  return { text: String(value) };
-}
-
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object"
     ? (value as Record<string, unknown>)
@@ -794,6 +776,71 @@ function notificationDisplaySummary(notification: {
     );
   }
   return notification.body || notification.source || "Open to view details.";
+}
+
+type NotificationActionTarget = {
+  view: ViewKey;
+  label: string;
+  settingsTab?: number | null;
+};
+
+function viewFromStructuredValue(value: unknown): ViewKey | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (!normalized) return null;
+  if (VIEW_KEYS.has(normalized as ViewKey)) return normalized as ViewKey;
+  const directAlias = VIEW_ALIASES[normalized];
+  if (directAlias) return directAlias;
+  const compact = normalized.replace(/-/g, "");
+  if (VIEW_KEYS.has(compact as ViewKey)) return compact as ViewKey;
+  return VIEW_ALIASES[compact] || null;
+}
+
+function notificationMetadataRecord(notification: {
+  metadata?: Record<string, unknown> | null;
+}): Record<string, unknown> {
+  return notification.metadata && typeof notification.metadata === "object"
+    ? notification.metadata
+    : {};
+}
+
+function viewLabel(view: ViewKey): string {
+  for (const group of NAV_GROUPS) {
+    for (const item of group.items) {
+      if (item.key === view) return item.label;
+    }
+  }
+  if (view === "overview") return "Mission Control";
+  return view;
+}
+
+function notificationActionTarget(notification: {
+  title?: string;
+  body?: string;
+  source?: string;
+  level?: string;
+  kind?: string;
+  metadata?: Record<string, unknown> | null;
+}): NotificationActionTarget {
+  const metadata = notificationMetadataRecord(notification);
+  const action =
+    metadata.action && typeof metadata.action === "object"
+      ? (metadata.action as Record<string, unknown>)
+      : {};
+  const candidates = [
+    metadata.target_view,
+    metadata.targetView,
+    metadata.route,
+    action.target_view,
+    action.targetView,
+    action.view,
+    notification.source,
+  ];
+  for (const candidate of candidates) {
+    const view = viewFromStructuredValue(candidate);
+    if (view) return { view, label: `Open ${viewLabel(view)}` };
+  }
+  return { view: "overview", label: "Open Mission Control" };
 }
 
 function isRoutineSecurityGuardNotification(notification: {
@@ -962,23 +1009,25 @@ export default function App() {
   );
 
   useEffect(() => {
+    const cancelSettingsWarmup = scheduleWarmup(() => {
+      // Settings has a large editor surface. Warm it shortly after first paint
+      // so opening the dialog or jumping to a tab does not pay the full
+      // download/parse cost on the click path.
+      preloadAppView("settings", { settingsTab: 1 });
+    }, 120);
     const cancelCoreWarmup = scheduleWarmup(() => {
       preloadAppView("chat");
       preloadAppView("sentinel");
       preloadAppView("swarm");
       preloadAppView("sessions");
       preloadAppView("trace");
-      // Warm Settings + the Models tab early so the user's first click on
-      // either the Settings gear or a Models-tab shortcut lands instantly.
-      // preloadAppView("settings") also fires prefetchSettingsTabData; model
-      // rows come from the cached /settings payload.
-      preloadAppView("settings", { settingsTab: 1 });
       void loadApprovalPromptOverlayModule();
     }, 900);
     const cancelGuidedTourWarmup = scheduleWarmup(() => {
       void loadGuidedTourModule();
     }, 1800);
     return () => {
+      cancelSettingsWarmup();
       cancelCoreWarmup();
       cancelGuidedTourWarmup();
     };
@@ -1047,9 +1096,12 @@ export default function App() {
       const status = await api.getStatus();
       const t1 =
         typeof performance !== "undefined" ? performance.now() : Date.now();
+      const rttMs = Math.max(0, Math.round(t1 - t0));
+      const at = Date.now();
+      recordRuntimeMetricSample({ at, latencyMs: rttMs, status });
       return {
-        at: Date.now(),
-        rtt_ms: Math.max(0, Math.round(t1 - t0)),
+        at,
+        rtt_ms: rttMs,
         status,
       };
     },
@@ -1240,14 +1292,6 @@ export default function App() {
     };
   }, [queryClient]);
 
-  let selectedNotification: (typeof visibleNotifications)[number] | null = null;
-  for (const n of visibleNotifications) {
-    if (n.id === selectedNotificationId) {
-      selectedNotification = n;
-      break;
-    }
-  }
-
   const now = Date.now();
   const lastPingAt = serverQ.data?.at ?? 0;
   const pingAge = lastPingAt ? now - lastPingAt : Number.POSITIVE_INFINITY;
@@ -1390,6 +1434,35 @@ export default function App() {
       );
     },
     [navigateToView, preloadAppView],
+  );
+
+  const handleNotificationPrimaryAction = useCallback(
+    (notification: {
+      id: string;
+      read?: boolean;
+      title?: string;
+      body?: string;
+      source?: string;
+      level?: string;
+      metadata?: Record<string, unknown> | null;
+    }) => {
+      const target = notificationActionTarget(notification);
+      if (!notification.read) {
+        markReadMutation.mutate(notification.id);
+      }
+      setNotifAnchorEl(null);
+      closeNotification();
+      if (target.view === "settings") {
+        openSettingsView("settings", target.settingsTab ?? null);
+        return;
+      }
+      if (target.view === "arkpulse") {
+        openSettingsView("arkpulse");
+        return;
+      }
+      navigateToView(target.view);
+    },
+    [closeNotification, markReadMutation, navigateToView, openSettingsView],
   );
 
   const openGuidedTourStep = useCallback(
@@ -1792,21 +1865,30 @@ export default function App() {
       <Popover
         open={notifListOpen}
         anchorEl={notifAnchorEl}
-        onClose={() => setNotifAnchorEl(null)}
+        onClose={() => {
+          setNotifAnchorEl(null);
+          closeNotification();
+        }}
         anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
         transformOrigin={{ vertical: "top", horizontal: "right" }}
         slotProps={{
           paper: {
+            className: "notification-popover-paper",
             sx: {
-              width: 420,
+              width: 460,
               maxWidth: "calc(100vw - 24px)",
-              borderRadius: 2.5,
+              maxHeight: "min(640px, calc(100vh - 88px))",
+              display: "flex",
+              flexDirection: "column",
+              borderRadius: 2,
               overflow: "hidden",
-              border: "1px solid var(--ui-rgba-255-255-255-080)",
-              background: "var(--ui-rgba-22-22-26-940)",
-              boxShadow: "0 16px 48px var(--ui-rgba-0-0-0-500)",
-              backdropFilter: "blur(24px)",
-              WebkitBackdropFilter: "blur(24px)",
+              border: "1px solid #2a3038",
+              background: "#111317 !important",
+              backgroundImage: "none !important",
+              boxShadow: "0 18px 54px var(--ui-rgba-0-0-0-500)",
+              backdropFilter: "none !important",
+              WebkitBackdropFilter: "none !important",
+              color: "#f3f6f8",
             },
           },
         }}
@@ -1816,7 +1898,8 @@ export default function App() {
             px: 1.5,
             pt: 1.25,
             pb: 1,
-            borderBottom: "1px solid var(--ui-rgba-255-255-255-080)",
+            background: "#111317",
+            borderBottom: "1px solid #2a3038",
           }}
         >
           <Stack
@@ -1830,7 +1913,7 @@ export default function App() {
               variant="subtitle1"
               sx={{
                 fontWeight: 600,
-                color: "var(--ui-rgba-244-245-247-940)",
+                color: "#f3f6f8",
               }}
             >
               Notifications
@@ -1844,10 +1927,10 @@ export default function App() {
               sx={{
                 textTransform: "none",
                 fontSize: "0.75rem",
-                color: "var(--ui-rgba-171-176-184-700)",
+                color: "#c8d0d8",
                 "&:hover": {
-                  color: "var(--ui-rgba-239-241-244-880)",
-                  background: "var(--ui-rgba-255-255-255-050)",
+                  color: "#f3f6f8",
+                  background: "#222831",
                 },
               }}
             >
@@ -1881,14 +1964,14 @@ export default function App() {
               }
               onClick={() => setNotifFilter("input_needed")}
             >
-              Input Needed
+              Input
             </Button>
             <Button
               size="small"
               variant={notifFilter === "errors" ? "contained" : "outlined"}
               onClick={() => setNotifFilter("errors")}
             >
-              Errors Only
+              Errors
             </Button>
             <Button
               size="small"
@@ -1897,11 +1980,19 @@ export default function App() {
               }
               onClick={() => setNotifFilter("automation_failures")}
             >
-              Automation Failures
+              Failures
             </Button>
           </Stack>
         </Box>
-        <Box sx={{ maxHeight: 520, overflow: "auto", p: 1.25 }}>
+        <Box
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "auto",
+            p: 1.25,
+            background: "#0f1115",
+          }}
+        >
           {notificationsQ.error ? (
             <Alert severity="error">Failed to load notifications</Alert>
           ) : null}
@@ -1930,6 +2021,8 @@ export default function App() {
                   isAutomationFailureNotification(n) && !inputNeeded;
                 const displayTitle = notificationDisplayTitle(n);
                 const displaySummary = notificationDisplaySummary(n);
+                const selected = selectedNotificationId === n.id;
+                const actionTarget = notificationActionTarget(n);
                 return (
                   <ListItemButton
                     key={n.id}
@@ -1939,24 +2032,29 @@ export default function App() {
                       overflow: "hidden",
                       borderRadius: 1.5,
                       px: 1.25,
-                      py: 0.85,
-                      border: "none",
-                      background: inputNeeded
-                        ? "var(--ui-rgba-255-193-7-060)"
-                        : "transparent",
+                      py: 1,
+                      border: selected
+                        ? "1px solid #3d4652"
+                        : "1px solid #232933",
+                      background: selected
+                        ? "#20252c"
+                        : inputNeeded
+                          ? "#211b10"
+                          : "#171a1f",
                       transition: "background 140ms ease",
                       "&:hover": {
-                        background: inputNeeded
-                          ? "var(--ui-rgba-255-193-7-100)"
-                          : "var(--ui-rgba-255-255-255-050)",
+                        background: selected
+                          ? "#252b34"
+                          : inputNeeded
+                            ? "#2a2112"
+                            : "#20242b",
                       },
                       "&:not(:last-child)": {
-                        borderBottom: "1px solid var(--ui-rgba-255-255-255-060)",
+                        borderBottom: "1px solid #232933",
                       },
                     }}
                     onClick={async () => {
                       openNotification(n.id);
-                      setNotifAnchorEl(null);
                       if (!n.read) {
                         markReadMutation.mutate(n.id);
                       }
@@ -2002,8 +2100,8 @@ export default function App() {
                               minWidth: 0,
                               flex: 1,
                               color: n.read
-                                ? "var(--ui-rgba-177-181-189-680)"
-                                : "var(--ui-rgba-244-245-247-940)",
+                                ? "#b5bdc8"
+                                : "#f3f6f8",
                             }}
                           >
                             {displayTitle}
@@ -2013,7 +2111,7 @@ export default function App() {
                             noWrap
                             sx={{
                               flexShrink: 0,
-                              color: "var(--ui-rgba-155-159-169-520)",
+                              color: "#9aa5b1",
                             }}
                             title={notifTimeAgo(n.created_at).tip}
                           >
@@ -2028,11 +2126,12 @@ export default function App() {
                             sx={{
                               display: "block",
                               color: n.read
-                                ? "var(--ui-rgba-155-159-169-600)"
-                                : "var(--ui-rgba-187-191-199-780)",
+                                ? "#9aa5b1"
+                                : "#d4d9df",
                               lineHeight: 1.45,
+                              whiteSpace: selected ? "pre-wrap" : "nowrap",
                             }}
-                            noWrap
+                            noWrap={!selected}
                             title={displaySummary}
                           >
                             {displaySummary}
@@ -2076,6 +2175,42 @@ export default function App() {
                               />
                             ) : null}
                           </Stack>
+                          {selected ? (
+                            <Stack
+                              direction="row"
+                              spacing={0.75}
+                              useFlexGap
+                              sx={{
+                                alignItems: "center",
+                                flexWrap: "wrap",
+                                pt: 0.35,
+                              }}
+                            >
+                              <Button
+                                size="small"
+                                variant="contained"
+                                endIcon={
+                                  <ChevronRightRoundedIcon fontSize="small" />
+                                }
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleNotificationPrimaryAction(n);
+                                }}
+                              >
+                                {actionTarget.label}
+                              </Button>
+                              <Button
+                                size="small"
+                                variant="text"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  closeNotification();
+                                }}
+                              >
+                                Collapse
+                              </Button>
+                            </Stack>
+                          ) : null}
                         </Stack>
                       }
                     />
@@ -2086,194 +2221,6 @@ export default function App() {
           )}
         </Box>
       </Popover>
-      <Drawer
-        anchor="right"
-        open={!!selectedNotification}
-        onClose={closeNotification}
-        slotProps={{
-          paper: {
-            sx: {
-              width: 520,
-              maxWidth: "calc(100vw - 24px)",
-              borderLeft: "1px solid var(--ui-rgba-255-255-255-080)",
-              background:
-                "linear-gradient(160deg, var(--ui-rgba-24-24-28-980), var(--ui-rgba-15-15-18-950))",
-            },
-          },
-        }}
-      >
-        <Box
-          sx={{
-            p: 2,
-            height: "100%",
-            display: "flex",
-            flexDirection: "column",
-            gap: 1.25,
-          }}
-        >
-          <Stack
-            direction="row"
-            spacing={1}
-            sx={{
-              alignItems: "center",
-              justifyContent: "space-between",
-            }}
-          >
-            <Stack
-              direction="row"
-              spacing={1}
-              sx={{
-                alignItems: "center",
-                minWidth: 0,
-              }}
-            >
-              <NotificationsActiveRoundedIcon color="warning" />
-              <Typography
-                variant="h6"
-                noWrap
-                title={selectedNotification?.title || "Notification detail"}
-              >
-                {notificationDisplayTitle(selectedNotification || {})}
-              </Typography>
-            </Stack>
-            {selectedNotification &&
-            isInputNeededNotification(selectedNotification) ? (
-              <Chip
-                size="small"
-                label="Waiting on you"
-                color="warning"
-                variant="outlined"
-              />
-            ) : null}
-            {!selectedNotification?.read ? (
-              <Button
-                size="small"
-                onClick={() =>
-                  selectedNotification?.id &&
-                  markReadMutation.mutate(selectedNotification.id)
-                }
-                disabled={markReadMutation.isPending}
-              >
-                Mark read
-              </Button>
-            ) : null}
-          </Stack>
-          <Typography
-            variant="caption"
-            title={notifTimeAgo(selectedNotification?.created_at).tip}
-            sx={{
-              color: "text.secondary",
-            }}
-          >
-            {notifTimeAgo(selectedNotification?.created_at).label}
-          </Typography>
-          <Divider />
-          <Box sx={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-            {selectedNotification ? (
-              <Stack spacing={1}>
-                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                  {notificationDisplaySummary(selectedNotification)}
-                </Typography>
-                {selectedNotification.metadata ? (
-                  <>
-                    <Typography variant="subtitle2">Metadata</Typography>
-                    <Box className="metadata-box">
-                      {(() => {
-                        const meta = selectedNotification.metadata as any;
-                        const entries: Array<[string, unknown]> =
-                          meta &&
-                          typeof meta === "object" &&
-                          !Array.isArray(meta)
-                            ? Object.entries(meta)
-                            : [];
-                        const shown = entries.slice(0, 14);
-                        return (
-                          <Stack spacing={0.65}>
-                            {shown.length === 0 ? (
-                              <Typography
-                                variant="body2"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
-                              >
-                                (No top-level metadata fields)
-                              </Typography>
-                            ) : (
-                              shown.map(([k, v]) => {
-                                const out = formatMetaValue(v);
-                                return (
-                                  <Stack
-                                    key={k}
-                                    direction="row"
-                                    spacing={1}
-                                    sx={{
-                                      alignItems: "baseline",
-                                    }}
-                                  >
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        width: 140,
-                                        flex: "0 0 auto",
-                                      }}
-                                    >
-                                      {k}
-                                    </Typography>
-                                    {out.href ? (
-                                      <Typography
-                                        variant="body2"
-                                        sx={{
-                                          wordBreak: "break-all",
-                                          flex: "1 1 auto",
-                                        }}
-                                      >
-                                        <a
-                                          href={out.href}
-                                          target="_blank"
-                                          rel="noreferrer"
-                                          style={{ color: "inherit" }}
-                                        >
-                                          {out.text}
-                                        </a>
-                                      </Typography>
-                                    ) : (
-                                      <Typography
-                                        variant="body2"
-                                        sx={{
-                                          wordBreak: "break-word",
-                                          flex: "1 1 auto",
-                                        }}
-                                      >
-                                        {out.text}
-                                      </Typography>
-                                    )}
-                                  </Stack>
-                                );
-                              })
-                            )}
-                            {entries.length > shown.length ? (
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: "text.secondary",
-                                }}
-                              >
-                                {entries.length - shown.length} more field(s)
-                                not shown.
-                              </Typography>
-                            ) : null}
-                          </Stack>
-                        );
-                      })()}
-                    </Box>
-                  </>
-                ) : null}
-              </Stack>
-            ) : null}
-          </Box>
-        </Box>
-      </Drawer>
       <Suspense fallback={null}>
         <GuidedTour openTourStep={openGuidedTourStep} currentView={view} />
       </Suspense>

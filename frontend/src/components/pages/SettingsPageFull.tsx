@@ -109,7 +109,6 @@ import { CompanionDevicesPanel } from "../CompanionDevicesPanel";
 import { MediaSettingsPanel } from "./MediaSettingsPanel";
 import { ObservabilityPanel } from "../ObservabilityPanel";
 import { PluginSdkPanel } from "../PluginSdkPanel";
-import { SenderVerificationPanel } from "../SenderVerificationPanel";
 import { SettingsAdvancedPanel } from "./SettingsAdvancedPanel";
 import { SettingsDataLifecyclePanel } from "./SettingsDataLifecyclePanel";
 import { SettingsModelsPanel } from "./SettingsModelsPanel";
@@ -153,6 +152,7 @@ import {
 import {
   getSettingsPageMeta,
   getSettingsTabLoadingMessage,
+  normalizeSettingsTab,
   resolveInitialSettingsTab,
   settingsTabSupportsSave,
   type SettingsPageProps,
@@ -311,7 +311,8 @@ export default function SettingsPage({
 }: SettingsPageProps) {
   const LOCAL_EMBEDDINGS_MODEL = "BAAI/bge-small-en-v1.5";
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState(() => resolveInitialSettingsTab(initialTab));
+  const initialResolvedTab = resolveInitialSettingsTab(initialTab);
+  const [tab, setTab] = useState(() => initialResolvedTab);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -374,6 +375,7 @@ export default function SettingsPage({
     Record<string, string>
   >({});
   const [showTunnelAdvanced, setShowTunnelAdvanced] = useState(false);
+  const [securityVaultRequested, setSecurityVaultRequested] = useState(false);
   const [tunnelSetupChecks, setTunnelSetupChecks] = useState<JsonRecord[]>([]);
   const [tunnelPanelNotice, setTunnelPanelNotice] = useState<{
     severity: "success" | "info" | "warning";
@@ -394,6 +396,15 @@ export default function SettingsPage({
   const needsAvailableChannels = setupTabActive || channelsTabActive;
   const needsMediaSettings = setupTabActive || mediaTabActive;
   const needsModelSettings = setupTabActive || modelTabActive;
+
+  const changeSettingsTab = (nextTabRaw: number) => {
+    const nextTab = normalizeSettingsTab(nextTabRaw);
+    preloadSettingsTab(nextTab);
+    if (!standaloneArkPulse) {
+      prefetchSettingsTabData(queryClient, nextTab);
+    }
+    setTab((current) => (current === nextTab ? current : nextTab));
+  };
 
   useEffect(() => {
     const nextTab = resolveInitialSettingsTab(initialTab);
@@ -561,12 +572,10 @@ export default function SettingsPage({
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
     refetchOnWindowFocus: false,
   });
-  // Security status + abuse reviews are cheap reads. Fire eagerly on settings
-  // mount so the Security tab is warm before the user clicks it. Refetch
-  // interval stays tab-gated to avoid noisy polling on unrelated tabs.
   const securityStatusQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityStatus,
     queryFn: fetchSecurityStatus,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -575,6 +584,7 @@ export default function SettingsPage({
   const abuseReviewsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.securityAbuseReviews,
     queryFn: fetchSecurityAbuseReviews,
+    enabled: securityTabActive,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: securityTabActive && autoRefresh ? REFRESH_MS : false,
@@ -593,7 +603,7 @@ export default function SettingsPage({
   const vaultSecretsQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.secrets,
     queryFn: fetchSettingsSecrets,
-    enabled: securityTabActive,
+    enabled: securityTabActive && securityVaultRequested,
     staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
     gcTime: SETTINGS_CACHE_GC_TIME_MS,
     refetchInterval: false,
@@ -2789,11 +2799,14 @@ export default function SettingsPage({
     modelSlotsLive.length === 0 &&
     stableModelSlots.length > 0 &&
     (modelsQ.isFetching || !!modelsRefreshIssue);
-  const activeSettingsDataLoading =
+  const activeSettingsDataRefreshing =
     !standaloneArkPulse &&
-    (settingsQ.isLoading ||
-      (needsMediaSettings && mediaQ.isLoading) ||
-      (needsModelSettings && modelsQ.isLoading));
+    !settingsQ.isLoading &&
+    !(needsMediaSettings && mediaQ.isLoading && mediaQ.data == null) &&
+    !(needsModelSettings && modelsQ.isLoading && modelSlots.length === 0) &&
+    (settingsQ.isFetching ||
+      (needsMediaSettings && mediaQ.isFetching) ||
+      (needsModelSettings && modelsQ.isFetching));
   const activeSettingsDataError =
     settingsQ.error ||
     (needsMediaSettings ? mediaQ.error : null) ||
@@ -4649,7 +4662,7 @@ export default function SettingsPage({
         }}
       >
         {!hideSettingsNav ? (
-          <SettingsNavigation tab={tab} onTabChange={setTab} />
+          <SettingsNavigation tab={tab} onTabChange={changeSettingsTab} />
         ) : null}
         <Box
           className={`settings-main${hideSettingsNav ? " settings-main-standalone" : ""}`}
@@ -4675,6 +4688,9 @@ export default function SettingsPage({
                       flexWrap: "wrap",
                     }}
                   >
+                    {activeSettingsDataRefreshing ? (
+                      <Chip size="small" variant="outlined" label="Updating..." />
+                    ) : null}
                     {modelsQ.isFetching && showingModelFallback ? (
                       <Chip
                         size="small"
@@ -4824,13 +4840,13 @@ export default function SettingsPage({
                           border: "1px solid",
                           borderColor:
                             s.tone === "success"
-                              ? "var(--ui-rgba-130-247-193-200)"
+                              ? "var(--ui-rgba-57-208-255-220)"
                               : s.tone === "warning"
                                 ? "var(--ui-rgba-255-180-50-240)"
                                 : "var(--ui-rgba-255-255-255-080)",
                           background:
                             s.tone === "success"
-                              ? "var(--ui-rgba-130-247-193-060)"
+                              ? "var(--ui-rgba-57-208-255-060)"
                               : s.tone === "warning"
                                 ? "var(--ui-rgba-255-180-50-080)"
                                 : "var(--ui-rgba-255-255-255-030)",
@@ -4847,13 +4863,13 @@ export default function SettingsPage({
                             flexShrink: 0,
                             background:
                               s.tone === "success"
-                                ? "#82f7c1"
+                                ? "var(--ui-rgba-57-208-255-850)"
                                 : s.tone === "warning"
                                   ? "var(--ui-rgba-255-180-50-900)"
                                   : "var(--ui-rgba-255-255-255-180)",
                             boxShadow:
                               s.tone === "success"
-                                ? "0 0 6px var(--ui-rgba-130-247-193-320)"
+                                ? "0 0 6px var(--ui-rgba-57-208-255-300)"
                                 : s.tone === "warning"
                                   ? "0 0 6px var(--ui-rgba-255-180-50-350)"
                                   : "none",
@@ -4924,8 +4940,8 @@ export default function SettingsPage({
                         variant="outlined"
                         label="Setup complete"
                         sx={{
-                          borderColor: "var(--ui-rgba-130-247-193-220)",
-                          color: "var(--ui-rgba-130-247-193-880)",
+                          borderColor: "var(--ui-rgba-57-208-255-220)",
+                          color: "var(--ui-rgba-57-208-255-850)",
                           fontSize: "0.72rem",
                         }}
                       />
@@ -5419,20 +5435,20 @@ export default function SettingsPage({
                   vaultPassword={vaultPassword}
                   setVaultPassword={setVaultPassword}
                   vaultSecretsQ={vaultSecretsQ}
+                  vaultSecretsRequested={securityVaultRequested}
+                  requestVaultSecrets={() => setSecurityVaultRequested(true)}
                   queryClient={queryClient}
                   openVaultEditor={openVaultEditor}
                   deleteVaultSecretMutation={deleteVaultSecretMutation}
                   resolveVaultPasswordForSensitiveOps={
                     resolveVaultPasswordForSensitiveOps
                   }
+                  autoRefresh={autoRefresh}
                 form={form}
                 setField={setField}
                 setError={setError}
                 setSuccess={setSuccess}
               />
-            ) : null}
-            {tab === 16 ? (
-              <SenderVerificationPanel autoRefresh={autoRefresh} />
             ) : null}
             {tab === 5 ? (
               <SettingsAdvancedPanel
@@ -6704,16 +6720,6 @@ export default function SettingsPage({
           </Stack>
         </DialogContent>
       </Dialog>
-      {activeSettingsDataLoading ? (
-        <Typography
-          variant="body2"
-          sx={{
-            color: "text.secondary",
-          }}
-        >
-          Loading settings...
-        </Typography>
-      ) : null}
       <Dialog
         open={vaultEditorOpen}
         onClose={closeVaultEditor}

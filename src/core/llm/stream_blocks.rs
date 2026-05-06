@@ -19,6 +19,10 @@ pub(crate) enum StreamBlockEvent {
     Delete {
         path: String,
     },
+    Patch {
+        path: String,
+        patch: String,
+    },
     Checklist {
         items: Vec<String>,
     },
@@ -38,6 +42,11 @@ enum StreamBlockState {
         raw_open_tag: String,
         content: String,
     },
+    Patch {
+        path: String,
+        raw_open_tag: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +58,24 @@ pub(crate) struct StreamBlockParser {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedStreamBlocks {
     pub files: BTreeMap<String, String>,
+    pub file_patches: Vec<ParsedStreamPatch>,
     pub delete_paths: Vec<String>,
     pub delete_orphans: bool,
     pub checklist_items: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedStreamPatch {
+    pub path: String,
+    pub patch: String,
+}
+
 impl ParsedStreamBlocks {
     pub(crate) fn has_operations(&self) -> bool {
-        !self.files.is_empty() || !self.delete_paths.is_empty() || self.delete_orphans
+        !self.files.is_empty()
+            || !self.file_patches.is_empty()
+            || !self.delete_paths.is_empty()
+            || self.delete_orphans
     }
 }
 
@@ -69,6 +88,9 @@ pub(crate) fn parse_stream_blocks_from_text(text: &str) -> ParsedStreamBlocks {
         match event {
             StreamBlockEvent::FileEnd { path, content } => {
                 parsed.files.insert(path, content);
+            }
+            StreamBlockEvent::Patch { path, patch } => {
+                parsed.file_patches.push(ParsedStreamPatch { path, patch });
             }
             StreamBlockEvent::Delete { path } => {
                 if path == "*" {
@@ -223,6 +245,42 @@ impl StreamBlockParser {
                             }
                         }
                     }
+                    if raw_tag.starts_with("<patch") {
+                        match parse_opening_tag(&raw_tag, "patch") {
+                            Ok(attrs) => {
+                                let path = match attrs.get("path") {
+                                    Some(raw) => match normalize_block_path(raw, false) {
+                                        Ok(path) => path,
+                                        Err(_) => {
+                                            let text = self.buffer[..=tag_end].to_string();
+                                            self.buffer.drain(..=tag_end);
+                                            events.push(StreamBlockEvent::Text(text));
+                                            continue;
+                                        }
+                                    },
+                                    None => {
+                                        let text = self.buffer[..=tag_end].to_string();
+                                        self.buffer.drain(..=tag_end);
+                                        events.push(StreamBlockEvent::Text(text));
+                                        continue;
+                                    }
+                                };
+                                self.buffer.drain(..=tag_end);
+                                self.state = StreamBlockState::Patch {
+                                    path,
+                                    raw_open_tag: raw_tag,
+                                    content: String::new(),
+                                };
+                                continue;
+                            }
+                            Err(_) => {
+                                let text = self.buffer[..=tag_end].to_string();
+                                self.buffer.drain(..=tag_end);
+                                events.push(StreamBlockEvent::Text(text));
+                                continue;
+                            }
+                        }
+                    }
                     if raw_tag.starts_with("<checklist") {
                         match parse_opening_tag(&raw_tag, "checklist") {
                             Ok(_) => {
@@ -321,6 +379,50 @@ impl StreamBlockParser {
                     self.state = StreamBlockState::Text;
                     continue;
                 }
+                StreamBlockState::Patch {
+                    path,
+                    raw_open_tag,
+                    content,
+                } => {
+                    let Some(close_start) = self.buffer.find("</patch>") else {
+                        if finish {
+                            content.push_str(&self.buffer);
+                            self.buffer.clear();
+                            events.push(StreamBlockEvent::Text(format!(
+                                "{}{}",
+                                raw_open_tag.as_str(),
+                                content
+                            )));
+                            self.state = StreamBlockState::Text;
+                            continue;
+                        }
+                        let emit_len = safe_patch_body_emit_len(&self.buffer);
+                        if emit_len > 0 {
+                            let delta = self.buffer[..emit_len].to_string();
+                            self.buffer.drain(..emit_len);
+                            content.push_str(&delta);
+                            continue;
+                        }
+                        break;
+                    };
+                    let raw_body = self.buffer[..close_start].to_string();
+                    self.buffer.drain(..close_start + "</patch>".len());
+                    content.push_str(&raw_body);
+                    if content.trim().is_empty() {
+                        events.push(StreamBlockEvent::Text(format!(
+                            "{}{}</patch>",
+                            raw_open_tag.as_str(),
+                            content
+                        )));
+                    } else {
+                        events.push(StreamBlockEvent::Patch {
+                            path: path.clone(),
+                            patch: content.clone(),
+                        });
+                    }
+                    self.state = StreamBlockState::Text;
+                    continue;
+                }
                 StreamBlockState::Checklist {
                     raw_open_tag,
                     content,
@@ -373,7 +475,7 @@ impl StreamBlockParser {
 }
 
 fn next_block_start(buffer: &str) -> Option<usize> {
-    ["<file", "<delete", "<checklist"]
+    ["<file", "<patch", "<delete", "<checklist"]
         .iter()
         .filter_map(|needle| buffer.find(needle))
         .min()
@@ -381,12 +483,24 @@ fn next_block_start(buffer: &str) -> Option<usize> {
 
 fn safe_text_emit_len(buffer: &str) -> usize {
     let mut keep = 0usize;
-    for prefix in ["<file", "<delete", "<checklist"] {
+    for prefix in ["<file", "<patch", "<delete", "<checklist"] {
         let max = buffer.len().min(prefix.len().saturating_sub(1));
         for len in 1..=max {
             if buffer.ends_with(&prefix[..len]) {
                 keep = keep.max(len);
             }
+        }
+    }
+    buffer.len().saturating_sub(keep)
+}
+
+fn safe_patch_body_emit_len(buffer: &str) -> usize {
+    let close = "</patch>";
+    let mut keep = 0usize;
+    let max = buffer.len().min(close.len().saturating_sub(1));
+    for len in 1..=max {
+        if buffer.ends_with(&close[..len]) {
+            keep = keep.max(len);
         }
     }
     buffer.len().saturating_sub(keep)
@@ -645,6 +759,23 @@ mod tests {
     }
 
     #[test]
+    fn parser_emits_patch_event_across_chunks() {
+        let mut parser = StreamBlockParser::new();
+        let mut events = Vec::new();
+        events.extend(parser.feed("<patch path=\"index.html\">@@ -1,1 +1,1 @@\n"));
+        events.extend(parser.feed("-old\n+new\n</patch>"));
+        events.extend(parser.finish());
+
+        assert_eq!(
+            events,
+            vec![StreamBlockEvent::Patch {
+                path: "index.html".to_string(),
+                patch: "@@ -1,1 +1,1 @@\n-old\n+new\n".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn parser_emits_checklist_event_across_chunks() {
         let mut parser = StreamBlockParser::new();
         let mut events = Vec::new();
@@ -671,10 +802,17 @@ mod tests {
     #[test]
     fn parse_stream_blocks_collects_files_deletes_and_checklist() {
         let parsed = parse_stream_blocks_from_text(
-            "Note\n<file path=\"index.html\">hi</file><delete path=\"old.css\"/><delete path=\"*\"/><checklist><item>One</item></checklist>",
+            "Note\n<file path=\"index.html\">hi</file><patch path=\"app.js\">@@ -1,1 +1,1 @@\n-old\n+new\n</patch><delete path=\"old.css\"/><delete path=\"*\"/><checklist><item>One</item></checklist>",
         );
 
         assert_eq!(parsed.files.get("index.html"), Some(&"hi".to_string()));
+        assert_eq!(
+            parsed.file_patches,
+            vec![ParsedStreamPatch {
+                path: "app.js".to_string(),
+                patch: "@@ -1,1 +1,1 @@\n-old\n+new\n".to_string(),
+            }]
+        );
         assert_eq!(parsed.delete_paths, vec!["old.css".to_string()]);
         assert!(parsed.delete_orphans);
         assert_eq!(parsed.checklist_items, vec!["One".to_string()]);

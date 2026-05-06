@@ -61,6 +61,7 @@ async fn build_test_state() -> (AppState, TempDir, TempDir) {
         application_registry: applications::ApplicationLauncherRegistry::default(),
         deployment_mode: DeploymentMode::TrustedLocal,
         server_role: HttpServerRole::ControlPlane,
+        runtime_started_at: Instant::now(),
         public_app_bind_addr: None,
         public_app_base_url: None,
         release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),

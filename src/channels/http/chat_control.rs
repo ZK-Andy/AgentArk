@@ -1989,48 +1989,6 @@ pub(super) fn deep_research_terminal_status(
     }
 }
 
-pub(super) fn deep_research_notification_details(
-    topic: &str,
-    terminal_status: &crate::core::TaskStatus,
-    run_status: Option<&str>,
-) -> Option<(&'static str, String, &'static str)> {
-    match terminal_status {
-        crate::core::TaskStatus::Completed => Some((
-            "Deep research completed",
-            format!(
-                "{} is ready. Open Chat to review the completed report.",
-                topic
-            ),
-            "info",
-        )),
-        crate::core::TaskStatus::Failed { .. } => {
-            let normalized_run_status = run_status
-                .map(|value| value.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if normalized_run_status == "platform_failed" {
-                Some((
-                    "Deep research failed",
-                    format!(
-                        "{} could not finish because AgentArk hit an execution problem. Open Chat to review the error.",
-                        topic
-                    ),
-                    "error",
-                ))
-            } else {
-                Some((
-                    "Deep research failed",
-                    format!(
-                        "{} could not finish cleanly. Open Chat to review the issue.",
-                        topic
-                    ),
-                    "warning",
-                ))
-            }
-        }
-        _ => None,
-    }
-}
-
 fn deep_research_plan_id(task_id: &str) -> String {
     let suffix = task_id
         .chars()
@@ -2412,7 +2370,7 @@ fn deep_research_error_message(error: &anyhow::Error) -> String {
     let error_text = error.to_string();
     if deep_research_setup_issue(&error_text) {
         format!(
-            "Deep research stopped because the available search and page-reading path could not gather enough reliable evidence for this run. AgentArk will try the free/browser-backed path first when available, but consistently strong deep research usually needs a reachable SearXNG instance or an API-backed provider such as Serper, Brave Search API, Exa, Tavily, Perplexity, or Firecrawl configured in Search Settings.\n\nDetails: {}",
+            "Deep research stopped because the available search backends failed or returned too little usable source evidence. AgentArk will not generate a cited report from unreliable or unreadable search results. Configure a reliable backend in Search Settings: SearXNG, Serper, Brave Search API, Exa, Tavily, Perplexity, or Firecrawl.\n\nDetails: {}",
             truncate_stream_task_text(&error_text, 900)
         )
     } else {
@@ -2875,19 +2833,6 @@ async fn run_approved_deep_research_stream(
                 agent_snapshot
                     .execution_supervisor
                     .build_success_outcome(&output, &[], &[]);
-            let topic = deep_research_topic_label(message);
-            agent_snapshot
-                .emit_notification(
-                    "Deep research completed",
-                    &format!(
-                        "{} is ready. Open Chat to review the completed report.",
-                        topic
-                    ),
-                    "info",
-                    "deep_research",
-                )
-                .await;
-
             send_chat_stream_event(
                 tx,
                 live_runs,
@@ -3015,7 +2960,7 @@ async fn run_approved_deep_research_stream(
                     "deep_research_failed".to_string()
                 },
                 summary: if setup_issue {
-                    "search backend setup needed".to_string()
+                    "search backends returned no usable evidence".to_string()
                 } else {
                     "deep research failed".to_string()
                 },
@@ -3054,15 +2999,6 @@ async fn run_approved_deep_research_stream(
                         &[],
                     )
             };
-            agent_snapshot
-                .emit_notification(
-                    "Deep research failed",
-                    "The research run stopped before producing a trustworthy cited report. Open Chat to review the issue.",
-                    if setup_issue { "warning" } else { "error" },
-                    "deep_research",
-                )
-                .await;
-
             send_chat_stream_event(
                 tx,
                 live_runs,
@@ -3075,7 +3011,7 @@ async fn run_approved_deep_research_stream(
                     "content": message_text,
                     "kind": "phase_status",
                     "phase": failed_phase,
-                    "label": "Research stopped",
+                    "label": if setup_issue { "Search backends failed" } else { "Research stopped" },
                     "detail": message_text,
                     "status": "failed",
                     "elapsed_secs": started_at.elapsed().as_secs(),
@@ -4375,24 +4311,6 @@ pub(super) fn spawn_chat_stream_response(
                         crate::core::RunEventPriority::High,
                     )
                     .await;
-                    if deep_research {
-                        let topic = processed
-                            .conversation_title
-                            .as_deref()
-                            .filter(|value| !value.trim().is_empty())
-                            .unwrap_or(task.description.as_str());
-                        let notification = deep_research_notification_details(
-                            topic,
-                            &terminal_status,
-                            processed.run_status.as_deref(),
-                        );
-                        if let Some((title, body, level)) = notification {
-                            let agent_snapshot = Agent::snapshot(&agent_ref).await;
-                            agent_snapshot
-                                .emit_notification(title, &body, level, "deep_research")
-                                .await;
-                        }
-                    }
                 }
 
                 if time_to_first_token_ms.load(Ordering::Relaxed) == 0

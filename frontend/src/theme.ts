@@ -5,9 +5,9 @@ export const appTheme = createTheme({
   palette: {
     mode: "dark",
     primary: {
-      main: "#d8ad78",
-      light: "#f1d6ad",
-      dark: "#8d6841",
+      main: "#39d0ff",
+      light: "#8de8ff",
+      dark: "#1979c9",
     },
     secondary: {
       main: "#f0e2cf",
@@ -17,13 +17,13 @@ export const appTheme = createTheme({
       main: "#8bd6a5",
     },
     warning: {
-      main: "#d8ad78",
+      main: "#ffbe63",
     },
     error: {
       main: "#ff9b9b",
     },
     info: {
-      main: "#d8c2a6",
+      main: "#7ce7ff",
     },
     background: {
       default: "#0a0a0a",
@@ -102,7 +102,7 @@ export const appTheme = createTheme({
       styleOverrides: {
         body: {
           scrollbarWidth: "thin",
-          scrollbarColor: "var(--ui-rgba-0-255-170-150) transparent",
+          scrollbarColor: "var(--ui-rgba-57-208-255-150) transparent",
         },
       },
     },
@@ -331,7 +331,7 @@ export const appTheme = createTheme({
         root: {
           "& .MuiTableCell-head": {
             background: "var(--cyber-panel-raised)",
-            color: "var(--ui-rgba-0-255-170-400)",
+            color: "var(--ui-rgba-57-208-255-720)",
             fontFamily: "var(--font-mono)",
             fontWeight: 500,
             fontSize: "0.68rem",
@@ -349,7 +349,7 @@ export const appTheme = createTheme({
           "& .MuiTableRow-root": {
             transition: "background 0.15s ease",
             "&:hover": {
-              background: "var(--ui-rgba-0-255-170-040) !important",
+              background: "var(--ui-rgba-57-208-255-040) !important",
             },
           },
           "& .MuiTableCell-body": {
@@ -413,12 +413,12 @@ export const appTheme = createTheme({
           fontSize: "0.76rem",
           color: "var(--text-primary)",
           "&:hover": {
-            background: "var(--ui-rgba-0-255-170-060)",
+            background: "var(--ui-rgba-57-208-255-060)",
           },
           "&.Mui-selected": {
-            background: "var(--ui-rgba-0-255-170-100)",
+            background: "var(--ui-rgba-57-208-255-100)",
             "&:hover": {
-              background: "var(--ui-rgba-0-255-170-150)",
+              background: "var(--ui-rgba-57-208-255-150)",
             },
           },
         },
@@ -439,7 +439,7 @@ export const appTheme = createTheme({
           },
           "&.Mui-focused .MuiOutlinedInput-notchedOutline": {
             borderColor: "var(--teal)",
-            boxShadow: "0 0 0 2px var(--ui-rgba-0-255-170-100)",
+            boxShadow: "0 0 0 2px var(--ui-rgba-57-208-255-100)",
           },
         },
         input: {
@@ -508,7 +508,7 @@ export const appTheme = createTheme({
           backgroundColor: "var(--teal)",
           height: 2,
           borderRadius: 1,
-          boxShadow: "0 0 8px var(--ui-rgba-0-255-170-150)",
+          boxShadow: "0 0 8px var(--ui-rgba-57-208-255-150)",
         },
       },
     },
@@ -591,7 +591,7 @@ export const appTheme = createTheme({
           "&.Mui-checked": {
             color: "var(--teal)",
             "& + .MuiSwitch-track": {
-              backgroundColor: "var(--ui-rgba-0-255-170-150)",
+              backgroundColor: "var(--ui-rgba-57-208-255-150)",
             },
           },
         },

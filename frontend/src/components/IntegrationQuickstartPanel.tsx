@@ -77,7 +77,7 @@ type IntegrationQuickstartPanelProps = {
 const INTEGRATION_SORT_ORDER: Record<string, number> = {
   google_workspace: 0, github: 1, "1password": 3, notion: 4, jira: 5, sentry: 6, linear: 7,
   google_analytics: 10, google_search_console: 11, garmin: 12, shopify: 13, social_analytics: 14,
-  google_places: 99,
+  google_places: 99, moltbook: 1000,
 };
 
 function asRecord(value: unknown): JsonRecord {
@@ -234,9 +234,11 @@ export function IntegrationQuickstartPanel({
   });
   const customApis = useMemo(() => asRecords(asRecord(customApisQ.data).custom_apis), [customApisQ.data]);
   const sortedIntegrations = useMemo(() => {
-    return integrations
-      .filter((integration) => integration.id.trim().toLowerCase() !== "moltbook")
+    return [...integrations]
       .sort((a, b) => {
+        const aIsMoltbook = a.id.trim().toLowerCase() === "moltbook";
+        const bIsMoltbook = b.id.trim().toLowerCase() === "moltbook";
+        if (aIsMoltbook !== bIsMoltbook) return aIsMoltbook ? 1 : -1;
         const rankDiff = connectorSortRank(a) - connectorSortRank(b);
         if (rankDiff !== 0) return rankDiff;
         const orderA = INTEGRATION_SORT_ORDER[a.id] ?? 50;

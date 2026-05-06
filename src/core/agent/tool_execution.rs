@@ -36,6 +36,115 @@ fn notification_tool_should_dispatch_for_surface(
     )
 }
 
+fn list_watchers_status_label(status: &crate::core::watcher::WatcherStatus) -> &'static str {
+    match status {
+        crate::core::watcher::WatcherStatus::Active => "active",
+        crate::core::watcher::WatcherStatus::Paused => "paused",
+        crate::core::watcher::WatcherStatus::Triggered => "triggered",
+        crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
+        crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
+        crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
+    }
+}
+
+fn list_watchers_live_row(watcher: &crate::core::watcher::Watcher) -> serde_json::Value {
+    let status_error = match &watcher.status {
+        crate::core::watcher::WatcherStatus::Failed { error } => Some(error.clone()),
+        _ => None,
+    };
+    serde_json::json!({
+        "id": watcher.id.to_string(),
+        "description": watcher.description,
+        "poll_action": watcher.poll_action,
+        "poll_arguments": watcher.poll_arguments,
+        "condition": watcher.condition,
+        "status": list_watchers_status_label(&watcher.status),
+        "status_error": status_error,
+        "interval_secs": watcher.interval_secs,
+        "timeout_secs": watcher.timeout_secs,
+        "poll_count": watcher.poll_count,
+        "created_at": watcher.created_at.to_rfc3339(),
+        "last_poll_at": watcher.last_poll_at.as_ref().map(|value| value.to_rfc3339()),
+        "next_poll_not_before": watcher.next_poll_not_before.as_ref().map(|value| value.to_rfc3339()),
+        "notify_channel": watcher.notify_channel,
+        "on_trigger": watcher.on_trigger,
+        "trigger_result": watcher.trigger_result,
+        "last_result": watcher.last_result,
+        "last_error": watcher.last_error,
+        "last_poll_outcome": watcher.last_poll_outcome,
+        "notification_attempts": watcher.notification_attempts,
+        "history_only": false,
+    })
+}
+
+fn list_watchers_history_error_is_notification_summary_failure(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let lower = error.to_ascii_lowercase();
+    lower.contains("watcher notification")
+        || lower.contains("notification summary")
+        || lower.contains("follow-up summary")
+}
+
+fn list_watchers_history_row(
+    state: crate::core::automation::AutomationSupervisorState,
+) -> serde_json::Value {
+    let created_at = state
+        .created_at
+        .clone()
+        .or_else(|| state.last_run_at.clone())
+        .or_else(|| state.last_success_at.clone());
+    let notification_summary_failure = state.status == "failed"
+        && list_watchers_history_error_is_notification_summary_failure(state.last_error.as_deref());
+    let status = if notification_summary_failure {
+        "triggered".to_string()
+    } else {
+        state.status.clone()
+    };
+    let status_error = if notification_summary_failure {
+        None
+    } else {
+        state.last_error.clone()
+    };
+    let last_poll_outcome = match status.as_str() {
+        "triggered" => Some("matched"),
+        "failed" | "timed_out" => Some("error"),
+        _ => None,
+    };
+    serde_json::json!({
+        "id": state.automation_id,
+        "description": state.title,
+        "poll_action": state.action,
+        "poll_arguments": serde_json::Value::Null,
+        "condition": serde_json::Value::Null,
+        "status": status,
+        "status_error": status_error,
+        "interval_secs": serde_json::Value::Null,
+        "timeout_secs": serde_json::Value::Null,
+        "poll_count": state.attempt_count,
+        "created_at": created_at,
+        "last_poll_at": state.last_run_at,
+        "next_poll_not_before": state.next_retry_at,
+        "notify_channel": serde_json::Value::Null,
+        "on_trigger": serde_json::Value::Null,
+        "trigger_result": serde_json::Value::Null,
+        "last_result": serde_json::Value::Null,
+        "last_error": status_error,
+        "last_poll_outcome": last_poll_outcome,
+        "notification_attempts": Vec::<serde_json::Value>::new(),
+        "history_only": true,
+    })
+}
+
+fn list_watchers_row_matches_filter(row: &serde_json::Value, filter: &str) -> bool {
+    filter == "all"
+        || row
+            .get("status")
+            .and_then(|value| value.as_str())
+            .is_some_and(|status| status == filter)
+}
+
 fn resolve_gepa_candidates_path(
     project_root: &std::path::Path,
     run_id: Option<&str>,
@@ -116,6 +225,29 @@ fn gepa_job_value_failed(value: &serde_json::Value) -> bool {
         .and_then(|status| status.as_str())
         .map(|status| matches!(status, "failed" | "timed_out" | "error"))
         .unwrap_or(false)
+}
+
+fn gepa_effective_status(value: &serde_json::Value) -> String {
+    value
+        .get("result")
+        .and_then(|result| result.get("status"))
+        .or_else(|| value.get("status"))
+        .and_then(|status| status.as_str())
+        .unwrap_or("completed")
+        .to_string()
+}
+
+fn gepa_effective_reason(value: &serde_json::Value) -> Option<String> {
+    let inner = value.get("result");
+    inner
+        .and_then(|result| result.get("error"))
+        .or_else(|| inner.and_then(|result| result.get("stderr_tail")))
+        .or_else(|| inner.and_then(|result| result.get("message")))
+        .or_else(|| value.get("error"))
+        .or_else(|| value.get("stderr_tail"))
+        .or_else(|| value.get("message"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn typed_tool_error_fields(error: &anyhow::Error) -> Option<TypedToolErrorFields> {
@@ -1386,6 +1518,7 @@ impl Agent {
         "allow_duplicate",
         "conversation_id",
         "_conversation_id",
+        "_streamed_app_delivery",
         "name",
     ];
 
@@ -4064,6 +4197,73 @@ impl Agent {
             .await;
     }
 
+    async fn execute_direct_list_watchers_tool(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        let filter = arguments
+            .get("filter")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "active".to_string());
+        let limit = arguments
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+
+        let (mut watchers, supervisor_states) = tokio::join!(
+            self.watcher_manager.list(),
+            crate::core::list_automation_supervisor_states(&self.storage)
+        );
+        watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        let live_ids = watchers
+            .iter()
+            .map(|watcher| watcher.id.to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut rows = watchers
+            .iter()
+            .map(list_watchers_live_row)
+            .collect::<Vec<_>>();
+        rows.extend(
+            supervisor_states
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|state| {
+                    state.automation_kind == "watcher"
+                        && !live_ids.contains(&state.automation_id)
+                })
+                .map(list_watchers_history_row),
+        );
+        rows.retain(|row| list_watchers_row_matches_filter(row, &filter));
+        rows.sort_by(|left, right| {
+            let left_created = left
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let right_created = right
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            right_created.cmp(left_created)
+        });
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+
+        if rows.is_empty() {
+            return Ok(format!("No {} watcher(s) found.", filter));
+        }
+
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "filter": filter,
+            "count": rows.len(),
+            "watchers": rows,
+        }))?)
+    }
+
     pub(crate) async fn execute_action_with_hooks(
         &self,
         action_name: &str,
@@ -4087,6 +4287,8 @@ impl Agent {
             && notification_tool_should_dispatch_for_surface(channel, authorization)
         {
             self.execute_direct_notify_user_tool(arguments).await
+        } else if action_name.eq_ignore_ascii_case("list_watchers") {
+            self.execute_direct_list_watchers_tool(arguments).await
         } else if let Some(auth_context) = authorization {
             self.runtime
                 .execute_action_with_context(action_name, arguments, auth_context)
@@ -6175,24 +6377,18 @@ impl Agent {
         if mode == "gepa_status" {
             return;
         }
-        let status = value
-            .get("status")
-            .and_then(|value| value.as_str())
-            .unwrap_or("completed");
+        let status = gepa_effective_status(value);
         let now = chrono::Utc::now().to_rfc3339();
         let mut state =
             crate::core::self_evolve::gepa_bridge::load_gepa_auto_run_state(&self.storage).await;
-        state.last_status = Some(status.to_string());
-        state.last_reason = value
-            .get("error")
-            .or_else(|| value.get("stderr_tail"))
-            .or_else(|| value.get("message"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .or_else(|| Some(status.to_string()));
+        state.last_status = Some(status.clone());
+        state.last_reason = gepa_effective_reason(value).or_else(|| Some(status.clone()));
         if status == "queued" {
             state.last_queued_at = Some(now);
-        } else if matches!(status, "completed" | "failed" | "timed_out" | "blocked") {
+        } else if matches!(
+            status.as_str(),
+            "completed" | "failed" | "timed_out" | "blocked"
+        ) {
             state.last_completed_at = Some(now);
         }
         let _ =
@@ -6452,6 +6648,40 @@ impl Agent {
                     serde_json::json!(promotion_applied),
                 );
                 obj.insert(
+                    "runtime_promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "apply_promotion_requested".to_string(),
+                    serde_json::json!(apply_promotion),
+                );
+                obj.insert(
+                    "promotion_requires_user_acceptance".to_string(),
+                    serde_json::json!(true),
+                );
+                obj.insert(
+                    "promotion_mode".to_string(),
+                    serde_json::json!(if promotion_applied {
+                        "canary"
+                    } else if result.promoted {
+                        "pending_user_acceptance"
+                    } else {
+                        "none"
+                    }),
+                );
+                obj.insert(
+                    "candidate_review_id".to_string(),
+                    serde_json::json!(result.lineage_entry_id.clone()),
+                );
+                obj.insert(
+                    "candidate_source_path".to_string(),
+                    serde_json::json!(candidates_path.display().to_string()),
+                );
+                obj.insert(
+                    "rollback_available".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
                     "canary_state".to_string(),
                     serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
                 );
@@ -6582,6 +6812,40 @@ impl Agent {
                     serde_json::json!(promotion_applied),
                 );
                 obj.insert(
+                    "runtime_promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "apply_promotion_requested".to_string(),
+                    serde_json::json!(apply_promotion),
+                );
+                obj.insert(
+                    "promotion_requires_user_acceptance".to_string(),
+                    serde_json::json!(true),
+                );
+                obj.insert(
+                    "promotion_mode".to_string(),
+                    serde_json::json!(if promotion_applied {
+                        "canary"
+                    } else if result.promoted {
+                        "pending_user_acceptance"
+                    } else {
+                        "none"
+                    }),
+                );
+                obj.insert(
+                    "candidate_review_id".to_string(),
+                    serde_json::json!(result.lineage_entry_id.clone()),
+                );
+                obj.insert(
+                    "candidate_source_path".to_string(),
+                    serde_json::json!(candidates_path.display().to_string()),
+                );
+                obj.insert(
+                    "rollback_available".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
                     "canary_state".to_string(),
                     serde_json::to_value(&canary_state).unwrap_or(serde_json::Value::Null),
                 );
@@ -6706,8 +6970,38 @@ impl Agent {
                     serde_json::json!(promotion_applied),
                 );
                 obj.insert(
+                    "runtime_promotion_applied".to_string(),
+                    serde_json::json!(promotion_applied),
+                );
+                obj.insert(
+                    "apply_promotion_requested".to_string(),
+                    serde_json::json!(apply_promotion),
+                );
+                obj.insert(
+                    "promotion_requires_user_acceptance".to_string(),
+                    serde_json::json!(true),
+                );
+                obj.insert(
                     "promotion_mode".to_string(),
-                    serde_json::json!(if promotion_applied { "canary" } else { "none" }),
+                    serde_json::json!(if promotion_applied {
+                        "canary"
+                    } else if result.promoted {
+                        "pending_user_acceptance"
+                    } else {
+                        "none"
+                    }),
+                );
+                obj.insert(
+                    "candidate_review_id".to_string(),
+                    serde_json::json!(result.lineage_entry_id.clone()),
+                );
+                obj.insert(
+                    "candidate_source_path".to_string(),
+                    serde_json::json!(candidates_path.display().to_string()),
+                );
+                obj.insert(
+                    "rollback_available".to_string(),
+                    serde_json::json!(promotion_applied),
                 );
                 obj.insert(
                     "canary_state".to_string(),
@@ -6733,6 +7027,8 @@ impl Agent {
         Ok(serde_json::json!({
             "status": "completed",
             "mode": "gepa_import",
+            "candidate_source_path": candidates_path.display().to_string(),
+            "promotion_requires_user_acceptance": true,
             "summary": imported.summary,
             "results": results,
         }))
@@ -6789,11 +7085,12 @@ impl Agent {
             .get("allow_code_writes")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let apply_promotion = call
+        let apply_promotion_requested = call
             .arguments
             .get("apply_promotion")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false);
+        let apply_promotion = false;
         let canary_rollout_percent = call
             .arguments
             .get("canary_rollout_percent")
@@ -6895,6 +7192,8 @@ impl Agent {
                 "mode": mode.clone(),
                 "allow_code_writes": allow_code_writes,
                 "apply_promotion": apply_promotion,
+                "apply_promotion_requested": apply_promotion_requested,
+                "promotion_requires_user_acceptance": true,
                 "canary_rollout_percent": canary_rollout_percent,
                 "canary_min_samples_per_version": canary_min_samples_per_version,
                 "canary_min_success_gain": canary_min_success_gain,
@@ -7366,7 +7665,7 @@ impl Agent {
                         "trace_kind": "self_evolve.policy.promotion",
                         "request": request.clone(),
                         "promotion_applied": promotion_applied,
-                        "apply_promotion_requested": apply_promotion,
+                        "apply_promotion_requested": apply_promotion_requested,
                         "promotion_mode": promotion_mode,
                         "promoted_directly_to_baseline": promoted_directly_to_baseline,
                         "canary_state": canary_state.clone(),
@@ -7385,7 +7684,7 @@ impl Agent {
                     );
                     obj.insert(
                         "apply_promotion_requested".to_string(),
-                        serde_json::json!(apply_promotion),
+                        serde_json::json!(apply_promotion_requested),
                     );
                     obj.insert(
                         "promotion_mode".to_string(),
@@ -7717,7 +8016,7 @@ impl Agent {
                         "trace_kind": "self_evolve.prompt.promotion",
                         "request": request.clone(),
                         "promotion_applied": promotion_applied,
-                        "apply_promotion_requested": apply_promotion,
+                        "apply_promotion_requested": apply_promotion_requested,
                         "promotion_mode": promotion_mode,
                         "promoted_directly_to_baseline": promoted_directly_to_baseline,
                         "baseline_version": result.baseline_version.clone(),
@@ -7740,7 +8039,7 @@ impl Agent {
                     );
                     obj.insert(
                         "apply_promotion_requested".to_string(),
-                        serde_json::json!(apply_promotion),
+                        serde_json::json!(apply_promotion_requested),
                     );
                     obj.insert(
                         "promotion_mode".to_string(),
@@ -9192,6 +9491,40 @@ impl Agent {
                     if let Some(obj) = resolved_args.as_object_mut() {
                         obj.entry("_conversation_id".to_string())
                             .or_insert_with(|| serde_json::json!(cid));
+                    }
+                }
+                let patch_update_without_target = resolved_args
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .map(|value| value.is_empty())
+                    .unwrap_or(true)
+                    && resolved_args
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("patch"))
+                    && resolved_args
+                        .get("file_patches")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|items| !items.is_empty());
+                if patch_update_without_target {
+                    if let Some(cid) = conversation_id
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        if let Some(recent_app) = self
+                            .load_recent_artifact_context(cid)
+                            .await
+                            .filter(|artifact| artifact.artifact_type.eq_ignore_ascii_case("app"))
+                        {
+                            let app_id = recent_app.artifact_id.trim();
+                            if !app_id.is_empty() {
+                                if let Some(obj) = resolved_args.as_object_mut() {
+                                    obj.insert("app_id".to_string(), serde_json::json!(app_id));
+                                }
+                            }
+                        }
                     }
                 }
                 let allow_duplicate_requested = resolved_args

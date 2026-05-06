@@ -41,18 +41,18 @@
   --cyber-panel: #070b09;
   --cyber-panel-raised: #0a100d;
   --cyber-panel-soft: #0d1310;
-  --cyber-rain: var(--ui-rgba-0-255-170-150);
-  --cyber-rain-faint: var(--ui-rgba-0-255-170-040);
+  --cyber-rain: var(--ui-rgba-57-208-255-150);
+  --cyber-rain-faint: var(--ui-rgba-57-208-255-040);
   --cyber-rain-hot: var(--ui-rgba-255-180-50-240);
   --cyber-grid: var(--ui-rgba-255-255-255-030);
   --cyber-scanline: var(--ui-rgba-0-0-0-140);
   --cyan: #7ce7ff;
   --cyan-glow: var(--ui-rgba-47-212-255-220);
   --cyan-subtle: var(--ui-rgba-47-212-255-080);
-  --teal: #64f4bd;
+  --teal: #7ce7ff;
   --teal-glow: var(--ui-rgba-74-210-157-280);
   --green: #78f2b0;
-  --green-glow: var(--ui-rgba-0-255-170-150);
+  --green-glow: var(--ui-rgba-57-208-255-150);
   --orange: #ffbe63;
   --red: #ff9b9b;
   --red-glow: var(--ui-rgba-255-155-155-200);
@@ -60,23 +60,23 @@
   --text-primary: #eff7ef;
   --text-secondary: var(--ui-rgba-213-216-223-720);
   --text-dim: var(--ui-rgba-155-159-169-560);
-  --border: var(--ui-rgba-0-255-170-080);
-  --border-hover: var(--ui-rgba-0-255-170-150);
+  --border: var(--ui-rgba-57-208-255-080);
+  --border-hover: var(--ui-rgba-57-208-255-150);
   --bg-card: var(--cyber-panel);
   --bg-surface: var(--cyber-panel);
-  --surface-border: var(--ui-rgba-0-255-170-080);
-  --surface-border-strong: var(--ui-rgba-0-255-170-150);
+  --surface-border: var(--ui-rgba-57-208-255-080);
+  --surface-border-strong: var(--ui-rgba-57-208-255-150);
   --surface-bg: linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel));
   --surface-bg-elevated: linear-gradient(180deg, var(--cyber-panel-soft), var(--cyber-panel));
   --surface-shadow: 0 18px 44px var(--ui-rgba-0-0-0-400);
   --surface-shadow-soft: 0 10px 24px var(--ui-rgba-0-0-0-300);
-  --micro-surface-border: var(--ui-rgba-0-255-170-080);
-  --micro-surface-border-strong: var(--ui-rgba-0-255-170-150);
+  --micro-surface-border: var(--ui-rgba-57-208-255-080);
+  --micro-surface-border-strong: var(--ui-rgba-57-208-255-150);
   --micro-surface-bg:
     radial-gradient(circle at top left, var(--cyber-rain-faint), transparent 36%),
     linear-gradient(160deg, var(--cyber-panel-soft), var(--cyber-panel));
   --micro-surface-item-bg: var(--ui-rgba-255-255-255-020);
-  --micro-surface-shadow: inset 0 0 0 1px var(--ui-rgba-0-255-170-030);
+  --micro-surface-shadow: inset 0 0 0 1px var(--ui-rgba-57-208-255-040);
   --radius-sm: 5px;
   --radius-md: 8px;
   --radius-lg: 8px;
@@ -87,8 +87,8 @@
   --button-pad-x-sm: 10px;
   --button-pad-x-md: 14px;
   --button-pad-x-lg: 18px;
-  --button-border: var(--ui-rgba-0-255-170-100);
-  --button-border-strong: var(--ui-rgba-0-255-170-150);
+  --button-border: var(--ui-rgba-57-208-255-100);
+  --button-border-strong: var(--ui-rgba-57-208-255-150);
   --button-bg-subtle: linear-gradient(180deg, var(--cyber-panel-soft), var(--cyber-panel));
   --button-bg-subtle-hover: linear-gradient(180deg, #101a15, var(--cyber-panel-raised));
   --button-bg-primary: linear-gradient(180deg, #163d31, #0b241d);
@@ -98,9 +98,9 @@
   --button-text-muted: var(--ui-rgba-184-191-201-780);
   --button-text-strong: #f3f7fb;
   --button-shadow: 0 4px 10px var(--ui-rgba-0-0-0-300);
-  --button-shadow-hover: 0 0 0 1px var(--ui-rgba-0-255-170-080), 0 10px 24px var(--ui-rgba-0-0-0-400);
-  --button-shadow-primary: 0 0 0 1px var(--ui-rgba-0-255-170-100), 0 14px 28px var(--ui-rgba-0-0-0-400);
-  --button-focus-ring: 0 0 0 2px var(--ui-rgba-0-255-170-150), 0 0 18px var(--ui-rgba-0-255-170-100);
+  --button-shadow-hover: 0 0 0 1px var(--ui-rgba-57-208-255-080), 0 10px 24px var(--ui-rgba-0-0-0-400);
+  --button-shadow-primary: 0 0 0 1px var(--ui-rgba-57-208-255-100), 0 14px 28px var(--ui-rgba-0-0-0-400);
+  --button-focus-ring: 0 0 0 2px var(--ui-rgba-57-208-255-150), 0 0 18px var(--ui-rgba-57-208-255-100);
   --activity-divider: var(--surface-border);
   --activity-hover-bg: var(--micro-surface-item-bg);
   --activity-active-bg: var(--micro-surface-item-bg);
@@ -1074,9 +1074,9 @@ body {
   border-radius: var(--surface-radius-lg);
   backdrop-filter: blur(8px);
   background:
-    linear-gradient(90deg, var(--ui-rgba-0-255-170-030), transparent 42%, var(--ui-rgba-255-180-50-050)),
+    linear-gradient(90deg, var(--ui-rgba-57-208-255-040), transparent 42%, var(--ui-rgba-255-180-50-050)),
     linear-gradient(180deg, #07100c, #040705);
-  box-shadow: inset 0 -1px 0 var(--ui-rgba-0-255-170-060), var(--surface-shadow-soft);
+  box-shadow: inset 0 -1px 0 var(--ui-rgba-57-208-255-060), var(--surface-shadow-soft);
 }
 
 .shell-toolbar {
@@ -1086,7 +1086,7 @@ body {
 }
 
 .shell-brand-mark {
-  width: 40px;
+  width: 42px;
   height: 40px;
   display: flex;
   align-items: center;
@@ -1099,8 +1099,8 @@ body {
 
 .shell-brand-mark img {
   display: block;
-  width: 36px;
-  height: 36px;
+  width: 42px;
+  height: 42px;
   filter: none;
 }
 
@@ -1109,16 +1109,16 @@ body {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
-  padding-left: 2px;
+  gap: 1px;
+  padding-left: 3px;
 }
 
 .shell-kicker.MuiTypography-root {
   display: block;
-  font-size: 0.95rem !important;
-  line-height: 1.05 !important;
+  font-size: 1.05rem !important;
+  line-height: 1 !important;
   font-weight: 700 !important;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
   text-transform: none;
   color: var(--ui-rgba-245-246-248-960);
 }
@@ -1131,10 +1131,10 @@ body {
 }
 
 .shell-title.MuiTypography-root {
-  font-size: 0.6rem !important;
-  line-height: 1.05 !important;
+  font-size: 0.68rem !important;
+  line-height: 1 !important;
   font-weight: 500 !important;
-  letter-spacing: 0.18em !important;
+  letter-spacing: 0 !important;
   text-transform: uppercase;
   color: rgba(180, 210, 225, 0.55) !important;
 }
@@ -1223,7 +1223,7 @@ body {
   border: 1px solid var(--surface-border);
   border-radius: var(--surface-radius-lg);
   background:
-    linear-gradient(180deg, var(--ui-rgba-0-255-170-020), transparent 36%),
+    linear-gradient(180deg, var(--ui-rgba-57-208-255-040), transparent 36%),
     linear-gradient(180deg, #070d0a, #030504);
   backdrop-filter: blur(8px);
   box-shadow: var(--surface-shadow-soft);
@@ -1278,6 +1278,10 @@ body {
 }
 
 .main-pane-chat {
+  overflow: hidden;
+}
+
+.main-pane-overview {
   overflow: hidden;
 }
 
@@ -1455,6 +1459,9 @@ body {
   width: 100%;
   max-width: none;
   margin: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .workspace-stage-chat {
@@ -1949,8 +1956,8 @@ body {
   max-width: min(100%, 280px);
   min-height: 24px;
   border-radius: 999px;
-  border: 1px solid rgba(216, 173, 120, 0.28);
-  background: rgba(216, 173, 120, 0.08);
+  border: 1px solid rgba(57, 208, 255, 0.28);
+  background: rgba(57, 208, 255, 0.08);
   color: rgba(255, 238, 210, 0.94);
   padding: 3px 4px 3px 8px;
   font-size: 0.68rem;
@@ -1989,8 +1996,8 @@ body {
   min-height: 22px;
   max-width: 100%;
   border-radius: 999px;
-  border: 1px solid rgba(216, 173, 120, 0.22);
-  background: rgba(216, 173, 120, 0.075);
+  border: 1px solid rgba(57, 208, 255, 0.22);
+  background: rgba(57, 208, 255, 0.075);
   color: rgba(255, 248, 237, 0.9);
   padding: 3px 8px;
   font-family: var(--font-sans);
@@ -2036,7 +2043,7 @@ body {
 }
 
 .chat-value-pill.is-clickable:hover {
-  border-color: rgba(216, 173, 120, 0.36);
+  border-color: rgba(57, 208, 255, 0.36);
   color: rgba(255, 248, 237, 0.96);
 }
 
@@ -2218,7 +2225,7 @@ body {
   margin: 3px 6px 5px;
   font-size: 10.5px;
   letter-spacing: 0;
-  color: var(--ui-rgba-0-255-170-400);
+  color: var(--ui-rgba-57-208-255-350);
   font-family: var(--font-mono);
   text-transform: uppercase;
 }
@@ -2284,8 +2291,8 @@ body {
 .nav-item.Mui-selected {
   border-color: var(--surface-border-strong) !important;
   background:
-    linear-gradient(90deg, var(--ui-rgba-0-255-170-100), transparent 72%) !important;
-  box-shadow: inset 2px 0 0 var(--teal), inset 0 0 0 1px var(--ui-rgba-0-255-170-030);
+    linear-gradient(90deg, var(--ui-rgba-57-208-255-100), transparent 72%) !important;
+  box-shadow: inset 2px 0 0 var(--teal), inset 0 0 0 1px var(--ui-rgba-57-208-255-040);
 }
 
 .nav-item.Mui-selected .nav-item-icon,
@@ -2298,7 +2305,7 @@ body {
   border: 1px solid var(--surface-border);
   border-radius: var(--surface-radius-lg);
   background:
-    linear-gradient(180deg, var(--ui-rgba-0-255-170-020), transparent 46%),
+    linear-gradient(180deg, var(--ui-rgba-57-208-255-040), transparent 46%),
     var(--surface-bg);
   padding: var(--surface-padding);
   min-width: 0;
@@ -2729,6 +2736,10 @@ body {
 .term-content,
 .term-label,
 .term-detail,
+.computer-pane-stage,
+.cview-terminal-body,
+.cview-generic-body,
+.cview-generic-page-body,
 .activity-row-time,
 .activity-row-summary,
 .activity-payload-preview-text,
@@ -2972,7 +2983,7 @@ body {
 }
 
 .chat-search-brief-item::marker {
-  color: rgba(216, 173, 120, 0.86);
+  color: rgba(57, 208, 255, 0.86);
   font-weight: 760;
 }
 
@@ -3317,6 +3328,15 @@ body {
   font-size: 12px;
   color: var(--ui-rgba-227-241-255-960);
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.chat-md-code-plain {
+  margin: 0.55rem 0 0.8rem;
+  border: 1px solid var(--ui-rgba-255-255-255-070);
+  border-radius: 7px;
+  background: var(--ui-rgba-255-255-255-025);
+  color: var(--ui-rgba-229-234-241-920);
+  white-space: pre-wrap;
 }
 
 .chat-md-ide-pre {
@@ -4392,6 +4412,21 @@ body {
   box-shadow: var(--button-focus-ring) !important;
 }
 
+.activity-payload-actions {
+  flex: 0 0 auto;
+}
+
+.activity-payload-copy {
+  width: 24px !important;
+  height: 24px !important;
+  color: var(--button-text-muted) !important;
+}
+
+.activity-payload-copy:hover {
+  color: var(--button-text) !important;
+  background: var(--ui-rgba-255-255-255-060) !important;
+}
+
 .activity-payload-toggle-icon {
   transition: transform 0.2s ease;
 }
@@ -4411,6 +4446,43 @@ body {
   color: var(--text-secondary) !important;
   font-family: var(--font-sans) !important;
   font-size: 0.68rem !important;
+}
+
+.activity-payload-fields {
+  display: grid;
+  gap: 6px;
+  padding: 2px 0 4px;
+}
+
+.activity-payload-field {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.32fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 7px 0;
+  border-top: 1px solid var(--ui-rgba-255-255-255-050);
+}
+
+.activity-payload-field:first-child {
+  border-top: 0;
+}
+
+.activity-payload-field-label {
+  min-width: 0;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.activity-payload-field-value {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .activity-payload-pre {
@@ -4582,7 +4654,7 @@ body {
   word-break: break-word;
   font-size: 11.5px;
 }
-.term-dim { color: var(--ui-rgba-0-255-170-150); }
+.term-dim { color: var(--ui-rgba-57-208-255-150); }
 .term-cursor-line {
   padding-top: 0;
   padding-bottom: 4px;
@@ -4612,7 +4684,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 10px 14px;
-  border-top: 1px solid var(--ui-rgba-0-255-170-080);
+  border-top: 1px solid var(--ui-rgba-57-208-255-080);
   background: linear-gradient(180deg, var(--ui-rgba-5-10-19-920), var(--ui-rgba-4-8-16-980));
   white-space: nowrap;
   overflow: hidden;
@@ -6513,15 +6585,148 @@ body {
     linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880));
 }
 
-/* Warning tone keeps the AgentArk amber border (#ffbe63 ≈ rgba(255,181,86)) as
-   an accent but uses the standard dark green-tinted AgentArk surface as the
-   base, with only a faint amber wash at the top-left for visual hierarchy.
-   Previous warm-brown gradient (rgba(27,19,8) → rgba(12,10,5)) was off-palette. */
+/* Warning cards stay on the green-neutral AgentArk surface instead of the
+   older warm-brown treatment. */
 .settings-inline-card.tone-warning {
-  border-color: var(--ui-rgba-255-181-86-220);
+  border-color: rgba(57, 208, 255, 0.16);
   background:
-    radial-gradient(circle at top left, rgba(255, 190, 99, 0.06), transparent 38%),
-    linear-gradient(160deg, var(--cyber-panel-raised, #0a100d), var(--cyber-panel, #070b09));
+    radial-gradient(circle at top left, rgba(57, 208, 255, 0.055), transparent 38%),
+    linear-gradient(160deg, var(--cyber-panel-raised, #121316), var(--cyber-panel, #0d0e10));
+}
+
+.settings-security-panel {
+  container-type: inline-size;
+}
+
+.security-basics-panel {
+  border: 1px solid rgba(57, 208, 255, 0.14);
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at top left, rgba(57, 208, 255, 0.055), transparent 36%),
+    linear-gradient(180deg, rgba(20, 21, 23, 0.82), rgba(10, 11, 12, 0.68));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  padding: 14px;
+}
+
+.security-basics-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.security-basics-kicker {
+  color: rgba(57, 208, 255, 0.78) !important;
+  font-size: 0.64rem !important;
+  font-weight: 720 !important;
+  letter-spacing: 0 !important;
+  line-height: 1.2 !important;
+  text-transform: uppercase;
+}
+
+.security-basics-title {
+  color: rgba(246, 240, 232, 0.96) !important;
+  font-size: 1rem !important;
+  font-weight: 700 !important;
+  line-height: 1.25 !important;
+}
+
+.security-basics-description,
+.security-basics-row-copy,
+.security-accordion-copy {
+  color: rgba(226, 218, 208, 0.66) !important;
+  font-size: 0.8rem !important;
+  line-height: 1.45 !important;
+  letter-spacing: 0 !important;
+}
+
+.security-basics-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.security-basics-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 62px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.security-basics-row + .security-basics-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.security-basics-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  color: rgba(246, 240, 232, 0.84);
+}
+
+.security-basics-copy {
+  min-width: 0;
+}
+
+.security-basics-row-title,
+.security-accordion-title {
+  color: rgba(246, 240, 232, 0.94) !important;
+  font-size: 0.88rem !important;
+  font-weight: 680 !important;
+  line-height: 1.25 !important;
+}
+
+.security-accordion.MuiAccordion-root {
+  border: 1px solid rgba(255, 255, 255, 0.065);
+  border-radius: 8px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.008)),
+    rgba(10, 10, 10, 0.5) !important;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.security-accordion.MuiAccordion-root::before {
+  display: none;
+}
+
+.security-accordion .MuiAccordionSummary-root {
+  min-height: 54px;
+  padding: 0 14px;
+}
+
+.security-accordion .MuiAccordionSummary-content {
+  margin: 10px 0 !important;
+}
+
+.security-accordion .MuiAccordionDetails-root {
+  border-top: 1px solid rgba(255, 255, 255, 0.055);
+  padding: 12px 14px 14px;
+}
+
+.security-panel-details {
+  padding: 0 !important;
+}
+
+@container (max-width: 720px) {
+  .security-basics-row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+
+  .security-basics-row > .MuiChip-root,
+  .security-basics-row > .MuiButton-root,
+  .security-basics-row > .MuiStack-root {
+    grid-column: 2;
+    justify-self: start;
+  }
 }
 
 .settings-inline-card-head {
@@ -6845,7 +7050,7 @@ body {
 
 .settings-main .MuiAlert-standard.MuiAlert-colorWarning,
 .settings-page-shell .MuiAlert-standardWarning {
-  background: var(--ui-rgba-43-28-10-720) !important;
+  background: rgba(57, 208, 255, 0.08) !important;
 }
 
 .settings-main .MuiAlert-standard.MuiAlert-colorError,
@@ -8263,7 +8468,7 @@ body {
 }
 
 .bulk-import-source-card {
-  border: 1px solid var(--ui-rgba-0-255-170-100);
+  border: 1px solid var(--ui-rgba-57-208-255-100);
   border-radius: 8px;
   padding: 12px;
   background: var(--ui-rgba-2-8-16-500);
@@ -8282,7 +8487,7 @@ body {
 
 .bulk-import-table-shell {
   overflow-x: auto;
-  border: 1px solid var(--ui-rgba-0-255-170-060);
+  border: 1px solid var(--ui-rgba-57-208-255-060);
   border-radius: 8px;
   background: var(--ui-rgba-2-6-14-600);
 }
@@ -8297,8 +8502,8 @@ body {
   font-size: 10.5px;
   letter-spacing: 0;
   text-transform: uppercase;
-  color: var(--ui-rgba-0-255-170-400) !important;
-  border-bottom-color: var(--ui-rgba-0-255-170-080) !important;
+  color: var(--ui-rgba-57-208-255-350) !important;
+  border-bottom-color: var(--ui-rgba-57-208-255-080) !important;
 }
 
 .bulk-import-table th,
@@ -8308,11 +8513,11 @@ body {
 }
 
 .bulk-import-table td {
-  border-bottom-color: var(--ui-rgba-0-255-170-040) !important;
+  border-bottom-color: var(--ui-rgba-57-208-255-040) !important;
 }
 
 .bulk-import-table tbody tr:hover {
-  background: var(--ui-rgba-0-255-170-020);
+  background: var(--ui-rgba-57-208-255-040);
 }
 
 .bulk-import-col-select { width: 48px; }
@@ -9080,9 +9285,11 @@ body {
   gap: 12px;
   padding: 12px 16px;
   border-radius: 8px;
-  background: var(--ui-rgba-43-28-10-720);
-  border: 1px solid var(--ui-rgba-255-181-86-220);
-  color: var(--ui-rgba-236-214-167-860);
+  background:
+    radial-gradient(circle at top left, rgba(57, 208, 255, 0.045), transparent 34%),
+    var(--ui-rgba-255-255-255-030);
+  border: 1px solid rgba(57, 208, 255, 0.14);
+  color: var(--ui-rgba-218-232-255-920);
   font-size: 0.8rem;
   letter-spacing: 0;
   font-family: var(--font-mono);
@@ -9290,19 +9497,19 @@ body {
   --cyber-panel: rgba(18, 18, 20, 0.78);
   --cyber-panel-raised: rgba(23, 23, 26, 0.86);
   --cyber-panel-soft: rgba(16, 16, 18, 0.72);
-  --cyber-rain: rgba(207, 157, 106, 0.18);
-  --cyber-rain-faint: rgba(207, 157, 106, 0.06);
-  --cyber-rain-hot: rgba(230, 184, 124, 0.2);
+  --cyber-rain: rgba(57, 208, 255, 0.18);
+  --cyber-rain-faint: rgba(57, 208, 255, 0.06);
+  --cyber-rain-hot: rgba(255, 190, 99, 0.20);
   --cyber-grid: rgba(255, 255, 255, 0.035);
   --cyber-scanline: rgba(255, 255, 255, 0.025);
-  --cyan: #d8c2a6;
-  --cyan-glow: rgba(216, 173, 120, 0.18);
-  --cyan-subtle: rgba(216, 173, 120, 0.08);
-  --teal: #d8ad78;
-  --teal-glow: rgba(216, 173, 120, 0.22);
-  --green: #91d8a7;
-  --green-glow: rgba(145, 216, 167, 0.2);
-  --orange: #d8ad78;
+  --cyan: #7ce7ff;
+  --cyan-glow: rgba(124, 231, 255, 0.18);
+  --cyan-subtle: rgba(124, 231, 255, 0.08);
+  --teal: #7ce7ff;
+  --teal-glow: rgba(57, 208, 255, 0.22);
+  --green: #78f2b0;
+  --green-glow: rgba(57, 208, 255, 0.20);
+  --orange: #ffbe63;
   --red: #ff9b9b;
   --red-glow: rgba(255, 155, 155, 0.18);
   --purple: #d6c1ff;
@@ -9310,11 +9517,11 @@ body {
   --text-secondary: rgba(226, 218, 208, 0.72);
   --text-dim: rgba(226, 218, 208, 0.44);
   --border: rgba(255, 255, 255, 0.1);
-  --border-hover: rgba(216, 173, 120, 0.26);
+  --border-hover: rgba(57, 208, 255, 0.26);
   --bg-card: rgba(17, 17, 19, 0.76);
   --bg-surface: rgba(12, 12, 13, 0.72);
   --surface-border: rgba(255, 255, 255, 0.09);
-  --surface-border-strong: rgba(216, 173, 120, 0.26);
+  --surface-border-strong: rgba(57, 208, 255, 0.26);
   --surface-bg: linear-gradient(180deg, rgba(23, 23, 26, 0.84), rgba(10, 10, 10, 0.72));
   --surface-bg-elevated:
     radial-gradient(ellipse at 25% 0%, rgba(255, 255, 255, 0.055), transparent 44%),
@@ -9322,26 +9529,26 @@ body {
   --surface-shadow: 0 22px 52px rgba(0, 0, 0, 0.34);
   --surface-shadow-soft: 0 14px 32px rgba(0, 0, 0, 0.24);
   --micro-surface-border: rgba(255, 255, 255, 0.08);
-  --micro-surface-border-strong: rgba(216, 173, 120, 0.24);
+  --micro-surface-border-strong: rgba(57, 208, 255, 0.24);
   --micro-surface-bg:
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
     rgba(10, 10, 10, 0.58);
   --micro-surface-item-bg: rgba(255, 255, 255, 0.035);
   --micro-surface-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   --button-border: rgba(255, 255, 255, 0.12);
-  --button-border-strong: rgba(216, 173, 120, 0.3);
+  --button-border-strong: rgba(57, 208, 255, 0.3);
   --button-bg-subtle: rgba(255, 255, 255, 0.035);
   --button-bg-subtle-hover: rgba(255, 255, 255, 0.07);
-  --button-bg-primary: rgba(216, 173, 120, 0.18);
-  --button-bg-primary-hover: rgba(216, 173, 120, 0.26);
-  --button-bg-pressed: rgba(216, 173, 120, 0.13);
+  --button-bg-primary: rgba(57, 208, 255, 0.18);
+  --button-bg-primary-hover: rgba(57, 208, 255, 0.26);
+  --button-bg-pressed: rgba(57, 208, 255, 0.13);
   --button-text: rgba(246, 240, 232, 0.92);
   --button-text-muted: rgba(226, 218, 208, 0.72);
   --button-text-strong: #fff8ed;
   --button-shadow: none;
-  --button-shadow-hover: 0 0 0 1px rgba(216, 173, 120, 0.14);
-  --button-shadow-primary: 0 0 0 1px rgba(216, 173, 120, 0.18);
-  --button-focus-ring: 0 0 0 2px rgba(216, 173, 120, 0.24);
+  --button-shadow-hover: 0 0 0 1px rgba(57, 208, 255, 0.14);
+  --button-shadow-primary: 0 0 0 1px rgba(57, 208, 255, 0.18);
+  --button-focus-ring: 0 0 0 2px rgba(57, 208, 255, 0.24);
 }
 
 body {
@@ -9443,14 +9650,11 @@ body {
   padding: 12px 10px !important;
 }
 
-/* Kicker labels use a dim AgentArk green tint to align with the rest of the
-   Ark* surfaces. Was previously rgba(216,173,120,.74) — a warm tan that
-   clashed with the green/cyan-dominant theme. */
 .nav-group-label,
 .workspace-page-kicker,
 .settings-nav-group-label,
 .settings-section-kicker {
-  color: rgba(120, 242, 176, 0.62) !important;
+  color: rgba(57, 208, 255, 0.62) !important;
 }
 
 .nav-item {
@@ -9471,11 +9675,11 @@ body {
 .nav-item.Mui-selected,
 .sidebar-item-active,
 .MuiListItemButton-root.Mui-selected {
-  border-color: rgba(216, 173, 120, 0.28) !important;
-  border-left-color: rgba(216, 173, 120, 0.65) !important;
+  border-color: rgba(57, 208, 255, 0.28) !important;
+  border-left-color: rgba(57, 208, 255, 0.65) !important;
   background:
-    linear-gradient(90deg, rgba(216, 173, 120, 0.14), rgba(255, 255, 255, 0.025) 72%) !important;
-  box-shadow: inset 2px 0 0 rgba(216, 173, 120, 0.78) !important;
+    linear-gradient(90deg, rgba(57, 208, 255, 0.14), rgba(255, 255, 255, 0.025) 72%) !important;
+  box-shadow: inset 2px 0 0 rgba(57, 208, 255, 0.78) !important;
 }
 
 .nav-item.Mui-selected .nav-item-icon,
@@ -9494,7 +9698,7 @@ body {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
     rgba(10, 10, 10, 0.62) !important;
-  border-color: rgba(216, 173, 120, 0.15) !important;
+  border-color: rgba(57, 208, 255, 0.15) !important;
 }
 
 .workspace-page-copy,
@@ -9529,7 +9733,7 @@ body {
 }
 
 .attention-card {
-  border-color: rgba(216, 173, 120, 0.2) !important;
+  border-color: rgba(57, 208, 255, 0.2) !important;
 }
 
 .MuiButton-root,
@@ -9543,13 +9747,11 @@ body {
   border-radius: 999px !important;
 }
 
-/* Primary buttons use AgentArk green tint (was warm-tan rgba(216,173,120,*)).
-   Aligns Save / send buttons with the rest of the Ark* surfaces. */
 .MuiButton-contained,
 .chat-composer-send-btn,
 .chat-mode-toggle-btn.active {
-  border-color: rgba(120, 242, 176, 0.32) !important;
-  background: rgba(120, 242, 176, 0.16) !important;
+  border-color: rgba(57, 208, 255, 0.32) !important;
+  background: rgba(57, 208, 255, 0.16) !important;
   color: var(--button-text-strong) !important;
   box-shadow: var(--button-shadow-primary) !important;
 }
@@ -9557,7 +9759,7 @@ body {
 .MuiButton-contained:hover,
 .chat-composer-send-btn:hover,
 .chat-mode-toggle-btn.active:hover {
-  background: rgba(120, 242, 176, 0.24) !important;
+  background: rgba(57, 208, 255, 0.24) !important;
   box-shadow: var(--button-shadow-hover) !important;
 }
 
@@ -9576,7 +9778,7 @@ body {
 .chat-mode-toggle-btn:hover,
 .chat-composer-action-btn:hover,
 .settings-nav-btn:hover:not(.active) {
-  border-color: rgba(216, 173, 120, 0.22) !important;
+  border-color: rgba(57, 208, 255, 0.22) !important;
   background: rgba(255, 255, 255, 0.055) !important;
   color: var(--button-text) !important;
 }
@@ -9590,8 +9792,8 @@ body {
 
 .MuiTabs-indicator,
 .workspace-page-subnav-tabs .MuiTabs-indicator {
-  background-color: rgba(216, 173, 120, 0.9) !important;
-  box-shadow: 0 0 10px rgba(216, 173, 120, 0.22) !important;
+  background-color: rgba(57, 208, 255, 0.9) !important;
+  box-shadow: 0 0 10px rgba(57, 208, 255, 0.22) !important;
 }
 
 .workspace-page-subnav-tabs .MuiTab-root,
@@ -9601,7 +9803,7 @@ body {
 
 .workspace-page-subnav-tabs .Mui-selected,
 .MuiTab-root.Mui-selected {
-  background: rgba(216, 173, 120, 0.1) !important;
+  background: rgba(57, 208, 255, 0.1) !important;
   color: var(--text-primary) !important;
 }
 
@@ -9617,8 +9819,8 @@ body {
 
 .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline,
 .chat-composer-shell:focus-within {
-  border-color: rgba(216, 173, 120, 0.35) !important;
-  box-shadow: 0 0 0 2px rgba(216, 173, 120, 0.14) !important;
+  border-color: rgba(57, 208, 255, 0.35) !important;
+  box-shadow: 0 0 0 2px rgba(57, 208, 255, 0.14) !important;
 }
 
 .chat-reading-column {
@@ -9670,7 +9872,7 @@ body {
 .trace-stat-value--success,
 .mission-metric-card__value,
 .status-dot-online {
-  color: #91d8a7 !important;
+  color: #78f2b0 !important;
 }
 
 .trace-stat-value--error {
@@ -9709,29 +9911,29 @@ body {
 }
 
 .settings-page-header {
-  border-color: rgba(216, 173, 120, 0.14) !important;
+  border-color: rgba(57, 208, 255, 0.14) !important;
 }
 
 .settings-main .MuiAlert-standard.MuiAlert-colorInfo,
 .settings-page-shell .MuiAlert-standardInfo,
 .MuiAlert-standard.MuiAlert-colorInfo {
-  border-color: rgba(216, 173, 120, 0.18) !important;
-  background: rgba(216, 173, 120, 0.08) !important;
+  border-color: rgba(57, 208, 255, 0.18) !important;
+  background: rgba(57, 208, 255, 0.08) !important;
 }
 
 .settings-main .MuiAlert-standard.MuiAlert-colorWarning,
 .settings-page-shell .MuiAlert-standardWarning,
 .MuiAlert-standard.MuiAlert-colorWarning {
-  border-color: rgba(216, 173, 120, 0.22) !important;
-  background: rgba(216, 173, 120, 0.1) !important;
+  border-color: rgba(57, 208, 255, 0.22) !important;
+  background: rgba(57, 208, 255, 0.1) !important;
 }
 
 /* Border cleanup: keep the same theme without outlining every control. */
 :root {
   --surface-border: rgba(255, 255, 255, 0.065);
-  --surface-border-strong: rgba(216, 173, 120, 0.16);
+  --surface-border-strong: rgba(57, 208, 255, 0.16);
   --button-border: rgba(255, 255, 255, 0.08);
-  --button-border-strong: rgba(216, 173, 120, 0.18);
+  --button-border-strong: rgba(57, 208, 255, 0.18);
 }
 
 .list-shell,
@@ -9797,7 +9999,7 @@ body {
 }
 
 .settings-nav-btn.active {
-  background: rgba(216, 173, 120, 0.09) !important;
+  background: rgba(57, 208, 255, 0.09) !important;
   color: var(--text-primary) !important;
 }
 
@@ -9807,7 +10009,7 @@ body {
   align-self: stretch;
   margin: 7px 8px 7px -3px;
   border-radius: 999px;
-  background: rgba(216, 173, 120, 0.78);
+  background: rgba(57, 208, 255, 0.78);
 }
 
 .settings-nav-divider,
@@ -9847,8 +10049,8 @@ body {
 .chat-toolbar-btn.active,
 .activity-toggle-pill.active,
 .workspace-scope-menu-trigger[aria-expanded="true"] {
-  border-color: rgba(216, 173, 120, 0.18) !important;
-  background: rgba(216, 173, 120, 0.09) !important;
+  border-color: rgba(57, 208, 255, 0.18) !important;
+  background: rgba(57, 208, 255, 0.09) !important;
 }
 
 /* Final shared skin pass: remap legacy blue tokens and remove heavy outlines. */
@@ -9857,9 +10059,9 @@ body {
   --surface-radius-lg: 10px;
   --button-radius: 8px;
   --surface-border: rgba(255, 255, 255, 0.045);
-  --surface-border-strong: rgba(216, 173, 120, 0.12);
+  --surface-border-strong: rgba(57, 208, 255, 0.12);
   --micro-surface-border: rgba(255, 255, 255, 0.045);
-  --micro-surface-border-strong: rgba(216, 173, 120, 0.12);
+  --micro-surface-border-strong: rgba(57, 208, 255, 0.12);
   --surface-bg:
     linear-gradient(180deg, rgba(20, 20, 22, 0.68), rgba(8, 8, 9, 0.62));
   --surface-bg-elevated:
@@ -9879,34 +10081,34 @@ body {
   --ui-rgba-9-22-40-720: rgb(18 17 16 / 0.72);
   --ui-rgba-14-25-43-920: rgb(22 20 18 / 0.92);
   --ui-rgba-14-25-43-950: rgb(22 20 18 / 0.95);
-  --ui-rgba-15-68-110-180: rgb(216 173 120 / 0.14);
-  --ui-rgba-47-212-255-000: rgb(216 173 120 / 0);
-  --ui-rgba-47-212-255-060: rgb(216 173 120 / 0.06);
-  --ui-rgba-47-212-255-080: rgb(216 173 120 / 0.08);
-  --ui-rgba-47-212-255-120: rgb(216 173 120 / 0.12);
-  --ui-rgba-47-212-255-140: rgb(216 173 120 / 0.14);
-  --ui-rgba-47-212-255-160: rgb(216 173 120 / 0.16);
-  --ui-rgba-47-212-255-180: rgb(216 173 120 / 0.18);
-  --ui-rgba-47-212-255-200: rgb(216 173 120 / 0.2);
-  --ui-rgba-47-212-255-220: rgb(216 173 120 / 0.22);
-  --ui-rgba-47-212-255-280: rgb(216 173 120 / 0.28);
-  --ui-rgba-47-212-255-320: rgb(216 173 120 / 0.32);
-  --ui-rgba-47-212-255-350: rgb(216 173 120 / 0.35);
-  --ui-rgba-47-212-255-400: rgb(216 173 120 / 0.4);
-  --ui-rgba-47-212-255-480: rgb(216 173 120 / 0.48);
+  --ui-rgba-15-68-110-180: rgb(120 242 176 / 0.14);
+  --ui-rgba-47-212-255-000: rgb(120 242 176 / 0);
+  --ui-rgba-47-212-255-060: rgb(120 242 176 / 0.06);
+  --ui-rgba-47-212-255-080: rgb(120 242 176 / 0.08);
+  --ui-rgba-47-212-255-120: rgb(120 242 176 / 0.12);
+  --ui-rgba-47-212-255-140: rgb(120 242 176 / 0.14);
+  --ui-rgba-47-212-255-160: rgb(120 242 176 / 0.16);
+  --ui-rgba-47-212-255-180: rgb(120 242 176 / 0.18);
+  --ui-rgba-47-212-255-200: rgb(120 242 176 / 0.2);
+  --ui-rgba-47-212-255-220: rgb(120 242 176 / 0.22);
+  --ui-rgba-47-212-255-280: rgb(120 242 176 / 0.28);
+  --ui-rgba-47-212-255-320: rgb(120 242 176 / 0.32);
+  --ui-rgba-47-212-255-350: rgb(120 242 176 / 0.35);
+  --ui-rgba-47-212-255-400: rgb(120 242 176 / 0.4);
+  --ui-rgba-47-212-255-480: rgb(120 242 176 / 0.48);
   --ui-rgba-47-212-255-860: rgb(230 214 192 / 0.86);
   --ui-rgba-47-212-255-950: rgb(236 220 198 / 0.95);
-  --ui-rgba-64-196-255-240: rgb(216 173 120 / 0.16);
-  --ui-rgba-64-196-255-360: rgb(216 173 120 / 0.24);
+  --ui-rgba-64-196-255-240: rgb(120 242 176 / 0.16);
+  --ui-rgba-64-196-255-360: rgb(120 242 176 / 0.24);
   --ui-rgba-112-153-201-120: rgb(255 255 255 / 0.045);
   --ui-rgba-112-153-201-140: rgb(255 255 255 / 0.05);
   --ui-rgba-112-153-201-160: rgb(255 255 255 / 0.055);
   --ui-rgba-112-153-201-180: rgb(255 255 255 / 0.06);
-  --ui-rgba-112-153-201-260: rgb(216 173 120 / 0.14);
+  --ui-rgba-112-153-201-260: rgb(120 242 176 / 0.14);
   --ui-rgba-120-144-170-240: rgb(255 255 255 / 0.045);
   --ui-rgba-142-162-186-200: rgb(255 255 255 / 0.05);
-  --ui-rgba-158-186-218-360: rgb(216 173 120 / 0.14);
-  --ui-rgba-161-196-255-240: rgb(216 173 120 / 0.13);
+  --ui-rgba-158-186-218-360: rgb(120 242 176 / 0.14);
+  --ui-rgba-161-196-255-240: rgb(120 242 176 / 0.13);
   --ui-rgba-173-192-214-900: rgb(226 218 208 / 0.88);
   --ui-rgba-198-214-235-820: rgb(226 218 208 / 0.78);
   --ui-rgba-218-232-255-920: rgb(246 240 232 / 0.9);
@@ -9947,9 +10149,9 @@ body {
 
 .MuiButton-root.chat-starter-card:hover,
 .chat-starter-card:hover {
-  border-color: rgba(216, 173, 120, 0.08) !important;
+  border-color: rgba(57, 208, 255, 0.08) !important;
   background:
-    linear-gradient(180deg, rgba(216, 173, 120, 0.04), rgba(255, 255, 255, 0.008)),
+    linear-gradient(180deg, rgba(57, 208, 255, 0.04), rgba(255, 255, 255, 0.008)),
     rgba(12, 12, 13, 0.48) !important;
   box-shadow: none !important;
 }
@@ -9986,7 +10188,7 @@ body {
 
 .settings-nav-btn:hover:not(.active),
 .settings-nav-btn.active {
-  background: rgba(216, 173, 120, 0.055) !important;
+  background: rgba(57, 208, 255, 0.055) !important;
   color: rgba(246, 240, 232, 0.92) !important;
 }
 
@@ -10010,9 +10212,9 @@ body {
 .settings-page-shell [role="button"]:hover,
 .settings-page-shell .MuiGrid2-root > .MuiBox-root:not(.workspace-page-hero-shell):not(.settings-page-header):not(.list-shell):hover,
 .settings-page-shell .MuiCard-root:hover {
-  border-color: rgba(216, 173, 120, 0.12) !important;
+  border-color: rgba(57, 208, 255, 0.12) !important;
   background:
-    linear-gradient(180deg, rgba(216, 173, 120, 0.035), rgba(255, 255, 255, 0.01)),
+    linear-gradient(180deg, rgba(57, 208, 255, 0.035), rgba(255, 255, 255, 0.01)),
     rgba(12, 12, 13, 0.56) !important;
 }
 
@@ -10103,13 +10305,24 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 
+.MuiDialogContent-root:has(.settings-shell-layout) .settings-main .list-shell:not(.workspace-page-hero-shell),
+.MuiDialogContent-root:has(.settings-shell-layout) .settings-page-shell .list-shell:not(.workspace-page-hero-shell),
+.settings-main .list-shell:not(.workspace-page-hero-shell),
+.settings-page-shell .list-shell:not(.workspace-page-hero-shell) {
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
 .MuiPopover-paper.MuiMenu-paper,
 .MuiMenu-paper,
 .MuiAutocomplete-popper .MuiPaper-root {
   background:
-    radial-gradient(ellipse at 28% 0%, rgba(216, 173, 120, 0.07), transparent 44%),
+    radial-gradient(ellipse at 28% 0%, rgba(57, 208, 255, 0.07), transparent 44%),
     linear-gradient(180deg, rgba(24, 23, 22, 0.98), rgba(10, 10, 10, 0.98)) !important;
-  border: 1px solid rgba(216, 173, 120, 0.16) !important;
+  border: 1px solid rgba(57, 208, 255, 0.16) !important;
   color: rgba(246, 240, 232, 0.94) !important;
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.56) !important;
   backdrop-filter: blur(18px) saturate(1.08) !important;
@@ -10134,7 +10347,7 @@ body {
 .MuiMenuItem-root.Mui-selected:hover,
 .MuiAutocomplete-option.Mui-focused,
 .MuiAutocomplete-option[aria-selected="true"] {
-  background: rgba(216, 173, 120, 0.14) !important;
+  background: rgba(57, 208, 255, 0.14) !important;
   color: #fff8ed !important;
 }
 
@@ -10204,7 +10417,7 @@ body .chat-composer-options-menu .chat-composer-menu-check.Mui-checked {
 .table-shell th,
 .diagnostics-table-shell th,
 .bulk-import-table th {
-  color: rgba(216, 173, 120, 0.74) !important;
+  color: rgba(57, 208, 255, 0.74) !important;
 }
 
 .table-shell .MuiTableCell-root,
@@ -10224,25 +10437,25 @@ body .chat-composer-options-menu .chat-composer-menu-check.Mui-checked {
 /* Console alignment: Run Details, live console, and trace console share the app skin. */
 :root {
   --activity-divider: rgba(255, 255, 255, 0.055);
-  --activity-hover-bg: rgba(216, 173, 120, 0.045);
-  --activity-active-bg: rgba(216, 173, 120, 0.075);
-  --activity-active-border: rgba(216, 173, 120, 0.72);
-  --activity-tone-default: #d8ad78;
-  --activity-tone-running: #d8ad78;
-  --activity-tone-done: #91d8a7;
-  --activity-tone-planning: #d8ad78;
+  --activity-hover-bg: rgba(57, 208, 255, 0.045);
+  --activity-active-bg: rgba(57, 208, 255, 0.075);
+  --activity-active-border: rgba(57, 208, 255, 0.72);
+  --activity-tone-default: #7ce7ff;
+  --activity-tone-running: #7ce7ff;
+  --activity-tone-done: #78f2b0;
+  --activity-tone-planning: #ffbe63;
   --activity-tone-issue: #ff9b9b;
-  --activity-pill-bg: rgba(216, 173, 120, 0.08);
-  --activity-pill-border: rgba(216, 173, 120, 0.18);
+  --activity-pill-bg: rgba(57, 208, 255, 0.08);
+  --activity-pill-border: rgba(57, 208, 255, 0.18);
   --activity-pill-text: rgba(246, 240, 232, 0.82);
   --activity-payload-bg: rgba(10, 10, 10, 0.5);
   --activity-payload-code-bg: rgba(7, 7, 8, 0.72);
   --activity-payload-code-border: rgba(255, 255, 255, 0.055);
   --activity-panel-bg:
-    radial-gradient(ellipse at 28% 0%, rgba(216, 173, 120, 0.045), transparent 45%),
+    radial-gradient(ellipse at 28% 0%, rgba(57, 208, 255, 0.045), transparent 45%),
     linear-gradient(180deg, rgba(20, 20, 22, 0.64), rgba(8, 8, 9, 0.54));
   --activity-panel-border: rgba(255, 255, 255, 0.055);
-  --activity-panel-border-warning: rgba(216, 173, 120, 0.22);
+  --activity-panel-border-warning: rgba(57, 208, 255, 0.22);
   --activity-subpanel-bg: rgba(10, 10, 10, 0.48);
 }
 
@@ -10255,19 +10468,19 @@ body .chat-composer-options-menu .chat-composer-menu-check.Mui-checked {
 }
 
 .chat-workspace-sections {
-  scrollbar-color: rgba(216, 173, 120, 0.22) transparent !important;
+  scrollbar-color: rgba(57, 208, 255, 0.22) transparent !important;
 }
 
 .chat-workspace-sections::-webkit-scrollbar-thumb,
 .term-body::-webkit-scrollbar-thumb,
 .console-scroll::-webkit-scrollbar-thumb {
-  background: rgba(216, 173, 120, 0.22) !important;
+  background: rgba(57, 208, 255, 0.22) !important;
 }
 
 .chat-activity-intro-kicker,
 .live-console-eyebrow,
 .trace-console-accordion-header .MuiTypography-caption {
-  color: rgba(216, 173, 120, 0.66) !important;
+  color: rgba(57, 208, 255, 0.66) !important;
 }
 
 .chat-activity-intro-title,
@@ -10316,7 +10529,7 @@ body .chat-composer-options-menu .chat-composer-menu-check.Mui-checked {
 .live-console-summary-label,
 .activity-payload-body-label,
 .activity-signal-label {
-  color: rgba(216, 173, 120, 0.62) !important;
+  color: rgba(57, 208, 255, 0.62) !important;
 }
 
 .term-titlebar-stats,
@@ -10329,19 +10542,19 @@ body .chat-composer-options-menu .chat-composer-menu-check.Mui-checked {
 .term-line-active,
 .activity-timeline-row:hover,
 .live-console-entry:hover {
-  background: rgba(216, 173, 120, 0.055) !important;
+  background: rgba(57, 208, 255, 0.055) !important;
 }
 
 .term-prompt {
-  color: rgba(216, 173, 120, 0.68) !important;
+  color: rgba(57, 208, 255, 0.68) !important;
 }
 
 .term-badge,
 .activity-kind-pill,
 .live-console-entry-badge,
 .live-console-status-chip {
-  border-color: rgba(216, 173, 120, 0.18) !important;
-  background: rgba(216, 173, 120, 0.09) !important;
+  border-color: rgba(57, 208, 255, 0.18) !important;
+  background: rgba(57, 208, 255, 0.09) !important;
   color: rgba(246, 240, 232, 0.86) !important;
 }
 
@@ -10456,8 +10669,8 @@ select,
   min-height: 22px;
   max-width: min(100%, 280px);
   border-radius: 999px;
-  border: 1px solid rgba(216, 173, 120, 0.32);
-  background: rgba(216, 173, 120, 0.08);
+  border: 1px solid rgba(57, 208, 255, 0.32);
+  background: rgba(57, 208, 255, 0.08);
   color: rgba(255, 238, 210, 0.94);
   padding: 3px 8px;
   font-size: 0.68rem;
@@ -10685,7 +10898,7 @@ select,
 .chat-live-work-panel {
   width: min(100%, 760px);
   min-width: 0;
-  border: 1px solid rgba(216, 173, 120, 0.16);
+  border: 1px solid rgba(57, 208, 255, 0.16);
   border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.006)),
@@ -10762,7 +10975,7 @@ select,
   align-items: center;
   gap: 8px;
   border-radius: 8px;
-  border: 1px solid rgba(216, 173, 120, 0.16);
+  border: 1px solid rgba(57, 208, 255, 0.16);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0.006)),
     rgba(10, 10, 10, 0.5);
@@ -10773,7 +10986,7 @@ select,
 }
 
 .chat-transcript-action-row:hover {
-  border-color: rgba(216, 173, 120, 0.3);
+  border-color: rgba(57, 208, 255, 0.3);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012)),
     rgba(18, 18, 18, 0.62);
@@ -10798,7 +11011,7 @@ select,
 }
 
 .chat-transcript-action-row:focus-visible {
-  outline: 2px solid rgba(216, 173, 120, 0.5);
+  outline: 2px solid rgba(57, 208, 255, 0.5);
   outline-offset: 2px;
 }
 
@@ -10806,7 +11019,7 @@ select,
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: rgba(216, 173, 120, 0.76);
+  color: rgba(57, 208, 255, 0.76);
   font-size: 16px;
 }
 
@@ -10814,9 +11027,9 @@ select,
   width: 13px;
   height: 13px;
   border-radius: 999px;
-  border: 2px solid rgba(216, 173, 120, 0.18);
-  border-top-color: rgba(216, 173, 120, 0.92);
-  box-shadow: 0 0 10px rgba(216, 173, 120, 0.16);
+  border: 2px solid rgba(57, 208, 255, 0.18);
+  border-top-color: rgba(57, 208, 255, 0.92);
+  box-shadow: 0 0 10px rgba(57, 208, 255, 0.16);
   animation: chat-transcript-spin 820ms linear infinite;
 }
 
@@ -10882,8 +11095,8 @@ select,
   min-width: 20px;
   height: 18px;
   border-radius: 999px;
-  border: 1px solid rgba(216, 173, 120, 0.16);
-  background: rgba(216, 173, 120, 0.08);
+  border: 1px solid rgba(57, 208, 255, 0.16);
+  background: rgba(57, 208, 255, 0.08);
   color: rgba(226, 218, 208, 0.68);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -10899,13 +11112,13 @@ select,
 
 .chat-transcript-action-shell.is-expanded .chat-transcript-action-chevron {
   transform: rotate(180deg);
-  color: rgba(216, 173, 120, 0.78);
+  color: rgba(57, 208, 255, 0.78);
 }
 
 .chat-transcript-action-details {
   margin: 6px 0 2px 18px;
   padding: 2px 0 2px 14px;
-  border-left: 1px solid rgba(216, 173, 120, 0.16);
+  border-left: 1px solid rgba(57, 208, 255, 0.16);
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -10937,7 +11150,7 @@ select,
 }
 
 .chat-transcript-action-detail-row:focus-visible {
-  outline: 2px solid rgba(216, 173, 120, 0.45);
+  outline: 2px solid rgba(57, 208, 255, 0.45);
   outline-offset: 2px;
 }
 
@@ -10946,11 +11159,11 @@ select,
   height: 6px;
   margin-top: 6px;
   border-radius: 999px;
-  background: rgba(216, 173, 120, 0.5);
+  background: rgba(57, 208, 255, 0.5);
 }
 
 .chat-transcript-action-detail-row.status-running .chat-transcript-action-detail-dot {
-  background: rgba(216, 173, 120, 0.82);
+  background: rgba(57, 208, 255, 0.82);
   animation: chat-transcript-pulse 1.1s ease-in-out infinite;
 }
 
@@ -11003,7 +11216,7 @@ select,
 .chat-live-work-eyebrow {
   display: block;
   margin-bottom: 5px !important;
-  color: rgba(216, 173, 120, 0.7) !important;
+  color: rgba(57, 208, 255, 0.7) !important;
   font-family: var(--font-sans) !important;
   font-size: 0.66rem !important;
   font-weight: 720 !important;
@@ -11030,12 +11243,12 @@ select,
   margin-top: 7px;
   border-radius: 999px;
   background: var(--activity-tone-planning);
-  box-shadow: 0 0 0 3px rgba(216, 173, 120, 0.12);
+  box-shadow: 0 0 0 3px rgba(57, 208, 255, 0.12);
 }
 
 .chat-public-progress.is-live .chat-public-progress-dot {
   background: var(--activity-tone-running);
-  box-shadow: 0 0 0 3px rgba(216, 173, 120, 0.14);
+  box-shadow: 0 0 0 3px rgba(57, 208, 255, 0.14);
   animation: chatPublicProgressPulse 1.4s ease-in-out infinite;
 }
 
@@ -11049,7 +11262,7 @@ select,
   justify-content: stretch !important;
   border-radius: 8px !important;
   padding: 9px 10px !important;
-  border: 1px solid rgba(216, 173, 120, 0.16) !important;
+  border: 1px solid rgba(57, 208, 255, 0.16) !important;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.008)),
     rgba(10, 10, 10, 0.5) !important;
@@ -11077,15 +11290,15 @@ select,
 }
 
 .chat-inline-run-card.MuiButton-root:hover {
-  border-color: rgba(216, 173, 120, 0.28) !important;
+  border-color: rgba(57, 208, 255, 0.28) !important;
   background:
-    linear-gradient(180deg, rgba(216, 173, 120, 0.055), rgba(255, 255, 255, 0.01)),
+    linear-gradient(180deg, rgba(57, 208, 255, 0.055), rgba(255, 255, 255, 0.01)),
     rgba(10, 10, 10, 0.58) !important;
 }
 
 .chat-inline-run-card.is-live .chat-public-progress-dot {
   background: var(--activity-tone-running);
-  box-shadow: 0 0 0 3px rgba(216, 173, 120, 0.14);
+  box-shadow: 0 0 0 3px rgba(57, 208, 255, 0.14);
   animation: chatPublicProgressPulse 1.4s ease-in-out infinite;
 }
 
@@ -11096,7 +11309,7 @@ select,
 }
 
 .chat-inline-run-kicker {
-  color: rgba(216, 173, 120, 0.72);
+  color: rgba(57, 208, 255, 0.72);
   font-size: 0.62rem;
   font-weight: 720;
   line-height: 1.15;
@@ -11324,7 +11537,7 @@ select,
 .chat-stream-section-kicker {
   display: block;
   margin-bottom: 6px !important;
-  color: rgba(216, 173, 120, 0.72) !important;
+  color: rgba(57, 208, 255, 0.72) !important;
   font-family: var(--font-sans) !important;
   font-size: 0.62rem !important;
   font-weight: 760 !important;
@@ -11384,7 +11597,7 @@ select,
   align-self: flex-start;
   min-height: 26px !important;
   padding: 0 8px !important;
-  border: 1px solid rgba(216, 173, 120, 0.14) !important;
+  border: 1px solid rgba(57, 208, 255, 0.14) !important;
   border-radius: 999px !important;
   background: rgba(10, 10, 10, 0.48) !important;
   color: rgba(226, 218, 208, 0.68) !important;
@@ -11409,7 +11622,7 @@ select,
 }
 
 .chat-inline-task-toggle-kicker {
-  color: rgba(216, 173, 120, 0.72);
+  color: rgba(57, 208, 255, 0.72);
   font-size: 0.62rem;
   font-weight: 700;
   line-height: 1.15;
@@ -11434,8 +11647,8 @@ select,
 }
 
 .chat-inline-activity-toggle:hover {
-  border-color: rgba(216, 173, 120, 0.24) !important;
-  background: rgba(216, 173, 120, 0.08) !important;
+  border-color: rgba(57, 208, 255, 0.24) !important;
+  background: rgba(57, 208, 255, 0.08) !important;
   color: rgba(246, 240, 232, 0.92) !important;
 }
 
@@ -11466,9 +11679,9 @@ select,
 }
 
 .chat-inline-activity-card.is-active {
-  border-color: rgba(216, 173, 120, 0.22) !important;
+  border-color: rgba(57, 208, 255, 0.22) !important;
   background:
-    linear-gradient(180deg, rgba(216, 173, 120, 0.045), rgba(255, 255, 255, 0.006)),
+    linear-gradient(180deg, rgba(57, 208, 255, 0.045), rgba(255, 255, 255, 0.006)),
     rgba(10, 10, 10, 0.56) !important;
 }
 
@@ -11477,7 +11690,7 @@ select,
 }
 
 .chat-inline-activity-kind {
-  color: rgba(216, 173, 120, 0.7) !important;
+  color: rgba(57, 208, 255, 0.7) !important;
   font-size: 0.62rem !important;
   line-height: 1.25 !important;
 }
@@ -11683,7 +11896,7 @@ select,
 /* Status: a thin left accent stripe instead of full-card tint. Cleaner read
    at a glance, doesn't shout, matches Kimi-style restraint. */
 .action-chip.status-running {
-  border-left: 2px solid rgba(216, 173, 120, 0.6);
+  border-left: 2px solid rgba(57, 208, 255, 0.6);
 }
 .action-chip.status-done {
   border-left: 2px solid rgba(74, 210, 157, 0.5);
@@ -11702,7 +11915,7 @@ select,
 }
 
 .action-chip.status-running .action-chip-icon {
-  color: rgba(216, 173, 120, 0.86);
+  color: rgba(57, 208, 255, 0.86);
 }
 .action-chip.status-done .action-chip-icon {
   color: rgba(74, 210, 157, 0.86);
@@ -11768,7 +11981,7 @@ select,
 
 .action-chip.status-running .action-chip-status,
 .action-chip-spinner {
-  color: rgba(216, 173, 120, 0.78) !important;
+  color: rgba(57, 208, 255, 0.78) !important;
 }
 .action-chip.status-done .action-chip-status,
 .action-chip-status-icon.is-done {
@@ -11857,7 +12070,7 @@ select,
 }
 
 .computer-pane-eyebrow {
-  color: rgba(216, 173, 120, 0.66) !important;
+  color: rgba(57, 208, 255, 0.66) !important;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   font-size: 10px;
@@ -11881,7 +12094,7 @@ select,
   display: inline-flex;
   align-items: center;
   background: rgba(10, 10, 10, 0.48);
-  border: 1px solid rgba(216, 173, 120, 0.2);
+  border: 1px solid rgba(57, 208, 255, 0.2);
   border-radius: 999px;
   padding: 2px;
   gap: 2px;
@@ -11905,20 +12118,20 @@ select,
 }
 
 .computer-pane-tab:hover {
-  background: rgba(216, 173, 120, 0.06);
+  background: rgba(57, 208, 255, 0.06);
   color: rgba(246, 240, 232, 0.9);
 }
 
 .computer-pane-tab.is-active {
   background: linear-gradient(
     180deg,
-    rgba(216, 173, 120, 0.18),
-    rgba(216, 173, 120, 0.08)
+    rgba(57, 208, 255, 0.18),
+    rgba(57, 208, 255, 0.08)
   );
   color: rgba(255, 244, 226, 0.96);
   box-shadow:
-    inset 0 0 0 1px rgba(216, 173, 120, 0.38),
-    0 0 18px rgba(216, 173, 120, 0.08);
+    inset 0 0 0 1px rgba(57, 208, 255, 0.38),
+    0 0 18px rgba(57, 208, 255, 0.08);
 }
 
 .computer-pane-body {
@@ -11965,8 +12178,8 @@ select,
 
 .computer-pane-follow-button {
   appearance: none;
-  background: rgba(216, 173, 120, 0.08);
-  border: 1px solid rgba(216, 173, 120, 0.18);
+  background: rgba(57, 208, 255, 0.08);
+  border: 1px solid rgba(57, 208, 255, 0.18);
   border-radius: 999px;
   padding: 2px 10px;
   color: rgba(226, 218, 208, 0.7);
@@ -11980,11 +12193,19 @@ select,
 
 .computer-pane-follow-button:hover {
   color: rgba(255, 244, 226, 0.94);
-  border-color: rgba(216, 173, 120, 0.34);
+  border-color: rgba(57, 208, 255, 0.34);
 }
 
 .computer-pane-stage {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   padding: 0 4px 8px;
+}
+
+.computer-pane-stage > .cview {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .computer-pane-files-section {
@@ -12047,7 +12268,7 @@ select,
 }
 
 .computer-pane-files-collapse:hover {
-  background: rgba(216, 173, 120, 0.08) !important;
+  background: rgba(57, 208, 255, 0.08) !important;
   color: rgba(255, 244, 226, 0.94) !important;
 }
 
@@ -12145,6 +12366,7 @@ select,
   overflow: hidden;
   background: var(--ui-rgba-5-11-21-720);
   position: relative;
+  min-height: 100%;
 }
 
 .cview-terminal::before {
@@ -12213,7 +12435,19 @@ select,
   color: var(--ui-rgba-255-202-202-960);
 }
 
+.cview-terminal-copy {
+  width: 28px !important;
+  height: 28px !important;
+  color: var(--ui-rgba-184-191-201-720) !important;
+}
+
+.cview-terminal-copy:hover {
+  color: var(--ui-rgba-226-241-255-940) !important;
+  background: var(--ui-rgba-255-255-255-060) !important;
+}
+
 .cview-terminal-body {
+  flex: 1 1 auto;
   margin: 0;
   padding: 10px 12px;
   font-family: var(--font-mono);
@@ -12223,7 +12457,8 @@ select,
   background: transparent;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 60vh;
+  min-height: min(420px, 58vh);
+  max-height: none;
   overflow: auto;
   position: relative;
   z-index: 1;
@@ -12530,8 +12765,8 @@ select,
 }
 
 .computer-pane-activity-row.is-active .computer-pane-activity-button {
-  background: rgba(216, 173, 120, 0.07);
-  box-shadow: inset 0 0 0 1px rgba(216, 173, 120, 0.24);
+  background: rgba(57, 208, 255, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(57, 208, 255, 0.24);
 }
 
 .computer-pane-activity-kind {
@@ -12656,6 +12891,9 @@ select,
 }
 
 .cview-generic {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
   border: 1px solid var(--ui-rgba-118-152-190-120);
   border-radius: 8px;
   background: var(--ui-rgba-5-11-21-720);
@@ -12697,8 +12935,66 @@ select,
 .cview-generic-items {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
   gap: 8px;
   padding: 8px;
+}
+
+.cview-generic-pager {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cview-generic > .cview-generic-pager {
+  padding: 8px;
+}
+
+.cview-generic-page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--ui-rgba-118-152-190-080);
+  border-radius: 6px;
+  background: var(--ui-rgba-255-255-255-020);
+}
+
+.cview-generic-page-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.cview-generic-page-controls {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.cview-generic-page-count {
+  min-width: 42px;
+  color: var(--ui-rgba-184-191-201-720);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-align: center;
+}
+
+.cview-generic-action {
+  width: 28px !important;
+  height: 28px !important;
+  color: var(--ui-rgba-184-191-201-720) !important;
+}
+
+.cview-generic-action:hover {
+  color: var(--ui-rgba-226-241-255-940) !important;
+  background: var(--ui-rgba-255-255-255-060) !important;
 }
 
 .cview-generic-item {
@@ -12767,9 +13063,11 @@ select,
 }
 
 .cview-generic-body {
+  flex: 1 1 auto;
   margin: 0;
   padding: 10px 12px;
-  max-height: 60vh;
+  min-height: min(420px, 58vh);
+  max-height: none;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -12777,6 +13075,12 @@ select,
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
+}
+
+.cview-generic-page-body {
+  border: 1px solid var(--ui-rgba-118-152-190-080);
+  border-radius: 6px;
+  background: rgba(5, 8, 14, 0.58);
 }
 
 .cview-generic-empty {
@@ -13020,8 +13324,8 @@ select,
 }
 
 .trace-row.is-active {
-  border-color: rgba(216, 173, 120, 0.34);
-  box-shadow: inset 0 0 0 1px rgba(216, 173, 120, 0.12);
+  border-color: rgba(57, 208, 255, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(57, 208, 255, 0.12);
 }
 
 .trace-row-button {
@@ -13846,10 +14150,10 @@ select,
 .orbit-system-banner {
   margin-bottom: 28px;
   padding: 22px 26px;
-  border: 1px solid var(--ui-rgba-0-255-170-080);
+  border: 1px solid var(--ui-rgba-57-208-255-080);
   border-radius: 10px;
   background:
-    radial-gradient(circle at 0% 0%, var(--ui-rgba-0-255-170-040), transparent 55%),
+    radial-gradient(circle at 0% 0%, var(--ui-rgba-57-208-255-040), transparent 55%),
     linear-gradient(180deg, rgba(7, 13, 18, 0.92), rgba(5, 9, 12, 0.96));
   font-family: var(--font-display);
   max-width: min(880px, 100%);
@@ -13894,8 +14198,8 @@ select,
   gap: 6px;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid var(--ui-rgba-0-255-170-080);
-  background: var(--ui-rgba-0-255-170-040);
+  border: 1px solid var(--ui-rgba-57-208-255-080);
+  background: var(--ui-rgba-57-208-255-040);
   color: var(--cyan-glow);
   font-size: 0.7rem;
   letter-spacing: 0.08em;
@@ -13922,7 +14226,7 @@ select,
 .arkorbit-new-button.MuiButton-root,
 .arkorbit-orbit-menu-button.MuiButton-root {
   position: relative;
-  border: 1px solid var(--ui-rgba-0-255-170-150) !important;
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
   background: rgba(7, 13, 18, 0.6) !important;
   color: var(--ui-rgba-236-240-245-920) !important;
   letter-spacing: 0.06em;
@@ -13968,11 +14272,11 @@ select,
 .arkorbit-new-button.MuiButton-root:hover,
 .arkorbit-orbit-menu-button.MuiButton-root:hover {
   border-color: var(--green-glow) !important;
-  background: var(--ui-rgba-0-255-170-080) !important;
+  background: var(--ui-rgba-57-208-255-080) !important;
   color: var(--green-glow) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-150),
-    0 0 18px var(--ui-rgba-0-255-170-150);
+    0 0 0 1px var(--ui-rgba-57-208-255-150),
+    0 0 18px var(--ui-rgba-57-208-255-150);
 }
 
 .arkorbit-toolbar-icon.MuiIconButton-root:hover::before,
@@ -14189,8 +14493,8 @@ select,
   cursor: grab;
   background-color: var(--ui-rgba-0-0-0-400);
   background-image:
-    linear-gradient(var(--ui-rgba-0-255-170-040) 1px, transparent 1px),
-    linear-gradient(90deg, var(--ui-rgba-0-255-170-040) 1px, transparent 1px);
+    linear-gradient(var(--ui-rgba-57-208-255-040) 1px, transparent 1px),
+    linear-gradient(90deg, var(--ui-rgba-57-208-255-040) 1px, transparent 1px);
   background-size: 48px 48px, 48px 48px;
   touch-action: none;
 }
@@ -14210,7 +14514,7 @@ select,
   padding: 0.3rem 0.55rem;
   border-radius: 999px;
   background: var(--ui-rgba-0-0-0-400);
-  border: 1px solid var(--ui-rgba-0-255-170-080);
+  border: 1px solid var(--ui-rgba-57-208-255-080);
   box-shadow: var(--surface-shadow-soft, 0 6px 14px rgba(0, 0, 0, 0.3));
   z-index: 4;
   pointer-events: auto;
@@ -14235,7 +14539,7 @@ select,
   text-align: center;
   padding: 1rem 1.25rem;
   border-radius: 14px;
-  border: 1px dashed var(--ui-rgba-0-255-170-080);
+  border: 1px dashed var(--ui-rgba-57-208-255-080);
   background: var(--ui-rgba-0-0-0-300);
   color: var(--text-secondary);
   pointer-events: none;
@@ -14248,7 +14552,7 @@ select,
   display: flex;
   flex-direction: column;
   border-radius: 12px;
-  border: 1px solid var(--ui-rgba-0-255-170-080);
+  border: 1px solid var(--ui-rgba-57-208-255-080);
   background: var(--ui-rgba-0-0-0-400);
   box-shadow: var(--surface-shadow, 0 12px 28px rgba(0, 0, 0, 0.45));
   overflow: hidden;
@@ -14269,7 +14573,7 @@ select,
   text-transform: uppercase;
   color: var(--text-secondary);
   background: var(--ui-rgba-0-0-0-300);
-  border-bottom: 1px solid var(--ui-rgba-0-255-170-040);
+  border-bottom: 1px solid var(--ui-rgba-57-208-255-040);
   cursor: grab;
   user-select: none;
 }
@@ -14321,7 +14625,7 @@ select,
   padding: 0.15rem;
   border-radius: 999px;
   background: var(--ui-rgba-0-0-0-400);
-  border: 1px solid var(--ui-rgba-0-255-170-080);
+  border: 1px solid var(--ui-rgba-57-208-255-080);
   z-index: 3;
 }
 .orbit-widget-action.MuiIconButton-root {
@@ -14345,7 +14649,7 @@ select,
   height: 14px;
   cursor: nwse-resize;
   background:
-    linear-gradient(135deg, transparent 0 50%, var(--ui-rgba-0-255-170-150) 50% 100%);
+    linear-gradient(135deg, transparent 0 50%, var(--ui-rgba-57-208-255-150) 50% 100%);
   border-bottom-right-radius: 12px;
 }
 
@@ -14728,7 +15032,7 @@ select,
   height: 6px;
   border-radius: 50%;
   background: var(--green-glow);
-  box-shadow: 0 0 0 2px var(--ui-rgba-0-255-170-040), 0 0 10px var(--green-glow);
+  box-shadow: 0 0 0 2px var(--ui-rgba-57-208-255-040), 0 0 10px var(--green-glow);
   animation: orbit-status-pulse 2.4s ease-in-out infinite;
 }
 .orbit-chat-panel-failed .orbit-chat-subtitle::before {
@@ -14746,7 +15050,7 @@ select,
 
 .orbit-chat-tool.MuiIconButton-root {
   position: relative;
-  border: 1px solid var(--ui-rgba-0-255-170-150) !important;
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
   border-radius: 6px !important;
   background: rgba(7, 13, 18, 0.6) !important;
   transition: border-color 200ms ease, background 200ms ease, box-shadow 200ms ease, color 200ms ease;
@@ -14778,8 +15082,8 @@ select,
 .orbit-chat-tool.MuiIconButton-root:hover {
   border-color: var(--green-glow) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-080),
-    0 0 14px var(--ui-rgba-0-255-170-150);
+    0 0 0 1px var(--ui-rgba-57-208-255-080),
+    0 0 14px var(--ui-rgba-57-208-255-150);
 }
 .orbit-chat-tool.MuiIconButton-root:hover::before,
 .orbit-chat-tool.MuiIconButton-root:hover::after {
@@ -14936,19 +15240,19 @@ select,
 .orbit-chat-input:focus {
   border-color: var(--green-glow) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-080),
-    0 0 14px var(--ui-rgba-0-255-170-100);
+    0 0 0 1px var(--ui-rgba-57-208-255-080),
+    0 0 14px var(--ui-rgba-57-208-255-100);
 }
 
 .orbit-chat-send-icon.MuiIconButton-root {
   position: relative;
-  border: 1px solid var(--ui-rgba-0-255-170-150) !important;
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
   border-radius: 8px !important;
-  background: var(--ui-rgba-0-255-170-080) !important;
+  background: var(--ui-rgba-57-208-255-080) !important;
   color: var(--green-glow) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-080),
-    0 0 16px var(--ui-rgba-0-255-170-100);
+    0 0 0 1px var(--ui-rgba-57-208-255-080),
+    0 0 16px var(--ui-rgba-57-208-255-100);
   transition: border-color 200ms ease, background 200ms ease, box-shadow 200ms ease;
 }
 .orbit-chat-send-icon.MuiIconButton-root::before {
@@ -14976,10 +15280,10 @@ select,
   transition: width 200ms ease, height 200ms ease;
 }
 .orbit-chat-send-icon.MuiIconButton-root:hover {
-  background: var(--ui-rgba-0-255-170-150) !important;
+  background: var(--ui-rgba-57-208-255-150) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-150),
-    0 0 24px var(--ui-rgba-0-255-170-150);
+    0 0 0 1px var(--ui-rgba-57-208-255-150),
+    0 0 24px var(--ui-rgba-57-208-255-150);
 }
 .orbit-chat-send-icon.MuiIconButton-root:hover::before,
 .orbit-chat-send-icon.MuiIconButton-root:hover::after {
@@ -14987,14 +15291,14 @@ select,
   height: 10px;
 }
 .orbit-chat-send-icon.MuiIconButton-root.Mui-disabled {
-  border-color: var(--ui-rgba-0-255-170-080) !important;
+  border-color: var(--ui-rgba-57-208-255-080) !important;
   background: rgba(7, 13, 18, 0.4) !important;
   color: rgba(237, 247, 244, 0.4) !important;
   box-shadow: none;
 }
 .orbit-chat-send-icon.MuiIconButton-root.Mui-disabled::before,
 .orbit-chat-send-icon.MuiIconButton-root.Mui-disabled::after {
-  border-color: var(--ui-rgba-0-255-170-080);
+  border-color: var(--ui-rgba-57-208-255-080);
 }
 
 .orbit-chat-activity {
@@ -15208,6 +15512,39 @@ select,
   margin-block: 0.45em 0.55em;
 }
 
+/* Responsive chat reading width.
+   Assistant reports should use the available chat column instead of staying
+   capped at article width, especially when Run Details is open. */
+.chat-shell {
+  --chat-response-max-width: min(100%, clamp(760px, 78vw, 1180px));
+}
+
+.chat-shell .chat-thread .chat-row:not(.chat-row-user):not(.chat-row-live-work):not(.chat-row-interrupted-work) {
+  align-items: flex-start;
+}
+
+.chat-shell .chat-thread .chat-row:not(.chat-row-user):not(.chat-row-live-work):not(.chat-row-interrupted-work)
+  .chat-bubble-assistant:not(.chat-bubble-plan-confirmation),
+.chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) {
+  flex: 1 1 auto;
+  width: var(--chat-response-max-width) !important;
+  max-width: var(--chat-response-max-width) !important;
+  min-width: 0;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-markdown,
+.chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) .chat-markdown,
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) .chat-stream-section-reply,
+.chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) .chat-stream-section-reply {
+  width: 100%;
+  max-width: 100% !important;
+}
+
+.chat-shell .chat-thread .chat-bubble-assistant:not(.chat-bubble-plan-confirmation) table,
+.chat-shell .chat-thread .chat-bubble-streaming:not(.chat-bubble-streaming-reply) table {
+  width: 100%;
+}
+
 /* ============================================================
    ArkReflect - sci-fi visual layer
    ============================================================ */
@@ -15215,19 +15552,66 @@ select,
 .arkreflect-status,
 .arkreflect-narrative,
 .arkreflect-panorama,
-.arkreflect-grid-pane {
+.arkreflect-grid-pane,
+.arkreflect-motion-panel,
+.arkreflect-tab-strip {
   position: relative;
   overflow: visible;
+}
+
+.arkreflect-motion-panel {
+  animation: arkreflect-panel-in 420ms ease-out both;
+  transform-origin: 50% 16px;
+}
+
+.arkreflect-tab-strip {
+  animation: arkreflect-panel-in 320ms ease-out both;
+}
+
+@keyframes arkreflect-panel-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+    filter: saturate(0.88);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: saturate(1);
+  }
+}
+
+.arkreflect-live-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green-glow);
+  box-shadow: 0 0 0 2px var(--ui-rgba-57-208-255-040), 0 0 10px var(--green-glow);
+  animation: arkreflect-live-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes arkreflect-live-pulse {
+  0%, 100% {
+    transform: scale(0.82);
+    opacity: 0.58;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 .arkreflect-status::before,
 .arkreflect-narrative::before,
 .arkreflect-panorama::before,
 .arkreflect-grid-pane::before,
+.arkreflect-motion-panel::before,
 .arkreflect-status::after,
 .arkreflect-narrative::after,
 .arkreflect-panorama::after,
-.arkreflect-grid-pane::after {
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::after {
   content: "";
   position: absolute;
   width: 18px;
@@ -15241,7 +15625,8 @@ select,
 .arkreflect-status::before,
 .arkreflect-narrative::before,
 .arkreflect-panorama::before,
-.arkreflect-grid-pane::before {
+.arkreflect-grid-pane::before,
+.arkreflect-motion-panel::before {
   top: -1px;
   left: -1px;
   border-top: 1px solid;
@@ -15251,7 +15636,8 @@ select,
 .arkreflect-status::after,
 .arkreflect-narrative::after,
 .arkreflect-panorama::after,
-.arkreflect-grid-pane::after {
+.arkreflect-grid-pane::after,
+.arkreflect-motion-panel::after {
   bottom: -1px;
   right: -1px;
   border-bottom: 1px solid;
@@ -15265,7 +15651,9 @@ select,
 .arkreflect-panorama:hover::before,
 .arkreflect-panorama:hover::after,
 .arkreflect-grid-pane:hover::before,
-.arkreflect-grid-pane:hover::after {
+.arkreflect-grid-pane:hover::after,
+.arkreflect-motion-panel:hover::before,
+.arkreflect-motion-panel:hover::after {
   border-color: var(--green-glow);
   width: 24px;
   height: 24px;
@@ -15286,13 +15674,13 @@ select,
 
 .arkreflect-status {
   background:
-    linear-gradient(90deg, var(--ui-rgba-0-255-170-040), transparent 70%),
+    linear-gradient(90deg, var(--ui-rgba-57-208-255-040), transparent 70%),
     linear-gradient(180deg, rgba(7, 13, 18, 0.95), rgba(5, 9, 12, 0.92)) !important;
 }
 
 .arkreflect-narrative {
   background:
-    radial-gradient(circle at 0% 0%, var(--ui-rgba-0-255-170-040), transparent 55%),
+    radial-gradient(circle at 0% 0%, var(--ui-rgba-57-208-255-040), transparent 55%),
     linear-gradient(180deg, rgba(7, 13, 18, 0.92), rgba(5, 9, 12, 0.96)) !important;
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34) !important;
 }
@@ -15404,8 +15792,8 @@ select,
 }
 
 .arkreflect-pill.MuiChip-root {
-  background: var(--ui-rgba-0-255-170-040) !important;
-  border: 1px solid var(--ui-rgba-0-255-170-150) !important;
+  background: var(--ui-rgba-57-208-255-040) !important;
+  border: 1px solid var(--ui-rgba-57-208-255-150) !important;
   color: var(--cyan-glow) !important;
   font-family: var(--font-display);
   font-size: 0.7rem;
@@ -15447,8 +15835,8 @@ select,
 .arkreflect-pill.MuiChip-root:hover {
   border-color: var(--green-glow) !important;
   box-shadow:
-    0 0 0 1px var(--ui-rgba-0-255-170-080),
-    0 0 14px var(--ui-rgba-0-255-170-150);
+    0 0 0 1px var(--ui-rgba-57-208-255-080),
+    0 0 14px var(--ui-rgba-57-208-255-150);
 }
 
 .arkreflect-pill.MuiChip-root:hover::before,
@@ -15476,9 +15864,183 @@ select,
 }
 
 .arkreflect-status .MuiLinearProgress-root {
-  background: var(--ui-rgba-0-255-170-040) !important;
+  background: var(--ui-rgba-57-208-255-040) !important;
 }
 .arkreflect-status .MuiLinearProgress-bar {
   background:
     linear-gradient(90deg, var(--cyan-glow), var(--green-glow), var(--cyan-glow)) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arkreflect-motion-panel,
+  .arkreflect-tab-strip,
+  .arkreflect-live-dot,
+  .arkreflect-panorama-backdrop {
+    animation: none !important;
+  }
+}
+
+.notification-popover-paper.MuiPaper-root {
+  background: #111317 !important;
+  background-image: none !important;
+  border: 1px solid #2a3038 !important;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.55) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  color: #f3f6f8 !important;
+  opacity: 1 !important;
+}
+
+.notification-popover-paper .MuiList-root {
+  background: #0f1115 !important;
+}
+
+.notification-popover-paper .MuiListItemButton-root {
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+/* Settings uses the AgentArk cyan control language; do not inherit the
+   green/tan accents used by other surfaces or legacy warning treatments. */
+.MuiDialog-paper:has(.settings-shell-layout),
+.settings-shell-layout {
+  --settings-accent-text: var(--ui-rgba-57-208-255-850);
+  --settings-accent-strong: var(--ui-rgba-57-208-255-720);
+  --settings-accent-border: var(--ui-rgba-57-208-255-220);
+  --settings-accent-border-strong: var(--ui-rgba-57-208-255-300);
+  --settings-accent-bg: var(--ui-rgba-57-208-255-080);
+  --settings-accent-bg-hover: var(--ui-rgba-57-208-255-120);
+  --settings-accent-bg-soft: var(--ui-rgba-57-208-255-040);
+}
+
+.settings-shell-layout .settings-nav-group-label,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-group-label,
+.settings-shell-layout .settings-section-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-section-kicker,
+.settings-shell-layout .settings-inline-card-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-inline-card-kicker,
+.settings-shell-layout .workspace-page-kicker,
+.MuiDialog-paper:has(.settings-shell-layout) .workspace-page-kicker,
+.settings-shell-layout .security-basics-kicker {
+  color: var(--settings-accent-text) !important;
+}
+
+.settings-shell-layout .settings-nav-btn:hover:not(.active),
+.settings-shell-layout .settings-nav-btn.active,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn:hover:not(.active),
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active,
+.settings-shell-layout .MuiTab-root.Mui-selected {
+  background: var(--settings-accent-bg) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+}
+
+.settings-shell-layout .settings-nav-btn.active,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-nav-btn.active {
+  box-shadow: inset 2px 0 0 var(--settings-accent-strong) !important;
+}
+
+.settings-shell-layout .MuiTabs-indicator {
+  background-color: var(--settings-accent-strong) !important;
+  box-shadow: 0 0 10px var(--settings-accent-border) !important;
+}
+
+.settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled),
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled) {
+  border-color: var(--settings-accent-border-strong) !important;
+  background:
+    linear-gradient(180deg, var(--settings-accent-bg-hover), var(--settings-accent-bg)),
+    var(--ui-rgba-255-255-255-020) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+  box-shadow: 0 0 0 1px var(--settings-accent-bg), 0 12px 26px var(--ui-rgba-0-0-0-300) !important;
+}
+
+.settings-shell-layout .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-contained:not(.MuiButton-colorError):not(.Mui-disabled):hover {
+  border-color: var(--settings-accent-strong) !important;
+  background:
+    linear-gradient(180deg, var(--settings-accent-bg-hover), var(--settings-accent-bg-soft)),
+    var(--ui-rgba-255-255-255-035) !important;
+}
+
+.settings-shell-layout .MuiButton-outlined:not(.MuiButton-colorError):hover,
+.settings-shell-layout .MuiButton-text:not(.MuiButton-colorError):hover,
+.settings-shell-layout .settings-page-shell [role="button"]:hover,
+.settings-shell-layout .settings-page-shell .MuiCard-root:hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-outlined:not(.MuiButton-colorError):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiButton-text:not(.MuiButton-colorError):hover,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-page-shell [role="button"]:hover,
+.MuiDialog-paper:has(.settings-shell-layout) .settings-page-shell .MuiCard-root:hover {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    linear-gradient(180deg, var(--settings-accent-bg-soft), var(--ui-rgba-255-255-255-010)),
+    var(--ui-rgba-13-14-17-580) !important;
+}
+
+.settings-shell-layout .MuiCheckbox-root.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiCheckbox-root.Mui-checked,
+.settings-shell-layout .MuiRadio-root.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiRadio-root.Mui-checked,
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked,
+.settings-shell-layout .MuiSvgIcon-root.MuiSvgIcon-colorPrimary {
+  color: var(--settings-accent-text) !important;
+}
+
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked .MuiSwitch-thumb,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked .MuiSwitch-thumb {
+  background-color: var(--settings-accent-text) !important;
+  box-shadow: 0 0 10px var(--settings-accent-border) !important;
+}
+
+.settings-shell-layout .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track {
+  background-color: var(--settings-accent-text) !important;
+  border-color: var(--settings-accent-border) !important;
+  opacity: 0.34 !important;
+}
+
+.settings-shell-layout .MuiChip-colorSuccess.MuiChip-filled,
+.settings-shell-layout .MuiChip-colorSuccess.MuiChip-outlined,
+.settings-shell-layout .MuiChip-colorPrimary.MuiChip-filled,
+.settings-shell-layout .MuiChip-colorPrimary.MuiChip-outlined,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorSuccess.MuiChip-filled,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorSuccess.MuiChip-outlined,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorPrimary.MuiChip-filled,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiChip-colorPrimary.MuiChip-outlined {
+  border-color: var(--settings-accent-border) !important;
+  background: var(--settings-accent-bg) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+  box-shadow: none !important;
+}
+
+.settings-shell-layout .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.settings-shell-layout .MuiInputBase-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline,
+.MuiDialog-paper:has(.settings-shell-layout) .MuiInputBase-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--settings-accent-border-strong) !important;
+}
+
+.settings-shell-layout .settings-inline-card.tone-warning,
+.settings-shell-layout .security-basics-panel {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    radial-gradient(circle at top left, var(--settings-accent-bg-soft), transparent 38%),
+    linear-gradient(160deg, var(--ui-rgba-22-22-26-920), var(--ui-rgba-14-14-18-880)) !important;
+}
+
+.settings-shell-layout .companion-step-index {
+  border-color: var(--settings-accent-border) !important;
+  background: var(--settings-accent-bg) !important;
+  color: var(--ui-rgba-244-245-247-950) !important;
+}
+
+.settings-shell-layout .companion-connect-card {
+  border-color: var(--settings-accent-border) !important;
+  background:
+    radial-gradient(circle at top left, var(--settings-accent-bg-soft), transparent 42%),
+    var(--ui-rgba-255-255-255-020) !important;
+}
+
+.settings-shell-layout .companion-connect-url {
+  color: var(--settings-accent-text) !important;
 }

@@ -177,8 +177,8 @@ function SummaryTile({
             borderRadius: 1.5,
             display: "grid",
             placeItems: "center",
-            color: "var(--ui-rgba-130-247-193-920)",
-            background: "var(--ui-rgba-130-247-193-080)",
+            color: "var(--ui-rgba-57-208-255-850)",
+            background: "var(--ui-rgba-57-208-255-080)",
             flexShrink: 0,
           }}
         >
@@ -454,9 +454,9 @@ export function SenderVerificationPanel({
         className="list-shell"
         sx={{
           p: 2,
-          borderColor: "var(--ui-rgba-130-247-193-120) !important",
+          borderColor: "var(--ui-rgba-57-208-255-120) !important",
           background:
-            "linear-gradient(135deg, var(--ui-rgba-130-247-193-050), var(--ui-rgba-255-255-255-020)) !important",
+            "linear-gradient(135deg, var(--ui-rgba-57-208-255-040), var(--ui-rgba-255-255-255-020)) !important",
         }}
       >
         <Stack
@@ -472,8 +472,8 @@ export function SenderVerificationPanel({
                 borderRadius: 2,
                 display: "grid",
                 placeItems: "center",
-                color: "var(--ui-rgba-130-247-193-920)",
-                background: "var(--ui-rgba-130-247-193-100)",
+                color: "var(--ui-rgba-57-208-255-850)",
+                background: "var(--ui-rgba-57-208-255-100)",
                 flexShrink: 0,
               }}
             >

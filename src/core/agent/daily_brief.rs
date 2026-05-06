@@ -1,5 +1,6 @@
 use super::*;
 use crate::core::{background_session, task, watcher};
+use chrono::Timelike;
 
 #[derive(Debug, Clone)]
 pub(super) struct DailyBriefRunResult {
@@ -41,19 +42,12 @@ pub(super) enum DailyBriefMailSummary {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DailyBriefFallbackInput<'a> {
-    pub(super) generated_at: &'a str,
     pub(super) counts: DailyBriefTaskCounts,
     pub(super) overdue: &'a [String],
     pub(super) due_today: &'a [String],
-    pub(super) due_soon: &'a [String],
-    pub(super) in_progress: &'a [String],
     pub(super) failed: &'a [String],
     pub(super) awaiting_approval: &'a [String],
-    pub(super) paused: &'a [String],
-    pub(super) backlog: &'a [String],
     pub(super) important_events: &'a [String],
-    pub(super) module_events: &'a [String],
-    pub(super) recent: &'a [String],
     pub(super) calendar_summary: &'a DailyBriefCalendarSummary,
     pub(super) mail_summary: &'a DailyBriefMailSummary,
 }
@@ -96,6 +90,68 @@ impl Agent {
                 .format("%a, %b %d %I:%M %p %Z")
                 .to_string(),
             None => at.format("%a, %b %d %I:%M %p UTC").to_string(),
+        }
+    }
+
+    fn daily_brief_date_label(
+        at: chrono::DateTime<chrono::Utc>,
+        tz: Option<chrono_tz::Tz>,
+    ) -> String {
+        match tz {
+            Some(tz) => at.with_timezone(&tz).format("%A, %B %-d").to_string(),
+            None => at.format("%A, %B %-d").to_string(),
+        }
+    }
+
+    fn daily_brief_local_hour(
+        at: chrono::DateTime<chrono::Utc>,
+        tz: Option<chrono_tz::Tz>,
+    ) -> u32 {
+        match tz {
+            Some(tz) => at.with_timezone(&tz).hour(),
+            None => at.hour(),
+        }
+    }
+
+    fn daily_brief_period_label(
+        at: chrono::DateTime<chrono::Utc>,
+        tz: Option<chrono_tz::Tz>,
+    ) -> &'static str {
+        match Self::daily_brief_local_hour(at, tz) {
+            0..=11 => "morning",
+            12..=16 => "afternoon",
+            _ => "evening",
+        }
+    }
+
+    fn daily_brief_expected_greeting(
+        at: chrono::DateTime<chrono::Utc>,
+        tz: Option<chrono_tz::Tz>,
+    ) -> &'static str {
+        match Self::daily_brief_local_hour(at, tz) {
+            0..=11 => "Good morning",
+            12..=16 => "Good afternoon",
+            _ => "Good evening",
+        }
+    }
+
+    fn daily_brief_intro(
+        at: chrono::DateTime<chrono::Utc>,
+        tz: Option<chrono_tz::Tz>,
+    ) -> String {
+        format!(
+            "{}. Here's your brief for {}.",
+            Self::daily_brief_expected_greeting(at, tz),
+            Self::daily_brief_date_label(at, tz)
+        )
+    }
+
+    fn daily_brief_render(intro: &str, body: &str) -> String {
+        let body = body.trim();
+        if body.is_empty() {
+            intro.trim().to_string()
+        } else {
+            format!("{}\n{}", intro.trim(), body)
         }
     }
 
@@ -222,6 +278,107 @@ impl Agent {
             selected.push(format!("{} more", remaining));
         }
         selected.join("; ")
+    }
+
+    fn daily_brief_bulletize_summary(text: &str, limit: usize) -> String {
+        let mut lines = Vec::new();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let normalized = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .or_else(|| line.strip_prefix("• "))
+                .or_else(|| {
+                    let (prefix, rest) = line.split_once(". ")?;
+                    prefix
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                        .then_some(rest)
+                })
+                .unwrap_or(line)
+                .trim();
+            if normalized.is_empty() {
+                continue;
+            }
+            lines.push(format!("- {}", normalized));
+            if lines.len() >= limit {
+                break;
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn daily_brief_build_summary_fallback(input: DailyBriefFallbackInput<'_>) -> String {
+        let mut lines = Vec::new();
+        let priority = if !input.overdue.is_empty() {
+            format!(
+                "Overdue work needs attention: {}.",
+                Self::daily_brief_compact_list(input.overdue, 3)
+            )
+        } else if !input.failed.is_empty() {
+            format!(
+                "Failed work needs triage: {}.",
+                Self::daily_brief_compact_list(input.failed, 2)
+            )
+        } else if !input.awaiting_approval.is_empty() {
+            format!(
+                "Approvals are blocking progress: {}.",
+                Self::daily_brief_compact_list(input.awaiting_approval, 2)
+            )
+        } else if !input.important_events.is_empty() {
+            format!(
+                "Important alerts need review: {}.",
+                Self::daily_brief_compact_list(input.important_events, 3)
+            )
+        } else if !input.due_today.is_empty() {
+            format!(
+                "Today's deadlines: {}.",
+                Self::daily_brief_compact_list(input.due_today, 3)
+            )
+        } else {
+            "Task queue and immediate alerts are quiet right now.".to_string()
+        };
+        lines.push(format!("- {}", priority));
+        lines.push(format!(
+            "- Workload has {} open task(s): {} pending, {} in progress, {} awaiting approval, and {} paused.",
+            input.counts.open(),
+            input.counts.pending,
+            input.counts.in_progress,
+            input.counts.awaiting_approval,
+            input.counts.paused
+        ));
+        match input.calendar_summary {
+            DailyBriefCalendarSummary::NotConnected => lines.push(
+                "- Calendar is not connected, so today's meetings were not checked.".to_string(),
+            ),
+            DailyBriefCalendarSummary::LoadFailed => lines.push(
+                "- Calendar is connected, but today's meetings could not be loaded.".to_string(),
+            ),
+            DailyBriefCalendarSummary::Clear => {
+                lines.push("- Calendar has no events today.".to_string())
+            }
+            DailyBriefCalendarSummary::Meetings(items) => lines.push(format!(
+                "- Calendar has {} meeting(s) today: {}.",
+                items.len(),
+                Self::daily_brief_compact_list(items, 3)
+            )),
+        }
+        match input.mail_summary {
+            DailyBriefMailSummary::NotConnected => lines.push(
+                "- Mail is not connected, so unread inbox mail was not checked.".to_string(),
+            ),
+            DailyBriefMailSummary::LoadFailed => lines.push(
+                "- Mail is connected, but unread inbox mail could not be loaded.".to_string(),
+            ),
+            DailyBriefMailSummary::Clear => {
+                lines.push("- Mail has no unread inbox messages from the last day.".to_string())
+            }
+            DailyBriefMailSummary::Messages(items) => lines.push(format!(
+                "- Mail has {} unread inbox item(s): {}.",
+                items.len(),
+                Self::daily_brief_compact_list(items, 3)
+            )),
+        }
+        lines.join("\n")
     }
 
     fn daily_brief_format_calendar_window(
@@ -387,165 +544,6 @@ impl Agent {
         }
     }
 
-    pub(super) fn daily_brief_build_fallback(input: DailyBriefFallbackInput<'_>) -> String {
-        let mut lines = vec![format!("Morning command brief for {}", input.generated_at)];
-
-        let priority = if !input.overdue.is_empty() {
-            format!(
-                "overdue work needs attention: {}",
-                Self::daily_brief_compact_list(input.overdue, 3)
-            )
-        } else if !input.failed.is_empty() {
-            format!(
-                "failed work needs triage: {}",
-                Self::daily_brief_compact_list(input.failed, 2)
-            )
-        } else if !input.awaiting_approval.is_empty() {
-            format!(
-                "approvals are blocking progress: {}",
-                Self::daily_brief_compact_list(input.awaiting_approval, 2)
-            )
-        } else if !input.due_today.is_empty() {
-            format!(
-                "today's deadlines: {}",
-                Self::daily_brief_compact_list(input.due_today, 3)
-            )
-        } else if !input.backlog.is_empty() {
-            format!(
-                "next useful work: {}",
-                Self::daily_brief_compact_list(input.backlog, 3)
-            )
-        } else {
-            "task queue is quiet right now".to_string()
-        };
-        lines.push(format!("- Priority: {}.", priority));
-
-        let mut workload_parts = vec![
-            format!("{} pending", input.counts.pending),
-            format!("{} in progress", input.counts.in_progress),
-            format!("{} awaiting approval", input.counts.awaiting_approval),
-            format!("{} paused", input.counts.paused),
-        ];
-        if input.counts.failed > 0 {
-            workload_parts.push(format!("{} failed", input.counts.failed));
-        }
-        lines.push(format!(
-            "- Workload: {} active; {}.",
-            input.counts.open(),
-            workload_parts.join(", ")
-        ));
-
-        if !input.in_progress.is_empty() {
-            lines.push(format!(
-                "- In progress now: {}.",
-                Self::daily_brief_compact_list(input.in_progress, 3)
-            ));
-        }
-
-        let mut time_sensitive = Vec::new();
-        if !input.due_today.is_empty() {
-            time_sensitive.push(format!(
-                "due today: {}",
-                Self::daily_brief_compact_list(input.due_today, 3)
-            ));
-        }
-        if !input.due_soon.is_empty() {
-            time_sensitive.push(format!(
-                "next 3 days: {}",
-                Self::daily_brief_compact_list(input.due_soon, 3)
-            ));
-        }
-        if !time_sensitive.is_empty() {
-            lines.push(format!("- Time-sensitive: {}.", time_sensitive.join("; ")));
-        }
-
-        match input.calendar_summary {
-            DailyBriefCalendarSummary::NotConnected => lines.push(
-                "- Meetings: Calendar is not connected, so today's meetings were not checked."
-                    .to_string(),
-            ),
-            DailyBriefCalendarSummary::LoadFailed => lines.push(
-                "- Meetings: Calendar is connected, but today's meetings could not be loaded."
-                    .to_string(),
-            ),
-            DailyBriefCalendarSummary::Clear => {
-                lines.push("- Meetings: no calendar events today.".to_string())
-            }
-            DailyBriefCalendarSummary::Meetings(items) => lines.push(format!(
-                "- Meetings today: {}.",
-                Self::daily_brief_compact_list(items, 3)
-            )),
-        }
-
-        match input.mail_summary {
-            DailyBriefMailSummary::NotConnected => lines.push(
-                "- Mail: Gmail/Google Workspace is not connected, so new mail was not checked."
-                    .to_string(),
-            ),
-            DailyBriefMailSummary::LoadFailed => lines.push(
-                "- Mail: Gmail/Google Workspace is connected, but unread mail could not be loaded."
-                    .to_string(),
-            ),
-            DailyBriefMailSummary::Clear => {
-                lines.push("- Mail: no unread inbox messages from the last day.".to_string())
-            }
-            DailyBriefMailSummary::Messages(items) => lines.push(format!(
-                "- Mail: {}.",
-                Self::daily_brief_compact_list(items, 3)
-            )),
-        }
-
-        if input.important_events.is_empty() {
-            lines.push("- Important events: no unread AgentArk alerts.".to_string());
-        } else {
-            lines.push(format!(
-                "- Important events: {}.",
-                Self::daily_brief_compact_list(input.important_events, 4)
-            ));
-        }
-
-        if !input.module_events.is_empty() {
-            lines.push(format!(
-                "- Module attention: {}.",
-                Self::daily_brief_compact_list(input.module_events, 4)
-            ));
-        }
-
-        let mut risks = Vec::new();
-        if !input.failed.is_empty() {
-            risks.push(format!(
-                "failed: {}",
-                Self::daily_brief_compact_list(input.failed, 2)
-            ));
-        }
-        if !input.awaiting_approval.is_empty() {
-            risks.push(format!(
-                "awaiting approval: {}",
-                Self::daily_brief_compact_list(input.awaiting_approval, 2)
-            ));
-        }
-        if !input.paused.is_empty() {
-            risks.push(format!(
-                "paused: {}",
-                Self::daily_brief_compact_list(input.paused, 2)
-            ));
-        }
-        if !risks.is_empty() {
-            lines.push(format!("- Blockers and risk: {}.", risks.join("; ")));
-        }
-
-        if input.recent.is_empty() {
-            lines.push("- Recent execution: no recent runs recorded.".to_string());
-        } else {
-            lines.push(format!(
-                "- Recent execution: {}.",
-                Self::daily_brief_compact_list(input.recent, 3)
-            ));
-        }
-
-        lines.join("\n")
-    }
-
     async fn load_daily_brief_calendar_summary(
         &self,
         tz: Option<chrono_tz::Tz>,
@@ -648,6 +646,9 @@ impl Agent {
             )
         };
         let generated_at = Self::daily_brief_datetime_label(now, tz);
+        let local_time_label = Self::daily_brief_time_label(now, tz);
+        let daypart = Self::daily_brief_period_label(now, tz);
+        let expected_greeting = Self::daily_brief_expected_greeting(now, tz);
 
         let (
             counts,
@@ -787,12 +788,10 @@ impl Agent {
                 .collect::<Vec<_>>()
         };
 
-        let watcher_attention = self
-            .watcher_manager
-            .list()
-            .await
-            .into_iter()
-            .filter_map(|watcher| match watcher.status {
+        let watchers = self.watcher_manager.list().await;
+        let watcher_attention = watchers
+            .iter()
+            .filter_map(|watcher| match &watcher.status {
                 watcher::WatcherStatus::Triggered => Some(format!(
                     "{} triggered",
                     safe_truncate(watcher.description.trim(), 120)
@@ -801,7 +800,7 @@ impl Agent {
                     "{} timed out",
                     safe_truncate(watcher.description.trim(), 120)
                 )),
-                watcher::WatcherStatus::Failed { ref error } => Some(format!(
+                watcher::WatcherStatus::Failed { error } => Some(format!(
                     "{} failed: {}",
                     safe_truncate(watcher.description.trim(), 90),
                     safe_truncate(error.trim(), 90)
@@ -1011,6 +1010,7 @@ impl Agent {
         }
 
         let startup_issues = self.startup_issues.read().await;
+        let startup_issue_count = startup_issues.len();
         if !startup_issues.is_empty() {
             let summaries = startup_issues
                 .iter()
@@ -1176,6 +1176,243 @@ impl Agent {
             module_events.push("Apps: status check timed out".to_string());
         }
 
+        let (
+            fact_count,
+            document_count,
+            preference_count,
+            user_data_count,
+            knowledge_count,
+            document_chunk_count,
+        ) = tokio::join!(
+            self.storage.count_facts(None),
+            self.storage.count_documents(None),
+            self.storage.count_user_preferences(None),
+            self.storage.count_user_data_items(None, None),
+            self.storage.count_visible_knowledge_items(None),
+            self.storage.count_document_chunks()
+        );
+        let fact_count = fact_count.unwrap_or(0);
+        let document_count = document_count.unwrap_or(0);
+        let preference_count = preference_count.unwrap_or(0);
+        let user_data_count = user_data_count.unwrap_or(0);
+        let knowledge_count = knowledge_count.unwrap_or(0);
+        let document_chunk_count = document_chunk_count.unwrap_or(0);
+
+        let learning_queue = self.storage.learning_queue_counts().await.unwrap_or_default();
+        let learning_enabled = crate::core::learning::load_learning_enabled(&self.storage).await;
+        let self_evolve_enabled_pref = self
+            .storage
+            .get(crate::core::self_evolve::strategy_runtime::SELF_EVOLVE_ENABLED_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .map(|value| !value.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let self_evolve_enabled = learning_enabled && self_evolve_enabled_pref;
+        let mut active_canary_count = 0usize;
+        for key in [
+            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
+            crate::core::self_evolve::strategy_runtime::TOOL_STRATEGY_CANARY_STATE_KEY,
+            crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+            crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+            crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+        ] {
+            if let Ok(Some(raw)) = self.storage.get(key).await {
+                if serde_json::from_slice::<
+                    crate::core::self_evolve::strategy_runtime::CanaryRolloutState,
+                >(&raw)
+                .map(|state| state.enabled)
+                .unwrap_or(false)
+                {
+                    active_canary_count += 1;
+                }
+            }
+        }
+
+        let reflect_from = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let reflect_to = now.to_rfc3339();
+        let reflect_units = self
+            .storage
+            .list_semantic_work_units_between(&reflect_from, &reflect_to, 500)
+            .await
+            .unwrap_or_default();
+        let reflect_message_count: i32 = reflect_units
+            .iter()
+            .map(|unit| unit.message_count.max(0))
+            .sum();
+
+        let (arkpulse_total, latest_arkpulse_events) = tokio::join!(
+            self.storage.count_arkpulse_events(),
+            self.storage.list_arkpulse_events(1)
+        );
+        let arkpulse_total = arkpulse_total.unwrap_or(0);
+        let latest_arkpulse = latest_arkpulse_events
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        let arkpulse_summary = latest_arkpulse
+            .as_ref()
+            .map(|event| {
+                let when = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                    .map(|timestamp| {
+                        Self::daily_brief_time_label(timestamp.with_timezone(&chrono::Utc), tz)
+                    })
+                    .unwrap_or_else(|_| "time unknown".to_string());
+                let status = event.status.trim();
+                let status = if status.is_empty() {
+                    "recorded"
+                } else {
+                    status
+                };
+                format!(
+                    "{} at {}",
+                    status,
+                    when
+                )
+            })
+            .unwrap_or_else(|| "no previous run".to_string());
+
+        let security_event_count = security_snapshot.injection_attempts
+            + security_snapshot.auth_failures
+            + security_snapshot.rate_limit_hits
+            + security_snapshot.unauthorized_channel_attempts;
+        let arkcore_items = vec![
+            format!(
+                "ArkCore: {} open task(s), {} active background session(s), and {} active browser session(s).",
+                counts.open(),
+                background_sessions
+                    .iter()
+                    .filter(|session| !session.status.is_closed())
+                    .count(),
+                active_browser_sessions.len()
+            ),
+            format!(
+                "ArkMemory: {} fact(s), {} preference(s), {} document(s), {} chunk(s), {} user-data item(s), and {} knowledge item(s).",
+                fact_count,
+                preference_count,
+                document_count,
+                document_chunk_count,
+                user_data_count,
+                knowledge_count
+            ),
+            format!(
+                "ArkSentinel: {} watcher(s), {} watcher attention item(s), {} security event(s), and {} startup issue(s).",
+                watchers.len(),
+                watcher_attention.len(),
+                security_event_count,
+                startup_issue_count
+            ),
+            format!(
+                "ArkEvolve: {}, {} draft candidate(s), {} pending consolidation item(s), {} pending reflection item(s), {} active pattern(s), and {} active canary run(s).",
+                if self_evolve_enabled { "enabled" } else { "paused" },
+                learning_queue.draft_candidates,
+                learning_queue.pending_consolidation,
+                learning_queue.pending_reflection,
+                learning_queue.active_patterns,
+                active_canary_count
+            ),
+            format!(
+                "ArkReflect: {} semantic work unit(s) and {} source message(s) indexed from the last 24 hours.",
+                reflect_units.len(),
+                reflect_message_count
+            ),
+            format!(
+                "ArkPulse: {} stored run(s); latest status is {}.",
+                arkpulse_total,
+                arkpulse_summary
+            ),
+        ];
+
+        let mut detail_lines = vec![format!(
+            "- Tasks: {} open task(s), {} pending, {} in progress, {} awaiting approval, {} paused, and {} failed.",
+            counts.open(),
+            counts.pending,
+            counts.in_progress,
+            counts.awaiting_approval,
+            counts.paused,
+            counts.failed
+        )];
+        if !overdue.is_empty() {
+            detail_lines.push(format!(
+                "- Overdue: {}.",
+                Self::daily_brief_compact_list(&overdue, 4)
+            ));
+        }
+        if !due_today.is_empty() {
+            detail_lines.push(format!(
+                "- Due today: {}.",
+                Self::daily_brief_compact_list(&due_today, 4)
+            ));
+        }
+        if !due_soon.is_empty() {
+            detail_lines.push(format!(
+                "- Due soon: {}.",
+                Self::daily_brief_compact_list(&due_soon, 3)
+            ));
+        }
+        match &calendar_summary {
+            DailyBriefCalendarSummary::NotConnected => detail_lines.push(
+                "- Calendar: not connected or disabled; today's meetings were not checked."
+                    .to_string(),
+            ),
+            DailyBriefCalendarSummary::LoadFailed => detail_lines.push(
+                "- Calendar: connected, but today's meetings could not be loaded.".to_string(),
+            ),
+            DailyBriefCalendarSummary::Clear => {
+                detail_lines.push("- Calendar: no events today.".to_string())
+            }
+            DailyBriefCalendarSummary::Meetings(items) => detail_lines.push(format!(
+                "- Calendar: {} meeting(s) today: {}.",
+                items.len(),
+                Self::daily_brief_compact_list(items, 3)
+            )),
+        }
+        match &mail_summary {
+            DailyBriefMailSummary::NotConnected => detail_lines.push(
+                "- Mail: Gmail/Google Workspace is not connected or disabled; unread mail was not checked."
+                    .to_string(),
+            ),
+            DailyBriefMailSummary::LoadFailed => detail_lines.push(
+                "- Mail: connected, but unread inbox mail could not be loaded.".to_string(),
+            ),
+            DailyBriefMailSummary::Clear => detail_lines
+                .push("- Mail: no unread inbox messages from the last day.".to_string()),
+            DailyBriefMailSummary::Messages(items) => detail_lines.push(format!(
+                "- Mail: {} unread inbox item(s): {}.",
+                items.len(),
+                Self::daily_brief_compact_list(items, 3)
+            )),
+        }
+        if important_events.is_empty() {
+            detail_lines.push(
+                "- Important events: no unread AgentArk alerts, watcher issues, or security counters."
+                    .to_string(),
+            );
+        } else {
+            detail_lines.push(format!(
+                "- Important events: {}.",
+                Self::daily_brief_compact_list(&important_events, 5)
+            ));
+        }
+        detail_lines.extend(arkcore_items.iter().map(|item| format!("- {}", item)));
+        if module_events.is_empty() {
+            detail_lines.push("- Module attention: no module-level attention signals.".to_string());
+        } else {
+            detail_lines.push(format!(
+                "- Module attention: {}.",
+                Self::daily_brief_compact_list(&module_events, 5)
+            ));
+        }
+        if recent.is_empty() {
+            detail_lines.push("- Recent execution: no recent runs recorded.".to_string());
+        } else {
+            detail_lines.push(format!(
+                "- Recent execution: {}.",
+                Self::daily_brief_compact_list(&recent, 4)
+            ));
+        }
+
         let mut style = Vec::new();
         if let Some(lang) = language.as_ref().filter(|value| !value.trim().is_empty()) {
             style.push(format!("Language: {}", lang.trim()));
@@ -1291,13 +1528,22 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let arkcore_block = arkcore_items
+            .iter()
+            .map(|item| format!("- {}", item))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let prompt = format!(
-            "Create the user's morning command brief.\n{}\n\nBrief requirements:\n- Think like an operator maintaining situational awareness across AgentArk modules: tasks, approvals, failures, alerts, meetings, mail, watchers, background sessions, browser sessions, swarm, apps, security, and recent execution.\n- Write 5-8 compact bullet points maximum.\n- Lead with the highest-impact fact across tasks, approvals, failures, alerts, meetings, mail, and monitoring.\n- Include today's meeting status and unread mail status explicitly, including not-connected or load-failed states.\n- Include important events from the notification/security/watchers section before routine backlog.\n- Include module/custom-install state only when it indicates attention-needed or new meaningful activity; do not recite routine counts or installed inventory.\n- If the calendar is not connected or failed to load, say that explicitly and never claim the schedule is clear.\n- Avoid filler or coaching language such as 'good day to plan ahead', 'focus on priorities', or 'consider setting 1-3 key goals'.\n- Use only the facts below. Do not invent external news or events.\n- If there are no open tasks and no important events, say the queue is quiet.\n\nGenerated at:\n{}\n\nTask snapshot:\n{}\n\nImportant events:\n{}\n\nModule attention signals:\n{}\n\nRecent execution:\n{}\n\nCalendar:\n{}\n\nMail:\n{}",
+            "Create the top summary for a daily command brief.\n{}\n\nBrief requirements:\n- This run was generated at the user's local time shown below; the deterministic wrapper will handle the greeting, so do not write a greeting, title, sign-off, or section heading.\n- Return 2-4 compact bullet points only.\n- Summarize the highest-impact facts across tasks, approvals, failures, alerts, meetings, mail, monitoring, ArkCore modules, and recent execution.\n- Make the summary useful even when queues are quiet by naming what was checked and what was not connected or unavailable.\n- Use only the facts below. Do not invent external news, events, counts, services, or statuses.\n\nGenerated at:\n{}\nLocal time:\n{}\nLocal daypart:\n{}\nExpected wrapper greeting:\n{}\n\nTask snapshot:\n{}\n\nImportant events:\n{}\n\nArkCore status facts:\n{}\n\nModule attention signals:\n{}\n\nRecent execution:\n{}\n\nCalendar:\n{}\n\nMail:\n{}",
             style_block,
             generated_at,
+            local_time_label,
+            daypart,
+            expected_greeting,
             task_lines.join("\n"),
             events_block,
+            arkcore_block,
             modules_block,
             recent_block,
             calendar_block,
@@ -1312,7 +1558,7 @@ impl Agent {
                 "daily_brief",
                 &ModelRole::Primary,
                 vec![],
-                "You are a concise assistant creating factual morning briefs.",
+                "You are a concise assistant creating factual daily command brief summaries.",
                 &prompt,
                 &[],
                 &empty_actions,
@@ -1321,54 +1567,51 @@ impl Agent {
             )
             .await
         else {
-            return Ok(Self::daily_brief_build_fallback(DailyBriefFallbackInput {
-                generated_at: &generated_at,
+            let summary = Self::daily_brief_build_summary_fallback(DailyBriefFallbackInput {
                 counts,
                 overdue: &overdue,
                 due_today: &due_today,
-                due_soon: &due_soon,
-                in_progress: &in_progress,
                 failed: &failed,
                 awaiting_approval: &awaiting_approval,
-                paused: &paused,
-                backlog: &backlog,
                 important_events: &important_events,
-                module_events: &module_events,
-                recent: &recent,
                 calendar_summary: &calendar_summary,
                 mail_summary: &mail_summary,
-            }));
+            });
+            let body = format!("**Summary**\n{}\n\n**Details**\n{}", summary, detail_lines.join("\n"));
+            return Ok(Self::daily_brief_render(&Self::daily_brief_intro(now, tz), &body));
         };
 
         let content = response.content.trim().to_string();
-        let lower = content.to_ascii_lowercase();
-        let looks_generic = lower.contains("good day to plan ahead")
-            || lower.contains("consider setting 1-3 key goals")
-            || (matches!(
-                &calendar_summary,
-                DailyBriefCalendarSummary::NotConnected | DailyBriefCalendarSummary::LoadFailed
-            ) && lower.contains("schedule appears clear"));
-        if !content.is_empty() && !looks_generic {
-            return Ok(content);
-        }
-
-        Ok(Self::daily_brief_build_fallback(DailyBriefFallbackInput {
-            generated_at: &generated_at,
-            counts,
-            overdue: &overdue,
-            due_today: &due_today,
-            due_soon: &due_soon,
-            in_progress: &in_progress,
-            failed: &failed,
-            awaiting_approval: &awaiting_approval,
-            paused: &paused,
-            backlog: &backlog,
-            important_events: &important_events,
-            module_events: &module_events,
-            recent: &recent,
-            calendar_summary: &calendar_summary,
-            mail_summary: &mail_summary,
-        }))
+        let summary = if content.is_empty() {
+            Self::daily_brief_build_summary_fallback(DailyBriefFallbackInput {
+                counts,
+                overdue: &overdue,
+                due_today: &due_today,
+                failed: &failed,
+                awaiting_approval: &awaiting_approval,
+                important_events: &important_events,
+                calendar_summary: &calendar_summary,
+                mail_summary: &mail_summary,
+            })
+        } else {
+            let bulletized = Self::daily_brief_bulletize_summary(&content, 4);
+            if bulletized.trim().is_empty() {
+                Self::daily_brief_build_summary_fallback(DailyBriefFallbackInput {
+                    counts,
+                    overdue: &overdue,
+                    due_today: &due_today,
+                    failed: &failed,
+                    awaiting_approval: &awaiting_approval,
+                    important_events: &important_events,
+                    calendar_summary: &calendar_summary,
+                    mail_summary: &mail_summary,
+                })
+            } else {
+                bulletized
+            }
+        };
+        let body = format!("**Summary**\n{}\n\n**Details**\n{}", summary, detail_lines.join("\n"));
+        Ok(Self::daily_brief_render(&Self::daily_brief_intro(now, tz), &body))
     }
 
     /// Generate the daily brief and deliver it via the user's preferred channel.

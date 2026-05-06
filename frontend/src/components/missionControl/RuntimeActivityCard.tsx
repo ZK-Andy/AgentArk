@@ -71,7 +71,7 @@ export function RuntimeActivityCard({ traces, onOpenActivity }: RuntimeActivityC
       if (aTs === bTs) return 0;
       return aTs < bTs ? 1 : -1;
     });
-    return all.slice(0, 3);
+    return all.slice(0, 2);
   }, [traces]);
 
   return (
@@ -93,7 +93,7 @@ export function RuntimeActivityCard({ traces, onOpenActivity }: RuntimeActivityC
               .join(" ");
             return (
               <div className="nw-activity-row" key={trace.id}>
-                <div className={icCls}>·</div>
+                <div className={icCls}>.</div>
                 <div className="nw-activity-meta">
                   <div className="nw-activity-ts" title={formatUiRelativeDateTimeMeta(trace.started_at).tip}>
                     {formatUiRelativeDateTimeMeta(trace.started_at).label}
@@ -115,7 +115,7 @@ export function RuntimeActivityCard({ traces, onOpenActivity }: RuntimeActivityC
           style={{ marginTop: 12 }}
           onClick={onOpenActivity}
         >
-          View all <span className="nw-arrow">→</span>
+          Activity feed <span className="nw-arrow">-&gt;</span>
         </button>
       ) : null}
     </NeuralPanel>

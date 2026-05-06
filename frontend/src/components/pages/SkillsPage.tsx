@@ -1702,7 +1702,7 @@ function ImportUrlDialog({
                 sx={{
                   px: 1.5,
                   py: 0.75,
-                  borderBottom: "1px solid var(--ui-rgba-0-255-170-060)",
+                  borderBottom: "1px solid var(--ui-rgba-57-208-255-060)",
                 }}
               >
                 <Typography
@@ -1712,7 +1712,7 @@ function ImportUrlDialog({
                     fontWeight: 700,
                     letterSpacing: 0,
                     textTransform: "uppercase",
-                    color: "var(--ui-rgba-0-255-170-400)",
+                    color: "var(--ui-rgba-57-208-255-350)",
                   }}
                 >
                   Per-Skill Analysis
@@ -1739,7 +1739,7 @@ function ImportUrlDialog({
                         display: "flex",
                         gap: 1.5,
                         py: 0.4,
-                        borderBottom: "1px solid var(--ui-rgba-0-255-170-030)",
+                        borderBottom: "1px solid var(--ui-rgba-57-208-255-040)",
                         alignItems: "baseline",
                       }}
                     >

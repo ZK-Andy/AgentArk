@@ -6,12 +6,15 @@ import {
   Box,
   Button,
   ButtonBase,
+  Checkbox,
   Chip,
   CircularProgress,
   Dialog,
+  DialogActions,
   DialogContent,
   DialogTitle,
   Divider,
+  FormControlLabel,
   Stack,
   Tooltip,
   Typography,
@@ -26,7 +29,13 @@ import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
-import type { ArkPulseRemediationSpec, ArkPulseRunFixRequest } from "../../types";
+import type {
+  ArkPulseCleanupCandidate,
+  ArkPulseCleanupPreviewResponse,
+  ArkPulseCleanupRequest,
+  ArkPulseRemediationSpec,
+  ArkPulseRunFixRequest,
+} from "../../types";
 import { WorkspacePageHeader, WorkspacePageShell } from "../WorkspacePage";
 import { asRecord, errMessage, num, pickRecords, str, toBool, type JsonRecord } from "./pageHelpers";
 import {
@@ -70,6 +79,18 @@ type PulseFinding = {
   row: JsonRecord;
   findingIndex: number;
 };
+
+function formatBytesForUi(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
 
 function severityChipColor(
   severity: string,
@@ -186,6 +207,11 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     baselineEventId: string;
     deadlineAt: number;
   } | null>(null);
+  const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
+  const [cleanupPreview, setCleanupPreview] = useState<ArkPulseCleanupPreviewResponse | null>(null);
+  const [selectedCleanupIds, setSelectedCleanupIds] = useState<Record<string, boolean>>({});
+  const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
+  const [cleanupJob, setCleanupJob] = useState<JsonRecord | null>(null);
 
   const pulseQ = useQuery({
     queryKey: SETTINGS_QUERY_KEYS.arkPulseLog,
@@ -314,6 +340,12 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
       helper: "Active background monitors",
     },
   ];
+  const cleanupCandidates = cleanupPreview?.candidates ?? [];
+  const selectedCleanupCandidates = cleanupCandidates.filter((candidate) => selectedCleanupIds[candidate.id]);
+  const selectedCleanupSize = selectedCleanupCandidates.reduce(
+    (sum, candidate) => sum + num(candidate.size_bytes, 0),
+    0,
+  );
 
   const triggerPulseMutation = useMutation({
     mutationFn: () => api.rawPost("/arkpulse/trigger", {}),
@@ -348,6 +380,14 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
     },
   });
 
+  const cleanupPreviewMutation = useMutation({
+    mutationFn: async () => asRecord(await api.rawPost("/arkpulse/cleanup-preview", {})),
+  });
+
+  const cleanupMutation = useMutation({
+    mutationFn: async (body: ArkPulseCleanupRequest) => asRecord(await api.rawPost("/arkpulse/cleanup", body)),
+  });
+
   async function runArkPulseCheck() {
     setError(null);
     setSuccess(null);
@@ -363,6 +403,45 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
         baselineEventId: latestPulseEventKey,
         deadlineAt: Date.now() + 2 * 60 * 1000,
       });
+      await queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEYS.arkPulseLog });
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  }
+
+  async function openCleanupReview() {
+    setError(null);
+    setSuccess(null);
+    setCleanupDialogOpen(true);
+    setCleanupPreview(null);
+    setCleanupConfirmed(false);
+    setCleanupJob(null);
+    try {
+      const out = (await cleanupPreviewMutation.mutateAsync()) as unknown as ArkPulseCleanupPreviewResponse;
+      const candidates = Array.isArray(out.candidates) ? out.candidates : [];
+      setCleanupPreview({ ...out, candidates });
+      const defaults: Record<string, boolean> = {};
+      for (const candidate of candidates) {
+        defaults[candidate.id] = Boolean(candidate.selected_by_default);
+      }
+      setSelectedCleanupIds(defaults);
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  }
+
+  async function submitCleanupArchive() {
+    setError(null);
+    setSuccess(null);
+    const candidateIds = selectedCleanupCandidates.map((candidate) => candidate.id);
+    if (!cleanupConfirmed || candidateIds.length === 0) return;
+    try {
+      const out = await cleanupMutation.mutateAsync({
+        candidate_ids: candidateIds,
+        confirm_archive: true,
+      });
+      setCleanupJob(out);
+      setSuccess(str(out.message, "ArkPulse cleanup is running on its background worker."));
       await queryClient.invalidateQueries({ queryKey: SETTINGS_QUERY_KEYS.arkPulseLog });
     } catch (e) {
       setError(errMessage(e));
@@ -428,31 +507,41 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
   return (
     <WorkspacePageShell spacing={1.5} className="arkpulse-page-shell">
       <WorkspacePageHeader
-        eyebrow="Ark Core"
+        eyebrow="Ark Core / ArkPulse"
         title="ArkPulse"
         description={
           <>
-            ArkPulse runs health checks across AgentArk and your connected systems, and surfaces concrete findings when something is off.
+            ArkPulse shows whether AgentArk and connected systems are working normally.
             <br />
-            For issues it can resolve on its own, it offers a one-click fix.
+            ArkPulse runs checks and offers a one-click fix when it can safely resolve an issue.
           </>
         }
         actions={
-          <Button
-            size="small"
-            variant="contained"
-            startIcon={
-              triggerPulseMutation.isPending || pulseRunning ? (
-                <CircularProgress size={14} color="inherit" />
-              ) : (
-                <AutorenewRoundedIcon fontSize="small" />
-              )
-            }
-            onClick={() => void runArkPulseCheck()}
-            disabled={triggerPulseMutation.isPending || pulseRunning}
-          >
-            {triggerPulseMutation.isPending || pulseRunning ? "Running..." : "Run now"}
-          </Button>
+          <Stack direction="row" spacing={0.75}>
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => void openCleanupReview()}
+              disabled={cleanupPreviewMutation.isPending || cleanupMutation.isPending}
+            >
+              {cleanupPreviewMutation.isPending ? "Loading..." : "Cleanup"}
+            </Button>
+            <Button
+              size="small"
+              variant="contained"
+              startIcon={
+                triggerPulseMutation.isPending || pulseRunning ? (
+                  <CircularProgress size={14} color="inherit" />
+                ) : (
+                  <AutorenewRoundedIcon fontSize="small" />
+                )
+              }
+              onClick={() => void runArkPulseCheck()}
+              disabled={triggerPulseMutation.isPending || pulseRunning}
+            >
+              {triggerPulseMutation.isPending || pulseRunning ? "Running..." : "Run now"}
+            </Button>
+          </Stack>
         }
       />
 
@@ -965,6 +1054,106 @@ export default function ArkPulsePage({ autoRefresh }: ArkPulsePageProps) {
             </Box>
           </Stack>
         </DialogContent>
+      </Dialog>
+
+      <Dialog open={cleanupDialogOpen} onClose={() => setCleanupDialogOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>Managed Artifact Cleanup</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.2}>
+            {cleanupPreviewMutation.isPending ? (
+              <Stack direction="row" spacing={1} sx={{ alignItems: "center" }}>
+                <CircularProgress size={16} />
+                <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  Loading cleanup preview on the ArkPulse worker.
+                </Typography>
+              </Stack>
+            ) : cleanupPreview ? (
+              <>
+                <Alert severity={cleanupCandidates.length > 0 ? "info" : "success"}>
+                  {cleanupCandidates.length > 0
+                    ? `${cleanupCandidates.length} managed artifact${cleanupCandidates.length === 1 ? "" : "s"} can be archived. Selected size: ${formatBytesForUi(selectedCleanupSize)}.`
+                    : "No managed cleanup candidates were found."}
+                </Alert>
+                <Stack spacing={0.75}>
+                  {cleanupCandidates.map((candidate: ArkPulseCleanupCandidate) => {
+                    const checked = Boolean(selectedCleanupIds[candidate.id]);
+                    return (
+                      <Box
+                        key={candidate.id}
+                        sx={{
+                          border: "1px solid",
+                          borderColor: checked ? "primary.main" : "divider",
+                          borderRadius: "8px",
+                          p: 1,
+                        }}
+                      >
+                        <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ alignItems: { sm: "flex-start" } }}>
+                          <Checkbox
+                            checked={checked}
+                            onChange={(event) =>
+                              setSelectedCleanupIds((prev) => ({ ...prev, [candidate.id]: event.target.checked }))
+                            }
+                            slotProps={{ input: { "aria-label": `Select ${candidate.path_label}` } }}
+                          />
+                          <Stack spacing={0.45} sx={{ minWidth: 0, flex: 1 }}>
+                            <Stack direction="row" spacing={0.6} useFlexGap sx={{ flexWrap: "wrap", alignItems: "center" }}>
+                              <Chip size="small" label={candidate.category_label || titleCaseLabel(candidate.category)} />
+                              <Chip size="small" variant="outlined" color={severityChipColor(candidate.risk)} label={candidate.risk} />
+                              <Typography variant="caption" sx={{ color: "text.secondary" }}>
+                                {formatBytesForUi(num(candidate.size_bytes, 0))} - {num(candidate.age_days, 0).toFixed(1)}d old
+                              </Typography>
+                            </Stack>
+                            <Typography variant="body2" sx={{ fontWeight: 700, wordBreak: "break-word" }}>
+                              {candidate.path_label}
+                            </Typography>
+                            <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                              {candidate.reason}
+                            </Typography>
+                          </Stack>
+                        </Stack>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+                {cleanupCandidates.length > 0 ? (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={cleanupConfirmed}
+                        onChange={(event) => setCleanupConfirmed(event.target.checked)}
+                      />
+                    }
+                    label={`Archive selected live artifacts to ${cleanupPreview.archive_root}; archives auto-delete after ${cleanupPreview.archive_retention_days} days.`}
+                  />
+                ) : null}
+                {cleanupJob ? (
+                  <Alert severity="success">
+                    Cleanup job {str(cleanupJob.job_id, "-")} is {str(cleanupJob.status, "accepted")}.
+                  </Alert>
+                ) : null}
+              </>
+            ) : (
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                Cleanup preview is not loaded.
+              </Typography>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCleanupDialogOpen(false)}>Close</Button>
+          <Button
+            variant="contained"
+            onClick={() => void submitCleanupArchive()}
+            disabled={
+              cleanupMutation.isPending ||
+              !cleanupConfirmed ||
+              selectedCleanupCandidates.length === 0 ||
+              !cleanupPreview
+            }
+          >
+            {cleanupMutation.isPending ? "Queueing..." : "Archive selected"}
+          </Button>
+        </DialogActions>
       </Dialog>
     </WorkspacePageShell>
   );

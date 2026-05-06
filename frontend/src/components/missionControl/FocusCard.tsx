@@ -17,7 +17,7 @@ const STATE_TAG: Record<FocusState, { label: string; tone: NeuralPanelTagTone }>
 export function FocusCard({ state, body }: FocusCardProps) {
   const { label, tone } = STATE_TAG[state];
   return (
-    <NeuralPanel title="Current Focus" tag={label} tagTone={tone} className="nw-panel--focus">
+    <NeuralPanel title="Current Objective" tag={label} tagTone={tone} className="nw-panel--focus">
       <div className="nw-panel-muted">{body}</div>
     </NeuralPanel>
   );

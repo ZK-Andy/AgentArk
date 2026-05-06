@@ -243,6 +243,25 @@ enum TurnExecutionPath {
     AgentLoop,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConversationControlCommand {
+    New,
+    Clear,
+}
+
+fn parse_conversation_control_command(message: &str) -> Option<ConversationControlCommand> {
+    let mut parts = message.trim().split_whitespace();
+    let command = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match command {
+        "/new" | "\\new" => Some(ConversationControlCommand::New),
+        "/clear" | "\\clear" => Some(ConversationControlCommand::Clear),
+        _ => None,
+    }
+}
+
 fn turn_execution_path_from_routing(
     routing: Option<&crate::security::intent_classifier::InboundRoutingSignal>,
     state: DirectConversationRuntimeState,
@@ -1622,6 +1641,61 @@ impl Agent {
         let contact_info_memory_candidate =
             !secret_redaction.had_secret() && has_contact_info_for_memory_capture(&message_storage);
         let early_safe_message = message_storage.clone();
+        if !matches!(channel, "http" | "web") {
+            if let (Some(request_conversation_id), Some(command)) = (
+                conversation_id,
+                parse_conversation_control_command(&message_storage),
+            ) {
+                let (response, new_conversation_id) = match command {
+                    ConversationControlCommand::New => {
+                        let new_id = self
+                            .start_new_channel_conversation(
+                                channel,
+                                request_conversation_id,
+                                project_id,
+                                "New Chat",
+                            )
+                            .await?;
+                        (
+                            "Started a new conversation. Previous history is kept.".to_string(),
+                            new_id,
+                        )
+                    }
+                    ConversationControlCommand::Clear => {
+                        let new_id = self
+                            .clear_current_channel_conversation(
+                                channel,
+                                request_conversation_id,
+                                project_id,
+                            )
+                            .await?;
+                        ("Conversation cleared. Starting fresh.".to_string(), new_id)
+                    }
+                };
+                return Ok(ProcessedMessage {
+                    response,
+                    conversation_id: Some(new_conversation_id),
+                    conversation_title: None,
+                    run_id: None,
+                    run_status: Some(
+                        crate::core::ExecutionRunStatus::Completed
+                            .as_str()
+                            .to_string(),
+                    ),
+                    trace_id: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    choices: Vec::new(),
+                    degradation: Vec::new(),
+                    attempted_models: Vec::new(),
+                    user_outcome: None,
+                    trace_steps: Vec::new(),
+                    turn_records: Vec::new(),
+                    turn_plan: None,
+                });
+            }
+        }
         let (resolved_conversation_id, is_new_conversation) = self
             .resolve_conversation_id(channel, conversation_id, project_id, &early_safe_message)
             .await?;

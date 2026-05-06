@@ -169,11 +169,6 @@ export function prefetchSettingsTabData(
         queryFn: fetchSecurityAbuseReviews,
         staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
       },
-      {
-        queryKey: SETTINGS_QUERY_KEYS.secrets,
-        queryFn: fetchSettingsSecrets,
-        staleTime: SETTINGS_BACKGROUND_STALE_TIME_MS,
-      },
     );
   }
   if (tab === 5) {

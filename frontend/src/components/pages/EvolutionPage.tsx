@@ -91,7 +91,6 @@ import {
   uniqueNonEmptyStrings,
 } from "./traceEvolutionHelpers";
 import {
-  charsLabel,
   formatTimestampForHumans,
   promptCanarySafetyStatusColor,
   promptProposalRiskColor,
@@ -137,7 +136,9 @@ function recordList(value: unknown): JsonRecord[] {
 function backgroundImprovementReason(reason: string) {
   switch (reason) {
     case "learning_paused":
-      return "Learning is paused.";
+      return "ArkEvolve is paused.";
+    case "gepa_disabled":
+      return "GEPA background optimizer is disabled.";
     case "model_or_runtime_not_ready":
       return "Finish model setup before background improvements can start.";
     case "budget_paused":
@@ -152,6 +153,16 @@ function backgroundImprovementReason(reason: string) {
       return "Collecting more completed work before the next check.";
     case "queued_for_quiet_time":
       return "Queued and waiting for quiet time.";
+    case "blocked":
+      return "The last background improvement was blocked by readiness or budget gates.";
+    case "failed":
+      return "The last background improvement failed.";
+    case "timed_out":
+      return "The last background improvement timed out.";
+    case "retry_pending":
+      return "A failed background improvement will retry after AgentArk is quiet.";
+    case "completed":
+      return "The last background improvement completed.";
     default:
       return reason ? "Background improvement is waiting." : "Watching recent work.";
   }
@@ -174,6 +185,10 @@ type ExperimentSurfaceItem = {
   canaryState: JsonRecord;
   primaryMetricLabel: string;
   replayGateReasons: JsonRecord[];
+  stopAction?: JsonRecord;
+  acceptAction?: JsonRecord;
+  rollbackAction?: JsonRecord;
+  rollbackAvailable?: boolean;
 };
 
 type ExperimentMetricSummary = {
@@ -182,6 +197,62 @@ type ExperimentMetricSummary = {
   helper: string;
   tone?: "default" | "good" | "warn" | "info";
 };
+
+function EvolutionLifecycle({
+  steps,
+  activeIndex,
+}: {
+  steps: string[];
+  activeIndex: number;
+}) {
+  return (
+    <Box
+      sx={{
+        display: "grid",
+        gridTemplateColumns: {
+          xs: "1fr",
+          sm: `repeat(${Math.min(steps.length, 3)}, minmax(0, 1fr))`,
+          lg: `repeat(${steps.length}, minmax(0, 1fr))`,
+        },
+        gap: 0.6,
+      }}
+    >
+      {steps.map((step, idx) => {
+        const isActive = idx === activeIndex;
+        const isPast = idx < activeIndex;
+        return (
+          <Box
+            key={`${step}-${idx}`}
+            sx={{
+              minWidth: 0,
+              px: 0.85,
+              py: 0.65,
+              borderRadius: 1,
+              border: "1px solid var(--ui-rgba-145-170-205-120)",
+              bgcolor: isActive
+                ? "rgba(20, 241, 149, 0.12)"
+                : isPast
+                  ? "rgba(84, 198, 255, 0.08)"
+                  : "rgba(8, 14, 24, 0.34)",
+            }}
+          >
+            <Typography
+              variant="caption"
+              sx={{
+                color: isActive ? "#8ee3b1" : "text.secondary",
+                display: "block",
+                fontWeight: isActive ? 700 : 500,
+                lineHeight: 1.35,
+              }}
+            >
+              {step}
+            </Typography>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
 
 function finiteNumber(value: unknown): number | null {
   const parsed = num(value, Number.NaN);
@@ -222,6 +293,116 @@ function formatSampleCount(value: number | null): string {
 function formatPercentRatio(value: number | null, digits = 1): string {
   if (value == null) return "-";
   return percentageLabel(value, digits) || "-";
+}
+
+function ResultSummaryCard({
+  label,
+  value,
+  helper,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  helper: string;
+  tone?: "default" | "good" | "warn" | "info";
+}) {
+  const accent =
+    tone === "good"
+      ? "#14f195"
+      : tone === "warn"
+        ? "#fbbf24"
+        : tone === "info"
+          ? "#54c6ff"
+          : "#9fb3c8";
+  return (
+    <Box
+      sx={{
+        minWidth: 0,
+        p: 1,
+        border: "1px solid var(--ui-rgba-145-170-205-120)",
+        borderRadius: 1,
+        bgcolor: "rgba(8, 14, 24, 0.34)",
+        borderLeft: `3px solid ${accent}`,
+      }}
+    >
+      <Typography
+        variant="caption"
+        sx={{ color: "text.secondary", display: "block" }}
+      >
+        {label}
+      </Typography>
+      <Typography
+        variant="h6"
+        sx={{ color: "#e8f4ff", fontWeight: 750, lineHeight: 1.2, mt: 0.25 }}
+      >
+        {value}
+      </Typography>
+      <Typography
+        variant="caption"
+        sx={{ color: "text.secondary", display: "block", lineHeight: 1.35 }}
+      >
+        {helper}
+      </Typography>
+    </Box>
+  );
+}
+
+function ResultProgressRow({
+  label,
+  value,
+  helper,
+  color,
+}: {
+  label: string;
+  value: number;
+  helper: string;
+  color: string;
+}) {
+  return (
+    <Box sx={{ minWidth: 0 }}>
+      <Stack
+        direction="row"
+        spacing={1}
+        sx={{ justifyContent: "space-between", alignItems: "baseline" }}
+      >
+        <Typography
+          variant="body2"
+          sx={{ color: "#e8f4ff", fontWeight: 650, minWidth: 0 }}
+          noWrap
+          title={label}
+        >
+          {label}
+        </Typography>
+        <Typography variant="caption" sx={{ color: "text.secondary" }}>
+          {value.toFixed(1)}%
+        </Typography>
+      </Stack>
+      <Box
+        sx={{
+          mt: 0.45,
+          height: 7,
+          overflow: "hidden",
+          borderRadius: 999,
+          bgcolor: "rgba(148, 163, 184, 0.16)",
+        }}
+      >
+        <Box
+          sx={{
+            width: `${Math.max(0, Math.min(100, value))}%`,
+            height: "100%",
+            borderRadius: 999,
+            bgcolor: color,
+          }}
+        />
+      </Box>
+      <Typography
+        variant="caption"
+        sx={{ color: "text.secondary", display: "block", mt: 0.35 }}
+      >
+        {helper}
+      </Typography>
+    </Box>
+  );
 }
 
 function formatLatencyMs(value: unknown): string {
@@ -407,7 +588,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const [success, setSuccess] = useState<string | null>(null);
   const [selectedPatternCard, setSelectedPatternCard] =
     useState<EvolutionPatternCard | null>(null);
-  const [showArkEvolveInternals, setShowArkEvolveInternals] = useState(false);
   const [technicalDialogProposalId, setTechnicalDialogProposalId] = useState<
     string | null
   >(null);
@@ -479,6 +659,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const specialistCanary = asRecord(evolution.specialist_prompt_canary);
   const promptFragmentCanary = asRecord(evolution.prompt_fragment_canary);
   const learningQueue = asRecord(evolution.learning_queue);
+  const gepaConfig = asRecord(evolution.gepa_config);
   const gepaReadiness = asRecord(evolution.gepa_readiness);
   const gepaBudget = asRecord(gepaReadiness.budget);
   const gepaAutoState = asRecord(evolution.gepa_auto_state);
@@ -491,10 +672,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         .filter(Boolean)
     : [];
   const gepaReady = toBool(gepaReadiness.ready);
-  const gepaPythonReady = toBool(gepaReadiness.python_ready);
-  const gepaDspyReady = toBool(gepaReadiness.dspy_ready);
-  const gepaModelReady = toBool(gepaReadiness.model_ready);
-  const gepaProviderReady = toBool(gepaReadiness.provider_key_ready);
   const gepaPendingItems = recordList(gepaQueue.pending);
   const gepaRunningItems = recordList(gepaQueue.running);
   const gepaCompletedItems = recordList(gepaQueue.completed);
@@ -516,6 +693,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       ? gepaLastResult
       : (latestGepaQueueRecord ?? {});
   const latestGepaInner = asRecord(latestGepaRecord.result);
+  const latestGepaStatus = str(
+    latestGepaInner.status,
+    str(latestGepaRecord.status, ""),
+  ).trim();
+  const latestGepaError =
+    str(latestGepaInner.error, "").trim() ||
+    str(latestGepaInner.stderr_tail, "").trim() ||
+    str(latestGepaRecord.error, "").trim();
   const latestGepaImport = asRecord(
     latestGepaInner.import_result ?? latestGepaRecord.import_result,
   );
@@ -524,40 +709,102 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     num(latestGepaImportSummary.prompt_candidates, 0) +
     num(latestGepaImportSummary.specialist_prompt_candidates, 0) +
     num(latestGepaImportSummary.prompt_fragment_candidates, 0);
+  const gepaAutoStatus = str(gepaAutoState.last_status, "").trim();
   const gepaAutoReason = str(gepaAutoState.last_reason, "");
   const gepaEvidenceSamples = num(gepaAutoState.last_evidence_samples, 0);
-  const backgroundImprovementPaused = !toBool(evolution.self_evolve_enabled);
+  const selfEvolveEnabled = toBool(evolution.self_evolve_enabled);
+  const gepaOptimizerEnabled =
+    gepaConfig.enabled == null ? true : toBool(gepaConfig.enabled);
+  const backgroundImprovementPaused =
+    !selfEvolveEnabled || !gepaOptimizerEnabled;
+  const backgroundImprovementPauseText = !selfEvolveEnabled
+    ? "ArkEvolve is paused."
+    : "GEPA background optimizer is disabled.";
+  const backgroundImprovementNeedsAttention = [
+    latestGepaStatus,
+    gepaAutoStatus,
+  ].some((status) => ["blocked", "failed", "timed_out", "error"].includes(status));
   const backgroundImprovementLabel = backgroundImprovementPaused
     ? "Paused"
     : gepaRunningJobs > 0
-      ? "Improving now"
+      ? "Running now"
       : gepaPendingJobs > 0
         ? "Waiting for quiet time"
         : !gepaReady
           ? "Needs model setup"
           : !gepaBudgetAllowed
             ? "Daily limit reached"
-            : "Automatic";
+            : backgroundImprovementNeedsAttention
+              ? "Needs attention"
+              : latestGepaCandidateCount > 0
+                ? "Safety checks"
+                : gepaEvidenceSamples > 0
+                  ? "Collecting samples"
+                  : "Waiting for more data";
   const backgroundImprovementColor = backgroundImprovementPaused
     ? ("default" as const)
     : gepaRunningJobs > 0
       ? ("info" as const)
       : gepaPendingJobs > 0
         ? ("warning" as const)
-        : !gepaReady || !gepaBudgetAllowed
+      : !gepaReady || !gepaBudgetAllowed || backgroundImprovementNeedsAttention
           ? ("warning" as const)
-          : ("success" as const);
+          : latestGepaCandidateCount > 0
+            ? ("success" as const)
+            : ("info" as const);
   const backgroundImprovementSummary = backgroundImprovementPaused
-    ? "Learning is paused."
+    ? backgroundImprovementPauseText
     : gepaRunningJobs > 0
       ? "Reviewing recent work and preparing safer prompt candidates."
       : gepaPendingJobs > 0
         ? "Queued. It will start after AgentArk has been quiet for a few minutes."
         : !gepaReady
           ? "Finish model setup in Models so background improvements can run."
-          : latestGepaCandidateCount > 0
-            ? `${latestGepaCandidateCount} candidate${latestGepaCandidateCount === 1 ? "" : "s"} handed to ArkEvolve safety checks.`
-            : backgroundImprovementReason(gepaAutoReason);
+          : backgroundImprovementNeedsAttention
+            ? latestGepaError
+              ? `Last check stopped: ${latestGepaError}`
+              : backgroundImprovementReason(gepaAutoStatus || latestGepaStatus)
+            : latestGepaCandidateCount > 0
+              ? `${latestGepaCandidateCount} candidate${latestGepaCandidateCount === 1 ? "" : "s"} handed to safety checks.`
+              : backgroundImprovementReason(gepaAutoReason);
+  const backgroundImprovementNowText = backgroundImprovementPaused
+    ? `Paused: ${backgroundImprovementPauseText}`
+    : gepaRunningJobs > 0
+      ? "Running now: reviewing recent completed work and preparing candidates."
+      : gepaPendingJobs > 0
+        ? `${gepaPendingJobs} background check${gepaPendingJobs === 1 ? "" : "s"} queued until AgentArk is quiet.`
+        : !gepaReady
+          ? "Waiting for model setup: background improvement needs a working primary model."
+          : !gepaBudgetAllowed
+            ? "Paused for today: the daily background-improvement budget is used."
+            : backgroundImprovementNeedsAttention
+              ? backgroundImprovementSummary
+              : latestGepaCandidateCount > 0
+                ? backgroundImprovementSummary
+                : gepaEvidenceSamples > 0
+                  ? `${gepaEvidenceSamples} completed-work sample${gepaEvidenceSamples === 1 ? "" : "s"} ready for the next check.`
+                  : "Waiting for more data: ArkEvolve needs more completed work before another check can run.";
+  const backgroundImprovementSamplesText =
+    gepaEvidenceSamples > 0
+      ? `${gepaEvidenceSamples} completed-work sample${gepaEvidenceSamples === 1 ? "" : "s"} collected.`
+      : "No new completed-work samples are ready yet.";
+  const backgroundImprovementNextText = backgroundImprovementPaused
+    ? !selfEvolveEnabled
+      ? "Turn Self-evolve back on in Settings > Advanced when you want learning to resume."
+      : "Re-enable the GEPA optimizer config before background prompt optimization resumes."
+    : gepaRunningJobs > 0
+      ? "When it finishes, useful candidates move into safety checks or the review queue."
+      : gepaPendingJobs > 0
+        ? "It starts automatically after AgentArk has been quiet for a few minutes."
+        : !gepaReady
+          ? "Finish model setup in Settings > Models."
+          : !gepaBudgetAllowed
+            ? "It resumes after the daily budget resets."
+            : backgroundImprovementNeedsAttention
+              ? "Fix the readiness issue or let the queued retry run after AgentArk is quiet."
+              : latestGepaCandidateCount > 0
+                ? "Watch Live tests and Review queue for the safety-check result."
+                : "Keep using AgentArk; completed runs provide the samples ArkEvolve needs.";
   const promptInsights = asRecord(evolutionDev.prompt_insights);
   const classifierInsights = asRecord(
     evolutionDev.classifier_prompt_insights ?? evolutionDev.classifier_insights,
@@ -589,16 +836,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     evolutionDev,
     "prompt_canary_safety_events",
   );
-  const promptTelemetrySummary = asRecord(
-    evolutionDev.prompt_telemetry_summary,
-  );
   const promptOptimizationOpportunities = pickRecords(
     evolutionDev,
     "prompt_optimization_opportunities",
-  );
-  const promptTelemetrySections = pickRecords(
-    promptTelemetrySummary,
-    "top_sections",
   );
   const learningCandidates = pickRecords(evolutionDev, "learning_candidates");
   const learningPatterns = pickRecords(evolutionDev, "learning_patterns");
@@ -664,6 +904,15 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const confirmedLineageRows = lineageRows.filter((row) => toBool(row.promoted));
   const confirmedRecentChangeCount =
     confirmedLineageRows.length + skillHelpedItems.length;
+  const hasActiveRoutingCanary = toBool(canary.enabled);
+  const routingRollbackAvailable = toBool(evolution.routing_rollback_available);
+  const promptRollbackAvailable = toBool(evolution.prompt_rollback_available);
+  const specialistPromptRollbackAvailable = toBool(
+    evolution.specialist_prompt_rollback_available,
+  );
+  const promptFragmentRollbackAvailable = toBool(
+    evolution.prompt_fragment_rollback_available,
+  );
 
   const tests: ExperimentSurfaceItem[] = [
     {
@@ -686,6 +935,10 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       metrics: policyMetrics,
       canaryState: routingCanaryState,
       primaryMetricLabel: "Task success rate",
+      stopAction: { action: "disable_canary" },
+      acceptAction: { action: "promote_candidate" },
+      rollbackAction: { action: "rollback_baseline" },
+      rollbackAvailable: routingRollbackAvailable,
     },
     {
       key: "prompt",
@@ -707,6 +960,16 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       metrics: promptMetrics,
       canaryState: promptCanaryState,
       primaryMetricLabel: "Reply success rate",
+      stopAction: { action: "disable_prompt_canary", candidate_id: "prompt" },
+      acceptAction: {
+        action: "promote_prompt_canary_candidate",
+        candidate_id: "prompt",
+      },
+      rollbackAction: {
+        action: "rollback_prompt_baseline",
+        candidate_id: "prompt",
+      },
+      rollbackAvailable: promptRollbackAvailable,
     },
     {
       key: "specialist",
@@ -728,6 +991,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       metrics: specialistMetrics,
       canaryState: specialistPromptCanaryState,
       primaryMetricLabel: "Delegated work success",
+      stopAction: {
+        action: "disable_prompt_canary",
+        candidate_id: "specialist_prompt",
+      },
+      acceptAction: {
+        action: "promote_prompt_canary_candidate",
+        candidate_id: "specialist_prompt",
+      },
+      rollbackAction: {
+        action: "rollback_prompt_baseline",
+        candidate_id: "specialist_prompt",
+      },
+      rollbackAvailable: specialistPromptRollbackAvailable,
     },
     {
       key: "prompt-fragments",
@@ -749,6 +1025,19 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
       metrics: promptFragmentMetrics,
       canaryState: promptFragmentCanaryState,
       primaryMetricLabel: "Prompted turn success",
+      stopAction: {
+        action: "disable_prompt_canary",
+        candidate_id: "prompt_fragment",
+      },
+      acceptAction: {
+        action: "promote_prompt_canary_candidate",
+        candidate_id: "prompt_fragment",
+      },
+      rollbackAction: {
+        action: "rollback_prompt_baseline",
+        candidate_id: "prompt_fragment",
+      },
+      rollbackAvailable: promptFragmentRollbackAvailable,
     },
   ];
   const activeExperimentItems = tests.filter((item) => item.enabled);
@@ -978,10 +1267,36 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   const promotedChangeCount =
     lineageRows.filter((row) => toBool(row.promoted)).length +
     skillHelpedItems.length;
+  const experienceGraphReady =
+    experienceGraphNodes.length >= 4 && experienceGraphEdges.length > 0;
+  const experienceNodePreview = experienceGraphNodes.slice(0, 5);
+  const metricChartLabels = metricChartRows.map((row) => {
+    const surface = str(row.surface, "-");
+    const version = str(row.version, "").trim();
+    return version ? `${surface} ${version}` : surface;
+  });
+  const optimizationMetricSummaries = metricChartRows.slice(0, 5).map((row) => {
+    const label = str(row.surface, "-");
+    const version = str(row.version, "").trim();
+    const samples =
+      finiteNumber(row.samples) ??
+      finiteNumber(row.sample_count) ??
+      finiteNumber(row.total_runs);
+    return {
+      key: `${label}-${version || str(row.id, "")}`,
+      label: version ? `${label} ${version}` : label,
+      success: ratioPercent(row.success_rate),
+      error: ratioPercent(row.error_rate),
+      helper:
+        samples == null
+          ? "Recent traffic"
+          : `${Math.round(samples).toLocaleString()} recent sample${Math.round(samples) === 1 ? "" : "s"}`,
+    };
+  });
   const metricChartOption = {
     backgroundColor: "transparent",
     animationDuration: 350,
-    grid: { left: 48, right: 16, top: 36, bottom: 58 },
+    grid: { left: 42, right: 14, top: 40, bottom: 34, containLabel: true },
     legend: { top: 0, textStyle: { color: "#9fc3e6", fontSize: 11 } },
     tooltip: {
       trigger: "axis",
@@ -991,11 +1306,18 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     },
     xAxis: {
       type: "category",
-      data: metricChartRows.map(
-        (row) =>
-          `${str(row.surface, "-")} ${str(row.version, "").slice(0, 16)}`,
-      ),
-      axisLabel: { color: "#8fb2d1", fontSize: 10, rotate: 18 },
+      data: metricChartLabels,
+      axisTick: { alignWithLabel: true },
+      axisLabel: {
+        color: "#8fb2d1",
+        fontSize: 10,
+        interval: 0,
+        rotate: metricChartRows.length > 4 ? 22 : 0,
+        hideOverlap: true,
+        overflow: "truncate",
+        width: metricChartRows.length > 4 ? 92 : 120,
+        margin: 12,
+      },
     },
     yAxis: {
       type: "value",
@@ -1049,8 +1371,63 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     updateEvolutionMutation.isPending ||
     runEvolutionActionMutation.isPending ||
     !toBool(evolution.self_evolve_enabled);
-  const hasActiveRoutingCanary = toBool(canary.enabled);
-  const routingRollbackAvailable = toBool(evolution.routing_rollback_available);
+  const rollbackAvailableCount = [
+    routingRollbackAvailable,
+    promptRollbackAvailable,
+    specialistPromptRollbackAvailable,
+    promptFragmentRollbackAvailable,
+  ].filter(Boolean).length;
+  const anyRollbackAvailable = rollbackAvailableCount > 0;
+  const hasLiveOrStableChange = activeTests > 0 || anyRollbackAvailable;
+  const primaryStatusTitle = needsApprovalCount > 0
+    ? "Needs your decision"
+    : activeTests > 0
+      ? "Testing a change safely"
+      : anyRollbackAvailable
+        ? "Stable change active"
+        : gepaRunningJobs > 0
+          ? "Running background check"
+          : gepaPendingJobs > 0
+            ? "Queued for quiet time"
+            : !gepaReady
+              ? "Waiting for model setup"
+              : latestGepaCandidateCount > 0
+                ? "Checking candidate safety"
+                : "No action needed";
+  const primaryStatusDetail = needsApprovalCount > 0
+    ? `${needsApprovalCount} item${needsApprovalCount === 1 ? "" : "s"} need your decision before anything lasting happens.`
+    : activeTests > 0
+      ? "A candidate is live only for limited traffic. You can accept it as stable or stop the live test from this page."
+      : anyRollbackAvailable
+        ? `${rollbackAvailableCount} stable change${rollbackAvailableCount === 1 ? "" : "s"} can be rolled back from Live tests.`
+        : gepaRunningJobs > 0
+          ? "ArkEvolve is reviewing completed work. If it finds something useful, it will move into safety checks or review."
+          : gepaPendingJobs > 0
+            ? "A background check is waiting until AgentArk is quiet."
+            : !gepaReady
+              ? "Background improvement needs a working primary model before it can run."
+              : latestGepaCandidateCount > 0
+                ? "Candidate improvements were created and are going through safety checks."
+                : "No ArkEvolve behavior change is active right now.";
+  const deploymentStateLabel = hasActiveRoutingCanary
+    ? "Live test"
+    : activeTests > 0
+      ? "Live test"
+      : anyRollbackAvailable
+      ? "Stable change active"
+      : "No deployed change";
+  const rollbackStateLabel = anyRollbackAvailable
+    ? "Rollback available"
+    : activeTests > 0
+      ? "Stop test available"
+      : "No rollback needed";
+  const reviewLifecycleSteps = [
+    "Suggested",
+    "Saved for follow-up",
+    "More examples",
+    "Live test",
+    "Stable change",
+  ];
 
   async function updateEvolution(payload: JsonRecord, message: string) {
     setError(null);
@@ -1085,6 +1462,92 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
     ? errMessage(evolutionDevQ.error)
     : "";
   const activeError = error || statusError;
+  const hasMeasuredHelp =
+    confirmedRecentChangeCount > 0 ||
+    skillHelpedItems.length > 0 ||
+    helpedLines.length > 0;
+  const resultSummarySeverity = detailError
+    ? ("warning" as const)
+    : hasMeasuredHelp
+      ? ("success" as const)
+      : ("info" as const);
+  const resultSummaryTitle = detailLoading
+    ? "Loading measured results"
+    : detailError
+      ? "Results are unavailable"
+      : hasMeasuredHelp
+        ? `${confirmedRecentChangeCount || helpedLines.length} confirmed improvement${(confirmedRecentChangeCount || helpedLines.length) === 1 ? "" : "s"}`
+        : "No proven improvement yet";
+  const resultSummaryDetail = detailLoading
+    ? "ArkEvolve is loading the recent evidence behind prompt, routing, specialist, and skill changes."
+    : detailError
+      ? "The detail endpoint did not return enough data to explain recent ArkEvolve results."
+      : hasMeasuredHelp
+        ? "These are changes with measured evidence from recent runs. Live tests and review items are shown separately before anything risky becomes stable."
+        : "ArkEvolve has not found enough measured evidence to call a recent change useful. This page now shows that plainly instead of stretching empty panels or drawing weak charts.";
+  const resultSummaryCards = [
+    {
+      label: "Confirmed wins",
+      value: String(confirmedRecentChangeCount),
+      helper:
+        confirmedRecentChangeCount > 0
+          ? "Recent evidence says these helped."
+          : "Nothing has cleared the improvement threshold.",
+      tone: confirmedRecentChangeCount > 0 ? ("good" as const) : ("info" as const),
+    },
+    {
+      label: "Still measuring",
+      value: String(skillObservedItems.length),
+      helper:
+        skillObservedItems.length > 0
+          ? "Approved changes need more traffic."
+          : "No approved skill change is waiting.",
+      tone: skillObservedItems.length > 0 ? ("warn" as const) : ("default" as const),
+    },
+    {
+      label: "Needs review",
+      value: String(needsApprovalCount),
+      helper:
+        needsApprovalCount > 0
+          ? "Suggestions wait for your decision."
+          : "Nothing is waiting on you.",
+      tone: needsApprovalCount > 0 ? ("warn" as const) : ("default" as const),
+    },
+    {
+      label: "Live tests",
+      value: String(activeTests),
+      helper:
+        activeTests > 0
+          ? "Limited traffic is testing candidates."
+          : "No candidate is live right now.",
+      tone: activeTests > 0 ? ("info" as const) : ("default" as const),
+    },
+  ];
+  const evidenceMetricCards = [
+    {
+      label: "Prompt",
+      value: `Tool ${evolutionGainLabel(promptInsights.tool_success_uplift)}`,
+      helper: `Delegation avoided ${num(promptInsights.delegation_avoided, 0).toFixed(1)}, clarification avoided ${num(promptInsights.clarification_avoided, 0).toFixed(1)}`,
+    },
+    {
+      label: "Classifier",
+      value: `Direct ${evolutionGainLabel(
+        classifierInsights.successful_direct_resolution_uplift,
+      )}`,
+      helper: `Failed delegation reduction ${evolutionGainLabel(
+        classifierInsights.failed_delegation_reduction,
+      )}`,
+    },
+    {
+      label: "Specialist",
+      value: `Tool ${evolutionGainLabel(specialistInsights.tool_success_uplift)}`,
+      helper: `p95 savings ${
+        specialistInsights.latency_savings_p95_ms == null
+          ? "-"
+          : `${num(specialistInsights.latency_savings_p95_ms, 0)} ms`
+      }`,
+    },
+  ];
   const selectedPatternRuns = selectedPatternCard?.runs ?? [];
   const selectedPatternRequests = uniqueNonEmptyStrings(
     selectedPatternRuns
@@ -1113,13 +1576,13 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
   return (
     <WorkspacePageShell className="evolution-page" spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Ark Core"
+        eyebrow="Ark Core / ArkEvolve"
         title="ArkEvolve"
         description={
           <>
-            ArkEvolve quietly improves AgentArk based on how you actually use it.
+            ArkEvolve shows what AgentArk is trying to improve, what is being tested, and what can be rolled back.
             <br />
-            Each candidate change is tested against your own runs, then asked before anything sticks.
+            ArkEvolve quietly learns from completed work and asks before lasting behavior changes.
           </>
         }
         actions={
@@ -1154,361 +1617,134 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   : `${activeTests} active experiment${activeTests === 1 ? "" : "s"}`
               }
             />
-            <FormControlLabel
-              control={
-                <Switch
-                  size="small"
-                  checked={showArkEvolveInternals}
-                  onChange={(event) => {
-                    const next = event.target.checked;
-                    setShowArkEvolveInternals(next);
-                    if (!next) setSelectedPatternCard(null);
-                  }}
-                />
-              }
-              label={
-                <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                  Show ArkEvolve internals
-                </Typography>
-              }
-              sx={{ ml: 0.5, mr: 0 }}
-            />
           </Stack>
         }
       />
       {success ? <Alert severity="success">{success}</Alert> : null}
       {activeError ? <Alert severity="error">{activeError}</Alert> : null}
-      {!showArkEvolveInternals ? (
-        <>
-          <Box className="list-shell" sx={{ p: 1.5 }}>
-            <Stack spacing={0.5}>
-              <Typography variant="body1" sx={{ fontWeight: 700, color: "#e8f4ff" }}>
-                ArkEvolve is {toBool(evolution.self_evolve_enabled) ? "on" : "off"}.
-              </Typography>
-              <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-                {activeTests > 0
-                  ? `${activeTests} active experiment${activeTests === 1 ? "" : "s"}.`
-                  : "No experiment running right now."}{" "}
-                {needsApprovalCount > 0
-                  ? `${needsApprovalCount} change${needsApprovalCount === 1 ? "" : "s"} waiting on you.`
-                  : "Nothing waiting on you."}{" "}
-                {promotedChangeCount > 0
-                  ? `${promotedChangeCount} confirmed improvement${promotedChangeCount === 1 ? "" : "s"} so far.`
-                  : "No confirmed improvements yet."}
-              </Typography>
-            </Stack>
-          </Box>
-          {activeExperimentItems.length > 0 ? (
-            <Box className="list-shell" sx={{ p: 1.5 }}>
-              <Stack spacing={1.25}>
-                <Stack
-                  direction={{ xs: "column", md: "row" }}
-                  spacing={1}
-                  sx={{
-                    alignItems: { xs: "flex-start", md: "center" },
-                    justifyContent: "space-between",
-                  }}
-                >
-                  <Box sx={{ minWidth: 0 }}>
-                    <Typography
-                      variant="subtitle1"
-                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                    >
-                      Active experiment{activeExperimentItems.length === 1 ? "" : "s"}
-                    </Typography>
-                    <Typography
-                      variant="body2"
-                      sx={{ color: "text.secondary", mt: 0.25, lineHeight: 1.55 }}
-                    >
-                      Live canary evidence from stable and candidate versions.
-                    </Typography>
-                  </Box>
-                  <Chip
-                    size="small"
-                    color="warning"
-                    label={`${maxRollout.toFixed(0)}% max rollout`}
-                  />
-                </Stack>
-                {detailError ? (
-                  <Alert severity="warning" sx={{ borderRadius: 1 }}>
-                    Run metrics are unavailable: {detailError}
-                  </Alert>
-                ) : null}
-                {detailLoading ? (
-                  <Stack
-                    direction="row"
-                    spacing={1}
-                    sx={{ alignItems: "center", color: "text.secondary" }}
-                  >
-                    <CircularProgress size={16} />
-                    <Typography variant="body2">Refreshing experiment metrics...</Typography>
-                  </Stack>
-                ) : null}
-                {activeExperimentItems.map((item, idx) => {
-                  const safetyEvent = findMatchingCanarySafetyEvent(
-                    promptCanarySafetyEvents,
-                    item,
-                  );
-                  const metricSummaries = buildExperimentMetricSummaries(
-                    item,
-                    safetyEvent,
-                  );
-                  const stage = experimentStageText(item, safetyEvent);
-                  const reviewStatus = str(safetyEvent?.review_status, "").trim();
-                  const needsDecision =
-                    reviewStatus === "open" ||
-                    reviewStatus === "review_recommended";
-                  const reasonLabels = replayGateReasonLabels(item);
-                  return (
-                    <Box
-                      key={`active-experiment-${item.key}`}
-                      sx={{
-                        pt: idx === 0 ? 0 : 1.25,
-                        borderTop:
-                          idx === 0
-                            ? "none"
-                            : "1px solid var(--ui-rgba-145-170-205-120)",
-                      }}
-                    >
-                      <Stack spacing={1.15}>
-                        <Stack
-                          direction={{ xs: "column", lg: "row" }}
-                          spacing={1}
-                          sx={{
-                            alignItems: { xs: "flex-start", lg: "center" },
-                            justifyContent: "space-between",
-                          }}
-                        >
-                          <Box sx={{ minWidth: 0 }}>
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              useFlexGap
-                              sx={{ alignItems: "center", flexWrap: "wrap" }}
-                            >
-                              <Typography
-                                variant="h6"
-                                sx={{ color: "#e8f4ff", fontWeight: 700 }}
-                              >
-                                {item.audienceLabel}
-                              </Typography>
-                              <Chip size="small" color="warning" label={stage} />
-                              <Chip size="small" label={item.name} />
-                            </Stack>
-                            <Typography
-                              variant="body2"
-                              sx={{ color: "text.secondary", mt: 0.45, lineHeight: 1.6 }}
-                            >
-                              {item.summary}
-                            </Typography>
-                          </Box>
-                          <Stack
-                            direction="row"
-                            spacing={0.75}
-                            sx={{ flexShrink: 0, alignItems: "center" }}
-                          >
-                            <Button
-                              size="small"
-                              variant={needsDecision ? "contained" : "outlined"}
-                              onClick={() => {
-                                setShowArkEvolveInternals(true);
-                                setTab(needsDecision ? "review" : "tests");
-                              }}
-                            >
-                              {needsDecision ? "Review decision" : "View details"}
-                            </Button>
-                          </Stack>
-                        </Stack>
-                        <Box
-                          sx={{
-                            display: "grid",
-                            gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 260px" },
-                            gap: 1.25,
-                            alignItems: "start",
-                          }}
-                        >
-                          <Stack spacing={1}>
-                            <Box
-                              sx={{
-                                display: "grid",
-                                gridTemplateColumns: {
-                                  xs: "1fr 1fr",
-                                  md: "repeat(3, minmax(0, 1fr))",
-                                  xl: "repeat(6, minmax(0, 1fr))",
-                                },
-                                gap: 0.75,
-                              }}
-                            >
-                              {metricSummaries.map((metric) => {
-                                const valueColor =
-                                  metric.tone === "good"
-                                    ? "#8ee3b1"
-                                    : metric.tone === "warn"
-                                      ? "#ffd180"
-                                      : "#e8f4ff";
-                                return (
-                                  <Box
-                                    key={`${item.key}-${metric.label}`}
-                                    sx={{
-                                      minWidth: 0,
-                                      p: 1,
-                                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                                      borderRadius: 1,
-                                      bgcolor: "rgba(8, 14, 24, 0.38)",
-                                    }}
-                                  >
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        lineHeight: 1.35,
-                                      }}
-                                    >
-                                      {metric.label}
-                                    </Typography>
-                                    <Typography
-                                      variant="body2"
-                                      sx={{
-                                        color: valueColor,
-                                        fontWeight: 700,
-                                        mt: 0.2,
-                                        overflowWrap: "anywhere",
-                                        fontVariantNumeric: "tabular-nums",
-                                      }}
-                                    >
-                                      {metric.value}
-                                    </Typography>
-                                    <Typography
-                                      variant="caption"
-                                      sx={{
-                                        color: "text.secondary",
-                                        display: "block",
-                                        mt: 0.25,
-                                        lineHeight: 1.35,
-                                        overflowWrap: "anywhere",
-                                      }}
-                                    >
-                                      {metric.helper}
-                                    </Typography>
-                                  </Box>
-                                );
-                              })}
-                            </Box>
-                            <Box
-                              sx={{
-                                display: "grid",
-                                gridTemplateColumns: { xs: "1fr", md: "1fr 1fr" },
-                                gap: 1,
-                              }}
-                            >
-                              <Box sx={{ minWidth: 0 }}>
-                                <Typography
-                                  variant="caption"
-                                  sx={{ color: "text.secondary", display: "block" }}
-                                >
-                                  Why it could help
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "#d8edff", lineHeight: 1.55 }}
-                                >
-                                  {item.benefit}
-                                </Typography>
-                              </Box>
-                              <Box sx={{ minWidth: 0 }}>
-                                <Typography
-                                  variant="caption"
-                                  sx={{ color: "text.secondary", display: "block" }}
-                                >
-                                  Last activity
-                                </Typography>
-                                <Typography
-                                  variant="body2"
-                                  sx={{ color: "#d8edff", lineHeight: 1.55 }}
-                                >
-                                  {experimentLastActivityText(item, safetyEvent)}
-                                </Typography>
-                              </Box>
-                            </Box>
-                            <Typography
-                              variant="body2"
-                              sx={{ color: "text.secondary", lineHeight: 1.55 }}
-                            >
-                              {experimentGuardrailText(item)}
-                            </Typography>
-                            {reasonLabels.length > 0 ? (
-                              <Box
-                                component="ul"
-                                sx={{ pl: 2.25, m: 0, color: "text.secondary" }}
-                              >
-                                {reasonLabels.map((label, reasonIdx) => (
-                                  <Typography
-                                    key={`${item.key}-replay-reason-${reasonIdx}`}
-                                    component="li"
-                                    variant="body2"
-                                    sx={{ lineHeight: 1.5 }}
-                                  >
-                                    {label}
-                                  </Typography>
-                                ))}
-                              </Box>
-                            ) : null}
-                          </Stack>
-                          <EvolutionRolloutBar
-                            label="Traffic in experiment"
-                            percent={item.rollout}
-                          />
-                        </Box>
-                      </Stack>
-                    </Box>
-                  );
-                })}
-              </Stack>
-            </Box>
-          ) : null}
-          <Accordion
-            disableGutters
+      <Box className="list-shell" sx={{ p: 1.5 }}>
+        <Stack spacing={1.15}>
+          <Stack
+            direction={{ xs: "column", md: "row" }}
+            spacing={1}
             sx={{
-              background: "transparent",
-              border: "1px solid var(--ui-rgba-145-170-205-120)",
-              borderRadius: 1,
-              "&::before": { display: "none" },
+              alignItems: { xs: "flex-start", md: "center" },
+              justifyContent: "space-between",
             }}
           >
-            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1.5 }}>
-              <Typography variant="body2" sx={{ fontWeight: 700, color: "#e8f4ff" }}>
-                How does ArkEvolve work?
-              </Typography>
-            </AccordionSummary>
-            <AccordionDetails sx={{ px: 1.5, pb: 1.5 }}>
-              <Stack spacing={1.1}>
-                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
-                  ArkEvolve watches how AgentArk performs on your real work. When it spots corrected runs, slow turns, or recurring patterns, it drafts a candidate improvement to a prompt, a routing rule, or a specialist behavior.
+            <Box sx={{ minWidth: 0 }}>
+              <Stack
+                direction="row"
+                spacing={0.75}
+                useFlexGap
+                sx={{ alignItems: "center", flexWrap: "wrap" }}
+              >
+                <Typography
+                  variant="h6"
+                  sx={{ color: "#e8f4ff", fontWeight: 800 }}
+                >
+                  {primaryStatusTitle}
                 </Typography>
-                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
-                  Each candidate is tested against your own runs and statistical evidence thresholds. Only changes that beat the current behavior with confidence get promoted, and meaningful changes always ask before becoming permanent.
-                </Typography>
-                <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.65 }}>
-                  Toggle <strong>Show ArkEvolve internals</strong> at the top right to see live experiments, evidence, the review queue, and per-step diagnostics.
-                </Typography>
+                <Chip size="small" label={deploymentStateLabel} />
+                <Chip
+                  size="small"
+                  color={hasLiveOrStableChange ? "warning" : "success"}
+                  label={rollbackStateLabel}
+                />
               </Stack>
-            </AccordionDetails>
-          </Accordion>
-        </>
-      ) : null}
-      {showArkEvolveInternals ? (
-        <>
+              <Typography
+                variant="body2"
+                sx={{ color: "text.secondary", mt: 0.4, lineHeight: 1.6 }}
+              >
+                {primaryStatusDetail}
+              </Typography>
+            </Box>
+            {needsApprovalCount > 0 ||
+            activeTests > 0 ||
+            anyRollbackAvailable ? (
+              <Stack
+                direction="row"
+                spacing={0.75}
+                useFlexGap
+                sx={{ flexWrap: "wrap", flexShrink: 0 }}
+              >
+                {needsApprovalCount > 0 ? (
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={() => setTab("review")}
+                  >
+                    Review items
+                  </Button>
+                ) : null}
+                {activeTests > 0 ? (
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={() => setTab("tests")}
+                  >
+                    View live tests
+                  </Button>
+                ) : null}
+                {routingRollbackAvailable ? (
+                  <Button
+                    size="small"
+                    color="inherit"
+                    disabled={runEvolutionActionMutation.isPending}
+                    onClick={() =>
+                      void runEvolutionAction(
+                        { action: "rollback_baseline" },
+                        "Rolled back to the previous stable routing behavior.",
+                        "Roll back the stable routing change now?",
+                      )
+                    }
+                  >
+                    Roll back stable change
+                  </Button>
+                ) : anyRollbackAvailable ? (
+                  <Button
+                    size="small"
+                    color="inherit"
+                    onClick={() => setTab("tests")}
+                  >
+                    Rollback options
+                  </Button>
+                ) : null}
+              </Stack>
+            ) : null}
+          </Stack>
+          <EvolutionLifecycle
+            steps={[
+              "Watching",
+              "Your decision",
+              "Safety check",
+              "Limited test",
+              "Stable",
+            ]}
+            activeIndex={
+              needsApprovalCount > 0
+                ? 1
+                : activeTests > 0
+                  ? 3
+                  : anyRollbackAvailable
+                    ? 4
+                    : latestGepaCandidateCount > 0
+                      ? 2
+                      : 0
+            }
+          />
+        </Stack>
+      </Box>
       <EvolutionStatStrip
         items={[
           {
-            label: "Improvement mode",
+            label: "ArkEvolve mode",
             value: toBool(evolution.self_evolve_enabled) ? "On" : "Off",
-            helper: "Learns quietly · asks before lasting changes",
+            helper: "Learns quietly; asks before lasting changes",
             tone: toBool(evolution.self_evolve_enabled) ? "good" : "default",
           },
           {
-            label: "Experiments",
+            label: "Live tests",
             value: activeTests,
             helper:
               activeTests > 0
@@ -1517,7 +1753,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             tone: activeTests > 0 ? "warn" : "info",
           },
           {
-            label: "Needs approval",
+            label: "Needs you",
             value: needsApprovalCount,
             helper:
               needsApprovalCount > 0
@@ -1555,7 +1791,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   variant="subtitle1"
                   sx={{ color: "#e8f4ff", fontWeight: 700 }}
                 >
-                  Background improvement
+                  Background learning
                 </Typography>
                 <Chip
                   size="small"
@@ -1567,8 +1803,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                 variant="body2"
                 sx={{ color: "text.secondary", mt: 0.25 }}
               >
-                AgentArk reviews completed work when the server is quiet and
-                sends useful candidates through ArkEvolve safety checks.
+                Runs when AgentArk is quiet. It uses completed work to find
+                useful ideas, then sends anything risky through review or a
+                limited test.
               </Typography>
             </Box>
           </Stack>
@@ -1579,39 +1816,21 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
               display: "flex",
               flexDirection: "column",
-              gap: 0.5,
+              gap: 0.65,
               fontVariantNumeric: "tabular-nums",
             }}
           >
             <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              {gepaRunningJobs > 0 ? (
-                <>
-                  A background check is <strong style={{ color: "#ffd180" }}>running now</strong>.{" "}
-                  {backgroundImprovementSummary}
-                </>
-              ) : gepaPendingJobs > 0 ? (
-                <>
-                  <strong style={{ color: "#ffd180" }}>{gepaPendingJobs}</strong> check
-                  {gepaPendingJobs === 1 ? "" : "s"} queued, waiting for active work to settle.
-                </>
-              ) : (
-                <>
-                  Queue is <strong style={{ color: "#8ee3b1" }}>clear</strong>. {backgroundImprovementSummary}
-                </>
-              )}
+              <strong style={{ color: "#e8f4ff" }}>Now:</strong>{" "}
+              {backgroundImprovementNowText}
             </Typography>
             <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
-              {gepaEvidenceSamples > 0 ? (
-                <>
-                  <strong style={{ color: gepaEvidenceSamples >= 6 ? "#8ee3b1" : "#e8f4ff" }}>
-                    {gepaEvidenceSamples}
-                  </strong>{" "}
-                  fresh sample{gepaEvidenceSamples === 1 ? "" : "s"} collected.
-                </>
-              ) : (
-                <>Collecting more completed work before the next check.</>
-              )}{" "}
-              Runs after enough completed work is available.
+              <strong style={{ color: "#e8f4ff" }}>Samples:</strong>{" "}
+              {backgroundImprovementSamplesText}
+            </Typography>
+            <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
+              <strong style={{ color: "#e8f4ff" }}>Next:</strong>{" "}
+              {backgroundImprovementNextText}
             </Typography>
             <Typography variant="body2" sx={{ color: "text.secondary", lineHeight: 1.6 }}>
               <strong style={{ color: gepaBudgetAllowed ? "#8ee3b1" : "#ffd180" }}>
@@ -1623,74 +1842,13 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             </Typography>
           </Box>
 
-          {!gepaReady && !showArkEvolveInternals ? (
+          {!gepaReady && !backgroundImprovementPaused ? (
             <Alert severity="info" sx={{ borderRadius: 1 }}>
-              Background improvement starts automatically after Models has a
-              working primary model.
+              Background improvement starts automatically after Models has a working primary
+              model{gepaIssues[0] ? `: ${gepaIssues[0]}` : "."}
             </Alert>
           ) : null}
 
-          {showArkEvolveInternals ? (
-            <Box
-              sx={{
-                borderTop: "1px solid var(--ui-rgba-145-170-205-120)",
-                pt: 1,
-              }}
-            >
-              <Typography
-                variant="caption"
-                sx={{
-                  color: "text.secondary",
-                  display: "block",
-                  textTransform: "uppercase",
-                  letterSpacing: 0,
-                  mb: 0.75,
-                }}
-              >
-                Optimizer internals
-              </Typography>
-              <Stack
-                direction="row"
-                spacing={0.75}
-                useFlexGap
-                sx={{ alignItems: "center", flexWrap: "wrap" }}
-              >
-                <Chip
-                  size="small"
-                  color={gepaPythonReady ? "success" : "warning"}
-                  label={gepaPythonReady ? "Runtime ready" : "Runtime missing"}
-                />
-                <Chip
-                  size="small"
-                  color={gepaDspyReady ? "success" : "warning"}
-                  label={gepaDspyReady ? "DSPy installed" : "DSPy missing"}
-                />
-                <Chip
-                  size="small"
-                  color={
-                    gepaModelReady && gepaProviderReady ? "success" : "warning"
-                  }
-                  label={
-                    gepaModelReady && gepaProviderReady
-                      ? str(gepaReadiness.model_slot, "Active model")
-                      : "Model not ready"
-                  }
-                />
-                <Chip
-                  size="small"
-                  color={gepaBudgetAllowed ? "success" : "warning"}
-                  label={
-                    gepaBudgetAllowed ? "Budget available" : "Budget paused"
-                  }
-                />
-              </Stack>
-              {gepaIssues.length > 0 ? (
-                <Alert severity="warning" sx={{ borderRadius: 1, mt: 1 }}>
-                  {gepaIssues.slice(0, 3).join(" ")}
-                </Alert>
-              ) : null}
-            </Box>
-          ) : null}
         </Stack>
       </Box>
       <Box className="list-shell" sx={{ p: 0.75 }}>
@@ -1762,7 +1920,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               >
                 No confirmed improvements yet. ArkEvolve will list changes here
                 only after they have proven measurable impact. In the meantime,
-                the Needs approval tab shows changes that are waiting on you.
+                the Review queue tab shows changes that are waiting on you.
               </Typography>
             ) : (
               <Stack spacing={1}>
@@ -1933,7 +2091,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
             )}
           </Box>
 
-          {showArkEvolveInternals && evidenceCards.length > 0 ? (
+          {developerModeEnabled && evidenceCards.length > 0 ? (
             <Box className="list-shell" sx={{ p: 1.6 }}>
               <Typography variant="h6" sx={{ fontWeight: 700, mb: 0.5 }}>
                 Recent patterns
@@ -2327,9 +2485,70 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
         </DialogActions>
       </Dialog>
       {tab === "helped" ? (
-        <Grid2 container spacing={1.5}>
+        <Stack spacing={1.5}>
+          <Box className="list-shell" sx={{ p: 1.6 }}>
+            <Stack spacing={1.2}>
+              <Stack
+                direction={{ xs: "column", md: "row" }}
+                spacing={1}
+                sx={{
+                  justifyContent: "space-between",
+                  alignItems: { xs: "flex-start", md: "center" },
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography
+                    variant="h6"
+                    sx={{ color: "#e8f4ff", fontWeight: 750 }}
+                  >
+                    Results in plain English
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                    What ArkEvolve can prove, what it is still measuring, and
+                    whether anything needs your decision.
+                  </Typography>
+                </Box>
+                <Chip
+                  size="small"
+                  color={
+                    resultSummarySeverity === "success"
+                      ? "success"
+                      : resultSummarySeverity === "warning"
+                        ? "warning"
+                        : "info"
+                  }
+                  label={resultSummaryTitle}
+                />
+              </Stack>
+              <Alert severity={resultSummarySeverity} sx={{ borderRadius: 1 }}>
+                {resultSummaryDetail}
+              </Alert>
+              <Box
+                sx={{
+                  display: "grid",
+                  gridTemplateColumns: {
+                    xs: "1fr",
+                    sm: "repeat(2, minmax(0, 1fr))",
+                    lg: "repeat(4, minmax(0, 1fr))",
+                  },
+                  gap: 1,
+                }}
+              >
+                {resultSummaryCards.map((card) => (
+                  <ResultSummaryCard
+                    key={card.label}
+                    label={card.label}
+                    value={card.value}
+                    helper={card.helper}
+                    tone={card.tone}
+                  />
+                ))}
+              </Box>
+            </Stack>
+          </Box>
+          <Grid2 container spacing={1.5} sx={{ alignItems: "flex-start" }}>
           <Grid2 size={{ xs: 12, lg: 7 }}>
-            <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
+            <Box className="list-shell" sx={{ p: 1.6 }}>
               <Typography
                 variant="h6"
                 sx={{ color: "#e8f4ff", fontWeight: 700 }}
@@ -2369,14 +2588,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   Impact details are unavailable: {detailError}
                 </Alert>
               ) : skillHelpedItems.length === 0 && helpedLines.length === 0 ? (
-                <Typography
-                  variant="body2"
-                  sx={{
-                    color: "text.secondary",
-                  }}
-                >
-                  Not enough measured evidence yet.
-                </Typography>
+                <Alert severity="info" sx={{ borderRadius: 1 }}>
+                  No improvement is being claimed yet. ArkEvolve needs enough
+                  recent traffic to compare a change against stable behavior
+                  before it calls the change helpful.
+                </Alert>
               ) : (
                 <Stack spacing={1}>
                   {skillHelpedItems.map((row, idx) => {
@@ -2504,49 +2720,27 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   ))}
                 </Stack>
               )}
-              <Stack spacing={0.7} sx={{ mt: 1.25 }}>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                  }}
-                >
-                  Prompt: delegation avoided{" "}
-                  {num(promptInsights.delegation_avoided, 0).toFixed(1)},
-                  clarification avoided{" "}
-                  {num(promptInsights.clarification_avoided, 0).toFixed(1)},
-                  tool success{" "}
-                  {evolutionGainLabel(promptInsights.tool_success_uplift)}
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                  }}
-                >
-                  Classifier: direct resolution{" "}
-                  {evolutionGainLabel(
-                    classifierInsights.successful_direct_resolution_uplift,
-                  )}
-                  , failed delegation reduction{" "}
-                  {evolutionGainLabel(
-                    classifierInsights.failed_delegation_reduction,
-                  )}
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    color: "text.secondary",
-                  }}
-                >
-                  Specialist: tool success{" "}
-                  {evolutionGainLabel(specialistInsights.tool_success_uplift)},
-                  p95 savings{" "}
-                  {specialistInsights.latency_savings_p95_ms == null
-                    ? "-"
-                    : `${num(specialistInsights.latency_savings_p95_ms, 0)} ms`}
-                </Typography>
-              </Stack>
+              <Box
+                sx={{
+                  mt: 1.25,
+                  display: "grid",
+                  gridTemplateColumns: {
+                    xs: "1fr",
+                    md: "repeat(3, minmax(0, 1fr))",
+                  },
+                  gap: 1,
+                }}
+              >
+                {evidenceMetricCards.map((metric) => (
+                  <ResultSummaryCard
+                    key={metric.label}
+                    label={metric.label}
+                    value={metric.value}
+                    helper={metric.helper}
+                    tone="info"
+                  />
+                ))}
+              </Box>
             </Box>
           </Grid2>
           <Grid2 size={{ xs: 12, lg: 5 }}>
@@ -2587,9 +2781,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     Observed skill metrics are unavailable: {detailError}
                   </Alert>
                 ) : skillObservedItems.length === 0 ? (
-                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  <Alert severity="info" sx={{ borderRadius: 1 }}>
                     No approved skill changes are waiting on more evidence.
-                  </Typography>
+                  </Alert>
                 ) : (
                   <Stack spacing={1}>
                     {skillObservedItems.slice(0, 6).map((row, idx) => {
@@ -2664,7 +2858,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   </Stack>
                 )}
               </Box>
-              <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
+              <Box className="list-shell" sx={{ p: 1.6 }}>
                 <Typography
                   variant="h6"
                   sx={{ color: "#e8f4ff", fontWeight: 700 }}
@@ -2698,9 +2892,61 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     Experience graph is unavailable: {detailError}
                   </Alert>
                 ) : experienceGraphNodes.length === 0 ? (
-                  <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                  <Alert severity="info" sx={{ borderRadius: 1 }}>
                     No saved experience graph nodes yet.
-                  </Typography>
+                  </Alert>
+                ) : !experienceGraphReady ? (
+                  <Stack spacing={1}>
+                    <Stack
+                      direction="row"
+                      spacing={0.75}
+                      useFlexGap
+                      sx={{ flexWrap: "wrap" }}
+                    >
+                      <Chip
+                        size="small"
+                        label={`${experienceGraphNodes.length} nodes`}
+                      />
+                      <Chip
+                        size="small"
+                        label={`${experienceGraphEdges.length} edges`}
+                      />
+                    </Stack>
+                    <Alert severity="info" sx={{ borderRadius: 1 }}>
+                      The graph is still forming. There are not enough connected
+                      runs and learned items to draw a useful network yet.
+                    </Alert>
+                    <Stack spacing={0.7}>
+                      {experienceNodePreview.map((node, idx) => (
+                        <Box
+                          key={`experience-node-preview-${str(node.id, String(idx))}`}
+                          sx={{
+                            p: 0.9,
+                            border: "1px solid var(--ui-rgba-145-170-205-120)",
+                            borderRadius: 1,
+                            bgcolor: "rgba(8, 14, 24, 0.28)",
+                          }}
+                        >
+                          <Typography
+                            variant="body2"
+                            sx={{ color: "#e8f4ff", fontWeight: 650 }}
+                            noWrap
+                            title={str(node.label, str(node.id, "Node"))}
+                          >
+                            {str(node.label, str(node.id, "Node"))}
+                          </Typography>
+                          <Typography
+                            variant="caption"
+                            sx={{ color: "text.secondary", display: "block" }}
+                          >
+                            {titleCaseLabel(
+                              str(node.kind, "item").replace(/_/g, " "),
+                            )}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </Stack>
+                  </Stack>
                 ) : (
                   <Stack spacing={1}>
                     <Stack
@@ -2721,12 +2967,12 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     </Stack>
                     <ReactECharts
                       option={experienceGraphOption}
-                      style={{ height: 320 }}
+                      style={{ height: 260, width: "100%" }}
                     />
                   </Stack>
                 )}
               </Box>
-              <Box className="list-shell" sx={{ p: 1.6, minHeight: "100%" }}>
+              <Box className="list-shell" sx={{ p: 1.6 }}>
                 <Typography
                   variant="h6"
                   sx={{ color: "#e8f4ff", fontWeight: 700 }}
@@ -2765,24 +3011,67 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     Optimization data is unavailable: {detailError}
                   </Alert>
                 ) : metricChartRows.length === 0 ? (
-                  <Typography
-                    variant="body2"
-                    sx={{
-                      color: "text.secondary",
-                    }}
-                  >
+                  <Alert severity="info" sx={{ borderRadius: 1 }}>
                     No version metrics yet.
-                  </Typography>
+                  </Alert>
+                ) : metricChartRows.length === 1 ? (
+                  <Stack spacing={1}>
+                    {optimizationMetricSummaries.map((metric) => (
+                      <Box
+                        key={metric.key}
+                        sx={{
+                          p: 1,
+                          border: "1px solid var(--ui-rgba-145-170-205-120)",
+                          borderRadius: 1,
+                          bgcolor: "rgba(8, 14, 24, 0.28)",
+                        }}
+                      >
+                        <Typography
+                          variant="body2"
+                          sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                          noWrap
+                          title={metric.label}
+                        >
+                          {metric.label}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: "text.secondary",
+                            display: "block",
+                            mb: 1,
+                          }}
+                        >
+                          {metric.helper}
+                        </Typography>
+                        <Stack spacing={0.85}>
+                          <ResultProgressRow
+                            label="Success"
+                            value={metric.success}
+                            helper="Higher is better"
+                            color="#14f195"
+                          />
+                          <ResultProgressRow
+                            label="Error"
+                            value={metric.error}
+                            helper="Lower is better"
+                            color="#fb7185"
+                          />
+                        </Stack>
+                      </Box>
+                    ))}
+                  </Stack>
                 ) : (
                   <ReactECharts
                     option={metricChartOption}
-                    style={{ height: 320 }}
+                    style={{ height: 260, width: "100%" }}
                   />
                 )}
               </Box>
             </Stack>
           </Grid2>
-        </Grid2>
+          </Grid2>
+        </Stack>
       ) : null}
       {tab === "tests" ? (
         <Stack spacing={1.5}>
@@ -2969,6 +3258,45 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           </Box>
                         );
                       })()}
+                      <Stack
+                        direction="row"
+                        spacing={0.75}
+                        useFlexGap
+                        sx={{ flexWrap: "wrap" }}
+                      >
+                        {item.acceptAction ? (
+                          <Button
+                            size="small"
+                            variant="contained"
+                            disabled={runEvolutionActionMutation.isPending}
+                            onClick={() =>
+                              void runEvolutionAction(
+                                item.acceptAction!,
+                                "Accepted as stable. Rollback is available.",
+                                `Accept ${item.audienceLabel} as stable now?`,
+                              )
+                            }
+                          >
+                            Accept as stable
+                          </Button>
+                        ) : null}
+                        {item.stopAction ? (
+                          <Button
+                            size="small"
+                            color="inherit"
+                            disabled={runEvolutionActionMutation.isPending}
+                            onClick={() =>
+                              void runEvolutionAction(
+                                item.stopAction!,
+                                "Live test stopped.",
+                                `Stop the ${item.audienceLabel} live test now?`,
+                              )
+                            }
+                          >
+                            Stop test
+                          </Button>
+                        ) : null}
+                      </Stack>
                       <Accordion disableGutters className="chat-workspace-section">
                         <AccordionSummary expandIcon={<ExpandMoreIcon />}>
                           <Typography variant="body2">Technical details</Typography>
@@ -3060,6 +3388,23 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       >
                         Baseline: {item.baseline}
                       </Typography>
+                      {item.rollbackAvailable && item.rollbackAction ? (
+                        <Button
+                          size="small"
+                          color="inherit"
+                          sx={{ mt: 0.75 }}
+                          disabled={runEvolutionActionMutation.isPending}
+                          onClick={() =>
+                            void runEvolutionAction(
+                              item.rollbackAction!,
+                              "Rolled back to the previous stable behavior.",
+                              `Roll back ${item.audienceLabel} to the previous stable version?`,
+                            )
+                          }
+                        >
+                          Roll back stable change
+                        </Button>
+                      ) : null}
                     </Box>
                   ))}
                 </Stack>
@@ -3085,7 +3430,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   variant="h6"
                   sx={{ color: "#e8f4ff", fontWeight: 700 }}
                 >
-                  Needs approval
+                  Review queue
                 </Typography>
                 <Typography
                   variant="body2"
@@ -3093,8 +3438,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     color: "text.secondary",
                   }}
                 >
-                  ArkEvolve keeps meaningful changes as suggestions until you
-                  decide.
+                  Nothing here changes AgentArk until a card says it is in a
+                  live test or stable change.
                 </Typography>
               </Box>
               <FormControlLabel
@@ -3104,9 +3449,14 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                     onChange={(event) => setShowSuperseded(event.target.checked)}
                   />
                 }
-                label="Show older suggestions"
+                label="Show past decisions"
               />
             </Stack>
+            <Alert severity="info" sx={{ borderRadius: 1, mb: 1.25 }}>
+              Review items are suggestions until ArkEvolve marks them as a
+              live test or stable change. Suggested-only items do not change
+              AgentArk behavior and do not need rollback.
+            </Alert>
             {detailLoading ? (
               <Stack
                 direction="row"
@@ -3139,7 +3489,8 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                   color: "text.secondary",
                 }}
               >
-                Nothing is waiting on you right now.
+                Nothing is waiting on you right now. Suggestions saved for
+                follow-up are not deployed, so there is nothing to roll back.
               </Typography>
             ) : (
               <Stack spacing={1.5}>
@@ -3371,7 +3722,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                       variant="subtitle2"
                       sx={{ color: "#e8f4ff", mb: 1 }}
                     >
-                      Suggested improvements
+                      Suggestions before behavior changes
                     </Typography>
                     <Stack spacing={1}>
                       {visiblePromptOptimizationOpportunities.map((row, idx) => {
@@ -3388,13 +3739,18 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                           !!proposalId &&
                           reviewStatus !== "approved" &&
                           reviewStatus !== "rejected";
+                        const proposalStateLabel = canApprove
+                          ? "Suggested only"
+                          : "Review recorded";
                         return (
                           <Box
                             key={`prompt-proposal-${proposalId || idx}`}
                             sx={{
                               p: 1.25,
                               border: "1px solid var(--ui-rgba-145-170-205-120)",
+                              borderLeft: "3px solid rgba(20, 241, 149, 0.72)",
                               borderRadius: 1,
+                              bgcolor: "rgba(8, 14, 24, 0.28)",
                             }}
                           >
                             <Stack
@@ -3438,6 +3794,95 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     label={`${riskLevel || "unknown"} risk`}
                                   />
                                 </Stack>
+                                <Box
+                                  sx={{
+                                    display: "grid",
+                                    gridTemplateColumns: {
+                                      xs: "1fr",
+                                      md: "minmax(0, 1fr) minmax(0, 1fr)",
+                                    },
+                                    gap: 1,
+                                    mb: 1,
+                                  }}
+                                >
+                                  <Box
+                                    sx={{
+                                      p: 1,
+                                      border:
+                                        "1px solid var(--ui-rgba-145-170-205-120)",
+                                      borderRadius: 1,
+                                      bgcolor: "rgba(20, 241, 149, 0.08)",
+                                    }}
+                                  >
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                      }}
+                                    >
+                                      Current state
+                                    </Typography>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                                    >
+                                      {proposalStateLabel}
+                                    </Typography>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        lineHeight: 1.4,
+                                      }}
+                                    >
+                                      AgentArk behavior has not changed.
+                                    </Typography>
+                                  </Box>
+                                  <Box
+                                    sx={{
+                                      p: 1,
+                                      border:
+                                        "1px solid var(--ui-rgba-145-170-205-120)",
+                                      borderRadius: 1,
+                                      bgcolor: "rgba(8, 14, 24, 0.34)",
+                                    }}
+                                  >
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                      }}
+                                    >
+                                      Rollback
+                                    </Typography>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{ color: "#e8f4ff", fontWeight: 700 }}
+                                    >
+                                      No rollback needed
+                                    </Typography>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: "text.secondary",
+                                        display: "block",
+                                        lineHeight: 1.4,
+                                      }}
+                                    >
+                                      Rollback appears only after a live test or
+                                      stable change exists.
+                                    </Typography>
+                                  </Box>
+                                </Box>
+                                <Box sx={{ mb: 1 }}>
+                                  <EvolutionLifecycle
+                                    steps={reviewLifecycleSteps}
+                                    activeIndex={canApprove ? 0 : 1}
+                                  />
+                                </Box>
                                 <Typography variant="body1">
                                   {str(
                                     row.summary,
@@ -3464,8 +3909,9 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                     mt: expectedBenefit[0] ? 0.45 : 0.75,
                                   }}
                                 >
-                                  Review only: marking this worth pursuing does not change
-                                  runtime prompt behavior.
+                                  Saving this for follow-up records the idea. A
+                                  future safety check or live test is required
+                                  before behavior can change.
                                 </Typography>
                                 {caveats[0] ? (
                                   <Typography
@@ -3510,11 +3956,11 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                           "approve_prompt_optimization_proposal",
                                         candidate_id: proposalId,
                                       },
-                                      "Suggestion marked worth pursuing.",
+                                      "Saved for follow-up. AgentArk behavior has not changed, so no rollback is needed.",
                                     )
                                   }
                                 >
-                                  Worth pursuing
+                                  Save for follow-up
                                 </Button>
                                 <Button
                                   size="small"
@@ -3529,7 +3975,7 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
                                           "reject_prompt_optimization_proposal",
                                         candidate_id: proposalId,
                                       },
-                                      "Suggestion dismissed.",
+                                      "Suggestion dismissed. AgentArk behavior has not changed.",
                                     )
                                   }
                                 >
@@ -4375,136 +4821,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
               </Stack>
             )}
           </Box>
-          {showArkEvolveInternals &&
-          (num(promptTelemetrySummary.sample_count, 0) > 0 ||
-            promptTelemetrySections.length > 0) ? (
-            <Accordion disableGutters className="chat-workspace-section">
-              <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                <Typography variant="body2">
-                  Technical evidence from recent prompt traffic
-                </Typography>
-              </AccordionSummary>
-              <AccordionDetails sx={{ pt: 0 }}>
-                <Alert severity="info" sx={{ borderRadius: 1, mb: 1 }}>
-                  These metrics explain why ArkEvolve generated some review
-                  suggestions. They are technical evidence, not required reading
-                  before you approve or reject.
-                </Alert>
-                <Box
-                  sx={{
-                    display: "grid",
-                    gridTemplateColumns: {
-                      xs: "1fr 1fr",
-                      lg: "repeat(5, minmax(0,1fr))",
-                    },
-                    gap: 1,
-                    mb: promptTelemetrySections.length > 0 ? 1 : 0,
-                  }}
-                >
-                  <Box
-                    sx={{
-                      p: 1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      Samples
-                    </Typography>
-                    <Typography variant="body2">
-                      {num(promptTelemetrySummary.sample_count, 0).toLocaleString()}
-                    </Typography>
-                  </Box>
-                  <Box
-                    sx={{
-                      p: 1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      p95 final prompt
-                    </Typography>
-                    <Typography variant="body2">
-                      {charsLabel(promptTelemetrySummary.p95_final_prompt_chars)}
-                    </Typography>
-                  </Box>
-                  <Box
-                    sx={{
-                      p: 1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      p95 tool schema
-                    </Typography>
-                    <Typography variant="body2">
-                      {charsLabel(promptTelemetrySummary.p95_tool_schema_chars)}
-                    </Typography>
-                  </Box>
-                  <Box
-                    sx={{
-                      p: 1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      p95 request size
-                    </Typography>
-                    <Typography variant="body2">
-                      {charsLabel(
-                        promptTelemetrySummary.p95_estimated_total_request_chars,
-                      )}
-                    </Typography>
-                  </Box>
-                  <Box
-                    sx={{
-                      p: 1,
-                      border: "1px solid var(--ui-rgba-145-170-205-120)",
-                      borderRadius: 1,
-                    }}
-                  >
-                    <Typography variant="caption" sx={{ color: "text.secondary" }}>
-                      Avg tools
-                    </Typography>
-                    <Typography variant="body2">
-                      {num(promptTelemetrySummary.avg_tool_count, -1) >= 0
-                        ? num(promptTelemetrySummary.avg_tool_count, 0).toFixed(2)
-                        : "-"}
-                    </Typography>
-                  </Box>
-                </Box>
-                {promptTelemetrySections.length > 0 ? (
-                  <Box>
-                    <Typography
-                      variant="caption"
-                      sx={{
-                        color: "text.secondary",
-                        display: "block",
-                        mb: 0.45,
-                      }}
-                    >
-                      Largest prompt sections
-                    </Typography>
-                    <Stack spacing={0.45}>
-                      {promptTelemetrySections.slice(0, 6).map((row, idx) => (
-                        <Typography
-                          key={`prompt-section-${str(row.section, idx.toString())}`}
-                          variant="caption"
-                          sx={{ color: "text.secondary", display: "block" }}
-                        >
-                          {str(row.section, "section")}: p95 {charsLabel(row.p95_chars)},
-                          {" "}p50 {charsLabel(row.p50_chars)}, avg {charsLabel(row.avg_chars)}
-                        </Typography>
-                      ))}
-                    </Stack>
-                  </Box>
-                ) : null}
-              </AccordionDetails>
-            </Accordion>
-          ) : null}
         </Stack>
       ) : null}
       <Dialog
@@ -4594,8 +4910,6 @@ export default function EvolutionPage({ autoRefresh }: { autoRefresh: boolean })
           <Button onClick={() => setReadinessDialog(null)}>Close</Button>
         </DialogActions>
       </Dialog>
-        </>
-      ) : null}
     </WorkspacePageShell>
   );
 }

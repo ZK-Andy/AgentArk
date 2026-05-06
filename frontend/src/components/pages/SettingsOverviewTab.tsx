@@ -38,13 +38,13 @@ function StatusCard({
         border: "1px solid",
         borderColor:
           tone === "success"
-            ? "var(--ui-rgba-130-247-193-200)"
+            ? "var(--ui-rgba-57-208-255-220)"
             : tone === "warning"
               ? "var(--ui-rgba-255-180-50-240)"
               : "var(--ui-rgba-255-255-255-080)",
         background:
           tone === "success"
-            ? "var(--ui-rgba-130-247-193-060)"
+            ? "var(--ui-rgba-57-208-255-060)"
             : tone === "warning"
               ? "var(--ui-rgba-255-180-50-080)"
               : "var(--ui-rgba-255-255-255-030)",
@@ -63,13 +63,13 @@ function StatusCard({
           flexShrink: 0,
           background:
             tone === "success"
-              ? "#82f7c1"
+              ? "var(--ui-rgba-57-208-255-850)"
               : tone === "warning"
                 ? "var(--ui-rgba-255-180-50-900)"
                 : "var(--ui-rgba-255-255-255-180)",
           boxShadow:
             tone === "success"
-              ? "0 0 6px var(--ui-rgba-130-247-193-320)"
+              ? "0 0 6px var(--ui-rgba-57-208-255-300)"
               : tone === "warning"
                 ? "0 0 6px var(--ui-rgba-255-180-50-350)"
                 : "none",

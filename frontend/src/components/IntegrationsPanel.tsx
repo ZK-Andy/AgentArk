@@ -1309,11 +1309,7 @@ export function IntegrationsPanel({
     onError: (err) => setNotice({ kind: "error", text: asErrorMessage(err) })
   });
 
-  const integrations = shouldLoadConnectorCatalog
-    ? (integrationsQ.data?.integrations || []).filter(
-        (integration) => normalizeIntegrationId(integration.id) !== "moltbook",
-      )
-    : [];
+  const integrations = shouldLoadConnectorCatalog ? integrationsQ.data?.integrations || [] : [];
   const integrationSyncStatuses = showCatalog ? integrationSyncStatusQ.data?.statuses || [] : [];
   const integrationSyncStatusById = useMemo(
     () =>
@@ -1707,6 +1703,10 @@ export function IntegrationsPanel({
   const sorted = useMemo(
     () =>
       [...integrations].sort((a, b) => {
+        const aId = normalizeIntegrationId(a.id);
+        const bId = normalizeIntegrationId(b.id);
+        if (aId === "moltbook" && bId !== "moltbook") return 1;
+        if (bId === "moltbook" && aId !== "moltbook") return -1;
         if (a.id === "google_workspace" && b.id !== "google_workspace") return -1;
         if (b.id === "google_workspace" && a.id !== "google_workspace") return 1;
         return a.name.localeCompare(b.name);

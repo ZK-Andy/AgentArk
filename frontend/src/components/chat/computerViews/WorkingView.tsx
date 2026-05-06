@@ -95,8 +95,13 @@ export function WorkingView({
     isReasoning && reasoningPhase
       ? REASONING_PHASE_LABELS[reasoningPhase] || null
       : null;
+  const terminalPhase =
+    /failed|stopped|cancelled|blocked|complete/i.test(phaseLabel || "") ||
+    /failed|stopped|cancelled|blocked|complete/i.test(detail || "");
   const emptyPreviewText = detail
-    ? "Preparing the next step..."
+    ? terminalPhase
+      ? "No further steps are running."
+      : "Preparing the next step..."
     : "Preparing the response...";
 
   useEffect(() => {

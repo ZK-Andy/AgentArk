@@ -15,6 +15,7 @@ export function normalizeSettingsTab(rawTab?: number | null): number {
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return 0;
   const tab = Math.max(0, Math.trunc(rawTab));
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 16) return 4;
   if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
 }
@@ -34,13 +35,13 @@ export function settingsTabFromLocation(): number {
     messaging: 20,
     media: 3,
     security: 4,
+    verification: 4,
+    trust: 4,
+    "sender-verification": 4,
+    senderverification: 4,
     observability: 6,
     telemetry: 6,
     webhooks: 22,
-    verification: 16,
-    trust: 16,
-    "sender-verification": 16,
-    senderverification: 16,
     plugins: 23,
     plugin: 23,
     sdk: 23,
@@ -80,7 +81,7 @@ export function resolveInitialSettingsTab(initialTab?: number | null): number {
 }
 
 export function settingsTabSupportsSave(tab: number): boolean {
-  return ![9, 11, 13, 16, 17, 20, 21, 22, 23, 25, 26].includes(tab);
+  return ![8, 9, 11, 13, 17, 20, 21, 22, 23, 25, 26].includes(tab);
 }
 
 export function getSettingsTabLoadingMessage(tab: number): string {
@@ -103,8 +104,6 @@ export function getSettingsTabLoadingMessage(tab: number): string {
       return "Loading memory...";
     case 14:
       return "Loading data cleanup...";
-    case 16:
-      return "Loading sender verification...";
     case 20:
       return "Loading messaging channels...";
     case 21:
@@ -156,13 +155,6 @@ export function getSettingsPageMeta(tab: number): SettingsPageMeta {
         description:
           "Instance protection, secrets posture, and security review controls.",
       };
-    case 16:
-      return {
-        kicker: "Security",
-        title: "Sender Verification",
-        description:
-          "Trust policies, pending approvals, and approved senders for inbound channels.",
-      };
     case 5:
       return {
         kicker: "Security",
@@ -177,7 +169,7 @@ export function getSettingsPageMeta(tab: number): SettingsPageMeta {
       };
     case 8:
       return {
-        kicker: "Knowledge",
+        kicker: "Integrations",
         description:
           "MCP server registration, transport, auth, and tool/resource exposure.",
       };

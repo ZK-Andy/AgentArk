@@ -82,6 +82,9 @@ pub fn split_outbound_message(text: &str, profile: SplitProfile) -> Vec<String> 
 
 fn label_chunks(chunks: Vec<String>) -> Vec<String> {
     let total = chunks.len();
+    if total <= 1 {
+        return chunks;
+    }
     chunks
         .into_iter()
         .enumerate()
@@ -238,6 +241,14 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|chunk| chunk.chars().count() <= PUSH_NOTIFICATION_MAX_CHARS));
+    }
+
+    #[test]
+    fn push_split_does_not_label_single_chunk() {
+        let text = "Short notification.";
+        let chunks = split_for_push_notification(text);
+
+        assert_eq!(chunks, vec![text.to_string()]);
     }
 
     #[test]

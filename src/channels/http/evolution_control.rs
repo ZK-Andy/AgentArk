@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 static GEPA_AUTO_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
 const GEPA_AUTO_INITIAL_DELAY_SECS: u64 = 90;
@@ -1615,6 +1616,223 @@ pub(super) fn prompt_canary_state_key_for_surface(
     }
 }
 
+struct PromptRuntimeSurface {
+    surface: &'static str,
+    label: &'static str,
+    profile_key: &'static str,
+    canary_profile_key: &'static str,
+    canary_state_key: &'static str,
+    baseline_snapshot_key: &'static str,
+    last_result_key: &'static str,
+}
+
+fn prompt_runtime_surface(surface: &str) -> Result<PromptRuntimeSurface> {
+    match surface.trim().to_ascii_lowercase().as_str() {
+        "prompt" | "main_prompt" | "prompt_bundle" => Ok(PromptRuntimeSurface {
+            surface: "prompt",
+            label: "main prompt bundle",
+            profile_key: crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_KEY,
+            canary_profile_key: crate::core::self_evolve::PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+            canary_state_key: crate::core::self_evolve::PROMPT_BUNDLE_CANARY_STATE_KEY,
+            baseline_snapshot_key: crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+            last_result_key: crate::core::self_evolve::PROMPT_BUNDLE_LAST_RESULT_KEY,
+        }),
+        "specialist" | "specialist_prompt" | "specialist_prompt_bundle" => {
+            Ok(PromptRuntimeSurface {
+                surface: "specialist_prompt",
+                label: "specialist prompt bundle",
+                profile_key: crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_KEY,
+                canary_profile_key:
+                    crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_PROFILE_CANARY_KEY,
+                canary_state_key:
+                    crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_CANARY_STATE_KEY,
+                baseline_snapshot_key:
+                    crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                last_result_key: crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_LAST_RESULT_KEY,
+            })
+        }
+        "prompt_fragment" | "prompt-fragment" | "prompt-fragments" | "prompt_fragment_bundle" => {
+            Ok(PromptRuntimeSurface {
+                surface: "prompt_fragment",
+                label: "prompt fragment bundle",
+                profile_key: crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_KEY,
+                canary_profile_key:
+                    crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_PROFILE_CANARY_KEY,
+                canary_state_key:
+                    crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_CANARY_STATE_KEY,
+                baseline_snapshot_key:
+                    crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_BASELINE_SNAPSHOT_KEY,
+                last_result_key:
+                    crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_LAST_RESULT_KEY,
+            })
+        }
+        other => anyhow::bail!("Unsupported prompt evolution surface '{}'.", other),
+    }
+}
+
+fn default_prompt_surface_snapshot(surface: &PromptRuntimeSurface) -> Result<Vec<u8>> {
+    match surface.surface {
+        "prompt" => Ok(serde_json::to_vec(
+            &crate::core::self_evolve::PromptBundleProfile::default(),
+        )?),
+        "specialist_prompt" => Ok(serde_json::to_vec(
+            &crate::core::self_evolve::SpecialistPromptBundleProfile::default(),
+        )?),
+        "prompt_fragment" => Ok(serde_json::to_vec(
+            &crate::core::prompt_fragments::default_prompt_fragment_bundle(),
+        )?),
+        other => anyhow::bail!("Unsupported prompt evolution surface '{}'.", other),
+    }
+}
+
+async fn load_prompt_canary_state_for_surface(
+    storage: &crate::storage::Storage,
+    surface: &PromptRuntimeSurface,
+) -> Result<crate::core::self_evolve::strategy_runtime::CanaryRolloutState> {
+    let raw = storage
+        .get(surface.canary_state_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No {} canary state found.", surface.label))?;
+    serde_json::from_slice(&raw)
+        .with_context(|| format!("Stored {} canary state is unreadable.", surface.label))
+}
+
+async fn record_prompt_runtime_decision(
+    storage: &crate::storage::Storage,
+    surface: &PromptRuntimeSurface,
+    decision: &str,
+    state: Option<&crate::core::self_evolve::strategy_runtime::CanaryRolloutState>,
+) {
+    let Ok(Some(raw)) = storage.get(surface.last_result_key).await else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    obj.insert(
+        "user_runtime_decision".to_string(),
+        serde_json::json!(decision),
+    );
+    obj.insert("user_decision_at".to_string(), serde_json::json!(now));
+    obj.insert("surface".to_string(), serde_json::json!(surface.surface));
+    if let Some(state) = state {
+        obj.insert(
+            "canary_state".to_string(),
+            serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    if decision == "accepted_stable" {
+        obj.insert("promotion_applied".to_string(), serde_json::json!(true));
+        obj.insert("promotion_mode".to_string(), serde_json::json!("baseline"));
+        obj.insert("rollback_available".to_string(), serde_json::json!(true));
+    } else if decision == "rolled_back" {
+        obj.insert(
+            "promotion_mode".to_string(),
+            serde_json::json!("rolled_back"),
+        );
+        obj.insert("rollback_applied".to_string(), serde_json::json!(true));
+    } else if decision == "stopped_canary" {
+        obj.insert(
+            "promotion_mode".to_string(),
+            serde_json::json!("canary_stopped"),
+        );
+    }
+    if let Ok(bytes) = serde_json::to_vec(&value) {
+        let _ = storage.set(surface.last_result_key, &bytes).await;
+    }
+}
+
+async fn disable_prompt_canary_for_surface(
+    storage: &crate::storage::Storage,
+    surface_name: &str,
+) -> Result<String> {
+    let surface = prompt_runtime_surface(surface_name)?;
+    let mut state = load_prompt_canary_state_for_surface(storage, &surface).await?;
+    if !state.enabled {
+        anyhow::bail!("No active {} canary is running.", surface.label);
+    }
+    state.enabled = false;
+    storage
+        .set(surface.canary_state_key, &serde_json::to_vec(&state)?)
+        .await?;
+    record_prompt_runtime_decision(storage, &surface, "stopped_canary", Some(&state)).await;
+    Ok(format!(
+        "Stopped the {} live test for '{}'.",
+        surface.label, state.candidate_version
+    ))
+}
+
+async fn promote_prompt_canary_to_baseline(
+    storage: &crate::storage::Storage,
+    surface_name: &str,
+) -> Result<String> {
+    let surface = prompt_runtime_surface(surface_name)?;
+    let mut state = load_prompt_canary_state_for_surface(storage, &surface).await?;
+    if !state.enabled {
+        anyhow::bail!("No active {} canary is running.", surface.label);
+    }
+    let candidate = storage
+        .get(surface.canary_profile_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No {} candidate bundle is available.", surface.label))?;
+    let rollback_snapshot = match storage.get(surface.profile_key).await? {
+        Some(current) => current,
+        None => default_prompt_surface_snapshot(&surface)?,
+    };
+    storage
+        .set(surface.baseline_snapshot_key, &rollback_snapshot)
+        .await
+        .with_context(|| format!("Failed to snapshot current {}.", surface.label))?;
+    storage
+        .set(surface.profile_key, &candidate)
+        .await
+        .with_context(|| format!("Failed to promote {}.", surface.label))?;
+    state.enabled = false;
+    state.baseline_version = state.candidate_version.clone();
+    storage
+        .set(surface.canary_state_key, &serde_json::to_vec(&state)?)
+        .await?;
+    record_prompt_runtime_decision(storage, &surface, "accepted_stable", Some(&state)).await;
+    Ok(format!(
+        "Accepted {} '{}' as stable. Rollback is available.",
+        surface.label, state.baseline_version
+    ))
+}
+
+async fn rollback_prompt_baseline_for_surface(
+    storage: &crate::storage::Storage,
+    surface_name: &str,
+) -> Result<String> {
+    let surface = prompt_runtime_surface(surface_name)?;
+    let snapshot = storage
+        .get(surface.baseline_snapshot_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No {} rollback snapshot is available.", surface.label))?;
+    storage
+        .set(surface.profile_key, &snapshot)
+        .await
+        .with_context(|| format!("Failed to restore previous {}.", surface.label))?;
+    let state = match load_prompt_canary_state_for_surface(storage, &surface).await {
+        Ok(mut state) => {
+            state.enabled = false;
+            storage
+                .set(surface.canary_state_key, &serde_json::to_vec(&state)?)
+                .await?;
+            Some(state)
+        }
+        Err(_) => None,
+    };
+    record_prompt_runtime_decision(storage, &surface, "rolled_back", state.as_ref()).await;
+    Ok(format!(
+        "Rolled back the {} to the previous stable snapshot.",
+        surface.label
+    ))
+}
+
 pub(super) async fn update_prompt_canary_safety_review_status(
     storage: &crate::storage::Storage,
     event_id: &str,
@@ -2355,6 +2573,24 @@ pub(super) async fn build_evolution_settings_response(
         .ok()
         .flatten()
         .is_some();
+    let prompt_rollback_available = storage
+        .get(crate::core::self_evolve::PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let specialist_prompt_rollback_available = storage
+        .get(crate::core::self_evolve::SPECIALIST_PROMPT_BUNDLE_BASELINE_SNAPSHOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let prompt_fragment_rollback_available = storage
+        .get(crate::core::prompt_fragments::PROMPT_FRAGMENT_BUNDLE_BASELINE_SNAPSHOT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
     let gepa_config =
         crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(storage).await;
     let gepa_auto_state =
@@ -2409,6 +2645,9 @@ pub(super) async fn build_evolution_settings_response(
         prompt_fragment_replay_gate_reasons,
         prompt_fragment_promotion_mode,
         routing_rollback_available,
+        prompt_rollback_available,
+        specialist_prompt_rollback_available,
+        prompt_fragment_rollback_available,
         deploy_guard_default: load_deploy_guard_default(storage).await,
         readiness_policy,
         gepa_config,
@@ -3553,6 +3792,10 @@ pub(super) async fn update_evolution_settings(
     let mut gepa_config =
         crate::core::self_evolve::gepa_bridge::load_gepa_optimizer_config(&storage).await;
     let mut gepa_config_changed = false;
+    if let Some(enabled) = request.gepa_enabled {
+        gepa_config.enabled = enabled;
+        gepa_config_changed = true;
+    }
     if let Some(mode) = request.gepa_auto_mode.as_deref() {
         gepa_config.auto_mode = mode.trim().to_string();
         gepa_config_changed = true;
@@ -4027,6 +4270,10 @@ async fn run_gepa_auto_tick(state: &AppState) -> Result<()> {
         &agent.primary_model_id,
     )
     .await;
+    if !readiness.enabled {
+        save_gepa_auto_skip(&storage, auto_state, now, "gepa_disabled", 0, None).await;
+        return Ok(());
+    }
     if !readiness.ready {
         save_gepa_auto_skip(
             &storage,
@@ -4293,28 +4540,7 @@ async fn run_guided_routing_optimization(
                         state.max_sign_test_p_value,
                     );
                 if replay_eval.promote {
-                    storage
-                        .set(
-                            crate::core::self_evolve::ROUTING_COMPLEXITY_POLICY_KEY,
-                            &candidate_serialized,
-                        )
-                        .await
-                        .map_err(|error| {
-                            format!("Failed to promote routing policy immediately: {}", error)
-                        })?;
-                    let mut disabled_state = state.clone();
-                    disabled_state.enabled = false;
-                    let disabled_bytes = serde_json::to_vec(&disabled_state)
-                        .map_err(|error| format!("Failed to encode canary state: {}", error))?;
-                    storage
-                        .set(
-                            crate::core::self_evolve::strategy_runtime::ROUTING_COMPLEXITY_CANARY_STATE_KEY,
-                            &disabled_bytes,
-                        )
-                        .await
-                        .map_err(|error| format!("Failed to close promoted canary: {}", error))?;
-                    canary_state = Some(disabled_state);
-                    promotion_mode = "baseline";
+                    promotion_mode = "canary";
                 }
                 replay_result = Some(replay_eval);
             }
@@ -4361,13 +4587,6 @@ async fn run_guided_routing_optimization(
             result.error.as_deref().unwrap_or("unknown error")
         ));
     }
-    if promotion_mode == "baseline" {
-        return Ok(format!(
-            "Optimization found a routing improvement and promoted it after replay passed. Accuracy changed from {:.0}% to {:.0}%.",
-            result.baseline_accuracy * 100.0,
-            result.best_candidate_accuracy * 100.0,
-        ));
-    }
     if promotion_mode == "canary" {
         return Ok(format!(
             "Optimization found a routing improvement and started a 20% canary. Accuracy changed from {:.0}% to {:.0}%.",
@@ -4410,7 +4629,7 @@ pub(super) async fn run_evolution_dev_action(
                     "mode": "gepa_run",
                     "request": "Use recent ArkEvolve evidence to generate GEPA prompt candidates.",
                     "gepa_quiet_window_seconds": 60,
-                    "apply_promotion": true,
+                    "apply_promotion": false,
                     "import_after_run": true,
                 }),
             };
@@ -4445,7 +4664,7 @@ pub(super) async fn run_evolution_dev_action(
                         "GEPA run was blocked by readiness or budget gates.".to_string()
                     }),
                 "completed" => {
-                    "GEPA run completed and candidates were handed to ArkEvolve gates.".to_string()
+                    "GEPA run completed and tracked candidates for user review; no runtime behavior changed.".to_string()
                 }
                 "timed_out" => "GEPA run timed out; it was recorded for review.".to_string(),
                 "failed" => result
@@ -5647,6 +5866,96 @@ pub(super) async fn run_evolution_dev_action(
                 proposal_id
             )
         }
+        "disable_prompt_canary" => {
+            let Some(surface) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error:
+                            "candidate_id must be prompt, specialist_prompt, or prompt_fragment."
+                                .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            match disable_prompt_canary_for_surface(&storage, surface).await {
+                Ok(message) => message,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "promote_prompt_canary_candidate" => {
+            let Some(surface) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error:
+                            "candidate_id must be prompt, specialist_prompt, or prompt_fragment."
+                                .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            match promote_prompt_canary_to_baseline(&storage, surface).await {
+                Ok(message) => message,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "rollback_prompt_baseline" => {
+            let Some(surface) = request
+                .candidate_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error:
+                            "candidate_id must be prompt, specialist_prompt, or prompt_fragment."
+                                .to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            match rollback_prompt_baseline_for_surface(&storage, surface).await {
+                Ok(message) => message,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
         "disable_prompt_canary_candidate" => {
             let Some(event_id) = request
                 .candidate_id
@@ -5720,7 +6029,7 @@ pub(super) async fn run_evolution_dev_action(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "Unsupported action. Use run_guided_optimization, disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
+                    error: "Unsupported action. Use run_guided_optimization, disable_canary, promote_candidate, rollback_baseline, approve_learning_candidate, reject_learning_candidate, approve_prompt_optimization_proposal, reject_prompt_optimization_proposal, disable_prompt_canary, promote_prompt_canary_candidate, rollback_prompt_baseline, disable_prompt_canary_candidate, or keep_prompt_canary_candidate."
                         .to_string(),
                 }),
             )

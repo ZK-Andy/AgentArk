@@ -1,7 +1,11 @@
 // Terminal-style live output for shell / code_execute / build / deploy steps.
 
+import { useEffect, useState } from "react";
 import Box from "@mui/material/Box";
+import IconButton from "@mui/material/IconButton";
+import Tooltip from "@mui/material/Tooltip";
 import Typography from "@mui/material/Typography";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
 
 import type { ChatStepCard } from "../types";
 import { extractCommand, extractSurfaceBody } from "../dispatch";
@@ -50,8 +54,28 @@ export function TerminalView({ card, live = false }: TerminalViewProps) {
   const command = extractCommand(card);
   const presentation = buildReadableToolPresentation(card);
   const structuredBody = extractSurfaceBody(card);
-  const body = structuredBody || (presentation.isStructured ? presentation.body : pickBody(card));
+  const body =
+    structuredBody ||
+    (presentation.isStructured ? presentation.body : pickBody(card));
   const tone = pickTone(card, live);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  async function handleCopy() {
+    if (!body) return;
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be denied in insecure contexts.
+    }
+  }
+
   return (
     <Box className="cview cview-terminal">
       <Box className={`cview-terminal-head tone-${tone}`}>
@@ -65,6 +89,23 @@ export function TerminalView({ card, live = false }: TerminalViewProps) {
         <span className={`cview-terminal-pill tone-${tone}`}>
           {TONE_LABEL[tone]}
         </span>
+        <Tooltip
+          title={copied ? "Copied" : "Copy terminal output"}
+          placement="top"
+          arrow
+        >
+          <span>
+            <IconButton
+              className="cview-terminal-copy"
+              size="small"
+              disabled={!body}
+              onClick={handleCopy}
+              aria-label="Copy terminal output"
+            >
+              <ContentCopyRoundedIcon fontSize="inherit" />
+            </IconButton>
+          </span>
+        </Tooltip>
       </Box>
       <pre className="cview-terminal-body">
         {body || (live ? "..." : "(no output captured)")}

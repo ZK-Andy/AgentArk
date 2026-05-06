@@ -42,7 +42,12 @@ pub struct LearnedFactRecord {
     pub confidence: f32,
     pub sources: String,
     pub created_at: String,
+    pub updated_at: String,
     pub project_id: Option<String>,
+    pub scope: String,
+    pub memory_kind: Option<String>,
+    pub memory_category: String,
+    pub topics: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -626,6 +631,25 @@ fn experience_item_kind_rank(kind: &str) -> i32 {
     }
 }
 
+fn learned_fact_topics_from_metadata(metadata: &serde_json::Value) -> Vec<String> {
+    crate::core::memory_schema::normalize_memory_topics(metadata.get("topics"), 8)
+}
+
+fn learned_fact_kind_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("memory_kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn learned_fact_category_from_metadata(metadata: &serde_json::Value) -> String {
+    let semantic_kind = learned_fact_kind_from_metadata(metadata);
+    crate::core::memory_schema::memory_category_from_metadata(metadata, semantic_kind.as_deref())
+        .to_string()
+}
+
 fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFactRecord {
     let sources = item
         .metadata
@@ -637,13 +661,23 @@ fn learned_fact_from_experience_item(item: experience_item::Model) -> LearnedFac
                 .unwrap_or_else(|| value.to_string())
         })
         .unwrap_or_else(|| "[]".to_string());
+    let memory_kind = learned_fact_kind_from_metadata(&item.metadata);
+    let memory_category =
+        crate::core::memory_schema::memory_category_from_metadata(&item.metadata, memory_kind.as_deref())
+            .to_string();
+    let topics = learned_fact_topics_from_metadata(&item.metadata);
     LearnedFactRecord {
         id: item.id,
         fact: item.content,
         confidence: item.confidence.clamp(0.0, 1.0) as f32,
         sources,
         created_at: item.created_at,
+        updated_at: item.updated_at,
         project_id: item.project_id,
+        scope: item.scope,
+        memory_kind,
+        memory_category,
+        topics,
     }
 }
 
@@ -2002,6 +2036,49 @@ impl Storage {
             .collect())
     }
 
+    async fn get_fact_items_by_project_unpaged(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<experience_item::Model>> {
+        let mut query = experience_item::Entity::find()
+            .filter(experience_item::Column::Status.eq("active"))
+            .filter(experience_item::Column::Kind.is_in(["personal_fact", "constraint"]))
+            .order_by_desc(experience_item::Column::UpdatedAt);
+        if let Some(pid) = project_id {
+            query = query.filter(experience_item::Column::ProjectId.eq(pid));
+        }
+        Ok(query
+            .limit(Self::MAX_FACT_ROWS_PER_QUERY)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Get learned memory rows filtered by semantic memory category.
+    pub async fn get_facts_by_project_and_category(
+        &self,
+        limit: u64,
+        offset: u64,
+        project_id: Option<&str>,
+        category: &str,
+    ) -> Result<Vec<LearnedFactRecord>> {
+        let category = category.trim();
+        if category.is_empty() || category == "all" {
+            return self.get_facts_by_project(limit, offset, project_id).await;
+        }
+        let offset = Self::db_offset(offset) as usize;
+        let limit = Self::db_limit(limit) as usize;
+        let facts = self
+            .get_fact_items_by_project_unpaged(project_id)
+            .await?
+            .into_iter()
+            .filter(|item| learned_fact_category_from_metadata(&item.metadata) == category)
+            .skip(offset)
+            .take(limit)
+            .map(learned_fact_from_experience_item)
+            .collect();
+        Ok(facts)
+    }
+
     /// Count learned facts in the current memory store.
     pub async fn count_facts(&self, project_id: Option<&str>) -> Result<u64> {
         let mut query = experience_item::Entity::find()
@@ -2011,6 +2088,25 @@ impl Storage {
             query = query.filter(experience_item::Column::ProjectId.eq(pid));
         }
         Ok(query.count(&self.db).await?)
+    }
+
+    /// Count learned memory rows filtered by semantic memory category.
+    pub async fn count_facts_by_category(
+        &self,
+        project_id: Option<&str>,
+        category: &str,
+    ) -> Result<u64> {
+        let category = category.trim();
+        if category.is_empty() || category == "all" {
+            return self.count_facts(project_id).await;
+        }
+        let count = self
+            .get_fact_items_by_project_unpaged(project_id)
+            .await?
+            .into_iter()
+            .filter(|item| learned_fact_category_from_metadata(&item.metadata) == category)
+            .count();
+        Ok(count as u64)
     }
 
     // ==================== Tasks ====================

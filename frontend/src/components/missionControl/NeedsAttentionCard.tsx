@@ -141,7 +141,7 @@ export function NeedsAttentionCard({
             className="nw-btn nw-btn--small"
             onClick={() => onNavigate(item.targetView ?? "settings")}
           >
-            View <span className="nw-arrow">→</span>
+            View <span className="nw-arrow">-&gt;</span>
           </button>
         </div>
       );
@@ -208,7 +208,7 @@ export function NeedsAttentionCard({
               style={{ marginTop: 8 }}
               onClick={() => onNavigate("settings")}
             >
-              Set up <span className="nw-arrow">→</span>
+              Set up <span className="nw-arrow">-&gt;</span>
             </button>
           </div>
         </div>
@@ -216,7 +216,7 @@ export function NeedsAttentionCard({
 
       {actionableItems.slice(0, 3).map((item) => (
         <div className="nw-activity-row" key={item.id}>
-          <div className={iconToneClsForKind(item.kind)}>·</div>
+          <div className={iconToneClsForKind(item.kind)}>.</div>
           <div className="nw-activity-meta">
             <div className="nw-activity-ts">{kindLabel(item.kind)}</div>
             <div className="nw-activity-txt">{item.title}</div>
@@ -239,17 +239,13 @@ export function NeedsAttentionCard({
         </div>
       ) : null}
 
-      <div className="nw-actions nw-actions--split" style={{ marginTop: 8 }}>
-        <button className="nw-btn" onClick={() => onNavigate("tasks")}>
-          Open task queue <span className="nw-arrow">→</span>
-        </button>
-        <button
-          className="nw-btn nw-btn--ghost"
-          onClick={() => onNavigate("trace")}
-        >
-          Open trace <span className="nw-arrow">→</span>
-        </button>
-      </div>
+      {waitingCount > 0 || failedCount > 0 ? (
+        <div className="nw-actions" style={{ marginTop: 8 }}>
+          <button className="nw-btn" onClick={() => onNavigate("tasks")}>
+            Open task queue <span className="nw-arrow">-&gt;</span>
+          </button>
+        </div>
+      ) : null}
     </NeuralPanel>
   );
 }

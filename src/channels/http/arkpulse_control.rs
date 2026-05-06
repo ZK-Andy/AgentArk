@@ -1,5 +1,12 @@
 use super::*;
 
+static ARKPULSE_CLEANUP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ARKPULSE_CLEANUP_JOBS: once_cell::sync::Lazy<
+    RwLock<HashMap<String, ArkPulseCleanupJobSnapshot>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+const ARKPULSE_CLEANUP_IDLE_APP_HOURS: i64 = 24;
+const ARKPULSE_CLEANUP_JOB_HISTORY_LIMIT: usize = 20;
+
 #[derive(Debug, Deserialize)]
 pub(super) struct RunArkPulseFixRequest {
     #[serde(default)]
@@ -14,6 +21,45 @@ pub(super) struct RunArkPulseFixRequest {
     event_timestamp: Option<String>,
     #[serde(default)]
     finding_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ArkPulseCleanupPreviewRequest {
+    #[serde(default)]
+    _refresh: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RunArkPulseCleanupRequest {
+    #[serde(default)]
+    candidate_ids: Vec<String>,
+    #[serde(default)]
+    confirm_archive: bool,
+    #[serde(default)]
+    event_timestamp: Option<String>,
+    #[serde(default)]
+    finding_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ArkPulseCleanupJobSnapshot {
+    job_id: String,
+    status: String,
+    queued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_at: Option<String>,
+    requested_count: usize,
+    archived_count: usize,
+    archived_bytes: u64,
+    skipped_count: usize,
+    #[serde(default)]
+    archived: Vec<crate::core::artifact_hygiene::ArchivedArtifactOutcome>,
+    #[serde(default)]
+    errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention: Option<crate::core::artifact_hygiene::ArchiveRetentionSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +118,110 @@ pub(super) fn truncate_for_response(input: &str, max_chars: usize) -> String {
         return input.to_string();
     }
     input.chars().take(max_chars).collect::<String>() + "..."
+}
+
+fn parse_cleanup_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn managed_artifact_apps_from_app_rows(
+    app_rows: &[serde_json::Value],
+    data_dir: &FsPath,
+) -> Vec<crate::core::artifact_hygiene::ManagedArtifactApp> {
+    app_rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let title = row
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            Some(crate::core::artifact_hygiene::ManagedArtifactApp {
+                app_dir: row
+                    .get("app_dir")
+                    .and_then(|value| value.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("apps").join(&id)),
+                created_at: row
+                    .get("created_at")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_cleanup_datetime),
+                enabled: row
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                running: row
+                    .get("running")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                is_static: row
+                    .get("is_static")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                id,
+                title,
+            })
+        })
+        .collect()
+}
+
+async fn collect_arkpulse_cleanup_candidates_for_state(
+    state: &AppState,
+) -> Result<Vec<crate::core::artifact_hygiene::ArtifactCleanupCandidate>> {
+    let (data_dir, storage) = {
+        let agent = state.agent.read().await;
+        (agent.data_dir().to_path_buf(), agent.storage.clone())
+    };
+    let lifecycle = load_data_lifecycle_settings(&storage).await;
+    let app_rows = state.app_registry.list().await;
+    let apps = managed_artifact_apps_from_app_rows(&app_rows, &data_dir);
+    let idle_apps = state
+        .app_registry
+        .get_unused_apps(ARKPULSE_CLEANUP_IDLE_APP_HOURS)
+        .await
+        .into_iter()
+        .map(|(id, _title, last_accessed)| (id, last_accessed))
+        .collect::<HashMap<_, _>>();
+    crate::core::artifact_hygiene::collect_artifact_cleanup_candidates(
+        &data_dir, &apps, &idle_apps, &lifecycle,
+    )
+    .await
+}
+
+async fn cleanup_active_job_snapshot() -> Option<ArkPulseCleanupJobSnapshot> {
+    let jobs = ARKPULSE_CLEANUP_JOBS.read().await;
+    jobs.values()
+        .filter(|job| job.status == "queued" || job.status == "running")
+        .max_by(|left, right| left.queued_at.cmp(&right.queued_at))
+        .cloned()
+}
+
+async fn upsert_cleanup_job(snapshot: ArkPulseCleanupJobSnapshot) {
+    let mut jobs = ARKPULSE_CLEANUP_JOBS.write().await;
+    jobs.insert(snapshot.job_id.clone(), snapshot);
+    if jobs.len() > ARKPULSE_CLEANUP_JOB_HISTORY_LIMIT {
+        let mut ordered = jobs
+            .values()
+            .map(|job| (job.queued_at.clone(), job.job_id.clone()))
+            .collect::<Vec<_>>();
+        ordered.sort();
+        for (_, job_id) in ordered.into_iter().take(
+            jobs.len()
+                .saturating_sub(ARKPULSE_CLEANUP_JOB_HISTORY_LIMIT),
+        ) {
+            jobs.remove(&job_id);
+        }
+    }
+}
+
+async fn get_cleanup_job_snapshot(job_id: &str) -> Option<ArkPulseCleanupJobSnapshot> {
+    ARKPULSE_CLEANUP_JOBS.read().await.get(job_id).cloned()
 }
 
 pub(super) fn describe_arkpulse_remediation(
@@ -814,6 +964,312 @@ pub(super) async fn respond_arkpulse_fix(
         .min(i64::MAX as u128) as i64;
     persist_arkpulse_fix_audit(state, &context.audit, latency_ms, status, &body).await;
     (status, Json(body)).into_response()
+}
+
+pub(super) async fn arkpulse_cleanup_preview(
+    State(state): State<AppState>,
+    Json(_request): Json<ArkPulseCleanupPreviewRequest>,
+) -> Response {
+    let state_for_worker = state.clone();
+    let worker = tokio::spawn(async move {
+        collect_arkpulse_cleanup_candidates_for_state(&state_for_worker).await
+    });
+    let candidates = match tokio::time::timeout(Duration::from_secs(20), worker).await {
+        Ok(Ok(Ok(candidates))) => candidates,
+        Ok(Ok(Err(error))) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+        Ok(Err(error)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("cleanup preview worker failed: {}", error) })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "running",
+                    "message": "Cleanup preview is still running on the ArkPulse worker. Try again shortly."
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let total_size_bytes: u64 = candidates
+        .iter()
+        .map(|candidate| candidate.size_bytes)
+        .sum();
+    let category_counts = crate::core::artifact_hygiene::candidate_category_counts(&candidates)
+        .into_iter()
+        .map(|(category, count, size_bytes)| {
+            serde_json::json!({
+                "category": category,
+                "count": count,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "status": "ok",
+        "archive_root": "data_dir/artifact_archive",
+        "legacy_archive_root": "data_dir/app_archive",
+        "archive_retention_days": crate::core::artifact_hygiene::ARCHIVE_RETENTION_DAYS,
+        "candidates": candidates,
+        "category_counts": category_counts,
+        "total_size_bytes": total_size_bytes,
+        "active_job": cleanup_active_job_snapshot().await,
+    }))
+    .into_response()
+}
+
+pub(super) async fn get_arkpulse_cleanup_job(Path(job_id): Path<String>) -> Response {
+    match get_cleanup_job_snapshot(job_id.trim()).await {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Cleanup job not found" })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn run_arkpulse_cleanup(
+    State(state): State<AppState>,
+    Json(request): Json<RunArkPulseCleanupRequest>,
+) -> Response {
+    if !request.confirm_archive {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "confirm_archive must be true before ArkPulse archives managed artifacts"
+            })),
+        )
+            .into_response();
+    }
+    if ARKPULSE_CLEANUP_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "running",
+                "message": "An ArkPulse cleanup worker is already running.",
+                "active_job": cleanup_active_job_snapshot().await,
+            })),
+        )
+            .into_response();
+    }
+
+    let candidate_ids = request
+        .candidate_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let queued_at = chrono::Utc::now().to_rfc3339();
+    let snapshot = ArkPulseCleanupJobSnapshot {
+        job_id: job_id.clone(),
+        status: "queued".to_string(),
+        queued_at,
+        started_at: None,
+        finished_at: None,
+        requested_count: candidate_ids.len(),
+        archived_count: 0,
+        archived_bytes: 0,
+        skipped_count: 0,
+        archived: Vec::new(),
+        errors: Vec::new(),
+        retention: None,
+    };
+    upsert_cleanup_job(snapshot.clone()).await;
+
+    let state_for_worker = state.clone();
+    let event_timestamp = request.event_timestamp;
+    let finding_index = request.finding_index;
+    crate::spawn_logged!(
+        "src/channels/http/arkpulse_control.rs:cleanup_worker",
+        async move {
+            execute_arkpulse_cleanup_job(
+                state_for_worker,
+                snapshot,
+                candidate_ids,
+                event_timestamp,
+                finding_index,
+            )
+            .await;
+            ARKPULSE_CLEANUP_ACTIVE.store(false, Ordering::Release);
+        }
+    );
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "accepted",
+            "message": "ArkPulse cleanup is running on its background worker.",
+            "job_id": job_id,
+        })),
+    )
+        .into_response()
+}
+
+async fn execute_arkpulse_cleanup_job(
+    state: AppState,
+    mut snapshot: ArkPulseCleanupJobSnapshot,
+    candidate_ids: Vec<String>,
+    event_timestamp: Option<String>,
+    finding_index: Option<usize>,
+) {
+    snapshot.status = "running".to_string();
+    snapshot.started_at = Some(chrono::Utc::now().to_rfc3339());
+    upsert_cleanup_job(snapshot.clone()).await;
+
+    let result =
+        run_arkpulse_cleanup_worker(&state, &candidate_ids, event_timestamp, finding_index).await;
+    match result {
+        Ok((archived, skipped_count, errors, retention)) => {
+            snapshot.status = if errors.is_empty() {
+                "completed".to_string()
+            } else {
+                "completed_with_errors".to_string()
+            };
+            snapshot.archived_bytes = archived
+                .iter()
+                .map(|outcome| outcome.size_bytes)
+                .sum::<u64>();
+            snapshot.archived_count = archived.len();
+            snapshot.skipped_count = skipped_count;
+            snapshot.archived = archived;
+            snapshot.errors = errors;
+            snapshot.retention = Some(retention);
+        }
+        Err(error) => {
+            snapshot.status = "failed".to_string();
+            snapshot.errors = vec![error.to_string()];
+        }
+    }
+    snapshot.finished_at = Some(chrono::Utc::now().to_rfc3339());
+    upsert_cleanup_job(snapshot).await;
+}
+
+async fn run_arkpulse_cleanup_worker(
+    state: &AppState,
+    candidate_ids: &[String],
+    event_timestamp: Option<String>,
+    finding_index: Option<usize>,
+) -> Result<(
+    Vec<crate::core::artifact_hygiene::ArchivedArtifactOutcome>,
+    usize,
+    Vec<String>,
+    crate::core::artifact_hygiene::ArchiveRetentionSummary,
+)> {
+    let data_dir = {
+        let agent = state.agent.read().await;
+        agent.data_dir().to_path_buf()
+    };
+    let candidates = collect_arkpulse_cleanup_candidates_for_state(state).await?;
+    let selected_ids = candidate_ids.iter().cloned().collect::<HashSet<String>>();
+    let candidate_ids_by_id = candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<HashSet<_>>();
+    let mut skipped_count = selected_ids
+        .iter()
+        .filter(|id| !candidate_ids_by_id.contains(*id))
+        .count();
+    let selected = candidates
+        .into_iter()
+        .filter(|candidate| {
+            if selected_ids.is_empty() {
+                candidate.selected_by_default
+            } else {
+                selected_ids.contains(&candidate.id)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut archived = Vec::new();
+    let mut errors = Vec::new();
+    for candidate in selected {
+        if let Some(app_id) = candidate.app_id.as_deref() {
+            if candidate.requires_app_stop {
+                if let Err(error) = stop_app_runtime_for_artifact_cleanup(state, app_id).await {
+                    errors.push(format!(
+                        "{}: failed to stop app runtime before archive: {}",
+                        candidate.path_label, error
+                    ));
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+        }
+        match crate::core::artifact_hygiene::archive_cleanup_candidate(
+            &data_dir,
+            &candidate,
+            event_timestamp.clone(),
+            finding_index,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                if let Some(app_id) = candidate.app_id.as_deref() {
+                    if let Err(error) = state.app_registry.stop(app_id).await {
+                        errors.push(format!(
+                            "{}: archived but failed to remove app registry entry: {}",
+                            candidate.path_label, error
+                        ));
+                    }
+                }
+                archived.push(outcome);
+            }
+            Err(error) => {
+                errors.push(format!("{}: {}", candidate.path_label, error));
+                skipped_count += 1;
+            }
+        }
+    }
+
+    let retention = crate::core::artifact_hygiene::prune_archive_retention(&data_dir).await?;
+    Ok((archived, skipped_count, errors, retention))
+}
+
+async fn stop_app_runtime_for_artifact_cleanup(
+    state: &AppState,
+    app_id: &str,
+) -> Result<(), String> {
+    if let Some(executor) = state.executor_client.as_ref() {
+        match executor
+            .request(
+                reqwest::Method::POST,
+                &format!("/internal/v1/apps/{}/stop", app_id),
+            )
+            .json(&crate::clients::AppLifecycleRequest {
+                title: None,
+                query: None,
+            })
+            .send()
+            .await
+        {
+            Ok(response)
+                if response.status().is_success()
+                    || response.status() == reqwest::StatusCode::NOT_FOUND => {}
+            Ok(response) => {
+                return Err(format!("executor returned {}", response.status()));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    } else if let Err(error) = state.app_registry.stop_runtime(app_id).await {
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 /// Execute a supported ArkPulse remediation directly (without going through Chat).

@@ -748,23 +748,35 @@ impl Agent {
         let scope = self.conversation_scope_mode().await;
         let conv_key = scope.conversation_key(channel, project_id);
 
-        let create_conversation = |id: String| crate::storage::entities::conversation::Model {
-            id: id.clone(),
-            title: safe_truncate(message_preview, 50),
-            channel: channel.to_string(),
-            project_id: project_id.map(|s| s.to_string()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            message_count: 0,
-            archived: false,
-            starred: false,
+        let create_conversation = |id: String| {
+            Self::new_conversation_model(&id, channel, project_id, message_preview, &now)
         };
 
         if let Some(cid) = conversation_id {
+            if let Some((active_id, existing)) = self
+                .load_active_explicit_channel_conversation(channel, project_id, cid)
+                .await?
+            {
+                let _ = self.storage.set(&conv_key, active_id.as_bytes()).await;
+                return Ok((
+                    active_id,
+                    existing.message_count == 0 || existing.title == "New Chat",
+                ));
+            }
             let is_new = match self.storage.get_conversation(cid).await {
                 Ok(Some(existing)) => existing.message_count == 0 || existing.title == "New Chat",
                 Ok(None) => {
-                    return Err(anyhow::anyhow!("Conversation not found"));
+                    if !Self::can_bootstrap_missing_explicit_conversation(channel, cid) {
+                        return Err(anyhow::anyhow!("Conversation not found"));
+                    }
+                    let conv = create_conversation(cid.to_string());
+                    self.storage.create_conversation_if_absent(&conv).await?;
+                    tracing::info!(
+                        channel = %channel,
+                        conversation_id = %cid,
+                        "Created missing explicit channel conversation"
+                    );
+                    true
                 }
                 Err(error) => {
                     return Err(anyhow::anyhow!(
@@ -775,6 +787,8 @@ impl Agent {
                 }
             };
             let _ = self.storage.set(&conv_key, cid.as_bytes()).await;
+            let explicit_key = Self::explicit_channel_conversation_key(channel, project_id, cid);
+            let _ = self.storage.set(&explicit_key, cid.as_bytes()).await;
             return Ok((cid.to_string(), is_new));
         }
 
@@ -809,6 +823,148 @@ impl Agent {
             let _ = self.storage.set(&conv_key, new_id.as_bytes()).await;
         }
         Ok((new_id, true))
+    }
+
+    fn new_conversation_model(
+        id: &str,
+        channel: &str,
+        project_id: Option<&str>,
+        title_seed: &str,
+        now: &str,
+    ) -> crate::storage::entities::conversation::Model {
+        crate::storage::entities::conversation::Model {
+            id: id.to_string(),
+            title: safe_truncate(title_seed, 50),
+            channel: channel.to_string(),
+            project_id: project_id.map(|s| s.to_string()),
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            message_count: 0,
+            archived: false,
+            starred: false,
+        }
+    }
+
+    fn explicit_channel_conversation_key(
+        channel: &str,
+        project_id: Option<&str>,
+        conversation_id: &str,
+    ) -> String {
+        match project_id.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(project_id) => format!(
+                "active_conversation_explicit:{}:{}:{}",
+                channel.trim(),
+                project_id,
+                conversation_id.trim()
+            ),
+            None => format!(
+                "active_conversation_explicit:{}:{}",
+                channel.trim(),
+                conversation_id.trim()
+            ),
+        }
+    }
+
+    async fn load_active_explicit_channel_conversation(
+        &self,
+        channel: &str,
+        project_id: Option<&str>,
+        conversation_id: &str,
+    ) -> Result<Option<(String, crate::storage::entities::conversation::Model)>> {
+        if !Self::can_bootstrap_missing_explicit_conversation(channel, conversation_id) {
+            return Ok(None);
+        }
+        let explicit_key =
+            Self::explicit_channel_conversation_key(channel, project_id, conversation_id);
+        let Some(active_id) = self
+            .storage
+            .get(&explicit_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        match self.storage.get_conversation(&active_id).await {
+            Ok(Some(existing)) => Ok(Some((active_id, existing))),
+            Ok(None) => {
+                let _ = self.storage.delete(&explicit_key).await;
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "Conversation lookup failed for '{}': {}",
+                active_id,
+                error
+            )),
+        }
+    }
+
+    fn can_bootstrap_missing_explicit_conversation(channel: &str, conversation_id: &str) -> bool {
+        let channel = channel.trim();
+        let conversation_id = conversation_id.trim();
+        !channel.is_empty()
+            && !conversation_id.is_empty()
+            && !matches!(channel, "http" | "web")
+    }
+
+    pub(crate) async fn start_new_channel_conversation(
+        &self,
+        channel: &str,
+        conversation_id: &str,
+        project_id: Option<&str>,
+        title_seed: &str,
+    ) -> Result<String> {
+        if !Self::can_bootstrap_missing_explicit_conversation(channel, conversation_id) {
+            anyhow::bail!("Channel conversation cannot be reset for this surface");
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let title = if title_seed.trim().is_empty() {
+            "New Chat"
+        } else {
+            title_seed
+        };
+        let conv = Self::new_conversation_model(&new_id, channel, project_id, title, &now);
+        self.storage.create_conversation_if_absent(&conv).await?;
+
+        let scope = self.conversation_scope_mode().await;
+        let conv_key = scope.conversation_key(channel, project_id);
+        let explicit_key =
+            Self::explicit_channel_conversation_key(channel, project_id, conversation_id);
+        let _ = self.storage.set(&conv_key, new_id.as_bytes()).await;
+        let _ = self.storage.set(&explicit_key, new_id.as_bytes()).await;
+        Ok(new_id)
+    }
+
+    pub(crate) async fn clear_current_channel_conversation(
+        &self,
+        channel: &str,
+        conversation_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<String> {
+        let active_id = match self
+            .load_active_explicit_channel_conversation(channel, project_id, conversation_id)
+            .await?
+        {
+            Some((active_id, _)) => Some(active_id),
+            None => self
+                .storage
+                .get_conversation(conversation_id)
+                .await?
+                .map(|_| conversation_id.to_string()),
+        };
+
+        if let Some(active_id) = active_id {
+            self.clear_conversation_by_id(channel, &active_id, project_id)
+                .await;
+        }
+
+        self.start_new_channel_conversation(channel, conversation_id, project_id, "New Chat")
+            .await
     }
 
     pub async fn ensure_conversation_id_for_request(

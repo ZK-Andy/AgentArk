@@ -30,15 +30,11 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     items: [
       { value: 20, label: "Messaging Channels" },
       { value: 21, label: "Integrations" },
+      { value: 8, label: "MCP Servers" },
       { value: 26, label: "Companion Devices" },
       { value: 22, label: "Webhooks & APIs" },
       { value: 23, label: "Plugins" },
     ],
-  },
-  {
-    id: "knowledge",
-    label: "Knowledge",
-    items: [{ value: 8, label: "MCP Servers" }],
   },
   {
     id: "admin",
@@ -54,7 +50,6 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroup[] = [
     label: "Security",
     items: [
       { value: 4, label: "Security" },
-      { value: 16, label: "Sender Verification" },
       { value: 5, label: "Advanced" },
     ],
   },

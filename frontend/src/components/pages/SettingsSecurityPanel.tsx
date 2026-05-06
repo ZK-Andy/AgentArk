@@ -1,5 +1,6 @@
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import LockRoundedIcon from "@mui/icons-material/LockRounded";
+import ManageAccountsRoundedIcon from "@mui/icons-material/ManageAccountsRounded";
 import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
 import VpnKeyRoundedIcon from "@mui/icons-material/VpnKeyRounded";
 import PublicRoundedIcon from "@mui/icons-material/PublicRounded";
@@ -13,6 +14,10 @@ import {
   Box,
   Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   FormControlLabel,
   MenuItem,
@@ -28,6 +33,7 @@ import {
   Typography,
 } from "@mui/material";
 import Grid2 from "@mui/material/Grid";
+import { useState } from "react";
 import { asRecord, errMessage, num, str, toBool } from "./pageHelpers";
 import { humanTs } from "./workspaceUiBits";
 import {
@@ -41,6 +47,7 @@ import {
   tunnelCheckChipColor,
   tunnelCheckLabel,
 } from "./settingsPageHelpers";
+import { SenderVerificationPanel } from "../SenderVerificationPanel";
 
 type SettingsSecurityPanelProps = {
   [key: string]: any;
@@ -100,25 +107,226 @@ export function SettingsSecurityPanel({
   vaultPassword,
   setVaultPassword,
   vaultSecretsQ,
+  vaultSecretsRequested,
+  requestVaultSecrets,
   queryClient,
   openVaultEditor,
   deleteVaultSecretMutation,
   resolveVaultPasswordForSensitiveOps,
+  autoRefresh,
   form,
   setField,
   setError,
   setSuccess,
 }: SettingsSecurityPanelProps) {
+  const [remoteSetupOpen, setRemoteSetupOpen] = useState(false);
+  const [internalCredentialsOpen, setInternalCredentialsOpen] = useState(false);
+  const [vaultOpen, setVaultOpen] = useState(false);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [senderVerificationOpen, setSenderVerificationOpen] = useState(false);
+  const securityStatusLoading = securityStatusQ.isLoading;
+  const remoteAccessLoading = tunnelQ.isLoading || tunnelProvidersQ.isLoading;
+  const remoteAccessActive = toBool(tunnel.active);
+  const passwordStatusLabel = securityStatusLoading
+    ? "Checking..."
+    : hasCustomMasterPassword
+      ? "Password required"
+      : "No sign-in password";
+  const passwordStatusTone = securityStatusLoading
+    ? "default"
+    : hasCustomMasterPassword
+      ? "success"
+      : "warning";
+  const passwordHelpText = securityStatusLoading
+    ? "Checking whether this instance already requires a password."
+    : hasCustomMasterPassword
+    ? "People must enter your AgentArk password before they can use this instance."
+    : "Local data is encrypted, but anyone on this computer can open AgentArk. Add a password before using remote access.";
+  const remoteAccessHelpText = remoteAccessLoading
+    ? "Checking the remote access provider before showing the current state."
+    : remoteAccessActive
+    ? `${tunnelStateLabel}. Stop it when you are done using another device.`
+    : hasCustomMasterPassword
+      ? "Off by default. Turn it on only when you need AgentArk from another device."
+      : "Off. Add a sign-in password before opening AgentArk from another device.";
+  const remoteAccessPrimaryLabel = remoteAccessActive
+    ? "Manage access"
+    : tunnelStartMutation.isPending
+      ? "Turning on..."
+      : hasCustomMasterPassword
+        ? "Configure and turn on"
+        : "Add password and turn on";
+  const reviewStatusLabel =
+    abuseReviews.length > 0 ? `${abuseReviews.length} to review` : "Nothing waiting";
+  const remoteSetupNeedsAttention = Boolean(
+    tunnelQ.error ||
+      tunnelProvidersQ.error ||
+      tunnelPanelNotice ||
+      str(tunnel.error, "").trim() ||
+      tunnelSetupChecks.length > 0 ||
+      (!remoteAccessLoading && hasCustomMasterPassword && !selectedTunnelAvailable),
+  );
+  const remoteStatusLabel = remoteAccessLoading
+    ? "Checking..."
+    : remoteAccessActive
+      ? "On"
+      : remoteSetupNeedsAttention
+        ? "Needs setup"
+      : "Off";
+  const vaultStatusLabel =
+    !vaultSecretsRequested
+      ? "Not loaded"
+      : vaultSecretsQ.isLoading
+        ? "Checking..."
+        : vaultSecrets.length === 0
+          ? "No saved secrets"
+          : `${vaultSecrets.length} saved`;
+
   return (
-              <Stack spacing={2}>
-                {renderSettingsInlineCard({
-                  eyebrow: "Security",
-                  title: "Review before changing",
-                  description:
-                    "These controls govern who can sign in, what credentials live on this instance, and how the public surface is exposed. Changes take effect immediately for new sessions.",
-                  fullWidthCopy: true,
-                  tone: "warning",
-                })}
+    <>
+              <Stack spacing={2} className="settings-security-panel">
+                <Box className="security-basics-panel">
+                  <Stack spacing={1.25}>
+                    <Box className="security-basics-heading">
+                      <Typography className="security-basics-kicker">
+                        Start here
+                      </Typography>
+                      <Typography className="security-basics-title">
+                        Security basics
+                      </Typography>
+                      <Typography className="security-basics-description">
+                        Most people only need these three checks. Advanced setup is below.
+                      </Typography>
+                    </Box>
+                    <Box className="security-basics-list">
+                      <Box className="security-basics-row">
+                        <Box className="security-basics-icon">
+                          <LockRoundedIcon fontSize="small" />
+                        </Box>
+                        <Box className="security-basics-copy">
+                          <Typography className="security-basics-row-title">
+                            Protect sign-in
+                          </Typography>
+                          <Typography className="security-basics-row-copy">
+                            {passwordHelpText}
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          color={passwordStatusTone}
+                          variant="outlined"
+                          label={passwordStatusLabel}
+                        />
+                        {securityStatusLoading ? null : hasCustomMasterPassword ? (
+                          <Stack direction="row" spacing={0.75} useFlexGap>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              onClick={() => openPasswordDialog("change")}
+                              disabled={passwordMutationPending}
+                            >
+                              Change
+                            </Button>
+                            <Button
+                              size="small"
+                              color="error"
+                              variant="text"
+                              onClick={() => openPasswordDialog("remove")}
+                              disabled={passwordMutationPending}
+                            >
+                              Remove
+                            </Button>
+                          </Stack>
+                        ) : (
+                          <Button
+                            size="small"
+                            variant="contained"
+                            onClick={() => openPasswordDialog("set")}
+                            disabled={passwordMutationPending}
+                          >
+                            Add password
+                          </Button>
+                        )}
+                      </Box>
+                      <Box className="security-basics-row">
+                        <Box className="security-basics-icon">
+                          <PublicRoundedIcon fontSize="small" />
+                        </Box>
+                        <Box className="security-basics-copy">
+                          <Typography className="security-basics-row-title">
+                            Remote access
+                          </Typography>
+                          <Typography className="security-basics-row-copy">
+                            {remoteAccessHelpText}
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          color={remoteAccessLoading ? "default" : tunnelSummaryTone}
+                          variant="outlined"
+                          label={remoteStatusLabel}
+                        />
+                        <Button
+                          size="small"
+                          variant={
+                            remoteAccessActive || !hasCustomMasterPassword
+                              ? "outlined"
+                              : "contained"
+                          }
+                          onClick={() => setRemoteSetupOpen(true)}
+                          disabled={remoteAccessLoading}
+                        >
+                          {remoteAccessPrimaryLabel}
+                        </Button>
+                      </Box>
+                      <Box className="security-basics-row">
+                        <Box className="security-basics-icon">
+                          <ShieldRoundedIcon fontSize="small" />
+                        </Box>
+                        <Box className="security-basics-copy">
+                          <Typography className="security-basics-row-title">
+                            Review blocked senders
+                          </Typography>
+                          <Typography className="security-basics-row-copy">
+                            AgentArk pauses suspicious inbound senders here instead of guessing.
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          color={abuseReviews.length > 0 ? "warning" : "success"}
+                          variant="outlined"
+                          label={reviewStatusLabel}
+                        />
+                      </Box>
+                      <Box className="security-basics-row">
+                        <Box className="security-basics-icon">
+                          <ManageAccountsRoundedIcon fontSize="small" />
+                        </Box>
+                        <Box className="security-basics-copy">
+                          <Typography className="security-basics-row-title">
+                            Sender verification
+                          </Typography>
+                          <Typography className="security-basics-row-copy">
+                            Trust policies, pending approvals, and approved senders for inbound channels.
+                          </Typography>
+                        </Box>
+                        <Chip
+                          size="small"
+                          color="info"
+                          variant="outlined"
+                          label="Inbound trust"
+                        />
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          onClick={() => setSenderVerificationOpen(true)}
+                        >
+                          Manage
+                        </Button>
+                      </Box>
+                    </Box>
+                  </Stack>
+                </Box>
                 <Box
                   sx={{
                     display: "grid",
@@ -131,122 +339,23 @@ export function SettingsSecurityPanel({
                       className="list-shell"
                       sx={{ minHeight: 0 }}
                     >
-                      <Stack spacing={1}>
-                        {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Security & Master Password",
-                          description:
-                            "Protect operator access, control remote sign-in, and manage the primary instance password.",
-                          icon: <LockRoundedIcon fontSize="small" />,
-                        })}
-                        {securityStatusQ.isLoading ? (
-                          <Typography
-                            variant="body2"
-                            sx={{
-                              color: "text.secondary",
-                            }}
-                          >
-                            Loading security status...
-                          </Typography>
-                        ) : securityStatusQ.error ? (
-                          <Alert severity="error">
-                            {errMessage(securityStatusQ.error)}
-                          </Alert>
-                        ) : hasCustomMasterPassword ? (
-                          <Stack spacing={1.1}>
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              sx={{ alignItems: "center" }}
-                            >
-                              <Chip
-                                size="small"
-                                color="success"
-                                variant="outlined"
-                                label="Custom password set"
-                              />
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Sign-in protected · remote access can be enabled below.
-                              </Typography>
-                            </Stack>
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                            >
-                              <Button
-                                variant="contained"
-                                onClick={() => openPasswordDialog("change")}
-                                disabled={passwordMutationPending}
-                              >
-                                Change Password
-                              </Button>
-                              <Button
-                                color="error"
-                                variant="outlined"
-                                onClick={() => openPasswordDialog("remove")}
-                                disabled={passwordMutationPending}
-                              >
-                                Remove Password
-                              </Button>
-                            </Stack>
-                          </Stack>
-                        ) : (
-                          <Stack spacing={1.1}>
-                            <Stack
-                              direction="row"
-                              spacing={0.75}
-                              sx={{ alignItems: "center" }}
-                            >
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label="No custom password"
-                              />
-                              <Typography
-                                variant="caption"
-                                sx={{ color: "text.secondary" }}
-                              >
-                                Built-in encryption is active. Add a master password
-                                to gate sign-in and unlock remote access.
-                              </Typography>
-                            </Stack>
-                            <Stack
-                              direction={{ xs: "column", sm: "row" }}
-                              spacing={1}
-                            >
-                              <Button
-                                variant="contained"
-                                onClick={() => openPasswordDialog("set")}
-                                disabled={passwordMutationPending}
-                              >
-                                Set Master Password
-                              </Button>
-                            </Stack>
-                          </Stack>
-                        )}
-                      </Stack>
-                    </Box>
-
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0 }}
-                    >
                       <Stack spacing={1.1}>
                         {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Abuse Review",
+                          eyebrow: "Messages",
+                          title: "Blocked sender details",
                           description:
-                            "Resume or pause sources that repeatedly tripped the inbound semantic guard.",
+                            "If AgentArk pauses a sender, review the source and choose whether to keep it paused or allow it again.",
                           icon: <ShieldRoundedIcon fontSize="small" />,
                           action: (
                             <Chip
                               size="small"
                               color={abuseReviews.length > 0 ? "warning" : "success"}
                               variant="outlined"
-                              label={`${abuseReviews.length} waiting`}
+                              label={
+                                abuseReviews.length > 0
+                                  ? `${abuseReviews.length} waiting for you`
+                                  : "All clear"
+                              }
                             />
                           ),
                         })}
@@ -257,9 +366,12 @@ export function SettingsSecurityPanel({
                         ) : abuseReviewsQ.error ? (
                           <Alert severity="error">{errMessage(abuseReviewsQ.error)}</Alert>
                         ) : abuseReviews.length === 0 ? (
-                          <Alert severity="success" sx={{ py: 0.25 }}>
-                            No sources are paused or waiting for review.
-                          </Alert>
+                          <Typography
+                            variant="body2"
+                            sx={{ color: "text.secondary", py: 0.5 }}
+                          >
+                            Nothing to review right now.
+                          </Typography>
                         ) : (
                           <TableContainer className="table-shell" sx={{ width: "100%", overflowX: "auto" }}>
                             <Table size="small" sx={{ tableLayout: "fixed", width: "100%" }}>
@@ -347,14 +459,33 @@ export function SettingsSecurityPanel({
                     </Box>
 
                     {showInternalServiceSection ? (
-                      <Box
-                        className="list-shell"
-                        sx={{ minHeight: 0 }}
+                      <Accordion
+                        className="security-accordion"
+                        expanded={internalCredentialsOpen}
+                        onChange={(_, expanded) =>
+                          setInternalCredentialsOpen(expanded)
+                        }
+                        disableGutters
                       >
+                        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                          <Box className="security-accordion-summary">
+                            <Typography className="security-accordion-title">
+                              Internal service credentials
+                            </Typography>
+                            <Typography className="security-accordion-copy">
+                              Expert-only keys used between AgentArk services.
+                            </Typography>
+                          </Box>
+                        </AccordionSummary>
+                        <AccordionDetails>
+                          <Box
+                            className="list-shell security-panel-details"
+                            sx={{ minHeight: 0 }}
+                          >
                       <Stack spacing={1.25}>
                         {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Internal Service Credentials",
+                          eyebrow: "Service",
+                          title: "Service credentials",
                           description: internalServiceDescription,
                           icon: <VpnKeyRoundedIcon fontSize="small" />,
                           action: internalServiceRotationSupported ? (
@@ -509,19 +640,29 @@ export function SettingsSecurityPanel({
                           </Stack>
                         )}
                       </Stack>
-                      </Box>
+                          </Box>
+                        </AccordionDetails>
+                      </Accordion>
                     ) : null}
 
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0 }}
+                    <Dialog
+                      open={remoteSetupOpen}
+                      onClose={() => setRemoteSetupOpen(false)}
+                      fullWidth
+                      maxWidth="md"
                     >
+                      <DialogTitle>Remote access setup</DialogTitle>
+                      <DialogContent dividers sx={{ p: 1.5 }}>
+                        <Box
+                          className="list-shell security-panel-details"
+                          sx={{ minHeight: 0 }}
+                        >
                       <Stack spacing={1.25}>
                         {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Remote Access",
+                          eyebrow: "Access",
+                          title: "Remote access",
                           description:
-                            "Only expose remote sign-in when you need it, and keep the access method and posture visible.",
+                            "Reach AgentArk from another device. We'll only open it up while you say so.",
                           icon: <PublicRoundedIcon fontSize="small" />,
                           action: (
                             <Stack
@@ -545,6 +686,12 @@ export function SettingsSecurityPanel({
                             </Stack>
                           ),
                         })}
+                        <Alert severity="info" sx={{ py: 0.5 }}>
+                          Pick Cloudflare, Tailscale, ngrok, bore, or any
+                          available provider here. Provider-specific auth,
+                          OAuth, token, key, and advanced fields appear in this
+                          popup before you start access.
+                        </Alert>
                         {tunnelQ.isLoading || tunnelProvidersQ.isLoading ? (
                           <Typography
                             variant="body2"
@@ -991,24 +1138,51 @@ export function SettingsSecurityPanel({
                           </Stack>
                         )}
                       </Stack>
-                    </Box>
+                        </Box>
+                      </DialogContent>
+                      <DialogActions>
+                        <Button onClick={() => setRemoteSetupOpen(false)}>
+                          Done
+                        </Button>
+                      </DialogActions>
+                    </Dialog>
 
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0 }}
+                    <Accordion
+                      className="security-accordion"
+                      expanded={vaultOpen}
+                      onChange={(_, expanded) => {
+                        setVaultOpen(expanded);
+                        if (expanded) requestVaultSecrets();
+                      }}
+                      disableGutters
                     >
+                      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                        <Box className="security-accordion-summary">
+                          <Typography className="security-accordion-title">
+                            Stored secrets
+                          </Typography>
+                          <Typography className="security-accordion-copy">
+                            {vaultStatusLabel}. API keys and tokens stay encrypted.
+                          </Typography>
+                        </Box>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                        <Box
+                          className="list-shell security-panel-details"
+                          sx={{ minHeight: 0 }}
+                        >
                       <Stack spacing={1}>
                         {renderSettingsSectionIntro({
-                          eyebrow: "Security",
-                          title: "Secrets vault",
-                          description: vaultSummaryText,
-                          info: "Save private keys and tokens here so AgentArk can use them without showing the raw value in normal screens.",
+                          eyebrow: "Vault",
+                          title: "Stored secrets",
+                          description:
+                            "API keys, tokens, and credentials AgentArk uses for you. Encrypted at rest, never shown in plain text.",
                           icon: <InventoryRoundedIcon fontSize="small" />,
                           action: (
                             <Chip
                               size="small"
                               variant="outlined"
-                              label={`${vaultSecrets.length} saved`}
+                              label={vaultStatusLabel}
                             />
                           ),
                         })}
@@ -1058,7 +1232,16 @@ export function SettingsSecurityPanel({
                           </Button>
                         </Stack>
 
-                        {vaultSecretsQ.isLoading ? (
+                        {!vaultSecretsRequested ? (
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              color: "text.secondary",
+                            }}
+                          >
+                            Opened on demand to keep Security settings fast.
+                          </Typography>
+                        ) : vaultSecretsQ.isLoading ? (
                           <Typography
                             variant="body2"
                             sx={{
@@ -1219,12 +1402,31 @@ export function SettingsSecurityPanel({
                           </TableContainer>
                         )}
                       </Stack>
-                    </Box>
+                        </Box>
+                      </AccordionDetails>
+                    </Accordion>
 
-                    <Box
-                      className="list-shell"
-                      sx={{ minHeight: 0 }}
+                    <Accordion
+                      className="security-accordion"
+                      expanded={privacyOpen}
+                      onChange={(_, expanded) => setPrivacyOpen(expanded)}
+                      disableGutters
                     >
+                      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                        <Box className="security-accordion-summary">
+                          <Typography className="security-accordion-title">
+                            Advanced model privacy
+                          </Typography>
+                          <Typography className="security-accordion-copy">
+                            Controls for what sensitive context can be sent to models.
+                          </Typography>
+                        </Box>
+                      </AccordionSummary>
+                      <AccordionDetails>
+                        <Box
+                          className="list-shell security-panel-details"
+                          sx={{ minHeight: 0 }}
+                        >
                       <Stack spacing={1.5}>
                         {renderSettingsSectionIntro({
                           eyebrow: "Security",
@@ -1336,8 +1538,55 @@ export function SettingsSecurityPanel({
                           context for that single follow-up turn.
                         </Typography>
                       </Stack>
-                    </Box>
+                        </Box>
+                      </AccordionDetails>
+                    </Accordion>
                   </Box>
               </Stack>
+      <Dialog
+        open={senderVerificationOpen}
+        onClose={() => setSenderVerificationOpen(false)}
+        maxWidth="lg"
+        fullWidth
+        slotProps={{
+          paper: {
+            className: "sender-verification-dialog",
+            sx: {
+              maxHeight: "min(88vh, 920px)",
+            },
+          },
+        }}
+      >
+        <DialogTitle>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1}
+            sx={{
+              alignItems: { xs: "flex-start", sm: "center" },
+              justifyContent: "space-between",
+            }}
+          >
+            <Box>
+              <Typography variant="h6" sx={{ lineHeight: 1.2 }}>
+                Sender Verification
+              </Typography>
+              <Typography variant="body2" sx={{ color: "text.secondary" }}>
+                Edit inbound sender policies and approvals.
+              </Typography>
+            </Box>
+            <Button
+              size="small"
+              variant="outlined"
+              onClick={() => setSenderVerificationOpen(false)}
+            >
+              Close
+            </Button>
+          </Stack>
+        </DialogTitle>
+        <DialogContent dividers>
+          <SenderVerificationPanel autoRefresh={Boolean(autoRefresh)} />
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

@@ -15,7 +15,22 @@ export type StatusResponse = {
   actions_loaded?: number;
   tasks_pending: number;
   version: string;
+  runtime_health?: RuntimeHealth | null;
   update?: UpdateStatus | null;
+};
+
+export type RuntimeHealth = {
+  uptime_seconds: number;
+  cpu_percent?: number | null;
+  ram_percent?: number | null;
+  memory_pressure_percent?: number | null;
+  memory_used_bytes?: number | null;
+  memory_total_bytes?: number | null;
+  disk_read_bytes_per_sec?: number | null;
+  disk_write_bytes_per_sec?: number | null;
+  temperature_celsius?: number | null;
+  load_average_1m?: number | null;
+  sampled_at: string;
 };
 
 export type Task = {
@@ -215,6 +230,39 @@ export type ArkPulseRunFixRequest = {
   remediation?: ArkPulseRemediationSpec;
   issue_title?: string;
   target?: string;
+  event_timestamp?: string;
+  finding_index?: number;
+};
+
+export type ArkPulseCleanupCandidate = {
+  id: string;
+  category: string;
+  category_label: string;
+  path_label: string;
+  size_bytes: number;
+  age_seconds: number;
+  age_days: number;
+  risk: string;
+  reason: string;
+  selected_by_default: boolean;
+  app_id?: string | null;
+  requires_app_stop?: boolean;
+};
+
+export type ArkPulseCleanupPreviewResponse = {
+  status: string;
+  archive_root: string;
+  legacy_archive_root: string;
+  archive_retention_days: number;
+  candidates: ArkPulseCleanupCandidate[];
+  category_counts: Array<{ category: string; count: number; size_bytes: number }>;
+  total_size_bytes: number;
+  active_job?: unknown;
+};
+
+export type ArkPulseCleanupRequest = {
+  candidate_ids: string[];
+  confirm_archive: boolean;
   event_timestamp?: string;
   finding_index?: number;
 };

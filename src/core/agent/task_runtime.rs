@@ -2044,6 +2044,27 @@ impl Agent {
         )
     }
 
+    pub(super) fn task_report_is_chat_owned(task: &super::task::Task) -> bool {
+        let origin = task
+            .arguments
+            .get("_origin")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if !origin.eq_ignore_ascii_case("chat") {
+            return false;
+        }
+
+        let task_kind = task
+            .arguments
+            .get("_task_kind")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        task_kind.eq_ignore_ascii_case("chat_request")
+            || task.action.eq_ignore_ascii_case("chat_request")
+    }
+
     pub(super) async fn preferred_task_report_channel_hint(
         &self,
         task: &super::task::Task,
@@ -2304,9 +2325,6 @@ impl Agent {
         task: &super::task::Task,
         message: &str,
     ) {
-        let report_to = Self::task_report_target(task);
-        let preferred_hint = self.preferred_task_report_channel_hint(task).await;
-        let is_webhook = Self::webhook_task_metadata(task).is_some();
         if task.action == "daily_brief" {
             tracing::debug!(
                 "Scheduled daily_brief delivery already handled inside run_daily_brief_and_notify"
@@ -2316,6 +2334,16 @@ impl Agent {
         if message.trim().is_empty() {
             return;
         }
+        if Self::task_report_is_chat_owned(task) {
+            tracing::debug!(
+                "Skipping task report notification for chat-owned task '{}'",
+                task.description
+            );
+            return;
+        }
+        let report_to = Self::task_report_target(task);
+        let preferred_hint = self.preferred_task_report_channel_hint(task).await;
+        let is_webhook = Self::webhook_task_metadata(task).is_some();
         if report_to.is_empty() || report_to == AUTOMATION_IN_APP_NOTIFICATION_CHANNEL {
             if !is_webhook {
                 self.emit_notification("Scheduled Task Result", message, "info", "scheduler")
@@ -5617,5 +5645,37 @@ mod tests {
             items[1].get("poll_action").and_then(|v| v.as_str()),
             Some("web_search")
         );
+    }
+
+    #[test]
+    fn chat_owned_task_reports_are_suppressed() {
+        let task = crate::core::Task::new(
+            "Deep research: market structure".to_string(),
+            "chat_request".to_string(),
+            serde_json::json!({
+                "_origin": "chat",
+                "_task_kind": "chat_request",
+                "_work_type": "research",
+                "deep_research": true,
+                "message": "research market structure"
+            }),
+        );
+
+        assert!(Agent::task_report_is_chat_owned(&task));
+    }
+
+    #[test]
+    fn scheduled_research_task_reports_are_not_suppressed() {
+        let task = crate::core::Task::new(
+            "Scheduled market research".to_string(),
+            "research".to_string(),
+            serde_json::json!({
+                "deep_research": true,
+                "query": "research market structure",
+                "report_to": "preferred"
+            }),
+        );
+
+        assert!(!Agent::task_report_is_chat_owned(&task));
     }
 }

@@ -3835,7 +3835,7 @@ print(json.dumps({
 
         self.register_builtin_action(ActionDef {
             name: "file_write".to_string(),
-            description: "Author or overwrite a single file in the workspace with the provided text content. Suitable for tangible authored artifacts that the user wants persisted on disk: HTML pages, JSON or YAML configuration, Markdown notes, source code modules, generated reports. The path must resolve inside the configured workspace and data directories; both the path and the full content body are required for any useful write. Parent directories are created if they do not already exist. For generated multi-file apps, write each app file individually under one workspace directory, then call app_deploy with source_dir and source_paths so the hosted app is assembled from those staged files.".to_string(),
+            description: "Author or overwrite a single file in the workspace with the provided text content. Suitable for tangible authored artifacts that the user wants persisted on disk: HTML pages, JSON or YAML configuration, CSV/TSV data tables, Markdown notes, analytical models, source code modules, and generated reports. The path must resolve inside the configured workspace and data directories; both the path and the full content body are required for any useful write. Parent directories are created if they do not already exist. For generated multi-file apps, write each app file individually under one workspace directory, then call app_deploy with source_dir and source_paths so the hosted app is assembled from those staged files.".to_string(),
             version: "1.0.0".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -9094,6 +9094,77 @@ print(json.dumps({
                     }
                 }
                 Ok(output)
+            }
+            "list_watchers" => {
+                let storage = self
+                    .storage
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Storage not available"))?;
+                let filter = arguments
+                    .get("filter")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("active");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let mut watchers = storage.list_watchers().await?;
+                watchers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                let status_label = |status: &crate::core::watcher::WatcherStatus| -> &'static str {
+                    match status {
+                        crate::core::watcher::WatcherStatus::Active => "active",
+                        crate::core::watcher::WatcherStatus::Paused => "paused",
+                        crate::core::watcher::WatcherStatus::Triggered => "triggered",
+                        crate::core::watcher::WatcherStatus::TimedOut => "timed_out",
+                        crate::core::watcher::WatcherStatus::Cancelled => "cancelled",
+                        crate::core::watcher::WatcherStatus::Failed { .. } => "failed",
+                    }
+                };
+                let rows = watchers
+                    .into_iter()
+                    .filter(|watcher| filter == "all" || status_label(&watcher.status) == filter)
+                    .take(limit)
+                    .map(|watcher| {
+                        let status = status_label(&watcher.status);
+                        let status_error = match &watcher.status {
+                            crate::core::watcher::WatcherStatus::Failed { error } => {
+                                Some(error.clone())
+                            }
+                            _ => None,
+                        };
+                        serde_json::json!({
+                            "id": watcher.id.to_string(),
+                            "description": watcher.description,
+                            "poll_action": watcher.poll_action,
+                            "condition": watcher.condition,
+                            "status": status,
+                            "status_error": status_error,
+                            "interval_secs": watcher.interval_secs,
+                            "timeout_secs": watcher.timeout_secs,
+                            "poll_count": watcher.poll_count,
+                            "created_at": watcher.created_at.to_rfc3339(),
+                            "last_poll_at": watcher.last_poll_at.map(|value| value.to_rfc3339()),
+                            "next_poll_not_before": watcher
+                                .next_poll_not_before
+                                .map(|value| value.to_rfc3339()),
+                            "notify_channel": watcher.notify_channel,
+                            "on_trigger": watcher.on_trigger,
+                            "last_error": watcher.last_error,
+                            "last_poll_outcome": watcher.last_poll_outcome,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if rows.is_empty() {
+                    return Ok(format!("No {} watcher(s) found.", filter));
+                }
+                Ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "filter": filter,
+                    "count": rows.len(),
+                    "watchers": rows,
+                }))?)
             }
             "tunnel_control" => self.execute_tunnel_control(arguments).await,
             "background_session_manage" => {
@@ -20720,6 +20791,19 @@ version: "1.2.3"
 
         assert!(!error.contains("Unknown native action"));
         assert!(error.contains("storage") || error.contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn list_watchers_has_native_executor() {
+        let runtime = runtime_for_authorization_tests().await;
+        let error = runtime
+            .execute_action("list_watchers", &serde_json::json!({"filter": "all"}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("Unknown native action"));
+        assert!(error.contains("Storage not available") || error.contains("not available"));
     }
 
     #[tokio::test]

@@ -8,6 +8,238 @@ pub(super) fn heartbeat_recent_with_threshold(value: Option<&str>, max_age_secs:
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeProcSample {
+    at: Instant,
+    cpu_total: u64,
+    cpu_idle: u64,
+    disk_read_sectors: u64,
+    disk_write_sectors: u64,
+}
+
+static LAST_RUNTIME_PROC_SAMPLE: once_cell::sync::Lazy<
+    parking_lot::Mutex<Option<RuntimeProcSample>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(None));
+
+fn collect_status_runtime_health(uptime_seconds: u64) -> RuntimeHealthResponse {
+    let memory = read_linux_memory_pressure();
+    let sample = read_linux_proc_sample();
+    let (cpu_percent, disk_read_bytes_per_sec, disk_write_bytes_per_sec) =
+        sample
+            .map(update_runtime_proc_rates)
+            .unwrap_or((None, None, None));
+
+    RuntimeHealthResponse {
+        uptime_seconds,
+        cpu_percent,
+        ram_percent: memory.map(|item| item.2),
+        memory_pressure_percent: memory.map(|item| item.2),
+        memory_used_bytes: memory.map(|item| item.0),
+        memory_total_bytes: memory.map(|item| item.1),
+        disk_read_bytes_per_sec,
+        disk_write_bytes_per_sec,
+        temperature_celsius: read_linux_temperature_celsius(),
+        load_average_1m: read_linux_load_average_1m(),
+        sampled_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+fn update_runtime_proc_rates(
+    sample: RuntimeProcSample,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let mut previous = LAST_RUNTIME_PROC_SAMPLE.lock();
+    let last = previous.replace(sample);
+    let Some(last) = last else {
+        return (None, None, None);
+    };
+
+    let elapsed_secs = sample.at.duration_since(last.at).as_secs_f64();
+    if elapsed_secs <= 0.05 {
+        return (None, None, None);
+    }
+
+    let cpu_total_delta = sample.cpu_total.saturating_sub(last.cpu_total);
+    let cpu_idle_delta = sample.cpu_idle.saturating_sub(last.cpu_idle);
+    let cpu_percent = if cpu_total_delta > 0 {
+        let active = cpu_total_delta.saturating_sub(cpu_idle_delta) as f64;
+        Some(round_1((active / cpu_total_delta as f64 * 100.0).clamp(0.0, 100.0)))
+    } else {
+        None
+    };
+
+    let read_bps = sample
+        .disk_read_sectors
+        .checked_sub(last.disk_read_sectors)
+        .map(|sectors| round_1(sectors as f64 * 512.0 / elapsed_secs));
+    let write_bps = sample
+        .disk_write_sectors
+        .checked_sub(last.disk_write_sectors)
+        .map(|sectors| round_1(sectors as f64 * 512.0 / elapsed_secs));
+
+    (cpu_percent, read_bps, write_bps)
+}
+
+fn read_linux_proc_sample() -> Option<RuntimeProcSample> {
+    let (cpu_total, cpu_idle) = read_linux_cpu_counters()?;
+    let (disk_read_sectors, disk_write_sectors) = read_linux_disk_sectors().unwrap_or((0, 0));
+    Some(RuntimeProcSample {
+        at: Instant::now(),
+        cpu_total,
+        cpu_idle,
+        disk_read_sectors,
+        disk_write_sectors,
+    })
+}
+
+fn read_linux_cpu_counters() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = content.lines().find(|line| line.starts_with("cpu "))?;
+    let values = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values[3].saturating_add(values.get(4).copied().unwrap_or(0));
+    let total = values.iter().copied().sum::<u64>();
+    Some((total, idle))
+}
+
+fn read_linux_memory_pressure() -> Option<(u64, u64, f64)> {
+    if let Some(memory) = read_linux_cgroup_memory_pressure() {
+        return Some(memory);
+    }
+
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total_kb = None;
+    let mut available_kb = None;
+    let mut free_kb = None;
+
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let key = parts.next().unwrap_or_default().trim_end_matches(':');
+        let value = parts.next().and_then(|part| part.parse::<u64>().ok());
+        match key {
+            "MemTotal" => total_kb = value,
+            "MemAvailable" => available_kb = value,
+            "MemFree" => free_kb = value,
+            _ => {}
+        }
+    }
+
+    let total = total_kb?;
+    if total == 0 {
+        return None;
+    }
+    let available = available_kb.or(free_kb).unwrap_or(0).min(total);
+    let used = total.saturating_sub(available);
+    let percent = round_1((used as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
+    Some((used.saturating_mul(1024), total.saturating_mul(1024), percent))
+}
+
+fn read_linux_cgroup_memory_pressure() -> Option<(u64, u64, f64)> {
+    fn read_u64_file(path: &str) -> Option<u64> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("max") {
+            return None;
+        }
+        trimmed.parse::<u64>().ok()
+    }
+
+    fn valid_limit(value: u64) -> Option<u64> {
+        if value == 0 || value >= (1_u64 << 60) {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    let usage = read_u64_file("/sys/fs/cgroup/memory.current")
+        .or_else(|| read_u64_file("/sys/fs/cgroup/memory/memory.usage_in_bytes"))?;
+    let limit = read_u64_file("/sys/fs/cgroup/memory.max")
+        .or_else(|| read_u64_file("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        .and_then(valid_limit)?;
+    if limit == 0 {
+        return None;
+    }
+    let used = usage.min(limit);
+    let percent = round_1((used as f64 / limit as f64 * 100.0).clamp(0.0, 100.0));
+    Some((used, limit, percent))
+}
+
+fn read_linux_disk_sectors() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/diskstats").ok()?;
+    let mut read_sectors = 0_u64;
+    let mut write_sectors = 0_u64;
+    let mut found = false;
+
+    for line in content.lines() {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 10 {
+            continue;
+        }
+        let name = parts[2];
+        if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("fd") {
+            continue;
+        }
+        let read = parts[5].parse::<u64>().ok();
+        let written = parts[9].parse::<u64>().ok();
+        if let (Some(read), Some(written)) = (read, written) {
+            read_sectors = read_sectors.saturating_add(read);
+            write_sectors = write_sectors.saturating_add(written);
+            found = true;
+        }
+    }
+
+    found.then_some((read_sectors, write_sectors))
+}
+
+fn read_linux_temperature_celsius() -> Option<f64> {
+    let entries = std::fs::read_dir("/sys/class/thermal").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("temp")) else {
+            continue;
+        };
+        let Ok(value) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        let celsius = if value.abs() > 1000.0 {
+            value / 1000.0
+        } else {
+            value
+        };
+        if (-40.0..=130.0).contains(&celsius) {
+            return Some(round_1(celsius));
+        }
+    }
+    None
+}
+
+fn read_linux_load_average_1m() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/loadavg").ok()?;
+    content
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(round_2)
+}
+
+fn round_1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn round_2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 pub(super) async fn build_runtime_health_payload(
     state: &AppState,
     readiness_mode: bool,
@@ -2186,6 +2418,7 @@ pub(super) async fn status(State(state): State<AppState>) -> Json<StatusResponse
         actions_loaded: Some(status.actions_loaded),
         tasks_pending: status.tasks_pending,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        runtime_health: collect_status_runtime_health(state.runtime_started_at.elapsed().as_secs()),
         update: Some(update),
     })
 }

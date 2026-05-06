@@ -205,171 +205,240 @@ async fn link_current_llm_key_for_chat(agent: &SharedAgent, key: &str) -> Result
     ))
 }
 
-/// Convert markdown to Telegram HTML format
-fn markdown_to_telegram_html(text: &str) -> String {
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-
-    while let Some(c) = chars.next() {
+fn escape_telegram_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
         match c {
-            // Escape HTML special chars
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '&' => result.push_str("&amp;"),
-
-            // Bold: **text** or __text__
-            '*' if chars.peek() == Some(&'*') => {
-                chars.next(); // consume second *
-                let mut bold_text = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next == '*' {
-                        chars.next();
-                        if chars.peek() == Some(&'*') {
-                            chars.next();
-                            break;
-                        }
-                        bold_text.push('*');
-                    } else {
-                        bold_text.push(chars.next().unwrap());
-                    }
-                }
-                result.push_str(&format!("<b>{}</b>", bold_text));
-            }
-
-            // Headers: # text -> bold
-            '#' if result.ends_with('\n') || result.is_empty() => {
-                // Count # symbols
-                let mut level = 1;
-                while chars.peek() == Some(&'#') {
-                    chars.next();
-                    level += 1;
-                }
-                // Skip space after #
-                if chars.peek() == Some(&' ') {
-                    chars.next();
-                }
-                // Collect header text until newline
-                let mut header_text = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next == '\n' {
-                        break;
-                    }
-                    header_text.push(chars.next().unwrap());
-                }
-                // Add ASCII prefix for different levels
-                let prefix = match level {
-                    1 => "* ",
-                    2 => "> ",
-                    3 => "- ",
-                    _ => "",
-                };
-                result.push_str(&format!("<b>{}{}</b>", prefix, header_text));
-            }
-
-            // Links: [text](url)
-            '[' => {
-                let mut link_text = String::new();
-                let mut found_link = false;
-                while let Some(&next) = chars.peek() {
-                    if next == ']' {
-                        chars.next();
-                        if chars.peek() == Some(&'(') {
-                            chars.next();
-                            let mut url = String::new();
-                            while let Some(&url_char) = chars.peek() {
-                                if url_char == ')' {
-                                    chars.next();
-                                    break;
-                                }
-                                url.push(chars.next().unwrap());
-                            }
-                            result.push_str(&format!("<a href=\"{}\">{}</a>", url, link_text));
-                            found_link = true;
-                        }
-                        break;
-                    }
-                    link_text.push(chars.next().unwrap());
-                }
-                if !found_link {
-                    result.push('[');
-                    result.push_str(&link_text);
-                    result.push(']');
-                }
-            }
-
-            // Inline code: `code`
-            '`' if chars.peek() != Some(&'`') => {
-                let mut code_text = String::new();
-                while let Some(&next) = chars.peek() {
-                    if next == '`' {
-                        chars.next();
-                        break;
-                    }
-                    code_text.push(chars.next().unwrap());
-                }
-                result.push_str(&format!("<code>{}</code>", code_text));
-            }
-
-            // Code block: ```code```
-            '`' if chars.peek() == Some(&'`') => {
-                chars.next(); // second `
-                if chars.peek() == Some(&'`') {
-                    chars.next(); // third `
-                                  // Skip optional language identifier
-                    while let Some(&next) = chars.peek() {
-                        if next == '\n' {
-                            chars.next();
-                            break;
-                        }
-                        chars.next();
-                    }
-                    let mut code_block = String::new();
-                    let mut backtick_count = 0;
-                    while let Some(&next) = chars.peek() {
-                        if next == '`' {
-                            backtick_count += 1;
-                            chars.next();
-                            if backtick_count == 3 {
-                                break;
-                            }
-                        } else {
-                            if backtick_count > 0 {
-                                for _ in 0..backtick_count {
-                                    code_block.push('`');
-                                }
-                                backtick_count = 0;
-                            }
-                            code_block.push(chars.next().unwrap());
-                        }
-                    }
-                    result.push_str(&format!("<pre>{}</pre>", code_block.trim()));
-                } else {
-                    result.push_str("``");
-                }
-            }
-
-            // Horizontal rule: --- or *** or ___
-            '-' if result.ends_with('\n') || result.is_empty() => {
-                let mut dash_count = 1;
-                while chars.peek() == Some(&'-') {
-                    chars.next();
-                    dash_count += 1;
-                }
-                if dash_count >= 3 {
-                    result.push_str("-----------------");
-                } else {
-                    for _ in 0..dash_count {
-                        result.push('-');
-                    }
-                }
-            }
-
-            // Keep everything else
-            _ => result.push(c),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(c),
         }
     }
+    escaped
+}
 
-    result
+fn markdown_inline_to_telegram_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '*' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut inner = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == '*' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            if closed {
+                out.push_str("<b>");
+                out.push_str(&escape_telegram_html(&inner));
+                out.push_str("</b>");
+            } else {
+                out.push_str("**");
+                out.push_str(&escape_telegram_html(&inner));
+            }
+        } else if c == '_' && chars.peek() == Some(&'_') {
+            chars.next();
+            let mut inner = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == '_' && chars.peek() == Some(&'_') {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            if closed {
+                out.push_str("<b>");
+                out.push_str(&escape_telegram_html(&inner));
+                out.push_str("</b>");
+            } else {
+                out.push_str("__");
+                out.push_str(&escape_telegram_html(&inner));
+            }
+        } else if c == '`' {
+            let mut inner = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == '`' {
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            if closed {
+                out.push_str("<code>");
+                out.push_str(&escape_telegram_html(&inner));
+                out.push_str("</code>");
+            } else {
+                out.push('`');
+                out.push_str(&escape_telegram_html(&inner));
+            }
+        } else if c == '*' {
+            let mut inner = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == '*' {
+                    closed = true;
+                    break;
+                }
+                inner.push(next);
+            }
+            if closed && !inner.trim().is_empty() {
+                out.push_str("<i>");
+                out.push_str(&escape_telegram_html(&inner));
+                out.push_str("</i>");
+            } else {
+                out.push('*');
+                out.push_str(&escape_telegram_html(&inner));
+            }
+        } else if c == '[' {
+            let mut label = String::new();
+            let mut url = String::new();
+            let mut found = false;
+            while let Some(next) = chars.next() {
+                if next == ']' && chars.peek() == Some(&'(') {
+                    chars.next();
+                    while let Some(url_ch) = chars.next() {
+                        if url_ch == ')' {
+                            found = true;
+                            break;
+                        }
+                        url.push(url_ch);
+                    }
+                    break;
+                }
+                label.push(next);
+            }
+            if found && !label.trim().is_empty() && !url.trim().is_empty() {
+                out.push_str("<a href=\"");
+                out.push_str(&escape_telegram_html(url.trim()));
+                out.push_str("\">");
+                out.push_str(&escape_telegram_html(label.trim()));
+                out.push_str("</a>");
+            } else {
+                out.push('[');
+                out.push_str(&escape_telegram_html(&label));
+            }
+        } else {
+            out.push_str(&escape_telegram_html(&c.to_string()));
+        }
+    }
+    out
+}
+
+fn markdown_wrapped_bold(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("**")
+        .and_then(|value| value.strip_suffix("**"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("__")
+                .and_then(|value| value.strip_suffix("__"))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_markdown_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3
+        && trimmed
+            .chars()
+            .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace())
+        && trimmed
+            .chars()
+            .filter(|c| matches!(c, '-' | '*' | '_'))
+            .count()
+            >= 3
+}
+
+/// Convert common Markdown to Telegram HTML.
+fn markdown_to_telegram_html(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut result = String::with_capacity(normalized.len());
+    let mut in_code_block = false;
+    let mut code_block = String::new();
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                result.push_str("<pre>");
+                result.push_str(&escape_telegram_html(code_block.trim_end()));
+                result.push_str("</pre>\n");
+                code_block.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_block.push_str(line);
+            code_block.push('\n');
+            continue;
+        }
+
+        if is_markdown_rule(trimmed) {
+            if !result.ends_with("\n\n") && !result.is_empty() {
+                result.push('\n');
+            }
+            continue;
+        }
+
+        if let Some(stripped) = trimmed.strip_prefix("# ") {
+            result.push_str("<b>");
+            result.push_str(&markdown_inline_to_telegram_html(stripped.trim()));
+            result.push_str("</b>\n");
+            continue;
+        }
+        if let Some(stripped) = trimmed.strip_prefix("## ") {
+            result.push_str("<b>");
+            result.push_str(&markdown_inline_to_telegram_html(stripped.trim()));
+            result.push_str("</b>\n");
+            continue;
+        }
+        if let Some(stripped) = trimmed.strip_prefix("### ") {
+            result.push_str("<b>");
+            result.push_str(&markdown_inline_to_telegram_html(stripped.trim()));
+            result.push_str("</b>\n");
+            continue;
+        }
+
+        let content = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .map(|item| {
+                if let Some(heading) = markdown_wrapped_bold(item) {
+                    format!("<b>{}</b>", markdown_inline_to_telegram_html(heading))
+                } else {
+                    format!("- {}", markdown_inline_to_telegram_html(item.trim()))
+                }
+            })
+            .unwrap_or_else(|| markdown_inline_to_telegram_html(line));
+        result.push_str(&content);
+        result.push('\n');
+    }
+
+    if in_code_block && !code_block.trim().is_empty() {
+        result.push_str("<pre>");
+        result.push_str(&escape_telegram_html(code_block.trim_end()));
+        result.push_str("</pre>\n");
+    }
+
+    result.trim().to_string()
 }
 
 /// Register bot commands with Telegram (shows in / menu)
@@ -392,6 +461,7 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("model", "Switch LLM model - /model <name>"),
         BotCommand::new("settings", "View settings"),
         BotCommand::new("tunnel", "Tunnel control - /tunnel [start|stop|status]"),
+        BotCommand::new("new", "Start a new conversation"),
         BotCommand::new("clear", "Clear conversation history"),
     ];
 
@@ -670,15 +740,12 @@ pub async fn serve(agent: SharedAgent) -> Result<()> {
                     };
                     typing_done.store(true, std::sync::atomic::Ordering::Relaxed);
 
-                    // Convert markdown to Telegram HTML
-                    let html_response = markdown_to_telegram_html(&response);
-
                     let chunks = super::outbound_split::split_for_provider_safe_channel(
                         "telegram",
-                        &html_response,
+                        &response,
                     );
                     for chunk in chunks {
-                        bot.send_message(chat_id, chunk)
+                        bot.send_message(chat_id, markdown_to_telegram_html(&chunk))
                             .parse_mode(ParseMode::Html)
                             .await?;
                     }
@@ -708,7 +775,9 @@ pub async fn send_message(agent: &Agent, text: &str) -> Result<()> {
 
     let bot = Bot::new(&config.bot_token);
     for chunk in super::outbound_split::split_for_provider_safe_channel("telegram", text) {
-        bot.send_message(ChatId(chat_id), chunk).await?;
+        bot.send_message(ChatId(chat_id), markdown_to_telegram_html(&chunk))
+            .parse_mode(ParseMode::Html)
+            .await?;
     }
     Ok(())
 }
@@ -800,6 +869,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
                 /install <url> - Install a skill from URL\n\
                 /tunnel [start|stop|status] - Manage remote UI access\n\
                 /run <skill> [query] - Run a custom skill\n\
+                /new - Start a new conversation\n\
                 /clear - Clear conversation history\n\n\
                 Or just chat with me!",
                 agent.config.name
@@ -1109,12 +1179,26 @@ async fn handle_command(text: &str, agent: &SharedAgent, chat_id: ChatId) -> Str
             }
         }
 
+        "/new" => {
+            let agent = agent.read().await;
+            match agent
+                .start_new_channel_conversation("telegram", &conversation_id, None, "New Chat")
+                .await
+            {
+                Ok(_) => "Started a new conversation. Previous history is kept.".to_string(),
+                Err(e) => format!("Failed to start a new conversation: {}", e),
+            }
+        }
+
         "/clear" => {
             let agent = agent.read().await;
-            agent
-                .clear_conversation_by_id("telegram", &conversation_id, None)
-                .await;
-            "Conversation cleared. Starting fresh.".to_string()
+            match agent
+                .clear_current_channel_conversation("telegram", &conversation_id, None)
+                .await
+            {
+                Ok(_) => "Conversation cleared. Starting fresh.".to_string(),
+                Err(e) => format!("Failed to clear conversation: {}", e),
+            }
         }
 
         "/model" => {

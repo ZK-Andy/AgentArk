@@ -4,7 +4,7 @@ use super::sentinel_panel;
 use super::*;
 
 use crate::core::arkorbit::{ArkOrbitService, Orbit, OrbitChatMessage, OrbitChatTranscriptSummary};
-use crate::core::{EmbeddingClient, TaskStatus};
+use crate::core::{EmbeddingClient, LlmClient, TaskStatus};
 use crate::storage::entities::{
     arkpulse_event, conversation, experience_item, experience_run, llm_usage, message,
     procedural_pattern, semantic_work_unit, task,
@@ -58,23 +58,40 @@ const REFLECT_RELATED_HISTORY_MAX_DISTANCE: f64 = 0.32;
 const REFLECT_BASELINE_LOOKBACK_DAYS: i64 = 183;
 const REFLECT_DAILY_DIGEST_STATUS_KEY: &str = "arkreflect_daily_digest_status_v1";
 const REFLECT_DAILY_DIGEST_LEASE_KEY: &str = "arkreflect_daily_digest_lease_v1";
+const REFLECT_FOLLOWUP_FEEDBACK_KEY: &str = "arkreflect_followup_feedback_v1";
 const REFLECT_DAILY_DIGEST_LEASE_TTL_SECS: i64 = 180;
 const REFLECT_DAILY_DIGEST_TIMEOUT: Duration = Duration::from_secs(35);
 const REFLECT_DAILY_DIGEST_NOT_BEFORE_LOCAL_HOUR: u32 = 20;
 const REFLECT_MAX_SUGGESTED_FOLLOWUPS: usize = 5;
+const REFLECT_MAX_RETURNED_FOLLOWUPS: usize = 18;
 const REFLECT_SUGGESTION_EXPERIENCE_RUN_LIMIT: u64 = 160;
 const REFLECT_SUGGESTION_TEXT_CHARS: usize = 220;
 const REFLECT_FOLLOWUP_SEARCH_CACHE_KEY: &str = "arkreflect_followup_search_cache_v1";
 const REFLECT_FOLLOWUP_SEARCH_LEASE_KEY: &str = "arkreflect_followup_search_lease_v1";
-const REFLECT_FOLLOWUP_SEARCH_LEASE_TTL_SECS: i64 = 180;
-const REFLECT_FOLLOWUP_SEARCH_TIMEOUT: Duration = Duration::from_secs(55);
+const REFLECT_FOLLOWUP_SUMMARY_LEASE_KEY: &str = "arkreflect_followup_summary_lease_v1";
+const REFLECT_FOLLOWUP_SEARCH_LEASE_TTL_SECS: i64 = 480;
+const REFLECT_FOLLOWUP_SUMMARY_LEASE_TTL_SECS: i64 = 480;
+const REFLECT_FOLLOWUP_SEARCH_TIMEOUT: Duration = Duration::from_secs(75);
+const REFLECT_FOLLOWUP_SUMMARY_JOB_TIMEOUT: Duration = Duration::from_secs(420);
 const REFLECT_FOLLOWUP_SEARCH_DUE_AFTER_SECS: i64 = 24 * 60 * 60;
 const REFLECT_FOLLOWUP_SEARCH_RESULTS_PER_TOPIC: usize = 3;
 const REFLECT_FOLLOWUP_BACKGROUND_SEARCH_LIMIT: usize = 3;
+const REFLECT_FOLLOWUP_PLAN_LIMIT: usize = 8;
+const REFLECT_FOLLOWUP_PLAN_TIMEOUT: Duration = Duration::from_secs(45);
+const REFLECT_FOLLOWUP_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+const REFLECT_FOLLOWUP_SUMMARY_MAX_CHARS: usize = 1_000;
+const REFLECT_SEMANTIC_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(5);
+const REFLECT_SEMANTIC_FRESHNESS_MIN_SIMILARITY: f32 = 0.28;
+const REFLECT_SEMANTIC_FRESHNESS_MIN_MARGIN: f32 = 0.04;
+const REFLECT_FEEDBACK_SEMANTIC_MAX_DISTANCE: f32 = 0.18;
+const REFLECT_PUBLIC_DEVELOPMENT_CONCEPT_TEXT: &str = "A reflected topic about public events, external entities, products, places, services, regulations, markets, research, releases, or other outside-world information whose useful answer depends on current source evidence.";
+const REFLECT_PRIVATE_WORK_CONCEPT_TEXT: &str = "A reflected local or personal topic about private profile facts, identity, location, preferences, saved memories, internal notes, app UI, code edits, workflow state, system maintenance, or other user-specific context that should continue without public source research.";
 
 static REFLECT_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static REFLECT_IDLE_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
+static REFLECT_FOLLOWUP_COORDINATOR_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static REFLECT_REFRESH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static REFLECT_REFRESH_STATUS: OnceLock<Arc<RwLock<ReflectRefreshStatus>>> = OnceLock::new();
 static REFLECT_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -325,8 +342,86 @@ struct ReflectSuggestedFollowup {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_unit_id: Option<String>,
     rank_score: f64,
+    #[serde(default)]
+    search_results: Vec<ReflectFollowupSearchResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_checked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_summary_generated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_summary_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feedback: Option<ReflectFollowupFeedbackState>,
+    #[serde(default)]
+    feedback_keys: Vec<String>,
+    #[serde(skip_serializing)]
+    feedback_vector: Option<Vec<f32>>,
     #[serde(skip_serializing)]
     search_query: Option<String>,
+    #[serde(skip_serializing)]
+    search_planning_context: Option<String>,
+    #[serde(skip_serializing)]
+    search_requires_planning: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ReflectFollowupFeedbackState {
+    #[serde(default)]
+    useful_count: u32,
+    #[serde(default)]
+    dismiss_count: u32,
+    #[serde(default)]
+    snooze_count: u32,
+    last_action: Option<String>,
+    last_at: Option<String>,
+    snoozed_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_vector: Option<Vec<f32>>,
+    #[serde(default)]
+    renewed_after_feedback: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ReflectFollowupFeedbackStore {
+    updated_at: Option<String>,
+    #[serde(default)]
+    entries: BTreeMap<String, ReflectFollowupFeedbackState>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct ReflectFollowupFeedbackRequest {
+    action: ReflectFollowupFeedbackAction,
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReflectFollowupFeedbackAction {
+    Useful,
+    Dismiss,
+    Snooze,
+}
+
+impl ReflectFollowupFeedbackAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Useful => "useful",
+            Self::Dismiss => "dismiss",
+            Self::Snooze => "snooze",
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReflectFollowupFeedbackResponse {
+    status: String,
+    id: String,
+    feedback: ReflectFollowupFeedbackState,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -345,6 +440,9 @@ struct ReflectFollowupSearchEntry {
     #[serde(default)]
     results: Vec<ReflectFollowupSearchResult>,
     error: Option<String>,
+    summary: Option<String>,
+    summary_generated_at: Option<String>,
+    summary_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -354,6 +452,32 @@ struct ReflectFollowupSearchResult {
     snippet: String,
     source: String,
     published_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct ReflectExternalPursuitPlan {
+    id: String,
+    #[serde(default)]
+    useful: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    search_query: String,
+    #[serde(default)]
+    rationale: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReflectSemanticFreshnessContext {
+    public_development: Vec<f32>,
+    private_work: Vec<f32>,
+    dimension: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReflectSemanticFreshnessScore {
+    similarity: f32,
+    margin: f32,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -421,6 +545,22 @@ struct ReflectFollowupSearchInFlightGuard;
 impl Drop for ReflectFollowupSearchInFlightGuard {
     fn drop(&mut self) {
         REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+struct ReflectFollowupSummaryInFlightGuard;
+
+impl Drop for ReflectFollowupSummaryInFlightGuard {
+    fn drop(&mut self) {
+        REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+struct ReflectFollowupCoordinatorInFlightGuard;
+
+impl Drop for ReflectFollowupCoordinatorInFlightGuard {
+    fn drop(&mut self) {
+        REFLECT_FOLLOWUP_COORDINATOR_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
 
@@ -791,10 +931,284 @@ fn reflect_followup_search_is_due(
         .unwrap_or(true)
 }
 
+fn reflect_followup_summary_is_due(entry: &ReflectFollowupSearchEntry) -> bool {
+    if entry.results.is_empty() {
+        return false;
+    }
+    if entry
+        .error
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
+    let has_summary = entry
+        .summary
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_summary_error = entry
+        .summary_error
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    !has_summary && !has_summary_error
+}
+
+fn reflect_followup_latest_summary_fields(
+    entry: Option<&ReflectFollowupSearchEntry>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(entry) = entry else {
+        return (None, None, None);
+    };
+    let summary = entry
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let generated_at = entry
+        .summary_generated_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let error = entry
+        .summary_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    (summary, generated_at, error)
+}
+
+async fn load_reflect_followup_feedback(storage: &Storage) -> ReflectFollowupFeedbackStore {
+    storage
+        .get(REFLECT_FOLLOWUP_FEEDBACK_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<ReflectFollowupFeedbackStore>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+async fn save_reflect_followup_feedback(storage: &Storage, store: &ReflectFollowupFeedbackStore) {
+    if let Ok(bytes) = serde_json::to_vec(store) {
+        if let Err(error) = storage.set(REFLECT_FOLLOWUP_FEEDBACK_KEY, &bytes).await {
+            tracing::debug!(target: "arkreflect", error = %error, "failed to save followup feedback");
+        }
+    }
+}
+
+fn reflect_followup_feedback_weight(feedback: Option<&ReflectFollowupFeedbackState>) -> f64 {
+    let Some(feedback) = feedback else {
+        return 0.0;
+    };
+    let mut weight = feedback.useful_count as f64 * 9.0
+        - feedback.dismiss_count as f64 * 16.0
+        - feedback.snooze_count as f64 * 5.0;
+    if feedback.dismiss_count >= 2 {
+        weight -= 32.0;
+    }
+    if feedback.dismiss_count >= 1 && feedback.snooze_count >= 2 {
+        weight -= 48.0;
+    }
+    weight
+}
+
+fn reflect_followup_feedback_keys<'a>(
+    id: &'a str,
+    source_unit_id: Option<&'a str>,
+    conversation_id: Option<&'a str>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in [
+        Some(format!("followup:{}", id)),
+        source_unit_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("unit:{}", value.trim())),
+        conversation_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("conversation:{}", value.trim())),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn reflect_followup_effective_feedback(
+    keys: &[String],
+    store: &ReflectFollowupFeedbackStore,
+) -> Option<ReflectFollowupFeedbackState> {
+    let mut merged = ReflectFollowupFeedbackState::default();
+    let mut seen = false;
+    for key in keys {
+        let Some(feedback) = store.entries.get(key) else {
+            continue;
+        };
+        seen = true;
+        merged.useful_count = merged.useful_count.saturating_add(feedback.useful_count);
+        merged.dismiss_count = merged.dismiss_count.saturating_add(feedback.dismiss_count);
+        merged.snooze_count = merged.snooze_count.saturating_add(feedback.snooze_count);
+        if feedback
+            .last_at
+            .as_deref()
+            .zip(merged.last_at.as_deref())
+            .map(|(candidate, current)| candidate > current)
+            .unwrap_or(merged.last_at.is_none())
+        {
+            merged.last_action = feedback.last_action.clone();
+            merged.last_at = feedback.last_at.clone();
+        }
+        let candidate_snooze = feedback.snoozed_until.as_deref();
+        let current_snooze = merged.snoozed_until.as_deref();
+        if candidate_snooze
+            .zip(current_snooze)
+            .map(|(candidate, current)| candidate > current)
+            .unwrap_or(current_snooze.is_none() && candidate_snooze.is_some())
+        {
+            merged.snoozed_until = feedback.snoozed_until.clone();
+        }
+        if merged.semantic_vector.is_none() {
+            merged.semantic_vector = feedback.semantic_vector.clone();
+        }
+    }
+    seen.then_some(merged)
+}
+
+fn reflect_followup_semantic_feedback(
+    vector: Option<&[f32]>,
+    store: &ReflectFollowupFeedbackStore,
+) -> Option<ReflectFollowupFeedbackState> {
+    let vector = vector?;
+    let mut merged = ReflectFollowupFeedbackState::default();
+    let mut seen = false;
+    for feedback in store.entries.values() {
+        let Some(stored_vector) = feedback.semantic_vector.as_deref() else {
+            continue;
+        };
+        if stored_vector.len() != vector.len()
+            || cosine_distance(vector, stored_vector) > REFLECT_FEEDBACK_SEMANTIC_MAX_DISTANCE
+        {
+            continue;
+        }
+        seen = true;
+        merged.useful_count = merged.useful_count.saturating_add(feedback.useful_count);
+        merged.dismiss_count = merged.dismiss_count.saturating_add(feedback.dismiss_count);
+        merged.snooze_count = merged.snooze_count.saturating_add(feedback.snooze_count);
+        if feedback
+            .last_at
+            .as_deref()
+            .zip(merged.last_at.as_deref())
+            .map(|(candidate, current)| candidate > current)
+            .unwrap_or(merged.last_at.is_none())
+        {
+            merged.last_action = feedback.last_action.clone();
+            merged.last_at = feedback.last_at.clone();
+        }
+        let candidate_snooze = feedback.snoozed_until.as_deref();
+        let current_snooze = merged.snoozed_until.as_deref();
+        if candidate_snooze
+            .zip(current_snooze)
+            .map(|(candidate, current)| candidate > current)
+            .unwrap_or(current_snooze.is_none() && candidate_snooze.is_some())
+        {
+            merged.snoozed_until = feedback.snoozed_until.clone();
+        }
+    }
+    seen.then_some(merged)
+}
+
+fn reflect_feedback_for_response(
+    feedback: Option<ReflectFollowupFeedbackState>,
+) -> Option<ReflectFollowupFeedbackState> {
+    feedback.map(|mut state| {
+        state.semantic_vector = None;
+        state
+    })
+}
+
+fn reflect_followup_refresh_feedback_for_new_evidence(
+    feedback: Option<ReflectFollowupFeedbackState>,
+    occurred_at: &str,
+) -> Option<ReflectFollowupFeedbackState> {
+    feedback.map(|mut state| {
+        let renewed = state
+            .last_at
+            .as_deref()
+            .and_then(parse_time)
+            .zip(parse_time(occurred_at))
+            .is_some_and(|(last_feedback, evidence_at)| evidence_at > last_feedback);
+        if renewed {
+            state.renewed_after_feedback = true;
+            state.snoozed_until = None;
+        }
+        state
+    })
+}
+
+fn reflect_register_followup_feedback_vectors(
+    store: &mut ReflectFollowupFeedbackStore,
+    candidates: &[ReflectSuggestedFollowup],
+) -> bool {
+    let mut changed = false;
+    for candidate in candidates {
+        let Some(vector) = candidate.feedback_vector.as_ref() else {
+            continue;
+        };
+        for key in &candidate.feedback_keys {
+            let entry = store.entries.entry(key.clone()).or_default();
+            let needs_update = entry
+                .semantic_vector
+                .as_ref()
+                .map(|existing| existing.len() != vector.len())
+                .unwrap_or(true);
+            if needs_update {
+                entry.semantic_vector = Some(vector.clone());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn reflect_followup_is_snoozed(
+    feedback: Option<&ReflectFollowupFeedbackState>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if feedback.is_some_and(|state| state.renewed_after_feedback) {
+        return false;
+    }
+    feedback
+        .and_then(|state| state.snoozed_until.as_deref())
+        .and_then(parse_time)
+        .is_some_and(|until| until > now)
+}
+
+fn reflect_followup_is_dismissed(feedback: Option<&ReflectFollowupFeedbackState>) -> bool {
+    feedback.is_some_and(|state| state.dismiss_count > 0 && !state.renewed_after_feedback)
+}
+
 fn reflect_followup_latest_detail(cache: &ReflectFollowupSearchCache, source_id: &str) -> String {
     let Some(entry) = reflect_search_cache_entry(cache, source_id) else {
-        return "A daily latest check will run when AgentArk is idle.".to_string();
+        return "A current-source check will run when AgentArk is idle.".to_string();
     };
+    if entry
+        .summary
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return format!(
+            "Last checked {} via {}. Generated a source-backed insight from {} result{}.",
+            format_uiish_time(&entry.checked_at),
+            entry.backend.as_deref().unwrap_or("search"),
+            entry.results.len(),
+            if entry.results.len() == 1 { "" } else { "s" },
+        );
+    }
     if let Some(result) = entry.results.first() {
         let checked = format_uiish_time(&entry.checked_at);
         return format!(
@@ -812,11 +1226,11 @@ fn reflect_followup_latest_detail(cache: &ReflectFollowupSearchCache, source_id:
         .filter(|value| !value.trim().is_empty())
     {
         return format!(
-            "Latest check last failed: {}",
+            "Current-source check last failed: {}",
             reflect_sentence_fragment(error, REFLECT_SUGGESTION_TEXT_CHARS),
         );
     }
-    "Latest check ran but returned no results.".to_string()
+    "Current-source check ran but returned no results.".to_string()
 }
 
 fn reflect_followup_latest_status(
@@ -882,7 +1296,22 @@ fn reflect_failure_suggestion(
         conversation_id: run.conversation_id.clone(),
         source_unit_id: None,
         rank_score: 100.0 + reflect_recency_score(&run.updated_at, now),
+        search_results: Vec::new(),
+        search_checked_at: None,
+        search_error: None,
+        latest_summary: None,
+        latest_summary_generated_at: None,
+        latest_summary_error: None,
+        feedback: None,
+        feedback_keys: reflect_followup_feedback_keys(
+            &format!("reflect-recovery-{}", run.id),
+            None,
+            run.conversation_id.as_deref(),
+        ),
+        feedback_vector: None,
         search_query: None,
+        search_planning_context: None,
+        search_requires_planning: false,
     }
 }
 
@@ -901,8 +1330,29 @@ fn reflect_latest_suggestion(
             .collect::<String>()
     );
     let has_fresh_cache = !reflect_followup_search_is_due(cache, &source_id, now);
+    let cache_entry = reflect_search_cache_entry(cache, &source_id);
+    let search_results = cache_entry
+        .map(|entry| entry.results.clone())
+        .unwrap_or_default();
+    let search_checked_at = cache_entry.and_then(|entry| {
+        if entry.checked_at.trim().is_empty() {
+            None
+        } else {
+            Some(entry.checked_at.clone())
+        }
+    });
+    let search_error = cache_entry.and_then(|entry| {
+        entry
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    let (latest_summary, latest_summary_generated_at, latest_summary_error) =
+        reflect_followup_latest_summary_fields(cache_entry);
     let title = if topic_preview.is_empty() {
-        "Open research thread — what changed?".to_string()
+        "Open research thread - what changed?".to_string()
     } else {
         topic_preview.clone()
     };
@@ -911,17 +1361,267 @@ fn reflect_latest_suggestion(
         kind: "latest_developments".to_string(),
         title,
         detail: reflect_followup_latest_detail(cache, &source_id),
-        prompt: format!("What's the latest on: {}", topic_preview),
+        prompt: format!(
+            "Use the reflected context and current sources to produce a useful next insight for: {}",
+            topic_preview
+        ),
         status: reflect_followup_latest_status(cache, &source_id, now),
-        source_label: "Latest developments".to_string(),
+        source_label: "Source insight".to_string(),
         occurred_at: run.updated_at.clone(),
         conversation_id: run.conversation_id.clone(),
         source_unit_id: None,
         rank_score: 82.0
             + reflect_recency_score(&run.updated_at, now)
             + if has_fresh_cache { 8.0 } else { 0.0 },
+        search_results,
+        search_checked_at,
+        search_error,
+        latest_summary,
+        latest_summary_generated_at,
+        latest_summary_error,
+        feedback: None,
+        feedback_keys: reflect_followup_feedback_keys(
+            &source_id,
+            None,
+            run.conversation_id.as_deref(),
+        ),
+        feedback_vector: None,
         search_query: Some(topic_preview),
+        search_planning_context: None,
+        search_requires_planning: false,
     }
+}
+
+async fn build_reflect_semantic_freshness_context(
+    embedder: Option<&EmbeddingClient>,
+) -> Option<ReflectSemanticFreshnessContext> {
+    let embedder = embedder?;
+    let texts = vec![
+        REFLECT_PUBLIC_DEVELOPMENT_CONCEPT_TEXT.to_string(),
+        REFLECT_PRIVATE_WORK_CONCEPT_TEXT.to_string(),
+    ];
+    let embeddings = match tokio::time::timeout(
+        REFLECT_SEMANTIC_FRESHNESS_TIMEOUT,
+        embedder.embed_texts(&texts),
+    )
+    .await
+    {
+        Ok(Ok(embeddings)) => embeddings,
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "semantic freshness concept embedding failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(target: "arkreflect", "semantic freshness concept embedding timed out");
+            return None;
+        }
+    };
+    if embeddings.len() != texts.len() {
+        return None;
+    }
+    let dimension = embeddings
+        .first()
+        .map(|embedding| embedding.as_slice().len())
+        .filter(|dimension| *dimension > 0)?;
+    let public_development = normalized_vector(&embeddings[0], dimension)?;
+    let private_work = normalized_vector(&embeddings[1], dimension)?;
+    if public_development.len() != private_work.len() {
+        return None;
+    }
+    Some(ReflectSemanticFreshnessContext {
+        public_development,
+        private_work,
+        dimension,
+    })
+}
+
+fn reflect_semantic_freshness_score(
+    embedding: &PgVector,
+    context: &ReflectSemanticFreshnessContext,
+) -> Option<ReflectSemanticFreshnessScore> {
+    let vector = normalized_vector(embedding, context.dimension)?;
+    let public_similarity = 1.0 - cosine_distance(&vector, &context.public_development);
+    let private_similarity = 1.0 - cosine_distance(&vector, &context.private_work);
+    Some(ReflectSemanticFreshnessScore {
+        similarity: public_similarity,
+        margin: public_similarity - private_similarity,
+    })
+}
+
+fn reflect_semantic_freshness_is_actionable(score: ReflectSemanticFreshnessScore) -> bool {
+    score.similarity >= REFLECT_SEMANTIC_FRESHNESS_MIN_SIMILARITY
+        && score.margin >= REFLECT_SEMANTIC_FRESHNESS_MIN_MARGIN
+}
+
+fn reflect_cluster_latest_topic(cluster: &ReflectClusterResponse) -> String {
+    let mut seen = HashSet::<String>::new();
+    let mut parts = Vec::new();
+    let usable_units = cluster
+        .units
+        .iter()
+        .filter(|unit| !matches!(unit.source_kind.as_str(), "llm_usage"))
+        .take(3)
+        .collect::<Vec<_>>();
+    if usable_units.is_empty() {
+        return String::new();
+    }
+    let use_cluster_label = cluster
+        .units
+        .iter()
+        .all(|unit| !matches!(unit.source_kind.as_str(), "llm_usage"));
+    let values = use_cluster_label
+        .then_some(cluster.label.as_str())
+        .into_iter()
+        .chain(usable_units.iter().flat_map(|unit| {
+            [
+                unit.title.as_str(),
+                unit.summary.as_str(),
+                unit.content_preview.as_str(),
+            ]
+        }));
+    for value in values {
+        let part = reflect_sentence_fragment(value, 96);
+        if part.is_empty() || !seen.insert(part.clone()) {
+            continue;
+        }
+        parts.push(part);
+    }
+    reflect_sentence_fragment(&parts.join(". "), REFLECT_SUGGESTION_TEXT_CHARS)
+}
+
+fn reflect_cluster_external_planning_context(cluster: &ReflectClusterResponse) -> String {
+    let mut seen = HashSet::<String>::new();
+    let mut parts = Vec::new();
+    for unit in cluster
+        .units
+        .iter()
+        .filter(|unit| !matches!(unit.source_kind.as_str(), "llm_usage"))
+        .take(5)
+    {
+        let mut unit_parts = vec![
+            format!("source_kind: {}", unit.source_kind),
+            format!("source_label: {}", unit.source_label),
+        ];
+        for (label, value) in [
+            ("title", unit.title.as_str()),
+            ("summary", unit.summary.as_str()),
+            ("preview", unit.content_preview.as_str()),
+        ] {
+            let fragment = reflect_sentence_fragment(value, 260);
+            if fragment.is_empty() || !seen.insert(format!("{}:{}", label, fragment)) {
+                continue;
+            }
+            unit_parts.push(format!("{}: {}", label, fragment));
+        }
+        if let Some(kind) = unit.metadata.get("kind").and_then(|value| value.as_str()) {
+            unit_parts.push(format!("memory_kind: {}", kind));
+        }
+        parts.push(unit_parts.join("\n"));
+    }
+    if parts.is_empty() {
+        return reflect_cluster_latest_topic(cluster);
+    }
+    truncate_chars(&parts.join("\n\n"), 1400)
+}
+
+fn reflect_semantic_cluster_latest_suggestion(
+    cluster: &ReflectClusterResponse,
+    cache: &ReflectFollowupSearchCache,
+    now: chrono::DateTime<chrono::Utc>,
+    score: ReflectSemanticFreshnessScore,
+) -> Option<ReflectSuggestedFollowup> {
+    if !reflect_semantic_freshness_is_actionable(score) {
+        return None;
+    }
+    let unit = cluster.units.first()?;
+    let topic = reflect_cluster_latest_topic(cluster);
+    if topic.trim().is_empty() {
+        return None;
+    }
+    let planning_context = reflect_cluster_external_planning_context(cluster);
+    let source_id = format!(
+        "latest:semantic:{}",
+        stable_hash(&format!("{}:{}", cluster.representative_unit_id, topic))
+            .chars()
+            .take(24)
+            .collect::<String>()
+    );
+    let cache_entry = reflect_search_cache_entry(cache, &source_id);
+    let has_fresh_cache = !reflect_followup_search_is_due(cache, &source_id, now);
+    let search_results = cache_entry
+        .map(|entry| entry.results.clone())
+        .unwrap_or_default();
+    let search_checked_at = cache_entry.and_then(|entry| {
+        if entry.checked_at.trim().is_empty() {
+            None
+        } else {
+            Some(entry.checked_at.clone())
+        }
+    });
+    let search_error = cache_entry.and_then(|entry| {
+        entry
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+    let (latest_summary, latest_summary_generated_at, latest_summary_error) =
+        reflect_followup_latest_summary_fields(cache_entry);
+    let planned_search_query = cache_entry
+        .map(|entry| entry.query.trim().to_string())
+        .filter(|query| !query.is_empty())
+        .unwrap_or_else(|| topic.clone());
+    let detail = if cache_entry.is_some() {
+        reflect_followup_latest_detail(cache, &source_id)
+    } else {
+        "ArkReflect inferred that this reflected topic may benefit from current external sources. A source check will run when AgentArk is idle.".to_string()
+    };
+    let conversation_id = unit
+        .metadata
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Some(ReflectSuggestedFollowup {
+        id: source_id.clone(),
+        kind: "latest_developments".to_string(),
+        title: topic.clone(),
+        detail,
+        prompt: format!(
+            "Use current source evidence for this reflected topic, then summarize the useful insight and the next practical step: {}",
+            topic
+        ),
+        status: reflect_followup_latest_status(cache, &source_id, now),
+        source_label: "Source insight".to_string(),
+        occurred_at: unit.occurred_at.clone(),
+        conversation_id: conversation_id.clone(),
+        source_unit_id: Some(unit.id.clone()),
+        rank_score: 76.0
+            + reflect_recency_score(&unit.occurred_at, now)
+            + cluster.unit_count.min(6) as f64
+            + (score.similarity.max(0.0) as f64 * 12.0)
+            + (score.margin.max(0.0) as f64 * 24.0)
+            + if has_fresh_cache { 8.0 } else { 0.0 },
+        search_results,
+        search_checked_at,
+        search_error,
+        latest_summary,
+        latest_summary_generated_at,
+        latest_summary_error,
+        feedback: None,
+        feedback_keys: reflect_followup_feedback_keys(
+            &source_id,
+            Some(&unit.id),
+            conversation_id.as_deref(),
+        ),
+        feedback_vector: cluster
+            .centroid_embedding
+            .as_ref()
+            .map(|embedding| embedding.as_slice().to_vec()),
+        search_query: Some(planned_search_query),
+        search_planning_context: Some(planning_context),
+        search_requires_planning: true,
+    })
 }
 
 fn reflect_cluster_dominant_source(cluster: &ReflectClusterResponse) -> &'static str {
@@ -971,14 +1671,9 @@ fn reflect_source_label_for_kind(kind: &str) -> &'static str {
 
 fn reflect_cluster_action_verb(kind: &str) -> &'static str {
     match kind {
-        "conversation" | "orbit_chat" => "Pick up",
-        "experience_item" | "procedural_pattern" => "Apply",
-        "watcher" | "sentinel" | "arkpulse" => "Investigate",
-        "app" => "Continue building",
-        "goal" => "Push forward on",
-        "arkevolve" => "Review",
         "llm_usage" => "Audit",
-        _ => "Continue",
+        "watcher" | "sentinel" | "arkpulse" | "arkevolve" => "Review",
+        _ => "Review",
     }
 }
 
@@ -1004,7 +1699,7 @@ fn reflect_cluster_source_mix_phrase(cluster: &ReflectClusterResponse) -> String
             }
         })
         .collect();
-    parts.join(" · ")
+    parts.join(" / ")
 }
 
 fn reflect_cluster_followup(
@@ -1023,7 +1718,7 @@ fn reflect_cluster_followup(
 
     let recurrence = if cluster.related_history.mode == "recurring" {
         format!(
-            " Pattern repeats — {} prior similar entr{} in your history.",
+            " Pattern repeats - {} prior similar entr{} in your history.",
             cluster.related_history.similar_count,
             if cluster.related_history.similar_count == 1 {
                 "y"
@@ -1044,20 +1739,25 @@ fn reflect_cluster_followup(
     };
     let detail = format!("{}{}", detail_lead, recurrence);
 
+    let source_id = format!("reflect-continue-{}", cluster.id);
+    let conversation_id = unit
+        .metadata
+        .get("conversation_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
     Some(ReflectSuggestedFollowup {
-        id: format!("reflect-continue-{}", cluster.id),
+        id: source_id.clone(),
         kind: "continue_theme".to_string(),
         title: label.clone(),
         detail,
-        prompt: format!("{} this thread: {}", action_verb, label),
+        prompt: format!(
+            "{} this reflected thread and ask what concrete action should happen next: {}",
+            action_verb, label
+        ),
         status: "ready".to_string(),
         source_label: source_label.to_string(),
         occurred_at: unit.occurred_at.clone(),
-        conversation_id: unit
-            .metadata
-            .get("conversation_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
+        conversation_id: conversation_id.clone(),
         source_unit_id: Some(unit.id.clone()),
         rank_score: 44.0
             + reflect_recency_score(&unit.occurred_at, now)
@@ -1067,7 +1767,25 @@ fn reflect_cluster_followup(
             } else {
                 0.0
             },
+        search_results: Vec::new(),
+        search_checked_at: None,
+        search_error: None,
+        latest_summary: None,
+        latest_summary_generated_at: None,
+        latest_summary_error: None,
+        feedback: None,
+        feedback_keys: reflect_followup_feedback_keys(
+            &source_id,
+            Some(&unit.id),
+            conversation_id.as_deref(),
+        ),
+        feedback_vector: cluster
+            .centroid_embedding
+            .as_ref()
+            .map(|embedding| embedding.as_slice().to_vec()),
         search_query: None,
+        search_planning_context: None,
+        search_requires_planning: false,
     })
 }
 
@@ -1084,22 +1802,24 @@ fn select_top_reflect_followups(
     let mut selected_ids = HashSet::<String>::new();
     let mut kind_counts = BTreeMap::<String, usize>::new();
     for candidate in &candidates {
-        if selected.len() >= REFLECT_MAX_SUGGESTED_FOLLOWUPS {
+        if selected.len() >= REFLECT_MAX_RETURNED_FOLLOWUPS {
             break;
         }
         if selected_ids.contains(&candidate.id) {
             continue;
         }
-        if kind_counts.get(&candidate.kind).copied().unwrap_or(0) >= 2 {
+        if selected.len() < REFLECT_MAX_SUGGESTED_FOLLOWUPS
+            && kind_counts.get(&candidate.kind).copied().unwrap_or(0) >= 4
+        {
             continue;
         }
         selected_ids.insert(candidate.id.clone());
         *kind_counts.entry(candidate.kind.clone()).or_default() += 1;
         selected.push(candidate.clone());
     }
-    if selected.len() < REFLECT_MAX_SUGGESTED_FOLLOWUPS {
+    if selected.len() < REFLECT_MAX_RETURNED_FOLLOWUPS {
         for candidate in candidates {
-            if selected.len() >= REFLECT_MAX_SUGGESTED_FOLLOWUPS {
+            if selected.len() >= REFLECT_MAX_RETURNED_FOLLOWUPS {
                 break;
             }
             if selected_ids.insert(candidate.id.clone()) {
@@ -1128,12 +1848,170 @@ async fn save_reflect_followup_search_cache(storage: &Storage, cache: &ReflectFo
     }
 }
 
+fn extract_reflect_json_value(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let object = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(start, end)| {
+            if end >= start {
+                serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+            } else {
+                None
+            }
+        });
+    if object.is_some() {
+        return object;
+    }
+    trimmed
+        .find('[')
+        .zip(trimmed.rfind(']'))
+        .and_then(|(start, end)| {
+            if end >= start {
+                serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+            } else {
+                None
+            }
+        })
+}
+
+fn parse_reflect_external_pursuit_plans(
+    response: &str,
+) -> BTreeMap<String, ReflectExternalPursuitPlan> {
+    let Some(value) = extract_reflect_json_value(response) else {
+        return BTreeMap::new();
+    };
+    let plans_value = value
+        .get("plans")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    let plans = match plans_value {
+        serde_json::Value::Array(values) => values,
+        other => vec![other],
+    };
+    plans
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<ReflectExternalPursuitPlan>(value).ok())
+        .filter(|plan| !plan.id.trim().is_empty())
+        .map(|mut plan| {
+            plan.id = truncate_chars(plan.id.trim(), 140);
+            plan.title = truncate_chars(plan.title.trim(), 120);
+            plan.search_query = truncate_chars(plan.search_query.trim(), 240);
+            plan.rationale = truncate_chars(plan.rationale.trim(), 220);
+            (plan.id.clone(), plan)
+        })
+        .collect()
+}
+
+async fn plan_reflect_external_pursuits(
+    llm: Option<&LlmClient>,
+    candidates: &[ReflectSuggestedFollowup],
+) -> BTreeMap<String, ReflectExternalPursuitPlan> {
+    let Some(llm) = llm else {
+        return BTreeMap::new();
+    };
+    let planning_items = candidates
+        .iter()
+        .filter(|candidate| candidate.search_requires_planning)
+        .take(REFLECT_FOLLOWUP_PLAN_LIMIT)
+        .map(|candidate| {
+            let reflected_topic = candidate
+                .search_planning_context
+                .as_deref()
+                .or(candidate.search_query.as_deref())
+                .unwrap_or(&candidate.title);
+            serde_json::json!({
+                "id": candidate.id,
+                "reflected_topic": truncate_chars(reflected_topic, 900),
+                "source_label": candidate.source_label,
+                "detail": truncate_chars(&candidate.detail, 260),
+            })
+        })
+        .collect::<Vec<_>>();
+    if planning_items.is_empty() {
+        return BTreeMap::new();
+    }
+    let system_prompt = "You decide whether ArkReflect reflected topics are worth a current public-source check for a human. Work by meaning, not exact words. Do not validate private memories, profile facts, names, or assertions against the web. If a reflected topic implies a useful external-facing pursuit, emit a concise public search query and title that pursue the actual opportunity. Preserve the user's real requested deliverable, named entity, domain, constraints, and evaluation criteria when present. For analytical or research deliverables, target the required data breakouts, forecast inputs, decision drivers, and evidence that separates likely leading signals from merely coincident ones rather than generic news. Remove unrelated private facts and memory keys from the query. If the topic is only an ordinary profile fact, preference, nickname, identity detail, or internal work state with no useful public next step, mark it not useful. Return only JSON.";
+    let user_message = format!(
+        "Plan public-source checks for these reflected topics:\n{}\n\nReturn JSON in this exact shape: {{\"plans\":[{{\"id\":\"same id\",\"useful\":true|false,\"title\":\"short human-facing title when useful\",\"search_query\":\"public web search query when useful\",\"rationale\":\"brief reason\"}}]}}",
+        serde_json::to_string_pretty(&planning_items).unwrap_or_else(|_| "[]".to_string())
+    );
+    match tokio::time::timeout(
+        REFLECT_FOLLOWUP_PLAN_TIMEOUT,
+        llm.chat_with_system_bounded(system_prompt, &user_message, 900),
+    )
+    .await
+    {
+        Ok(Ok(response)) => parse_reflect_external_pursuit_plans(&response.content),
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "external pursuit planning failed");
+            BTreeMap::new()
+        }
+        Err(_) => {
+            tracing::debug!(target: "arkreflect", "external pursuit planning timed out");
+            BTreeMap::new()
+        }
+    }
+}
+
+fn apply_reflect_external_pursuit_plans(
+    candidates: Vec<ReflectSuggestedFollowup>,
+    plans: &BTreeMap<String, ReflectExternalPursuitPlan>,
+) -> Vec<ReflectSuggestedFollowup> {
+    candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            if !candidate.search_requires_planning {
+                return Some(candidate);
+            }
+            let plan = plans.get(&candidate.id)?;
+            if !plan.useful || plan.search_query.trim().is_empty() || plan.title.trim().is_empty()
+            {
+                return None;
+            }
+            let query_changed = candidate
+                .search_query
+                .as_deref()
+                .map(|query| query.trim() != plan.search_query.trim())
+                .unwrap_or(true);
+            candidate.title = plan.title.clone();
+            candidate.search_query = Some(plan.search_query.clone());
+            candidate.prompt = format!(
+                "Use current source evidence to summarize this useful next step: {}",
+                plan.title
+            );
+            candidate.detail = if plan.rationale.trim().is_empty() {
+                "ArkReflect found a reflected topic that can be pursued with current public sources.".to_string()
+            } else {
+                plan.rationale.clone()
+            };
+            if query_changed {
+                candidate.status = "queued".to_string();
+                candidate.search_results.clear();
+                candidate.search_checked_at = None;
+                candidate.search_error = None;
+                candidate.latest_summary = None;
+                candidate.latest_summary_generated_at = None;
+                candidate.latest_summary_error = None;
+            }
+            candidate.rank_score += 12.0;
+            Some(candidate)
+        })
+        .collect()
+}
+
 async fn build_suggested_followups(
     storage: &Storage,
     clusters: &[ReflectClusterResponse],
+    embedder: Option<&EmbeddingClient>,
+    llm: Option<&LlmClient>,
 ) -> Vec<ReflectSuggestedFollowup> {
     let now = chrono::Utc::now();
     let cache = load_reflect_followup_search_cache(storage).await;
+    let mut feedback_store = load_reflect_followup_feedback(storage).await;
     let mut candidates = Vec::new();
     let runs = tokio::time::timeout(
         REFLECT_DB_TIMEOUT,
@@ -1151,11 +2029,91 @@ async fn build_suggested_followups(
             candidates.push(reflect_latest_suggestion(&run, &cache, now));
         }
     }
+    if !clusters.is_empty() {
+        if let Some(context) = build_reflect_semantic_freshness_context(embedder).await {
+            let mut latest_candidates = clusters
+                .iter()
+                .filter_map(|cluster| {
+                    let score = cluster.centroid_embedding.as_ref().and_then(|embedding| {
+                        reflect_semantic_freshness_score(embedding, &context)
+                    })?;
+                    reflect_semantic_cluster_latest_suggestion(cluster, &cache, now, score)
+                })
+                .collect::<Vec<_>>();
+            latest_candidates.sort_by(|a, b| {
+                b.rank_score
+                    .total_cmp(&a.rank_score)
+                    .then_with(|| b.occurred_at.cmp(&a.occurred_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            candidates.extend(latest_candidates);
+        }
+    }
     for cluster in clusters {
         if let Some(suggestion) = reflect_cluster_followup(cluster, now) {
             candidates.push(suggestion);
         }
     }
+    for candidate in &mut candidates {
+        let fallback_keys = reflect_followup_feedback_keys(
+            &candidate.id,
+            candidate.source_unit_id.as_deref(),
+            candidate.conversation_id.as_deref(),
+        );
+        if candidate.feedback_keys.is_empty() {
+            candidate.feedback_keys = fallback_keys;
+        }
+    }
+    let plans = plan_reflect_external_pursuits(llm, &candidates).await;
+    candidates = apply_reflect_external_pursuit_plans(candidates, &plans);
+    if reflect_register_followup_feedback_vectors(&mut feedback_store, &candidates) {
+        feedback_store.updated_at = Some(now.to_rfc3339());
+        save_reflect_followup_feedback(storage, &feedback_store).await;
+    }
+    candidates = candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            let feedback =
+                reflect_followup_effective_feedback(&candidate.feedback_keys, &feedback_store);
+            let semantic_feedback = reflect_followup_semantic_feedback(
+                candidate.feedback_vector.as_deref(),
+                &feedback_store,
+            );
+            let feedback =
+                reflect_followup_refresh_feedback_for_new_evidence(feedback, &candidate.occurred_at);
+            let semantic_feedback = reflect_followup_refresh_feedback_for_new_evidence(
+                semantic_feedback,
+                &candidate.occurred_at,
+            );
+            if reflect_followup_is_dismissed(feedback.as_ref())
+                || reflect_followup_is_dismissed(semantic_feedback.as_ref())
+            {
+                return None;
+            }
+            if reflect_followup_is_snoozed(feedback.as_ref(), now)
+                || reflect_followup_is_snoozed(semantic_feedback.as_ref(), now)
+            {
+                return None;
+            }
+            if !feedback
+                .as_ref()
+                .is_some_and(|state| state.renewed_after_feedback)
+            {
+                candidate.rank_score += reflect_followup_feedback_weight(feedback.as_ref());
+            }
+            if !semantic_feedback
+                .as_ref()
+                .is_some_and(|state| state.renewed_after_feedback)
+            {
+                candidate.rank_score += reflect_followup_feedback_weight(semantic_feedback.as_ref());
+            }
+            if candidate.rank_score < 8.0 {
+                return None;
+            }
+            candidate.feedback = reflect_feedback_for_response(feedback.or(semantic_feedback));
+            Some(candidate)
+        })
+        .collect();
     select_top_reflect_followups(candidates)
 }
 
@@ -1170,13 +2128,38 @@ fn due_latest_followup_searches(
         .filter(|suggestion| suggestion.kind == "latest_developments")
         .filter_map(|suggestion| {
             let query = suggestion.search_query.as_deref()?.trim();
-            if query.is_empty() || !reflect_followup_search_is_due(cache, &suggestion.id, now) {
+            let cached_query_matches = reflect_search_cache_entry(cache, &suggestion.id)
+                .map(|entry| entry.query.trim() == query)
+                .unwrap_or(false);
+            if query.is_empty()
+                || (cached_query_matches
+                    && !reflect_followup_search_is_due(cache, &suggestion.id, now))
+            {
                 return None;
             }
             if !seen.insert(suggestion.id.clone()) {
                 return None;
             }
             Some((suggestion.id.clone(), query.to_string()))
+        })
+        .take(REFLECT_FOLLOWUP_BACKGROUND_SEARCH_LIMIT)
+        .collect()
+}
+
+fn due_latest_followup_summaries(
+    suggestions: &[ReflectSuggestedFollowup],
+    cache: &ReflectFollowupSearchCache,
+) -> Vec<String> {
+    let mut seen = HashSet::<String>::new();
+    suggestions
+        .iter()
+        .filter(|suggestion| suggestion.kind == "latest_developments")
+        .filter_map(|suggestion| {
+            let entry = reflect_search_cache_entry(cache, &suggestion.id)?;
+            if !reflect_followup_summary_is_due(entry) || !seen.insert(suggestion.id.clone()) {
+                return None;
+            }
+            Some(suggestion.id.clone())
         })
         .take(REFLECT_FOLLOWUP_BACKGROUND_SEARCH_LIMIT)
         .collect()
@@ -1199,6 +2182,72 @@ fn prune_reflect_followup_search_cache(cache: &mut ReflectFollowupSearchCache) {
         .map(|(key, _)| key)
         .collect::<HashSet<_>>();
     cache.entries.retain(|key, _| keep.contains(key));
+}
+
+async fn generate_reflect_followup_latest_summary(
+    llm: &LlmClient,
+    query: &str,
+    checked_at: &str,
+    results: &[ReflectFollowupSearchResult],
+) -> (Option<String>, Option<String>) {
+    if results.is_empty() {
+        return (None, None);
+    }
+    let source_context = results
+        .iter()
+        .take(REFLECT_FOLLOWUP_SEARCH_RESULTS_PER_TOPIC)
+        .map(|result| {
+            serde_json::json!({
+                "title": truncate_chars(&result.title, 220),
+                "source": truncate_chars(&result.source, 80),
+                "published_date": result.published_date,
+                "snippet": truncate_chars(&result.snippet, 420),
+                "url": truncate_chars(&result.url, 260),
+            })
+        })
+        .collect::<Vec<_>>();
+    let context = serde_json::json!({
+        "reflected_topic": truncate_chars(query, REFLECT_SUGGESTION_TEXT_CHARS),
+        "checked_at": checked_at,
+        "sources": source_context,
+    });
+    let system_prompt = "You synthesize ArkReflect current-source checks for a personal AI Agent OS. The reflected topic can be any subject inferred from the user's reflected activity and state. Use only the provided topic and source snippets. Do not invent facts, dates, causes, entities, attributes, constraints, or outcomes. Anchor the answer to the actual requested deliverable and constraints in the reflected topic. If the sources are adjacent but do not cover required pieces such as segment data, consensus estimates, assumptions, comparisons, or lead/lag evidence, say what is supported and what still needs better sourcing. If the sources do not establish a useful insight, say that plainly. Write a concise user-facing source-backed insight in 2-4 bullets or one short paragraph. Avoid tables, citations markup, and generic advice.";
+    let user_message = format!(
+        "Structured ArkReflect current-source check:\n{}\n\nWrite the source-backed insight. Make it actionable only to the extent supported by the source evidence.",
+        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string())
+    );
+    match tokio::time::timeout(
+        REFLECT_FOLLOWUP_SUMMARY_TIMEOUT,
+        llm.chat_with_system_bounded(system_prompt, &user_message, 480),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
+            let content = response.content.trim();
+            if content.chars().count() >= 16 {
+                (
+                    Some(truncate_chars(content, REFLECT_FOLLOWUP_SUMMARY_MAX_CHARS)),
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    Some("Latest-development summary was too short to use.".to_string()),
+                )
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(target: "arkreflect", error = %error, "followup latest summary failed");
+            (None, Some(error.to_string()))
+        }
+        Err(_) => {
+            tracing::debug!(target: "arkreflect", "followup latest summary timed out");
+            (
+                None,
+                Some("Latest-development summary timed out.".to_string()),
+            )
+        }
+    }
 }
 
 async fn run_reflect_followup_search_job(
@@ -1240,6 +2289,9 @@ async fn run_reflect_followup_search_job(
                         })
                         .collect(),
                     error: None,
+                    summary: None,
+                    summary_generated_at: None,
+                    summary_error: None,
                 },
                 Err(error) => ReflectFollowupSearchEntry {
                     source_id: source_id.clone(),
@@ -1248,6 +2300,9 @@ async fn run_reflect_followup_search_job(
                     backend: None,
                     results: Vec::new(),
                     error: Some(error.to_string()),
+                    summary: None,
+                    summary_generated_at: None,
+                    summary_error: None,
                 },
             };
         cache.updated_at = Some(chrono::Utc::now().to_rfc3339());
@@ -1259,32 +2314,155 @@ async fn run_reflect_followup_search_job(
     Ok(completed)
 }
 
-async fn maybe_spawn_reflect_followup_search(
-    state: AppState,
-    suggestions: Vec<ReflectSuggestedFollowup>,
+async fn run_reflect_followup_summary_job(
+    storage: Storage,
+    llm: LlmClient,
+    source_ids: Vec<String>,
+) -> std::result::Result<usize, String> {
+    if source_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut completed = 0usize;
+    for source_id in source_ids {
+        let cache = load_reflect_followup_search_cache(&storage).await;
+        let Some(entry) = cache.entries.get(&source_id).cloned() else {
+            continue;
+        };
+        if !reflect_followup_summary_is_due(&entry) {
+            continue;
+        }
+        let (summary, summary_error) = generate_reflect_followup_latest_summary(
+            &llm,
+            &entry.query,
+            &entry.checked_at,
+            &entry.results,
+        )
+        .await;
+        let mut cache = load_reflect_followup_search_cache(&storage).await;
+        if let Some(current) = cache.entries.get_mut(&source_id) {
+            if current.checked_at == entry.checked_at && reflect_followup_summary_is_due(current) {
+                current.summary = summary;
+                current.summary_generated_at = current
+                    .summary
+                    .as_ref()
+                    .map(|_| chrono::Utc::now().to_rfc3339());
+                current.summary_error = summary_error;
+                cache.updated_at = Some(chrono::Utc::now().to_rfc3339());
+                save_reflect_followup_search_cache(&storage, &cache).await;
+                completed += 1;
+            }
+        }
+    }
+    Ok(completed)
+}
+
+async fn spawn_reflect_followup_summary_worker(
+    storage: Storage,
+    llm: LlmClient,
+    source_ids: Vec<String>,
     trigger: &'static str,
 ) -> bool {
-    if suggestions.is_empty()
-        || REFLECT_REFRESH_IN_FLIGHT.load(Ordering::Acquire)
-        || !reflect_server_is_idle(&state).await
+    if source_ids.is_empty()
+        || REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     {
         return false;
     }
-    let (storage, config_dir) = {
-        let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.config_dir.clone())
+    let lease_owner = format!(
+        "arkreflect-followup-summary:{}:{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let lease_guard = match tokio::time::timeout(
+        REFLECT_DB_TIMEOUT,
+        storage.acquire_kv_lease_guard(
+            REFLECT_FOLLOWUP_SUMMARY_LEASE_KEY,
+            &lease_owner,
+            REFLECT_FOLLOWUP_SUMMARY_LEASE_TTL_SECS,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(guard))) => guard,
+        Ok(Ok(None)) => {
+            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
+            return false;
+        }
+        Ok(Err(error)) => {
+            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
+            tracing::debug!(target: "arkreflect", error = %error, "failed to acquire followup summary lease");
+            return false;
+        }
+        Err(_) => {
+            REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.store(false, Ordering::Release);
+            tracing::debug!(target: "arkreflect", "followup summary lease timed out");
+            return false;
+        }
     };
-    let cache = load_reflect_followup_search_cache(&storage).await;
-    let searches = due_latest_followup_searches(&suggestions, &cache, chrono::Utc::now());
-    if searches.is_empty() {
-        return false;
-    }
-    if REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+    crate::spawn_logged!(
+        "src/channels/http/reflect_control.rs:followup_summary",
+        async move {
+            let _guard = ReflectFollowupSummaryInFlightGuard;
+            let result = tokio::time::timeout(
+                REFLECT_FOLLOWUP_SUMMARY_JOB_TIMEOUT,
+                run_reflect_followup_summary_job(storage.clone(), llm, source_ids),
+            )
+            .await;
+            match result {
+                Ok(Ok(count)) => {
+                    tracing::debug!(
+                        target: "arkreflect",
+                        trigger,
+                        count,
+                        "followup latest-summary background pass completed"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        target: "arkreflect",
+                        trigger,
+                        error = %error,
+                        "followup latest-summary background pass failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        target: "arkreflect",
+                        trigger,
+                        "followup latest-summary background pass timed out"
+                    );
+                }
+            }
+            if let Err(error) = storage
+                .release_kv_lease_guard(REFLECT_FOLLOWUP_SUMMARY_LEASE_KEY, &lease_guard)
+                .await
+            {
+                tracing::debug!(target: "arkreflect", error = %error, "failed to release followup summary lease");
+            }
+        }
+    );
+    true
+}
+
+async fn spawn_reflect_followup_search_worker(
+    storage: Storage,
+    config_dir: std::path::PathBuf,
+    llm: LlmClient,
+    searches: Vec<(String, String)>,
+    trigger: &'static str,
+) -> bool {
+    if searches.is_empty()
+        || REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     {
         return false;
     }
+    let source_ids = searches
+        .iter()
+        .map(|(source_id, _)| source_id.clone())
+        .collect::<Vec<_>>();
     let lease_owner = format!(
         "arkreflect-followup:{}:{}",
         std::process::id(),
@@ -1333,6 +2511,13 @@ async fn maybe_spawn_reflect_followup_search(
                         count,
                         "followup latest-search background pass completed"
                     );
+                    let _ = spawn_reflect_followup_summary_worker(
+                        storage.clone(),
+                        llm,
+                        source_ids,
+                        trigger,
+                    )
+                    .await;
                 }
                 Ok(Err(error)) => {
                     tracing::debug!(
@@ -1361,6 +2546,56 @@ async fn maybe_spawn_reflect_followup_search(
     true
 }
 
+async fn maybe_spawn_reflect_followup_search(
+    state: AppState,
+    suggestions: Vec<ReflectSuggestedFollowup>,
+    trigger: &'static str,
+) -> bool {
+    if suggestions.is_empty() || REFLECT_REFRESH_IN_FLIGHT.load(Ordering::Acquire) {
+        return false;
+    }
+    if REFLECT_FOLLOWUP_COORDINATOR_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    crate::spawn_logged!(
+        "src/channels/http/reflect_control.rs:followup_coordinator",
+        async move {
+            let _guard = ReflectFollowupCoordinatorInFlightGuard;
+            if !reflect_server_is_idle(&state).await {
+                return;
+            }
+            let (storage, config_dir, llm) = {
+                let agent = state.agent.read().await;
+                (
+                    agent.storage.clone(),
+                    agent.config_dir.clone(),
+                    agent.llm.clone(),
+                )
+            };
+            let cache = load_reflect_followup_search_cache(&storage).await;
+            let searches = due_latest_followup_searches(&suggestions, &cache, chrono::Utc::now());
+            let summaries = due_latest_followup_summaries(&suggestions, &cache);
+            if searches.is_empty() && summaries.is_empty() {
+                return;
+            }
+            let _ = spawn_reflect_followup_summary_worker(
+                storage.clone(),
+                llm.clone(),
+                summaries,
+                trigger,
+            )
+            .await;
+            let _ =
+                spawn_reflect_followup_search_worker(storage, config_dir, llm, searches, trigger)
+                    .await;
+        }
+    );
+    true
+}
+
 async fn maybe_spawn_reflect_followup_search_from_recent_activity(
     state: AppState,
     trigger: &'static str,
@@ -1368,11 +2603,16 @@ async fn maybe_spawn_reflect_followup_search_from_recent_activity(
     if !reflect_server_is_idle(&state).await {
         return false;
     }
-    let storage = {
+    let (storage, embedding_client, llm) = {
         let agent = state.agent.read().await;
-        agent.storage.clone()
+        (
+            agent.storage.clone(),
+            agent.embedding_client.clone(),
+            agent.llm.clone(),
+        )
     };
-    let suggestions = build_suggested_followups(&storage, &[]).await;
+    let suggestions =
+        build_suggested_followups(&storage, &[], embedding_client.as_deref(), Some(&llm)).await;
     maybe_spawn_reflect_followup_search(state, suggestions, trigger).await
 }
 
@@ -3377,6 +4617,7 @@ async fn enrich_clusters_with_related_history(
 async fn reflect_server_is_idle(state: &AppState) -> bool {
     if REFLECT_REFRESH_IN_FLIGHT.load(Ordering::Acquire)
         || REFLECT_FOLLOWUP_SEARCH_IN_FLIGHT.load(Ordering::Acquire)
+        || REFLECT_FOLLOWUP_SUMMARY_IN_FLIGHT.load(Ordering::Acquire)
     {
         return false;
     }
@@ -4191,9 +5432,14 @@ pub(super) async fn ark_reflect_endpoint(
     let from_s = request.from.to_rfc3339();
     let to_s = request.to.to_rfc3339();
 
-    let (storage, profile_arc) = {
+    let (storage, profile_arc, embedding_client, llm) = {
         let agent = state.agent.read().await;
-        (agent.storage.clone(), agent.user_profile.clone())
+        (
+            agent.storage.clone(),
+            agent.user_profile.clone(),
+            agent.embedding_client.clone(),
+            agent.llm.clone(),
+        )
     };
     let profile = profile_arc.read().await.clone();
     let tz = reflect_timezone_from_profile(&profile);
@@ -4246,7 +5492,9 @@ pub(super) async fn ark_reflect_endpoint(
     {
         tracing::debug!(target: "arkreflect", "related history enrichment timed out");
     }
-    let suggested_followups = build_suggested_followups(&storage, &clusters).await;
+    let suggested_followups =
+        build_suggested_followups(&storage, &clusters, embedding_client.as_deref(), Some(&llm))
+            .await;
     let _ = maybe_spawn_reflect_followup_search(state.clone(), suggested_followups.clone(), "page")
         .await;
     (
@@ -4287,6 +5535,65 @@ pub(super) async fn ark_reflect_refresh_endpoint(
     (status, Json(result)).into_response()
 }
 
+pub(super) async fn ark_reflect_followup_feedback_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ReflectFollowupFeedbackRequest>,
+) -> Response {
+    let action = payload.action;
+    let storage = {
+        let agent = state.agent.read().await;
+        agent.storage.clone()
+    };
+    let mut store = load_reflect_followup_feedback(&storage).await;
+    let now = chrono::Utc::now();
+    let mut keys = payload
+        .keys
+        .into_iter()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    let direct_key = format!("followup:{}", id);
+    if !keys.contains(&direct_key) {
+        keys.push(direct_key);
+    }
+    for key in &keys {
+        let entry = store.entries.entry(key.clone()).or_default();
+        match action {
+            ReflectFollowupFeedbackAction::Useful => {
+                entry.useful_count = entry.useful_count.saturating_add(1);
+                entry.snoozed_until = None;
+            }
+            ReflectFollowupFeedbackAction::Dismiss => {
+                entry.dismiss_count = entry.dismiss_count.saturating_add(1);
+                entry.snoozed_until = None;
+            }
+            ReflectFollowupFeedbackAction::Snooze => {
+                entry.snooze_count = entry.snooze_count.saturating_add(1);
+                let days = if entry.snooze_count >= 2 { 30 } else { 7 };
+                entry.snoozed_until = Some((now + chrono::Duration::days(days)).to_rfc3339());
+            }
+        }
+        entry.renewed_after_feedback = false;
+        entry.last_action = Some(action.as_str().to_string());
+        entry.last_at = Some(now.to_rfc3339());
+    }
+    let response_entry =
+        reflect_feedback_for_response(reflect_followup_effective_feedback(&keys, &store))
+            .unwrap_or_default();
+    store.updated_at = Some(now.to_rfc3339());
+    save_reflect_followup_feedback(&storage, &store).await;
+    (
+        StatusCode::OK,
+        Json(ReflectFollowupFeedbackResponse {
+            status: "ok".to_string(),
+            id,
+            feedback: response_entry,
+        }),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4296,11 +5603,24 @@ mod tests {
     }
 
     fn unit(id: &str, title: &str, values: &[f32]) -> semantic_work_unit::Model {
+        unit_with_source_kind(id, "conversation", title, values)
+    }
+
+    fn unit_with_source_kind(
+        id: &str,
+        source_kind: &str,
+        title: &str,
+        values: &[f32],
+    ) -> semantic_work_unit::Model {
         semantic_work_unit::Model {
             id: id.to_string(),
-            source_kind: "conversation".to_string(),
+            source_kind: source_kind.to_string(),
             source_id: id.to_string(),
-            conversation_id: Some(id.to_string()),
+            conversation_id: if source_kind == "conversation" {
+                Some(id.to_string())
+            } else {
+                None
+            },
             project_id: None,
             channel: "web".to_string(),
             title: title.to_string(),
@@ -4331,7 +5651,54 @@ mod tests {
             conversation_id: None,
             source_unit_id: None,
             rank_score: score,
+            search_results: Vec::new(),
+            search_checked_at: None,
+            search_error: None,
+            latest_summary: None,
+            latest_summary_generated_at: None,
+            latest_summary_error: None,
+            feedback: None,
+            feedback_keys: reflect_followup_feedback_keys(id, None, None),
+            feedback_vector: None,
             search_query: None,
+            search_planning_context: None,
+            search_requires_planning: false,
+        }
+    }
+
+    fn freshness_context() -> ReflectSemanticFreshnessContext {
+        ReflectSemanticFreshnessContext {
+            public_development: vec![1.0, 0.0, 0.0],
+            private_work: vec![0.0, 1.0, 0.0],
+            dimension: 3,
+        }
+    }
+
+    fn freshness_cluster(id: &str, title: &str, values: &[f32]) -> ReflectClusterResponse {
+        freshness_cluster_with_source_kind(id, "conversation", title, values)
+    }
+
+    fn freshness_cluster_with_source_kind(
+        id: &str,
+        source_kind: &str,
+        title: &str,
+        values: &[f32],
+    ) -> ReflectClusterResponse {
+        let source = unit_with_source_kind(id, source_kind, title, values);
+        let mut source_mix = BTreeMap::new();
+        source_mix.insert(source_label(source_kind, &source.channel), 1);
+        ReflectClusterResponse {
+            id: format!("cluster-{}", id),
+            representative_unit_id: source.id.clone(),
+            centroid_embedding: source.embedding.clone(),
+            label: source.title.clone(),
+            plain_summary: source.summary.clone(),
+            unit_count: 1,
+            message_count: source.message_count,
+            source_mix,
+            color: "#00ffaa".to_string(),
+            related_history: ReflectRelatedHistory::unavailable("test"),
+            units: vec![unit_to_response(&source)],
         }
     }
 
@@ -4426,5 +5793,144 @@ mod tests {
 
         let unrelated = experience_run_with_tools(Some("app_deploy"), &["app_deploy"]);
         assert!(!reflect_experience_run_is_research(&unrelated));
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let topic = reflect_sentence_fragment(
+            &reflect_experience_run_topic(&by_tool_sequence),
+            REFLECT_SUGGESTION_TEXT_CHARS,
+        );
+        let source_id = format!(
+            "latest:{}",
+            stable_hash(&topic).chars().take(24).collect::<String>()
+        );
+        let mut cache = ReflectFollowupSearchCache::default();
+        cache.entries.insert(
+            source_id,
+            ReflectFollowupSearchEntry {
+                source_id: "latest-test".to_string(),
+                query: topic,
+                checked_at: "2026-05-06T11:55:00Z".to_string(),
+                backend: Some("test".to_string()),
+                results: vec![ReflectFollowupSearchResult {
+                    title: "Fresh public update".to_string(),
+                    url: "https://example.com/update".to_string(),
+                    snippet: "A source-backed result appears in ArkReflect.".to_string(),
+                    source: "Example".to_string(),
+                    published_date: Some("2026-05-06".to_string()),
+                }],
+                error: None,
+                summary: Some("A source-backed insight summary.".to_string()),
+                summary_generated_at: Some("2026-05-06T11:56:00Z".to_string()),
+                summary_error: None,
+            },
+        );
+        let suggestion = reflect_latest_suggestion(&by_tool_sequence, &cache, now);
+        assert_eq!(suggestion.status, "ready");
+        assert_eq!(suggestion.search_results.len(), 1);
+        assert!(suggestion.latest_summary.is_some());
+        assert_eq!(
+            suggestion.search_results[0].url,
+            "https://example.com/update"
+        );
+    }
+
+    #[test]
+    fn semantic_freshness_followup_uses_embedding_meaning() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let context = freshness_context();
+        let cluster = freshness_cluster("fresh", "Cross-border news tracking", &[0.99, 0.01, 0.0]);
+        let score = reflect_semantic_freshness_score(
+            cluster.centroid_embedding.as_ref().unwrap(),
+            &context,
+        )
+        .unwrap();
+        let suggestion = reflect_semantic_cluster_latest_suggestion(
+            &cluster,
+            &ReflectFollowupSearchCache::default(),
+            now,
+            score,
+        )
+        .unwrap();
+        assert_eq!(suggestion.kind, "latest_developments");
+        assert_eq!(suggestion.status, "queued");
+        assert!(suggestion.search_query.is_some());
+    }
+
+    #[test]
+    fn semantic_freshness_ignores_private_local_work() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 6, 12, 0, 0)
+            .single()
+            .unwrap();
+        let context = freshness_context();
+        let cluster = freshness_cluster("local", "Local app settings cleanup", &[0.01, 0.99, 0.0]);
+        let score = reflect_semantic_freshness_score(
+            cluster.centroid_embedding.as_ref().unwrap(),
+            &context,
+        )
+        .unwrap();
+        assert!(!reflect_semantic_freshness_is_actionable(score));
+        assert!(reflect_semantic_cluster_latest_suggestion(
+            &cluster,
+            &ReflectFollowupSearchCache::default(),
+            now,
+            score,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn external_pursuit_planning_drops_unuseful_memory_candidates() {
+        let mut candidate = followup("memory-topic", "latest_developments", 80.0);
+        candidate.search_requires_planning = true;
+        candidate.search_query = Some("Learned user memory about an ordinary nickname".to_string());
+        let mut plans = BTreeMap::new();
+        plans.insert(
+            candidate.id.clone(),
+            ReflectExternalPursuitPlan {
+                id: candidate.id.clone(),
+                useful: false,
+                title: String::new(),
+                search_query: String::new(),
+                rationale: "No public pursuit implied.".to_string(),
+            },
+        );
+
+        let planned = apply_reflect_external_pursuit_plans(vec![candidate], &plans);
+        assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn external_pursuit_planning_rewrites_useful_memory_candidates() {
+        let mut candidate = followup("location-topic", "latest_developments", 80.0);
+        candidate.search_requires_planning = true;
+        candidate.search_query = Some("Learned user memory about a home location".to_string());
+        let mut plans = BTreeMap::new();
+        plans.insert(
+            candidate.id.clone(),
+            ReflectExternalPursuitPlan {
+                id: candidate.id.clone(),
+                useful: true,
+                title: "Places worth exploring nearby".to_string(),
+                search_query: "places of interest near a Kolkata neighborhood".to_string(),
+                rationale: "The reflected location can support a public local discovery check."
+                    .to_string(),
+            },
+        );
+
+        let planned = apply_reflect_external_pursuit_plans(vec![candidate], &plans);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].title, "Places worth exploring nearby");
+        assert_eq!(
+            planned[0].search_query.as_deref(),
+            Some("places of interest near a Kolkata neighborhood")
+        );
+        assert!(planned[0].rank_score > 80.0);
     }
 }

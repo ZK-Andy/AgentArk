@@ -243,7 +243,7 @@ pub async fn ssh_list_connections_scoped(
         return Ok(if allowed_names.is_some() {
             "No SSH connections are attached to this agent.".to_string()
         } else {
-            "No SSH connections configured. Add connections in Settings > MCP Servers > SSH Access."
+            "No SSH connections configured. Add connections in Settings > Integrations > MCP Servers > SSH Access."
                 .to_string()
         });
     }

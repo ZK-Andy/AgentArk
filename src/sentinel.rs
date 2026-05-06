@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crate::channels;
 use crate::core::data_lifecycle::load_data_lifecycle_settings;
 use crate::core::{Agent, TaskStatus};
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -774,6 +775,128 @@ fn build_knowledge_growth_notification(findings: &[DoctorFinding]) -> Option<(St
         "AgentArk kept your documents and memories intact, but the durable knowledge store is getting large ({detail}). Open ArkPulse to review capacity and Postgres maintenance before latency or backup times drift."
     );
     Some((signature, body))
+}
+
+fn parse_utc_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn managed_artifact_apps_from_rows(
+    app_rows: &[serde_json::Value],
+    data_dir: &Path,
+) -> Vec<crate::core::artifact_hygiene::ManagedArtifactApp> {
+    app_rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let title = row
+                .get("title")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let app_dir = row
+                .get("app_dir")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("apps").join(&id));
+            let created_at = row
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .and_then(parse_utc_rfc3339);
+            Some(crate::core::artifact_hygiene::ManagedArtifactApp {
+                id,
+                title,
+                app_dir,
+                enabled: row
+                    .get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                running: row
+                    .get("running")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                is_static: row
+                    .get("is_static")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                created_at,
+            })
+        })
+        .collect()
+}
+
+fn artifact_cleanup_summary(
+    candidates: &[crate::core::artifact_hygiene::ArtifactCleanupCandidate],
+) -> String {
+    crate::core::artifact_hygiene::candidate_category_counts(candidates)
+        .into_iter()
+        .map(|(label, count, bytes)| {
+            format!(
+                "{}: {} item(s), {:.1} MB",
+                label,
+                count,
+                bytes as f64 / (1024.0 * 1024.0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn lifecycle_retention_warnings(
+    lifecycle: &crate::core::data_lifecycle::DataLifecycleSettings,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !lifecycle.cleanup_enabled {
+        warnings.push("data lifecycle cleanup is disabled".to_string());
+    }
+    if !lifecycle.logs_cleanup_enabled {
+        warnings.push("log/history cleanup is disabled".to_string());
+    }
+    let loose = [
+        (
+            "execution traces",
+            lifecycle.execution_trace_retention_days,
+            180,
+        ),
+        (
+            "operational logs",
+            lifecycle.operational_log_retention_days,
+            180,
+        ),
+        ("security logs", lifecycle.security_log_retention_days, 365),
+        ("LLM usage", lifecycle.llm_usage_retention_days, 365),
+        (
+            "terminal tasks",
+            lifecycle.terminal_task_retention_days,
+            365,
+        ),
+        (
+            "execution runs",
+            lifecycle.execution_run_retention_days,
+            365,
+        ),
+        (
+            "browser sessions",
+            lifecycle.browser_session_retention_days,
+            180,
+        ),
+        (
+            "automation runs",
+            lifecycle.automation_run_retention_days,
+            365,
+        ),
+    ];
+    for (label, days, threshold) in loose {
+        if days > threshold {
+            warnings.push(format!("{} retained for {} days", label, days));
+        }
+    }
+    warnings
 }
 
 fn control_plane_bases() -> (String, String) {
@@ -2389,6 +2512,44 @@ async fn run_runtime_hardening_checks(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BackendMemoryPressure {
+    rss_bytes: Option<u64>,
+    cgroup_current_bytes: Option<u64>,
+    cgroup_max_bytes: Option<u64>,
+}
+
+fn read_u64_text(path: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn read_process_rss_bytes() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/self/status").ok()?;
+    raw.lines().find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix("VmRSS:")?.trim();
+        let kb = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(kb.saturating_mul(1024))
+    })
+}
+
+fn read_backend_memory_pressure() -> BackendMemoryPressure {
+    BackendMemoryPressure {
+        rss_bytes: read_process_rss_bytes(),
+        cgroup_current_bytes: read_u64_text("/sys/fs/cgroup/memory.current"),
+        cgroup_max_bytes: read_u64_text("/sys/fs/cgroup/memory.max"),
+    }
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 async fn run_resource_checks(
     ctx: &PulseDoctorContext,
     deployed_apps: &[AppPulseInfo],
@@ -2580,6 +2741,59 @@ async fn run_resource_checks(
                 format!("{} attempts", sec.injection_attempts),
                 "Active probing of prompt surface was observed.",
                 "Review security logs and block offending sources".to_string(),
+            );
+        }
+    }
+
+    let memory = read_backend_memory_pressure();
+    if let (Some(current), Some(max)) = (memory.cgroup_current_bytes, memory.cgroup_max_bytes) {
+        if max > 0 {
+            let ratio = current as f64 / max as f64;
+            if ratio >= 0.85 {
+                push_finding!(
+                    findings,
+                    "high",
+                    "resource",
+                    "backend_memory",
+                    "Backend memory pressure is high",
+                    format!(
+                        "cgroup memory is {} of {} ({:.0}%)",
+                        format_mb(current),
+                        format_mb(max),
+                        ratio * 100.0
+                    ),
+                    "Runtime memory pressure can cause request latency, failed background jobs, or container eviction.",
+                    "Review live traffic, running apps, and retention settings before raising memory limits".to_string(),
+                );
+            } else if ratio >= 0.70 {
+                push_finding!(
+                    findings,
+                    "medium",
+                    "resource",
+                    "backend_memory",
+                    "Backend memory pressure is elevated",
+                    format!(
+                        "cgroup memory is {} of {} ({:.0}%)",
+                        format_mb(current),
+                        format_mb(max),
+                        ratio * 100.0
+                    ),
+                    "Sustained memory growth can degrade ArkPulse, background workers, and API responsiveness.",
+                    "Review retention settings and recent runtime workload before memory pressure reaches eviction thresholds".to_string(),
+                );
+            }
+        }
+    } else if let Some(rss) = memory.rss_bytes {
+        if rss >= 1536 * 1024 * 1024 {
+            push_finding!(
+                findings,
+                "medium",
+                "resource",
+                "backend_memory",
+                "Backend RSS is large",
+                format!("process RSS is {}", format_mb(rss)),
+                "Large resident memory can indicate runtime growth that deserves operator review.",
+                "Inspect active background jobs, app runtimes, and retention posture".to_string(),
             );
         }
     }
@@ -2775,6 +2989,105 @@ async fn run_data_safety_checks(
     }
 
     backup_status
+}
+
+async fn run_managed_artifact_hygiene_checks(
+    ctx: &PulseDoctorContext,
+    app_rows: &[serde_json::Value],
+    findings: &mut Vec<DoctorFinding>,
+) -> crate::core::artifact_hygiene::ArchiveRetentionSummary {
+    let data_dir = ctx.data_dir.clone();
+    let retention_summary = match crate::core::artifact_hygiene::prune_archive_retention(&data_dir)
+        .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            push_internal_finding!(
+                findings,
+                "medium",
+                "artifact_hygiene",
+                "artifact_archive",
+                "Archive retention could not be pruned",
+                error.to_string(),
+                "AgentArk could not inspect or prune managed archive entries.",
+                "Check data directory permissions; ArkPulse will retry on the next run".to_string(),
+            );
+            crate::core::artifact_hygiene::ArchiveRetentionSummary::default()
+        }
+    };
+
+    let lifecycle = load_data_lifecycle_settings(&ctx.storage).await;
+    let lifecycle_warnings = lifecycle_retention_warnings(&lifecycle);
+    if !lifecycle_warnings.is_empty() {
+        push_finding!(
+            findings,
+            "medium",
+            "retention_policy",
+            "data_lifecycle",
+            "Data lifecycle retention needs review",
+            lifecycle_warnings.join(" | "),
+            "Loose or disabled retention lets logs, traces, sessions, and automation history grow in Postgres.",
+            "Open Settings > Data Lifecycle and tighten retention windows; ArkPulse will not bypass DB policy".to_string(),
+        );
+    }
+
+    let managed_apps = managed_artifact_apps_from_rows(app_rows, &data_dir);
+    let idle_apps = ctx
+        .app_registry
+        .get_unused_apps(UNUSED_APP_IDLE_HOURS)
+        .await
+        .into_iter()
+        .map(|(id, _title, last_accessed)| (id, last_accessed))
+        .collect::<HashMap<_, _>>();
+    match crate::core::artifact_hygiene::collect_artifact_cleanup_candidates(
+        &data_dir,
+        &managed_apps,
+        &idle_apps,
+        &lifecycle,
+    )
+    .await
+    {
+        Ok(candidates) if !candidates.is_empty() => {
+            let total_size: u64 = candidates
+                .iter()
+                .map(|candidate| candidate.size_bytes)
+                .sum();
+            let high_risk = candidates
+                .iter()
+                .filter(|candidate| candidate.risk == "high" || candidate.risk == "medium")
+                .count();
+            push_finding!(
+                findings,
+                if high_risk > 0 { "medium" } else { "low" },
+                "artifact_hygiene",
+                "managed_artifacts",
+                "Managed artifact cleanup is available",
+                format!(
+                    "{} candidate(s), {:.1} MB | {}",
+                    candidates.len(),
+                    total_size as f64 / (1024.0 * 1024.0),
+                    artifact_cleanup_summary(&candidates)
+                ),
+                "AgentArk-owned runtime artifacts can outlive their active use, but user data and durable memory are excluded from cleanup.",
+                "Open ArkPulse cleanup review and archive selected managed artifacts".to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            push_internal_finding!(
+                findings,
+                "medium",
+                "artifact_hygiene",
+                "managed_artifacts",
+                "Managed artifact cleanup could not be evaluated",
+                error.to_string(),
+                "AgentArk could not inspect owned runtime artifact roots.",
+                "Check data directory permissions; ArkPulse will retry on the next run".to_string(),
+            );
+        }
+    }
+
+    retention_summary
 }
 
 async fn run_policy_compliance_checks(findings: &mut Vec<DoctorFinding>) {
@@ -3273,6 +3586,29 @@ async fn run_doctor_checks(
         vec![
             pulse_metric("Data dir", data_dir.display().to_string()),
             pulse_metric("Managed backup", managed_backup_status),
+        ],
+    ));
+
+    let artifact_hygiene_started = Instant::now();
+    let findings_before = findings.len();
+    let archive_retention =
+        run_managed_artifact_hygiene_checks(ctx, &app_rows, &mut findings).await;
+    sections.push(build_scan_section(
+        "artifact_hygiene",
+        "Managed artifact hygiene",
+        artifact_hygiene_started.elapsed(),
+        &findings[findings_before..],
+        "Reviewed AgentArk-owned runtime artifacts and pruned expired archive entries.",
+        "Checked managed apps, runtime residue, browser/session scratch, automation artifacts, and archive retention without touching user data.",
+        vec![
+            pulse_metric(
+                "Archive entries pruned",
+                archive_retention.deleted_entries.to_string(),
+            ),
+            pulse_metric(
+                "Archive bytes pruned",
+                format!("{:.1} MB", archive_retention.deleted_bytes as f64 / (1024.0 * 1024.0)),
+            ),
         ],
     ));
 

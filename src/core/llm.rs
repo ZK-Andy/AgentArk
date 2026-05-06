@@ -868,6 +868,24 @@ async fn emit_stream_block_events(
                 )
                 .await;
             }
+            stream_blocks::StreamBlockEvent::Patch { path, patch } => {
+                let stream_key = format!("stream-patch:{}", path);
+                emit_stream_tool_progress(
+                    token_tx,
+                    "app_deploy",
+                    format!("Patching {}", path),
+                    serde_json::json!({
+                        "kind": "patch_file",
+                        "phase": "generating_files",
+                        "file": path.clone(),
+                        "path": path,
+                        "patch": patch,
+                        "done": true,
+                        "stream_key": stream_key,
+                    }),
+                )
+                .await;
+            }
             stream_blocks::StreamBlockEvent::Checklist { items } => {
                 emit_stream_tool_progress(
                     token_tx,

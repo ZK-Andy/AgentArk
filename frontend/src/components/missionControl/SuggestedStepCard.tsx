@@ -6,7 +6,6 @@ export type SuggestedStepCardProps = {
   prompts: string[];
   onGoChat?: () => void;
   onRunBriefing?: () => void;
-  onViewTasks?: () => void;
   briefingLoading?: boolean;
   briefing?: BriefingResponse | null;
   onExecuteAction?: (action: RecommendedAction) => void;
@@ -17,7 +16,6 @@ export function SuggestedStepCard({
   prompts,
   onGoChat,
   onRunBriefing,
-  onViewTasks,
   briefingLoading = false,
   briefing,
   onExecuteAction,
@@ -126,11 +124,6 @@ export function SuggestedStepCard({
         {onRunBriefing ? (
           <button className="nw-btn" disabled={briefingLoading} onClick={onRunBriefing}>
             {briefingLoading ? "Running..." : "Generate Daily Brief"} <span className="nw-arrow">→</span>
-          </button>
-        ) : null}
-        {onViewTasks ? (
-          <button className="nw-btn nw-btn--ghost" onClick={onViewTasks}>
-            Review Tasks <span className="nw-arrow">→</span>
           </button>
         ) : null}
       </div>

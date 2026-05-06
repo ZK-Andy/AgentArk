@@ -643,8 +643,9 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
 /// - `# heading` -> `*heading*` (headers rendered as bold)
 /// - Leaves inline code, code blocks, and other text untouched.
 fn format_for_whatsapp(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+    let normalized = normalize_markdown_for_whatsapp(text);
+    let mut result = String::with_capacity(normalized.len());
+    let mut chars = normalized.chars().peekable();
 
     while let Some(c) = chars.next() {
         match c {
@@ -732,6 +733,70 @@ fn format_for_whatsapp(text: &str) -> String {
     }
 
     result
+}
+
+fn normalize_markdown_for_whatsapp(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    let mut in_code_block = false;
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_code_block {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if is_whatsapp_markdown_rule(trimmed) {
+            if !out.ends_with("\n\n") && !out.is_empty() {
+                out.push('\n');
+            }
+            continue;
+        }
+        let line = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .and_then(markdown_wrapped_bold_for_whatsapp)
+            .map(|heading| format!("**{}**", heading))
+            .unwrap_or_else(|| line.to_string());
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    out.trim_end().to_string()
+}
+
+fn markdown_wrapped_bold_for_whatsapp(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("**")
+        .and_then(|value| value.strip_suffix("**"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("__")
+                .and_then(|value| value.strip_suffix("__"))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_whatsapp_markdown_rule(line: &str) -> bool {
+    line.len() >= 3
+        && line
+            .chars()
+            .all(|c| c == '-' || c == '*' || c == '_' || c.is_whitespace())
+        && line
+            .chars()
+            .filter(|c| matches!(c, '-' | '*' | '_'))
+            .count()
+            >= 3
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,6 +1665,7 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
                  /image <prompt> - Generate an image\n\
                  /tunnel [start|stop|status] - Manage remote UI access\n\
                  /approve <number> - Approve a contact\n\
+                 /new - Start a new conversation\n\
                  /clear - Clear conversation history\n\n\
                  Or just send me a message!",
                 agent.config.name
@@ -1877,12 +1943,26 @@ async fn handle_command(text: &str, agent: &SharedAgent, from: &str) -> String {
             }
         }
 
+        "/new" => {
+            let agent = agent.read().await;
+            match agent
+                .start_new_channel_conversation("whatsapp", &conversation_id, None, "New Chat")
+                .await
+            {
+                Ok(_) => "Started a new conversation. Previous history is kept.".to_string(),
+                Err(e) => format!("Failed to start a new conversation: {}", e),
+            }
+        }
+
         "/clear" => {
             let agent = agent.read().await;
-            agent
-                .clear_conversation_by_id("whatsapp", &conversation_id, None)
-                .await;
-            "Conversation cleared. Starting fresh!".to_string()
+            match agent
+                .clear_current_channel_conversation("whatsapp", &conversation_id, None)
+                .await
+            {
+                Ok(_) => "Conversation cleared. Starting fresh.".to_string(),
+                Err(e) => format!("Failed to clear conversation: {}", e),
+            }
         }
 
         "/approve" => {

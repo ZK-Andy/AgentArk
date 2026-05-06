@@ -389,13 +389,13 @@ export default function ArkMemoryPage({
   return (
     <WorkspacePageShell spacing={1.5}>
       <WorkspacePageHeader
-        eyebrow="Ark Core"
+        eyebrow="Ark Core / ArkMemory"
         title="ArkMemory"
         description={
           <>
             ArkMemory is what the agent remembers about you and your work.
             <br />
-            It stores facts, preferences, recurring patterns, and useful knowledge gathered from your chats and from background signals across AgentArk.
+            ArkMemory stores facts, preferences, recurring patterns, and useful knowledge gathered from chats and background signals.
           </>
         }
       />
@@ -834,8 +834,8 @@ export default function ArkMemoryPage({
             <Stack spacing={0.35}>
               <Typography variant="h6">History</Typography>
               <Typography variant="body2" sx={{ color: "text.secondary" }}>
-                Changes, consolidations, and rollbacks. Open Advanced on an item
-                when you need technical detail or a restore action.
+                Changes, consolidations, and rollbacks. Expand an item for
+                technical detail.
               </Typography>
             </Stack>
             {historyEvents.length === 0 ? (
@@ -960,39 +960,37 @@ export default function ArkMemoryPage({
                               </Typography>
                             </Stack>
                           </Box>
-                          <Stack
-                            direction={{ xs: "column", sm: "row" }}
-                            spacing={1}
-                            sx={{
-                              justifyContent: "space-between",
-                              alignItems: { xs: "stretch", sm: "center" },
-                            }}
-                          >
-                            <Typography
-                              variant="caption"
-                              sx={{ color: "text.secondary" }}
+                          {restoreTargetId ? (
+                            <Stack
+                              direction={{ xs: "column", sm: "row" }}
+                              spacing={1}
+                              sx={{
+                                justifyContent: "space-between",
+                                alignItems: { xs: "stretch", sm: "center" },
+                              }}
                             >
-                              {restoreTargetId
-                                ? type === "queue_memory_merged" &&
-                                  linkedRestoreId
+                              <Typography
+                                variant="caption"
+                                sx={{ color: "text.secondary" }}
+                              >
+                                {type === "queue_memory_merged" &&
+                                linkedRestoreId
                                   ? "Restores the archived source memory behind this consolidation."
-                                  : "Restores the previous memory snapshot recorded for this change."
-                                : "No restore action is available for this history item."}
-                            </Typography>
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              color="warning"
-                              disabled={busy || !restoreTargetId}
-                              onClick={() =>
-                                restoreTargetId
-                                  ? rollbackMutation.mutate(restoreTargetId)
-                                  : undefined
-                              }
-                            >
-                              {restoreLabel}
-                            </Button>
-                          </Stack>
+                                  : "Restores the previous memory snapshot recorded for this change."}
+                              </Typography>
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                color="warning"
+                                disabled={busy}
+                                onClick={() =>
+                                  rollbackMutation.mutate(restoreTargetId)
+                                }
+                              >
+                                {restoreLabel}
+                              </Button>
+                            </Stack>
+                          ) : null}
                         </Stack>
                       </AccordionDetails>
                     </Accordion>

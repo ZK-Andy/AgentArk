@@ -316,14 +316,29 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
         (
             "ArkSentinel",
             "/sentinel",
-            "ArkSentinel view with proposals, observations, and Background learning status.",
+            "Decision inbox for proposals, observations, approvals, and Background learning status.",
+        ),
+        (
+            "ArkEvolve",
+            "/evolution",
+            "Learning status, review-only suggestions, live tests, stable changes, and rollback.",
+        ),
+        (
+            "ArkMemory",
+            "/arkmemory",
+            "Stored facts, preferences, user data, knowledge, provenance, review, and rollback.",
+        ),
+        (
+            "ArkReflect",
+            "/arkreflect",
+            "Day, week, and month recaps with local work patterns and follow-ups.",
         ),
         (
             "Watchers",
             "/watchers",
             "Background poll-until-condition monitors.",
         ),
-        ("ArkPulse", "/arkpulse", "Operational pulse and guidance."),
+        ("ArkPulse", "/arkpulse", "Operational health, findings, and fix guidance."),
         ("Trace", "/trace", "Execution history and tool telemetry."),
         (
             "Documents",
@@ -370,14 +385,12 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
                 "Settings > Integrations > Messaging Channels",
                 "Settings > Integrations > Prebuilt Connectors",
                 "Settings > Integrations > Custom Integrations",
+                "Settings > Integrations > MCP Servers",
                 "Settings > Integrations > Webhooks & APIs",
                 "Settings > Integrations > Plugins",
             ],
         ),
-        (
-            "Knowledge",
-            &["ArkMemory", "Settings > Knowledge > MCP Servers"],
-        ),
+        ("Knowledge", &["ArkMemory"]),
         (
             "Admin",
             &["Settings > Data Lifecycle", "Settings > Observability"],
@@ -489,15 +502,18 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
 - ArkMemory > Current Memory > Facts | Learned facts and operating constraints captured by the memory system.\n\
 - ArkMemory > Current Memory > Preferences | Durable user preferences and rules.\n\
 - ArkMemory > Current Memory > User Data | Notes, links, and captured user data.\n\
-- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including AgentArk manual/capability entries after sync.\n\
-- Settings > Knowledge > MCP Servers | External MCP server configuration.";
+- ArkMemory > Current Memory > Knowledge | Reusable knowledge-base items, including AgentArk manual/capability entries after sync.\n\n\
+Semantic routing guidance.\n\n\
+- Choose by meaning, not by product-name usage or keyword matching.\n\
+- ArkMemory owns persistent personal/work knowledge: durable facts, preferences, user data, source attribution, and reusable knowledge-base items.\n\
+- Library > Documents owns file-centric retrieval: uploaded files, indexed documents, document search, and document-grounded answers.";
     items.push(SeedKnowledgeItem {
         title: "Library, documents, and memory surfaces".to_string(),
         content: branded_product_text(library_content),
         source: RUNTIME_SOURCE,
         url: Some(crate::branding::help_uri("help/runtime/library-memory")),
         tags: Some(
-            "library, documents, memory, knowledge, files, uploads, facts, preferences, user_data, mcp"
+            "library, documents, memory, knowledge, files, uploads, facts, preferences, user_data"
                 .to_string(),
         ),
     });
@@ -522,22 +538,28 @@ fn build_ui_topology_docs() -> Vec<SeedKnowledgeItem> {
     });
 
     let evolution_content = "ArkEvolve and self-learning surfaces in the current UI.\n\n\
-- ArkEvolve | Main self-learning page with What happened, What helped, Tests running, Review, and developer controls.\n\
+- ArkEvolve | Main self-learning page with Overview, Results, Live tests, Review queue, and developer controls.\n\
 - ArkSentinel > Background learning | Live status for heuristic reflection, experience consolidation, pattern induction, and candidate generation.\n\
 - Learned Heuristics | Short transferable lessons distilled from completed runs.\n\
-- ArkEvolve > What happened | Recent tested or promoted changes with lineage and plain-language summaries.\n\
-- ArkEvolve > What helped | Measured impact from prompt, classifier, specialist, and routing changes.\n\
-- ArkEvolve > Tests running | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
-- ArkEvolve > Review | Draft workflow, strategy, and memory candidates waiting for review.\n\
+- ArkEvolve > Overview | Current state, whether behavior changed, next step, and rollback availability.\n\
+- ArkEvolve > Results | Measured impact from prompt, classifier, specialist, and routing changes.\n\
+- ArkEvolve > Live tests | Canary rollout, baseline version, candidate version, and gate result for each evolvable surface.\n\
+- ArkEvolve > Review queue | Draft workflow, strategy, and memory candidates waiting for review.\n\
 - Settings > Advanced > ArkSentinel | Keep ArkSentinel available, choose whether it watches AgentArk activity or connected apps, and control routine detection.\n\
-- Settings > Advanced > ArkEvolve | Self-evolve master switch for background learning and canary experiments.\n\
+- Settings > Advanced > ArkEvolve | ArkEvolve self-evolve master switch for background learning and canary experiments.\n\
 - Settings > Advanced > App Deploy Defaults | Default app access guard for new app deploy and public-link flows.\n\
 - ArkEvolve > Controls | Developer-mode canary actions and manual testing controls.\n\
 - Learned Memory | Durable facts, rules, lessons, and memory extracted from runs.\n\
 - Learned Procedures | Repeated successful workflows distilled into procedures.\n\
 - Recent Experience Runs | Recent evidence feeding the learning system.\n\
 - Learning Candidates | Draft workflow/strategy/memory actions waiting for review.\n\
-- Canary History and Strategy Metrics | Diagnostics for policy rollout and promotion decisions.";
+- Canary History and Strategy Metrics | Diagnostics for policy rollout and promotion decisions.\n\n\
+Semantic routing guidance.\n\n\
+- Choose by meaning, not by product-name usage or keyword matching.\n\
+- ArkEvolve owns the improvement lifecycle: learning state, experiments, canary or live tests, stable behavior changes, deployment uncertainty, rollback state, and self-evolve controls.\n\
+- ArkSentinel owns operator decision state: approvals, rejected or snoozed suggestions, background observations, and items waiting for user attention.\n\
+- ArkPulse owns operational health: diagnostics, findings, runtime state, remediation guidance, and safe fix execution.\n\
+- ArkReflect owns retrospective understanding: time-window recaps, work patterns, source coverage, activity rhythm, and background-agent activity summaries.";
     items.push(SeedKnowledgeItem {
         title: "ArkEvolve and self-learning surfaces".to_string(),
         content: evolution_content.to_string(),

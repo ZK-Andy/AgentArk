@@ -173,6 +173,10 @@ const CHAT_ACTIVITY_PAYLOAD_STRING_MAX_CHARS = 1600;
 const CHAT_ACTIVITY_PAYLOAD_ARRAY_MAX_ITEMS = 80;
 const CHAT_ACTIVITY_PAYLOAD_OBJECT_MAX_KEYS = 80;
 const CHAT_ACTIVITY_PAYLOAD_DEPTH_MAX = 5;
+const CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_CHARS = 480;
+const CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_ITEMS = 12;
+const CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_KEYS = 12;
+const CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_DEPTH_MAX = 2;
 const CHAT_WORKSPACE_UI_MAX_FILES = 120;
 const CHAT_WORKSPACE_UI_MAX_FILE_CHARS = 80_000;
 const CHAT_WORKSPACE_UI_MAX_TOTAL_CHARS = 480_000;
@@ -310,6 +314,7 @@ type ChatWorkspaceSnapshot = {
 type ChatLaunchRunDetail = {
   message: string;
   conversationId?: string;
+  newConversation?: boolean;
   taskId?: string;
   launchMode?: "message" | "resume_task";
   navigateToChat?: boolean;
@@ -323,6 +328,7 @@ type ChatPendingLaunch = {
   launchMode: "message" | "resume_task";
   message?: string;
   conversationId?: string;
+  newConversation?: boolean;
   taskId?: string;
   source?: string;
   acceptedSuggestionId?: string;
@@ -675,6 +681,33 @@ function formatCodePreviewLanguage(
   }
 }
 
+function isWorkspaceCodePreview(
+  languageHint = "",
+  code = "",
+  fileName = "",
+): boolean {
+  const normalizedLanguage = normalizeCodeFenceLanguage(languageHint);
+  const explicitPlainText =
+    normalizedLanguage === "text" ||
+    normalizedLanguage === "txt" ||
+    normalizedLanguage === "plain" ||
+    normalizedLanguage === "plaintext";
+  if (explicitPlainText) return false;
+  if (normalizedLanguage && normalizedLanguage !== "markdown") return true;
+
+  const trimmed = (code || "").trim();
+  if (!trimmed) return false;
+  const guessed = guessCodeLanguage(fileName, trimmed);
+  if (guessed === "text") return false;
+  if (guessed === "markdown") {
+    const lineCount = trimmed
+      .split(/\r?\n/)
+      .filter((line) => line.trim()).length;
+    return Boolean(normalizedLanguage) && lineCount >= 3;
+  }
+  return true;
+}
+
 function reactNodeToPlainText(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -725,6 +758,19 @@ function InlineCodePreview({
     resolvedFileName,
     normalizedCode,
   );
+  const shouldUseWorkspaceChrome = isWorkspaceCodePreview(
+    languageHint,
+    normalizedCode,
+    resolvedFileName,
+  );
+
+  if (!shouldUseWorkspaceChrome) {
+    return (
+      <pre className="chat-md-code chat-md-code-plain">
+        <code>{normalizedCode}</code>
+      </pre>
+    );
+  }
 
   return (
     <Box className="chat-md-ide">
@@ -742,14 +788,15 @@ function InlineCodePreview({
           <button
             type="button"
             className="chat-md-ide-open"
-            onClick={() =>
+            onClick={(event) => {
+              event.stopPropagation();
               onOpenInWorkspace({
                 snippetId,
                 fileName: resolvedFileName,
                 code: normalizedCode,
                 languageHint,
-              })
-            }
+              });
+            }}
           >
             Open in workspace
           </button>
@@ -2623,6 +2670,12 @@ type ActivityPayloadView = {
   preview: string;
   body: string;
   lineCount: number;
+  items?: ActivityPayloadItem[];
+};
+
+type ActivityPayloadItem = {
+  label: string;
+  value: string;
 };
 
 type ActivityTimelineCard = {
@@ -2740,6 +2793,32 @@ const ACTIVITY_PAYLOAD_FILE_BODY_KEYS = new Set([
   "text",
 ]);
 
+function isStreamLikeActivityRecord(value: unknown): boolean {
+  const record = asRecord(value);
+  const kind = str(record.kind, "").trim().toLowerCase();
+  if (
+    kind === "console_chunk" ||
+    kind === "reasoning_delta" ||
+    kind === "argument_stream"
+  ) {
+    return true;
+  }
+  if (str(record.stream, "").trim()) return true;
+  const streamKey = str(record.stream_key, str(record.__streamKey, ""))
+    .trim()
+    .toLowerCase();
+  return streamKey.startsWith("console:");
+}
+
+function shouldOmitActivityPayloadString(
+  normalizedKey: string,
+  parent: unknown,
+): boolean {
+  if (!ACTIVITY_PAYLOAD_FILE_BODY_KEYS.has(normalizedKey)) return false;
+  if (normalizedKey === "text") return false;
+  return !isStreamLikeActivityRecord(parent);
+}
+
 function formatActivityToolName(name: string): string {
   const normalized = (name || "").trim().toLowerCase();
   if (!normalized) return "Tool";
@@ -2840,6 +2919,125 @@ function summarizeActivityPayloadPreview(value: unknown): string {
   return parts.join(" | ");
 }
 
+function formatActivityPayloadFieldLabel(key: string): string {
+  const normalized = (key || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "Value";
+  return normalized
+    .split(" ")
+    .map((part) =>
+      part.length <= 3 && part === part.toLowerCase()
+        ? part.toUpperCase()
+        : `${part.charAt(0).toUpperCase()}${part.slice(1)}`,
+    )
+    .join(" ");
+}
+
+function activityPayloadValueToCleanText(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") {
+    return value.trim().replace(/\s+/g, " ");
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "None";
+    const primitiveItems = value
+      .slice(0, 4)
+      .map((entry) => activityPayloadValueToCleanText(entry))
+      .filter(Boolean);
+    if (
+      primitiveItems.length > 0 &&
+      primitiveItems.length === Math.min(value.length, 4)
+    ) {
+      const suffix =
+        value.length > primitiveItems.length
+          ? ` +${value.length - primitiveItems.length} more`
+          : "";
+      return `${primitiveItems.join(", ")}${suffix}`;
+    }
+    return `${value.length} item${value.length === 1 ? "" : "s"}`;
+  }
+  const summary = summarizeActivityPayloadPreview(value);
+  if (summary) return summary;
+  const keys = Object.keys(asRecord(value)).filter(
+    (key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key),
+  );
+  return keys.length
+    ? `${keys.slice(0, 4).map(formatActivityPayloadFieldLabel).join(", ")}${
+        keys.length > 4 ? ` +${keys.length - 4} more` : ""
+      }`
+    : "";
+}
+
+function buildActivityPayloadItems(value: unknown): ActivityPayloadItem[] {
+  const out: ActivityPayloadItem[] = [];
+  const addItems = (source: unknown, prefix = "", depth = 0): void => {
+    if (out.length >= 10) return;
+    const record = asRecord(source);
+    const entries = Object.entries(record).filter(
+      ([key]) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key),
+    );
+    if (entries.length === 0) return;
+    const ordered = [
+      ...ACTIVITY_PAYLOAD_PREVIEW_PRIORITY
+        .filter((key) => entries.some(([entryKey]) => entryKey === key))
+        .map((key) => [key, record[key]] as [string, unknown]),
+      ...entries.filter(
+        ([key]) => !ACTIVITY_PAYLOAD_PREVIEW_PRIORITY.includes(key),
+      ),
+    ];
+    for (const [key, entryValue] of ordered) {
+      if (out.length >= 10) break;
+      if (ACTIVITY_PAYLOAD_SECRET_KEY_PATTERN.test(key)) {
+        out.push({
+          label: formatActivityPayloadFieldLabel(
+            prefix ? `${prefix} ${key}` : key,
+          ),
+          value: "[redacted]",
+        });
+        continue;
+      }
+      const entryRecord = asRecord(entryValue);
+      const canFlatten =
+        depth < 2 &&
+        ["args", "arguments", "payload", "params", "input"].includes(
+          key.trim().toLowerCase(),
+        ) &&
+        Object.keys(entryRecord).length > 0;
+      if (canFlatten) {
+        addItems(entryRecord, prefix, depth + 1);
+        continue;
+      }
+      const label = formatActivityPayloadFieldLabel(
+        prefix ? `${prefix} ${key}` : key,
+      );
+      const value = activityPayloadValueToCleanText(entryValue);
+      if (!value) continue;
+      out.push({ label, value: compactUiString(value, 260) });
+    }
+  };
+
+  if (Array.isArray(value)) {
+    value.slice(0, 6).forEach((entry, index) => {
+      const text = activityPayloadValueToCleanText(entry);
+      if (text) {
+        out.push({
+          label: `Item ${index + 1}`,
+          value: compactUiString(text, 260),
+        });
+      }
+    });
+  } else {
+    addItems(value);
+  }
+  return out;
+}
+
 function shouldTreatAsRawActivityText(text: string): boolean {
   const trimmed = (text || "").trim();
   if (!trimmed) return false;
@@ -2880,6 +3078,7 @@ function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
 
   const body = JSON.stringify(value, null, 2);
   if (!body) return null;
+  const items = buildActivityPayloadItems(value);
   const keys = hasObjectContent ? Object.keys(asObject) : [];
   const visibleKeys = keys.filter(
     (key) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(key),
@@ -2900,11 +3099,12 @@ function buildActivityPayloadView(value: unknown): ActivityPayloadView | null {
 
   return {
     kind: "json",
-    badgeLabel: "Data",
-    headerLabel: "Structured data",
+    badgeLabel: "Details",
+    headerLabel: items.length > 0 ? "Action details" : "Additional details",
     preview: summarizeActivityPayloadPreview(value),
     body,
     lineCount: body.split(/\r?\n/).length,
+    items,
   };
 }
 
@@ -3749,6 +3949,24 @@ function ActivityPayloadDisclosure({
   onToggle: () => void;
   controlsId: string;
 }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  async function handleCopyPayload() {
+    if (!payload.body) return;
+    try {
+      await navigator.clipboard.writeText(payload.body);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be denied in insecure contexts.
+    }
+  }
+
   return (
     <Box className={`activity-payload-shell${expanded ? " is-expanded" : ""}`}>
       <Stack
@@ -3779,31 +3997,68 @@ function ActivityPayloadDisclosure({
             {payload.preview || payload.headerLabel}
           </Typography>
         </Stack>
-        <Button
-          size="small"
-          variant="text"
-          className="activity-payload-toggle"
-          aria-expanded={expanded}
-          aria-controls={controlsId}
-          onClick={onToggle}
-          endIcon={
-            <ArrowDropDownRoundedIcon
-              className={`activity-payload-toggle-icon${expanded ? " is-expanded" : ""}`}
-            />
-          }
+        <Stack
+          direction="row"
+          spacing={0.35}
+          className="activity-payload-actions"
+          sx={{ alignItems: "center" }}
         >
-          {expanded ? "Hide data" : "Show data"}
-        </Button>
+          <Tooltip title={copied ? "Copied" : "Copy details"} placement="top" arrow>
+            <span>
+              <IconButton
+                size="small"
+                className="activity-payload-copy"
+                disabled={!payload.body}
+                onClick={handleCopyPayload}
+                aria-label="Copy payload details"
+              >
+                <ContentCopyRoundedIcon fontSize="inherit" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Button
+            size="small"
+            variant="text"
+            className="activity-payload-toggle"
+            aria-expanded={expanded}
+            aria-controls={controlsId}
+            onClick={onToggle}
+            endIcon={
+              <ArrowDropDownRoundedIcon
+                className={`activity-payload-toggle-icon${expanded ? " is-expanded" : ""}`}
+              />
+            }
+          >
+            {expanded ? "Hide details" : "Show details"}
+          </Button>
+        </Stack>
       </Stack>
       <Collapse in={expanded} mountOnEnter unmountOnExit>
         <Box id={controlsId} className="activity-payload-body">
           <Typography variant="caption" className="activity-payload-body-label">
-            {payload.headerLabel} - {payload.lineCount} line
-            {payload.lineCount === 1 ? "" : "s"}
+            {payload.headerLabel}
           </Typography>
-          <Box component="pre" className="activity-payload-pre">
-            {payload.body}
-          </Box>
+          {payload.items?.length ? (
+            <Box className="activity-payload-fields">
+              {payload.items.map((item, index) => (
+                <Box
+                  key={`${controlsId}-field-${index}`}
+                  className="activity-payload-field"
+                >
+                  <span className="activity-payload-field-label">
+                    {item.label}
+                  </span>
+                  <span className="activity-payload-field-value">
+                    {item.value}
+                  </span>
+                </Box>
+              ))}
+            </Box>
+          ) : (
+            <Box component="pre" className="activity-payload-pre">
+              {payload.body}
+            </Box>
+          )}
         </Box>
       </Collapse>
     </Box>
@@ -5365,6 +5620,7 @@ function loadChatPendingLaunch(): ChatPendingLaunch | null {
       message,
       conversationId:
         typeof parsed.conversationId === "string" ? parsed.conversationId : "",
+      newConversation: parsed.newConversation === true,
       taskId,
       source: typeof parsed.source === "string" ? parsed.source : "",
       acceptedSuggestionId:
@@ -5435,10 +5691,11 @@ function summarizeFilesPayloadForUi(value: unknown): JsonRecord[] {
     .filter((entry) => !!str(entry.path, ""));
 }
 
-function sanitizeActivityPayloadForUi(
+function summarizeNestedActivityPayloadForUi(
   value: unknown,
   key = "",
   depth = 0,
+  parent?: unknown,
 ): unknown {
   const normalizedKey = key.trim().toLowerCase();
   if (ACTIVITY_PAYLOAD_SECRET_KEY_PATTERN.test(normalizedKey)) {
@@ -5448,15 +5705,92 @@ function sanitizeActivityPayloadForUi(
     return value;
   }
   if (typeof value === "string") {
-    if (ACTIVITY_PAYLOAD_FILE_BODY_KEYS.has(normalizedKey)) {
+    if (shouldOmitActivityPayloadString(normalizedKey, parent)) {
       return value ? omittedStringLabel(value) : "";
+    }
+    return compactUiString(
+      value,
+      CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_CHARS,
+    );
+  }
+  if (normalizedKey === "files" || normalizedKey === "sources") {
+    return summarizeFilesPayloadForUi(value);
+  }
+  if (depth >= CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_DEPTH_MAX) {
+    if (Array.isArray(value)) {
+      return value.length === 0
+        ? []
+        : `[array: ${value.length.toLocaleString()} item${value.length === 1 ? "" : "s"}]`;
+    }
+    const visibleKeys = Object.keys(asRecord(value)).filter(
+      (entryKey) => !ACTIVITY_PAYLOAD_INTERNAL_KEYS.has(entryKey),
+    );
+    if (visibleKeys.length === 0) return {};
+    const shownKeys = visibleKeys.slice(
+      0,
+      CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_KEYS,
+    );
+    const suffix =
+      visibleKeys.length > shownKeys.length
+        ? `, +${visibleKeys.length - shownKeys.length} more`
+        : "";
+    return `[object: ${shownKeys.join(", ")}${suffix}]`;
+  }
+  if (Array.isArray(value)) {
+    const items = value
+      .slice(0, CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_ITEMS)
+      .map((entry) =>
+        summarizeNestedActivityPayloadForUi(entry, "", depth + 1, value),
+      );
+    if (value.length > items.length) {
+      items.push(`[+${value.length - items.length} more items]`);
+    }
+    return items;
+  }
+
+  const source = asRecord(value);
+  const out: JsonRecord = {};
+  const entries = Object.entries(source);
+  for (const [entryKey, entryValue] of entries.slice(
+    0,
+    CHAT_ACTIVITY_PAYLOAD_NESTED_SUMMARY_MAX_KEYS,
+  )) {
+    out[entryKey] = summarizeNestedActivityPayloadForUi(
+      entryValue,
+      entryKey,
+      depth + 1,
+      source,
+    );
+  }
+  const omitted = entries.length - Object.keys(out).length;
+  if (omitted > 0) out.__omitted_keys = omitted;
+  return out;
+}
+
+function sanitizeActivityPayloadForUi(
+  value: unknown,
+  key = "",
+  depth = 0,
+  parent?: unknown,
+): unknown {
+  const normalizedKey = key.trim().toLowerCase();
+  if (ACTIVITY_PAYLOAD_SECRET_KEY_PATTERN.test(normalizedKey)) {
+    return "[redacted]";
+  }
+  if (value == null || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    if (shouldOmitActivityPayloadString(normalizedKey, parent)) {
+      return value ? omittedStringLabel(value) : "";
+    }
+    if (isStreamLikeActivityRecord(parent)) {
+      return value;
     }
     return compactUiString(value);
   }
   if (depth >= CHAT_ACTIVITY_PAYLOAD_DEPTH_MAX) {
-    return Array.isArray(value)
-      ? `[omitted ${value.length.toLocaleString()} items]`
-      : "[omitted nested object]";
+    return summarizeNestedActivityPayloadForUi(value, key, 0, parent);
   }
   if (normalizedKey === "files" || normalizedKey === "sources") {
     return summarizeFilesPayloadForUi(value);
@@ -5464,7 +5798,9 @@ function sanitizeActivityPayloadForUi(
   if (Array.isArray(value)) {
     const items = value
       .slice(0, CHAT_ACTIVITY_PAYLOAD_ARRAY_MAX_ITEMS)
-      .map((entry) => sanitizeActivityPayloadForUi(entry, "", depth + 1));
+      .map((entry) =>
+        sanitizeActivityPayloadForUi(entry, "", depth + 1, value),
+      );
     if (value.length > items.length) {
       items.push(`[omitted ${value.length - items.length} more items]`);
     }
@@ -5479,6 +5815,7 @@ function sanitizeActivityPayloadForUi(
       entryValue,
       entryKey,
       depth + 1,
+      source,
     );
   }
   const omitted = entries.length - Object.keys(out).length;
@@ -6855,7 +7192,9 @@ function extractCodeFences(
 }
 
 function extractFirstCodeFence(text: string): string {
-  const first = extractCodeFences(text)[0];
+  const first = extractCodeFences(text).find((snippet) =>
+    isWorkspaceCodePreview(snippet.languageHint, snippet.code),
+  );
   return first?.code.trim() || "";
 }
 
@@ -6873,6 +7212,7 @@ function buildWorkspaceSnippetFiles(
     if (snippets.length === 0) return;
     replyIndex += 1;
     snippets.forEach((snippet, snippetIndex) => {
+      if (!isWorkspaceCodePreview(snippet.languageHint, snippet.code)) return;
       globalSnippetIndex += 1;
       const displayName = inferCodePreviewFileName(
         snippet.languageHint,
@@ -8473,6 +8813,8 @@ function ChatPageInner({
   const [selectedSnippetId, setSelectedSnippetId] = useState<string | null>(
     null,
   );
+  const [selectedSnippetOverride, setSelectedSnippetOverride] =
+    useState<WorkspaceSnippetEntry | null>(null);
   const [previewDialogOpen, setPreviewDialogOpen] = useState(false);
   const [researchReportDialog, setResearchReportDialog] =
     useState<ResearchReportDialogState | null>(null);
@@ -10889,6 +11231,22 @@ function ChatPageInner({
         return ["plan_step_update", planId, revision, stepId]
           .filter((part) => part.trim())
           .join(":");
+      }
+    }
+
+    if (stepType === "tool_progress") {
+      const streamKey = str(data.stream_key, str(value.stream_key, ""))
+        .trim();
+      if (streamKey) return streamKey;
+      const dataKind = normalizeStatusText(str(data.kind, ""));
+      if (dataKind === "phase_status") {
+        const toolName =
+          normalizeStatusText(str(data.tool_name, str(data.name, ""))) ||
+          "tool";
+        const phase =
+          normalizeStatusText(str(data.phase, str(value.phase, ""))) ||
+          "active";
+        return `phase-status:${toolName}:${phase}`;
       }
     }
 
@@ -14315,6 +14673,7 @@ function ChatPageInner({
     opts?: {
       sensitive?: boolean;
       conversationIdOverride?: string;
+      newConversation?: boolean;
       statusSource?: string;
       deepResearch?: boolean;
       resumeTaskId?: string;
@@ -14328,8 +14687,11 @@ function ChatPageInner({
     const requestedConversationOverride = (
       opts?.conversationIdOverride || ""
     ).trim();
+    const shouldStartNewConversation =
+      Boolean(opts?.newConversation) && !requestedConversationOverride && !isResumeMode;
     let targetConversationId =
-      requestedConversationOverride || conversationId || "";
+      requestedConversationOverride ||
+      (shouldStartNewConversation ? "" : conversationId || "");
     const preservedResumeSnapshot =
       isResumeMode && targetConversationId
         ? (() => {
@@ -14527,7 +14889,7 @@ function ChatPageInner({
           ? activeMessagePreview
           : str(preservedResumeSnapshot?.message, ""),
       startedAt: Date.now(),
-      initialMessageCount: messages.length,
+      initialMessageCount: shouldStartNewConversation ? 0 : messages.length,
       runId: "",
       mode: isResumeMode ? "resume" : "fresh",
       phase: "running",
@@ -15882,6 +16244,7 @@ function ChatPageInner({
       void runStreamingChat(launchMode === "resume_task" ? "" : message, [], {
         conversationIdOverride:
           str(detail?.conversationId, "").trim() || undefined,
+        newConversation: detail?.newConversation === true,
         statusSource: str(detail?.source, "").trim() || undefined,
         resumeTaskId: launchMode === "resume_task" ? resumeTaskId : undefined,
       }).catch((err) => {
@@ -15924,6 +16287,7 @@ function ChatPageInner({
       {
         conversationIdOverride:
           str(pendingLaunch.conversationId, "").trim() || undefined,
+        newConversation: pendingLaunch.newConversation === true,
         statusSource: str(pendingLaunch.source, "").trim() || undefined,
         resumeTaskId:
           pendingLaunch.launchMode === "resume_task"
@@ -16370,21 +16734,44 @@ function ChatPageInner({
     if (!selectedSnippetId) return;
     if (
       workspaceSnippetFiles.some((snippet) => snippet.id === selectedSnippetId)
-    )
+    ) {
+      if (selectedSnippetOverride?.id === selectedSnippetId) {
+        setSelectedSnippetOverride(null);
+      }
       return;
+    }
+    if (selectedSnippetOverride?.id === selectedSnippetId) {
+      return;
+    }
     setSelectedSnippetId(null);
-  }, [selectedSnippetId, workspaceSnippetFiles]);
+  }, [selectedSnippetId, selectedSnippetOverride, workspaceSnippetFiles]);
   // Keep this callback stable so messageRenderBundle memoization only busts
   // when message data changes.
   const openCodePreviewInWorkspace = useCallback(
     (request: CodePreviewOpenRequest) => {
+      const normalizedCode = str(request.code, "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\n$/, "");
+      const displayName =
+        str(request.fileName, "").trim() ||
+        inferCodePreviewFileName(request.languageHint, normalizedCode);
+      const snippetId =
+        request.snippetId ||
+        `preview::${displayName}::${normalizedCode.length}`;
       setWorkspaceOpen(true);
       setActiveStepId(null);
-      if (request.snippetId) {
-        setSelectedSnippetId(request.snippetId);
-        return;
+      setSelectedSnippetId(snippetId);
+      if (normalizedCode) {
+        setSelectedSnippetOverride({
+          id: snippetId,
+          name: displayName,
+          displayName,
+          content: normalizedCode,
+          languageHint: normalizeCodeFenceLanguage(request.languageHint),
+          sourceMessageId: "",
+          sourceLabel: "Current reply",
+        });
       }
-      setSelectedSnippetId(null);
     },
     [],
   );
@@ -16563,7 +16950,6 @@ function ChatPageInner({
       composerAwaitingPlanConfirmation ||
       isRunningPlanConfirmation ||
       isCompletedPlanConfirmation ||
-      isFailedPlanConfirmation ||
       isInterruptedPlanConfirmation);
   const planConfirmationEnabledCount =
     planConfirmation?.draft?.steps.filter((step) => step.enabled).length ?? 0;
@@ -17127,18 +17513,30 @@ function ChatPageInner({
   );
   const activeCodeFile = deployedFiles[codeViewerFileIdx] ?? null;
   const activeSnippetFile = useMemo(() => {
-    if (workspaceSnippetFiles.length === 0) return null;
+    if (workspaceSnippetFiles.length === 0 && !selectedSnippetOverride) {
+      return null;
+    }
     if (selectedSnippetId) {
       return (
+        (selectedSnippetOverride?.id === selectedSnippetId
+          ? selectedSnippetOverride
+          : null) ||
         workspaceSnippetFiles.find(
           (snippet) => snippet.id === selectedSnippetId,
         ) || null
       );
     }
     return deployedFiles.length === 0
-      ? workspaceSnippetFiles[workspaceSnippetFiles.length - 1] || null
+      ? workspaceSnippetFiles[workspaceSnippetFiles.length - 1] ||
+          selectedSnippetOverride ||
+          null
       : null;
-  }, [workspaceSnippetFiles, selectedSnippetId, deployedFiles.length]);
+  }, [
+    workspaceSnippetFiles,
+    selectedSnippetId,
+    selectedSnippetOverride,
+    deployedFiles.length,
+  ]);
   const activePhaseStatus =
     isStreamingForCurrentConversation || pendingSnapshotPhase === "running"
       ? (streamPhaseStatus ?? restoredPhaseStatus)
@@ -18717,15 +19115,15 @@ function ChatPageInner({
             : "1fr",
           lg: showWorkspacePanelInline
             ? showConversationSidebarInline
-              ? "clamp(188px, 13vw, 220px) minmax(0,1fr) clamp(340px, 26vw, 460px)"
-              : "minmax(0,1fr) clamp(360px, 30vw, 500px)"
+              ? "clamp(188px, 13vw, 220px) minmax(0,1fr) clamp(420px, 32vw, 640px)"
+              : "minmax(0,1fr) clamp(460px, 38vw, 720px)"
             : showConversationSidebarInline
               ? "clamp(192px, 13vw, 224px) minmax(0,1fr)"
               : "minmax(0,1fr)",
           xl: showWorkspacePanelInline
             ? showConversationSidebarInline
-              ? "clamp(192px, 12.5vw, 224px) minmax(0,1fr) clamp(400px, 30vw, 560px)"
-              : "minmax(0,1fr) clamp(420px, 32vw, 600px)"
+              ? "clamp(192px, 12.5vw, 224px) minmax(0,1fr) clamp(480px, 34vw, 700px)"
+              : "minmax(0,1fr) clamp(520px, 40vw, 780px)"
             : showConversationSidebarInline
               ? "clamp(196px, 12.5vw, 228px) minmax(0,1fr)"
               : "minmax(0,1fr)",
@@ -19480,6 +19878,7 @@ function ChatPageInner({
                   latestStreamingAssistantIndex === -1 ? (
                     !hasVisibleStreamingReply &&
                     !isPlanningDeepResearch &&
+                    !isRunningPlanConfirmation &&
                     visibleStreamingProgressMessages.length === 0 &&
                     liveChatTranscriptItems.length === 0 ? (
                     <Box className="chat-row chat-thinking-inline">
@@ -19490,7 +19889,7 @@ function ChatPageInner({
                     </Box>
                   ) : (
                     <>
-                      {isPlanningDeepResearch &&
+                      {(isPlanningDeepResearch || isRunningPlanConfirmation) &&
                       !hasVisibleStreamingReply ? (
                         <Box className="chat-row chat-row-plan-confirmation">
                           {renderAgentAvatar("chat-avatar-working")}

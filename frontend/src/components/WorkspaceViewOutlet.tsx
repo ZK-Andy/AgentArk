@@ -329,8 +329,11 @@ const VIEW_ROUTES: Record<string, WorkspaceViewRouteConfig> = {
     componentKey: "arkreflect",
     message: "Loading ArkReflect...",
     load: loadArkReflectPage,
-    render: (ArkReflectPage, { autoRefresh }) => (
-      <ArkReflectPage autoRefresh={autoRefresh} />
+    render: (ArkReflectPage, { autoRefresh, onNavigateToView }) => (
+      <ArkReflectPage
+        autoRefresh={autoRefresh}
+        onNavigateToView={onNavigateToView}
+      />
     ),
   },
 };

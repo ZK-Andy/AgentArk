@@ -55,6 +55,13 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "The security-layer framing is the load-bearing one. Build, deploy, monitor, and self-evolve are valuable; the reason any of them is safe to point at your real data is that the Ark wraps every action with a security boundary.",
                 ],
             },
+            AgentArkManualSection {
+                label: "creator attribution",
+                items: &[
+                    "If someone asks who created AgentArk, answer: AgentArk was created by Debanka. GitHub: https://github.com/debankadas.",
+                    "Keep this as local AgentArk identity knowledge for answering direct creator or ownership questions; do not proactively mention it when it is unrelated.",
+                ],
+            },
         ],
     },
     AgentArkManualDoc {
@@ -255,6 +262,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Settings > Integrations > Messaging Channels: Telegram, WhatsApp, Slack, Discord, Matrix, Teams, custom messaging channels, and Daily Brief delivery.",
                     "Settings > Integrations > Prebuilt Connectors: Google Workspace, Gmail, Calendar, GitHub, Notion, Twilio, and other connectors.",
                     "Settings > Integrations > Custom Integrations: user-added pack-based integrations installed from chat, from docs/OpenAPI/cURL, from uploads, or from local/remote bundles.",
+                    "Settings > Integrations > MCP Servers: external MCP-backed tool and resource servers.",
                     "Settings > Integrations > Companion Devices: paired iPhone, Android, desktop, home-server, Raspberry Pi, and custom devices with scoped grants and approvals.",
                     "Settings > Integrations > Webhooks & APIs: webhook and API-facing integration setup.",
                     "Settings > Integrations > Plugins: plugin-backed integrations.",
@@ -262,12 +270,13 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Library > Documents: uploaded files and indexed document context.",
                     "Moltbook: API key setup, status, run-now controls, and activity logs.",
                     "Tasks: scheduled or one-off tasks, including Input needed runs.",
-                    "ArkSentinel: ambient proposals, observations, and Background learning status.",
+                    "ArkSentinel: ambient proposals, observations, approvals, and Background learning status.",
+                    "ArkEvolve: learning status, saved suggestions, live tests, stable changes, and rollback.",
                     "ArkReflect: day, week, and month retrospectives over cached local work-unit clusters, narrative recap, source coverage, working-style rhythm, background-agent activity, and examples.",
                     "Watchers: monitor and poll-until workflows.",
                     "Apps: generated or managed apps, deployment, and app status.",
                     "Goals / Agents: long-running outcomes and specialist agents.",
-                    "Ark Core: ArkReflect, ArkSentinel, ArkEvolve, and ArkPulse for retrospection, background guidance, self-learning, and system health.",
+                    "Ark Core: ArkSentinel, ArkEvolve, ArkMemory, ArkReflect, and ArkPulse.",
                     "Trace / Analytics: what the agent did and how it performed.",
                     "Settings > Security / Advanced: security controls and expert settings.",
                 ],
@@ -280,19 +289,31 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Approvals go to Mission Control.",
                     "Google Workspace and other connectors are configured in Settings > Integrations > Prebuilt Connectors.",
                     "User-added pack-based integrations are managed in Settings > Integrations > Custom Integrations.",
+                    "MCP servers are managed in Settings > Integrations > MCP Servers.",
                     "Companion devices are managed in Settings > Integrations > Companion Devices.",
                     "Reusable notes or KB entries live in ArkMemory > Current Memory > Knowledge.",
                     "Uploaded files live in Library > Documents.",
                     "Image or video generation providers live in Settings > Media.",
                     "Moltbook uses the top-level Moltbook page.",
                     "Scheduled work uses Tasks; condition-based monitoring uses Watchers.",
-                    "ArkReflect Daily Digest delivery is enabled or disabled from Settings > General > Daily Brief.",
+                    "Reflection Daily Digest / ArkReflect delivery is enabled or disabled from Settings > General > Daily Brief.",
                     "Personal recaps, time-window clustering, and broad month/week/day reflection use ArkReflect.",
-                    "ArkEvolve history, impact, and review live in ArkEvolve; ArkSentinel and ArkEvolve switches live in Settings > Advanced.",
+                    "Learning history, impact, live tests, review-only suggestions, and rollback live in ArkEvolve; ArkSentinel and ArkEvolve switches live in Settings > Advanced.",
                     "Background learning and ArkSentinel proposals are inspected in ArkSentinel.",
                     "Behavior debugging uses Trace or Analytics.",
                     "Specialist agents and delegation use Agents.",
                     "Health findings and remediation use ArkPulse in Ark Core.",
+                ],
+            },
+            AgentArkManualSection {
+                label: "semantic intent map",
+                items: &[
+                    "Do not require product-name phrasing from users. Interpret the underlying intent and route to the matching branded surface by meaning, not by keyword matching.",
+                    "ArkMemory owns persistent personal/work knowledge: durable facts, preferences, user data, source attribution, and reusable knowledge-base items.",
+                    "ArkSentinel owns operator decision state: approvals, rejected or snoozed suggestions, background observations, and items waiting for user attention.",
+                    "ArkEvolve owns the improvement lifecycle: learning state, experiments, canary or live tests, stable behavior changes, deployment uncertainty, rollback state, and self-evolve controls.",
+                    "ArkReflect owns retrospective understanding: time-window recaps, work patterns, source coverage, activity rhythm, and background-agent activity summaries.",
+                    "ArkPulse owns operational health: diagnostics, findings, runtime state, remediation guidance, and safe fix execution.",
                 ],
             },
             AgentArkManualSection {
@@ -996,19 +1017,18 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
         ],
     },
     AgentArkManualDoc {
-        title: "Library, memory, documents, and MCP",
-        slug: "library-memory-documents-and-mcp",
+        title: "Library, memory, and documents",
+        slug: "library-memory-documents",
         tags: &[
             "library",
             "documents",
             "memory",
             "knowledge",
-            "mcp",
             "facts",
             "preferences",
             "user_data",
         ],
-        summary: "Library, memory, documents, and MCP are related but distinct surfaces.",
+        summary: "Library, memory, and documents are related but distinct knowledge and retrieval surfaces.",
         sections: &[
             AgentArkManualSection {
                 label: "paths",
@@ -1020,7 +1040,6 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "ArkMemory > Current Memory > Preferences.",
                     "ArkMemory > Current Memory > User Data.",
                     "ArkMemory > Current Memory > Knowledge.",
-                    "Settings > Knowledge > MCP Servers.",
                 ],
             },
             AgentArkManualSection {
@@ -1031,7 +1050,6 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Preferences are long-lived user preferences and rules.",
                     "User Data is for captured notes, links, and user-supplied structured data.",
                     "Knowledge is for reusable knowledge-base items, including AgentArk manual and capability entries after sync.",
-                    "MCP Servers are external tool servers that extend what __PRODUCT_NAME__ can access.",
                 ],
             },
             AgentArkManualSection {
@@ -1041,7 +1059,6 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Use `memory_lookup` when you need durable learned facts, operating constraints, lessons, or procedures during an active request.",
                     "Use ArkMemory > Current Memory > Knowledge for reusable KB entries, notes, or curated instructions.",
                     "Use Facts, Preferences, and User Data when the question is about what __PRODUCT_NAME__ remembers.",
-                    "Use Settings > Knowledge > MCP Servers when you want to add or manage external MCP-backed tools.",
                 ],
             },
             AgentArkManualSection {
@@ -1049,7 +1066,6 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 items: &[
                     "Uploaded files appear in Library > Documents.",
                     "Reusable knowledge items appear in ArkMemory > Current Memory > Knowledge.",
-                    "Enabled MCP servers appear in the MCP list and expose their tools or resources.",
                 ],
             },
             AgentArkManualSection {
@@ -1057,7 +1073,6 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 items: &[
                     "Documents are file-centric; Knowledge is reusable KB content.",
                     "Memory is the structured store; Knowledge is only one tab inside that area.",
-                    "MCP is external capability extension, not the local knowledge base.",
                 ],
             },
         ],
@@ -1287,7 +1302,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 label: "where to inspect",
                 items: &[
                     "Start in Chat with the current runtime access summary and action catalog because they are request-scoped live clues.",
-                    "Use Settings > Integrations > Messaging Channels and Settings > Integrations > Prebuilt Connectors for connected systems.",
+                    "Use Settings > Integrations for messaging channels, prebuilt connectors, MCP servers, plugins, webhooks, and custom APIs.",
                     "Use ArkMemory and Library > Documents for memory and indexed files.",
                     "Use Tasks, Watchers, Goals, Apps, ArkReflect, Trace, Analytics, and ArkPulse for durable work and operational investigation.",
                     "Use Settings > Security, Settings > Advanced, and Settings > Observability for approvals, runtime policy, export, and deploy defaults.",
@@ -1356,7 +1371,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Source coverage across main chat, ArkOrbit chat, memory, procedural patterns, apps, goals, watchers, ArkSentinel, ArkPulse, ArkEvolve, and LLM usage.",
                     "Working-style and activity rhythm charts so novice users can see how the period felt without reading raw logs.",
                     "A background-agent lane for work that happened outside direct chat, such as watchers, Sentinel, Pulse, and Evolve activity.",
-                    "A Today Status card that shows current-day cached activity and the latest ArkReflect Daily Digest state.",
+                    "A Today Status card that shows current-day cached activity and the latest Reflection Daily Digest / ArkReflect state.",
                     "An examples drawer that keeps technical evidence available without forcing it into the novice-first view.",
                 ],
             },
@@ -1384,7 +1399,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 items: &[
                     "`GET /reflect` should be treated as a cached read. Do not expect it to scan all sources, embed, and cluster inline.",
                     "Refresh work is single-flight guarded, lease-protected, timeout-bounded, and designed to run in the background when AgentArk is quiet.",
-                    "ArkReflect Daily Digest delivery is off by default. Users can enable it in Settings; it then prepares a user-readable recap with the configured model and sends it only when the structured day has meaningful activity.",
+                    "Reflection Daily Digest / ArkReflect delivery is off by default. Users can enable it in Settings; it then prepares a user-readable recap with the configured model and sends it only when the structured day has meaningful activity.",
                     "If the daily digest gate finds nothing meaningful, no in-app or external notification is sent.",
                     "If cache is empty or stale, show the preparing or stale state calmly and let the refresh job fill the cache; do not present this as a severe warning.",
                     "If semantic embeddings are unavailable, ArkReflect can still show source-aware activity summaries while semantic grouping catches up.",
@@ -1393,7 +1408,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             AgentArkManualSection {
                 label: "answer rules",
                 items: &[
-                    "When the user asks what they worked on in a day, week, or month, point to ArkReflect before Trace or Analytics unless they specifically need a single run or cost breakdown.",
+                    "When the user asks for retrospective understanding of a day, week, or month, point to ArkReflect before Trace or Analytics unless they specifically need a single run or cost breakdown.",
                     "Use Trace for exact execution steps, Analytics for token or model spend, ArkPulse for health findings, and ArkReflect for the broad personal recap.",
                     "Explain ArkReflect as local and cached by default. Refresh is explicit or background; normal reads should not hang the server.",
                     "Do not describe ArkReflect as exact phrase matching. Its grouping is based on derived source summaries and embeddings over work units.",
@@ -1444,7 +1459,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                     "Use trace, conversation, run, and task ids as operational references for correlation; they are not credentials or secrets by themselves.",
                     "Open Analytics when the user asks about usage, volume, model mix, or cost trends.",
                     "Open ArkReflect when the user wants a broad recap of what happened across chat, ArkOrbit, apps, goals, watchers, memory, and background systems.",
-                    "Open ArkPulse when the user asks whether the system is healthy or wants guided remediation for operational findings.",
+                    "Open ArkPulse when the user needs operational health or guided remediation for operational findings.",
                 ],
             },
             AgentArkManualSection {
@@ -1490,7 +1505,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             "erl",
             "settings",
         ],
-        summary: "ArkEvolve is the top-level page for local memory-driven learning, impact, canary tests, and review; Settings > Advanced holds ArkSentinel and ArkEvolve switches.",
+        summary: "ArkEvolve is the top-level page for local memory-driven learning, impact, live tests, review-only suggestions, and rollback; Settings > Advanced holds ArkSentinel and ArkEvolve switches.",
         sections: &[
             AgentArkManualSection {
                 label: "learning pipeline",
@@ -1525,11 +1540,11 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             AgentArkManualSection {
                 label: "ArkEvolve page",
                 items: &[
-                    "ArkEvolve > What happened explains recent tested or promoted changes in plain language.",
-                    "ArkEvolve > What helped summarizes measured impact from recent prompt, classifier, specialist, and routing changes.",
-                    "ArkEvolve > Tests running shows canary rollout, baseline version, candidate version, and gate result for each evolvable surface.",
-                    "ArkEvolve > Review lists draft learning candidates and keeps them as suggestions until approved.",
-                    "ArkEvolve > Review also shows `Prompt cost signals` with aggregated prompt telemetry such as p95 final prompt size, p95 tool schema size, estimated request size, and largest prompt sections.",
+                    "ArkEvolve > Overview explains current state, whether behavior changed, what happens next, and whether rollback is available.",
+                    "ArkEvolve > Results summarizes measured impact from recent prompt, classifier, specialist, and routing changes.",
+                    "ArkEvolve > Live tests shows canary rollout, baseline version, candidate version, and gate result for each evolvable surface.",
+                    "ArkEvolve > Review queue lists draft learning candidates and keeps them as suggestions until approved.",
+                    "ArkEvolve > Review queue may include review-only optimization suggestions; saving one for follow-up records the idea and does not change runtime behavior.",
                     "ArkEvolve > Controls keeps developer-mode canary actions; Settings > Advanced holds ArkEvolve and ArkSentinel switches plus app deploy defaults.",
                 ],
             },
@@ -1545,9 +1560,9 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 label: "answer rules",
                 items: &[
                     "If the user asks how self-learning works, explain the pipeline first and then the current instance status.",
-                    "If the user asks whether it is enabled or what it has learned, point to Settings > Advanced for switches and ArkEvolve for current counts, tests, and review.",
-                    "If the user asks about background learning status or why it is not running, lead with the live ArkSentinel background learning state and per-job status first.",
-                    "If the user asks about prompt cost, prompt size, or where to inspect prompt telemetry, route them to Trace for the per-run `Prompt Telemetry` step and ArkEvolve > Review for aggregates and review-only suggestions.",
+                    "If the user asks about the learning system's current state, point to Settings > Advanced for switches and ArkEvolve for current counts, tests, review-only suggestions, and rollback state.",
+                    "If the user asks about background learning state, lead with the live ArkSentinel background learning state and per-job status first.",
+                    "If the user asks about prompt cost, prompt size, or prompt telemetry, route them to Trace for per-run evidence and ArkEvolve > Review queue for aggregates and review-only suggestions.",
                     "Use live status rather than stale docs when debugging background learning.",
                     "Do not describe the current product as continuously retraining base model weights unless that deployment explicitly has a parameter-updating feature enabled.",
                     "Keep official product explanation separate from draft candidate content.",
@@ -1654,13 +1669,13 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             "canary",
             "review",
         ],
-        summary: "Prompt telemetry measures final prompt and tool-schema size without changing runtime prompt assembly. Use Trace for one run, ArkEvolve > Review for aggregates and review items, and observability export for numeric metrics when enabled.",
+        summary: "Prompt telemetry measures final prompt and tool-schema size without changing runtime prompt assembly. Use Trace for one run, ArkEvolve > Review queue for aggregates and review items, and observability export for numeric metrics when enabled.",
         sections: &[
             AgentArkManualSection {
                 label: "where to inspect",
                 items: &[
                     "Trace > Trace Detail for a single run.",
-                    "ArkEvolve > Review for prompt cost aggregates, largest sections, and review-only optimization proposals.",
+                    "ArkEvolve > Review queue for prompt cost aggregates, largest sections, and review-only optimization proposals.",
                     "Settings > Observability and the external observability backend for exported numeric prompt metrics when export is enabled.",
                 ],
             },
@@ -1677,7 +1692,7 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 label: "what it does not do",
                 items: &[
                     "It does not automatically trim prompt sections or rewrite runtime assembly logic.",
-                    "Prompt optimization proposals in ArkEvolve > Review are suggestions only until explicitly approved, and approval currently records review state rather than changing runtime prompt behavior.",
+                    "Prompt optimization proposals in ArkEvolve > Review queue are suggestions only until explicitly approved, and approval currently records review state rather than changing runtime prompt behavior.",
                     "Observability export is metrics-only; it should not export raw prompt text, raw tool schemas, or user content.",
                 ],
             },
@@ -1686,16 +1701,16 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
                 items: &[
                     "Prompt, classifier-prompt, and specialist-prompt canaries are watched against resolved experience runs.",
                     "Clear measured regression can disable the canary automatically and raise a notification with the reason.",
-                    "Weaker negative signals remain review items in ArkEvolve > Review so the operator can choose `Disable canary` or `Keep active`.",
+                    "Weaker negative signals remain review items in ArkEvolve > Review queue so the operator can choose `Disable canary` or `Keep active`.",
                 ],
             },
             AgentArkManualSection {
                 label: "verify",
                 items: &[
                     "A recent run shows a `Prompt Telemetry` step in Trace.",
-                    "ArkEvolve > Review shows prompt cost signals after enough runs exist.",
+                    "ArkEvolve > Review queue shows prompt cost signals after enough runs exist.",
                     "If observability export is enabled, prompt metrics appear as numeric attributes rather than raw prompt content.",
-                    "If canary safety triggers, the operator sees a notification and a prompt canary safety item in ArkEvolve > Review.",
+                    "If canary safety triggers, the operator sees a notification and a prompt canary safety item in ArkEvolve > Review queue.",
                 ],
             },
             AgentArkManualSection {
@@ -1709,8 +1724,8 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
         ],
     },
     AgentArkManualDoc {
-        title: "Plugins, webhooks, and custom APIs",
-        slug: "plugins-webhooks-and-custom-apis",
+        title: "MCP servers, plugins, webhooks, and custom APIs",
+        slug: "mcp-servers-plugins-webhooks-and-custom-apis",
         tags: &[
             "plugins",
             "webhooks",
@@ -1719,11 +1734,12 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             "mcp",
             "events",
         ],
-        summary: "Webhooks & APIs and Plugins are related integration surfaces, but they cover different flows.",
+        summary: "MCP Servers, Webhooks & APIs, and Plugins are related integration surfaces, but they cover different flows.",
         sections: &[
             AgentArkManualSection {
                 label: "paths",
                 items: &[
+                    "Settings > Integrations > MCP Servers.",
                     "Settings > Integrations > Webhooks & APIs.",
                     "Settings > Integrations > Plugins.",
                 ],
@@ -1731,9 +1747,18 @@ pub(crate) const AGENTARK_MANUAL_DOCS: &[AgentArkManualDoc] = &[
             AgentArkManualSection {
                 label: "what belongs where",
                 items: &[
+                    "MCP Servers covers external Model Context Protocol servers that expose tools or resources through configured transports.",
                     "Webhooks & APIs covers incoming webhook sources, webhook events, and imported custom APIs.",
                     "Plugins covers third-party plugin SDK integrations and their subscribed platform events.",
                     "Custom Integrations covers user-added extension-pack integrations that the agent installs or scaffolds as reusable tools.",
+                ],
+            },
+            AgentArkManualSection {
+                label: "mcp servers",
+                items: &[
+                    "Add or edit the MCP server connection in Settings > Integrations > MCP Servers.",
+                    "Confirm the transport, auth, tool/resource exposure, and enabled state before relying on it in an agent workflow.",
+                    "Treat MCP as an external capability extension, not as an ArkMemory knowledge-base item.",
                 ],
             },
             AgentArkManualSection {

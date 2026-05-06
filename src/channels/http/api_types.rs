@@ -35,8 +35,33 @@ pub(super) struct StatusResponse {
     pub actions_loaded: Option<usize>,
     pub tasks_pending: usize,
     pub version: String,
+    pub runtime_health: RuntimeHealthResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateStatusResponse>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(super) struct RuntimeHealthResponse {
+    pub uptime_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_pressure_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_read_bytes_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write_bytes_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_celsius: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_average_1m: Option<f64>,
+    pub sampled_at: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1222,6 +1247,9 @@ pub(super) struct EvolutionSettingsResponse {
         Vec<crate::core::self_evolve::PromotionGateReason>,
     pub(super) prompt_fragment_promotion_mode: String,
     pub(super) routing_rollback_available: bool,
+    pub(super) prompt_rollback_available: bool,
+    pub(super) specialist_prompt_rollback_available: bool,
+    pub(super) prompt_fragment_rollback_available: bool,
     pub(super) deploy_guard_default: bool,
     pub(super) readiness_policy: crate::core::ReadinessPolicy,
     pub(super) gepa_config: crate::core::self_evolve::gepa_bridge::GepaOptimizerConfig,
@@ -1239,6 +1267,7 @@ pub(super) struct EvolutionSettingsUpdateRequest {
     pub(super) learning_model_slot: Option<String>,
     pub(super) learning_queue_cap: Option<u64>,
     pub(super) readiness_policy: Option<crate::core::ReadinessPolicy>,
+    pub(super) gepa_enabled: Option<bool>,
     pub(super) gepa_auto_mode: Option<String>,
     pub(super) gepa_daily_budget_usd: Option<f64>,
     pub(super) gepa_per_run_budget_usd: Option<f64>,

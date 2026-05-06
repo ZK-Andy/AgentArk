@@ -114,6 +114,7 @@ struct AgentLoopStreamCapture {
     token_text: String,
     reasoning_text: String,
     draft_files: std::collections::BTreeMap<String, AgentLoopDraftFileCapture>,
+    file_patches: Vec<crate::core::llm::stream_blocks::ParsedStreamPatch>,
     delete_paths: Vec<String>,
     delete_orphans: bool,
 }
@@ -184,6 +185,29 @@ impl AgentLoopStreamCapture {
                     self.delete_paths.push(path.to_string());
                 }
             }
+            "patch_file" => {
+                let Some(path) = payload
+                    .get("path")
+                    .or_else(|| payload.get("file"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    return;
+                };
+                let Some(patch) = payload
+                    .get("patch")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    return;
+                };
+                self.file_patches
+                    .push(crate::core::llm::stream_blocks::ParsedStreamPatch {
+                        path: path.to_string(),
+                        patch: patch.to_string(),
+                    });
+            }
             _ => {}
         }
     }
@@ -207,6 +231,7 @@ impl AgentLoopStreamCapture {
                 blocks.files.insert(path.clone(), file.content.clone());
             }
         }
+        blocks.file_patches = self.file_patches.clone();
         blocks.delete_paths = self.delete_paths.clone();
         blocks.delete_orphans = self.delete_orphans;
         blocks
@@ -230,7 +255,23 @@ impl AgentLoopStreamCapture {
             .map(|path| path.chars().count().saturating_add(16))
             .sum::<usize>()
             .saturating_add(if self.delete_orphans { 16 } else { 0 });
-        token_text_chars.max(draft_file_chars.saturating_add(delete_chars))
+        let patch_chars = self
+            .file_patches
+            .iter()
+            .map(|patch| {
+                patch
+                    .path
+                    .chars()
+                    .count()
+                    .saturating_add(patch.patch.chars().count())
+                    .saturating_add(24)
+            })
+            .sum::<usize>();
+        token_text_chars.max(
+            draft_file_chars
+                .saturating_add(patch_chars)
+                .saturating_add(delete_chars),
+        )
     }
 }
 
@@ -1121,6 +1162,7 @@ fn agent_loop_system_prompt() -> String {
         "When a turn_plan is present, treat it as the typed contract for the turn: complete each pending goal, including plain answer/research goals that require no durable object.\n",
         "When an advisory_intent_plan contains multiple intents, complete each user-visible outcome before finalizing. You may call multiple authorized actions in one step when the outcomes are independent. If one outcome succeeds and another fails or needs input, report the partial result honestly.\n",
         "When a direct authorized durable action matches the goal's object class through its metadata, use that action rather than a code, shell, extension-management, or sandbox surrogate. Reserve code execution for computation, validation, or when no direct durable action exists.\n",
+        "Distinguish evidence gathering from delivery. When the user's intended outcome is a reusable deliverable or artifact such as an analytical model, report, table, file, dashboard, app, document, or other durable work product, treat search/research/read actions as inputs, not completion. After gathering enough evidence, use the appropriate authorized authoring or deployment action before finalizing. Finish with prose alone only when the requested outcome is the answer itself, the user explicitly does not want an artifact, or no suitable authoring action is authorized.\n",
         "Request-scoped active_guidance is supplied in the user prompt. Follow those fragments when their internal capability tags are active, and do not apply inactive flow guidance just because it exists elsewhere in AgentArk.\n",
     ));
     prompt.push_str(concat!(
@@ -2021,6 +2063,17 @@ fn should_use_app_delivery_stream_blocks_mode(
     );
     if pending_required_names.is_empty() {
         return app_delivery_fast_path;
+    }
+    let pending_requires_non_deploy_app_action = pending_required_names.iter().any(|name| {
+        authorized_actions
+            .iter()
+            .find(|action| action.name == name.as_str())
+            .is_some_and(|action| {
+                action_is_app_write_candidate(action) && !action_is_app_delivery_candidate(action)
+            })
+    });
+    if pending_requires_non_deploy_app_action {
+        return false;
     }
     pending_required_names
         .into_iter()
@@ -3678,14 +3731,16 @@ fn build_agent_loop_user_prompt(
             "app_delivery_file_stream_protocol": {
                 "use_when": "The current turn plan requires generated app/site/dashboard/tool delivery.",
                 "file_block_shape": "<file path=\"relative/path.ext\">complete file contents</file>",
+                "patch_block_shape": "<patch path=\"relative/path.ext\">unified diff</patch>",
                 "delete_block_shape": "<delete path=\"relative/path.ext\"/>",
                 "replace_all_shape": "<delete path=\"*\"/>",
                 "rules": [
-                    "Emit one <file> block per app file.",
+                    "Emit one <file> block per app file for new files or deliberate full-file replacements.",
+                    "When updating an existing app file with a localized change, prefer one <patch> block containing a unified diff for that file.",
                     "Use app-relative paths such as index.html, style.css, app.js, package.json, or src/App.tsx.",
                     "Emit the minimal complete file set for the requested app; ordinary browser-native apps should be compact bundles, not product scaffolds.",
-                    "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file blocks, or native tool calls.",
-                    "AgentArk will parse the streamed file blocks and run the app delivery action after the model response completes."
+                    "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file or patch blocks, or native tool calls.",
+                    "AgentArk will parse the streamed file/patch blocks and run the app delivery action after the model response completes."
                 ]
             }
         })
@@ -3704,7 +3759,7 @@ fn build_agent_loop_user_prompt(
         })
     };
     let app_delivery_rule = if app_delivery_stream_blocks {
-        "For generated app/site/dashboard/tool delivery, emit complete app files as streaming <file> blocks using the protocol above. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep the bundle lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs such as secrets, authenticated server-side APIs, durable jobs with no browser open, server-side databases/state, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs the browser/app proxy cannot safely call. Deploy locally by default; content visibility or audience requirements inside the app are not the same as external network exposure. Do not call or spell out app_deploy JSON in this model response; AgentArk will synthesize and run the app-hosting action from the parsed file blocks. When updating a recent deployed app, preserve the active workspace identity, original requirements, current deployed files, and working behavior unless the user asks to replace or recreate it. After deployment, nudge the user to the Apps page for controls and details."
+        "For generated app/site/dashboard/tool delivery, emit complete app files as streaming <file> blocks for new files and deliberate full-file replacements, and emit <patch> unified-diff blocks for localized edits to existing app files. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep the bundle lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs such as secrets, authenticated server-side APIs, durable jobs with no browser open, server-side databases/state, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs the browser/app proxy cannot safely call. Deploy locally by default; content visibility or audience requirements inside the app are not the same as external network exposure. Do not call or spell out app_deploy JSON in this model response; AgentArk will synthesize and run the app-hosting action from the parsed file/patch blocks. When updating a recent deployed app, preserve the active workspace identity, original requirements, current deployed files, and working behavior unless the user asks to replace or recreate it. After deployment, nudge the user to the Apps page for controls and details."
     } else {
         "For generated app/site/dashboard/tool delivery, file writes only stage content. Build the smallest working app that satisfies the requested workflow, with polished responsive UI, clear controls, and useful loading/empty/error states. Keep the bundle lean: avoid unrelated routes, auth, databases, admin areas, test suites, generated boilerplate, package manifests, server files, or lifecycle commands unless the user's intent semantically requires them. Prefer a standalone static/browser bundle when the requested behavior can run with browser APIs, timers, client-side state, and public same-origin/app-scoped fetch. Use a dynamic backend/runtime only for server-only needs such as secrets, authenticated server-side APIs, durable jobs with no browser open, server-side databases/state, filesystem/process access, webhooks, private-network access, non-HTTP protocols, or APIs the browser/app proxy cannot safely call. Deploy locally by default; content visibility or audience requirements inside the app are not the same as external network exposure. Finish with the authorized app-hosting action that returns the runnable app result or asks for missing required inputs. When the turn updates a recent deployed app, preserve the active workspace identity, original requirements, and current deployed files, and working behavior unless the user asks to replace or recreate it. After deployment, nudge the user to the Apps page for controls and details."
     };
@@ -3898,14 +3953,16 @@ fn build_agent_loop_followup_prompt(
             "tool_calling": "disabled_for_app_delivery_file_stream",
             "app_delivery_file_stream_protocol": {
                 "file_block_shape": "<file path=\"relative/path.ext\">complete file contents</file>",
+                "patch_block_shape": "<patch path=\"relative/path.ext\">unified diff</patch>",
                 "delete_block_shape": "<delete path=\"relative/path.ext\"/>",
                 "replace_all_shape": "<delete path=\"*\"/>",
                 "rules": [
-                    "Emit one <file> block per app file.",
+                    "Emit one <file> block per app file for new files or deliberate full-file replacements.",
+                    "When updating an existing app file with a localized change, prefer one <patch> block containing a unified diff for that file.",
                     "Use app-relative paths.",
                     "Emit the minimal complete file set for the requested app; ordinary browser-native apps should be compact bundles, not product scaffolds.",
-                    "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file blocks, or native tool calls.",
-                    "AgentArk will parse the streamed file blocks and run app delivery after this response completes."
+                    "Do not emit app_deploy JSON, agent_tool_calls JSON, markdown code fences around the file or patch blocks, or native tool calls.",
+                    "AgentArk will parse the streamed file/patch blocks and run app delivery after this response completes."
                 ]
             }
         })
@@ -4163,6 +4220,48 @@ fn stream_block_files_json(
     )
 }
 
+fn stream_block_file_patches_json(
+    blocks: &crate::core::llm::stream_blocks::ParsedStreamBlocks,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        blocks
+            .file_patches
+            .iter()
+            .map(|patch| {
+                serde_json::json!({
+                    "path": patch.path,
+                    "patch": patch.patch,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn append_stream_block_file_patches(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    blocks: &crate::core::llm::stream_blocks::ParsedStreamBlocks,
+) {
+    if blocks.file_patches.is_empty() {
+        return;
+    }
+    let file_patches = arguments
+        .entry("file_patches".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(items) = file_patches.as_array_mut() else {
+        return;
+    };
+    for patch in &blocks.file_patches {
+        if !items.iter().any(|item| {
+            item.get("path").and_then(|value| value.as_str()) == Some(patch.path.as_str())
+        }) {
+            items.push(serde_json::json!({
+                "path": patch.path,
+                "patch": patch.patch,
+            }));
+        }
+    }
+}
+
 fn append_stream_block_delete_paths(
     arguments: &mut serde_json::Map<String, serde_json::Value>,
     blocks: &crate::core::llm::stream_blocks::ParsedStreamBlocks,
@@ -4194,15 +4293,22 @@ fn merge_streamed_app_blocks_into_tool_call(
         return call;
     }
     let mut arguments = call.arguments.as_object().cloned().unwrap_or_default();
+    arguments.insert(
+        "_streamed_app_delivery".to_string(),
+        serde_json::json!(true),
+    );
     let existing = serde_json::Value::Object(arguments.clone());
     let has_deployable_source = app_delivery_call_has_deployable_source(&existing);
     if !blocks.files.is_empty() && !has_deployable_source {
         arguments.insert("files".to_string(), stream_block_files_json(blocks));
     }
+    append_stream_block_file_patches(&mut arguments, blocks);
     append_stream_block_delete_paths(&mut arguments, blocks);
     if !arguments.contains_key("mode") {
         if blocks.delete_orphans {
             arguments.insert("mode".to_string(), serde_json::json!("replace"));
+        } else if !blocks.file_patches.is_empty() {
+            arguments.insert("mode".to_string(), serde_json::json!("patch"));
         } else if arguments
             .get("app_id")
             .and_then(|value| value.as_str())
@@ -4220,8 +4326,19 @@ fn synthetic_app_deploy_call_from_stream_blocks(
     blocks: &crate::core::llm::stream_blocks::ParsedStreamBlocks,
 ) -> crate::core::llm::ToolCall {
     let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "_streamed_app_delivery".to_string(),
+        serde_json::json!(true),
+    );
     if !blocks.files.is_empty() {
         arguments.insert("files".to_string(), stream_block_files_json(blocks));
+    }
+    if !blocks.file_patches.is_empty() {
+        arguments.insert(
+            "file_patches".to_string(),
+            stream_block_file_patches_json(blocks),
+        );
+        arguments.insert("mode".to_string(), serde_json::json!("patch"));
     }
     if !blocks.delete_paths.is_empty() {
         arguments.insert(
@@ -4252,6 +4369,7 @@ fn merge_app_delivery_stream_blocks(
     for (path, content) in source.files {
         target.files.insert(path, content);
     }
+    target.file_patches.extend(source.file_patches);
     for path in source.delete_paths {
         if !target.delete_paths.iter().any(|existing| existing == &path) {
             target.delete_paths.push(path);
@@ -4410,6 +4528,14 @@ fn app_delivery_continuation_capture_state(capture: &AgentLoopStreamCapture) -> 
     serde_json::json!({
         "completed_files_already_saved_by_agentark": completed_files,
         "incomplete_files_to_finish": incomplete_files,
+        "completed_patches": capture
+            .file_patches
+            .iter()
+            .map(|patch| serde_json::json!({
+                "path": patch.path,
+                "chars": patch.patch.chars().count(),
+            }))
+            .collect::<Vec<_>>(),
         "delete_paths": capture.delete_paths.clone(),
         "delete_orphans": capture.delete_orphans,
         "raw_stream_tail": safe_tail_chars(&capture.token_text, 6_000),
@@ -4423,6 +4549,7 @@ fn app_delivery_continuation_system_prompt() -> String {
         "An earlier app-generation model stream was interrupted before AgentArk received a valid deploy action.\n",
         "Continue only the app delivery. Do not answer the user conversationally, do not request action-scope expansion, and do not call unrelated tools.\n",
         "Emit complete app file blocks using exactly <file path=\"relative/path.ext\">complete file contents</file> for files that are incomplete, missing, or need replacement.\n",
+        "For targeted edits to an existing complete file, emit <patch path=\"relative/path.ext\">unified diff</patch> instead of re-emitting the whole file.\n",
         "If a previously completed file does not need changes, omit it; AgentArk will merge saved completed files with your new complete blocks.\n",
         "For any file listed as incomplete, emit one complete final <file> block for that same path. Do not emit partial deltas.\n",
         "Use app-relative paths only. Do not wrap file blocks in markdown fences or prose.\n"
@@ -4440,6 +4567,7 @@ fn build_app_delivery_continuation_prompt(
             "version": AGENT_TURN_LOOP_VERSION,
             "tool_calling": "disabled_for_app_delivery_continuation",
             "file_block_shape": "<file path=\"relative/path.ext\">complete file contents</file>",
+            "patch_block_shape": "<patch path=\"relative/path.ext\">unified diff</patch>",
             "merge_policy": "AgentArk will merge completed saved files with complete file blocks emitted now. Re-emitting the same path replaces the saved content for that path."
         },
         "original_user_message": original_message,
@@ -4448,7 +4576,7 @@ fn build_app_delivery_continuation_prompt(
             "recovery_budget": "one bounded continuation attempt"
         },
         "saved_partial_state": app_delivery_continuation_capture_state(capture),
-        "instruction": "Continue from the saved app-delivery state. Emit only complete <file> blocks needed to finish a deployable app bundle. If no file is incomplete, emit complete replacements only for files that are necessary to make the app deployable."
+        "instruction": "Continue from the saved app-delivery state. Emit only complete <file> blocks needed to finish a deployable app bundle. If the existing target file is complete and only needs a small edit, emit a <patch> unified diff instead of a complete replacement."
     }))
     .unwrap_or_else(|_| original_message.to_string())
 }
@@ -4646,6 +4774,217 @@ fn app_delivery_call_has_deployable_source(arguments: &serde_json::Value) -> boo
         .map(|items| !items.is_empty())
         .unwrap_or(false);
     has_file_patches || has_deletes
+}
+
+fn non_empty_str_field<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+    })
+}
+
+fn active_workspace_app_id(
+    active_workspace_snapshot: Option<&serde_json::Value>,
+) -> Option<String> {
+    let value = active_workspace_snapshot?;
+    non_empty_str_field(value, &["app_id", "id"])
+        .or_else(|| {
+            value
+                .get("app")
+                .and_then(|app| non_empty_str_field(app, &["app_id", "id"]))
+        })
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| non_empty_str_field(data, &["app_id", "id"]))
+        })
+        .map(ToString::to_string)
+}
+
+fn normalized_structural_ref(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('/')
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn dependency_matches_artifact(dependency: &str, artifact: &ConversationArtifactContext) -> bool {
+    let dep = normalized_structural_ref(dependency);
+    if dep.is_empty() {
+        return false;
+    }
+    [
+        artifact.artifact_id.as_str(),
+        artifact.title.as_str(),
+        artifact.url.as_str(),
+    ]
+    .into_iter()
+    .map(normalized_structural_ref)
+    .any(|candidate| !candidate.is_empty() && candidate == dep)
+}
+
+fn turn_plan_has_artifact_dependency(
+    plan: Option<&AgentLoopTurnPlanState>,
+    artifact: &ConversationArtifactContext,
+) -> bool {
+    plan.map(|plan| {
+        plan.goals.iter().any(|goal| {
+            goal.dependencies
+                .iter()
+                .any(|dependency| dependency_matches_artifact(dependency, artifact))
+                || goal.result_ref.as_ref().is_some_and(|result_ref| {
+                    result_ref.kind.trim().eq_ignore_ascii_case("app")
+                        && result_ref.id.trim() == artifact.artifact_id.trim()
+                })
+        })
+    })
+    .unwrap_or(false)
+}
+
+fn turn_plan_has_any_dependency(plan: Option<&AgentLoopTurnPlanState>) -> bool {
+    plan.map(|plan| {
+        plan.goals.iter().any(|goal| {
+            !goal.dependencies.is_empty()
+                || goal.result_ref.as_ref().is_some_and(|result_ref| {
+                    !result_ref.id.trim().is_empty() || !result_ref.kind.trim().is_empty()
+                })
+        })
+    })
+    .unwrap_or(false)
+}
+
+fn app_deploy_args_have_target(arguments: &serde_json::Value) -> bool {
+    arguments
+        .get("app_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn app_deploy_args_have_edit_source(arguments: &serde_json::Value) -> bool {
+    let Some(obj) = arguments.as_object() else {
+        return false;
+    };
+    let has_files = obj
+        .get("files")
+        .and_then(|value| value.as_object())
+        .is_some_and(|files| !files.is_empty());
+    let has_patches = obj
+        .get("file_patches")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty());
+    let has_deletes = obj
+        .get("delete_paths")
+        .and_then(|value| value.as_array())
+        .is_some_and(|items| !items.is_empty());
+    has_files || has_patches || has_deletes
+}
+
+fn app_deploy_args_allow_recent_app_target(arguments: &serde_json::Value) -> bool {
+    if app_deploy_args_have_target(arguments) {
+        return false;
+    }
+    if arguments
+        .get("allow_duplicate")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !arguments
+        .get("_streamed_app_delivery")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !app_deploy_args_have_edit_source(arguments) {
+        return false;
+    }
+    if non_empty_str_field(arguments, &["repo_url", "source_dir", "deploy_target"]).is_some() {
+        return false;
+    }
+    true
+}
+
+fn recent_app_target_for_app_deploy(
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    recent_artifacts: &[ConversationArtifactContext],
+    active_workspace_snapshot: Option<&serde_json::Value>,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !app_deploy_args_allow_recent_app_target(arguments) {
+        return None;
+    }
+    let app_artifacts = recent_artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.artifact_type.trim().eq_ignore_ascii_case("app")
+                && !artifact.artifact_id.trim().is_empty()
+        })
+        .collect::<Vec<_>>();
+    if app_artifacts.is_empty() {
+        return None;
+    }
+    if !turn_plan_has_any_dependency(turn_plan) {
+        return None;
+    }
+
+    let exact_matches = app_artifacts
+        .iter()
+        .filter(|artifact| turn_plan_has_artifact_dependency(turn_plan, artifact))
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return Some(exact_matches[0].artifact_id.trim().to_string());
+    }
+
+    if app_artifacts.len() == 1 && turn_plan_has_any_dependency(turn_plan) {
+        if let Some(active_app_id) = active_workspace_app_id(active_workspace_snapshot) {
+            if app_artifacts[0].artifact_id.trim() != active_app_id.as_str() {
+                return None;
+            }
+        }
+        return Some(app_artifacts[0].artifact_id.trim().to_string());
+    }
+
+    None
+}
+
+fn apply_recent_app_target_to_app_deploy_calls(
+    calls: &mut [crate::core::llm::ToolCall],
+    turn_plan: Option<&AgentLoopTurnPlanState>,
+    recent_artifacts: &[ConversationArtifactContext],
+    active_workspace_snapshot: Option<&serde_json::Value>,
+) -> usize {
+    let mut updated = 0usize;
+    for call in calls {
+        if call.name != "app_deploy" {
+            continue;
+        }
+        let Some(target_app_id) = recent_app_target_for_app_deploy(
+            turn_plan,
+            recent_artifacts,
+            active_workspace_snapshot,
+            &call.arguments,
+        ) else {
+            continue;
+        };
+        let Some(obj) = call.arguments.as_object_mut() else {
+            continue;
+        };
+        obj.insert("app_id".to_string(), serde_json::json!(target_app_id));
+        if !obj.contains_key("mode") {
+            obj.insert("mode".to_string(), serde_json::json!("patch"));
+        }
+        updated = updated.saturating_add(1);
+    }
+    updated
 }
 
 fn tool_call_validation_issues(
@@ -9401,7 +9740,24 @@ Next step: {next_step}",
                 }
             };
 
-            let parsed_calls = parse_agent_loop_tool_calls(&response, &allowed_action_names);
+            let mut parsed_calls = parse_agent_loop_tool_calls(&response, &allowed_action_names);
+            let app_targets_resolved = apply_recent_app_target_to_app_deploy_calls(
+                &mut parsed_calls.calls,
+                turn_plan.as_ref(),
+                &recent_artifacts,
+                active_workspace_snapshot.as_ref(),
+            );
+            if app_targets_resolved > 0 {
+                emit_agent_loop_progress(
+                    stream_tx.as_ref(),
+                    Some(&progress_recorder),
+                    "app_delivery",
+                    format!(
+                        "Resolved {} app update target(s) from conversation artifact context.",
+                        app_targets_resolved
+                    ),
+                );
+            }
             if !parsed_calls.calls.is_empty() {
                 durable_no_action_iterations = 0;
                 emit_agent_loop_model_prose(
@@ -11778,6 +12134,163 @@ mod tests {
     }
 
     #[test]
+    fn streamed_patch_blocks_synthesize_patch_app_deploy_call() {
+        let response = llm_response(
+            "<patch path=\"app.js\">@@ -1,1 +1,1 @@\n-console.log(1);\n+console.log(2);\n</patch>",
+            Vec::new(),
+        );
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+
+        let parsed = parse_agent_loop_tool_calls(&response, &allowed);
+
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "app_deploy");
+        assert_eq!(
+            parsed.calls[0]
+                .arguments
+                .get("mode")
+                .and_then(|value| value.as_str()),
+            Some("patch")
+        );
+        assert_eq!(
+            parsed.calls[0]
+                .arguments
+                .get("file_patches")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("path"))
+                .and_then(|value| value.as_str()),
+            Some("app.js")
+        );
+        assert_eq!(
+            parsed.calls[0]
+                .arguments
+                .get("file_patches")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("patch"))
+                .and_then(|value| value.as_str()),
+            Some("@@ -1,1 +1,1 @@\n-console.log(1);\n+console.log(2);\n")
+        );
+    }
+
+    #[test]
+    fn streamed_app_delivery_uses_recent_app_target_for_dependent_update() {
+        let response = llm_response(
+            "<file path=\"index.html\"><h1>Updated</h1></file>",
+            Vec::new(),
+        );
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut parsed = parse_agent_loop_tool_calls(&response, &allowed);
+        let mut plan = turn_plan(goal("deployment"));
+        plan.goals[0].dependencies = vec!["app-123".to_string()];
+        let artifacts = vec![ConversationArtifactContext {
+            artifact_type: "app".to_string(),
+            artifact_id: "app-123".to_string(),
+            title: "Existing App".to_string(),
+            summary: String::new(),
+            url: "/apps/app-123/".to_string(),
+            related_actions: Vec::new(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }];
+
+        let updated = apply_recent_app_target_to_app_deploy_calls(
+            &mut parsed.calls,
+            Some(&plan),
+            &artifacts,
+            None,
+        );
+
+        assert_eq!(updated, 1);
+        assert_eq!(
+            parsed.calls[0]
+                .arguments
+                .get("app_id")
+                .and_then(|value| value.as_str()),
+            Some("app-123")
+        );
+        assert_eq!(
+            parsed.calls[0]
+                .arguments
+                .get("mode")
+                .and_then(|value| value.as_str()),
+            Some("patch")
+        );
+    }
+
+    #[test]
+    fn streamed_app_delivery_without_dependency_does_not_target_recent_app() {
+        let response = llm_response(
+            "<file path=\"index.html\"><h1>New App</h1></file>",
+            Vec::new(),
+        );
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut parsed = parse_agent_loop_tool_calls(&response, &allowed);
+        let plan = turn_plan(goal("deployment"));
+        let artifacts = vec![ConversationArtifactContext {
+            artifact_type: "app".to_string(),
+            artifact_id: "app-123".to_string(),
+            title: "Existing App".to_string(),
+            summary: String::new(),
+            url: "/apps/app-123/".to_string(),
+            related_actions: Vec::new(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }];
+
+        let updated = apply_recent_app_target_to_app_deploy_calls(
+            &mut parsed.calls,
+            Some(&plan),
+            &artifacts,
+            Some(&serde_json::json!({"id": "app-123"})),
+        );
+
+        assert_eq!(updated, 0);
+        assert!(parsed.calls[0].arguments.get("app_id").is_none());
+    }
+
+    #[test]
+    fn streamed_app_delivery_does_not_guess_target_across_multiple_apps() {
+        let response = llm_response(
+            "<file path=\"index.html\"><h1>Updated</h1></file>",
+            Vec::new(),
+        );
+        let allowed = HashSet::from(["app_deploy".to_string()]);
+        let mut parsed = parse_agent_loop_tool_calls(&response, &allowed);
+        let mut plan = turn_plan(goal("deployment"));
+        plan.goals[0].dependencies = vec!["previous-result".to_string()];
+        let artifacts = vec![
+            ConversationArtifactContext {
+                artifact_type: "app".to_string(),
+                artifact_id: "app-123".to_string(),
+                title: "First App".to_string(),
+                summary: String::new(),
+                url: "/apps/app-123/".to_string(),
+                related_actions: Vec::new(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+            ConversationArtifactContext {
+                artifact_type: "app".to_string(),
+                artifact_id: "app-456".to_string(),
+                title: "Second App".to_string(),
+                summary: String::new(),
+                url: "/apps/app-456/".to_string(),
+                related_actions: Vec::new(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            },
+        ];
+
+        let updated = apply_recent_app_target_to_app_deploy_calls(
+            &mut parsed.calls,
+            Some(&plan),
+            &artifacts,
+            Some(&serde_json::json!({"id": "app-456"})),
+        );
+
+        assert_eq!(updated, 0);
+        assert!(parsed.calls[0].arguments.get("app_id").is_none());
+    }
+
+    #[test]
     fn app_delivery_patch_arguments_are_deployable_source() {
         assert!(app_delivery_call_has_deployable_source(
             &serde_json::json!({
@@ -12813,6 +13326,35 @@ mod tests {
         ]);
 
         assert!(should_use_app_delivery_stream_blocks_mode(
+            false,
+            false,
+            Some(&plan),
+            &actions,
+            &actions,
+            &scores
+        ));
+    }
+
+    #[test]
+    fn app_delivery_stream_blocks_reject_required_lifecycle_plus_deploy_scope() {
+        let app_deploy = app_delivery_action();
+        let app_restart = app_lifecycle_action("app_restart");
+        let mut delivery_goal = goal("deployment");
+        delivery_goal.action_name = Some(app_deploy.name.clone());
+        let mut restart_goal = goal("restart_deployed_app");
+        restart_goal.action_name = Some(app_restart.name.clone());
+        let plan = AgentLoopTurnPlanState {
+            plan_id: "turn-test".to_string(),
+            summary: "Deploy an app and restart an existing app.".to_string(),
+            goals: vec![delivery_goal, restart_goal],
+        };
+        let actions = vec![app_deploy.clone(), app_restart.clone()];
+        let scores = HashMap::from([
+            (app_deploy.name.clone(), 0.91),
+            (app_restart.name.clone(), 0.84),
+        ]);
+
+        assert!(!should_use_app_delivery_stream_blocks_mode(
             false,
             false,
             Some(&plan),

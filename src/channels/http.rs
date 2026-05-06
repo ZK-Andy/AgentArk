@@ -752,6 +752,8 @@ pub struct AppState {
     pub deployment_mode: DeploymentMode,
     /// Which surface this listener serves.
     pub server_role: HttpServerRole,
+    /// Runtime process start time for lightweight status telemetry.
+    pub runtime_started_at: Instant,
     /// Optional dedicated bind address for public apps.
     pub public_app_bind_addr: Option<String>,
     /// Optional externally visible base URL for public apps.
@@ -1513,6 +1515,7 @@ pub async fn serve(
             application_registry: applications::ApplicationLauncherRegistry::default(),
             deployment_mode,
             server_role: HttpServerRole::ControlPlane,
+            runtime_started_at: Instant::now(),
             public_app_bind_addr,
             public_app_base_url,
             release_update_cache: Arc::new(RwLock::new(ReleaseUpdateCache::default())),
@@ -2232,6 +2235,10 @@ pub async fn serve(
         .route("/analytics/llm", get(llm_analytics_endpoint))
         .route("/reflect", get(ark_reflect_endpoint))
         .route("/reflect/refresh", post(ark_reflect_refresh_endpoint))
+        .route(
+            "/reflect/followups/{id}/feedback",
+            post(ark_reflect_followup_feedback_endpoint),
+        )
         // Document routes
         .route("/documents", get(list_documents_endpoint))
         .route("/documents/upload", post(upload_document_endpoint))
@@ -2484,6 +2491,9 @@ pub async fn serve(
         .route("/arkpulse", get(get_pulse_log))
         .route("/arkpulse/trigger", post(trigger_pulse))
         .route("/arkpulse/fix", post(run_arkpulse_fix))
+        .route("/arkpulse/cleanup-preview", post(arkpulse_cleanup_preview))
+        .route("/arkpulse/cleanup", post(run_arkpulse_cleanup))
+        .route("/arkpulse/cleanup/{job_id}", get(get_arkpulse_cleanup_job))
         // Browser automation sessions
         .route("/browser/sessions", get(browser_list_sessions))
         .route("/browser/sessions/{id}", get(browser_session_status))

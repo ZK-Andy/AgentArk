@@ -615,13 +615,13 @@ export function SentinelPanel({
     <>
       <WorkspacePageShell spacing={1.5}>
         <WorkspacePageHeader
-          eyebrow="Ark Core"
+          eyebrow="Ark Core / ArkSentinel"
           title="ArkSentinel"
           description={
             <>
-              ArkSentinel keeps an eye on everything you and the agent are doing.
+              ArkSentinel shows decisions and safety checks that need you.
               <br />
-              Through experience learning, it remembers what's worked before so the agent gets better over time.
+              ArkSentinel keeps an eye on activity in the background and learns from what worked before.
               <br />
               When something needs you, it shows up here as a suggestion you can approve or skip.
             </>

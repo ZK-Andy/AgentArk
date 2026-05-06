@@ -26,7 +26,7 @@
   Self-evolve prompts, classifiers, routing policies, and specialist behavior from your own usage.<br>
   Review your day, week, or month through ArkReflect: a local visual panorama of where chat, ArkOrbit, apps, goals, watchers, memory, background agents, usage, and learned workflows clustered.<br>
   Chat, memory, devices, integrations, and reviewable actions, all in one place, all on your machine, private by default.<br>
-  <code>~3.1GB full Docker image &middot; ~0.45GB idle containers measured &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
+  <code>~3.1GB Docker image &middot; ~500MB idle, ~1GB RAM steady-state under load (5 containers, embeddings loaded) &middot; AES-256-GCM encrypted &middot; model-agnostic</code>
 </p>
 
 <p align="center">
@@ -39,6 +39,9 @@
   <a href="#contributing">Contributing</a> &middot;
   <a href="https://deepwiki.com/agentark-ai/AgentArk">DeepWiki</a>
 </p>
+
+> [!IMPORTANT]
+> **AgentArk is in beta — not for production.** It can make mistakes and overwrite files inside its workspace. The Docker boundary keeps it off your host filesystem, but anything you mount into the containers is in scope. Keep approvals on, back up data, verify results.
 
 ---
 
@@ -836,15 +839,9 @@ Licensed under either of:
 
 ---
 
-## Beta Notice
-
-AgentArk is still in beta. It can make mistakes, misunderstand requests, choose the wrong tool, produce incorrect output, or take an action that does not match what you intended.
-
-Use it at your own risk, especially around files, secrets, connected accounts, automations, public links, payments, messages, production systems, or anything you cannot easily undo. Keep approvals enabled for risky actions, review plans before applying them, and verify important results yourself.
-
-AgentArk is currently distributed through this Git repository only. `agentark.ai` or any other AgentArk-branded domain is not an official AgentArk property unless it is explicitly linked from this repository.
-
----
+<p align="center">
+  <em>Distributed only through this Git repository — <code>agentark.ai</code> or any other AgentArk-branded domain is not official unless linked from here.</em>
+</p>
 
 <p align="center">
   Built with Rust 🦀

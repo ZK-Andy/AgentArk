@@ -3,7 +3,12 @@ import {
   Box,
   Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
+  InputAdornment,
   LinearProgress,
   Stack,
   TextField,
@@ -17,10 +22,16 @@ import AutoGraphRoundedIcon from "@mui/icons-material/AutoGraphRounded";
 import BubbleChartRoundedIcon from "@mui/icons-material/BubbleChartRounded";
 import CalendarMonthRoundedIcon from "@mui/icons-material/CalendarMonthRounded";
 import ChatRoundedIcon from "@mui/icons-material/ChatRounded";
+import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 import HubRoundedIcon from "@mui/icons-material/HubRounded";
 import MemoryRoundedIcon from "@mui/icons-material/MemoryRounded";
-import MonitorHeartRoundedIcon from "@mui/icons-material/MonitorHeartRounded";
+import OpenInNewRoundedIcon from "@mui/icons-material/OpenInNewRounded";
+import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
+import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
+import ThumbUpAltRoundedIcon from "@mui/icons-material/ThumbUpAltRounded";
+import TaskAltRoundedIcon from "@mui/icons-material/TaskAltRounded";
+import TimelineRoundedIcon from "@mui/icons-material/TimelineRounded";
 import WorkHistoryRoundedIcon from "@mui/icons-material/WorkHistoryRounded";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
@@ -36,10 +47,11 @@ import { asRecord, errMessage, num, pickRecords, str } from "./pageHelpers";
 
 type ArkReflectPageProps = {
   autoRefresh: boolean;
+  onNavigateToView?: (view: string, replace?: boolean) => void;
 };
 
 type ReflectPeriod = "daily" | "weekly" | "monthly";
-type ReflectStoryTab = "studio" | "patterns" | "achievements" | "dreams" | "replay";
+type ReflectStoryTab = "overview" | "topics" | "latest" | "timeline";
 
 type ReflectUnit = {
   id: string;
@@ -109,7 +121,46 @@ type ReflectSuggestedFollowup = {
   conversation_id?: string | null;
   source_unit_id?: string | null;
   rank_score: number;
+  search_results: ReflectSearchResult[];
+  search_checked_at?: string | null;
+  search_error?: string | null;
+  latest_summary?: string | null;
+  latest_summary_generated_at?: string | null;
+  latest_summary_error?: string | null;
+  feedback?: ReflectFollowupFeedbackState | null;
+  feedback_keys: string[];
 };
+
+type ReflectFollowupFeedbackState = {
+  useful_count: number;
+  dismiss_count: number;
+  snooze_count: number;
+  last_action?: string | null;
+  last_at?: string | null;
+  snoozed_until?: string | null;
+  renewed_after_feedback: boolean;
+};
+
+type ReflectSearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+  source: string;
+  published_date?: string | null;
+};
+
+type ChatPendingLaunch = {
+  createdAt: number;
+  launchMode: "message";
+  message: string;
+  conversationId?: string;
+  newConversation?: boolean;
+  source?: string;
+};
+
+const CHAT_PENDING_LAUNCH_STORAGE_KEY = "agentark.chat.pendingLaunch";
+const OPPORTUNITY_PAGE_SIZE = 6;
+const TOPIC_PAGE_SIZE = 6;
 
 type ReflectResponse = {
   period: ReflectPeriod;
@@ -283,6 +334,20 @@ function asRelatedHistory(value: unknown): ReflectRelatedHistory {
   };
 }
 
+function asSearchResult(value: unknown): ReflectSearchResult | null {
+  const raw = asRecord(value);
+  const title = str(raw.title, "").trim();
+  const url = str(raw.url, "").trim();
+  if (!title && !url) return null;
+  return {
+    title: title || url,
+    url,
+    snippet: str(raw.snippet, ""),
+    source: str(raw.source, "Search"),
+    published_date: str(raw.published_date, "") || null,
+  };
+}
+
 function asSuggestedFollowup(value: unknown): ReflectSuggestedFollowup | null {
   const raw = asRecord(value);
   const id = str(raw.id, "");
@@ -299,6 +364,32 @@ function asSuggestedFollowup(value: unknown): ReflectSuggestedFollowup | null {
     conversation_id: str(raw.conversation_id, "") || null,
     source_unit_id: str(raw.source_unit_id, "") || null,
     rank_score: num(raw.rank_score, 0),
+    search_results: pickRecords(raw, "search_results")
+      .map(asSearchResult)
+      .filter((item): item is ReflectSearchResult => item !== null),
+    search_checked_at: str(raw.search_checked_at, "") || null,
+    search_error: str(raw.search_error, "") || null,
+    latest_summary: str(raw.latest_summary, "") || null,
+    latest_summary_generated_at: str(raw.latest_summary_generated_at, "") || null,
+    latest_summary_error: str(raw.latest_summary_error, "") || null,
+    feedback: asFollowupFeedback(raw.feedback),
+    feedback_keys: Array.isArray(raw.feedback_keys)
+      ? raw.feedback_keys.map((key) => String(key).trim()).filter(Boolean)
+      : [],
+  };
+}
+
+function asFollowupFeedback(value: unknown): ReflectFollowupFeedbackState | null {
+  const raw = asRecord(value);
+  if (!Object.keys(raw).length) return null;
+  return {
+    useful_count: num(raw.useful_count, 0),
+    dismiss_count: num(raw.dismiss_count, 0),
+    snooze_count: num(raw.snooze_count, 0),
+    last_action: str(raw.last_action, "") || null,
+    last_at: str(raw.last_at, "") || null,
+    snoozed_until: str(raw.snoozed_until, "") || null,
+    renewed_after_feedback: Boolean(raw.renewed_after_feedback),
   };
 }
 
@@ -420,8 +511,15 @@ function relatedHistoryText(history: ReflectRelatedHistory): string {
 
 function unitDisplayTitle(unit: ReflectUnit): string {
   const title = unit.title.trim();
+  const meta = sourceMeta(unit.source_kind);
   if (unit.source_kind === "llm_usage") return "Usage summary";
-  if (title.length < 8) return sourceMeta(unit.source_kind).group;
+  if (
+    (unit.source_kind === "sentinel" || unit.source_kind === "arkpulse" || unit.source_kind === "watcher") &&
+    /[.:;]/.test(title)
+  ) {
+    return meta.group;
+  }
+  if (title.length < 8) return meta.group;
   return title;
 }
 
@@ -732,6 +830,245 @@ function clusterPlainSummary(cluster: ReflectCluster): string {
   return `${cluster.unit_count} item${cluster.unit_count === 1 ? "" : "s"} from ${sourceText || "AgentArk"}.`;
 }
 
+function compactText(value: string, maxChars: number): string {
+  const cleaned = value.split(/\s+/).join(" ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function stripInlineMarkup(value: string): string {
+  return value
+    .replace(/\*\*/g, "")
+    .replace(/#+\s*/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactMultilineText(value: string, maxChars: number): string {
+  const cleaned = value
+    .replace(/\*\*/g, "")
+    .replace(/#+\s*/g, "")
+    .replace(/`/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n");
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function meaningTokens(value: string): string[] {
+  return stripInlineMarkup(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length >= 3);
+}
+
+function meaningSimilarity(left: string, right: string): number {
+  const leftTokens = new Set(meaningTokens(left));
+  const rightTokens = new Set(meaningTokens(right));
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap += 1;
+  }
+  const union = new Set([...leftTokens, ...rightTokens]).size;
+  return union > 0 ? overlap / union : 0;
+}
+
+function isNearDuplicateText(left: string, right: string): boolean {
+  const leftClean = stripInlineMarkup(left).toLowerCase();
+  const rightClean = stripInlineMarkup(right).toLowerCase();
+  if (!leftClean || !rightClean) return false;
+  return leftClean === rightClean || meaningSimilarity(leftClean, rightClean) >= 0.72;
+}
+
+function firstNonDuplicateText(values: string[], reference: string, maxChars: number): string {
+  for (const value of values) {
+    const cleaned = stripInlineMarkup(value);
+    if (!cleaned || isNearDuplicateText(cleaned, reference)) continue;
+    return compactText(cleaned, maxChars);
+  }
+  return "";
+}
+
+function uniqueByVisibleMeaning<T>(items: T[], getText: (item: T) => string): T[] {
+  const selected: T[] = [];
+  for (const item of items) {
+    const text = getText(item);
+    if (!text.trim()) continue;
+    if (selected.some((existing) => isNearDuplicateText(getText(existing), text))) continue;
+    selected.push(item);
+  }
+  return selected;
+}
+
+function clusterTopicTitle(cluster: ReflectCluster): string {
+  const raw = stripInlineMarkup(cluster.label || clusterDisplayLabel(cluster));
+  const tokens = meaningTokens(raw);
+  const source = dominantSource(cluster);
+  if (
+    tokens.length > 9 ||
+    raw.length > 86 ||
+    ((source === "sentinel" || source === "arkpulse" || source === "watcher") && /[.:;]/.test(raw))
+  ) {
+    return sourceMeta(source).group;
+  }
+  return raw || sourceMeta(source).group;
+}
+
+function clusterTopicDetail(cluster: ReflectCluster): string {
+  const sources = Object.entries(cluster.source_mix)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 2)
+    .map(([label, count]) => `${label}${count > 1 ? ` (${count})` : ""}`)
+    .join(" / ");
+  return `${cluster.unit_count} item${cluster.unit_count === 1 ? "" : "s"}${sources ? ` from ${sources}` : ""}. ${relatedHistoryText(cluster.related_history)}`;
+}
+
+function latestUpdateTitle(item: ReflectSuggestedFollowup): string {
+  return compactText(stripInlineMarkup(item.title || "Reflected topic"), 110);
+}
+
+function latestDevelopmentSummary(item: ReflectSuggestedFollowup): string {
+  const generated = compactMultilineText(item.latest_summary || "", 640);
+  if (generated) return generated;
+  if (item.latest_summary_error && item.search_results.length > 0) {
+    return "Sources are cached, but AgentArk could not finish the plain-language insight yet. The sources remain available below.";
+  }
+  if (item.search_error) return compactText(item.search_error, 180);
+  return item.search_results.length > 0
+    ? "Sources are cached. The plain-language insight will appear after the background synthesis worker finishes."
+    : compactText(item.detail || "Current-source check is queued.", 180);
+}
+
+function latestUpdateSummary(item: ReflectSuggestedFollowup): string {
+  return latestDevelopmentSummary(item);
+}
+
+function latestDevelopmentMeta(item: ReflectSuggestedFollowup): string {
+  if (item.latest_summary_generated_at) {
+    return `Generated from source check ${formatUiDateTime(item.search_checked_at || item.latest_summary_generated_at, { fallback: "recently" })}`;
+  }
+  if (item.search_results.length > 0) {
+    return `Source check ${formatUiDateTime(item.search_checked_at || item.occurred_at, { fallback: "recently" })}`;
+  }
+  return `Queued ${formatUiDateTime(item.occurred_at, { fallback: "recently" })}`;
+}
+
+function followupWhatThisIs(item: ReflectSuggestedFollowup): string {
+  const origin = item.source_label || "ArkReflect";
+  if (item.kind === "latest_developments") {
+    if (item.feedback?.renewed_after_feedback) {
+      return `Renewed source-backed interest from ${origin}; this reappeared after earlier feedback.`;
+    }
+    if (item.latest_summary) return `Source-backed insight inferred from ${origin}.`;
+    if (item.search_results.length > 0) return `Current-source check inferred from ${origin}; summary worker pending.`;
+    if (item.status === "failed") return `Current-source check inferred from ${origin}; source fetch failed.`;
+    return `Inferred intent from ${origin}; queued for current-source research.`;
+  }
+  if (item.kind === "recovery_advice") {
+    return `Recovery item from ${origin}; a prior run needs follow-up.`;
+  }
+  if (item.kind === "continue_theme") {
+    return `Reflected theme from ${origin}; useful to continue or convert into an action.`;
+  }
+  return `ArkReflect follow-up from ${origin}.`;
+}
+
+function latestReflectedTopic(item: ReflectSuggestedFollowup): string {
+  return compactText(stripInlineMarkup(item.title), 120);
+}
+
+function followupChatContext(item: ReflectSuggestedFollowup): string {
+  const isContinueTheme = item.kind === "continue_theme";
+  const lines = [
+    `${isContinueTheme ? "ArkReflect review item" : "ArkReflect follow-up"}: ${item.title}`,
+    `Type: ${followupKindLabel(item.kind)}`,
+    `Status: ${followupStatusLabel(item)}`,
+    `Origin: ${item.source_label || "ArkReflect"}`,
+    `Why surfaced: ${followupWhatThisIs(item)}`,
+    item.detail ? `Reflect detail: ${item.detail}` : "",
+    item.latest_summary ? `Source-backed insight:\n${item.latest_summary}` : "",
+    item.search_error ? `Source check error: ${item.search_error}` : "",
+    item.search_checked_at ? `Source checked at: ${item.search_checked_at}` : "",
+    item.feedback?.renewed_after_feedback
+      ? "Prior feedback: this area was dismissed or snoozed before, but newer reflected evidence suggests renewed interest."
+      : "",
+  ].filter(Boolean);
+  if (item.search_results.length > 0) {
+    lines.push("Cached sources:");
+    for (const [index, result] of item.search_results.entries()) {
+      lines.push(
+        `${index + 1}. ${result.title || result.url}\nSource: ${result.source || "Search"}${result.published_date ? ` (${result.published_date})` : ""}\nURL: ${result.url || "n/a"}\nSnippet: ${result.snippet || "n/a"}`,
+      );
+    }
+  }
+  if (isContinueTheme) {
+    lines.push(
+      `Chat starting point: ${item.prompt.trim() || `Review this reflected thread: ${item.title.trim()}`}`,
+      "Launch mode: review this ArkReflect handoff in chat first. Do not build, deploy, restart, schedule, or create durable work from this handoff alone; ask for the concrete next action if it is not explicit.",
+    );
+  } else {
+    lines.push(`Requested next step: ${item.prompt.trim() || item.title.trim()}`);
+  }
+  return lines.join("\n\n");
+}
+
+function followupKindLabel(kind: string): string {
+  switch (kind) {
+    case "latest_developments":
+      return "Source insight";
+    case "recovery_advice":
+      return "Needs review";
+    case "continue_theme":
+      return "Continue";
+    default:
+      return "Follow-up";
+  }
+}
+
+function followupStatusLabel(item: ReflectSuggestedFollowup): string {
+  if (item.kind === "latest_developments") {
+    if (item.status === "queued") return "Checking current sources";
+    if (item.status === "failed") return "Source check failed";
+    if (item.search_results.length > 0 && !item.latest_summary && !item.latest_summary_error) {
+      return "Summarizing insight";
+    }
+    if (item.search_results.length > 0) return `${item.search_results.length} source${item.search_results.length === 1 ? "" : "s"}`;
+  }
+  return item.status ? item.status.replace(/_/g, " ") : "ready";
+}
+
+function followupActionLabel(kind: string): string {
+  switch (kind) {
+    case "latest_developments":
+      return "Launch in Chat";
+    case "recovery_advice":
+      return "Review in new Chat";
+    case "continue_theme":
+      return "Review in Chat";
+    default:
+      return "Start new Chat";
+  }
+}
+
+function unitReadableSummary(unit: ReflectUnit): string {
+  return compactText(unit.summary || unit.content_preview || sourceMeta(unit.source_kind).group, 170);
+}
+
+function storeChatPendingLaunch(snapshot: ChatPendingLaunch): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(CHAT_PENDING_LAUNCH_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Best-effort handoff only.
+  }
+}
+
 function quietStatus(
   response: ReflectResponse | undefined,
   fetching: boolean,
@@ -776,11 +1113,14 @@ function quietStatus(
   };
 }
 
-export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
+export default function ArkReflectPage({ autoRefresh, onNavigateToView }: ArkReflectPageProps) {
   const queryClient = useQueryClient();
   const [period, setPeriod] = useState<ReflectPeriod>("weekly");
   const [anchor, setAnchor] = useState(() => toDateInputValue(new Date()));
-  const [storyTab, setStoryTab] = useState<ReflectStoryTab>("studio");
+  const [storyTab, setStoryTab] = useState<ReflectStoryTab>("overview");
+  const [selectedFollowupId, setSelectedFollowupId] = useState<string | null>(null);
+  const [topicPage, setTopicPage] = useState(0);
+  const [opportunityPage, setOpportunityPage] = useState(0);
   const bounds = useMemo(() => periodBounds(period, anchor), [period, anchor]);
   const fromIso = bounds.from.toISOString();
   const toIso = bounds.to.toISOString();
@@ -854,6 +1194,116 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     return [...byId.values()];
   }, [clusters, response?.unclustered_units]);
   const suggestedFollowups = response?.suggested_followups ?? [];
+  const openFollowupInChat = (item: ReflectSuggestedFollowup) => {
+    const message = followupChatContext(item);
+    if (!message) return;
+    storeChatPendingLaunch({
+      createdAt: Date.now(),
+      launchMode: "message",
+      message,
+      newConversation: true,
+      source: "ArkReflect",
+    });
+    onNavigateToView?.("chat");
+    if (!onNavigateToView && typeof window !== "undefined") {
+      window.location.href = "/ui/chat";
+    }
+  };
+  const openSearchResult = (result: ReflectSearchResult) => {
+    if (!result.url || typeof window === "undefined") return;
+    window.open(result.url, "_blank", "noopener,noreferrer");
+  };
+  const feedbackMutation = useMutation({
+    mutationFn: async ({ item, action }: { item: ReflectSuggestedFollowup; action: "useful" | "snooze" | "dismiss" }) => {
+      await api.rawPost(`/reflect/followups/${encodeURIComponent(item.id)}/feedback`, {
+        action,
+        keys: item.feedback_keys,
+      });
+      return { item, action };
+    },
+    onSuccess: ({ item, action }) => {
+      if (action === "dismiss" || action === "snooze") {
+        setSelectedFollowupId((current) => (current === item.id ? null : current));
+      }
+      void queryClient.invalidateQueries({ queryKey: reflectQueryKey });
+      void queryClient.invalidateQueries({ queryKey: todayQueryKey });
+    },
+  });
+  const submitFollowupFeedback = (
+    item: ReflectSuggestedFollowup,
+    action: "useful" | "snooze" | "dismiss",
+  ) => {
+    if (feedbackMutation.isPending) return;
+    feedbackMutation.mutate({ item, action });
+  };
+  const renderFollowupControls = (item: ReflectSuggestedFollowup, includeDetails: boolean) => (
+    <Stack direction="row" spacing={0.65} sx={{ alignItems: "center", flexWrap: "wrap", rowGap: 0.65 }}>
+      <Button
+        size="small"
+        variant="outlined"
+        startIcon={<ThumbUpAltRoundedIcon />}
+        disabled={feedbackMutation.isPending}
+        onClick={(event) => {
+          event.stopPropagation();
+          submitFollowupFeedback(item, "useful");
+        }}
+        sx={{ borderRadius: "8px" }}
+      >
+        Useful
+      </Button>
+      <Button
+        size="small"
+        variant="outlined"
+        disabled={feedbackMutation.isPending}
+        onClick={(event) => {
+          event.stopPropagation();
+          submitFollowupFeedback(item, "snooze");
+        }}
+        sx={{ borderRadius: "8px" }}
+      >
+        Snooze
+      </Button>
+      <Button
+        size="small"
+        variant="outlined"
+        startIcon={<CloseRoundedIcon />}
+        disabled={feedbackMutation.isPending}
+        onClick={(event) => {
+          event.stopPropagation();
+          submitFollowupFeedback(item, "dismiss");
+        }}
+        sx={{ borderRadius: "8px" }}
+      >
+        Dismiss
+      </Button>
+      {includeDetails ? (
+        <Button
+          size="small"
+          variant="outlined"
+          endIcon={<OpenInNewRoundedIcon />}
+          onClick={(event) => {
+            event.stopPropagation();
+            setSelectedFollowupId(item.id);
+          }}
+          sx={{ borderRadius: "8px" }}
+        >
+          Details
+        </Button>
+      ) : null}
+      <Button
+        size="small"
+        variant="contained"
+        startIcon={<PlayArrowRoundedIcon />}
+        onClick={(event) => {
+          event.stopPropagation();
+          openFollowupInChat(item);
+        }}
+        sx={{ borderRadius: "8px" }}
+      >
+        Launch
+      </Button>
+    </Stack>
+  );
 
   useEffect(() => {
     const waitingForDailyLatest = suggestedFollowups.some(
@@ -880,7 +1330,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   const todayMeaningful = meaningfulForSourceCounts(todayResponse?.source_counts);
   const todayTotal = totalForSourceCounts(todayResponse?.source_counts);
   const focusLabel = strongestCluster
-    ? (clusterLabelById[strongestCluster.id] ?? clusterDisplayLabel(strongestCluster))
+    ? clusterTopicTitle(strongestCluster)
     : "No activity yet";
   const recurringCount = clusters.filter((cluster) => cluster.related_history.mode === "recurring").length;
   const sourceRows = useMemo(
@@ -901,7 +1351,6 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     countForSource(response, "arkevolve");
   const learnedCount =
     countForSource(response, "experience_item") + countForSource(response, "procedural_pattern");
-  const styleSignals = useMemo(() => workingStyleSignals(response), [response]);
   const narrative = useMemo(
     () => narrativeLines(response, focusLabel, totalUnits, learnedCount, backgroundCount, recurringCount),
     [backgroundCount, focusLabel, learnedCount, recurringCount, response, totalUnits],
@@ -929,7 +1378,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     clusters.forEach((cluster, index) => {
       const source = dominantSource(cluster);
       const meta = sourceMeta(source);
-      const clusterName = clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster);
+      const clusterName = clusterTopicTitle(cluster);
       const nodeId = `cluster-${cluster.id}`;
       seen.add(nodeId);
       clusterNodeIds.push(nodeId);
@@ -937,7 +1386,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       const stroke = tacticalAccent(meta.color);
       const code = tacticalCode(source);
       const idx = String(index + 1).padStart(2, "0");
-      const truncated = clusterName.length > 38 ? `${clusterName.slice(0, 36)}…` : clusterName;
+      const truncated = clusterName.length > 38 ? `${clusterName.slice(0, 36)}...` : clusterName;
       nodes.push({
         id: nodeId,
         name: clusterName,
@@ -956,7 +1405,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           show: true,
           position: "right",
           distance: 8,
-          formatter: `{code|${idx}·${code}}  {name|${truncated.toUpperCase()}}`,
+          formatter: `{code|${idx}-${code}}  {name|${truncated.toUpperCase()}}`,
           rich: {
             code: {
               color: stroke,
@@ -1077,8 +1526,8 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           const name = (info.data?.name || "node").toUpperCase();
           const v = info.data?.value;
           return v
-            ? `<span style="opacity:0.6">› TRACE</span> ${name}<br/><span style="opacity:0.6">› UNITS</span> ${v}`
-            : `<span style="opacity:0.6">› NODE</span> ${name}`;
+            ? `<span style="opacity:0.6">TRACE</span> ${name}<br/><span style="opacity:0.6">UNITS</span> ${v}`
+            : `<span style="opacity:0.6">NODE</span> ${name}`;
         },
       },
       graphic: {
@@ -1101,7 +1550,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             left: 14,
             top: 12,
             style: {
-              text: `◢ PANORAMA · ${clusters.length.toString().padStart(2, "0")} TRACES`,
+              text: `PANORAMA - ${clusters.length.toString().padStart(2, "0")} TRACES`,
               fill: "rgba(120, 200, 220, 0.55)",
               font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
             },
@@ -1111,7 +1560,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             right: 14,
             bottom: 12,
             style: {
-              text: "◣ FOCUS·MAP",
+              text: "FOCUS MAP",
               fill: "rgba(120, 200, 220, 0.45)",
               font: "500 9.5px 'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
               textAlign: "right",
@@ -1188,7 +1637,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           const i = p.dataIndex;
           const tBucket = haveBounds ? new Date(fromTs + ((i + 0.5) / TIMELINE_BUCKETS) * span) : null;
           const stamp = tBucket ? tBucket.toISOString().slice(0, 16).replace("T", " ") : `BIN ${i + 1}`;
-          return `<span style="opacity:0.55">› T</span> ${stamp}<br/><span style="opacity:0.55">› N</span> ${p.value}`;
+          return `<span style="opacity:0.55">T</span> ${stamp}<br/><span style="opacity:0.55">N</span> ${p.value}`;
         },
       },
       grid: { left: 28, right: 12, top: 14, bottom: 22, containLabel: false },
@@ -1248,11 +1697,17 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     () => [...clusters].sort((left, right) => right.unit_count - left.unit_count),
     [clusters],
   );
-  const topClusters = sortedClusters.slice(0, 5);
-  const leadCluster = sortedClusters[0] ?? null;
-  const mostChangedStyle = styleSignals
-    .slice()
-    .sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta))[0];
+  const topicRows = useMemo(
+    () => uniqueByVisibleMeaning(sortedClusters, (cluster) => clusterTopicTitle(cluster)),
+    [sortedClusters],
+  );
+  const topClusters = topicRows.slice(0, 5);
+  const topicPageCount = Math.max(1, Math.ceil(topicRows.length / TOPIC_PAGE_SIZE));
+  const visibleTopicRows = topicRows.slice(
+    topicPage * TOPIC_PAGE_SIZE,
+    topicPage * TOPIC_PAGE_SIZE + TOPIC_PAGE_SIZE,
+  );
+  const leadCluster = topicRows[0] ?? sortedClusters[0] ?? null;
   const replayUnits = useMemo(
     () =>
       allUnits
@@ -1264,6 +1719,89 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   const showWeeklyReplay = replayUnits.length >= 3;
   const recoveryFollowups = suggestedFollowups.filter((item) => item.kind === "recovery_advice");
   const latestFollowups = suggestedFollowups.filter((item) => item.kind === "latest_developments");
+  const selectedFollowup =
+    suggestedFollowups.find((item) => item.id === selectedFollowupId) ?? null;
+  const latestSourceCount = latestFollowups.reduce((sum, item) => sum + item.search_results.length, 0);
+  const latestReadyCount = latestFollowups.filter((item) => item.status === "ready").length;
+  const latestQueuedCount = latestFollowups.filter((item) => item.status === "queued").length;
+  const latestFailedCount = latestFollowups.filter((item) => item.status === "failed").length;
+  const opportunityFollowups = suggestedFollowups;
+  const opportunityPageCount = Math.max(1, Math.ceil(opportunityFollowups.length / OPPORTUNITY_PAGE_SIZE));
+  const visibleOpportunityFollowups = opportunityFollowups.slice(
+    opportunityPage * OPPORTUNITY_PAGE_SIZE,
+    opportunityPage * OPPORTUNITY_PAGE_SIZE + OPPORTUNITY_PAGE_SIZE,
+  );
+  const sourceMixOption = useMemo(
+    () => ({
+      backgroundColor: "transparent",
+      color: sourceRows.map((source) => tacticalAccent(source.color)),
+      tooltip: {
+        trigger: "item",
+        backgroundColor: "rgba(6, 11, 16, 0.96)",
+        borderColor: "rgba(120, 200, 220, 0.4)",
+        borderWidth: 1,
+        textStyle: {
+          color: "#dceaf2",
+          fontSize: 11,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+        },
+      },
+      legend: {
+        type: "scroll",
+        bottom: 0,
+        icon: "circle",
+        itemWidth: 7,
+        itemHeight: 7,
+        textStyle: {
+          color: "rgba(210, 226, 238, 0.72)",
+          fontSize: 10,
+          fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+        },
+      },
+      series: [
+        {
+          type: "pie",
+          radius: ["48%", "74%"],
+          center: ["50%", "42%"],
+          avoidLabelOverlap: true,
+          padAngle: 2,
+          itemStyle: { borderColor: "rgba(5, 9, 12, 0.94)", borderWidth: 2 },
+          label: {
+            color: "rgba(230, 244, 248, 0.86)",
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', 'IBM Plex Mono', Menlo, monospace",
+            formatter: "{b}\n{c}",
+          },
+          labelLine: { length: 8, length2: 5, lineStyle: { color: "rgba(120, 200, 220, 0.35)" } },
+          data: sourceRows.map((source) => ({ name: source.label, value: source.count })),
+          animationDuration: 800,
+          animationEasing: "cubicOut",
+        },
+      ],
+    }),
+    [sourceRows],
+  );
+  useEffect(() => {
+    if (!selectedFollowupId) return;
+    if (suggestedFollowups.some((item) => item.id === selectedFollowupId)) return;
+    setSelectedFollowupId(null);
+  }, [suggestedFollowups, selectedFollowupId]);
+  useEffect(() => {
+    if (topicPage < topicPageCount) return;
+    setTopicPage(Math.max(0, topicPageCount - 1));
+  }, [topicPage, topicPageCount]);
+  useEffect(() => {
+    if (opportunityPage < opportunityPageCount) return;
+    setOpportunityPage(Math.max(0, opportunityPageCount - 1));
+  }, [opportunityPage, opportunityPageCount]);
+  const keyMoments = useMemo(
+    () =>
+      uniqueByVisibleMeaning(
+        replayUnits.slice().reverse(),
+        (unit) => `${unitDisplayTitle(unit)} ${unit.summary || unit.content_preview}`,
+      ).slice(0, 6),
+    [replayUnits],
+  );
   const hasProblems =
     recoveryFollowups.length > 0 ||
     Boolean(response?.refresh_status.last_error) ||
@@ -1284,28 +1822,33 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     (response?.embedding_status.mode !== "semantic" && totalUnits > 0
       ? "Semantic grouping is still catching up, so some patterns may be grouped by source activity first."
       : "No major failure stood out in the reflected data. The main risk is letting the next step remain implicit.");
-  const achievementCards = [
+  const overviewStats = [
     {
-      label: "What you achieved",
-      value: `${clusters.length}`,
-      detail: `focus area${clusters.length === 1 ? "" : "s"} clarified from ${totalUnits} reflected item${totalUnits === 1 ? "" : "s"}.`,
+      label: "Topics found",
+      value: `${topicRows.length}`,
+      detail: `${totalUnits} reflected item${totalUnits === 1 ? "" : "s"} grouped into evidence-backed work themes.`,
       tone: "var(--green)",
     },
     {
-      label: "What went well",
-      value: `${Math.max(0, totalUnits - recoveryFollowups.length)}`,
-      detail: "signals moved cleanly enough to become a readable recap.",
+      label: "Source checks",
+      value: `${latestSourceCount || latestFollowups.length}`,
+      detail:
+        latestSourceCount > 0
+          ? `${latestSourceCount} current-source result${latestSourceCount === 1 ? "" : "s"} cached for reflected topics.`
+          : latestFollowups.length > 0
+            ? `${latestFollowups.length} reflected topic${latestFollowups.length === 1 ? "" : "s"} queued for source-backed checks.`
+            : "No reflected topic currently needs an external source check.",
       tone: "var(--cyan)",
     },
     ...(hasProblems
       ? [
           {
-            label: "What went wrong",
+            label: "Needs attention",
             value: `${recoveryFollowups.length}`,
             detail:
               recoveryFollowups.length > 0
-                ? "recovery follow-up surfaced from the period."
-                : "a system caveat needs attention.",
+                ? "stalled or corrected run(s) that deserve review."
+                : "a system caveat is affecting this recap.",
             tone: "var(--red)",
           },
         ]
@@ -1313,59 +1856,30 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
     ...(recurringCount > 0
       ? [
           {
-            label: "Observations",
+            label: "Recurring threads",
             value: `${recurringCount}`,
-            detail: `recurring theme${recurringCount === 1 ? "" : "s"} connected to earlier work.`,
+            detail: `theme${recurringCount === 1 ? "" : "s"} connected to earlier similar work.`,
             tone: "var(--orange)",
           },
         ]
       : []),
   ];
-  const dreamCards = [
-    {
-      title: leadCluster
-        ? `Carry ${clusterLabelById[leadCluster.id] ?? clusterDisplayLabel(leadCluster)} forward`
-        : "Let the next meaningful cluster emerge",
-      detail: leadCluster
-        ? leadCluster.plain_summary || clusterPlainSummary(leadCluster)
-        : "ArkReflect will turn the next real activity into a focused story once enough work is cached.",
-    },
-    ...(latestFollowups[0]
-      ? [
-          {
-            title: latestFollowups[0].title,
-            detail: latestFollowups[0].detail,
-          },
-        ]
-      : []),
-    ...(recurringCount > 0 && topClusters[0]
-      ? [
-          {
-            title: "Watch the recurring thread",
-            detail: relatedHistoryText(topClusters[0].related_history),
-          },
-        ]
-      : []),
-  ].filter((card) => card.title.trim() && card.detail.trim());
   const storyTabs = [
-    { value: "studio" as const, label: "Reflection Studio", short: "Studio", count: totalUnits },
+    { value: "overview" as const, label: "Overview", short: "Overview", count: totalUnits },
     ...(topClusters.length > 0
-      ? [{ value: "patterns" as const, label: "Pattern Observatory", short: "Patterns", count: topClusters.length }]
+      ? [{ value: "topics" as const, label: "Topics", short: "Topics", count: topicRows.length }]
       : []),
-    ...(achievementCards.length > 0
-      ? [{ value: "achievements" as const, label: "Achievement Canvas", short: "Achievements", count: achievementCards.length }]
-      : []),
-    ...(dreamCards.length > 0
-      ? [{ value: "dreams" as const, label: "Dream Board", short: "Dreams", count: dreamCards.length }]
+    ...(suggestedFollowups.length > 0
+      ? [{ value: "latest" as const, label: "Opportunities", short: "Opportunities", count: suggestedFollowups.length }]
       : []),
     ...(showWeeklyReplay
-      ? [{ value: "replay" as const, label: "Weekly Replay", short: "Replay", count: replayUnits.length }]
+      ? [{ value: "timeline" as const, label: "Timeline", short: "Timeline", count: replayUnits.length }]
       : []),
   ];
 
   useEffect(() => {
     if (storyTabs.some((tab) => tab.value === storyTab)) return;
-    setStoryTab("studio");
+    setStoryTab("overview");
   }, [storyTab, storyTabs]);
 
   const renderStoryView = () => {
@@ -1373,7 +1887,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       border: "1px solid var(--surface-border)",
       borderRadius: "8px",
       background:
-        "radial-gradient(circle at top left, var(--ui-rgba-0-255-170-040), transparent 38%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
+        "radial-gradient(circle at top left, var(--ui-rgba-57-208-255-040), transparent 38%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
       boxShadow: "var(--surface-shadow-soft)",
     };
     const labelSx = {
@@ -1395,11 +1909,10 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
       lineHeight: 1.55,
       fontSize: "0.9rem",
     };
-    const periodName = period === "daily" ? "day" : period === "weekly" ? "week" : "month";
     const focusTitle =
       focusLabel === "No activity yet"
         ? "ArkReflect is waiting for a clear focus."
-        : `This ${periodName} centered on ${focusLabel.toLowerCase()}.`;
+        : `Reflected focus: ${focusLabel}`;
 
     return (
       <Stack spacing={1.4}>
@@ -1408,7 +1921,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             ...panelSx,
             p: { xs: 1.5, md: 2 },
             background:
-              "linear-gradient(90deg, var(--ui-rgba-0-255-170-060), transparent 68%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
+              "linear-gradient(90deg, var(--ui-rgba-57-208-255-060), transparent 68%), linear-gradient(180deg, var(--cyber-panel-raised), var(--cyber-panel))",
           }}
         >
           <Stack
@@ -1417,7 +1930,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             sx={{ alignItems: { xs: "flex-start", md: "center" }, justifyContent: "space-between" }}
           >
             <Box sx={{ minWidth: 0 }}>
-              <Typography sx={labelSx}>Reflection Studio</Typography>
+              <Typography sx={labelSx}>Decision recap</Typography>
               <Typography sx={{ ...titleSx, fontSize: { xs: "1.45rem", md: "2rem" }, mt: 0.45 }}>
                 {focusTitle}
               </Typography>
@@ -1426,14 +1939,43 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               </Typography>
             </Box>
             <Stack direction="row" spacing={0.75} sx={{ flexWrap: "wrap", rowGap: 0.75 }}>
-              <Chip className="arkreflect-pill" icon={<WorkHistoryRoundedIcon />} label={`${totalUnits} reflected`} />
-              <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} focus areas`} />
-              <Chip className="arkreflect-pill" icon={<RefreshRoundedIcon />} label={status.title} />
+              <Chip
+                className="arkreflect-pill"
+                icon={<WorkHistoryRoundedIcon />}
+                label={`${totalUnits} reflected`}
+                clickable
+                onClick={() => setStoryTab("overview")}
+              />
+              <Chip
+                className="arkreflect-pill"
+                icon={<BubbleChartRoundedIcon />}
+                label={`${topicRows.length} topics`}
+                clickable
+                onClick={() => setStoryTab("topics")}
+              />
+              {suggestedFollowups.length > 0 ? (
+                <Chip
+                  className="arkreflect-pill"
+                  icon={<SearchRoundedIcon />}
+                  label={`${suggestedFollowups.length} opportunities`}
+                  clickable
+                  onClick={() => setStoryTab("latest")}
+                />
+              ) : null}
+              <Chip
+                className="arkreflect-pill"
+                icon={<RefreshRoundedIcon />}
+                label={response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
+                clickable
+                disabled={refreshMutation.isPending || response?.refresh_status.running}
+                onClick={() => refreshMutation.mutate()}
+              />
             </Stack>
           </Stack>
         </Box>
 
         <Box
+          className="arkreflect-motion-panel"
           sx={{
             ...panelSx,
             p: 0.75,
@@ -1457,7 +1999,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                   bgcolor: active ? "var(--green)" : "transparent",
                   borderColor: active ? "var(--green)" : "var(--surface-border)",
                   "&:hover": {
-                    bgcolor: active ? "var(--green)" : "var(--ui-rgba-0-255-170-060)",
+                    bgcolor: active ? "var(--green)" : "var(--ui-rgba-57-208-255-060)",
                     borderColor: "var(--surface-border-strong)",
                   },
                 }}
@@ -1471,13 +2013,14 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
           })}
         </Box>
 
-        {storyTab === "studio" ? (
+        {storyTab === "overview" ? (
         <Grid2 container spacing={1.4}>
           {sourceRows.length > 0 ? (
           <Grid2 size={{ xs: 12, lg: 3 }}>
-            <Box sx={{ ...panelSx, p: 1.35, height: "100%" }}>
-              <Typography sx={labelSx}>Activity mix</Typography>
-              <Stack spacing={0.9} sx={{ mt: 1 }}>
+            <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35, height: "100%" }}>
+              <Typography sx={labelSx}>Source mix</Typography>
+              <ReactECharts option={sourceMixOption} style={{ height: 230, width: "100%" }} />
+              <Stack spacing={0.75} sx={{ mt: 0.5 }}>
                 {sourceRows.slice(0, 5).map((source) => {
                   const pct = totalUnits > 0 ? Math.round((source.count / totalUnits) * 100) : 0;
                   return (
@@ -1503,10 +2046,10 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               lg: sourceRows.length > 0 && hasStudioSide ? 6 : sourceRows.length > 0 || hasStudioSide ? 9 : 12,
             }}
           >
-            <Box sx={{ ...panelSx, p: { xs: 1.4, md: 1.8 }, minHeight: 430 }}>
+            <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: { xs: 1.4, md: 1.8 }, minHeight: 430 }}>
               <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1.5 }}>
                 <Box>
-                  <Typography sx={labelSx}>What we did</Typography>
+                  <Typography sx={labelSx}>Plain-language recap</Typography>
                   <Typography sx={{ ...titleSx, fontSize: { xs: "1.25rem", md: "1.55rem" }, mt: 0.45 }}>
                     {focusLabel === "No activity yet" ? "Waiting for a useful story." : focusLabel}
                   </Typography>
@@ -1516,28 +2059,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                 </Typography>
               </Stack>
               <Grid2 container spacing={1}>
-                {[
-                  {
-                    label: "What you achieved",
-                    text: `You moved ${clusters.length} focus area${clusters.length === 1 ? "" : "s"} from raw activity into a readable recap.`,
-                  },
-                  {
-                    label: "What went good",
-                    text:
-                      mostChangedStyle && Math.abs(mostChangedStyle.delta) > 0.08
-                        ? `${mostChangedStyle.label} stood out compared with your baseline.`
-                        : "The activity stayed balanced enough to summarize without one source overwhelming the range.",
-                  },
-                  ...(hasProblems ? [{ label: "What went wrong", text: whatWentWrong }] : []),
-                  ...(narrative[1] ? [{ label: "Observation", text: narrative[1] }] : []),
-                  ...(dreamCards[0] ? [{ label: "Dream", text: dreamCards[0].detail }] : []),
-                  {
-                    label: "Evidence",
-                    text: leadCluster
-                      ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading focus.`
-                      : "Evidence appears here once a focus area is available.",
-                  },
-                ].map((item) => (
+                {overviewStats.map((item) => (
                   <Grid2 key={item.label} size={{ xs: 12, sm: 6 }}>
                     <Box
                       sx={{
@@ -1549,11 +2071,32 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                       }}
                     >
                       <Typography sx={labelSx}>{item.label}</Typography>
-                      <Typography sx={{ ...bodySx, mt: 0.75 }}>{item.text}</Typography>
+                      <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "1.75rem", fontWeight: 850, color: item.tone, mt: 0.6 }}>
+                        {item.value}
+                      </Typography>
+                      <Typography sx={{ ...bodySx, mt: 0.45 }}>{item.detail}</Typography>
                     </Box>
                   </Grid2>
                 ))}
               </Grid2>
+              <Box sx={{ mt: 1.4 }}>
+                <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ alignItems: { xs: "stretch", md: "center" } }}>
+                  <Box sx={{ flex: "1 1 280px", minWidth: 0 }}>
+                    <Typography sx={labelSx}>Activity rhythm</Typography>
+                    <ReactECharts option={activityOption} style={{ height: 136, width: "100%" }} />
+                  </Box>
+                  <Box sx={{ flex: "1 1 260px", minWidth: 0 }}>
+                    <Typography sx={labelSx}>Why this matters</Typography>
+                    <Typography sx={{ ...bodySx, mt: 0.75 }}>
+                      {hasProblems
+                        ? whatWentWrong
+                        : leadCluster
+                          ? `${leadCluster.unit_count} item${leadCluster.unit_count === 1 ? "" : "s"} support the leading topic. ${latestFollowups.length} reflected topic${latestFollowups.length === 1 ? "" : "s"} can be checked against current sources.`
+                          : "When enough activity exists, this area explains the strongest thread and why it is worth attention."}
+                    </Typography>
+                  </Box>
+                </Stack>
+              </Box>
             </Box>
           </Grid2>
 
@@ -1562,7 +2105,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             <Stack spacing={1.4}>
               {hasTodayStatus ? (
                 <Box sx={{ ...panelSx, p: 1.35 }}>
-                  <Typography sx={labelSx}>Today status</Typography>
+                  <Typography sx={labelSx}>Today</Typography>
                   <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.55 }}>{todayDigestTitle}</Typography>
                   <Typography sx={{ ...bodySx, mt: 0.65 }}>{todayDigestDetail}</Typography>
                   <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7, mt: 1 }}>
@@ -1573,13 +2116,22 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               ) : null}
               {suggestedFollowups.length > 0 ? (
                 <Box sx={{ ...panelSx, p: 1.35 }}>
-                  <Typography sx={labelSx}>Follow-ups</Typography>
+                  <Typography sx={labelSx}>Next useful action</Typography>
                   <Typography sx={{ ...titleSx, fontSize: "1.35rem", mt: 0.55 }}>
                     {suggestedFollowups.length}
                   </Typography>
                   <Typography sx={{ ...bodySx, mt: 0.65 }}>
                     {suggestedFollowups[0].title}
                   </Typography>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<PlayArrowRoundedIcon />}
+                    onClick={() => openFollowupInChat(suggestedFollowups[0])}
+                    sx={{ mt: 1, borderRadius: "8px" }}
+                  >
+                    {followupActionLabel(suggestedFollowups[0].kind)}
+                  </Button>
                 </Box>
               ) : null}
               {hasGroupingStatus ? (
@@ -1599,142 +2151,242 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
         </Grid2>
         ) : null}
 
-        {storyTab === "patterns" ? (
+        {storyTab === "topics" ? (
         <Grid2 container spacing={1.4}>
           <Grid2 size={{ xs: 12, lg: 7 }}>
             <Box className="arkreflect-panorama" sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1 }}>
                 <Box>
-                  <Typography sx={labelSx}>Pattern Observatory</Typography>
+                  <Typography sx={labelSx}>Topic map</Typography>
                   <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                    Themes and their evidence links
+                    Work themes and evidence links
                   </Typography>
                 </Box>
-                <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} patterns`} />
+                <Chip className="arkreflect-pill" icon={<BubbleChartRoundedIcon />} label={`${clusters.length} topics`} />
               </Stack>
               <ReactECharts option={constellationOption} style={{ height: 345, width: "100%" }} />
             </Box>
           </Grid2>
           <Grid2 size={{ xs: 12, lg: 5 }}>
-            <Box sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
-              <Typography sx={labelSx}>Observed patterns</Typography>
-              <Stack spacing={0.9} sx={{ mt: 1 }}>
-                {topClusters.map((cluster, index) => {
-                  const name = clusterLabelById[cluster.id] ?? clusterDisplayLabel(cluster);
+            <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35, minHeight: 430 }}>
+              <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "center", gap: 1 }}>
+                <Box>
+                  <Typography sx={labelSx}>Topic list</Typography>
+                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.35 }}>
+                    {topicRows.length} deduped themes
+                  </Typography>
+                </Box>
+                {topicRows.length > TOPIC_PAGE_SIZE ? (
+                  <Chip size="small" variant="outlined" label={`${topicPage + 1}/${topicPageCount}`} />
+                ) : null}
+              </Stack>
+              <Box
+                sx={{
+                  mt: 1,
+                  display: "grid",
+                  gap: 0.75,
+                  maxHeight: 346,
+                  overflow: "auto",
+                  pr: 0.35,
+                }}
+              >
+                {visibleTopicRows.map((cluster, index) => {
+                  const name = clusterTopicTitle(cluster);
                   const source = sourceMeta(dominantSource(cluster));
+                  const displayIndex = topicPage * TOPIC_PAGE_SIZE + index;
                   return (
                     <Box
                       key={cluster.id}
                       sx={{
                         display: "grid",
-                        gridTemplateColumns: "34px 1fr auto",
-                        gap: 1,
+                        gridTemplateColumns: "30px minmax(0, 1fr) auto",
+                        gap: 0.9,
                         alignItems: "center",
-                        p: 1,
+                        p: 0.9,
+                        minHeight: 58,
                         border: "1px solid var(--surface-border)",
                         borderRadius: "8px",
-                        background: "var(--ui-rgba-255-255-255-020)",
+                        background: index === 0 ? "rgba(0, 255, 170, 0.055)" : "var(--ui-rgba-255-255-255-020)",
                       }}
                     >
-                      <Box sx={{ color: tacticalAccent(source.color) }}>{sourceIcon(source.label)}</Box>
+                      <Box sx={{ color: tacticalAccent(source.color), display: "grid", placeItems: "center" }}>
+                        {sourceIcon(source.label)}
+                      </Box>
                       <Box sx={{ minWidth: 0 }}>
-                        <Typography sx={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        <Typography sx={{ fontWeight: 850, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {name}
                         </Typography>
-                        <Typography variant="caption">{relatedHistoryText(cluster.related_history)}</Typography>
+                        <Typography variant="caption" sx={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {clusterTopicDetail(cluster)}
+                        </Typography>
                       </Box>
-                      <Typography sx={{ fontFamily: "var(--font-mono)", color: tacticalAccent(source.color), fontWeight: 800 }}>
-                        {String(index + 1).padStart(2, "0")}
-                      </Typography>
+                      <Stack sx={{ alignItems: "flex-end" }}>
+                        <Typography sx={{ fontFamily: "var(--font-mono)", color: tacticalAccent(source.color), fontWeight: 850 }}>
+                          {String(displayIndex + 1).padStart(2, "0")}
+                        </Typography>
+                        <Typography variant="caption">{cluster.unit_count}</Typography>
+                      </Stack>
                     </Box>
                   );
                 })}
-              </Stack>
+              </Box>
+              {topicRows.length > TOPIC_PAGE_SIZE ? (
+                <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", mt: 0.9 }}>
+                  <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
+                    {topicPage * TOPIC_PAGE_SIZE + 1}-{Math.min(topicRows.length, (topicPage + 1) * TOPIC_PAGE_SIZE)} of {topicRows.length}
+                  </Typography>
+                  <Stack direction="row" spacing={0.75}>
+                    <Button size="small" variant="outlined" disabled={topicPage === 0} onClick={() => setTopicPage((page) => Math.max(0, page - 1))} sx={{ borderRadius: "8px" }}>
+                      Previous
+                    </Button>
+                    <Button size="small" variant="outlined" disabled={topicPage >= topicPageCount - 1} onClick={() => setTopicPage((page) => Math.min(topicPageCount - 1, page + 1))} sx={{ borderRadius: "8px" }}>
+                      Next
+                    </Button>
+                  </Stack>
+                </Stack>
+              ) : null}
             </Box>
           </Grid2>
         </Grid2>
         ) : null}
 
-        {storyTab === "achievements" ? (
-        <Box sx={{ ...panelSx, p: 1.35 }}>
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1 }}>
+        {storyTab === "latest" ? (
+        <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35 }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", mb: 1.2 }}>
             <Box>
-              <Typography sx={labelSx}>Achievement Canvas</Typography>
+              <Typography sx={labelSx}>Opportunities</Typography>
               <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                Wins, misses, and momentum
+                Useful pursuits and follow-ups from this recap
               </Typography>
             </Box>
-            <Chip className="arkreflect-pill" icon={<AutoGraphRoundedIcon />} label={`${learnedCount} learned signals`} />
+            <Stack direction="row" spacing={0.7} sx={{ flexWrap: "wrap", rowGap: 0.7 }}>
+              <Chip className="arkreflect-pill" icon={<TaskAltRoundedIcon />} label={`${opportunityFollowups.length} item${opportunityFollowups.length === 1 ? "" : "s"}`} />
+              {latestFollowups.length > 0 ? (
+                <Chip className="arkreflect-pill" icon={<SearchRoundedIcon />} label={`${latestSourceCount || latestFollowups.length} source-backed`} />
+              ) : null}
+              {latestQueuedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestQueuedCount} checking`} /> : null}
+              {latestReadyCount > 0 ? <Chip size="small" variant="outlined" label={`${latestReadyCount} ready`} /> : null}
+              {latestFailedCount > 0 ? <Chip size="small" variant="outlined" label={`${latestFailedCount} failed`} /> : null}
+            </Stack>
           </Stack>
-          <Grid2 container spacing={1}>
-            {achievementCards.map((card) => (
-              <Grid2 key={card.label} size={{ xs: 12, sm: 6, lg: 3 }}>
+          <Stack spacing={1}>
+            {visibleOpportunityFollowups.map((item) => {
+              const isLatest = item.kind === "latest_developments";
+              const itemIcon = isLatest ? (
+                <SearchRoundedIcon fontSize="small" />
+              ) : item.kind === "recovery_advice" ? (
+                <AutoGraphRoundedIcon fontSize="small" />
+              ) : (
+                <TaskAltRoundedIcon fontSize="small" />
+              );
+              const itemSummary = isLatest ? latestUpdateSummary(item) : item.detail || followupStatusLabel(item);
+              return (
                 <Box
-                  sx={{
-                    p: 1.25,
-                    minHeight: 138,
-                    border: "1px solid var(--surface-border)",
-                    borderRadius: "8px",
-                    background: "var(--ui-rgba-255-255-255-020)",
+                  key={item.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setSelectedFollowupId(item.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedFollowupId(item.id);
+                    }
                   }}
-                >
-                  <Typography sx={labelSx}>{card.label}</Typography>
-                  <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "2rem", fontWeight: 850, color: card.tone, mt: 0.8 }}>
-                    {card.value}
-                  </Typography>
-                  <Typography sx={{ ...bodySx, mt: 0.5 }}>{card.detail}</Typography>
-                </Box>
-              </Grid2>
-            ))}
-          </Grid2>
-        </Box>
-        ) : null}
-
-        {storyTab === "dreams" ? (
-        <Box sx={{ ...panelSx, p: 1.35 }}>
-          <Typography sx={labelSx}>Dream Board</Typography>
-          <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35, mb: 1 }}>
-            What this period points toward
-          </Typography>
-          <Grid2 container spacing={1}>
-            {dreamCards.map((card, index) => (
-              <Grid2 key={card.title} size={{ xs: 12, md: index === 0 ? 6 : 3 }}>
-                <Box
                   sx={{
-                    p: 1.25,
-                    minHeight: 150,
+                    display: "grid",
+                    gridTemplateColumns: { xs: "1fr", md: "34px minmax(0, 1fr) auto" },
+                    gap: 1,
+                    alignItems: "start",
+                    p: { xs: 1.05, md: 1.2 },
                     border: "1px solid var(--surface-border)",
                     borderRadius: "8px",
+                    cursor: "pointer",
                     background:
-                      index === 0
-                        ? "radial-gradient(circle at top left, var(--ui-rgba-100-160-230-180), transparent 46%), var(--ui-rgba-255-255-255-020)"
+                      isLatest && item.search_results.length > 0
+                        ? "linear-gradient(90deg, rgba(0, 184, 217, 0.08), rgba(255,255,255,0.02))"
                         : "var(--ui-rgba-255-255-255-020)",
+                    transition: "border-color 180ms ease, background 180ms ease, transform 180ms ease",
+                    "&:hover": {
+                      borderColor: "rgba(88, 224, 255, 0.34)",
+                      background: "rgba(88, 224, 255, 0.055)",
+                      transform: "translateY(-1px)",
+                    },
                   }}
                 >
-                  <Typography sx={labelSx}>Dream {index + 1}</Typography>
-                  <Typography sx={{ ...titleSx, fontSize: "1rem", mt: 0.65 }}>{card.title}</Typography>
-                  <Typography sx={{ ...bodySx, mt: 0.65 }}>{card.detail}</Typography>
+                  <Box sx={{ color: isLatest ? "var(--cyan)" : item.kind === "recovery_advice" ? "var(--red)" : "var(--green)", pt: 0.25 }}>
+                    {itemIcon}
+                  </Box>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Stack direction="row" spacing={0.75} sx={{ alignItems: "center", flexWrap: "wrap", rowGap: 0.5 }}>
+                      <Typography sx={{ ...titleSx, fontSize: "1.05rem" }}>
+                        {isLatest ? latestUpdateTitle(item) : item.title}
+                      </Typography>
+                      <Chip size="small" variant="outlined" label={followupKindLabel(item.kind)} />
+                      <Chip size="small" variant="outlined" label={followupStatusLabel(item)} />
+                    </Stack>
+                    <Typography variant="caption" sx={{ display: "block", mt: 0.45, color: "var(--text-dim)" }}>
+                      {isLatest ? latestDevelopmentMeta(item) : followupWhatThisIs(item)}
+                    </Typography>
+                    <Typography sx={{ ...bodySx, mt: 0.45, whiteSpace: isLatest ? "pre-line" : "normal" }}>
+                      {itemSummary}
+                    </Typography>
+                    {isLatest ? (
+                      <Typography variant="caption" sx={{ display: "block", mt: 0.55, color: "var(--text-dim)" }}>
+                        Reflected topic: {latestReflectedTopic(item)}
+                      </Typography>
+                    ) : null}
+                  </Box>
+                  <Box sx={{ justifySelf: { xs: "start", md: "end" } }}>
+                    {renderFollowupControls(item, isLatest)}
+                  </Box>
                 </Box>
-              </Grid2>
-            ))}
-          </Grid2>
+              );
+            })}
+            {opportunityFollowups.length > OPPORTUNITY_PAGE_SIZE ? (
+              <Stack direction="row" spacing={1} sx={{ justifyContent: "space-between", alignItems: "center", pt: 0.25 }}>
+                <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
+                  {opportunityPage * OPPORTUNITY_PAGE_SIZE + 1}-{Math.min(opportunityFollowups.length, (opportunityPage + 1) * OPPORTUNITY_PAGE_SIZE)} of {opportunityFollowups.length}
+                </Typography>
+                <Stack direction="row" spacing={0.75}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={opportunityPage === 0}
+                    onClick={() => setOpportunityPage((page) => Math.max(0, page - 1))}
+                    sx={{ borderRadius: "8px" }}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={opportunityPage >= opportunityPageCount - 1}
+                    onClick={() => setOpportunityPage((page) => Math.min(opportunityPageCount - 1, page + 1))}
+                    sx={{ borderRadius: "8px" }}
+                  >
+                    Next
+                  </Button>
+                </Stack>
+              </Stack>
+            ) : null}
+          </Stack>
         </Box>
         ) : null}
 
-        {storyTab === "replay" && showWeeklyReplay ? (
-          <Box sx={{ ...panelSx, p: 1.35 }}>
+        {storyTab === "timeline" && showWeeklyReplay ? (
+          <Box className="arkreflect-motion-panel" sx={{ ...panelSx, p: 1.35 }}>
             <Stack direction={{ xs: "column", md: "row" }} spacing={1.2} sx={{ justifyContent: "space-between", mb: 1 }}>
               <Box>
-                <Typography sx={labelSx}>Weekly Replay</Typography>
+                <Typography sx={labelSx}>Timeline</Typography>
                 <Typography sx={{ ...titleSx, fontSize: "1.2rem", mt: 0.35 }}>
-                  Step through the story when enough timestamps exist
+                  How the period unfolded
                 </Typography>
               </Box>
-              <Chip className="arkreflect-pill" icon={<MonitorHeartRoundedIcon />} label={`${replayUnits.length} scenes`} />
+              <Chip className="arkreflect-pill" icon={<TimelineRoundedIcon />} label={`${replayUnits.length} moments`} />
             </Stack>
             <Grid2 container spacing={1.2}>
               <Grid2 size={{ xs: 12, lg: 5 }}>
-                <ReactECharts option={activityOption} style={{ height: 170, width: "100%" }} />
+                <ReactECharts option={activityOption} style={{ height: 190, width: "100%" }} />
               </Grid2>
               <Grid2 size={{ xs: 12, lg: 7 }}>
                 <Box
@@ -1744,7 +2396,7 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                     gap: 1,
                   }}
                 >
-                  {replayUnits.map((unit, index) => (
+                  {keyMoments.map((unit, index) => (
                     <Box
                       key={unit.id}
                       sx={{
@@ -1752,15 +2404,19 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                         minHeight: 112,
                         border: "1px solid var(--surface-border)",
                         borderRadius: "8px",
-                        background: index === 0 ? "var(--ui-rgba-0-255-170-060)" : "var(--ui-rgba-255-255-255-020)",
+                        background: index === 0 ? "var(--ui-rgba-57-208-255-060)" : "var(--ui-rgba-255-255-255-020)",
                       }}
                     >
                       <Typography sx={labelSx}>
-                        Scene {String(index + 1).padStart(2, "0")} - {formatUiDateTime(unit.occurred_at, { fallback: "time pending" })}
+                        Moment {String(index + 1).padStart(2, "0")} - {formatUiDateTime(unit.occurred_at, { fallback: "time pending" })}
                       </Typography>
                       <Typography sx={{ fontWeight: 800, mt: 0.65 }}>{unitDisplayTitle(unit)}</Typography>
                       <Typography sx={{ ...bodySx, mt: 0.45 }}>
-                        {(unit.summary || unit.content_preview || sourceMeta(unit.source_kind).group).slice(0, 132)}
+                        {firstNonDuplicateText(
+                          [unit.summary, unit.content_preview, sourceMeta(unit.source_kind).group],
+                          unitDisplayTitle(unit),
+                          150,
+                        ) || sourceMeta(unit.source_kind).group}
                       </Typography>
                     </Box>
                   ))}
@@ -1776,26 +2432,48 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
   return (
     <WorkspacePageShell spacing={1.4}>
       <WorkspacePageHeader
-        eyebrow="ArkReflect"
-        title="Your work, clustered into a clear recap"
+        eyebrow="Ark Core / ArkReflect"
+        title="ArkReflect"
         description={
           <span>
-            See where chat, ArkOrbit, apps, goals, watchers, Sentinel, ArkPulse,
-            ArkEvolve, usage, memory, and learned workflows concentrated.
+            ArkReflect shows what happened, which topics need current sources,
+            and the next action you can launch in Chat.
           </span>
         }
         actions={
-          <Stack
-            direction={{ xs: "column", sm: "row" }}
-            spacing={1}
-            sx={{ minWidth: { xs: "100%", md: 460 } }}
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: { xs: "1fr", sm: "auto 164px auto" },
+              alignItems: "center",
+              justifyContent: { xs: "stretch", sm: "end" },
+              gap: 1,
+              minWidth: { xs: "100%", md: 460 },
+              "& .MuiToggleButtonGroup-root": {
+                height: 40,
+                justifySelf: { xs: "stretch", sm: "end" },
+              },
+              "& .MuiToggleButton-root": {
+                minHeight: 40,
+                height: 40,
+              },
+              "& .MuiInputBase-root": {
+                height: 40,
+                borderRadius: "8px",
+                alignItems: "center",
+              },
+              "& .MuiButton-root": {
+                height: 40,
+                whiteSpace: "nowrap",
+              },
+            }}
           >
             <ToggleButtonGroup
               exclusive
               size="small"
               value={period}
               onChange={(_, value) => value && setPeriod(value)}
-              aria-label="Reflection period"
+              aria-label="ArkReflect period"
               sx={{
                 bgcolor: "rgba(255,255,255,0.06)",
                 borderRadius: 2,
@@ -1825,11 +2503,15 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
               sx={{ minWidth: 164 }}
               slotProps={{
                 input: {
-                  startAdornment: <CalendarMonthRoundedIcon fontSize="small" />,
+                  startAdornment: (
+                    <InputAdornment position="start" sx={{ mr: 0.4 }}>
+                      <CalendarMonthRoundedIcon fontSize="small" />
+                    </InputAdornment>
+                  ),
                 },
               }}
             />
-            <Tooltip title="Refresh recap in the background">
+            <Tooltip title="Run ArkReflect for this date range now">
               <Button
                 variant="outlined"
                 onClick={() => refreshMutation.mutate()}
@@ -1837,10 +2519,10 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
                 startIcon={<RefreshRoundedIcon />}
                 sx={{ minHeight: 40 }}
               >
-                {response?.refresh_status.running || refreshMutation.isPending ? "Refreshing" : "Refresh"}
+                {response?.refresh_status.running || refreshMutation.isPending ? "Running ArkReflect" : "Run ArkReflect now"}
               </Button>
             </Tooltip>
-          </Stack>
+          </Box>
         }
       />
 
@@ -1979,6 +2661,123 @@ export default function ArkReflectPage({ autoRefresh }: ArkReflectPageProps) {
             : ""}
         </Typography>
       ) : null}
+
+      <Dialog
+        open={Boolean(selectedFollowup)}
+        onClose={() => setSelectedFollowupId(null)}
+        fullWidth
+        maxWidth="md"
+        slotProps={{
+          paper: {
+            sx: {
+              border: "1px solid var(--surface-border)",
+              borderRadius: "8px",
+              background:
+                "linear-gradient(180deg, rgba(7, 13, 18, 0.98), rgba(5, 9, 12, 0.98))",
+            },
+          },
+        }}
+      >
+        {selectedFollowup ? (
+          <>
+            <DialogTitle sx={{ pb: 1 }}>
+              <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "0.68rem", letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--text-dim)" }}>
+                {followupKindLabel(selectedFollowup.kind)}
+              </Typography>
+              <Typography sx={{ fontFamily: "var(--font-display)", fontWeight: 850, fontSize: "1.15rem", mt: 0.45 }}>
+                {selectedFollowup.kind === "latest_developments" ? latestUpdateTitle(selectedFollowup) : selectedFollowup.title}
+              </Typography>
+              <Typography variant="caption" sx={{ color: "var(--text-dim)", display: "block", mt: 0.45 }}>
+                {selectedFollowup.kind === "latest_developments"
+                  ? latestDevelopmentMeta(selectedFollowup)
+                  : `${selectedFollowup.source_label || "ArkReflect"} - ${formatUiDateTime(selectedFollowup.occurred_at, { fallback: "recently" })}`}
+              </Typography>
+            </DialogTitle>
+            <DialogContent dividers sx={{ borderColor: "var(--surface-border)" }}>
+              <Stack spacing={1.25}>
+                <Box>
+                  <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "0.68rem", letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--text-dim)", mb: 0.55 }}>
+                    Detail
+                  </Typography>
+                  <Typography sx={{ color: "var(--text-secondary)", lineHeight: 1.6, whiteSpace: "pre-line" }}>
+                    {selectedFollowup.kind === "latest_developments"
+                      ? latestUpdateSummary(selectedFollowup)
+                      : selectedFollowup.detail || selectedFollowup.prompt || followupStatusLabel(selectedFollowup)}
+                  </Typography>
+                </Box>
+                <Box>
+                  <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "0.68rem", letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--text-dim)", mb: 0.55 }}>
+                    Why surfaced
+                  </Typography>
+                  <Typography sx={{ color: "var(--text-secondary)", lineHeight: 1.6 }}>
+                    {followupWhatThisIs(selectedFollowup)}
+                  </Typography>
+                  {selectedFollowup.kind === "latest_developments" ? (
+                    <Typography variant="caption" sx={{ color: "var(--text-dim)", display: "block", mt: 0.45 }}>
+                      Reflected topic: {latestReflectedTopic(selectedFollowup)}
+                    </Typography>
+                  ) : null}
+                </Box>
+                {selectedFollowup.kind === "latest_developments" || selectedFollowup.search_results.length > 0 || selectedFollowup.search_error ? (
+                <Box>
+                  <Typography sx={{ fontFamily: "var(--font-mono)", fontSize: "0.68rem", letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--text-dim)", mb: 0.8 }}>
+                    Sources
+                  </Typography>
+                  <Stack spacing={0.85}>
+                    {selectedFollowup.search_results.length > 0 ? (
+                      selectedFollowup.search_results.map((result, index) => (
+                        <Box
+                          key={`${selectedFollowup.id}-${result.url || index}`}
+                          sx={{
+                            p: 1,
+                            border: "1px solid rgba(120, 200, 220, 0.14)",
+                            borderRadius: "8px",
+                            background: "rgba(255,255,255,0.025)",
+                          }}
+                        >
+                          <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ justifyContent: "space-between", gap: 1 }}>
+                            <Box sx={{ minWidth: 0 }}>
+                              <Typography sx={{ fontWeight: 850 }}>{compactText(stripInlineMarkup(result.title), 120)}</Typography>
+                              <Typography variant="caption" sx={{ color: "var(--text-dim)" }}>
+                                {result.source || "Source"}{result.published_date ? ` - ${result.published_date}` : ""}
+                              </Typography>
+                              <Typography sx={{ color: "var(--text-secondary)", lineHeight: 1.55, mt: 0.55 }}>
+                                {compactText(stripInlineMarkup(result.snippet || result.url), 220)}
+                              </Typography>
+                            </Box>
+                            {result.url ? (
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                endIcon={<OpenInNewRoundedIcon />}
+                                onClick={() => openSearchResult(result)}
+                                sx={{ borderRadius: "8px", alignSelf: { xs: "flex-start", sm: "center" }, flex: "0 0 auto" }}
+                              >
+                                Open
+                              </Button>
+                            ) : null}
+                          </Stack>
+                        </Box>
+                      ))
+                    ) : (
+                      <Typography sx={{ color: "var(--text-secondary)" }}>
+                        {selectedFollowup.search_error || selectedFollowup.detail || "No sources are cached for this insight yet."}
+                      </Typography>
+                    )}
+                  </Stack>
+                </Box>
+                ) : null}
+              </Stack>
+            </DialogContent>
+            <DialogActions sx={{ px: 2, py: 1.3 }}>
+              <Stack direction="row" spacing={0.75} sx={{ flex: 1, flexWrap: "wrap", rowGap: 0.75 }}>
+                {renderFollowupControls(selectedFollowup, false)}
+              </Stack>
+              <Button onClick={() => setSelectedFollowupId(null)}>Close</Button>
+            </DialogActions>
+          </>
+        ) : null}
+      </Dialog>
     </WorkspacePageShell>
   );
 }

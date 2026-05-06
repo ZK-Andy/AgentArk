@@ -4,6 +4,7 @@ export function normalizeSettingsPreloadTab(
   if (typeof rawTab !== "number" || !Number.isFinite(rawTab)) return null;
   const tab = Math.trunc(rawTab);
   if (tab === 2 || tab === 10 || tab === 15) return 20;
+  if (tab === 16) return 4;
   if (tab === 9 || tab === 13 || tab === 17) return 0;
   return tab;
 }
@@ -19,7 +20,9 @@ function preloadOnce(key: string, loader: () => Promise<unknown>): void {
 }
 
 export function preloadSettingsShell(): void {
-  preloadOnce("settings-shell", () => import("./SettingsPage"));
+  // SettingsPage is statically imported by the app shell; keep this hook for
+  // callers that warm settings data/panels without triggering a redundant
+  // dynamic import.
 }
 
 export function preloadSettingsFull(): void {
@@ -29,39 +32,15 @@ export function preloadSettingsFull(): void {
 export function preloadSettingsTab(rawTab?: number | null): void {
   preloadSettingsShell();
   const tab = normalizeSettingsPreloadTab(rawTab);
-  if (tab == null) return;
-  if (tab !== 0) {
+  if (tab == null) {
     preloadSettingsFull();
+    return;
   }
+  preloadSettingsFull();
   switch (tab) {
-    case 3:
-      preloadOnce("settings-media", () => import("./MediaSettingsPanel"));
-      break;
     case 1:
       // Models panel is now statically imported by SettingsPageFull, so no
       // separate preload is needed. Falls through to settings-full preload.
-      break;
-    case 4:
-      preloadOnce("settings-security", () => import("./SettingsSecurityPanel"));
-      break;
-    case 16:
-      preloadOnce("settings-sender-verification", () =>
-        import("../SenderVerificationPanel"),
-      );
-      break;
-    case 5:
-      preloadOnce("settings-advanced", () => import("./SettingsAdvancedPanel"));
-      break;
-    case 14:
-      preloadOnce("settings-data-lifecycle", () =>
-        import("./SettingsDataLifecyclePanel"),
-      );
-      break;
-    case 25:
-      preloadOnce("settings-updates", () => import("./SettingsUpdatesPanel"));
-      break;
-    case 6:
-      preloadOnce("settings-observability", () => import("../ObservabilityPanel"));
       break;
     case 8:
     case 20:
@@ -75,14 +54,7 @@ export function preloadSettingsTab(rawTab?: number | null): void {
       preloadOnce("settings-memory", () => import("./MemoryPage"));
       break;
     case 22:
-      preloadOnce("settings-webhooks", () => import("../WebhooksPanel"));
       preloadOnce("settings-quickstart", () => import("../IntegrationQuickstartPanel"));
-      break;
-    case 23:
-      preloadOnce("settings-plugins", () => import("../PluginSdkPanel"));
-      break;
-    case 26:
-      preloadOnce("settings-devices", () => import("../CompanionDevicesPanel"));
       break;
     default:
       break;

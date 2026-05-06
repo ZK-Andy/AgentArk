@@ -395,6 +395,9 @@ pub async fn check_gepa_readiness(
     let config = load_gepa_optimizer_config(storage).await;
     let budget = gepa_budget_status(storage, &config).await;
     let mut issues = Vec::new();
+    if !config.enabled {
+        issues.push("GEPA background optimizer is disabled.".to_string());
+    }
 
     let selected_slot = select_gepa_model_slot(agent_config, primary_model_id);
     let selected_runtime = selected_slot.and_then(gepa_model_runtime_from_slot);
@@ -412,6 +415,7 @@ pub async fn check_gepa_readiness(
         issues.push("The selected AgentArk model does not have usable credentials.".to_string());
     }
 
+    let bundled_python = bundled_gepa_python();
     let python_path = configured_gepa_python(project_root);
     let python_ready = command_runs(&python_path, &["--version"]).await;
     if !python_ready {
@@ -419,7 +423,12 @@ pub async fn check_gepa_readiness(
     }
 
     let dspy_ready = python_ready && command_runs(&python_path, &["-c", "import dspy"]).await;
-    if python_ready && !dspy_ready {
+    let auto_setup_ready = config.auto_setup
+        && python_ready
+        && project_root
+            .join("bridges/gepa_optimizer/requirements.txt")
+            .exists();
+    if python_ready && !dspy_ready && !auto_setup_ready {
         issues.push("DSPy is not installed in the GEPA Python environment.".to_string());
     }
     if !budget.allowed {
@@ -428,8 +437,13 @@ pub async fn check_gepa_readiness(
         }
     }
 
-    let ready =
-        python_ready && dspy_ready && model.is_some() && provider_key_ready && budget.allowed;
+    let runtime_ready = dspy_ready || auto_setup_ready;
+    let ready = config.enabled
+        && python_ready
+        && runtime_ready
+        && model.is_some()
+        && provider_key_ready
+        && budget.allowed;
     GepaReadiness {
         ready,
         enabled: config.enabled,
@@ -445,7 +459,7 @@ pub async fn check_gepa_readiness(
         auto_setup: config.auto_setup,
         budget,
         issues,
-        bundled: true,
+        bundled: bundled_python.is_some(),
     }
 }
 
@@ -503,6 +517,9 @@ pub async fn gepa_optimizer_runtime(
     primary_model_id: &str,
 ) -> Result<GepaOptimizerRuntime> {
     let config = load_gepa_optimizer_config(storage).await;
+    if !config.enabled {
+        anyhow::bail!("GEPA background optimizer is disabled");
+    }
     let slot = select_gepa_model_slot(agent_config, primary_model_id)
         .ok_or_else(|| anyhow::anyhow!("AgentArk's primary model is not configured"))?;
     let selected = gepa_model_runtime_from_slot(slot)
@@ -1381,7 +1398,6 @@ struct SelectedGepaModelRuntime {
 }
 
 fn normalize_gepa_optimizer_config(mut config: GepaOptimizerConfig) -> GepaOptimizerConfig {
-    config.enabled = true;
     let auto = config.auto_mode.trim().to_ascii_lowercase();
     config.auto_mode = if matches!(auto.as_str(), "light" | "medium" | "heavy") {
         auto
@@ -1587,7 +1603,7 @@ fn default_gepa_max_attempts() -> u32 {
 }
 
 fn default_apply_promotion() -> bool {
-    true
+    false
 }
 
 fn default_canary_rollout_percent() -> u8 {
@@ -1662,6 +1678,32 @@ mod tests {
 {"run_id":"r1","surface":"unknown","source":"s2","candidate":{}}"#;
         let records = parse_candidate_records(raw).expect("records parse");
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn normalize_gepa_optimizer_config_preserves_disabled_flag() {
+        let config = normalize_gepa_optimizer_config(GepaOptimizerConfig {
+            enabled: false,
+            auto_mode: "invalid".to_string(),
+            max_metric_calls: 999,
+            daily_budget_usd: 999.0,
+            per_run_budget_usd: 999.0,
+            max_runs_per_day: 999,
+            auto_setup: true,
+        });
+
+        assert!(!config.enabled);
+        assert_eq!(config.auto_mode, "light");
+        assert_eq!(config.max_metric_calls, 512);
+        assert_eq!(config.daily_budget_usd, 500.0);
+        assert_eq!(config.per_run_budget_usd, 100.0);
+        assert_eq!(config.max_runs_per_day, 100);
+    }
+
+    #[test]
+    fn gepa_promotion_settings_default_requires_manual_acceptance() {
+        let settings = GepaPromotionSettings::default();
+        assert!(!settings.apply_promotion);
     }
 
     #[test]
